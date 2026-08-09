@@ -3380,6 +3380,22 @@ export async function notesSpaces(vaultId: string): Promise<NoteSpaceVm[]> {
 }
 
 /**
+ * Re-create the default spaces this vault is missing (FR-156, Story 44.3), and
+ * report how many notes were written.
+ *
+ * Only what is missing: a default that is there is left alone, and so is a space
+ * of the user's own that already carries a default's name. Zero is the ordinary
+ * answer on a vault with nothing missing, and it is a success rather than a
+ * refusal.
+ *
+ * Rejects with: `invalidInput` (the vault could not be written to),
+ * `unsupported`, `internal`.
+ */
+export async function notesSpacesRestoreDefaults(vaultId: string): Promise<number> {
+  return await invoke<number>("notes_spaces_restore_defaults", { vaultId });
+}
+
+/**
  * Write or update a space note (FR-105). This is what "save this filter as a
  * space" produces, and it produces an ordinary markdown note — so the
  * organisation syncs, diffs and can be edited by hand or by an agent.

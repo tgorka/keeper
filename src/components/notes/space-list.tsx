@@ -19,20 +19,37 @@
  * than by reading eight labels. A space with no icon, and a space whose stored
  * icon is not in the set any more, both draw the fallback glyph — never a hole.
  */
-import { Pencil } from "lucide-react";
+import { Pencil, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { SpaceEditor, spaceIcon } from "@/components/notes/space-editor";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
-import { notesSpaces } from "@/lib/ipc/client";
+import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
 import { cn } from "@/lib/utils";
 
 /** The subtitle a space with an unparseable query carries, kept verbatim. */
 export const SPACE_BROKEN_SUBTITLE = "This space's query can't be read";
 
+/** The restore control's accessible name, kept verbatim. */
+export const RESTORE_DEFAULTS = "Restore default spaces";
+
+/**
+ * What restore says when there was nothing to do.
+ *
+ * Said out loud rather than flashing a success at a no-op: the whole promise of
+ * the control is that it never touches a space that is there, so the case where
+ * it touched nothing is the case it most has to be believed about.
+ */
+export const RESTORE_NOTHING_MISSING = "Nothing was missing.";
+
+/** What restore says when keeper could not write. */
+export const RESTORE_FAILED = "keeper couldn't restore the default spaces.";
+
 export function SpaceList({ vaultId }: { vaultId: string | null }) {
   const [spaces, setSpaces] = useState<NoteSpaceVm[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreResult, setRestoreResult] = useState<string | null>(null);
   const activeSpaceId = useNotesFiltersStore((s) => (s.scope.kind === "space" ? s.scope.id : null));
 
   const reload = useCallback(() => {
@@ -57,17 +74,68 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
 
   useEffect(reload, [reload]);
 
-  if (spaces.length === 0) {
-    return null;
-  }
+  /**
+   * Re-create the defaults this vault is missing (FR-156).
+   *
+   * Rust decides what "missing" means — a default is missing when no space
+   * carries its key and none is already called what it would be called — so this
+   * sends the ask and reports the count. Deciding it here would need the space
+   * list *and* the seed ledger in the webview, and the ledger is a fact about
+   * the vault on disk.
+   */
+  const restore = useCallback(() => {
+    if (vaultId === null) {
+      return;
+    }
+    setRestoring(true);
+    setRestoreResult(null);
+    void notesSpacesRestoreDefaults(vaultId)
+      .then((count) => {
+        setRestoreResult(
+          count === 0
+            ? RESTORE_NOTHING_MISSING
+            : count === 1
+              ? "Restored 1 space."
+              : `Restored ${count} spaces.`,
+        );
+        reload();
+      })
+      .catch(() => setRestoreResult(RESTORE_FAILED))
+      .finally(() => setRestoring(false));
+  }, [vaultId, reload]);
 
   const edited = spaces.find((space) => space.id === editing) ?? null;
 
+  // The section renders even when the vault has none. Spaces are the rail now
+  // (Story 44.3): folding it away when it is empty would hide the one control
+  // that fills it, and a vault whose owner deleted every default would have no
+  // way back.
   return (
     <section aria-label="Spaces" className="flex shrink-0 flex-col px-2 pb-1">
-      <span className="px-2 py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        Spaces
-      </span>
+      <div className="flex items-center justify-between gap-1 px-2 py-1">
+        <span className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+          Spaces
+        </span>
+        <button
+          type="button"
+          aria-label={RESTORE_DEFAULTS}
+          title={RESTORE_DEFAULTS}
+          disabled={vaultId === null || restoring}
+          onClick={restore}
+          className={cn(
+            "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+            "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+            "disabled:pointer-events-none disabled:opacity-50",
+          )}
+        >
+          <RotateCcw aria-hidden="true" className="size-3.5" />
+        </button>
+      </div>
+      {restoreResult !== null && (
+        <p role="status" className="px-2 pb-1 text-muted-foreground text-xs">
+          {restoreResult}
+        </p>
+      )}
       <ul className="flex flex-col gap-0.5">
         {spaces.map((space) => {
           const broken = space.error !== null;
@@ -88,9 +156,12 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                   active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
                 )}
                 onClick={() =>
-                  notesFiltersStore
-                    .getState()
-                    .setScope({ kind: "space", id: space.id, name: space.name })
+                  notesFiltersStore.getState().setScope({
+                    kind: "space",
+                    id: space.id,
+                    name: space.name,
+                    defaultKey: space.defaultKey,
+                  })
                 }
               >
                 <span

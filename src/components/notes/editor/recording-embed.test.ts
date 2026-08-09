@@ -6,6 +6,8 @@ import type { RecordingNoteTargetVm } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { livePreview } from "./live-preview";
 import {
+  FRAME_PRIME_SECONDS,
+  primeFirstFrame,
   RECORDING_ASSET_SCHEME,
   RECORDING_EMBED_COPY_PATH_LABEL,
   RECORDING_EMBED_REVEAL_LABEL,
@@ -99,6 +101,85 @@ describe("recordingAssetUrl", () => {
       `${RECORDING_ASSET_SCHEME}://${SESSION}/recordings/2026/` +
         "2026-08-08%2015.52%20pricing%20call/screen-0000.mov",
     );
+  });
+});
+
+/**
+ * Story 44.1's defect and its price.
+ *
+ * **What jsdom can say and what it cannot.** jsdom implements no media
+ * playback: `readyState` is 0 forever, no frame is ever decoded, and a canvas
+ * readback of a `<video>` here would be meaningless. So nothing below proves a
+ * frame appeared — that was measured in a real WKWebView, on the owner's own
+ * two-track session, and the pixel counts are in the spec. What these assert
+ * is the POLICY: who gets asked for a frame, who is left alone, and how often.
+ * Getting that wrong is a control that moves the recording under the reader's
+ * hand, which is the more dangerous half.
+ */
+describe("primeFirstFrame", () => {
+  /** A `<video>` with a settable `readyState`, which jsdom's is not. */
+  function video(readyState: number): HTMLVideoElement {
+    const element = document.createElement("video");
+    Object.defineProperty(element, "readyState", { configurable: true, value: readyState });
+    return element;
+  }
+
+  it("buys a frame for an element that has metadata and nothing to show", () => {
+    const player = video(1);
+    primeFirstFrame(player);
+
+    player.dispatchEvent(new Event("loadedmetadata"));
+
+    expect(player.currentTime).toBe(FRAME_PRIME_SECONDS);
+  });
+
+  it("asks before the metadata arrives and not a moment sooner", () => {
+    const player = video(0);
+    primeFirstFrame(player);
+
+    // A seek issued at HAVE_NOTHING is recorded as a default start position and
+    // raises nothing — the element would never confirm it and the transport
+    // would sit on Seeking for a request no one can answer.
+    expect(player.currentTime).toBe(0);
+  });
+
+  it("leaves an element the reader or the transport already moved exactly where it is", () => {
+    const player = video(1);
+    primeFirstFrame(player);
+    // By the time metadata lands, the pair has been placed at 37.5 s — either
+    // by a scrub or by a transport seating a late-joining track.
+    player.currentTime = 37.5;
+
+    player.dispatchEvent(new Event("loadedmetadata"));
+
+    expect(player.currentTime).toBe(37.5);
+  });
+
+  it("buys nothing for an element that already has a frame", () => {
+    // HAVE_CURRENT_DATA: there is a frame, so the range request would be spent
+    // for nothing on a file that may be on a pendrive.
+    const player = video(2);
+    primeFirstFrame(player);
+
+    player.dispatchEvent(new Event("loadedmetadata"));
+
+    expect(player.currentTime).toBe(0);
+  });
+
+  it("buys one frame and not one per event, even for a reader back at the top", () => {
+    const player = video(1);
+    primeFirstFrame(player);
+    player.dispatchEvent(new Event("loadedmetadata"));
+    expect(player.currentTime).toBe(FRAME_PRIME_SECONDS);
+
+    // Back to exactly zero — a reader who scrubbed to the start. The "has it
+    // been moved" guard cannot tell this apart from an untouched element, so
+    // the only thing stopping a second `loadedmetadata` (a source change, a
+    // reload) from moving them again is that the prime is genuinely once.
+    player.currentTime = 0;
+    player.dispatchEvent(new Event("loadedmetadata"));
+
+    expect(player.currentTime).toBe(0);
   });
 });
 
@@ -779,6 +860,143 @@ describe("livePreview, over a recording note", () => {
       expect(videos[0].controls).toBe(true);
       expect(view.contentDOM.querySelector(".cm-lp-recording-transport")).toBeNull();
       expect(view.contentDOM.querySelector(".cm-lp-recording-mix")).toBeNull();
+      // And the survivor is back in its OWN host, not left inside the furniture
+      // the group built around it: the note reads exactly as a one-video note.
+      expect(view.contentDOM.querySelector(".cm-lp-recording-stage")).toBeNull();
+      expect(view.contentDOM.querySelector(".cm-lp-recording-track")).toBeNull();
+      expect(videos[0].parentElement?.className).toBe("cm-lp-recording");
+
+      view.destroy();
+    });
+
+    /**
+     * Story 44.1. Grouping moves each `<video>` out of its own widget host and
+     * into the leader's stage, which is the only way two embeds on two
+     * CodeMirror lines can be rendered side by side — and it puts a hole
+     * straight through the teardown path, because `releaseRecordingMedia`
+     * searches the host for the element it must release. A follower's host is
+     * empty. Nothing here is hypothetical: without the host-keyed release these
+     * two fail with the follower's video still mounted and still holding its
+     * file.
+     */
+    it("stages the pair as one player, each track boxed with its own mixer", async () => {
+      const view = openPair();
+      await settle();
+
+      const stage = view.contentDOM.querySelector(".cm-lp-recording-stage");
+      expect(stage).not.toBeNull();
+      // One stage for the pair, not one per embed.
+      expect(view.contentDOM.querySelectorAll(".cm-lp-recording-stage")).toHaveLength(1);
+
+      const boxes = Array.from(
+        view.contentDOM.querySelectorAll<HTMLElement>(".cm-lp-recording-track"),
+      );
+      expect(boxes).toHaveLength(2);
+      const videos = videosOf(view);
+      for (const [index, box] of boxes.entries()) {
+        // The video and the control that governs it are inside one boundary —
+        // the whole of the "the mute slider sits away from its track" report.
+        expect(box.contains(videos[index])).toBe(true);
+        expect(box.querySelectorAll(".cm-lp-recording-mix")).toHaveLength(1);
+      }
+      // Both tracks, including the follower's, are inside the leading embed's
+      // own host — that is what "reads as one player" means in the DOM.
+      const leader = view.contentDOM.querySelectorAll(".cm-lp-recording")[0];
+      expect(leader.contains(videos[0])).toBe(true);
+      expect(leader.contains(videos[1])).toBe(true);
+
+      view.destroy();
+    });
+
+    it("releases a follower whose element the stage is holding, not just one in its own host", async () => {
+      const view = openPair();
+      await settle();
+      const camera = videosOf(view)[1];
+      // Proof the hole is real and not merely guarded against: the follower's
+      // element is genuinely not in the host the widget will be torn down with.
+      const followerHost = view.contentDOM.querySelectorAll(".cm-lp-recording")[1];
+      expect(followerHost.contains(camera)).toBe(false);
+
+      const line = view.state.doc.line(5);
+      view.dispatch({ changes: { from: line.from, to: line.to, insert: "" } });
+      await settle();
+
+      // Released means gone from the document AND told to let go of the file:
+      // a `<video>` still holding a `src` keeps a decoder and an open range
+      // pipeline against a volume the user may be trying to eject.
+      expect(videosOf(view)).toHaveLength(1);
+      expect(camera.isConnected).toBe(false);
+      expect(camera.getAttribute("src")).toBeNull();
+
+      view.destroy();
+    });
+
+    it("puts a failed follower back to a link with no dead player under it", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+      const followerHost = view.contentDOM.querySelectorAll<HTMLElement>(".cm-lp-recording")[1];
+
+      // The camera's file went away between the resolve and the request — a
+      // retitle, or an unmounted volume.
+      videos[1].dispatchEvent(new Event("error"));
+      await settle();
+
+      // The host shows the link the note actually says, and nothing else. The
+      // ordering this defends is exact: the track has to LEAVE the group before
+      // the host is restored, because leaving hands the element back to this
+      // host and a restore that ran first would be undone by it — a dead
+      // `<video>` sitting under the link.
+      expect(followerHost.querySelector("video")).toBeNull();
+      expect(followerHost.querySelector(".cm-lp-wikilink")).not.toBeNull();
+      // And the survivor is a lone video again.
+      expect(videos[0].controls).toBe(true);
+      expect(view.contentDOM.querySelector(".cm-lp-recording-stage")).toBeNull();
+
+      view.destroy();
+    });
+
+    it("hands the whole group down when the LEADING embed is deleted", async () => {
+      const view = openPair();
+      await settle();
+      measure(view, 120);
+      const survivor = videosOf(view)[1];
+
+      // The author deletes the screen embed. A third track would still make
+      // this a group, so here the pair simply falls to one — but the survivor
+      // must come back to its own host rather than leaving with the stage.
+      const line = view.state.doc.line(3);
+      view.dispatch({ changes: { from: line.from, to: line.to, insert: "" } });
+      await settle();
+
+      const videos = videosOf(view);
+      expect(videos).toHaveLength(1);
+      expect(videos[0]).toBe(survivor);
+      expect(survivor.controls).toBe(true);
+      expect(survivor.isConnected).toBe(true);
+      expect(survivor.parentElement?.className).toBe("cm-lp-recording");
+      expect(view.contentDOM.querySelector(".cm-lp-recording-stage")).toBeNull();
+
+      view.destroy();
+    });
+
+    it("primes both real players for a frame once the metadata lands", async () => {
+      const view = openPair();
+      await settle();
+      const videos = videosOf(view);
+
+      // jsdom raises no media events at all, so the one a real webview raises
+      // when it has a duration and no frame is supplied here. What is being
+      // asserted is that the real widget wired the prime to the real elements
+      // — the pixels it buys were counted in a real WKWebView, not here.
+      for (const video of videos) {
+        video.dispatchEvent(new Event("loadedmetadata"));
+      }
+
+      expect(videos.map((video) => video.currentTime)).toEqual([
+        FRAME_PRIME_SECONDS,
+        FRAME_PRIME_SECONDS,
+      ]);
 
       view.destroy();
     });

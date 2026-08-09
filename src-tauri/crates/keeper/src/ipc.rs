@@ -16399,10 +16399,25 @@ mod tests {
         // presence rather than value — the composer's own tests fix the format.
         assert!(fm.as_string("end").is_some(), "the end time is recorded");
         assert!(fm.as_string("duration").is_some());
+        // Story 44.2: the body opens as the recording. Both closed segments are
+        // embedded, in the ledger's order, BELOW the heading — `manifest.json`
+        // is in `files:` and is not embedded. Asserted here as well as in the
+        // composer's own tests because this is the seam that decides what the
+        // paths actually look like: they are whatever `stub_files` made
+        // relative to the anchor, and nothing joined a root back onto them.
         assert_eq!(
             &source[body..],
-            "\n# Weekly sync\n\n",
-            "the body offset is exact and the prose is byte-identical"
+            concat!(
+                "\n# Weekly sync\n",
+                "\n",
+                "![[keeper-rec session/screen-0000.mov]]\n",
+                "![[keeper-rec session/screen-0001.mov]]\n",
+                "\n",
+            ),
+            "the WHOLE body, so nothing can be reordered without failing here: the body \
+             offset is exact, the prose is byte-identical, and the heading is still the \
+             first line. An embed above it would become the note's displayed title, \
+             because `note_title` falls back to the body's first line"
         );
 
         // AC4, at the seam where an absolute path could actually get in: the
@@ -16609,7 +16624,14 @@ mod tests {
             .expect("an untitled session still gets a named stub");
         let (fm, body) = Frontmatter::parse(&source);
         assert_eq!(fm.as_string("title"), Some("2026-01-02"));
-        assert_eq!(&source[body..], "\n# 2026-01-02\n\n");
+        // The whole body, not a substring: the heading must stay the FIRST line,
+        // because `notes_vault::note_title` falls back to it and an embed above
+        // it would become the note's displayed name (story 44.2). The embed is
+        // here because `drive_synthetic_session` closes a real `.mov`.
+        assert_eq!(
+            &source[body..],
+            "\n# 2026-01-02\n\n![[keeper-rec 2026-01-02 10.00.00/screen-0000.mov]]\n\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -16712,7 +16734,16 @@ mod tests {
             "the head is keeper's block plus its separator: {head:?}"
         );
         let body = &stub.contents[head.len()..];
-        assert_eq!(body, "# Weekly sync\n\n");
+        // Story 44.2: the one closed segment is embedded under the heading, and
+        // the blank line after it is the line the surface's caret lands on —
+        // `setSelectionRange(value.length, …)` on exactly this string. Which is
+        // why the sentence appended below goes UNDER the recording rather than
+        // shoving it down the page.
+        assert_eq!(
+            body, "# Weekly sync\n\n![[keeper-rec session/screen-0000.mov]]\n\n",
+            "the WHOLE body: heading first, then the recording, then the blank line the \
+             caret lands on. An embed above the heading would become the note's title"
+        );
 
         recording_note_stub_save(folder_arg.clone(), format!("{head}{body}Ship on Friday.\n"))
             .await

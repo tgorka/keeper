@@ -146,7 +146,13 @@ describe("the slash menu", () => {
     await opened(view);
     acceptCompletion(view);
 
-    expect(text()).toBe("| Column | Column |\n| --- | --- |\n|  |  |\n");
+    // Story 44.9 replaced 43.9's hand-written skeleton with the toolbar's
+    // aligned builder, on purpose: one table command, one output. The pipes
+    // line up and the columns are told apart, which is what makes the table
+    // editable by hand in Obsidian and legible in a diff.
+    expect(text()).toBe(
+      "| Column 1 | Column 2 |\n| -------- | -------- |\n|          |          |\n",
+    );
 
     view.destroy();
   });

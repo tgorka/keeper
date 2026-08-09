@@ -17,15 +17,25 @@
  * Bold means unread here exactly as it does in the chat list. Conflict and pin
  * are glyphs rather than colour, because colour alone is not a carrier
  * (UX-DR43) and a conflict has to read on a monochrome panel too.
+ *
+ * The `+n` beside the chips is a truncation, so AD-83 applies to it (Story
+ * 44.12): it opens the tags it is hiding rather than merely counting them. A
+ * row that says `+2` and cannot say which two is the same failure as a property
+ * cut with nowhere to read the rest, in a smaller box.
  */
 import { AlertTriangle, Pin } from "lucide-react";
 import type { Ref } from "react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { formatDraftAge } from "@/lib/format-time";
 import type { NoteRowVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** How many tag chips a row shows before it collapses the rest into `+n`. */
 const VISIBLE_TAGS = 3;
+
+/** The accessible name of the `+n` chip, suffixed with the count. Named so a
+ * test and a screen reader agree on what the affordance is. */
+export const NOTE_MORE_TAGS_LABEL = "More tags on this note:";
 
 export function NoteRow({
   row,
@@ -44,7 +54,8 @@ export function NoteRow({
   ref?: Ref<HTMLButtonElement>;
 }) {
   const shownTags = row.tags.slice(0, VISIBLE_TAGS);
-  const overflow = row.tags.length - shownTags.length;
+  const hiddenTags = row.tags.slice(VISIBLE_TAGS);
+  const overflow = hiddenTags.length;
   // The accessible name puts state before content, but only where state changes
   // what the row MEANS — which for an unread, agent-touched note it does.
   const label = [
@@ -130,9 +141,46 @@ export function NoteRow({
             </button>
           ))}
           {overflow > 0 && (
-            <span className="shrink-0 text-[11px] text-muted-foreground leading-none">
-              +{overflow}
-            </span>
+            <Popover>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`${NOTE_MORE_TAGS_LABEL} ${hiddenTags.join(", ")}`}
+                  className="shrink-0 rounded-full px-1 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={(event) => {
+                    // Same rule as a chip: this opens the tags, not the note.
+                    event.stopPropagation();
+                  }}
+                >
+                  +{overflow}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="end"
+                className="w-56 gap-1"
+                // The trigger lives inside the row button, so a click landing on
+                // the panel must not travel back out and open the note.
+                onClick={(event) => event.stopPropagation()}
+              >
+                <p className="font-medium text-muted-foreground text-xs">{NOTE_MORE_TAGS_LABEL}</p>
+                <span className="flex max-h-40 flex-wrap gap-1 overflow-y-auto">
+                  {hiddenTags.map((tag) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      aria-label={`Tag ${tag}, on this note`}
+                      className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onToggleTag(tag);
+                      }}
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                </span>
+              </PopoverContent>
+            </Popover>
           )}
         </span>
       </span>

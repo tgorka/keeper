@@ -674,6 +674,7 @@ pub fn run() {
         notes_ipc::notes_space_save,
         notes_ipc::notes_space_validate,
         notes_ipc::notes_space_terms,
+        notes_ipc::notes_spaces_restore_defaults,
         notes_ipc::notes_create,
         notes_ipc::notes_journal_today,
         notes_ipc::notes_templates,

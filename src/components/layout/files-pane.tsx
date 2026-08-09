@@ -57,10 +57,11 @@ import {
   Folder,
   FolderOpen,
 } from "lucide-react";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { FilesEntryVm, FilesListingVm, IpcError, SyncProfileVm } from "@/lib/ipc/client";
 import { revealPath, syncBrowse, syncOpenEntry, syncProfiles } from "@/lib/ipc/client";
@@ -207,6 +208,44 @@ function isIpcError(value: unknown): value is IpcError {
   }
   const v = value as Record<string, unknown>;
   return typeof v.code === "string" && typeof v.message === "string";
+}
+
+/** What the affordance opens, for its accessible name. Every row's is the
+ * same verb; the file's own name is what distinguishes them. */
+export const FILES_NAME_LABEL = "file name";
+
+/**
+ * A row's name, plus the way to read it when the tree is narrower than the name
+ * is (Story 44.12, FR-168, AD-83).
+ *
+ * The name fits the tree, truncates when it cannot, and then — and only then —
+ * grows a trigger that opens the whole thing. A deeply nested path in a shallow
+ * pane is the ordinary case here, and until now the tail of such a name was
+ * simply unreadable: the tree has no tooltip and the row does not scroll.
+ *
+ * A render prop, because the two halves cannot live in one element. The
+ * truncating span belongs INSIDE a folder's toggle button — clicking a folder's
+ * name is how you open it — while the trigger must be outside it: a button
+ * inside a button is not HTML, and its click would toggle the folder on the way
+ * past.
+ */
+function RowName({
+  name,
+  tabIndex,
+  children,
+}: {
+  name: string;
+  /** The row's roving tab index, so only the focused row's affordance is a stop. */
+  tabIndex: number;
+  children: (ref: (element: HTMLElement | null) => void) => ReactNode;
+}) {
+  const { ref, overflowing } = useOverflowing();
+  return (
+    <>
+      {children(ref)}
+      {overflowing && <FullValueButton name={FILES_NAME_LABEL} value={name} tabIndex={tabIndex} />}
+    </>
+  );
 }
 
 export function FilesPane() {
@@ -588,35 +627,43 @@ export function FilesPane() {
         className="flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring"
         style={{ paddingInlineStart: `${(node.level - 1) * 16 + 8}px` }}
       >
-        {node.isFolder ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            tabIndex={-1}
-            className={cn(
-              "h-6 min-w-0 flex-1 justify-start gap-1 px-1",
-              entry === null ? "font-medium" : "font-normal",
-            )}
-            onClick={() => toggle(node.profileId, node.subpath)}
-          >
-            {node.open ? (
-              <ChevronDown className="size-3.5 shrink-0" aria-hidden="true" />
+        <RowName name={node.name} tabIndex={actionTabIndex}>
+          {(nameRef) =>
+            node.isFolder ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                tabIndex={-1}
+                className={cn(
+                  "h-6 min-w-0 flex-1 justify-start gap-1 px-1",
+                  entry === null ? "font-medium" : "font-normal",
+                )}
+                onClick={() => toggle(node.profileId, node.subpath)}
+              >
+                {node.open ? (
+                  <ChevronDown className="size-3.5 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="size-3.5 shrink-0" aria-hidden="true" />
+                )}
+                <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                <span ref={nameRef} className="truncate text-sm">
+                  {node.name}
+                </span>
+              </Button>
             ) : (
-              <ChevronRight className="size-3.5 shrink-0" aria-hidden="true" />
-            )}
-            <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span className="truncate text-sm">{node.name}</span>
-          </Button>
-        ) : (
-          <span className="flex min-w-0 flex-1 items-center gap-1 px-1">
-            {/* The chevron column is held open for a file so names line up with
+              <span className="flex min-w-0 flex-1 items-center gap-1 px-1">
+                {/* The chevron column is held open for a file so names line up with
                 the folders beside them rather than stepping left. */}
-            <span className="size-3.5 shrink-0" aria-hidden="true" />
-            <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span className="truncate text-sm">{node.name}</span>
-          </span>
-        )}
+                <span className="size-3.5 shrink-0" aria-hidden="true" />
+                <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                <span ref={nameRef} className="truncate text-sm">
+                  {node.name}
+                </span>
+              </span>
+            )
+          }
+        </RowName>
         {entry !== null && (
           <span className="flex shrink-0 items-center gap-1">
             {!node.isFolder && (

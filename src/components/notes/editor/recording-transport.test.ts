@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  BACK_GLYPH,
   BACK_LABEL,
   BUFFERING_LABEL,
   clock,
+  FORWARD_GLYPH,
   FORWARD_LABEL,
   MAX_DRIFT_SECONDS,
   MUTE_LABEL,
+  PAUSE_GLYPH,
   PAUSE_LABEL,
+  PLAY_GLYPH,
   PLAY_LABEL,
   PLAY_REFUSED_LABEL,
   RecordingTransport,
@@ -165,6 +169,39 @@ function statusOf(pair: Pair): string {
   return bar(pair).querySelector(".cm-lp-recording-transport-status")?.textContent ?? "";
 }
 
+function toggle(pair: Pair): HTMLElement {
+  const found = bar(pair).querySelector<HTMLElement>(".cm-lp-recording-transport-toggle");
+  if (found === null) {
+    throw new Error("no play/pause control");
+  }
+  return found;
+}
+
+/**
+ * Every run of visible text on the transport's control row.
+ *
+ * The wrap this story fixes happens for exactly one reason: a run of text with
+ * a space in it is a run of text a browser is allowed to break, and no flex
+ * rule can stop a button from breaking its own label when the label is wider
+ * than the pane. jsdom performs no layout, so the honest thing to assert here
+ * is the CAUSE rather than the effect — and the cause is text.
+ */
+function rowText(pair: Pair): string[] {
+  const row = bar(pair).querySelector(".cm-lp-recording-transport-row");
+  if (row === null) {
+    throw new Error("no control row");
+  }
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  const runs: string[] = [];
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+    const text = node.textContent ?? "";
+    if (text !== "") {
+      runs.push(text);
+    }
+  }
+  return runs;
+}
+
 beforeEach(() => {
   document.body.replaceChildren();
 });
@@ -179,6 +216,10 @@ describe("engagement", () => {
     expect(pair.tracks[0].controls).toBe(true);
     expect(pair.root.querySelector(".cm-lp-recording-transport")).toBeNull();
     expect(pair.root.querySelector(".cm-lp-recording-mix")).toBeNull();
+    // And no box and no stage: a lone video is not wrapped in furniture it has
+    // no use for, so the note renders it exactly as Story 42.6 shipped it.
+    expect(pair.root.querySelector(".cm-lp-recording-track")).toBeNull();
+    expect(pair.root.querySelector(".cm-lp-recording-stage")).toBeNull();
     expect(pair.transport.state.trackCount).toBe(1);
   });
 
@@ -190,10 +231,18 @@ describe("engagement", () => {
     expect(pair.tracks.map((track) => track.controls)).toEqual([false, false]);
     expect(pair.root.querySelectorAll(".cm-lp-recording-transport")).toHaveLength(1);
     // Under the FIRST embed in the note, because that is where a reader looks
-    // for the clock of the thing they are watching.
-    expect(bar(pair).parentElement).toBe(pair.hosts[0]);
+    // for the clock of the thing they are watching. Inside that host rather
+    // than directly under it: the pair is staged, so the bar sits below the
+    // row of track boxes within the leading widget's own host.
+    expect(pair.hosts[0].contains(bar(pair))).toBe(true);
     expect(bar(pair).getAttribute("aria-label")).toBe(TRANSPORT_LABEL);
-    // One mixer per track, beside its own video — never on the shared bar.
+    // One mixer per track, INSIDE its own track's box — never on the shared
+    // bar and never loose in the note beside it.
+    const boxes = pair.root.querySelectorAll<HTMLElement>(".cm-lp-recording-track");
+    expect(boxes).toHaveLength(2);
+    for (const box of boxes) {
+      expect(box.querySelectorAll(".cm-lp-recording-mix")).toHaveLength(1);
+    }
     expect(pair.root.querySelectorAll(".cm-lp-recording-mix")).toHaveLength(2);
   });
 
@@ -208,7 +257,7 @@ describe("engagement", () => {
     transport.join(second, hosts[1], NAMES[1]);
     transport.join(first, hosts[0], NAMES[0]);
 
-    expect(root.querySelector(".cm-lp-recording-transport")?.parentElement).toBe(hosts[0]);
+    expect(hosts[0].contains(root.querySelector(".cm-lp-recording-transport"))).toBe(true);
 
     first.duration = 60;
     second.duration = 60;
@@ -223,7 +272,7 @@ describe("engagement", () => {
 
     pair.transport.leave(pair.tracks[0]);
 
-    expect(bar(pair).parentElement).toBe(pair.hosts[1]);
+    expect(pair.hosts[1].contains(bar(pair))).toBe(true);
     // The bar is MOVED, not rebuilt: a reader who scrolled the top video out of
     // view has not asked to lose their place.
     expect(pair.transport.state.position).toBe(42);
@@ -281,6 +330,84 @@ describe("engagement", () => {
   });
 });
 
+/**
+ * Story 44.1. Measured in a real WKWebView at a 320 px note pane, the bar as
+ * Story 43.6 shipped it laid out over FIVE rows: "Back 10 seconds" broke
+ * across two line boxes and "Forward 10 seconds" across three, which is the
+ * owner's "Back 10 / Pla y / Forward 10 seconds".
+ *
+ * jsdom performs no layout, so nothing below measures a row. What it asserts
+ * is the property that makes the wrap impossible — the control row offers the
+ * browser no break opportunity — and that property fails the instant anyone
+ * puts a phrase back on a button, which is the failure mode worth defending
+ * against. The rendered proof is in the spec's WebKit measurements.
+ */
+describe("a control row that cannot wrap", () => {
+  it("offers no break opportunity anywhere in the row's visible text", () => {
+    const pair = joined(2);
+
+    const runs = rowText(pair);
+    // The row is not empty — an assertion over nothing passes for free.
+    expect(runs.length).toBeGreaterThanOrEqual(4);
+    for (const run of runs) {
+      expect(run).not.toMatch(/\s/);
+    }
+  });
+
+  it("keeps the break opportunity out of the readout too, at every width of clock", () => {
+    const pair = joined(2);
+    for (const track of pair.tracks) {
+      track.duration = 3723;
+    }
+    pair.transport.seekTo(3723);
+
+    // An hour-long recording is the longest this readout ever gets, and the
+    // spaced separator it used to carry was the widest single break
+    // opportunity on the row.
+    expect(bar(pair).querySelector(".cm-lp-recording-time")?.textContent).toBe("1:02:03/1:02:03");
+    for (const run of rowText(pair)) {
+      expect(run).not.toMatch(/\s/);
+    }
+  });
+
+  it("says the whole phrase to a screen reader while showing none of it", () => {
+    const pair = joined(2);
+
+    // The glyphs cost the accessible names nothing: every control is still
+    // announced by the phrase Story 43.6 shipped, and the transport is still
+    // a named group.
+    for (const [glyph, label] of [
+      [BACK_GLYPH, BACK_LABEL],
+      [PLAY_GLYPH, PLAY_LABEL],
+      [FORWARD_GLYPH, FORWARD_LABEL],
+    ]) {
+      const button = bar(pair).querySelector<HTMLElement>(`button[aria-label="${label}"]`);
+      expect(button?.textContent).toBe(glyph);
+    }
+    expect(bar(pair).getAttribute("aria-label")).toBe(TRANSPORT_LABEL);
+    // The skip glyphs carry the number, because "how far" is the one thing a
+    // triangle cannot say.
+    expect(BACK_GLYPH).toContain(String(SKIP_SECONDS));
+    expect(FORWARD_GLYPH).toContain(String(SKIP_SECONDS));
+  });
+
+  it("keeps the one real sentence off the control row entirely", async () => {
+    const pair = joined(2);
+    await pair.transport.play();
+    // After the play, not before: a `playing` event is what clears a stall,
+    // and the fake raises one as it starts.
+    pair.tracks[1].dispatchEvent(new Event("waiting"));
+
+    // "Playback was refused" and "Buffering" are messages, not controls, and a
+    // message on the row is either a wrapped row or a truncated message.
+    expect(statusOf(pair)).toBe(BUFFERING_LABEL);
+    expect(rowText(pair).join("")).not.toContain(BUFFERING_LABEL);
+    for (const run of rowText(pair)) {
+      expect(run).not.toMatch(/\s/);
+    }
+  });
+});
+
 describe("one clock", () => {
   it("plays and pauses both tracks from one button", async () => {
     const pair = joined(2);
@@ -291,17 +418,17 @@ describe("one clock", () => {
 
     expect(pair.tracks.map((track) => track.playCalls)).toEqual([1, 1]);
     expect(pair.transport.state.playback).toBe("playing");
-    expect(bar(pair).querySelector(".cm-lp-recording-transport-toggle")?.textContent).toBe(
-      PAUSE_LABEL,
-    );
+    // What it SHOWS is the glyph; what it is CALLED stays the word. Both, and
+    // separately, because losing either one is a different bug.
+    expect(toggle(pair).textContent).toBe(PAUSE_GLYPH);
+    expect(toggle(pair).getAttribute("aria-label")).toBe(PAUSE_LABEL);
 
     press(bar(pair), PAUSE_LABEL);
 
     expect(pair.tracks.map((track) => track.pauseCalls)).toEqual([1, 1]);
     expect(pair.transport.state.playback).toBe("paused");
-    expect(bar(pair).querySelector(".cm-lp-recording-transport-toggle")?.textContent).toBe(
-      PLAY_LABEL,
-    );
+    expect(toggle(pair).textContent).toBe(PLAY_GLYPH);
+    expect(toggle(pair).getAttribute("aria-label")).toBe(PLAY_LABEL);
   });
 
   it("scrubs both tracks to the same second", () => {
@@ -425,9 +552,7 @@ describe("the truth about a pair", () => {
     expect(statusOf(pair)).toBe(BUFFERING_LABEL);
     // The intent is still to play, so the button under the reader's finger is
     // still the one that stops it.
-    expect(bar(pair).querySelector(".cm-lp-recording-transport-toggle")?.textContent).toBe(
-      PAUSE_LABEL,
-    );
+    expect(toggle(pair).getAttribute("aria-label")).toBe(PAUSE_LABEL);
 
     pair.tracks[1].dispatchEvent(new Event("playing"));
 
@@ -454,9 +579,7 @@ describe("the truth about a pair", () => {
     expect(statusOf(pair)).toBe(PLAY_REFUSED_LABEL);
     // And the button says Play, so the reader's next click starts it rather
     // than "stopping" something that never began.
-    expect(bar(pair).querySelector(".cm-lp-recording-transport-toggle")?.textContent).toBe(
-      PLAY_LABEL,
-    );
+    expect(toggle(pair).getAttribute("aria-label")).toBe(PLAY_LABEL);
   });
 
   it("does not resurrect a refusal the reader already overruled by pausing", async () => {
@@ -683,7 +806,7 @@ describe("the readout", () => {
 
     pair.transport.seekTo(63);
 
-    expect(bar(pair).querySelector(".cm-lp-recording-time")?.textContent).toBe("1:03 / 2:00");
+    expect(bar(pair).querySelector(".cm-lp-recording-time")?.textContent).toBe("1:03/2:00");
   });
 });
 

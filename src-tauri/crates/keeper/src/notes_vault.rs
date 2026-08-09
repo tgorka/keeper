@@ -252,6 +252,11 @@ pub fn refresh(app: &AppHandle) {
     // Dropping a slot drops its work sender, which ends its reconciler task —
     // the whole of "unflagging a vault costs nothing and deletes nothing".
     guard.retain(|id, _| keep.contains(id.as_str()));
+    // The vaults this process had not registered a moment ago. Seeding is
+    // driven off exactly this set, and the writes happen after the lock is
+    // dropped: four small files is not work to hold the registry for, and a
+    // command arriving mid-seed must not block behind it.
+    let mut fresh: Vec<Vault> = Vec::new();
     for vault in wanted {
         match guard.get_mut(&vault.id) {
             // Same root: adopt the new configuration in place, so a settings
@@ -266,11 +271,21 @@ pub fn refresh(app: &AppHandle) {
             // process lifetime.
             _ => {
                 let slot = spawn_reconciler(app, vault);
+                fresh.push(slot.vault.clone());
                 guard.insert(slot.vault.id.clone(), slot);
             }
         }
     }
     drop(guard);
+    // Seed the default spaces (Story 44.3, FR-156, AD-79). This deliberately
+    // does NOT wait for the first scan: seeding asks the `spaces/` directory
+    // what is there rather than an index that has not been built yet, so a cold
+    // vault converges on its first registration instead of on the second. The
+    // notes it writes are announced with `touch`, which is how every other
+    // keeper-authored write reaches the reconciler.
+    for vault in fresh {
+        crate::notes_ipc::seed_default_spaces(&vault);
+    }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
     // means the first profile write after a repair puts notes back too.
     start_tap();
@@ -1407,6 +1422,18 @@ fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
     }
 }
 
+/// The same title rule, applied to a note keeper is reading straight off disk.
+///
+/// The seeder (Story 44.3) runs before the vault has an index, so it cannot ask
+/// an `IndexEntry` what a space is called. It asks this instead, rather than
+/// re-deriving the rule — a seeder that read only the frontmatter `title` would
+/// miss every space keeper itself wrote, because keeper writes the name as the
+/// body's heading and no `title` key at all.
+pub fn title_of_source(source: &str, rel: &str) -> String {
+    let (fm, body_offset) = Frontmatter::parse(source);
+    note_title(&fm, &source[body_offset..], rel)
+}
+
 /// The first [`SNIPPET_CHARS`] characters of body, whitespace folded.
 fn snippet(body: &str) -> String {
     body.split_whitespace()
@@ -1598,6 +1625,20 @@ pub fn read_note(vault: &Vault, rel: &str) -> Result<String, NotesError> {
 /// muting a path, because a real external write that lands inside the muting
 /// window is not swallowed by it.
 pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
+    write_vault_file(vault, rel, text)?;
+    touch(&vault.id, vec![rel.to_owned()]);
+    mark_dirty(&vault.id);
+    Ok(())
+}
+
+/// Write a vault file that is not a note, atomically.
+///
+/// [`write_note`] minus the two announcements, for keeper's own bookkeeping —
+/// today the default-space ledger (Story 44.3). Telling the reconciler about a
+/// `.json` would ask the index to re-read a path the walk never collects, and
+/// marking the vault dirty for it would put a commit cadence behind a file the
+/// user never touched.
+pub fn write_vault_file(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
     let path = contained(vault, rel)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1605,8 +1646,6 @@ pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError
     }
     atomic_write(&path, text.as_bytes())
         .map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
-    touch(&vault.id, vec![rel.to_owned()]);
-    mark_dirty(&vault.id);
     Ok(())
 }
 

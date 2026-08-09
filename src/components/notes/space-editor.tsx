@@ -38,14 +38,17 @@ import {
   Inbox,
   Layers,
   type LucideIcon,
+  Pin,
   Star,
   Tag,
   Users,
+  Video,
   Zap,
 } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import { tagPaths } from "@/components/notes/editor/tag-complete";
 import { TagFilterChip } from "@/components/notes/note-filter-bar";
+import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -72,10 +75,15 @@ import { cn } from "@/lib/utils";
  * The icons a space may carry, keyed by the name stored in its frontmatter.
  *
  * Fixed and small on purpose. An open icon picker is a decision the user has to
- * make every time and a value keeper then has to validate forever; eight
+ * make every time and a value keeper then has to validate forever; a handful of
  * recognisable shapes are enough to tell a sidebar's worth of saved views apart
  * at a glance, which is the whole job. The keys are lucide's own names, so the
  * value in the file is a thing a human hand-editing frontmatter can guess.
+ *
+ * `pin` and `video` are here because the seeded defaults use them (Story 44.3):
+ * they are the two glyphs the deleted Pinned and Recordings rows already drew,
+ * so the rail after the change looks like the rail before it. Widening the set
+ * further is Story 44.4's.
  */
 export const SPACE_ICONS: Readonly<Record<string, LucideIcon>> = {
   inbox: Inbox,
@@ -84,6 +92,8 @@ export const SPACE_ICONS: Readonly<Record<string, LucideIcon>> = {
   folder: Folder,
   tag: Tag,
   "calendar-days": CalendarDays,
+  pin: Pin,
+  video: Video,
   users: Users,
   zap: Zap,
 };
@@ -154,7 +164,6 @@ export function SpaceEditor({
   onSaved: () => void;
 }) {
   const nameId = useId();
-  const addTagId = useId();
   const [name, setName] = useState(space.name);
   const [icon, setIcon] = useState<string | null>(space.icon);
   const [terms, setTerms] = useState<Terms>({ kind: "pending" });
@@ -206,8 +215,10 @@ export function SpaceEditor({
         }
       })
       .catch(() => {
-        // No tag list means no add-a-tag control; the chips already on the space
-        // still cycle and still come off.
+        // A vocabulary that will not load leaves the chooser with nothing to
+        // browse, and since 44.13 that no longer means nothing to do: the
+        // field still takes a typed tag, because creating is allowed here.
+        // The chips already on the space still cycle and still come off.
       });
     return () => {
       cancelled = true;
@@ -390,36 +401,30 @@ export function SpaceEditor({
                     />
                   )}
                 </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label htmlFor={addTagId}>Add a tag</Label>
-                  {/* The vault's own tags, never a free-text field: a tag is
-                      whatever `notes::tags::normalise` says it is, and a box
-                      that let someone type one would be a second definition of
-                      that in TypeScript. */}
-                  <select
-                    id={addTagId}
-                    value=""
-                    className="h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    onChange={(event) => {
-                      const tag = event.target.value;
-                      if (tag !== "") {
-                        editDraft((draft) => ({
-                          ...draft,
-                          tags: withTagTerm(draft.tags, tag, "include"),
-                        }));
-                      }
-                    }}
-                  >
-                    <option value="">Choose a tag…</option>
-                    {vaultTags
-                      .filter((tag) => tagChipState(terms.draft.tags, tag) === "off")
-                      .map((tag) => (
-                        <option key={tag} value={tag}>
-                          {tag}
-                        </option>
-                      ))}
-                  </select>
-                </div>
+                {/* Story 44.13. This was a `<select>`, and 43.4's reason for
+                    making it one was that a free-text box would become a second
+                    definition of what a tag is. It would not: the typed text
+                    goes into the query DSL verbatim and `notes::query` runs
+                    every `tag:` through `tags::normalise` on the way back in
+                    (query.rs), which is the same road a hand-written space
+                    travels. So creating is allowed HERE and refused on the
+                    filter bar — a space is a document being authored, and
+                    naming the tag the work is about to carry before the first
+                    note carries it is ordinary; a live filter naming a tag no
+                    note has is just an unexplained empty list. */}
+                <TagCombobox
+                  label="Add a tag"
+                  placeholder="Type or browse"
+                  vocabulary={vaultTags}
+                  chosen={terms.draft.tags.map((chip) => chip.tag)}
+                  allowCreate
+                  onChoose={(tag) =>
+                    editDraft((draft) => ({
+                      ...draft,
+                      tags: withTagTerm(draft.tags, tag, "include"),
+                    }))
+                  }
+                />
               </>
             )}
           </section>

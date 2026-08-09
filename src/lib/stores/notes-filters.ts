@@ -39,56 +39,42 @@ import type { NoteQueryReq, NoteTagTerm } from "@/lib/ipc/client";
  * What the list is scoped to — the sidebar row that is selected, or `all` when
  * none is. Every one of these is a filter and not a route (UX-DR41).
  *
- * "Today" is deliberately absent: the sidebar's Today row opens or creates
- * today's journal entry (FR-99), which is an action on one note rather than a
- * way of narrowing the list.
+ * **There are only two kinds of row, and one of them is a space** (Story 44.3,
+ * AD-79). Inbox, Journal, Pinned and Recordings used to be four more variants
+ * here, each with a hard-coded `is:` flag in a table below, and each therefore
+ * unteachable: no icon, no rename, no reorder, no edit. They are seeded notes
+ * under `spaces/` now, so their queries live in the vault where the user can
+ * read and change them, and this type stopped needing to know their names.
+ *
+ * "Today" is not here and no longer anywhere: the row never filtered anything
+ * (AD-80). Opening or creating today's journal entry is an action on one note,
+ * and it still lives on `⌘⌥J`, the tray and the palette.
  */
 export type NoteScope =
   | { readonly kind: "all" }
-  | { readonly kind: "inbox" }
-  | { readonly kind: "journal" }
-  | { readonly kind: "pinned" }
-  | { readonly kind: "recording" }
-  | { readonly kind: "space"; readonly id: string; readonly name: string }
+  | {
+      readonly kind: "space";
+      readonly id: string;
+      readonly name: string;
+      /**
+       * Which seeded default this space is, `null` for every other space.
+       *
+       * Carried on the scope so a surface can speak about *this* space without
+       * re-reading the space list or, worse, matching on its name — a default
+       * is renameable like any other, and a sentence that stopped appearing
+       * because someone called Recordings "Sessions" would be a bug nobody
+       * connects to the rename.
+       */
+      readonly defaultKey: string | null;
+    }
   | { readonly kind: "folder"; readonly path: string };
 
 /** The unscoped list — every note in the vault, in the vault's own order. */
 export const ALL_NOTES_SCOPE: NoteScope = { kind: "all" };
 
-/**
- * The `is:` flag each scope narrows by, or `null` where the scope is not a flag
- * at all. The strings are the closed enum `keeper_core::notes::query` parses, so
- * this table is the one place the two vocabularies meet.
- *
- * `inbox` maps to `untagged` — the honest home of the unfiled is the note no tag
- * has claimed, and `untagged` is what the index computes.
- *
- * `recording` maps to the flag the index sets from a note's `session:`
- * frontmatter (Story 42.4). That one key is the whole predicate, so the lens
- * costs nothing but a row: no second filtering path, no folder convention, and
- * a stub filed anywhere in the vault is still listed.
- */
-const SCOPE_FLAG: Record<NoteScope["kind"], string | null> = {
-  all: null,
-  inbox: "untagged",
-  journal: "journal",
-  pinned: "pinned",
-  recording: "recording",
-  space: null,
-  folder: null,
-};
-
 /** The chip label for a scope, as the bar renders it. */
 export function scopeLabel(scope: NoteScope): string {
   switch (scope.kind) {
-    case "inbox":
-      return "Inbox";
-    case "journal":
-      return "Journal";
-    case "pinned":
-      return "Pinned";
-    case "recording":
-      return "Recordings";
     case "space":
       return scope.name;
     case "folder":
@@ -345,9 +331,13 @@ export function isScopeOnly(state: NotesFiltersState): boolean {
  * complete description of the window and not a patch — an omitted axis would
  * mean "unchanged" to a reader and "unfiltered" to Rust.
  *
- * Flags accumulate and intersect, exactly like tags: the Pinned scope and the
- * pinned-only chip resolve to the same flag, which is why this de-duplicates
- * rather than sending it twice.
+ * **No scope contributes a flag any more** (Story 44.3). A scope is a space or
+ * a folder, and a space's terms are its own DSL text in the vault, evaluated by
+ * Rust from `spaceId`. The table that mapped four hard-coded rows onto
+ * `untagged`/`journal`/`pinned`/`recording` is gone with the rows; those four
+ * strings now live where every other query term lives, in the note.
+ *
+ * `pinnedOnly` is the one flag left, and it is a chip rather than a scope.
  */
 export function noteQueryFor(
   state: NotesFiltersState,
@@ -355,11 +345,7 @@ export function noteQueryFor(
   limit: number,
 ): NoteQueryReq {
   const flags: string[] = [];
-  const scopeFlag = SCOPE_FLAG[state.scope.kind];
-  if (scopeFlag !== null) {
-    flags.push(scopeFlag);
-  }
-  if (state.pinnedOnly && !flags.includes("pinned")) {
+  if (state.pinnedOnly) {
     flags.push("pinned");
   }
   const text = state.text.trim();

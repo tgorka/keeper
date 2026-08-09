@@ -48,6 +48,7 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
     sort: p.sort ?? "modified desc",
     limit: p.limit ?? 500,
     icon: p.icon ?? null,
+    defaultKey: p.defaultKey ?? null,
     error: p.error ?? null,
   };
 }
@@ -116,15 +117,56 @@ describe("editing a space changes what it selects", () => {
     expect(savedRequest().query).toBe("-tag:client/acme");
   });
 
-  it("adds a tag from the vault's own vocabulary rather than from a free-text box", async () => {
+  it("adds a tag by typing it, from a list that is still there to be browsed (Story 44.13)", async () => {
     open();
 
     await screen.findByRole("button", { name: /Tag client\/acme/ });
-    fireEvent.change(screen.getByLabelText("Add a tag"), { target: { value: "urgent" } });
+    const field = screen.getByLabelText("Add a tag");
+    // The list is populated before a key is pressed — that is the browse half
+    // the `<select>` this replaced was the only half of. `draft` is absent
+    // because the space already carries it.
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
+      "client",
+      "urgent",
+    ]);
+
+    fireEvent.change(field, { target: { value: "urg" } });
+    fireEvent.keyDown(field, { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().query).toBe("tag:client/acme -tag:draft tag:urgent");
+  });
+
+  it("takes a tag the vault does not have yet, because a space is authored (Story 44.13)", async () => {
+    // The opposite setting from the filter bar, and for the stated reason: a
+    // space is a document, and naming the tag the work is about to carry
+    // before the first note carries it is ordinary. The typed text goes into
+    // the query verbatim; `notes::query` normalises every `tag:` on the way
+    // back in, so nothing here decides what a tag is.
+    open();
+
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    const field = screen.getByLabelText("Add a tag");
+    fireEvent.change(field, { target: { value: "client/newco" } });
+
+    expect(screen.getByText('Create tag "client/newco"')).toBeInTheDocument();
+    fireEvent.keyDown(field, { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().query).toBe("tag:client/acme -tag:draft tag:client/newco");
+  });
+
+  it("does not let Enter in the chooser save the space that is still being described", async () => {
+    // The dialog has a default button. A chooser that let Enter through would
+    // write the space on the keystroke meant to add a term to it.
+    open();
+
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    fireEvent.keyDown(screen.getByLabelText("Add a tag"), { key: "Enter" });
+
+    expect(mockSave).not.toHaveBeenCalled();
   });
 
   /**

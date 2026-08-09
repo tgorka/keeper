@@ -18,6 +18,7 @@ import {
   FILES_ALL_PAUSED_SENTENCE,
   FILES_COPY_PATH_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
+  FILES_NAME_LABEL,
   FILES_NO_PROFILES_SENTENCE,
   FILES_OPEN_LABEL,
   FILES_PANE_TITLE,
@@ -28,7 +29,9 @@ import {
   FILES_WRITE_CONTROL_LABELS,
   FilesPane,
 } from "@/components/layout/files-pane";
+import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { withTextLayout } from "@/test/layout";
 
 /** The exact sentence Rust composes for an unplugged profile. Verbatim, because
  * the whole point of the state is that this reaches the screen unaltered. */
@@ -545,5 +548,84 @@ describe("FilesPane keyboard navigation", () => {
       "tabindex",
       "0",
     );
+  });
+});
+
+/**
+ * Story 44.12 — a name the tree is too narrow to show.
+ *
+ * jsdom lays nothing out, so `withTextLayout` answers the two properties the
+ * real hook reads (`scrollWidth`, `clientWidth`) from the element's own text.
+ * The hook, the effect, the conditional render and the popover are the real
+ * ones. What is NOT proved here is that the tree's CSS actually truncates in a
+ * browser, or that a real font makes a real name overflow a real pane.
+ */
+describe("FilesPane — a name too long for the tree", () => {
+  const LONG = "a-quarterly-report-with-a-name-nobody-shortened-2026-Q3-final-v4.pdf";
+  let restoreLayout: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreLayout?.();
+    restoreLayout = null;
+  });
+
+  async function tree(available: number): Promise<HTMLElement> {
+    restoreLayout = withTextLayout(available);
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [entry(LONG, "file"), entry("ok.md", "file")]),
+    );
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button", { name: "Vault" }));
+    return await screen.findByRole("tree", { name: FILES_TREE_LABEL });
+  }
+
+  it("offers the whole name, and only for the name that did not fit", async () => {
+    // 67 characters at 8px each, in 200px of row.
+    const rows = await tree(200);
+
+    const long = within(rows).getByRole("treeitem", { name: LONG });
+    const short = within(rows).getByRole("treeitem", { name: "ok.md" });
+
+    const trigger = within(long).getByRole("button", {
+      name: `${OVERFLOW_TRIGGER_LABEL} ${FILES_NAME_LABEL}`,
+    });
+    // A tree with an affordance on every row is a tree with a tab stop on every
+    // row, which is the tree nobody can Tab out of.
+    expect(
+      within(short).queryByRole("button", {
+        name: `${OVERFLOW_TRIGGER_LABEL} ${FILES_NAME_LABEL}`,
+      }),
+    ).toBeNull();
+
+    await click(trigger);
+    expect(screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: ${FILES_NAME_LABEL}`)).toHaveTextContent(
+      LONG,
+    );
+  });
+
+  it("keeps the affordance out of the tab order until its row is the focused one", async () => {
+    const rows = await tree(200);
+    const long = within(rows).getByRole("treeitem", { name: LONG });
+
+    const named = { name: `${OVERFLOW_TRIGGER_LABEL} ${FILES_NAME_LABEL}` };
+    expect(within(long).getByRole("button", named)).toHaveAttribute("tabindex", "-1");
+
+    long.focus();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(within(long).getByRole("button", named)).toHaveAttribute("tabindex", "0");
+  });
+
+  it("does not grow a write control while offering to show a name", async () => {
+    const rows = await tree(200);
+
+    // The pane's standing promise (Story 43.8): nothing here moves, renames or
+    // deletes. A new control is a new chance to break it.
+    for (const label of FILES_WRITE_CONTROL_LABELS) {
+      expect(within(rows).queryByRole("button", { name: label })).toBeNull();
+    }
   });
 });

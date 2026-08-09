@@ -16,12 +16,23 @@ import type {
   CompletionSource,
 } from "@codemirror/autocomplete";
 import type { EditorView } from "@codemirror/view";
+import { gfmTable } from "./format-commands";
 
 /** A slash at the very start of an otherwise empty line, caret after it. */
 const OPEN_SLASH = /^\/\w*$/;
 
-/** A table the user can tab through rather than a table they must draw. */
-const TABLE_SKELETON = "| Column | Column |\n| --- | --- |\n|  |  |\n";
+/**
+ * A table the user can tab through rather than a table they must draw.
+ *
+ * **Story 44.9 changed the bytes this inserts, deliberately.** 43.9 pinned a
+ * hand-written skeleton whose pipes did not line up; the toolbar's table
+ * builder writes an aligned GFM table for the reason stated in
+ * `format-commands.ts`, and two table commands with two different outputs in
+ * one editor is the kind of divergence nobody notices until a diff is
+ * unreadable. So there is one builder, and `/` calls it: two columns and one
+ * body row under a header, which is what this row has always promised.
+ */
+const TABLE_SKELETON = gfmTable({ rows: 2, columns: 2, header: true });
 
 export interface SlashCommand {
   /** What the menu row reads. */

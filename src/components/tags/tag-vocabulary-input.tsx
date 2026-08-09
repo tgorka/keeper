@@ -47,8 +47,12 @@ export function tagVocabularyListId(inputId: string): string {
  * here would be the frontend deciding what a tag looks like.
  *
  * No filtering happens here: the browser matches the typed text against the
- * offered values, and re-implementing that match would be a second matching
- * rule beside the one `tag-complete.ts` already gets from CodeMirror.
+ * offered values. Story 44.13 gave keeper its own answer to "which tags match
+ * what I typed" (`tag-match.ts`), and the two tag CHOOSERS — the editor popup
+ * and `notes/tag-combobox.tsx` — both ask it. This field still delegates,
+ * because a `<datalist>` cannot be told which of its options to show without
+ * re-rendering the list under the browser's own popup; it stays the browser's
+ * match until the recording card's field becomes a chooser (Story 44.14).
  */
 export function tagSuggestions(typed: string, vocabulary: readonly string[]): string[] {
   const lastComma = typed.lastIndexOf(",");

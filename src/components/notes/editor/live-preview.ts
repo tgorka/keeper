@@ -425,22 +425,73 @@ const livePreviewTheme = EditorView.baseTheme({
     // not React, and a labelled control is legible to everyone anyway.
     textDecoration: "underline",
   },
-  // The shared transport of a session's videos (Story 43.6). Block, and full
-  // width under the leading track, because it is the pair's one clock and a bar
-  // that looked like it belonged to the video above it would be read as that
-  // video's own controls.
+  // The grouped pair of a session's videos (Stories 43.6, 44.1). The stage is
+  // block-level and holds a row of track boxes with the one transport beneath,
+  // because the pair is one player and a clock floating beside one of two
+  // videos is read as that video's own controls.
+  ".cm-lp-recording-stage": {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25em",
+  },
+  // Fit two tracks side by side, and wrap rather than crush them: `12rem` is
+  // the width below which a video is no longer worth watching, so a pane too
+  // narrow for two stacks them instead of showing two useless slivers.
+  ".cm-lp-recording-tracks": {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "flex-start",
+    gap: "0.5em",
+  },
+  // The box is the answer to a mute slider that floated away from the track it
+  // governs: a border is a boundary, and a control inside one is unambiguously
+  // about what else is inside it.
+  ".cm-lp-recording-track": {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25em",
+    // `min-width: 0` because a flex item's default `min-width: auto` is its
+    // content's intrinsic width, and a 1440-wide screen recording would push
+    // the pair back out of the pane it was just fitted into.
+    flex: "1 1 12rem",
+    minWidth: "0",
+    padding: "0.25em",
+    borderRadius: "4px",
+    border: "1px solid var(--border)",
+  },
+  // Inside a box the video fills the box rather than the pane, and gives up
+  // some height, because two of them are on screen at once. The lone video's
+  // rule above is untouched.
+  ".cm-lp-recording-track .cm-lp-recording-player": {
+    width: "100%",
+    height: "auto",
+    maxHeight: "40vh",
+  },
   ".cm-lp-recording-transport": {
     display: "flex",
+    flexDirection: "column",
+    fontSize: "0.9em",
+  },
+  // The row that must not break. `nowrap` is the belt; the glyph labels are
+  // the braces, and they are the part that actually holds — measured in a real
+  // WKWebView, the shipped sentence labels laid this row out over five rows at
+  // a 320 px pane whatever the wrapping rule said, because a button wider than
+  // its container breaks its own text.
+  ".cm-lp-recording-transport-row": {
+    display: "flex",
+    flexWrap: "nowrap",
     alignItems: "center",
     gap: "0.5em",
     padding: "0.25em 0",
-    fontSize: "0.9em",
   },
   ".cm-lp-recording-transport-toggle, .cm-lp-recording-transport-skip": {
     color: "var(--primary)",
     cursor: "pointer",
+    // A control is a glyph and never a sentence, so it has no business
+    // reflowing; `nowrap` says that of the glyph pairs too.
+    whiteSpace: "nowrap",
   },
-  ".cm-lp-recording-scrub": { flex: "1 1 auto", minWidth: "6rem" },
+  ".cm-lp-recording-scrub": { flex: "1 1 4rem", minWidth: "3rem" },
   ".cm-lp-recording-time": {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     color: "var(--muted-foreground)",
@@ -448,10 +499,19 @@ const livePreviewTheme = EditorView.baseTheme({
     // proportional fallback, and a readout that shifts the scrub bar sideways
     // once a second is unusable.
     fontVariantNumeric: "tabular-nums",
+    whiteSpace: "nowrap",
   },
-  ".cm-lp-recording-transport-status": { color: "var(--muted-foreground)" },
-  // Volume and mute stay per track, so the mixer sits with its own video rather
-  // than on the shared bar (UX-DR53).
+  // Its own line, below the controls: it is the one real sentence here
+  // ("Playback was refused"), and a sentence on the control row is either a
+  // wrapped row or a truncated message. Gone entirely while empty, which is
+  // almost always, so the bar is one row high in the ordinary case.
+  ".cm-lp-recording-transport-status": {
+    color: "var(--muted-foreground)",
+    fontSize: "0.9em",
+  },
+  ".cm-lp-recording-transport-status:empty": { display: "none" },
+  // Volume and mute stay per track, so the mixer sits inside its own track's
+  // box rather than on the shared bar (UX-DR53).
   ".cm-lp-recording-mix": {
     display: "flex",
     alignItems: "center",
@@ -459,7 +519,14 @@ const livePreviewTheme = EditorView.baseTheme({
     fontSize: "0.85em",
   },
   ".cm-lp-recording-mix-mute": { color: "var(--primary)", cursor: "pointer" },
-  ".cm-lp-recording-mix-volume": { width: "6rem" },
+  // One glyph for both states: struck through is the muted one. Two symbols
+  // would be two things to learn, and `aria-pressed` already carries the truth
+  // for anyone not looking at it.
+  '.cm-lp-recording-mix-mute[aria-pressed="true"]': {
+    textDecoration: "line-through",
+    color: "var(--muted-foreground)",
+  },
+  ".cm-lp-recording-mix-volume": { flex: "1 1 3rem", minWidth: "3rem", width: "auto" },
   ".cm-lp-image-missing, .cm-mermaid-error-message": {
     color: "var(--muted-foreground)",
     fontSize: "0.85em",

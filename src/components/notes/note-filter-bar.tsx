@@ -19,15 +19,33 @@
  * not animate in or out either: a filter change is a cut, because an animated
  * bar moves the target the user is reaching for.
  *
+ * **The bar can now make a tag chip, and only ever an existing tag** (Story
+ * 44.13). Until this the only way to raise a tag chip was to find the tag in
+ * the sidebar tree, which is a fine way to browse and a poor way to reach a tag
+ * you can already name. The chooser refuses to create: a chip for a tag no note
+ * carries produces an empty list with no explanation, so it says there is no
+ * such tag instead. The space editor, which authors a filter rather than
+ * running one, takes the opposite setting for the reason stated there.
+ *
  * The Save-as-space button appears only once something beyond the scope is
  * active, because a filter worth keeping is one you built rather than one you
  * clicked once — and a filter you can build but not keep trains people not to
  * build filters.
  */
 import { Minus, Plus, Search, X } from "lucide-react";
-import { type KeyboardEvent, type Ref, useId } from "react";
+import {
+  type KeyboardEvent,
+  type Ref,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
+import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { tagsVocabulary } from "@/lib/ipc/client";
 import {
   notesFiltersStore,
   scopeLabel,
@@ -35,6 +53,9 @@ import {
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { cn } from "@/lib/utils";
+
+/** The chip bar's own tag chooser (Story 44.13). */
+export const ADD_TAG_FILTER = "Add a tag filter";
 
 /** The header caption under the search field, kept verbatim. */
 export const NOTES_SEARCH_POSTURE = "Searching the files, not an index";
@@ -155,6 +176,47 @@ export function NoteFilterBar({
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const pinnedOnly = useNotesFiltersStore((s) => s.pinnedOnly);
   const fieldId = useId();
+  const [adding, setAdding] = useState(false);
+  const [vocabulary, setVocabulary] = useState<readonly string[]>([]);
+  const addRef = useRef<HTMLButtonElement>(null);
+
+  // Read when the chooser opens rather than when the bar mounts: the bar is on
+  // screen for the whole session and the vocabulary is only wanted for the few
+  // seconds someone is picking from it.
+  useEffect(() => {
+    if (!adding) {
+      return;
+    }
+    let cancelled = false;
+    void tagsVocabulary()
+      .then((vm) => {
+        if (!cancelled) {
+          setVocabulary(vm.entries.map((entry) => entry.path));
+        }
+      })
+      .catch(() => {
+        // Nothing to browse and nothing to type: this chooser cannot create a
+        // tag, so an unreadable vocabulary leaves it saying so rather than
+        // pretending a filter could be built out of it.
+        if (!cancelled) {
+          setVocabulary([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adding]);
+
+  // A stable ref callback, so the field takes focus once when the chooser opens
+  // and not again on every render of the bar behind it.
+  const focusChooser = useCallback((node: HTMLInputElement | null) => {
+    node?.focus();
+  }, []);
+
+  function closeChooser(): void {
+    setAdding(false);
+    addRef.current?.focus();
+  }
 
   // "Beyond scope" is the trigger, not "any chip": scoping to Pinned is
   // navigation-shaped and saving it as a space would just duplicate the row that
@@ -194,6 +256,22 @@ export function NoteFilterBar({
             onRemove={(tag) => notesFiltersStore.getState().removeTag(tag)}
           />
         ))}
+        {/* Sits with the tag chips, because it makes one. The bar's order —
+            scope, tags, origin, pinned — is what makes removing a chip a
+            muscle movement, and a chooser filed anywhere else would be a
+            second place to look for the tags. */}
+        <Button
+          ref={addRef}
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="shrink-0 text-muted-foreground"
+          aria-expanded={adding}
+          onClick={() => (adding ? closeChooser() : setAdding(true))}
+        >
+          <Plus aria-hidden="true" className="size-3" />
+          {ADD_TAG_FILTER}
+        </Button>
         {agentOnly && (
           <FilterChip
             label="Changed by agent"
@@ -242,6 +320,17 @@ export function NoteFilterBar({
           </Button>
         )}
       </div>
+      {adding && (
+        <TagCombobox
+          label={ADD_TAG_FILTER}
+          placeholder="Type or browse"
+          vocabulary={vocabulary}
+          chosen={tagTerms.map((chip) => chip.tag)}
+          inputRef={focusChooser}
+          onChoose={(tag) => notesFiltersStore.getState().setTagTerm(tag, "include")}
+          onDismiss={closeChooser}
+        />
+      )}
       <div className="flex items-center gap-1.5">
         <Search aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         <Input

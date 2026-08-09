@@ -26,10 +26,13 @@
  *     another vault and the note is still open when you come back. A vault
  *     switch is a filter that happens to be wide.
  *
- * The one row in the column that is NOT a filter is Today: it opens or creates
- * today's journal entry (FR-99), which is an action on one note.
+ * **Every row in the column is a space, a tag or a folder** (Story 44.3,
+ * AD-79). There is no fixed rail above them: Inbox, Journal, Pinned and
+ * Recordings are seeded notes under `spaces/`, listed by {@link SpaceList} with
+ * every other space, editable and deleteable like every other space. Today is
+ * gone (AD-80) — it never filtered anything, and opening today's journal entry
+ * is still `⌘⌥J`, the tray and the palette.
  */
-import { CalendarDays, Inbox, NotebookPen, Pin, Video } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
@@ -39,20 +42,13 @@ import { PhysicalTree } from "@/components/notes/physical-tree";
 import { SpaceList } from "@/components/notes/space-list";
 import { TagTree } from "@/components/notes/tag-tree";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
-import { Button } from "@/components/ui/button";
-import {
-  createNote,
-  openJournalToday,
-  saveFilterAsSpace,
-  useNotesActions,
-} from "@/hooks/use-notes-actions";
+import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import type { NoteRowVm } from "@/lib/ipc/client";
 import {
   emptyFilterReason,
   isFiltered,
   isScopeOnly,
-  type NoteScope,
   notesFiltersStore,
   scopeLabel,
   useNotesFiltersStore,
@@ -65,22 +61,6 @@ import {
 } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
-import { cn } from "@/lib/utils";
-
-/**
- * The scope rows above the data-driven groups, in the order the spine fixes.
- *
- * Recordings is one of these and nothing more: a scope that resolves to an `is:`
- * flag, evaluated by the same `notes_list` call every other row uses. The lens
- * exists because `session:` frontmatter exists — there is no second filter path
- * here to keep in step with the first.
- */
-const SCOPE_ROWS: { scope: NoteScope; label: string; icon: typeof Inbox }[] = [
-  { scope: { kind: "inbox" }, label: "Inbox", icon: Inbox },
-  { scope: { kind: "journal" }, label: "Journal", icon: CalendarDays },
-  { scope: { kind: "pinned" }, label: "Pinned", icon: Pin },
-  { scope: { kind: "recording" }, label: "Recordings", icon: Video },
-];
 
 /** What a failed verb reads as when the rejection carries no message. */
 const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
@@ -228,10 +208,15 @@ export function NotesPane() {
     // while the vault is still being read — "this vault is empty" said over a
     // scan in flight is simply false, and it is false for exactly as long as the
     // user is waiting to find out otherwise.
+    // The Recordings sentence follows the *space*, not a scope kind that no
+    // longer exists: `defaultKey` is the identity keeper wrote into the note, so
+    // renaming the seeded Recordings space to anything at all keeps it, and a
+    // space of the user's own that happens to be called Recordings does not
+    // borrow it.
     emptyKind =
       searchText.trim() !== ""
         ? "no-search-matches"
-        : scope.kind === "recording" && scopeOnly
+        : scope.kind === "space" && scope.defaultKey === "recordings" && scopeOnly
           ? "no-recordings"
           : filtered
             ? "no-matches"
@@ -272,46 +257,10 @@ export function NotesPane() {
         <div className="shrink-0 p-2">
           <VaultSwitcher />
         </div>
-        <ul className="flex shrink-0 flex-col gap-0.5 px-2">
-          <li>
-            {/* Not a filter: Today opens or creates one note (FR-99). */}
-            <Button
-              type="button"
-              variant="ghost"
-              className="w-full justify-start gap-2"
-              onClick={() => {
-                void openJournalToday().catch(report);
-              }}
-            >
-              <NotebookPen aria-hidden="true" />
-              Today
-            </Button>
-          </li>
-          {SCOPE_ROWS.map((row) => {
-            const Icon = row.icon;
-            const active = scope.kind === row.scope.kind;
-            return (
-              <li key={row.label}>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  aria-current={active ? "true" : undefined}
-                  aria-pressed={active}
-                  className={cn(
-                    "w-full justify-start gap-2",
-                    active && "bg-accent text-accent-foreground",
-                  )}
-                  onClick={() => notesFiltersStore.getState().setScope(row.scope)}
-                >
-                  <Icon aria-hidden="true" />
-                  {row.label}
-                </Button>
-              </li>
-            );
-          })}
-        </ul>
-        {/* Both trees are unbounded, so each owns its own scroll container and
-            everything below them stays reachable at every tree size (AD-34-4). */}
+        {/* Every group below is unbounded — spaces as much as tags, now that
+            the four fixed rows are spaces too — so they share one scroll
+            container and everything in it stays reachable at every size
+            (AD-34-4). */}
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
           <SpaceList vaultId={activeVaultId} />
           <TagTree vaultId={activeVaultId} />

@@ -33,6 +33,8 @@ import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/n
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
+import type { FormatAction } from "./editor/format-commands";
+import { FormatToolbar } from "./format-toolbar";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NoteHistoryPanel } from "./note-history-panel";
 import { PropertiesPanel, readFrontmatter, recordingSessionId } from "./properties-panel";
@@ -67,6 +69,15 @@ interface EditorRuntime {
    * appear in the buffer and never reach the file.
    */
   insertAtCursor: (text: string) => void;
+  /**
+   * Run a formatting action over the current selection (Story 44.9).
+   *
+   * The toolbar hands over a description rather than a command because it is
+   * in the main bundle and every `@codemirror/*` value has to stay inside the
+   * boot closure below. Translating the description is therefore the closure's
+   * job, and it is the only place that holds both the view and the commands.
+   */
+  runFormat: (action: FormatAction) => void;
   focus: () => void;
   destroy: () => void;
 }
@@ -174,6 +185,9 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   const insertAtCursor = useCallback((text: string) => {
     runtimeRef.current?.insertAtCursor(text);
   }, []);
+  const runFormat = useCallback((action: FormatAction) => {
+    runtimeRef.current?.runFormat(action);
+  }, []);
 
   // Refs, not effect dependencies: rebuilding the editor because a callback
   // identity changed would throw away the document, the undo stack and the
@@ -212,6 +226,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         tags,
         slash,
         indent,
+        format,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -223,6 +238,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         import("./editor/tag-complete"),
         import("./editor/slash-menu"),
         import("./editor/indent-keymap"),
+        import("./editor/format-commands"),
       ]);
       if (disposed) {
         return;
@@ -365,6 +381,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           // back is the difference between inserting and interrupting.
           editorView.focus();
         },
+        // Unannotated, like `insertAtCursor` and for the same reason: a
+        // formatting action IS the user's edit, so it belongs in the undo
+        // history and it has to reach Rust through the update listener.
+        runFormat: (action: FormatAction) => {
+          format.formatCommand(action)(editorView);
+        },
         focus: () => editorView.focus(),
         destroy: () => editorView.destroy(),
       };
@@ -479,6 +501,11 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
       {showAttachments && mode === "edit" ? (
         <AttachmentsPanel frontmatter={frontmatter} body={body.text} onInsert={insertAtCursor} />
       ) : null}
+
+      {/* Directly over the text it formats, and unmounted outside edit mode:
+          in history or conflict mode there is no selection for a button to act
+          on, and a toolbar that cannot do anything is a toolbar that lies. */}
+      {mode === "edit" ? <FormatToolbar onAction={runFormat} /> : null}
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo
           stack all have to survive a trip through history or conflict mode. */}

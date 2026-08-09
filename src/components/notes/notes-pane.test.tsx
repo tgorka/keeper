@@ -1,6 +1,12 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NoteListVm, NoteQueryReq, NoteRowVm, NoteVaultVm } from "@/lib/ipc/client";
+import type {
+  NoteListVm,
+  NoteQueryReq,
+  NoteRowVm,
+  NoteSpaceVm,
+  NoteVaultVm,
+} from "@/lib/ipc/client";
 
 /**
  * The editor is a sibling's surface and pulls CodeMirror in with it; the pane's
@@ -88,12 +94,53 @@ let activeVault = "vault-a";
 let vaultList: NoteVaultVm[] = [VAULT_A, VAULT_B];
 
 /**
+ * The four spaces keeper seeds into a fresh vault (Story 44.3), in the shape
+ * `notes_spaces` returns them. The rail renders these and nothing else, so a
+ * test that wants to press Recordings has to have keeper's seed on disk — which
+ * is the point: before this story there was a hard-coded row that worked with
+ * `notesSpaces` returning `[]`.
+ *
+ * The `query` strings are the ones `keeper_core::notes::default_spaces` writes,
+ * so this fixture and the seeder cannot drift into agreeing about a lens the
+ * vault does not actually hold.
+ */
+const SEEDED_SPACES: NoteSpaceVm[] = [
+  space("s-inbox", "Inbox", "is:untagged", "inbox", "inbox"),
+  space("s-journal", "Journal", "is:journal", "calendar-days", "journal"),
+  space("s-pinned", "Pinned", "is:pinned", "pin", "pinned"),
+  space("s-recordings", "Recordings", "is:recording", "video", "recordings"),
+];
+
+function space(
+  id: string,
+  name: string,
+  query: string,
+  icon: string,
+  defaultKey: string | null,
+): NoteSpaceVm {
+  return { id, name, query, sort: "modified desc", limit: 500, icon, defaultKey, error: null };
+}
+
+/** What the vault's `spaces/` currently holds, as the rail will read it. */
+let spaceList: NoteSpaceVm[] = SEEDED_SPACES;
+
+/**
  * The predicate `notes_list` applies: tag terms intersect — every `include`
  * present, every `exclude` absent — text is a substring, and every requested
  * flag must be one the entry carries. No row here carries any flag but
  * `recording`, exactly as `has_flag` would report.
+ *
+ * A `spaceId` is resolved the way Rust resolves it: the space's stored query
+ * text is parsed and applied. Only the `is:` forms the seeded defaults use are
+ * understood here, and an unknown one throws rather than quietly matching
+ * everything — a fake that shrugged at a query it did not know would turn a
+ * broken lens into a green test.
  */
 function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
+  const stored = spaceList.find((candidate) => candidate.id === query.spaceId);
+  if (query.spaceId !== null && stored === undefined) {
+    throw new Error(`no such space: ${query.spaceId}`);
+  }
   const rows = (contents[vaultId] ?? []).filter((candidate) => {
     for (const [tag, term] of Object.entries(query.tags)) {
       if (candidate.tags.includes(tag) !== (term === "include")) {
@@ -106,9 +153,25 @@ function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
     if (!query.flags.every((flag) => flag === "recording" && candidate.id in recordingIds)) {
       return false;
     }
-    return true;
+    return stored === undefined || matchesSpaceQuery(stored.query, candidate);
   });
   return { rows, total: rows.length, offset: 0 };
+}
+
+/** The `is:` predicates the seeded defaults store, evaluated over a row. */
+function matchesSpaceQuery(dsl: string, candidate: NoteRowVm): boolean {
+  switch (dsl) {
+    case "is:untagged":
+      return candidate.tags.length === 0;
+    case "is:journal":
+      return candidate.path.startsWith("journal/");
+    case "is:pinned":
+      return candidate.pinned;
+    case "is:recording":
+      return candidate.id in recordingIds;
+    default:
+      throw new Error(`the fake does not evaluate: ${dsl}`);
+  }
 }
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
@@ -123,7 +186,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     notesList: vi.fn(async (vaultId: string, query: NoteQueryReq) => evaluate(vaultId, query)),
     notesTree: vi.fn(async () => ({ relDir: "", dirs: [], notes: [] })),
     notesTagTree: vi.fn(async () => ({ nodes: [] })),
-    notesSpaces: vi.fn(async () => []),
+    notesSpaces: vi.fn(async () => spaceList),
+    notesSpacesRestoreDefaults: vi.fn(async () => 0),
     notesSubscribeChanges: vi.fn(async () => "sub-1"),
     notesUnsubscribeChanges: vi.fn(async () => undefined),
     notesCreate: vi.fn(async () => ({
@@ -190,6 +254,7 @@ beforeEach(() => {
   vaultList = [VAULT_A, VAULT_B];
   contents["vault-a"] = ROWS_A;
   contents["vault-b"] = ROWS_B;
+  spaceList = SEEDED_SPACES;
   // `a4` is the one note keeper wrote about a recording.
   recordingIds = { a4: true };
   resetNotesVaultsStoreForTest();
@@ -311,15 +376,57 @@ describe("NotesPane empty states", () => {
   });
 });
 
-describe("NotesPane Recordings lens", () => {
+describe("NotesPane rail", () => {
+  /**
+   * The whole of AD-79 in one assertion. Before this story the four rows were
+   * `<Button>`s built from a `SCOPE_ROWS` array in this file's component and
+   * `notesSpaces` returned `[]`; now every one of them is a row the space list
+   * drew from what the vault holds. Emptying the vault's `spaces/` therefore
+   * empties the rail, which a hard-coded row could not do.
+   */
+  it("renders the four defaults as spaces, and nothing when the vault has none", async () => {
+    renderPane();
+
+    const rail = await screen.findByRole("navigation", { name: "Notes" });
+    for (const name of ["Inbox", "Journal", "Pinned", "Recordings"]) {
+      expect(await within(rail).findByRole("button", { name })).toBeInTheDocument();
+    }
+
+    cleanup();
+    spaceList = [];
+    renderPane();
+    const bare = await screen.findByRole("navigation", { name: "Notes" });
+    await waitFor(() => {
+      expect(within(bare).queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
+    });
+    for (const name of ["Journal", "Pinned", "Recordings"]) {
+      expect(within(bare).queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+  });
+
+  /**
+   * AD-80. Today never filtered anything and is deleted rather than ported. The
+   * *action* it performed is not: `⌘⌥J`, the tray and the palette still open
+   * today's journal entry, and none of them is in this pane.
+   */
+  it("has no Today row, and no row that opens a note instead of filtering", async () => {
+    renderPane();
+    const rail = await screen.findByRole("navigation", { name: "Notes" });
+    await within(rail).findByRole("button", { name: "Inbox" });
+
+    expect(within(rail).queryByRole("button", { name: "Today" })).not.toBeInTheDocument();
+    expect(within(rail).queryByText("Today")).not.toBeInTheDocument();
+  });
+
   it("lists exactly the notes keeper wrote about a recording", async () => {
     renderPane();
     await waitForRows("Pricing", "Quarterly review");
 
-    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recordings" }));
 
     // `a4` carries `session:`; `a1` does not, and no tag, folder or filename
-    // convention distinguishes them — only the flag the request asked for.
+    // convention distinguishes them — only the seeded space's own `is:recording`
+    // does, sent as a `spaceId` and evaluated against the space the vault holds.
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
     });
@@ -334,12 +441,27 @@ describe("NotesPane Recordings lens", () => {
     });
   });
 
+  it("selects the unfiled through the seeded Inbox, which is a note and not a table here", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Quarterly review");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Inbox" }));
+
+    // `a4` is the only row with no tags. The store sends no flag at all now —
+    // `is:untagged` is a string in the vault — so this passes only if the space
+    // reached the query.
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /Note, Quarterly review/ })).toBeInTheDocument();
+  });
+
   it("says the vault has no recordings rather than blaming a filter the user did not set", async () => {
     recordingIds = {};
     renderPane();
     await waitForRows("Pricing");
 
-    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Recordings" }));
 
     await screen.findByText(
       "No recording notes yet. keeper writes one each time a recording stops.",
@@ -352,5 +474,33 @@ describe("NotesPane Recordings lens", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
     });
+  });
+
+  /**
+   * The sentence follows the marker keeper wrote, not the name. A default is
+   * renameable like any other space (AD-79), and a Recordings space someone
+   * called "Sessions" is still the one that can say who writes recording notes.
+   */
+  it("keeps the recordings sentence after the space is renamed, and does not lend it out", async () => {
+    recordingIds = {};
+    spaceList = [
+      space("s-recordings", "Sessions", "is:recording", "video", "recordings"),
+      // A space of the user's own, called Recordings, carrying no marker.
+      space("s-mine", "Recordings", "is:pinned", "star", null),
+    ];
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Sessions" }));
+    await screen.findByText(
+      "No recording notes yet. keeper writes one each time a recording stops.",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all notes" }));
+    await waitForRows("Pricing");
+    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+    // No row is pinned, so this selects nothing — and it gets the ordinary
+    // sentence, because it is not keeper's Recordings space.
+    await screen.findByText("No notes match these filters.");
   });
 });

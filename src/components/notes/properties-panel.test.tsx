@@ -19,8 +19,23 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingOpenPath: (path: string) => recordingOpenPath(path),
 }));
 
+import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
+import {
+  COLUMN_FITTED_VALUE_TEXT,
+  COLUMN_RESIZER_LABEL,
+  COLUMN_TEMPLATE_VAR,
+} from "@/components/ui/resizable-columns";
+import { COLUMN_WIDTH_COOKIE, MIN_COLUMN_WIDTH, readColumnWidths } from "@/lib/column-widths";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { PropertiesPanel, readFrontmatter } from "./properties-panel";
+import { ELLIPSIS } from "@/lib/truncate";
+import { withRect, withTextLayout } from "@/test/layout";
+import {
+  PROPERTIES_COLUMN_LABEL,
+  PROPERTY_KEY_COLUMN,
+  PropertiesPanel,
+  readFrontmatter,
+  UNPARSED_BLOCK_LABEL,
+} from "./properties-panel";
 
 /** A block holding a key keeper has never heard of, written in a style keeper
  *  would not have chosen. Both must survive an unrelated edit. */
@@ -306,5 +321,209 @@ describe("PropertiesPanel — a recording note's file actions", () => {
     // Copy path survives, because copying what is on screen is never wrong.
     fireEvent.click(within(menu).getByRole("menuitem", { name: "Copy path" }));
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(FILE);
+  });
+});
+
+/**
+ * Story 44.12 — the panel the owner met AD-83's failure in.
+ *
+ * Two things here are not provable in jsdom and are asserted through the
+ * closest real thing instead. Fitting is `fit-content(50%)` handed to the
+ * layout engine, so the assertion is that keeper asks for it — whether the
+ * engine then measures the glyphs correctly is the engine's contract, not
+ * keeper's. And overflow is `scrollWidth > clientWidth`, which jsdom answers
+ * `0 > 0` for every element ever rendered; `withTextLayout` answers those two
+ * properties from the element's own text so the component's REAL effect, REAL
+ * comparison and REAL conditional render run. Nothing about the component is
+ * stubbed. What remains unproven is named at the bottom of the spec.
+ */
+describe("PropertiesPanel — columns you can size", () => {
+  afterEach(() => {
+    // The rule guards production code against clobbering the cookie jar. Here
+    // the whole point is to clear the width this suite persisted, so the next
+    // test starts from the default rather than from its neighbour's drag.
+    // biome-ignore lint/suspicious/noDocumentCookie: clearing is the intent
+    document.cookie = `${COLUMN_WIDTH_COOKIE}=; path=/; max-age=0`;
+  });
+
+  /** The seam, with a known position, ready to be dragged from x. */
+  function seamAt(left: number): HTMLElement {
+    const seam = screen.getByRole("separator", {
+      name: `${COLUMN_RESIZER_LABEL} ${PROPERTIES_COLUMN_LABEL}`,
+    });
+    withRect(seam, left);
+    return seam;
+  }
+
+  /** The grid whose template is the whole visible result of a resize. */
+  function template(seam: HTMLElement): string {
+    const grid = seam.parentElement;
+    if (grid === null) {
+      throw new Error("the seam is not inside the grid it sizes");
+    }
+    return grid.style.getPropertyValue(COLUMN_TEMPLATE_VAR);
+  }
+
+  it("fits the key column to its content until somebody says otherwise", () => {
+    renderPanel();
+
+    // Not a number, and deliberately: the fitted width is the one the layout
+    // engine measures from the real glyphs. A `w-32` here is the bug.
+    expect(template(seamAt(0))).toContain("fit-content(50%)");
+    expect(readColumnWidths(document.cookie)).toEqual({});
+  });
+
+  it("moves the boundary to where the pointer took it, and remembers", () => {
+    const panel = renderPanel();
+    const seam = seamAt(160);
+
+    fireEvent.pointerDown(seam, { button: 0, pointerId: 1, clientX: 160 });
+    fireEvent.pointerMove(seam, { pointerId: 1, clientX: 260 });
+    fireEvent.pointerUp(seam, { pointerId: 1 });
+
+    expect(template(seam)).toBe("260px 0px minmax(0, 1fr)");
+    expect(readColumnWidths(document.cookie)[PROPERTY_KEY_COLUMN]).toBe(260);
+
+    // The reload jsdom has. Nothing is cached in module scope, so a fresh mount
+    // reads the cookie exactly as a relaunched window would.
+    panel.unmount();
+    renderPanel();
+
+    expect(template(seamAt(260))).toBe("260px 0px minmax(0, 1fr)");
+  });
+
+  it("ignores a pointer that never grabbed the seam", () => {
+    renderPanel();
+    const seam = seamAt(160);
+
+    // A drag that started somewhere else, passing over. Without the guard the
+    // column snaps to the cursor of any pointer that crosses it.
+    fireEvent.pointerMove(seam, { pointerId: 1, clientX: 400 });
+
+    expect(template(seam)).toContain("fit-content(50%)");
+  });
+
+  it("moves the boundary from the keyboard, and back to fitted", () => {
+    renderPanel();
+    const seam = seamAt(160);
+
+    fireEvent.keyDown(seam, { key: "ArrowRight" });
+    expect(template(seam)).toBe("168px 0px minmax(0, 1fr)");
+
+    fireEvent.keyDown(seam, { key: "ArrowLeft", shiftKey: true });
+    expect(template(seam)).toBe("136px 0px minmax(0, 1fr)");
+    expect(seam).toHaveAttribute("aria-valuenow", "136");
+
+    // Home is the door out of a width somebody regrets, and it has to clear the
+    // cookie too — otherwise the next launch restores the regret.
+    fireEvent.keyDown(seam, { key: "Home" });
+    expect(template(seam)).toContain("fit-content(50%)");
+    expect(seam).toHaveAttribute("aria-valuetext", COLUMN_FITTED_VALUE_TEXT);
+    expect(readColumnWidths(document.cookie)).toEqual({});
+  });
+
+  it("refuses to drag a column down to nothing", () => {
+    renderPanel();
+    const seam = seamAt(160);
+
+    fireEvent.pointerDown(seam, { button: 0, pointerId: 1, clientX: 160 });
+    fireEvent.pointerMove(seam, { pointerId: 1, clientX: -600 });
+
+    // A column at zero has swallowed its own content AND the handle that would
+    // bring it back.
+    expect(template(seam)).toBe(`${MIN_COLUMN_WIDTH}px 0px minmax(0, 1fr)`);
+  });
+});
+
+describe("PropertiesPanel — content you can read", () => {
+  let restoreLayout: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreLayout?.();
+    restoreLayout = null;
+  });
+
+  /** Give the pane `px` of room and let the text measure itself into it. */
+  function pane(px: number): void {
+    restoreLayout = withTextLayout(px);
+  }
+
+  it("says nothing extra about a value that fits", () => {
+    pane(1000);
+    renderPanel();
+
+    // The affordance is a tab stop. A panel that grows one per property is a
+    // worse panel than the one with the tooltips.
+    expect(screen.queryByRole("button", { name: "01ARZ3NDEKTSV4RRFFQ69G5FAV" })).toBeNull();
+    expect(screen.getByText("01ARZ3NDEKTSV4RRFFQ69G5FAV")).toBeInTheDocument();
+  });
+
+  it("offers the whole of a value the column cut", () => {
+    // 26 characters of ULID at 8px each, in 120px of column.
+    pane(120);
+    renderPanel();
+
+    const trigger = screen.getByRole("button", { name: "01ARZ3NDEKTSV4RRFFQ69G5FAV" });
+    fireEvent.click(trigger);
+
+    const full = screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: id`);
+    expect(full).toHaveTextContent("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+  });
+
+  it("shows a recording path in full, from a control and not a tooltip", async () => {
+    pane(120);
+    recordingNoteTargets.mockResolvedValue(TARGETS);
+    renderPanel(RECORDING_BLOCK);
+
+    const file = "recordings/2026/2026-08-08 1552 standup/screen-0000.mov";
+    const trigger = await screen.findByRole("button", { name: file });
+
+    // The failure this replaces: `title=` is a tooltip, and a tooltip does not
+    // exist for a keyboard, a touch screen, or a hand that is not hovering.
+    expect(trigger).not.toHaveAttribute("title");
+    expect(document.querySelector("[title]")).toBeNull();
+
+    // What a browser dispatches when Enter is pressed on a focused button.
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(trigger);
+
+    const panel = await screen.findByRole("dialog");
+    // The COMPLETE path, not the visible head of it.
+    expect(within(panel).getByLabelText(new RegExp(OVERFLOW_PANEL_LABEL))).toHaveTextContent(file);
+
+    // And a value taller than the panel is reachable: the region scrolls and
+    // takes focus, so arrow keys reach the bottom of it.
+    const region = within(panel).getByLabelText(new RegExp(OVERFLOW_PANEL_LABEL));
+    expect(region).toHaveAttribute("tabindex", "0");
+    expect(region.className).toContain("overflow-y-auto");
+    expect(region.className).toContain("max-h-64");
+
+    // Escape closes it and gives focus back, so the keyboard is never stranded.
+    fireEvent.keyDown(panel, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("previews an unreadable block without cutting a character in half", () => {
+    // 500 thumbs after an odd-length prefix, so code unit 400 lands INSIDE one.
+    const block = `---\nweird: !!str [ab\n${"👍".repeat(500)}\n---\n`;
+    // The bug being fixed, stated as a fact about the old implementation.
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(block.slice(0, 400))).toBe(true);
+
+    renderPanel(block);
+
+    const preview = screen.getByText(/👍/);
+    expect(preview.textContent).not.toContain("\uFFFD");
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(preview.textContent ?? "")).toBe(false);
+    expect(preview.textContent).toContain(ELLIPSIS);
+
+    // And the rest of it is not gone — it is behind one control.
+    fireEvent.click(
+      screen.getByRole("button", { name: `${OVERFLOW_TRIGGER_LABEL} ${UNPARSED_BLOCK_LABEL}` }),
+    );
+    expect(
+      screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: ${UNPARSED_BLOCK_LABEL}`),
+    ).toHaveTextContent("👍");
   });
 });

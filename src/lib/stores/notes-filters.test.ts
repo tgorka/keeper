@@ -48,28 +48,38 @@ describe("noteQueryFor", () => {
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).tags).toEqual({ work: "include" });
   });
 
-  it("does not send the same flag twice when the scope and the chip agree", () => {
+  it("sends the pinned chip's flag once, and it is the only flag a scope can no longer add", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "pinned" });
+    state.setScope({ kind: "space", id: "pinned-space", name: "Pinned", defaultKey: "pinned" });
     state.setPinnedOnly(true);
 
+    // The seeded Pinned space says `is:pinned` in its own frontmatter, which
+    // Rust evaluates from `spaceId`. If the store still carried a scope→flag
+    // table this would be `["pinned", "pinned"]` or would double-filter.
     expect(noteQueryFor(notesFiltersStore.getState(), 0, 200).flags).toEqual(["pinned"]);
   });
 
-  it("asks for recording notes by the flag the index computes, not by a path convention", () => {
-    notesFiltersStore.getState().setScope({ kind: "recording" });
+  it("asks for a seeded default's notes through its space id, never through a flag of its own", () => {
+    // Recordings, Inbox and Journal were `is:recording` / `is:untagged` /
+    // `is:journal` in a table here. Those strings live in the vault now, so the
+    // request for any of them carries no flag at all — a flag surviving here
+    // would mean the store was still filtering a space a second time.
+    for (const key of ["recordings", "inbox", "journal"]) {
+      notesFiltersStore.getState().clearAll();
+      notesFiltersStore
+        .getState()
+        .setScope({ kind: "space", id: `s-${key}`, name: key, defaultKey: key });
 
-    const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
-    // The literal string `keeper_core::notes::query`'s closed `is:` set parses.
-    // Spelt out rather than imported because this table IS the bridge between
-    // the two vocabularies, and a test that read it from the same constant would
-    // agree with any typo.
-    expect(query.flags).toEqual(["recording"]);
-    expect(query.spaceId).toBeNull();
+      const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
+      expect(query.flags).toEqual([]);
+      expect(query.spaceId).toBe(`s-${key}`);
+    }
   });
 
   it("sends a space id rather than a flag for a space scope", () => {
-    notesFiltersStore.getState().setScope({ kind: "space", id: "space-1", name: "Active work" });
+    notesFiltersStore
+      .getState()
+      .setScope({ kind: "space", id: "space-1", name: "Active work", defaultKey: null });
 
     const query = noteQueryFor(notesFiltersStore.getState(), 0, 200);
     expect(query.spaceId).toBe("space-1");
@@ -85,25 +95,45 @@ describe("noteQueryFor", () => {
 describe("scope selection", () => {
   it("clears the scope when the active row is selected again", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "inbox" });
-    state.setScope({ kind: "inbox" });
+    const inbox = { kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" } as const;
+    state.setScope(inbox);
+    state.setScope(inbox);
 
     expect(notesFiltersStore.getState().scope.kind).toBe("all");
   });
 
   it("distinguishes two spaces, so picking a different one switches rather than clears", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "space", id: "a", name: "A" });
-    state.setScope({ kind: "space", id: "b", name: "B" });
+    state.setScope({ kind: "space", id: "a", name: "A", defaultKey: null });
+    state.setScope({ kind: "space", id: "b", name: "B", defaultKey: null });
 
-    expect(notesFiltersStore.getState().scope).toEqual({ kind: "space", id: "b", name: "B" });
+    expect(notesFiltersStore.getState().scope).toEqual({
+      kind: "space",
+      id: "b",
+      name: "B",
+      defaultKey: null,
+    });
+  });
+
+  /**
+   * A seeded default and a space of the user's own are the same kind of thing.
+   * `defaultKey` rides along for the sentence an empty Recordings shows; it must
+   * not be a second axis of identity, or re-pressing a renamed default would
+   * fail to clear it.
+   */
+  it("tells two spaces apart by id alone, not by whether one is a seeded default", () => {
+    const state = notesFiltersStore.getState();
+    state.setScope({ kind: "space", id: "s1", name: "Recordings", defaultKey: "recordings" });
+    state.setScope({ kind: "space", id: "s1", name: "Sessions", defaultKey: "recordings" });
+
+    expect(notesFiltersStore.getState().scope.kind).toBe("all");
   });
 });
 
 describe("dropLastChip", () => {
   it("walks the bar down from its end, one press at a time", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "inbox" });
+    state.setScope({ kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" });
     state.cycleTag("work");
     state.cycleTag("urgent");
     state.setAgentOnly(true);
@@ -204,7 +234,7 @@ describe("emptyFilterReason", () => {
 
   it("names every axis of the bar, so no term can go unmentioned", () => {
     const state = notesFiltersStore.getState();
-    state.setScope({ kind: "inbox" });
+    state.setScope({ kind: "space", id: "s-inbox", name: "Inbox", defaultKey: "inbox" });
     state.setTagTerm("work", "include");
     state.setAgentOnly(true);
     state.setPinnedOnly(true);

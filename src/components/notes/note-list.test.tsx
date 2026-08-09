@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { NoteList } from "@/components/notes/note-list";
+import { NOTE_MORE_TAGS_LABEL } from "@/components/notes/note-row";
 import type { NoteRowVm } from "@/lib/ipc/client";
 
 /**
@@ -153,5 +154,84 @@ describe("NoteList affordances", () => {
 
     fireEvent.keyDown(list, { key: "Enter" });
     expect(onSelect).toHaveBeenCalledWith(UNREAD);
+  });
+});
+
+/**
+ * Story 44.12 — the notes list's own truncation.
+ *
+ * A row shows three chips and collapses the rest into `+n`. That is AD-83's
+ * second step with the third one missing: a count is not the value, and a row
+ * that says `+2` and cannot say which two is the property panel's failure in a
+ * smaller box.
+ */
+describe("NoteList — the tags a row could not fit", () => {
+  const MANY = row({
+    id: "9",
+    title: "Tagged",
+    tags: ["work", "clients/acme", "q3", "invoices", "urgent"],
+  });
+
+  function renderTagged() {
+    const onToggleTag = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <NoteList
+        rows={[MANY]}
+        total={1}
+        selectedId={null}
+        onSelect={onSelect}
+        onToggleTag={onToggleTag}
+        onVerb={vi.fn()}
+        onGrow={vi.fn()}
+      />,
+    );
+    return { onToggleTag, onSelect };
+  }
+
+  it("names the tags it is hiding rather than only counting them", () => {
+    renderTagged();
+
+    // The count is still what is drawn — the row is 64 px and five chips do not
+    // fit — but the affordance says what it stands for.
+    expect(
+      screen.getByRole("button", { name: `${NOTE_MORE_TAGS_LABEL} invoices, urgent` }),
+    ).toHaveTextContent("+2");
+  });
+
+  it("opens the hidden tags, and each one still filters", () => {
+    const { onToggleTag, onSelect } = renderTagged();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: `${NOTE_MORE_TAGS_LABEL} invoices, urgent` }),
+    );
+    // Opening the panel is not opening the note — the trigger sits inside the
+    // row's own button, so without the guard this alone would stream a body.
+    expect(onSelect).not.toHaveBeenCalled();
+
+    const panel = screen.getByRole("dialog");
+    expect(within(panel).getByRole("button", { name: "Tag invoices, on this note" })).toBeVisible();
+    fireEvent.click(within(panel).getByRole("button", { name: "Tag urgent, on this note" }));
+
+    expect(onToggleTag).toHaveBeenCalledWith("urgent");
+    // A React portal still propagates through the React tree, so a panel click
+    // that reached the row would open a note the user was only reading a tag off.
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("says nothing where every tag already fits", () => {
+    render(
+      <NoteList
+        rows={[row({ id: "8", title: "Few", tags: ["work", "q3"] })]}
+        total={1}
+        selectedId={null}
+        onSelect={vi.fn()}
+        onToggleTag={vi.fn()}
+        onVerb={vi.fn()}
+        onGrow={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: new RegExp(NOTE_MORE_TAGS_LABEL) })).toBeNull();
   });
 });

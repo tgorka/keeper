@@ -31,9 +31,15 @@
  * holding text that names a file and cannot open it. So each of those paths
  * gets one dropdown of actions whose targets Rust composed (AD-65), and the
  * text beside it stays exactly the relative path the note says.
+ *
+ * The two columns are sized by AD-83's order (Story 44.12): the key column fits
+ * its own keys, the user may drag the seam between them, and only what still
+ * does not fit truncates — with the whole value one click away. What it
+ * replaces was a `w-32` guess beside a `title=` tooltip, which is a cut value
+ * with nowhere a keyboard could read the rest.
  */
 import { Copy, FolderOpen, MoreHorizontal, Play } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -42,6 +48,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { FullValueButton, OverflowValue } from "@/components/ui/overflow-value";
+import {
+  COLUMN_GRID_CLASS,
+  ColumnResizer,
+  useResizableColumn,
+} from "@/components/ui/resizable-columns";
 import { Switch } from "@/components/ui/switch";
 import {
   type NoteWriteVm,
@@ -52,6 +64,8 @@ import {
   revealPath,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { truncateGraphemes } from "@/lib/truncate";
+import { cn } from "@/lib/utils";
 
 /** Which control the value's shape implies. */
 export type PropertyKind = "text" | "number" | "boolean" | "date" | "list";
@@ -259,6 +273,30 @@ export function addProperty(source: string, key: string, value: string): string 
   return `${source.slice(0, closing)}\n${key}:${value}${source.slice(closing)}`;
 }
 
+/** The remembered-width id of the key column. Stable across releases: change
+ * it and everyone's dragged width silently reverts to fitted. */
+export const PROPERTY_KEY_COLUMN = "properties-key";
+
+/** What the seam between the two columns sizes, for its accessible name. */
+export const PROPERTIES_COLUMN_LABEL = "the property name column";
+
+/** What the key column holds, named for the panel that opens a long key. */
+export const PROPERTY_NAME_LABEL = "Property name";
+
+/** What the unparsed-block preview's affordance opens. */
+export const UNPARSED_BLOCK_LABEL = "Properties block";
+
+/**
+ * How much of a block keeper will not parse is previewed inline, in
+ * user-perceived characters.
+ *
+ * Counted in graphemes rather than UTF-16 units (Story 44.12): the previous
+ * `slice(0, 400)` cut wherever the 400th code unit fell, which in a note with
+ * an emoji or a combining mark is the middle of a character, and the preview
+ * then showed a replacement glyph that is in nobody's file.
+ */
+export const UNPARSED_PREVIEW_GRAPHEMES = 400;
+
 export interface PropertiesPanelProps {
   /** The note's frontmatter block, verbatim, or `""` when it has none. */
   frontmatter: string;
@@ -291,6 +329,7 @@ export function PropertiesPanel({
   const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
   const sessionId = recordingSessionId(parsed);
   const [targets, setTargets] = useState<RecordingNoteTargetVm[] | null>(null);
+  const keyColumn = useResizableColumn(PROPERTY_KEY_COLUMN, PROPERTIES_COLUMN_LABEL);
 
   // Resolved by session id, once per note: the id is the handle that survives
   // a Story 40.4 retitle, so this answers "where is this recording NOW" while
@@ -336,40 +375,57 @@ export function PropertiesPanel({
   };
 
   if (parsed.unparsed) {
+    const preview = truncateGraphemes(frontmatter, UNPARSED_PREVIEW_GRAPHEMES);
     return (
       <section aria-label="Properties" className="border-b px-3 py-2 text-xs">
         <p className="text-muted-foreground">
           This note's properties can't be parsed, so keeper is showing them exactly as they are on
           disk rather than rewriting them.
         </p>
-        <pre className="mt-1 overflow-x-auto font-mono text-[11px]">
-          {frontmatter.slice(0, 400)}
-        </pre>
+        <div className="mt-1 flex items-start gap-1">
+          <pre className="min-w-0 flex-1 overflow-x-auto font-mono text-[11px]">{preview}</pre>
+          {preview !== frontmatter && (
+            <FullValueButton name={UNPARSED_BLOCK_LABEL} value={frontmatter} monospace />
+          )}
+        </div>
       </section>
     );
   }
 
   return (
     <section aria-label="Properties" className="flex flex-col gap-1 border-b px-3 py-2 text-xs">
-      {parsed.entries.map((entry) => {
-        // A recording note's own two path keys get actions; a `files:` key in
-        // somebody else's note is somebody else's list, and stays a control.
-        const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
-        const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
-        return (
-          <div key={entry.key} className="flex items-start gap-2">
-            <span className="w-32 shrink-0 truncate text-muted-foreground">{entry.key}</span>
-            {showsRecordingPaths ? (
-              <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
-            ) : (
-              <PropertyControl
-                entry={entry}
-                onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
-              />
-            )}
-          </div>
-        );
-      })}
+      {parsed.entries.length > 0 && (
+        <div
+          ref={keyColumn.containerRef}
+          className={cn(COLUMN_GRID_CLASS, "items-start gap-y-1")}
+          style={keyColumn.gridStyle(parsed.entries.length)}
+        >
+          {parsed.entries.map((entry) => {
+            // A recording note's own two path keys get actions; a `files:` key in
+            // somebody else's note is somebody else's list, and stays a control.
+            const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
+            const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
+            return (
+              <Fragment key={entry.key}>
+                <div className="col-start-1 min-w-0 pr-2 text-muted-foreground">
+                  <OverflowValue name={PROPERTY_NAME_LABEL} value={entry.key} />
+                </div>
+                <div className="col-start-3 flex min-w-0 items-start gap-2 pl-2">
+                  {showsRecordingPaths ? (
+                    <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
+                  ) : (
+                    <PropertyControl
+                      entry={entry}
+                      onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
+                    />
+                  )}
+                </div>
+              </Fragment>
+            );
+          })}
+          <ColumnResizer {...keyColumn.resizerProps} />
+        </div>
+      )}
       <div className="flex items-center gap-2 pt-1">
         <Input
           value={newKey}
@@ -416,9 +472,15 @@ const INPUT_TYPES: Record<PropertyKind, string> = {
 
 function PropertyControl({ entry, onChange }: PropertyControlProps) {
   // The ULID is identity, not metadata: links resolve through it (FR-97), so
-  // it is shown and copyable but never editable.
+  // it is shown and copyable but never editable. Being read-only is exactly
+  // what makes it need the overflow affordance: an editable value can be
+  // scrolled with the caret, and this one cannot be scrolled at all.
   if (entry.key === "id") {
-    return <code className="font-mono text-[11px] text-muted-foreground">{entry.text}</code>;
+    return (
+      <div className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+        <OverflowValue name={entry.key} value={entry.text} monospace />
+      </div>
+    );
   }
 
   if (entry.nested) {
@@ -649,13 +711,17 @@ interface RecordingPathProps {
  * reader the recording is there, and then fails at the moment they believed
  * it. Absence says the true thing immediately, and it is the same rule
  * `revealInFileManager` is gated by one line down.
+ *
+ * The path itself is the overflow affordance (Story 44.12). A recording path is
+ * long, the panel is narrow, and what stood here was `title=` — a tooltip a
+ * keyboard never sees, on the one value in the panel a caret cannot scroll.
  */
 function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) {
   return (
     <div className="flex min-w-0 items-center gap-1">
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={relativePath}>
-        {relativePath}
-      </span>
+      <div className="min-w-0 flex-1 text-[11px]">
+        <OverflowValue name={fileName(relativePath)} value={relativePath} monospace />
+      </div>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button

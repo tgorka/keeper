@@ -58,7 +58,7 @@
 import { WidgetType } from "@codemirror/view";
 import { type RecordingNoteTargetVm, recordingNoteTargets, revealPath } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
-import { type RecordingTransport, releaseTrack } from "./recording-transport";
+import { type RecordingTransport, releaseHost } from "./recording-transport";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /**
@@ -126,6 +126,83 @@ export const RECORDING_EMBED_REVEAL_LABEL = "Reveal in Finder";
 
 /** The Copy path action's label on a file chip, same one wording. */
 export const RECORDING_EMBED_COPY_PATH_LABEL = "Copy path";
+
+/**
+ * How far past a standing position a video is nudged to make it show a frame.
+ *
+ * **The defect this exists for, measured rather than reasoned about.** In a
+ * real WKWebView — the engine the Tauri shell renders in — driving the owner's
+ * own two-track session, `preload="metadata"` settles at `readyState` 1
+ * (HAVE_METADATA). The HTML spec says a video element at HAVE_METADATA that
+ * has obtained no video data represents *transparent black*, and WebKit obeys
+ * it exactly: a canvas readback of the element counted ZERO lit pixels. The
+ * element is genuinely frameless. What the reader sees through it is
+ * `.cm-lp-recording-player`'s own `background-color`, which is the grey box
+ * the field report describes.
+ *
+ * **This was never a two-video defect.** The single video measured the same —
+ * zero lit pixels — and read as working only because WebKit paints its native
+ * `controls` chrome over the emptiness. Story 43.6's transport takes `controls`
+ * away at two tracks and the emptiness becomes visible. So the prime belongs
+ * here, on every video this module creates, rather than in the transport:
+ * a video in a note that shows nothing until you press play is not a video in
+ * a note, whether there is one of them or two.
+ *
+ * **The cost, stated rather than left to be discovered.** Assigning
+ * `currentTime` is a seek, and a seek is a real range request for real bytes
+ * against a file that may be a multi-hundred-megabyte screen recording on a
+ * pendrive or a network volume. Opening a note therefore touches the drive
+ * once per embedded video. That is the right price — it buys one keyframe, not
+ * the `preload="auto"` download of the whole file, and it is the difference
+ * between a note that shows the recording and a note that shows a rectangle —
+ * but it is a price, and it is paid on open rather than on play.
+ *
+ * A millisecond, and both bounds are real. Non-zero because a seek to the
+ * position the element already reports is one a user agent may collapse into
+ * nothing, and nothing is exactly what cannot be afforded here. Far below one
+ * frame's duration — 33 ms at 30 fps — so the frame presented is the frame at
+ * the position asked for and not the one after it.
+ */
+export const FRAME_PRIME_SECONDS = 0.001;
+
+/** `HAVE_CURRENT_DATA`: the first `readyState` at which the element has a
+ *  frame to paint. Spelled as a constant because that threshold, not the
+ *  number, is the thing being tested. */
+const HAVE_CURRENT_DATA = 2;
+
+/**
+ * Ask a video for the frame that `preload="metadata"` does not fetch.
+ *
+ * Once, on `loadedmetadata`, and only for an element nobody has moved. Both
+ * halves of that matter. Once, because the point is to buy a frame and not to
+ * keep buying one. And only for an untouched element, because by the time
+ * metadata arrives the reader may have scrubbed, or the transport may have
+ * placed the pair at a shared position — dragging either of them back to the
+ * top would make a cosmetic fix into a control that moves the recording under
+ * someone's hand.
+ *
+ * An element that already has a frame is left alone: there is nothing to buy
+ * and the request would be spent for nothing.
+ */
+export function primeFirstFrame(player: HTMLVideoElement): void {
+  // `once`, declared rather than unregistered by hand: the guard below already
+  // refuses to move an element that is not at the top, but an element the
+  // reader has scrubbed BACK to zero is at the top and would be primed a
+  // second time by a later `loadedmetadata` — a source change or a reload —
+  // moving them a millisecond they did not ask for. The platform enforcing
+  // "once" is also one fewer listener left on an element this module works
+  // hard to let go of.
+  player.addEventListener(
+    "loadedmetadata",
+    () => {
+      if (player.currentTime !== 0 || player.readyState >= HAVE_CURRENT_DATA) {
+        return;
+      }
+      player.currentTime = FRAME_PRIME_SECONDS;
+    },
+    { once: true },
+  );
+}
 
 /**
  * The session's target this embed names, or `undefined`.
@@ -267,12 +344,18 @@ function elementFor(
   // height — is right for an audio bar too.
   player.className = target.kind === "video" ? "cm-lp-recording-player" : "cm-lp-recording-audio";
   player.controls = true;
-  // Metadata only: a duration and a poster frame, not half a gigabyte.
+  // Metadata only: a duration and a first frame, not half a gigabyte. The
+  // "and a first frame" half is not free and is not the platform's default —
+  // see {@link primeFirstFrame}, registered below.
   player.preload = "metadata";
   // The file name, so a screen reader hears which of a session's tracks this is.
   player.setAttribute("aria-label", name);
   player.addEventListener("error", onFailedLoad);
-  // Assigned last, because assigning `src` is what starts the load and the
+  if (player instanceof HTMLVideoElement) {
+    // Audio has no frame to show, so it is asked for nothing it cannot use.
+    primeFirstFrame(player);
+  }
+  // Assigned last, because assigning `src` is what starts the load and every
   // handler above must already be registered when it does.
   player.src = url;
   return player;
@@ -317,6 +400,12 @@ export async function renderRecordingEmbedInto(
   // that the surface says the smaller thing, never the alarming one.
   const before = Array.from(host.childNodes);
   const element = elementFor(sessionId, attachment, () => {
+    // Leave the pair FIRST. A track whose file went away has left the group,
+    // and while the group is staged its element lives in the leader's stage
+    // rather than here — `releaseHost` hands it back to this host, which the
+    // restore below then replaces with the link. Restoring first would put the
+    // link back and then have the dead element handed in underneath it.
+    releaseHost(host);
     host.replaceChildren(...before);
   });
   host.replaceChildren(element);
@@ -324,18 +413,12 @@ export async function renderRecordingEmbedInto(
   // After the mount, never before: the transport decides which track leads by
   // where it sits in the note, and an element with no parent sits nowhere.
   if (options.transport !== undefined && element instanceof HTMLVideoElement) {
-    // A track whose file went away has left the pair. Registered before the
-    // join so the ordering is stated here rather than inferred from the order
-    // `elementFor` happened to attach its own handler in.
-    element.addEventListener("error", () => {
-      releaseTrack(element);
-    });
     options.transport.join(element, host, fileName(attachment.relativePath));
   }
 }
 
 /**
- * Release the media element inside `dom`, if there is one.
+ * Release the media element this host is responsible for, if there is one.
  *
  * Removing the node is not enough. A `<video>` or `<audio>` with a `src` holds
  * a selected resource — an open range-request pipeline and a decoder — until it
@@ -348,13 +431,17 @@ export async function renderRecordingEmbedInto(
  * safe to call on the degraded link.
  */
 export function releaseRecordingMedia(dom: HTMLElement): void {
+  // Before the search, not after. A grouped track does not live in its own
+  // host — the transport moved it into the shared stage so the pair reads as
+  // one player — so looking here first would find nothing and release nothing.
+  // `releaseHost` hands the element back to `dom` and, when that drops the
+  // group to a single track, gives the survivor its native controls and its
+  // own host's contents back before either is torn down.
+  releaseHost(dom);
   const player = dom.querySelector("video, audio");
   if (!(player instanceof HTMLMediaElement)) {
     return;
   }
-  // Before the teardown, so a departing leader hands the shared bar to the
-  // track below it instead of taking it into `replaceChildren` below.
-  releaseTrack(player);
   player.pause();
   player.removeAttribute("src");
   // `load()` is what actually aborts the selected resource; clearing `src`

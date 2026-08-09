@@ -412,6 +412,37 @@ development_status:
   43-9-the-slash-menu-can-open: review
   epic-43-retrospective: optional
 
+  # Epic 44, opened 2026-08-09 from a second field report after epic 43 was
+  # installed and used. Twenty-two items that are four sentences: the rail lies
+  # about its own vocabulary (four hard-coded rows beside a weaker Spaces, and
+  # one of them - Today - has never worked); a note can be typed but not
+  # authored (no New Note, no template, no formatting menu, no table); every
+  # list is a fixed-width guess with no counts and no virtualisation; and 43.6's
+  # two-video case is not finished. See
+  # planning-artifacts/epic-44-the-vocabulary-is-the-space.md, chiefly AD-79
+  # (the fixed rows BECOME spaces), AD-80 (Today is deleted, not fixed), AD-81
+  # (order is the note's, sort is the space's) and AD-82 (a template is a note
+  # and its tag is the marker that leaves).
+  epic-44: in-progress
+  44-1-two-videos-properly: review
+  44-2-the-stub-embeds-its-own-videos: review
+  44-3-default-spaces-replace-the-fixed-rail: review
+  44-4-a-space-has-an-icon-an-order-and-a-sort: backlog
+  44-5-a-note-has-an-order-you-can-see: backlog
+  44-6-new-note: backlog
+  44-7-templates: backlog
+  44-8-update-notes-from-their-template: backlog
+  44-9-a-formatting-menu: review
+  44-10-lists-that-render-what-you-can-see: backlog
+  44-11-counts: backlog
+  44-12-columns-you-can-size-content-you-can-read: review
+  44-13-tag-entry-that-completes: review
+  44-14-recording-notes-are-editable-notes: backlog
+  44-15-a-gallery-in-a-note: backlog
+  44-16-csv-as-a-table-you-can-edit: backlog
+  44-17-sync-status-in-files: backlog
+  epic-44-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

@@ -41,7 +41,7 @@ use keeper_core::notes::vm::{
     NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm,
     NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
-use keeper_core::notes::{naming, query, search, templates, NotesError};
+use keeper_core::notes::{default_spaces, naming, query, search, templates, NotesError};
 use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
@@ -541,6 +541,10 @@ struct SpaceDef {
     sort: String,
     limit: u32,
     icon: Option<String>,
+    /// `keeper.default` — which seeded default this space is, when it is one
+    /// (Story 44.3). Never written by the editor; carried through a save so
+    /// editing a default does not quietly demote it.
+    default_key: Option<String>,
 }
 
 /// Read the space definition out of a space note's frontmatter.
@@ -560,6 +564,7 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
         sort: "modified desc".to_owned(),
         limit: MAX_LIMIT,
         icon: None,
+        default_key: None,
     };
     let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
         return def;
@@ -578,6 +583,10 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
             _ => {}
         }
     }
+    // The marker is read through `keeper-core`'s one rule rather than a fifth
+    // arm here, so the seeder — which reads notes off disk before the index
+    // exists — and this cannot disagree about what a default is.
+    def.default_key = default_spaces::default_key(pairs);
     def
 }
 
@@ -944,12 +953,161 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
                 sort: def.sort,
                 limit: def.limit,
                 icon: def.icon,
+                default_key: def.default_key,
                 error,
             }
         })
         .collect();
     spaces.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(spaces)
+}
+
+// ---------------------------------------------------------------------------
+// Default spaces (Story 44.3, FR-156, AD-79)
+// ---------------------------------------------------------------------------
+
+/// Seed this vault's default spaces if it has never been offered them.
+///
+/// Called from `notes_vault::refresh` for every newly registered vault, and
+/// from nowhere else — the frontend does not drive this, because a vault that
+/// is only ever reached from the tray or the capture window has to be seeded
+/// too.
+///
+/// **It does not wait for the index.** `notes_spaces` reads a snapshot, and on a
+/// vault registered a millisecond ago that snapshot is empty; seeding off it
+/// would write four notes into a vault that already has them. So the question
+/// "what is in `spaces/`" is asked of the directory, which is true immediately
+/// and is also the only source that stays true when the drive is unplugged
+/// halfway through a write.
+///
+/// Best-effort by construction: this runs on a startup path with nobody to show
+/// an error to, and a vault that could not be seeded is a vault with fewer rows
+/// in its rail, not a broken one. "Restore default spaces" is the retry.
+pub fn seed_default_spaces(vault: &Vault) {
+    match apply_default_spaces(vault, default_spaces::SeedMode::FirstRun) {
+        Ok(written) if !written.is_empty() => {
+            tracing::info!(vault = %vault.id, count = written.len(), "notes: seeded default spaces");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(vault = %vault.id, %error, "notes: could not seed the default spaces");
+        }
+    }
+}
+
+/// Re-create the default spaces this vault is missing (FR-156).
+///
+/// The user asking, so the ledger does not veto it — but it still only fills
+/// holes: a default that is there is not rewritten, and a space of the user's
+/// own that already carries a default's name stands that default down exactly as
+/// it does on the first run. Returns how many notes were written, so the surface
+/// can say "nothing was missing" rather than flashing a success at a no-op.
+#[tauri::command]
+pub async fn notes_spaces_restore_defaults(vault_id: String) -> Result<u32, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let written = apply_default_spaces(&vault, default_spaces::SeedMode::Restore)
+        .map_err(|error| notes_error(NotesError::Name(error)))?;
+    Ok(u32::try_from(written.len()).unwrap_or(u32::MAX))
+}
+
+/// Write the defaults `mode` calls for, then record what this vault has been
+/// offered. Returns the vault-relative paths written.
+///
+/// The ledger is written **after** the notes, and it records the union of what
+/// it already held with what was just written. Both halves matter for the
+/// unplugged-drive case: if the run dies after two notes, the ledger never lands
+/// and the next registration finishes the remaining two rather than repeating
+/// the first two — because [`default_spaces::plan`] is keyed on what is on disk,
+/// not on how far the last attempt got.
+fn apply_default_spaces(
+    vault: &Vault,
+    mode: default_spaces::SeedMode,
+) -> Result<Vec<String>, String> {
+    let offered = read_seed_ledger(vault);
+    let existing = existing_spaces(vault);
+    let planned = default_spaces::plan(mode, &existing, offered.as_ref());
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // One `siblings` read for the whole run, grown as each name is taken, so two
+    // defaults seeded in the same pass cannot be handed the same filename.
+    let mut taken = notes_vault::siblings(vault, SPACES_DIR);
+    let mut written = Vec::new();
+    let mut keys: std::collections::BTreeSet<String> = offered.unwrap_or_default();
+    for space in planned {
+        let filename = naming::note_filename(space.name, &today(), &taken);
+        let rel = format!("{SPACES_DIR}/{filename}");
+        let note = default_spaces::render_note(space, &crate::sync_ipc::new_ulid(), &now_local());
+        if let Err(error) = notes_vault::write_note(vault, &rel, &note) {
+            // Stop at the first failure and still record what did land: a full
+            // disk halfway through must not be retried as "write all four
+            // again" on the next launch.
+            record_seed_ledger(vault, &keys);
+            return Err(format!("{rel}: {error}"));
+        }
+        taken.push(filename);
+        keys.insert(space.key.to_owned());
+        written.push(rel);
+    }
+    record_seed_ledger(vault, &keys);
+    Ok(written)
+}
+
+/// The spaces already in `spaces/`, read off the disk.
+///
+/// Deliberately not the index (see [`seed_default_spaces`]). Unreadable
+/// directory, unreadable file: both yield "no space here", which is the
+/// conservative direction for a *name* check and the wrong one for the ledger —
+/// which is why the ledger's unreadable case is `None` and stops the run
+/// outright.
+fn existing_spaces(vault: &Vault) -> Vec<default_spaces::ExistingSpace> {
+    notes_vault::siblings(vault, SPACES_DIR)
+        .into_iter()
+        .filter(|name| name.ends_with(".md"))
+        .filter_map(|name| {
+            let rel = format!("{SPACES_DIR}/{name}");
+            let source = notes_vault::read_note(vault, &rel).ok()?;
+            Some(default_spaces::ExistingSpace {
+                default_key: default_spaces::default_key_of(&source),
+                name: notes_vault::title_of_source(&source, &rel),
+            })
+        })
+        .collect()
+}
+
+/// The keys this vault has already been offered.
+///
+/// Three answers, and the middle one is the whole point. An **absent** ledger is
+/// a vault that has never been seeded, so `Some(empty)` — offer everything. A
+/// ledger that is there and does not parse, or cannot be read, is `None` — a
+/// vault keeper knows nothing about, so the automatic path writes nothing.
+/// Reading a corrupt ledger as "never seeded" would resurrect every default its
+/// owner had deleted, and that is the one outcome worth being timid about.
+fn read_seed_ledger(vault: &Vault) -> Option<std::collections::BTreeSet<String>> {
+    let path = notes_vault::contained(vault, default_spaces::LEDGER_REL).ok()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => default_spaces::parse_ledger(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(std::collections::BTreeSet::new())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Record what this vault has been offered.
+///
+/// Not a note, so it goes through the plain vault write rather than
+/// [`notes_vault::write_note`]: announcing a `.json` to the reconciler would ask
+/// the index to re-read a path it does not index. A failure is logged and
+/// swallowed — the notes are already on disk, and the worst case is that the
+/// next launch offers a default the user has not deleted yet, which
+/// [`default_spaces::plan`]'s on-disk check refuses anyway.
+fn record_seed_ledger(vault: &Vault, keys: &std::collections::BTreeSet<String>) {
+    let text = default_spaces::render_ledger(keys);
+    if let Err(error) = notes_vault::write_vault_file(vault, default_spaces::LEDGER_REL, &text) {
+        tracing::warn!(vault = %vault.id, %error, "notes: could not record the seeded spaces");
+    }
 }
 
 /// Create or update a space note (FR-105, FR-149).
@@ -975,7 +1133,7 @@ pub async fn notes_space_save(
             token_index: error.token_index,
         })
     })?;
-    let mut pairs = vec![
+    let pairs = vec![
         ("space".to_owned(), FieldValue::Str(space.query.clone())),
         ("sort".to_owned(), FieldValue::Str(space.sort.clone())),
         (
@@ -985,10 +1143,12 @@ pub async fn notes_space_save(
     ];
     // Written only when there is one, so a space nobody gave an icon keeps the
     // frontmatter it had rather than growing an empty key to explain.
-    if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
-        pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
-    }
-    let definition = FieldValue::Map(pairs);
+    let with_icon = |mut pairs: Vec<(String, FieldValue)>| {
+        if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
+            pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
+        }
+        pairs
+    };
 
     // An existing space keeps every byte outside the keys this touches
     // (FR-121): the definition is spliced, and the name is spliced only when it
@@ -996,7 +1156,16 @@ pub async fn notes_space_save(
     if let Some(id) = space.id.as_ref().filter(|id| !id.is_empty()) {
         let entry = entry_of(&vault_id, id)?;
         let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
-        let mut updated = Frontmatter::set_in(&source, "keeper", definition);
+        let mut pairs = with_icon(pairs);
+        // `keeper` is spliced whole, so a key this request does not carry is a
+        // key the save would delete. `default` is keeper's own marker and the
+        // editor has no control for it (Story 44.3) — dropping it here would
+        // make editing the seeded Inbox turn it into an ordinary space, and
+        // "Restore default spaces" would then offer a second one.
+        if let Some(key) = default_spaces::default_key_of(&source) {
+            pairs.push(("default".to_owned(), FieldValue::Str(key)));
+        }
+        let mut updated = Frontmatter::set_in(&source, "keeper", FieldValue::Map(pairs));
         let renamed = space.name != entry.title;
         if renamed {
             // `title` rather than the heading alone, because `note_title` reads
@@ -1038,7 +1207,7 @@ pub async fn notes_space_save(
         ("id".to_owned(), FieldValue::Str(id.clone())),
         ("created".to_owned(), FieldValue::Str(now_local())),
         ("updated".to_owned(), FieldValue::Str(now_local())),
-        ("keeper".to_owned(), definition),
+        ("keeper".to_owned(), FieldValue::Map(with_icon(pairs))),
     ]);
     let body = format!("# {}\n", space.name);
     notes_vault::write_note(&vault, &rel, &format!("{front}\n{body}")).map_err(notes_error)?;

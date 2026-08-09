@@ -219,6 +219,16 @@ pub struct NoteSpaceVm {
     /// disk untouched, because keeper rewriting an icon it did not recognise is
     /// the same class of mistake as rewriting a query term it could not parse.
     pub icon: Option<String>,
+    /// Which seeded default this space is, when it is one
+    /// ([`crate::notes::default_spaces`], Story 44.3). `None` for every space a
+    /// person or an agent wrote.
+    ///
+    /// It is the identity, not the name: a default is editable like any other
+    /// space, so renaming Recordings to "Sessions" must not stop the empty list
+    /// saying who writes recording notes, and must not make restore offer a
+    /// second copy. Read from `keeper.default`, which only keeper writes and the
+    /// editor never touches.
+    pub default_key: Option<String>,
     /// The parse failure, when the stored query does not parse. A broken space
     /// matches nothing and says so; it never falls back to matching everything.
     pub error: Option<String>,

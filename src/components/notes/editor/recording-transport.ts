@@ -79,6 +79,33 @@ export const SEEKING_LABEL = "Seeking";
 export const PLAY_REFUSED_LABEL = "Playback was refused";
 
 /**
+ * What each control SHOWS. The labels above are what it is CALLED.
+ *
+ * Measured, not guessed: in a real WKWebView at a 320 px note pane the bar as
+ * Story 43.6 shipped it laid out over five distinct rows, with "Back 10
+ * seconds" broken across two line boxes and "Forward 10 seconds" across three
+ * — the owner's "Back 10 / Pla y / Forward 10 seconds". A sentence on a button
+ * is a sentence with break opportunities in it, and a flex row cannot make one
+ * fit a pane that is narrower than the sentence.
+ *
+ * So every control in the row shows a glyph and carries its phrase in
+ * `aria-label`, which is the one arrangement that costs a screen reader
+ * nothing: the accessible name is unchanged from what shipped, and the visible
+ * text no longer contains a single break opportunity. That last part is the
+ * invariant the tests assert, because it is the property that actually
+ * prevents the wrap — a class name would not.
+ *
+ * Deliberately outside the emoji block: U+25BA, U+275A, U+21BA, U+21BB and
+ * U+266A have no emoji presentation, so they render as text in the editor's
+ * own font rather than as colour images at a size nobody chose.
+ */
+export const PLAY_GLYPH = "\u25BA";
+export const PAUSE_GLYPH = "\u275A\u275A";
+export const BACK_GLYPH = `\u21BA${SKIP_SECONDS}`;
+export const FORWARD_GLYPH = `\u21BB${SKIP_SECONDS}`;
+export const MUTE_GLYPH = "\u266A";
+
+/**
  * The slice of `HTMLMediaElement` a transport drives.
  *
  * Structural, not nominal, and deliberately so: jsdom implements no media
@@ -123,9 +150,25 @@ export interface TransportState {
 
 interface Member {
   readonly track: TransportTrack;
-  /** The widget host the track was mounted into: where its mixer goes, and —
-   *  for the leader — where the one bar goes. */
+  /**
+   * The widget host the track was mounted into.
+   *
+   * It stays the member's address even while the element is somewhere else:
+   * the stage below re-parents every track into ONE container so the pair
+   * reads as one player, and the host is then an empty span holding the
+   * embed's place in the note. Document order — and therefore which track
+   * leads — is still read from the hosts, because they are the things that sit
+   * where the author put them.
+   */
   readonly host: HTMLElement;
+  /**
+   * The track's own DOM node, when the track is one.
+   *
+   * A fake track is an `EventTarget` and nothing more (that is the whole point
+   * of {@link TransportTrack} being structural), so everything that MOVES an
+   * element has to be able to find there is no element to move.
+   */
+  readonly element: HTMLElement | null;
   /** The file name, so four identical "Mute" buttons are four named ones. */
   readonly name: string;
   /** Set by `waiting`/`stalled`/`error`, cleared by `playing`/`canplay`. */
@@ -134,6 +177,9 @@ interface Member {
    *  toward a position the longer track is still advancing past would seek it
    *  in a loop it can never win. */
   ended: boolean;
+  /** The box holding this track and its own mixer while the pair is grouped:
+   *  the answer to a mute slider that floated away from the video it governs. */
+  box: HTMLElement | null;
   mixer: HTMLElement | null;
   unwire: () => void;
 }
@@ -141,6 +187,25 @@ interface Member {
 /** The bar is one node the group re-parents, never one node per track. */
 interface TransportBar {
   readonly dom: HTMLElement;
+  dispose(): void;
+}
+
+/**
+ * The one container the grouped pair lives in.
+ *
+ * A row of track boxes with the single transport beneath it, mounted in the
+ * leading embed's host. It exists because "the pair reads as one player" is
+ * not something CSS can say about two `<video>` elements in two different
+ * `.cm-line` blocks: CodeMirror owns those lines, they are block-level, and no
+ * rule this module is allowed to write puts them side by side. Re-parenting is
+ * the only honest way, and it has the pleasant side effect that handing the
+ * group down to a new leader moves ONE node — the tracks travel inside it, so
+ * position, play state and focus survive exactly as the bar alone used to.
+ */
+interface TransportStage {
+  readonly dom: HTMLElement;
+  /** Where the track boxes go, above the bar. */
+  readonly tracks: HTMLElement;
   dispose(): void;
 }
 
@@ -181,13 +246,25 @@ export function clock(seconds: number): string {
   return `${minutes}:${rest}`;
 }
 
-/** A control on the bar or on a mixer: a real `<button>`, keyboard reachable
- *  and announced as a control rather than as decorated text. */
-function control(className: string, label: string, run: () => void): HTMLButtonElement {
+/**
+ * A control on the bar or on a mixer: a real `<button>`, keyboard reachable
+ * and announced as a control rather than as decorated text.
+ *
+ * `glyph` and `label` are separate arguments and never the same string. What
+ * the control shows has to survive a 320 px pane; what it is CALLED has to be
+ * a phrase a screen reader can read out. Collapsing the two is how the shipped
+ * bar came to wrap "Forward 10 seconds" across three line boxes.
+ */
+function control(
+  className: string,
+  glyph: string,
+  label: string,
+  run: () => void,
+): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
   button.className = className;
-  button.textContent = label;
+  button.textContent = glyph;
   button.setAttribute("aria-label", label);
   button.addEventListener("click", run);
   return button;
@@ -205,13 +282,16 @@ function mixer(member: Member): HTMLElement {
   const strip = document.createElement("span");
   strip.className = "cm-lp-recording-mix";
 
-  const mute = control("cm-lp-recording-mix-mute", MUTE_LABEL, () => {
+  const mute = control("cm-lp-recording-mix-mute", MUTE_GLYPH, MUTE_LABEL, () => {
     member.track.muted = !member.track.muted;
     paint();
   });
   function paint(): void {
     const label = member.track.muted ? UNMUTE_LABEL : MUTE_LABEL;
-    mute.textContent = label;
+    // One glyph for both states, struck through when muted by the theme's
+    // `[aria-pressed="true"]` rule: two different symbols would be two things
+    // to learn, and the pressed state is already the accessible truth.
+    mute.textContent = MUTE_GLYPH;
     // The file name is in the accessible name because a session's two tracks
     // are two "Mute" buttons said twice to anyone not looking at the screen.
     mute.setAttribute("aria-label", `${label} ${member.name}`);
@@ -241,6 +321,14 @@ function mixer(member: Member): HTMLElement {
  * It reads nothing off any element. Every value it shows came from the fold, so
  * there is no path by which it can report the track the transport happened to
  * touch last.
+ *
+ * **Two rows, and the split is the fix for the wrap.** The controls live in a
+ * row that must never break; the status is not a control and gets a line of
+ * its own. That matters because the status is the one thing here that is a
+ * real sentence — "Playback was refused" — and a sentence cannot be made to
+ * fit a 320 px pane beside five controls. Putting it on the control row meant
+ * either wrapping the row or truncating the one message the reader most needs
+ * to read. It collapses to nothing while empty, which is almost always.
  */
 function transportBar(transport: RecordingTransport): TransportBar {
   const dom = document.createElement("span");
@@ -248,13 +336,16 @@ function transportBar(transport: RecordingTransport): TransportBar {
   dom.setAttribute("role", "group");
   dom.setAttribute("aria-label", TRANSPORT_LABEL);
 
-  const back = control("cm-lp-recording-transport-skip", BACK_LABEL, () => {
+  const row = document.createElement("span");
+  row.className = "cm-lp-recording-transport-row";
+
+  const back = control("cm-lp-recording-transport-skip", BACK_GLYPH, BACK_LABEL, () => {
     transport.skip(-SKIP_SECONDS);
   });
-  const toggle = control("cm-lp-recording-transport-toggle", PLAY_LABEL, () => {
+  const toggle = control("cm-lp-recording-transport-toggle", PLAY_GLYPH, PLAY_LABEL, () => {
     void transport.toggle();
   });
-  const forward = control("cm-lp-recording-transport-skip", FORWARD_LABEL, () => {
+  const forward = control("cm-lp-recording-transport-skip", FORWARD_GLYPH, FORWARD_LABEL, () => {
     transport.skip(SKIP_SECONDS);
   });
 
@@ -282,7 +373,7 @@ function transportBar(transport: RecordingTransport): TransportBar {
 
   function render(state: TransportState): void {
     const playing = state.playback !== "paused";
-    toggle.textContent = playing ? PAUSE_LABEL : PLAY_LABEL;
+    toggle.textContent = playing ? PAUSE_GLYPH : PLAY_GLYPH;
     toggle.setAttribute("aria-label", playing ? PAUSE_LABEL : PLAY_LABEL);
     // Until metadata arrives the pair has no span, and a range input whose
     // `max` is 0 clamps every value the reader sets back to 0 — a control that
@@ -292,7 +383,10 @@ function transportBar(transport: RecordingTransport): TransportBar {
     scrub.disabled = !measured;
     scrub.max = String(measured ? state.duration : 0);
     scrub.value = String(state.position);
-    readout.textContent = `${clock(state.position)} / ${clock(state.duration)}`;
+    // No spaces around the separator, and that is not typographic fussiness:
+    // a space is a break opportunity, and the readout is on the row that must
+    // not break. At 320 px the spaced form laid out over three line boxes.
+    readout.textContent = `${clock(state.position)}/${clock(state.duration)}`;
     // A refusal outranks a stall: the pair is not merely late, it declined.
     status.textContent =
       state.failure !== null
@@ -309,7 +403,8 @@ function transportBar(transport: RecordingTransport): TransportBar {
     }
   }
 
-  dom.append(back, toggle, forward, scrub, readout, status);
+  row.append(back, toggle, forward, scrub, readout);
+  dom.append(row, status);
   const unsubscribe = transport.subscribe(render);
   render(transport.state);
 
@@ -317,6 +412,27 @@ function transportBar(transport: RecordingTransport): TransportBar {
     dom,
     dispose: () => {
       unsubscribe();
+      dom.remove();
+    },
+  };
+}
+
+/** The stage: a row of track boxes with the one bar beneath them. */
+function transportStage(transport: RecordingTransport): TransportStage {
+  const dom = document.createElement("span");
+  dom.className = "cm-lp-recording-stage";
+
+  const tracks = document.createElement("span");
+  tracks.className = "cm-lp-recording-tracks";
+
+  const bar = transportBar(transport);
+  dom.append(tracks, bar.dom);
+
+  return {
+    dom,
+    tracks,
+    dispose: () => {
+      bar.dispose();
       dom.remove();
     },
   };
@@ -341,7 +457,7 @@ export class RecordingTransport {
   private intent: "paused" | "playing" = "paused";
   private position = 0;
   private failure: string | null = null;
-  private bar: TransportBar | null = null;
+  private stage: TransportStage | null = null;
   /** Set while the transport is the one calling `pause()`, so a track's own
    *  `pause` event is not mistaken for the track dropping out of the pair. */
   private applying = false;
@@ -420,15 +536,20 @@ export class RecordingTransport {
     const member: Member = {
       track,
       host,
+      // `instanceof Element` rather than a cast: {@link TransportTrack} is
+      // structural precisely so a fake can satisfy it, and a fake has no node
+      // to re-parent. Asking the question here means nothing below has to.
+      element: track instanceof HTMLElement ? track : null,
       name,
       stalled: false,
       ended: false,
+      box: null,
       mixer: null,
       unwire: () => {},
     };
     member.unwire = this.wire(member);
     this.members.push(member);
-    owners.set(track, this);
+    hostOwners.set(host, this);
     this.refresh();
   }
 
@@ -436,9 +557,13 @@ export class RecordingTransport {
    * Drop a track that is going away — scrolled out of the viewport, edited out
    * of the note, or whose file stopped loading.
    *
-   * Called before the widget empties its host, so the bar can move to the next
-   * track rather than being thrown away with the element it happened to hang
-   * under.
+   * Called before the widget empties its host, so the group can move to the
+   * next track rather than being thrown away with the element it happened to
+   * hang under. The departing element is handed back to its own host FIRST,
+   * because while the pair is grouped it lives in the shared stage, and the
+   * teardown that follows looks for it in the host — a track left behind in
+   * the stage would keep its decoder and its open range requests against a
+   * file the user is trying to eject.
    */
   leave(track: TransportTrack): void {
     const index = this.members.findIndex((member) => member.track === track);
@@ -447,12 +572,38 @@ export class RecordingTransport {
     }
     const [member] = this.members.splice(index, 1);
     member.unwire();
-    member.mixer?.remove();
+    this.unbox(member);
     // A departed track will never confirm its seek, and leaving it in the set
     // would wedge the bar on "Seeking" for the tracks that are still here.
     this.unconfirmed.delete(track);
-    owners.delete(track);
+    hostOwners.delete(member.host);
     this.refresh();
+  }
+
+  /** Hand `host`'s track back and drop it. The host-shaped door into
+   *  {@link leave}, for a widget tearing down a host whose element the stage
+   *  is holding. */
+  leaveHost(host: HTMLElement): void {
+    const member = this.members.find((candidate) => candidate.host === host);
+    if (member !== undefined) {
+      this.leave(member.track);
+    }
+  }
+
+  /** Return a member's element to its own host and drop its box. The inverse
+   *  of the boxing in {@link engage}, and the thing that makes both leaving
+   *  and falling back to one track put the note back the way it was. */
+  private unbox(member: Member): void {
+    if (member.box === null) {
+      return;
+    }
+    if (member.element !== null) {
+      member.host.append(member.element);
+    }
+    member.mixer?.remove();
+    member.mixer = null;
+    member.box.remove();
+    member.box = null;
   }
 
   private wire(member: Member): () => void {
@@ -680,52 +831,91 @@ export class RecordingTransport {
     this.seekTo(this.position + delta);
   }
 
-  /** Engage, disengage, or re-seat the bar under a new leader. */
+  /** Engage the group, disengage back to a lone video, or re-seat the stage
+   *  under a new leader. */
   private refresh(): void {
     this.members.sort(byDocumentOrder);
-    const grouped = this.members.length > 1;
+    if (this.members.length > 1) {
+      this.engage();
+    } else {
+      this.disengage();
+    }
+    this.emit();
+  }
+
+  /**
+   * Gather every track into one stage under the leading embed.
+   *
+   * Each track goes into its OWN box with its own mixer, which is the whole of
+   * the fix for a mute slider that sat away from the track it governs: before
+   * this, the mixer was appended to the widget's host and the two hosts are
+   * two separate lines, so the sliders read as furniture belonging to the note
+   * rather than to a video. A box is a boundary, and a control inside one is
+   * unambiguously about what else is inside it.
+   *
+   * `append` on a node that is already a child MOVES it, so re-running this on
+   * every join re-sorts the boxes into document order for free, and re-seating
+   * the stage under a new leader carries the tracks inside it — one node moved,
+   * in one task, which is what keeps a playing element playing.
+   */
+  private engage(): void {
+    this.stage ??= transportStage(this);
+    const stage = this.stage;
     for (const member of this.members) {
       // The native transport carries its own scrub bar, and a second scrub bar
       // is a second clock.
-      member.track.controls = !grouped;
-      if (grouped && member.mixer === null) {
+      member.track.controls = false;
+      if (member.box === null) {
+        const box = document.createElement("span");
+        box.className = "cm-lp-recording-track";
+        if (member.element !== null) {
+          box.append(member.element);
+        }
         member.mixer = mixer(member);
-        member.host.append(member.mixer);
-      } else if (!grouped && member.mixer !== null) {
-        member.mixer.remove();
-        member.mixer = null;
+        box.append(member.mixer);
+        member.box = box;
       }
+      stage.tracks.append(member.box);
     }
     const leader = this.reference();
-    if (grouped && leader !== undefined) {
-      this.bar ??= transportBar(this);
-      if (this.bar.dom.parentElement !== leader.host) {
-        // `append` MOVES the node, so the reader's position, the play state and
-        // the focus ring all survive the leader changing.
-        leader.host.append(this.bar.dom);
-      }
-    } else if (this.bar !== null) {
-      this.bar.dispose();
-      this.bar = null;
+    if (leader !== undefined && stage.dom.parentElement !== leader.host) {
+      leader.host.append(stage.dom);
     }
-    this.emit();
+  }
+
+  /** Give a lone track its native controls back and put its element home. */
+  private disengage(): void {
+    for (const member of this.members) {
+      member.track.controls = true;
+      this.unbox(member);
+    }
+    this.stage?.dispose();
+    this.stage = null;
   }
 }
 
 /**
- * Which transport a mounted track belongs to.
+ * Which transport is holding a widget host's track.
  *
- * Weak, and keyed by the element: teardown reaches this module holding a DOM
- * node and nothing else, and a strong map here would pin every `<video>` a
- * long editing session ever scrolled past — the exact leak
- * `releaseRecordingMedia` exists to prevent.
+ * Keyed by HOST, not by element, and that is the only key that still works
+ * once the pair is grouped: staging moves each `<video>` into the leader's
+ * stage, so a follower's host is an empty span and a teardown that searched it
+ * for a media element would find nothing, release nothing, and leave the
+ * transport holding an element whose widget is gone — the exact leak
+ * `releaseRecordingMedia` was written to prevent, reintroduced by the fix for
+ * the layout. The host is also the one thing a widget still has while it is
+ * being destroyed.
+ *
+ * Weak, because a strong map here would pin every host a long editing session
+ * ever scrolled past.
  */
-const owners = new WeakMap<TransportTrack, RecordingTransport>();
+const hostOwners = new WeakMap<HTMLElement, RecordingTransport>();
 
-/** Detach a track from whatever transport holds it. A no-op for the lone video
- *  that never joined one, which is what makes it safe on every teardown path. */
-export function releaseTrack(track: TransportTrack): void {
-  owners.get(track)?.leave(track);
+/** Hand `host`'s track back to it and drop it from its transport. A no-op for
+ *  a host that never joined one, which is what makes it safe on every teardown
+ *  path — including the lone video that was never grouped. */
+export function releaseHost(host: HTMLElement): void {
+  hostOwners.get(host)?.leaveHost(host);
 }
 
 /**

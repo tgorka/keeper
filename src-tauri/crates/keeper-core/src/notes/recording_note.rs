@@ -22,6 +22,26 @@
 //! resolved through 42.5's vocabulary rather than written as a literal (Story
 //! 43.2).
 //!
+//! # Why the body embeds the videos while the frontmatter lists the files
+//!
+//! `files:` is a machine's list and an embed is what a person sees; both name
+//! the same strings, and neither is derived from the other by joining anything
+//! (AD-65 — the embed is the `files:` entry verbatim, in the same
+//! relative-to-the-destination-root frame, so FR-145 holds in the body for the
+//! same reason it holds in the block).
+//!
+//! The embeds go **below the heading**, never above it.
+//! `notes_vault::note_title` falls back to the body's first line, so an embed
+//! written at offset zero becomes the note's displayed title. That is not a
+//! hypothetical: Story 43.7's panel inserts at the caret, a caret at zero put
+//! an embed above `# Title`, and the owner's vault has a note called
+//! `![[recordings/…/screen-0000.mov]]` because of it.
+//!
+//! Videos only, decided by [`kind_for_file_name`] rather than by a second
+//! extension table here. `manifest.json` and `events.log` are reachable through
+//! `files:` and Story 43.7's panel already, and embedding either would put a
+//! chip that shows nothing where the recording is supposed to be.
+//!
 //! # Two rules the shape of this module is built around
 //!
 //! **The link is an identity, never a path.** `session:` carries
@@ -52,10 +72,12 @@
 //! Both are derived by the shell from the same two stamps, so they cannot
 //! disagree about which session they describe.
 
+use crate::archive::recordings_fts::kind_for_file_name;
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming;
 use crate::notes::tags;
 use crate::notes::templates::Stamp;
+use crate::vm::RecordingNoteTargetKind;
 
 /// The frontmatter key whose presence makes a note a recording note.
 ///
@@ -148,12 +170,24 @@ pub struct NoteStub {
     /// The whole file — frontmatter block, a blank separator line, then the
     /// body.
     pub contents: String,
-    /// Byte offset of the **body's first byte** in [`Self::contents`].
+    /// Byte offset of the **body's first byte** in [`Self::contents`] — the
+    /// heading, which is also the first byte the writer is allowed to edit.
     ///
     /// One past what [`Frontmatter::parse`] calls the body offset, for the
     /// reason `create_note` adds `+ 1` to its caret hint: the parser's offset
     /// lands on the blank line that separates the block from the prose, and the
     /// prose is what the user was invited to write in.
+    ///
+    /// **It stays the heading even now that the body carries embeds**, and the
+    /// stop surface's caret — placed at the END of the body it slices off here
+    /// — is what lands below them. Moving this offset past the embeds would
+    /// look like a better caret hint and would instead move the embeds into the
+    /// read-only head that surface renders, making the one thing keeper just
+    /// wrote into someone's note the one thing they cannot delete. It would
+    /// also disagree with `RecordingNoteStubVm::body_offset`, which the shell
+    /// recomputes from [`Frontmatter::parse`] against the file on disk: two
+    /// same-named offsets meaning two different positions is a split that goes
+    /// wrong silently.
     pub body_offset: usize,
 }
 
@@ -236,23 +270,35 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     // as `tags` above and for the same reason: `- ` under `files:` is a
     // nameless entry, which is worse than no key at all — nobody can act on it,
     // and nobody can tell from the note what it was supposed to have been.
-    let files: Vec<FieldValue> = facts
+    //
+    // Trimmed once and kept, because the body's embeds must name the same
+    // strings the block does. Two independent passes over `facts.files` would
+    // be two places for the next filter to be added to and one for it to be
+    // forgotten.
+    let files: Vec<&str> = facts
         .files
         .iter()
         .map(|file| file.trim())
         .filter(|file| !file.is_empty())
-        .map(|file| FieldValue::Str(file.to_owned()))
         .collect();
     if !files.is_empty() {
-        pairs.push(("files".to_owned(), FieldValue::List(files)));
+        pairs.push((
+            "files".to_owned(),
+            FieldValue::List(
+                files
+                    .iter()
+                    .map(|file| FieldValue::Str((*file).to_owned()))
+                    .collect(),
+            ),
+        ));
     }
 
     let front = Frontmatter::serialise_new(&pairs);
-    // A heading and then room. Composed the way `create_note` composes a note —
-    // `format!("{front}\n{body}")` — because a stub that assembled its own
-    // frontmatter differently from every other note keeper writes would be the
-    // one note the vault's parser had a special case for.
-    let body = format!("# {title}\n\n");
+    // A heading, then the recording, then room. Composed the way `create_note`
+    // composes a note — `format!("{front}\n{body}")` — because a stub that
+    // assembled its own frontmatter differently from every other note keeper
+    // writes would be the one note the vault's parser had a special case for.
+    let body = format!("# {title}\n\n{}", video_embeds(&files));
     let body_offset = front.len() + 1;
     let contents = format!("{front}\n{body}");
 
@@ -312,6 +358,57 @@ fn kind_tag(own: &[String]) -> Option<String> {
     (!already).then_some(kind)
 }
 
+/// The session's videos as Obsidian embeds, one per line, with a blank line
+/// after them — or an empty string when the session has none.
+///
+/// **Empty, not blank.** A session that recorded only audio, or whose segments
+/// all failed to express themselves relative to the root, gets the body it got
+/// before this story: `# Title` and one blank line. An embed block that
+/// collapsed to nothing must not leave the separator it would have needed
+/// behind, because a stub is the one note nobody proofreads before saving.
+///
+/// **Ledger order, never a sort**, for the reason `files:` is in ledger order:
+/// sorting would lift `camera-0000.mov` above the screen segment it was
+/// recorded beside, and the pair reads as one player (Story 44.1).
+///
+/// **The `files:` string verbatim.** Nothing is joined onto it and nothing is
+/// re-derived from `recording:`; the note is written in one frame and every
+/// path in it stays in that frame, which is what makes it still true after the
+/// tree is cloned (FR-145).
+fn video_embeds(files: &[&str]) -> String {
+    let mut out = String::new();
+    for file in files
+        .iter()
+        .filter(|file| matches!(kind_for_file_name(file), RecordingNoteTargetKind::Video))
+        .filter(|file| wikilink_can_name(file))
+    {
+        out.push_str("![[");
+        out.push_str(file);
+        out.push_str("]]\n");
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether `![[file]]` would still mean *this* file.
+///
+/// Obsidian's wikilink grammar consumes each of these characters: `]` closes
+/// the link, `|` starts an alias, `#` starts a heading reference, `^` a block
+/// reference, and a newline ends it outright. A file name containing one is
+/// legal on APFS and would produce an embed pointing at some shorter path that
+/// does not exist — a broken player in place of the recording, which is worse
+/// than no embed. A newline is the sharper case: it would put a second body
+/// line into the note that keeper did not write.
+///
+/// Such a file is still listed under `files:` and still one press away in Story
+/// 43.7's panel, so nothing about it becomes unreachable — keeper only declines
+/// to write a link it knows is wrong.
+fn wikilink_can_name(file: &str) -> bool {
+    !file.contains(['\n', '\r', '[', ']', '|', '#', '^'])
+}
+
 /// Push `key: value`, or nothing at all when the value is blank.
 ///
 /// The whole "omit, do not label" rule funnels through here so it cannot be
@@ -357,6 +454,7 @@ fn duration_text(started_ms: Option<i64>, ended_ms: Option<i64>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes::links;
 
     const ID: &str = "01K0DEVICE0000000000000000-01K0SESSION00000000000000";
 
@@ -500,6 +598,305 @@ mod tests {
             )),
             "the list follows `recording:` immediately, one file per line: {}",
             stub.contents
+        );
+    }
+
+    /// The two tracks and the manifest, exactly as a two-camera session hands
+    /// them over.
+    const TWO_TRACKS: [&str; 3] = [
+        "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+        "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov",
+        "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+    ];
+
+    /// Story 44.2's whole claim, as the exact body: the heading, a blank line,
+    /// both tracks in the ledger's order, and the line the writer's caret lands
+    /// on. `manifest.json` is in `files:` and is deliberately not here — it is
+    /// already reachable through the attachment panel, and an embed of it is a
+    /// chip that shows nothing where the recording should be.
+    ///
+    /// Asserted as the whole body rather than with `contains`, because "an
+    /// extra blank line crept in" and "the embeds ended up in the wrong half of
+    /// the note" both pass a `contains`.
+    #[test]
+    fn a_two_track_session_embeds_both_videos_under_the_heading_in_ledger_order() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert_eq!(
+            &stub.contents[stub.body_offset..],
+            concat!(
+                "# Quarterly review\n",
+                "\n",
+                "![[2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov]]\n",
+                "![[2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov]]\n",
+                "\n",
+            )
+        );
+    }
+
+    /// Read back with the vault's own link parser rather than with `contains`,
+    /// because the promise is that Obsidian renders these: a string that merely
+    /// occurs in the body is not an embed, and `links::extract` is the reader
+    /// that decides. Each target is compared against the `files:` entry itself,
+    /// so a composer that ever joined a root onto a subpath (AD-65) or
+    /// re-derived the path from `recording:` fails here rather than on the
+    /// second machine the vault is cloned onto.
+    #[test]
+    fn the_embeds_read_back_as_embeds_naming_the_files_key_byte_for_byte() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+        let listed = Frontmatter::parse(&stub.contents)
+            .0
+            .as_list("files")
+            .expect("this session has files");
+        let links = links::extract(&stub.contents[stub.body_offset..]);
+
+        assert_eq!(links.len(), 2, "the manifest is listed, never embedded");
+        assert!(
+            links.iter().all(|link| link.embed),
+            "`![[…]]`, not `[[…]]` — a mention renders nothing"
+        );
+        assert!(
+            links.iter().all(|link| link.alias.is_none()),
+            "no alias: an embed with one names a different target"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.target.clone())
+                .collect::<Vec<_>>(),
+            vec![listed[0].clone(), listed[1].clone()],
+            "each embed names the note's own `files:` entry, in the ledger's order"
+        );
+    }
+
+    /// The failure this story is not allowed to reproduce. Story 43.7's panel
+    /// inserts at the caret, a caret at zero put an embed above `# Title`, and
+    /// `notes_vault::note_title` falls back to the body's first line — so the
+    /// owner's vault has a note called `![[recordings/…/screen-0000.mov]]`.
+    ///
+    /// Asserted through [`naming::title_from_body`], which IS that fallback,
+    /// rather than through a `starts_with('#')` of our own: a rule the test
+    /// restates is a rule the test can be wrong about.
+    #[test]
+    fn the_heading_is_still_the_title_under_the_rule_the_vault_falls_back_to() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert_eq!(
+            naming::title_from_body(&stub.contents[stub.body_offset..]),
+            "Quarterly review"
+        );
+        // And over the body the indexer actually slices — the parser's offset,
+        // separator line included — so the stub's own offset is not what is
+        // holding the heading up.
+        let (_, at) = Frontmatter::parse(&stub.contents);
+        assert_eq!(
+            naming::title_from_body(&stub.contents[at..]),
+            "Quarterly review"
+        );
+
+        // An untitled session is the same claim with nothing to hide behind:
+        // its heading is a date, and a date is still not an embed.
+        let untitled = compose(
+            &SessionFacts {
+                title: None,
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+        assert_eq!(
+            naming::title_from_body(&untitled.contents[untitled.body_offset..]),
+            "2026-08-08"
+        );
+    }
+
+    /// A session that recorded no video gets the body it got before this story,
+    /// byte for byte. An embed block that collapsed to nothing must not leave
+    /// the blank line it would have needed behind — a stub is the one note
+    /// nobody proofreads before saving, and a trailing blank is the kind of
+    /// thing that survives into every note a person owns.
+    #[test]
+    fn a_session_with_no_video_embeds_nothing_and_gains_no_blank_line() {
+        let bare = compose(&facts(), &[]);
+        let untouched = bare.contents[bare.body_offset..].to_owned();
+        assert_eq!(untouched, "# Quarterly review\n\n");
+
+        let audio_only = [
+            "2026/keeper-rec 2026-08-08 14.23.45/mix-0000.m4a",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let metadata_only = [
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+            "2026/keeper-rec 2026-08-08 14.23.45/events.log",
+        ];
+        for files in [&audio_only, &metadata_only] {
+            let stub = compose(&SessionFacts { files, ..facts() }, &[]);
+            assert_eq!(
+                &stub.contents[stub.body_offset..],
+                untouched,
+                "no video means the 42.4 body, unchanged: {files:?}"
+            );
+            assert_eq!(
+                Frontmatter::parse(&stub.contents).0.as_list("files"),
+                Some(files.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>()),
+                "the files are still listed — only the body is empty of them"
+            );
+        }
+    }
+
+    /// Every kind Story 43.5 names, in one session. What reaches the body is
+    /// cross-checked against [`kind_for_file_name`] itself rather than against a
+    /// list written out here, so a second extension table can never be added to
+    /// this module and diverge from the attachment panel's answer.
+    #[test]
+    fn only_the_files_43_5_calls_video_are_embedded() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/whiteboard.png",
+            "2026/keeper-rec 2026-08-08 14.23.45/mix-0000.m4a",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+            "2026/keeper-rec 2026-08-08 14.23.45/events.log",
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov.bak",
+            "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.MOV",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let embedded: Vec<String> = links::extract(&stub.contents[stub.body_offset..])
+            .into_iter()
+            .map(|link| link.target)
+            .collect();
+
+        assert_eq!(
+            embedded,
+            vec![
+                "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov".to_owned(),
+                // A file copied in from another machine is the same video; a
+                // backup of one is not, because the LAST extension decides.
+                "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.MOV".to_owned(),
+            ]
+        );
+        for file in files {
+            assert_eq!(
+                embedded.iter().any(|target| target == file),
+                matches!(kind_for_file_name(file), RecordingNoteTargetKind::Video),
+                "the body embeds exactly 43.5's videos, and {file} disagrees"
+            );
+        }
+    }
+
+    /// A file name Obsidian's wikilink grammar would eat. `]` closes the link,
+    /// `|` starts an alias, `#` starts a heading reference, and a newline ends
+    /// the link and puts a line into the note keeper did not write. Each is
+    /// legal on APFS, and an embed built from one points at a shorter path that
+    /// does not exist — a broken player in place of the recording.
+    ///
+    /// It stays in `files:`, so it stays one press away in Story 43.7's panel.
+    /// Keeper only declines to write a link it already knows is wrong.
+    #[test]
+    fn a_name_a_wikilink_cannot_express_is_listed_but_never_embedded() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/take [2].mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/a|b.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/take #3.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/one\n# Not the title.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let body = &stub.contents[stub.body_offset..];
+
+        assert_eq!(
+            links::extract(body)
+                .into_iter()
+                .map(|link| link.target)
+                .collect::<Vec<_>>(),
+            vec!["2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov".to_owned()],
+            "only the name a wikilink can carry is embedded: {body:?}"
+        );
+        assert!(
+            !body.contains("Not the title"),
+            "and no name put a line of its own into the body: {body:?}"
+        );
+        assert_eq!(
+            naming::title_from_body(body),
+            "Quarterly review",
+            "the heading is still the first line the vault reads"
+        );
+        assert_eq!(
+            stub.contents.matches("![[").count(),
+            1,
+            "the skipped names left no half-written embed behind"
+        );
+    }
+
+    /// Where the caret hint points, said out loud so moving it fails here.
+    ///
+    /// `body_offset` is the head/body split, and it stays on the heading. The
+    /// caret a person actually gets is the END of the slice taken from it — the
+    /// stop surface's `setSelectionRange(value.length, …)` — so it lands on the
+    /// blank line BELOW the embeds. Below and not above: keeper's prefill is
+    /// context and the sentence goes after it, and a caret above the embeds
+    /// would push them down the page on the first keystroke, which is the note
+    /// no longer opening as the recording.
+    ///
+    /// Moving `body_offset` past the embeds would look like a better caret hint
+    /// and would instead move them into the head that surface renders read-only,
+    /// making the one thing keeper just wrote the one thing nobody can delete.
+    #[test]
+    fn the_body_offset_is_the_heading_and_the_writers_line_is_below_the_embeds() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert!(
+            stub.contents[..stub.body_offset].ends_with("---\n\n"),
+            "everything before the offset is keeper's block and its separator"
+        );
+        assert!(
+            stub.contents[stub.body_offset..].starts_with("# Quarterly review\n"),
+            "the offset lands on the heading, which therefore stays editable"
+        );
+
+        let editable = &stub.contents[stub.body_offset..];
+        assert!(
+            editable.contains("![[2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov]]"),
+            "the embeds are inside the editable half, not in the read-only head"
+        );
+        assert!(
+            editable.ends_with("camera-0000.mov]]\n\n"),
+            "the caret at the end of that half sits under the last embed: {editable:?}"
         );
     }
 
