@@ -184,7 +184,10 @@ Without that, editing the seeded Inbox would silently demote it and Restore woul
 
 - `src-tauri/crates/keeper-core/src/notes/default_spaces.rs` — new. `DEFAULT_SPACES`, `plan`,
   `SeedMode`, `ExistingSpace`, `render_note`, `default_key` / `default_key_of`, `parse_ledger` /
-  `render_ledger`, `LEDGER_REL`.
+  `render_ledger`, `LEDGER_REL`, `SPACES_DIR`, and — after the field report — the `SeedVault` port,
+  `SeedOutcome` and the whole `seed` run.
+- `src-tauri/crates/keeper-core/src/notes/naming.rs` — `note_title`, moved out of the shell so the
+  seeder and the index share one three-branch fallback.
 - `src-tauri/crates/keeper-core/src/notes/mod.rs` — one module line.
 - `src-tauri/crates/keeper-core/src/notes/vm.rs` — `NoteSpaceVm.default_key`.
 - `src-tauri/crates/keeper/src/notes_ipc.rs` — `SpaceDef.default_key`; `space_def` reads it through
@@ -216,11 +219,11 @@ Without that, editing the seeded Inbox would silently demote it and Restore woul
 - [x] Tests, each proved by mutating the code it defends.
 
 **Acceptance Criteria:**
-- `cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --lib notes::` — 255 passed
-  (17 of them this story's).
+- `cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --lib notes::` — 267 passed
+  (29 of them this story's, 12 of those driving the real run against a real directory).
 - `bun run test src/components/notes/notes-pane.test.tsx src/components/notes/space-list.test.tsx` —
-  25 passed.
-- `bun run test src/components/notes/ src/lib/stores/notes-filters.test.ts src/hooks` — 555 passed,
+  26 passed.
+- `bun run test src/components/notes/ src/lib/stores/notes-filters.test.ts src/hooks` — 561 passed,
   so collapsing `NoteScope` broke nothing that reads it.
 
 ## Design Notes
@@ -316,6 +319,29 @@ One mutation could not be run as written: replacing both `FirstRun` arms with a 
 `let ledger = match …` unable to infer its `Option<&BTreeSet<String>>`, so the crate does not
 compile. The behaviour it would have tested is covered by the ledger-filter mutation above.
 
+### `keeper-core`, the run against a real directory
+
+Added after the field report. These drive `seed` through the `SeedVault` port against a temp
+directory, so they cover the reads and the error classification the first version could not test.
+
+| Mutation | Tests that caught it |
+|---|---|
+| `read_ledger` maps every read failure to "absent" — **the shipped bug** | `a_ledger_that_cannot_be_opened_is_not_read_as_an_absent_one` |
+| `read_ledger` maps every read failure to a permanent block, `NotFound` included | 8 tests, every one that expects a fresh vault to be seeded |
+| `read_ledger` treats an unparseable ledger as empty | `an_unreadable_ledger_blocks_the_run_with_a_sentence_naming_the_file` |
+| The refusal sentence drops the errno | `a_ledger_that_cannot_be_opened_is_not_read_as_an_absent_one` |
+| `read_existing` swallows the listing error and reads it as "no spaces" — **the second bug** | `a_spaces_directory_that_cannot_be_listed_blocks_the_run_rather_than_reading_as_empty` |
+| `seed` reports an empty write instead of naming the already-satisfied case | `a_second_run_over_the_same_directory_is_already_satisfied_and_says_so`, `a_deleted_default_is_not_resurrected_by_the_next_run` |
+| An unreadable ledger blocks Restore too, so the user cannot repair it | `an_unreadable_ledger_blocks_the_run_with_a_sentence_naming_the_file` |
+| The collision counter forgets the filenames already in `spaces/` | `one_unreadable_space_does_not_take_the_run_down_and_is_not_written_over` |
+| A partly-finished run records nothing, so a deleted default comes back | `a_run_that_stopped_still_recorded_what_landed_so_deleting_it_sticks` |
+
+Two of those mutations survived the first pass and each exposed a genuinely missing test rather than
+dead code: the ledger-read one, because the only unreadable-ledger test used *unparseable JSON* and
+nothing covered a file that cannot be *opened* — which is the class that fits the owner's machine;
+and the record-on-stop one, because the on-disk check alone makes the immediate retry correct and
+only a *later deletion* distinguishes it. Both tests were added, and both mutations now fail.
+
 ### Frontend
 
 | Mutation | Tests that caught it |
@@ -327,7 +353,8 @@ compile. The behaviour it would have tested is covered by the ledger-filter muta
 | `SpaceList` goes back to rendering `null` on an empty list | `shows the restore control on a vault with no spaces at all`, `cannot be pressed with no vault open` |
 | Restore does not re-read the list | `re-reads the list after restoring, so the recreated spaces appear` |
 | Restore claims success when nothing was missing | `says nothing was missing rather than claiming it restored something` |
-| A failed restore is swallowed | `says so when keeper could not write, and leaves the list as it was` |
+| A failed restore is swallowed | `falls back to a plain sentence when the rejection carries no message` |
+| A refusal shows the generic apology instead of the reason Rust gave | `shows the reason keeper gives, naming the file, rather than a generic apology` |
 
 ### The `Today` grep
 
@@ -349,26 +376,29 @@ compile. The behaviour it would have tested is covered by the ledger-filter muta
 **The `keeper` shell crate does not build on Linux.** `pkg-config` is absent and there is no
 `gobject-2.0.pc`; `cargo check -p keeper --lib` fails in the `gobject-sys` build script before a
 single line of keeper's own code is compiled, and this container has no root to install either. So
-every line added to `notes_ipc.rs`, `notes_vault.rs` and `lib.rs` is **unexercised here**, and the
-macOS gate is its first real check. That covers:
+every line in `notes_ipc.rs`, `notes_vault.rs` and `lib.rs` is **unexercised here**, and the macOS
+gate is its first real check.
 
-- `seed_default_spaces` and its hook in `notes_vault::refresh` — including that seeding a vault at
-  registration does not deadlock against the registry lock (the guard is dropped first) and that a
-  newly registered vault is the only one seeded.
-- `apply_default_spaces`, `existing_spaces`, `read_seed_ledger`, `record_seed_ledger` — the actual
-  file IO, the `NotFound`-versus-other error split, and the failure path that records partial
-  progress.
-- `notes_spaces_restore_defaults` and its command registration.
-- `space_def`'s new `default_key`, `notes_spaces` emitting it, and `notes_space_save` carrying the
+After the field report that surface is much smaller, and shrinking it *was* the fix. What is left:
+
+- **The four `VaultSeedFiles` bodies** — `read_to_string`, `read_dir`, the note-versus-ledger write
+  split, and the ULID. One call each. The classification they feed is `keeper-core`'s and is tested
+  against a real directory, including `chmod 000` on both the ledger and `spaces/`.
+- **The `refresh` loop** — that `engine_if_open()` is `Some` by the time `notes_vault::start` runs
+  (read from `start_supervisor`, which builds the engine synchronously before it spawns), that a
+  cold registry sends every vault down the `_` arm, and that seeding after `drop(guard)` cannot
+  deadlock against the registry lock.
+- **`notes_spaces_restore_defaults`** and its command registration.
+- **`space_def`'s `default_key`**, `notes_spaces` emitting it, and `notes_space_save` carrying the
   marker through the splice.
-- `notes_vault::title_of_source` and `write_vault_file`.
+- **`write_vault_file`**, and that `contained` accepts `.keeper-spaces.json` — its `is_internal`
+  check is an exact `==` against `.keeper`, read rather than run.
 
-Three specific claims are therefore **asserted but not run**: that `.keeper-spaces.json` at a vault
-root is not excluded by `keeper-sync`'s tier-0 corpus (read from `exclude.rs`'s own
-`sub/.keeperrc` test rather than observed); that it never enters the note index (read from `walk`'s
-`rel.ends_with(".md")` filter rather than observed); and that Obsidian hides it. The first two are
-one-line reads of code in this repo; the third is a fact about another application and nothing here
-can prove it.
+Three specific claims are **asserted but not run**: that `.keeper-spaces.json` at a vault root is
+not excluded by `keeper-sync`'s tier-0 corpus (read from `exclude.rs`'s own `sub/.keeperrc` test
+rather than observed); that it never enters the note index (read from `walk`'s `rel.ends_with(".md")`
+filter rather than observed); and that Obsidian hides it. The first two are one-line reads of code in
+this repo; the third is a fact about another application and nothing here can prove it.
 
 **Nothing was driven in a browser.** The rail, the Restore control and its three sentences are
 asserted through jsdom: accessible names, `disabled`, the exact `notesSpacesRestoreDefaults` call and
@@ -383,6 +413,95 @@ a query it does not know rather than matching everything — a fake that shrugge
 lens into a green test. The remaining untested link is the last one: that `render_note`'s bytes reach
 the file and come back as a `NoteSpaceVm` with the right `defaultKey`. That is shell code, and it is
 on the macOS gate with the rest.
+
+## Postmortem: it gated green and did nothing
+
+The first version of this story passed on Linux and macOS with zero binding drift, was installed on
+the owner's machine, and **wrote nothing into their vault and logged nothing about it**. 305k lines
+of debug log contained neither the `info!` for a successful seed nor the `warn!` for a failed one.
+
+### The defect
+
+`apply_default_spaces` had a silent arm. It returned `Result<Vec<String>, String>`, and an empty
+`Ok` meant two opposite things: *the vault already has every default* and *keeper could not read
+something, so it declined*. `seed_default_spaces` matched that with `Ok(_) => {}`. A feature that
+declines to act has to say so; this one could not, so a field report of "it did nothing" was
+unanswerable from the log.
+
+Underneath the silence, one read was classified wrongly and one was not classified at all:
+
+- **`read_seed_ledger` mapped every `io::Error` except `NotFound` to "keeper cannot tell", and
+  "cannot tell" to a permanent, silent no-op.** On a vault sitting on removable media that is the
+  likely class: `EACCES` from macOS TCC on `/Volumes`, `EIO` from a drive that spun down. Being
+  timid about *writing* is right — that is the AD-79 argument and it stands. Being timid about
+  *saying* is what shipped the invisibility.
+- **`existing_spaces` read `spaces/` through `notes_vault::siblings`, which `unwrap_or_default()`s
+  the listing error.** That is the same conflation in the opposite direction and nobody had noticed
+  it: a sleeping USB volume would have read as "this vault has no spaces" and written a second Inbox
+  beside the first. Found while building the harness below, not by the field report.
+
+### What was ruled out, and how
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| The presence rule matched the owner's four `recordings · first-recording` spaces | **Disproved on disk** | `the_owners_vault_gets_its_four_defaults_beside_the_four_spaces_it_already_had` builds their exact `spaces/` in a temp directory with no ledger and asserts all four defaults are written. `naming::slug` folds their name to `recordings-first-recording`, which equals no default. |
+| `refresh` never reached the hook | **Disproved by reading, then removed as a possibility** | `sync::start_supervisor` calls `engine(platform)` **synchronously** and fills the slot before spawning, so `engine_if_open()` is `Some` on the next line where `notes_vault::start` runs; a cold registry then sends every vault down the `_` arm. The freshness dependency is deleted anyway — see below. |
+| The ledger read declined | **The only path left, and it cannot be narrowed further from here** | Three sub-causes fit every measurement: a non-`NotFound` errno, a ledger present and unparseable, and a ledger present and *correct* because an earlier run seeded and the notes were later removed. The third is invisible in sync activity because `record_seed_ledger` writes through `write_vault_file`, which deliberately skips `touch`/`mark_dirty` — which is exactly why the "no `spaces/` writes" and "`file_state` is 0" greps came back clean. |
+
+**The honest statement: I cannot separate those three from this host.** What I can do is make the
+next launch say which one it was in one line, and make two of the three impossible to be permanent.
+
+### The fix
+
+- **`SeedOutcome` has four arms and no silent one**: `Wrote(paths)`, `AlreadySatisfied`,
+  `Blocked(sentence)`, `Stopped { written, reason }`. The shell logs each — `info`, `debug`, `warn`,
+  `warn` — and a refusal names the file *and* the errno.
+- **A refusal records nothing, so the next refresh retries.** It is a pause, not a verdict.
+- **`spaces/` that cannot be listed now blocks** instead of reading as "no spaces".
+- **Restore is never blocked by an unreadable ledger** and repairs it: the user is looking at the
+  rail, and the ledger's job is to stop keeper acting *on its own*.
+- **The refusal reaches the user.** `SpaceList` shows Rust's sentence rather than the generic
+  apology, because ".keeper-spaces.json could not be read (permission denied)" sends someone to the
+  file and "keeper couldn't restore the default spaces" sends them to a bug report.
+- **Seeding runs for every registered vault on every refresh, not only a newly registered one.** The
+  run plans against what is on disk and refuses to write when it cannot read, so repeating it is
+  free. The freshness filter bought one `read_dir` per refresh and cost the second chance — the
+  difference between a vault that heals itself and one that needs a menu item the user has no reason
+  to press.
+
+### The test that would have caught it
+
+The repo's recurring lesson landed exactly on this story: **every assertion was below `plan`, and
+all the risk was above it.** `plan` is a pure function over hand-placed values; the vault is a
+directory on a pendrive.
+
+So the reads are now a port, `default_spaces::SeedVault` — `read`, `list`, `write`, plus the id and
+the two clocks — and the whole run is `default_spaces::seed`, in a crate that builds on every host.
+The shell's adapter is four bodies of one call each. Twelve tests drive the real run against a real
+temp directory with real permission bits, including:
+
+- the owner's vault, reproduced from the field report;
+- a ledger `chmod 000` — the class that fits removable media, and the case that had **no test at
+  all** before;
+- a `spaces/` `chmod 000`;
+- one unreadable space among readable ones;
+- an unplugged drive mid-write, and the same again after the user deletes what landed.
+
+`contained`'s refusal is mapped to `io::Error::other` in the adapter rather than to `NotFound`, so a
+containment refusal can never again arrive at the seeder disguised as an absence.
+
+### What is still unprovable here
+
+The four adapter bodies and the `refresh` loop. That is a much smaller surface than the previous
+version's — the ledger read, the directory read, the error classification, the plan, the filename
+allocation, the write order and the ledger record all moved into tested code — but it is not zero,
+and the macOS gate is still their first real check.
+
+**And the diagnosis itself is not closed.** If the next launch on the owner's machine logs
+`notes: default spaces already settled for this vault`, the cause was a ledger that was there and
+correct, and the recovery is Restore. If it logs `notes: did not seed the default spaces`, the
+sentence names the file and the errno. Either way it is one grep, which is what this story owed and
+did not deliver the first time.
 
 ## Deliberately NOT Done
 

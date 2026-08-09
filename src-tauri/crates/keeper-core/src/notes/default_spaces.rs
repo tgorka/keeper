@@ -122,16 +122,23 @@ pub fn by_key(key: &str) -> Option<&'static DefaultSpace> {
 
 /// A space the vault already has, as the seeder needs to see it.
 ///
-/// Two fields because there are two ways a default can already be present: it
-/// is one keeper wrote (`default_key`), or it is one the *user* wrote and gave
-/// the same name to (`name`). The second is not hypothetical — a person who
-/// wanted an Inbox before keeper shipped one built it themselves.
+/// `default_key` and `name` are the two ways a default can already be present:
+/// it is one keeper wrote, or it is one the *user* wrote and gave the same name
+/// to. The second is not hypothetical — a person who wanted an Inbox before
+/// keeper shipped one built it themselves.
+///
+/// `filename` is not part of that decision. It is here because the collision
+/// counter needs the names that are taken, and taking them from the same
+/// listing that answered the presence question is what stops a seed writing
+/// over a space it just decided not to touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingSpace {
     /// `keeper.default` from the note's frontmatter, when it carries one.
     pub default_key: Option<String>,
     /// The space's displayed name.
     pub name: String,
+    /// The note's own file name inside `spaces/`, e.g. `2026-08-08-inbox.md`.
+    pub filename: String,
 }
 
 /// Why keeper is writing defaults right now.
@@ -187,6 +194,203 @@ pub fn plan(
         .filter(|space| !taken_names.contains(&naming::slug(space.name)))
         .collect()
 }
+
+/// The vault directory, as the seeder needs it.
+///
+/// **This port exists because Story 44.3 shipped green and did nothing.** Every
+/// test the story wrote drove [`plan`] with hand-placed inputs, and the whole
+/// risk lived one layer out: reading a ledger off a pendrive, listing a
+/// directory that might be asleep, and deciding what an `io::Error` means. Those
+/// three reads are now behind four method signatures, so the run that decides
+/// whether to write into somebody's vault can be driven against a real
+/// directory — with real permission bits — in a crate that builds on every host.
+///
+/// What is left in the shell is the four bodies, and each is one `std::fs` call
+/// or one existing `notes_vault` function.
+pub trait SeedVault {
+    /// Read a vault-relative file.
+    ///
+    /// The `io::Error` is handed back whole rather than folded into an
+    /// `Option`, because [`seed`] treats `NotFound` and everything else as
+    /// opposite answers and a caller that flattened them would put the bug back.
+    fn read(&self, rel: &str) -> std::io::Result<String>;
+    /// The file names directly inside a vault-relative directory, same contract.
+    fn list(&self, rel_dir: &str) -> std::io::Result<Vec<String>>;
+    /// Write a vault-relative file, creating parents.
+    fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()>;
+    /// A fresh note id, and the two stamps a new note carries.
+    fn new_id(&mut self) -> String;
+    fn now_local(&self) -> String;
+    fn today(&self) -> String;
+}
+
+/// What one seed run did, and — when it did nothing — why.
+///
+/// There is no silent arm. The original shipped with `Ok(Vec<String>)` and an
+/// empty vector meaning both "already satisfied" and "could not tell, so I
+/// declined", which is how a feature can be green on two hosts and invisible in
+/// the log of the machine it failed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// Wrote these vault-relative paths, in [`DEFAULT_SPACES`] order.
+    Wrote(Vec<String>),
+    /// The vault already has every default this run would have offered.
+    AlreadySatisfied,
+    /// Wrote nothing, deliberately, because something could not be read. The
+    /// string is the sentence for the log. Nothing is recorded, so the next
+    /// registration tries again.
+    Blocked(String),
+    /// Wrote some and then stopped. What landed is recorded.
+    Stopped {
+        written: Vec<String>,
+        reason: String,
+    },
+}
+
+/// Run the seed against a vault.
+///
+/// The order is forced: read the ledger, read `spaces/`, plan, write, record.
+/// Reading `spaces/` from the **directory** rather than the index is what makes
+/// this correct on a vault registered a millisecond ago, and what makes a
+/// half-written seed converge instead of doubling — see [`plan`].
+///
+/// **A read that fails is not an empty answer.** Both reads distinguish "absent"
+/// from "could not tell":
+///
+/// - No ledger means never seeded; an unreadable one means keeper does not know
+///   what this vault has been offered, and writing four notes on that basis is
+///   the AD-79 failure.
+/// - No `spaces/` means no spaces; an unlistable one means keeper cannot see
+///   what is there, and writing four notes on that basis puts a second Inbox in
+///   a vault that already had one.
+///
+/// The first version of this got the second case wrong in the other direction —
+/// it swallowed the listing error and read it as "no spaces" — which on a
+/// sleeping USB volume is a duplicate rail. Both now decline and say so.
+pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
+    let offered = match read_ledger(vault) {
+        Ok(offered) => offered,
+        Err(reason) => {
+            // Restore is the user asking, and they are looking at the rail: an
+            // unreadable ledger must not stop them repairing it.
+            if mode == SeedMode::FirstRun {
+                return SeedOutcome::Blocked(reason);
+            }
+            None
+        }
+    };
+    let existing = match read_existing(vault) {
+        Ok(existing) => existing,
+        Err(reason) => return SeedOutcome::Blocked(reason),
+    };
+
+    let planned = plan(mode, &existing, offered.as_ref());
+    if planned.is_empty() {
+        return SeedOutcome::AlreadySatisfied;
+    }
+
+    // One listing for the whole run, grown as each name is taken, so two
+    // defaults written in the same pass cannot be handed one filename.
+    let mut taken: Vec<String> = existing
+        .iter()
+        .map(|space| space.filename.clone())
+        .collect();
+    let mut keys: BTreeSet<String> = offered.unwrap_or_default();
+    let mut written = Vec::new();
+    for space in planned {
+        let filename = naming::note_filename(space.name, &vault.today(), &taken);
+        let rel = format!("{SPACES_DIR}/{filename}");
+        let id = vault.new_id();
+        let note = render_note(space, &id, &vault.now_local());
+        if let Err(error) = vault.write(&rel, &note) {
+            // Record what did land before giving up: a full disk halfway
+            // through must not be retried as "write all four again".
+            keys_recorded(vault, &keys);
+            return SeedOutcome::Stopped {
+                written,
+                reason: format!("{rel}: {error}"),
+            };
+        }
+        taken.push(filename);
+        keys.insert(space.key.to_owned());
+        written.push(rel);
+    }
+    keys_recorded(vault, &keys);
+    SeedOutcome::Wrote(written)
+}
+
+/// Write the ledger, best effort.
+///
+/// A failure here is not a failure of the run: the notes are on disk, and the
+/// worst case is that the next launch re-offers a default the on-disk check will
+/// refuse anyway.
+fn keys_recorded(vault: &mut dyn SeedVault, keys: &BTreeSet<String>) {
+    let text = render_ledger(keys);
+    let _ = vault.write(LEDGER_REL, &text);
+}
+
+/// The keys this vault has already been offered, or the sentence explaining why
+/// keeper cannot tell.
+///
+/// `Ok(None)` is impossible on purpose — an absent ledger is `Ok(Some(empty))`,
+/// which is a fact, not an absence of one.
+fn read_ledger(vault: &dyn SeedVault) -> Result<Option<BTreeSet<String>>, String> {
+    match vault.read(LEDGER_REL) {
+        Ok(text) => match parse_ledger(&text) {
+            Some(keys) => Ok(Some(keys)),
+            None => Err(format!(
+                "{LEDGER_REL} is there and is not a seed ledger; leaving this vault's spaces alone"
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(BTreeSet::new())),
+        Err(error) => Err(format!(
+            "{LEDGER_REL} could not be read ({error}); leaving this vault's spaces alone"
+        )),
+    }
+}
+
+/// The spaces already in `spaces/`, or the sentence explaining why keeper cannot
+/// tell.
+///
+/// A directory that is not there is not an error: `spaces/` is created lazily,
+/// and a vault without one has no spaces. A directory that is there and cannot
+/// be listed is an error, because "I saw nothing" and "I could not look" lead to
+/// opposite writes.
+///
+/// A single unreadable *file* inside it is neither: it is one space keeper
+/// cannot identify, and it contributes a name that matches no default rather
+/// than taking the whole run down. That is the conservative direction here —
+/// the run still cannot write over it, because its filename is in `taken`.
+fn read_existing(vault: &dyn SeedVault) -> Result<Vec<ExistingSpace>, String> {
+    let names = match vault.list(SPACES_DIR) {
+        Ok(names) => names,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(format!(
+                "{SPACES_DIR}/ is there and could not be listed ({error}); leaving this vault's spaces alone"
+            ))
+        }
+    };
+    Ok(names
+        .into_iter()
+        .filter(|name| name.ends_with(".md"))
+        .map(|filename| {
+            let rel = format!("{SPACES_DIR}/{filename}");
+            let source = vault.read(&rel).unwrap_or_default();
+            let (fm, body_offset) = Frontmatter::parse(&source);
+            let stem = filename.strip_suffix(".md").unwrap_or(&filename);
+            ExistingSpace {
+                default_key: default_key_of(&source),
+                name: naming::note_title(fm.as_string("title"), &source[body_offset..], stem),
+                filename,
+            }
+        })
+        .collect())
+}
+
+/// Where a space note lives, named here because [`seed`] composes the path and
+/// the shell must not compose a second one.
+pub const SPACES_DIR: &str = "spaces";
 
 /// The note keeper writes for one default.
 ///
@@ -291,7 +495,115 @@ mod tests {
         ExistingSpace {
             default_key: default_key.map(str::to_owned),
             name: name.to_owned(),
+            filename: format!("{}.md", naming::slug(name)),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A real directory, driven through the real port
+    //
+    // Story 44.3 shipped with every assertion below `plan` and none above it,
+    // and it did nothing on the owner's vault. These tests exist so the run
+    // that decides whether to write into somebody's vault is exercised against
+    // a filesystem, with real permission bits, on the host it is written on.
+    // -----------------------------------------------------------------------
+
+    /// The production adapter, spelt out: four `std::fs` calls and two clocks.
+    /// The shell's own impl is the same four calls over `notes_vault`.
+    struct DiskVault {
+        root: std::path::PathBuf,
+        ids: u32,
+        /// Every `write` the run attempted, in order, whether or not it landed.
+        attempted: Vec<String>,
+        /// A path whose write is refused, to stand in for a full disk.
+        refuse: Option<String>,
+    }
+
+    impl DiskVault {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                root,
+                ids: 0,
+                attempted: Vec::new(),
+                refuse: None,
+            }
+        }
+    }
+
+    impl SeedVault for DiskVault {
+        fn read(&self, rel: &str) -> std::io::Result<String> {
+            std::fs::read_to_string(self.root.join(rel))
+        }
+        fn list(&self, rel_dir: &str) -> std::io::Result<Vec<String>> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(self.root.join(rel_dir))? {
+                out.push(entry?.file_name().to_string_lossy().into_owned());
+            }
+            out.sort();
+            Ok(out)
+        }
+        fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()> {
+            self.attempted.push(rel.to_owned());
+            if self.refuse.as_deref() == Some(rel) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "no space left on device",
+                ));
+            }
+            let path = self.root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)
+        }
+        fn new_id(&mut self) -> String {
+            self.ids += 1;
+            format!("01J8ZQ4M7T5R9V3XK2B6C0DF{:02}", self.ids)
+        }
+        fn now_local(&self) -> String {
+            "2026-08-09T10:00:00+02:00".to_owned()
+        }
+        fn today(&self) -> String {
+            "2026-08-09".to_owned()
+        }
+    }
+
+    fn temp_vault() -> DiskVault {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "keeper-default-spaces-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp vault");
+        DiskVault::new(dir)
+    }
+
+    /// Put a space note in `spaces/`, the way `notes_space_save` writes one:
+    /// no `title` key, the name as the body's heading.
+    fn put_space(vault: &DiskVault, filename: &str, name: &str, query: &str) {
+        let dir = vault.root.join(SPACES_DIR);
+        std::fs::create_dir_all(&dir).expect("spaces/");
+        let text = format!(
+            "---\nid: 01USER{filename}\ncreated: 2026-08-08T09:00:00+02:00\nkeeper:\n  space: '{query}'\n  sort: modified desc\n  limit: 500\n---\n\n# {name}\n"
+        );
+        std::fs::write(dir.join(filename), text).expect("write a space");
+    }
+
+    /// The space names sitting in `spaces/`, read back the way the rail reads
+    /// them. The independent side of every assertion below.
+    fn names_on_disk(vault: &DiskVault) -> Vec<String> {
+        let mut out: Vec<String> = read_existing(vault)
+            .expect("spaces/ lists")
+            .into_iter()
+            .map(|space| space.name)
+            .collect();
+        out.sort();
+        out
     }
 
     fn keys(of: &[&'static DefaultSpace]) -> Vec<&'static str> {
@@ -608,5 +920,402 @@ mod tests {
             naming::title_from_body(note.split("---\n").nth(2).expect("a body")),
             "Recordings"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The run, against a real directory
+    // -----------------------------------------------------------------------
+
+    /// The owner's vault, reproduced from the field report: four saved filters
+    /// under `spaces/`, made from the Recordings lens on 2026-08-08, and no
+    /// ledger. The installed build wrote nothing here and logged nothing.
+    ///
+    /// This is the test that would have caught it. It fails on any run that
+    /// declines silently, because `AlreadySatisfied` and `Blocked` are different
+    /// values and neither is `Wrote`.
+    #[test]
+    fn the_owners_vault_gets_its_four_defaults_beside_the_four_spaces_it_already_had() {
+        let mut vault = temp_vault();
+        for (n, filename) in [
+            "2026-08-08-recordings-first-recording.md",
+            "2026-08-08-recordings-first-recording-2.md",
+            "2026-08-08-recordings-first-recording-3.md",
+            "2026-08-08-recordings-first-recording-4.md",
+        ]
+        .iter()
+        .enumerate()
+        {
+            put_space(
+                &vault,
+                filename,
+                &format!("Recordings · first-recording{}", " ".repeat(n)),
+                "is:recording tag:first-recording",
+            );
+        }
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+
+        assert_eq!(
+            outcome,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-inbox.md".to_owned(),
+                "spaces/2026-08-09-journal.md".to_owned(),
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ])
+        );
+        // Their four are still there, untouched, beside keeper's four. Sorted,
+        // so keeper's bare "Recordings" comes before their "Recordings · …".
+        let names = names_on_disk(&vault);
+        assert_eq!(names.len(), 8, "{names:?}");
+        assert_eq!(&names[..4], ["Inbox", "Journal", "Pinned", "Recordings"]);
+        for theirs in &names[4..] {
+            assert!(
+                theirs.starts_with("Recordings · first-recording"),
+                "{theirs}"
+            );
+        }
+    }
+
+    /// A fresh vault with no `spaces/` at all. An absent directory is not a
+    /// failure to read one.
+    #[test]
+    fn a_vault_with_no_spaces_directory_is_seeded_rather_than_declined() {
+        let mut vault = temp_vault();
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        assert!(
+            matches!(&outcome, SeedOutcome::Wrote(w) if w.len() == 4),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox", "Journal", "Pinned", "Recordings"]
+        );
+    }
+
+    /// Twice in a row writes nothing the second time, and says which of the two
+    /// silences it is.
+    #[test]
+    fn a_second_run_over_the_same_directory_is_already_satisfied_and_says_so() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(names_on_disk(&vault).len(), 4, "nothing doubled");
+    }
+
+    /// The story's own acceptance, now against files: delete one and reopen.
+    #[test]
+    fn a_deleted_default_is_not_resurrected_by_the_next_run() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        std::fs::remove_file(vault.root.join("spaces/2026-08-09-pinned.md")).expect("delete");
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(names_on_disk(&vault), ["Inbox", "Journal", "Recordings"]);
+
+        // And restore brings back exactly the one that is gone.
+        assert_eq!(
+            seed(&mut vault, SeedMode::Restore),
+            SeedOutcome::Wrote(vec!["spaces/2026-08-09-pinned.md".to_owned()])
+        );
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox", "Journal", "Pinned", "Recordings"]
+        );
+    }
+
+    /// The unplugged drive: two notes landed, the ledger never did. The next run
+    /// finishes the job rather than repeating the first two.
+    #[test]
+    fn a_half_written_seed_on_disk_converges_without_doubling() {
+        let mut vault = temp_vault();
+        vault.refuse = Some("spaces/2026-08-09-pinned.md".to_owned());
+        let stopped = seed(&mut vault, SeedMode::FirstRun);
+        assert!(
+            matches!(&stopped, SeedOutcome::Stopped { written, reason }
+                if written.len() == 2 && reason.contains("pinned")),
+            "{stopped:?}"
+        );
+
+        vault.refuse = None;
+        vault.attempted.clear();
+        let finished = seed(&mut vault, SeedMode::FirstRun);
+        assert_eq!(
+            finished,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ])
+        );
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox", "Journal", "Pinned", "Recordings"]
+        );
+    }
+
+    /// A ledger keeper cannot read blocks the automatic run — and **says which
+    /// file and why**. Silence here is what made the field report unanswerable.
+    #[test]
+    fn an_unreadable_ledger_blocks_the_run_with_a_sentence_naming_the_file() {
+        let mut vault = temp_vault();
+        std::fs::write(vault.root.join(LEDGER_REL), "{ this is not json").expect("write");
+
+        match seed(&mut vault, SeedMode::FirstRun) {
+            SeedOutcome::Blocked(why) => {
+                assert!(why.contains(LEDGER_REL), "{why}");
+                assert!(why.contains("not a seed ledger"), "{why}");
+            }
+            other => panic!("expected a spoken refusal, got {other:?}"),
+        }
+        assert!(names_on_disk(&vault).is_empty(), "nothing was written");
+
+        // The user pressing Restore is not blocked by it, and repairs it.
+        let repaired = seed(&mut vault, SeedMode::Restore);
+        assert!(
+            matches!(&repaired, SeedOutcome::Wrote(w) if w.len() == 4),
+            "{repaired:?}"
+        );
+        assert_eq!(
+            parse_ledger(&std::fs::read_to_string(vault.root.join(LEDGER_REL)).expect("read")),
+            Some(
+                ["inbox", "journal", "pinned", "recordings"]
+                    .iter()
+                    .map(|k| (*k).to_owned())
+                    .collect()
+            )
+        );
+    }
+
+    /// **The one the field report needed.** A ledger that exists and cannot be
+    /// *opened* — not one that fails to parse — is the class that fits a vault
+    /// on removable media: EACCES from macOS TCC on `/Volumes`, EIO from a drive
+    /// that spun down. The shipped code mapped every `io::Error` except
+    /// `NotFound` to a silent permanent no-op, and no test distinguished an
+    /// unopenable file from an absent one, which is precisely why it went green
+    /// on two hosts and wrote nothing on the owner's.
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_cannot_be_opened_is_not_read_as_an_absent_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut vault = temp_vault();
+        let path = vault.root.join(LEDGER_REL);
+        std::fs::write(&path, render_ledger(&ledger(&["inbox"]))).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("restore");
+
+        match &outcome {
+            SeedOutcome::Blocked(why) => {
+                assert!(why.contains(LEDGER_REL), "{why}");
+                assert!(why.contains("could not be read"), "{why}");
+                // The errno is in the sentence, so the next field report is one
+                // grep rather than three candidates.
+                assert!(
+                    why.to_lowercase().contains("permission"),
+                    "the reason has to name the errno: {why}"
+                );
+            }
+            other => panic!("expected a spoken refusal, got {other:?}"),
+        }
+        assert!(
+            names_on_disk(&vault).is_empty(),
+            "an unreadable ledger must not become 'never seeded'"
+        );
+
+        // And it is not permanent: once the file is readable the next run
+        // proceeds, honouring what the ledger actually said.
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-journal.md".to_owned(),
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ]),
+            "Inbox was already offered; the other three were not"
+        );
+    }
+
+    /// A run that stopped part way still records what landed, so a default that
+    /// was written and then deleted stays deleted.
+    ///
+    /// The on-disk check alone makes the *immediate* retry correct, which is why
+    /// this needs its own test: without the record, deleting the two notes that
+    /// did land would make the next automatic run write them again — keeper
+    /// putting back rows the user threw away, which is the AD-79 failure arriving
+    /// through the crash path instead of the happy one.
+    #[test]
+    fn a_run_that_stopped_still_recorded_what_landed_so_deleting_it_sticks() {
+        let mut vault = temp_vault();
+        vault.refuse = Some("spaces/2026-08-09-pinned.md".to_owned());
+        let stopped = seed(&mut vault, SeedMode::FirstRun);
+        assert!(matches!(&stopped, SeedOutcome::Stopped { written, .. } if written.len() == 2));
+
+        assert_eq!(
+            parse_ledger(&std::fs::read_to_string(vault.root.join(LEDGER_REL)).expect("recorded")),
+            Some(
+                ["inbox", "journal"]
+                    .iter()
+                    .map(|k| (*k).to_owned())
+                    .collect()
+            ),
+            "the two that landed were recorded before the run gave up"
+        );
+
+        // The user throws both away. The drive comes back. Nothing returns.
+        vault.refuse = None;
+        std::fs::remove_file(vault.root.join("spaces/2026-08-09-inbox.md")).expect("delete");
+        std::fs::remove_file(vault.root.join("spaces/2026-08-09-journal.md")).expect("delete");
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ])
+        );
+        assert_eq!(names_on_disk(&vault), ["Pinned", "Recordings"]);
+    }
+
+    /// The bug the first version had in the other direction. A `spaces/` that is
+    /// there and cannot be listed must not read as "this vault has no spaces" —
+    /// on a sleeping USB volume that writes a second Inbox beside the first.
+    #[cfg(unix)]
+    #[test]
+    fn a_spaces_directory_that_cannot_be_listed_blocks_the_run_rather_than_reading_as_empty() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-08-inbox.md", "Inbox", "is:untagged");
+        let dir = vault.root.join(SPACES_DIR);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore");
+
+        match outcome {
+            SeedOutcome::Blocked(why) => {
+                assert!(why.contains("spaces/"), "{why}");
+                assert!(why.contains("could not be listed"), "{why}");
+            }
+            other => panic!("expected a spoken refusal, got {other:?}"),
+        }
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox"],
+            "their Inbox is alone and untouched"
+        );
+    }
+
+    /// One space inside `spaces/` that cannot be read is not the whole vault.
+    /// It contributes a name that matches no default, and its filename is still
+    /// taken, so the run cannot write over it.
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_space_does_not_take_the_run_down_and_is_not_written_over() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-09-inbox.md", "Inbox", "is:untagged");
+        let file = vault.root.join("spaces/2026-08-09-inbox.md");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("restore");
+
+        // Its name is unreadable, so Inbox is not stood down by name — but the
+        // filename it holds is, so keeper's Inbox lands beside it under a
+        // counter rather than on top of it.
+        assert_eq!(
+            outcome,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-inbox-2.md".to_owned(),
+                "spaces/2026-08-09-journal.md".to_owned(),
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ])
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .expect("still readable now")
+                .contains("01USER"),
+            "the unreadable space was not overwritten"
+        );
+    }
+
+    /// A user space really called Inbox, on disk, with no marker. keeper stands
+    /// down and writes the other three.
+    #[test]
+    fn a_user_space_named_inbox_on_disk_stands_keepers_inbox_down() {
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-08-inbox.md", "Inbox", "tag:unfiled");
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+
+        assert_eq!(
+            outcome,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-journal.md".to_owned(),
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+            ])
+        );
+        // Theirs is byte-identical: keeper never edits a space it did not write.
+        let theirs = std::fs::read_to_string(vault.root.join("spaces/2026-08-08-inbox.md"))
+            .expect("still there");
+        assert!(theirs.contains("tag:unfiled"), "{theirs}");
+        assert!(!theirs.contains("default:"), "{theirs}");
+    }
+
+    /// The seeded notes are readable as spaces by the code that reads spaces —
+    /// which is what makes the rail render them at all.
+    #[test]
+    fn what_the_seed_wrote_reads_back_as_four_marked_defaults() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+
+        let read = read_existing(&vault).expect("spaces/ lists");
+        let mut marked: Vec<(String, String)> = read
+            .into_iter()
+            .filter_map(|space| space.default_key.map(|key| (key, space.name)))
+            .collect();
+        marked.sort();
+        assert_eq!(
+            marked,
+            vec![
+                ("inbox".to_owned(), "Inbox".to_owned()),
+                ("journal".to_owned(), "Journal".to_owned()),
+                ("pinned".to_owned(), "Pinned".to_owned()),
+                ("recordings".to_owned(), "Recordings".to_owned()),
+            ]
+        );
+        for space in &DEFAULT_SPACES {
+            let text = std::fs::read_to_string(
+                vault
+                    .root
+                    .join(format!("spaces/2026-08-09-{}.md", naming::slug(space.name))),
+            )
+            .expect("the seeded note is where the outcome said it is");
+            let after = &text[text.find("space: ").map_or(0, |i| i + 7)..];
+            let query = after.lines().next().unwrap_or_default();
+            assert!(
+                query::parse(query).is_ok(),
+                "the seeded query must parse: {query}"
+            );
+        }
     }
 }

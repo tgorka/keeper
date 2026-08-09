@@ -25,6 +25,7 @@ import { SpaceEditor, spaceIcon } from "@/components/notes/space-editor";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** The subtitle a space with an unparseable query carries, kept verbatim. */
@@ -82,6 +83,12 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
    * sends the ask and reports the count. Deciding it here would need the space
    * list *and* the seed ledger in the webview, and the ledger is a fact about
    * the vault on disk.
+   *
+   * A refusal carries Rust's own sentence rather than the generic one, because
+   * the sentence names the file it could not read. That is the difference
+   * between "keeper couldn't restore the default spaces" — which sends someone
+   * to a bug report — and "`.keeper-spaces.json` could not be read (permission
+   * denied)", which sends them to the file.
    */
   const restore = useCallback(() => {
     if (vaultId === null) {
@@ -100,7 +107,7 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
         );
         reload();
       })
-      .catch(() => setRestoreResult(RESTORE_FAILED))
+      .catch((raw: unknown) => setRestoreResult(syncErrorMessage(raw, RESTORE_FAILED)))
       .finally(() => setRestoring(false));
   }, [vaultId, reload]);
 

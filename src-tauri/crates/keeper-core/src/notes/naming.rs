@@ -170,6 +170,31 @@ pub fn title_from_body(body: &str) -> String {
     String::new()
 }
 
+/// A note's title as every surface shows it: an explicit frontmatter `title`,
+/// else the first heading or line of the body, else the filename stem — which is
+/// what Obsidian shows.
+///
+/// The rule lives here rather than in the shell because two callers need it and
+/// one of them cannot use the other's. The index computes it while building an
+/// `IndexEntry`; the default-space seeder needs it for a note it has just read
+/// off the disk, on a vault that has no index yet (Story 44.3). Two copies of a
+/// three-branch fallback is exactly the kind of drift nobody notices until a
+/// seeded space stands down against a name only one of them can see.
+pub fn note_title(frontmatter_title: Option<&str>, body: &str, stem: &str) -> String {
+    if let Some(title) = frontmatter_title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    let from_body = title_from_body(body);
+    if from_body.trim().is_empty() {
+        stem.to_owned()
+    } else {
+        from_body
+    }
+}
+
 /// Follow a retitle into the body's opening heading — but only into the heading
 /// keeper itself wrote. `None` means the caller must leave the body alone.
 ///

@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
+use keeper_core::notes::default_spaces::{self, SPACES_DIR};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
 use keeper_core::notes::vm::{
@@ -41,7 +42,7 @@ use keeper_core::notes::vm::{
     NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm,
     NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
-use keeper_core::notes::{default_spaces, naming, query, search, templates, NotesError};
+use keeper_core::notes::{naming, query, search, templates, NotesError};
 use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
@@ -85,8 +86,11 @@ const MAX_LINK_TARGETS: usize = 30;
 /// an icon. Lucide's longest name is well under this.
 const MAX_ICON_BYTES: usize = 64;
 
-/// The vault-relative directories keeper creates lazily, on first use.
-const SPACES_DIR: &str = "spaces";
+/// The vault-relative template directory keeper creates lazily, on first use.
+///
+/// `spaces/` has no twin here: it is `keeper-core`'s `SPACES_DIR`, because the
+/// seeder composes paths under it and two constants spelling one directory is a
+/// rename waiting to half-land.
 const TEMPLATES_DIR: &str = "templates";
 
 // ---------------------------------------------------------------------------
@@ -966,147 +970,145 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
 // Default spaces (Story 44.3, FR-156, AD-79)
 // ---------------------------------------------------------------------------
 
-/// Seed this vault's default spaces if it has never been offered them.
+/// The vault directory, as `keeper-core`'s seeder reads and writes it.
 ///
-/// Called from `notes_vault::refresh` for every newly registered vault, and
-/// from nowhere else — the frontend does not drive this, because a vault that
-/// is only ever reached from the tray or the capture window has to be seeded
-/// too.
-///
-/// **It does not wait for the index.** `notes_spaces` reads a snapshot, and on a
-/// vault registered a millisecond ago that snapshot is empty; seeding off it
-/// would write four notes into a vault that already has them. So the question
-/// "what is in `spaces/`" is asked of the directory, which is true immediately
-/// and is also the only source that stays true when the drive is unplugged
-/// halfway through a write.
-///
-/// Best-effort by construction: this runs on a startup path with nobody to show
-/// an error to, and a vault that could not be seeded is a vault with fewer rows
-/// in its rail, not a broken one. "Restore default spaces" is the retry.
-pub fn seed_default_spaces(vault: &Vault) {
-    match apply_default_spaces(vault, default_spaces::SeedMode::FirstRun) {
-        Ok(written) if !written.is_empty() => {
-            tracing::info!(vault = %vault.id, count = written.len(), "notes: seeded default spaces");
+/// **Every body here is one call.** That is the point: Story 44.3 first shipped
+/// with the ledger read, the directory read, the error classification and the
+/// write loop all in this file, all unbuildable on Linux, and it went green on
+/// two hosts and did nothing on the owner's vault. The run is
+/// [`default_spaces::seed`]'s now, exercised against a real directory in a crate
+/// that builds everywhere, and what is left unprovable here is four one-liners.
+struct VaultSeedFiles<'a> {
+    vault: &'a Vault,
+}
+
+impl default_spaces::SeedVault for VaultSeedFiles<'_> {
+    fn read(&self, rel: &str) -> std::io::Result<String> {
+        // `contained` refuses a path that leaves the vault. Its refusal is not
+        // an absence, so it must not arrive at the seeder as `NotFound` — that
+        // is the shape of the bug this whole rewrite exists to make impossible.
+        let path = notes_vault::contained(self.vault, rel)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        std::fs::read_to_string(path)
+    }
+
+    fn list(&self, rel_dir: &str) -> std::io::Result<Vec<String>> {
+        let path = notes_vault::contained(self.vault, rel_dir)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            out.push(entry?.file_name().to_string_lossy().into_owned());
         }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(vault = %vault.id, %error, "notes: could not seed the default spaces");
+        Ok(out)
+    }
+
+    fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()> {
+        // A space is a note and is announced to the reconciler; the ledger is
+        // not one, and telling the index to re-read a `.json` it never collects
+        // would be a lie about what changed.
+        let result = if rel == default_spaces::LEDGER_REL {
+            notes_vault::write_vault_file(self.vault, rel, text)
+        } else {
+            notes_vault::write_note(self.vault, rel, text)
+        };
+        result.map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    fn new_id(&mut self) -> String {
+        crate::sync_ipc::new_ulid()
+    }
+
+    fn now_local(&self) -> String {
+        now_local()
+    }
+
+    fn today(&self) -> String {
+        today()
+    }
+}
+
+/// Seed this vault's default spaces, and **say what happened** either way.
+///
+/// Called from `notes_vault::refresh` for every registered vault — not only a
+/// newly registered one. The run is idempotent by construction (it plans against
+/// what is on disk), so restricting it to first registration bought one
+/// directory listing and cost a failure mode nobody could see: a vault that
+/// registered while a read was failing never got another chance in that process.
+///
+/// The frontend does not drive this. A vault reached only from the tray or the
+/// capture window has to be seeded too.
+///
+/// **Four outcomes, four log lines, no silence.** The first version logged only
+/// the two interesting ones and left "planned nothing" quiet, which is why a
+/// field report of "it did nothing" could not be answered from 305k lines of
+/// debug log. `AlreadySatisfied` is the ordinary case and is `debug`; a refusal
+/// is `warn` and names the file and the errno, because a refusal is keeper
+/// declining to do the thing it was installed to do.
+pub fn seed_default_spaces(vault: &Vault) {
+    let outcome = default_spaces::seed(
+        &mut VaultSeedFiles { vault },
+        default_spaces::SeedMode::FirstRun,
+    );
+    match outcome {
+        default_spaces::SeedOutcome::Wrote(written) => {
+            tracing::info!(
+                vault = %vault.id,
+                count = written.len(),
+                paths = ?written,
+                "notes: seeded default spaces"
+            );
+        }
+        default_spaces::SeedOutcome::AlreadySatisfied => {
+            tracing::debug!(
+                vault = %vault.id,
+                "notes: default spaces already settled for this vault"
+            );
+        }
+        default_spaces::SeedOutcome::Blocked(why) => {
+            tracing::warn!(
+                vault = %vault.id,
+                %why,
+                "notes: did not seed the default spaces; will try again next launch"
+            );
+        }
+        default_spaces::SeedOutcome::Stopped { written, reason } => {
+            tracing::warn!(
+                vault = %vault.id,
+                count = written.len(),
+                %reason,
+                "notes: stopped part way through seeding the default spaces"
+            );
         }
     }
 }
 
 /// Re-create the default spaces this vault is missing (FR-156).
 ///
-/// The user asking, so the ledger does not veto it — but it still only fills
-/// holes: a default that is there is not rewritten, and a space of the user's
-/// own that already carries a default's name stands that default down exactly as
-/// it does on the first run. Returns how many notes were written, so the surface
-/// can say "nothing was missing" rather than flashing a success at a no-op.
+/// The user asking, so the ledger does not veto it — and an unreadable ledger
+/// does not either, because they are looking at the rail and repairing it is
+/// what they pressed. It still only fills holes: a default that is there is not
+/// rewritten, and a space of the user's own that already carries a default's
+/// name stands that default down exactly as it does on the first run.
+///
+/// Returns how many notes were written, so the surface can say "nothing was
+/// missing" rather than flashing a success at a no-op. A refusal is an error
+/// here rather than a log line — a person is waiting for an answer.
 #[tauri::command]
 pub async fn notes_spaces_restore_defaults(vault_id: String) -> Result<u32, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let written = apply_default_spaces(&vault, default_spaces::SeedMode::Restore)
-        .map_err(|error| notes_error(NotesError::Name(error)))?;
-    Ok(u32::try_from(written.len()).unwrap_or(u32::MAX))
-}
-
-/// Write the defaults `mode` calls for, then record what this vault has been
-/// offered. Returns the vault-relative paths written.
-///
-/// The ledger is written **after** the notes, and it records the union of what
-/// it already held with what was just written. Both halves matter for the
-/// unplugged-drive case: if the run dies after two notes, the ledger never lands
-/// and the next registration finishes the remaining two rather than repeating
-/// the first two — because [`default_spaces::plan`] is keyed on what is on disk,
-/// not on how far the last attempt got.
-fn apply_default_spaces(
-    vault: &Vault,
-    mode: default_spaces::SeedMode,
-) -> Result<Vec<String>, String> {
-    let offered = read_seed_ledger(vault);
-    let existing = existing_spaces(vault);
-    let planned = default_spaces::plan(mode, &existing, offered.as_ref());
-    if planned.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // One `siblings` read for the whole run, grown as each name is taken, so two
-    // defaults seeded in the same pass cannot be handed the same filename.
-    let mut taken = notes_vault::siblings(vault, SPACES_DIR);
-    let mut written = Vec::new();
-    let mut keys: std::collections::BTreeSet<String> = offered.unwrap_or_default();
-    for space in planned {
-        let filename = naming::note_filename(space.name, &today(), &taken);
-        let rel = format!("{SPACES_DIR}/{filename}");
-        let note = default_spaces::render_note(space, &crate::sync_ipc::new_ulid(), &now_local());
-        if let Err(error) = notes_vault::write_note(vault, &rel, &note) {
-            // Stop at the first failure and still record what did land: a full
-            // disk halfway through must not be retried as "write all four
-            // again" on the next launch.
-            record_seed_ledger(vault, &keys);
-            return Err(format!("{rel}: {error}"));
+    let outcome = default_spaces::seed(
+        &mut VaultSeedFiles { vault: &vault },
+        default_spaces::SeedMode::Restore,
+    );
+    match outcome {
+        default_spaces::SeedOutcome::Wrote(written) => {
+            Ok(u32::try_from(written.len()).unwrap_or(u32::MAX))
         }
-        taken.push(filename);
-        keys.insert(space.key.to_owned());
-        written.push(rel);
-    }
-    record_seed_ledger(vault, &keys);
-    Ok(written)
-}
-
-/// The spaces already in `spaces/`, read off the disk.
-///
-/// Deliberately not the index (see [`seed_default_spaces`]). Unreadable
-/// directory, unreadable file: both yield "no space here", which is the
-/// conservative direction for a *name* check and the wrong one for the ledger —
-/// which is why the ledger's unreadable case is `None` and stops the run
-/// outright.
-fn existing_spaces(vault: &Vault) -> Vec<default_spaces::ExistingSpace> {
-    notes_vault::siblings(vault, SPACES_DIR)
-        .into_iter()
-        .filter(|name| name.ends_with(".md"))
-        .filter_map(|name| {
-            let rel = format!("{SPACES_DIR}/{name}");
-            let source = notes_vault::read_note(vault, &rel).ok()?;
-            Some(default_spaces::ExistingSpace {
-                default_key: default_spaces::default_key_of(&source),
-                name: notes_vault::title_of_source(&source, &rel),
-            })
-        })
-        .collect()
-}
-
-/// The keys this vault has already been offered.
-///
-/// Three answers, and the middle one is the whole point. An **absent** ledger is
-/// a vault that has never been seeded, so `Some(empty)` — offer everything. A
-/// ledger that is there and does not parse, or cannot be read, is `None` — a
-/// vault keeper knows nothing about, so the automatic path writes nothing.
-/// Reading a corrupt ledger as "never seeded" would resurrect every default its
-/// owner had deleted, and that is the one outcome worth being timid about.
-fn read_seed_ledger(vault: &Vault) -> Option<std::collections::BTreeSet<String>> {
-    let path = notes_vault::contained(vault, default_spaces::LEDGER_REL).ok()?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => default_spaces::parse_ledger(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Some(std::collections::BTreeSet::new())
+        default_spaces::SeedOutcome::AlreadySatisfied => Ok(0),
+        default_spaces::SeedOutcome::Blocked(why) => Err(notes_error(NotesError::Name(why))),
+        default_spaces::SeedOutcome::Stopped { reason, .. } => {
+            Err(notes_error(NotesError::Name(reason)))
         }
-        Err(_) => None,
-    }
-}
-
-/// Record what this vault has been offered.
-///
-/// Not a note, so it goes through the plain vault write rather than
-/// [`notes_vault::write_note`]: announcing a `.json` to the reconciler would ask
-/// the index to re-read a path it does not index. A failure is logged and
-/// swallowed — the notes are already on disk, and the worst case is that the
-/// next launch offers a default the user has not deleted yet, which
-/// [`default_spaces::plan`]'s on-disk check refuses anyway.
-fn record_seed_ledger(vault: &Vault, keys: &std::collections::BTreeSet<String>) {
-    let text = default_spaces::render_ledger(keys);
-    if let Err(error) = notes_vault::write_vault_file(vault, default_spaces::LEDGER_REL, &text) {
-        tracing::warn!(vault = %vault.id, %error, "notes: could not record the seeded spaces");
     }
 }
 

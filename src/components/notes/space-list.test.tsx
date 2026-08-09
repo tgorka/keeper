@@ -260,18 +260,41 @@ describe("SpaceList restore", () => {
     expect(screen.queryByText(/Restored/)).not.toBeInTheDocument();
   });
 
-  it("says so when keeper could not write, and leaves the list as it was", async () => {
+  /**
+   * The refusal Rust gives names the file it could not read. Showing the generic
+   * sentence instead is how Story 44.3 shipped green and left a field report of
+   * "it did nothing" unanswerable: a message that says only "keeper couldn't"
+   * sends someone to a bug report, and one that names `.keeper-spaces.json`
+   * sends them to the file.
+   */
+  it("shows the reason keeper gives, naming the file, rather than a generic apology", async () => {
     mockSpaces.mockResolvedValue([space({ id: "s1", name: "Active work" })]);
-    mockRestore.mockRejectedValue(new Error("read-only volume"));
+    mockRestore.mockRejectedValue({
+      code: "notesInvalid",
+      message:
+        ".keeper-spaces.json could not be read (permission denied); leaving this vault's spaces alone",
+    });
+    render(<SpaceList vaultId="vault-1" />);
+    await screen.findByRole("button", { name: "Active work" });
+
+    fireEvent.click(screen.getByRole("button", { name: RESTORE_DEFAULTS }));
+
+    expect(await screen.findByText(/\.keeper-spaces\.json could not be read/)).toBeInTheDocument();
+    expect(screen.queryByText(RESTORE_FAILED)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Active work" })).toBeInTheDocument();
+    // A failed restore is not a reason to re-read a list nothing changed in.
+    expect(mockSpaces).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a plain sentence when the rejection carries no message", async () => {
+    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Active work" })]);
+    mockRestore.mockRejectedValue("nope");
     render(<SpaceList vaultId="vault-1" />);
     await screen.findByRole("button", { name: "Active work" });
 
     fireEvent.click(screen.getByRole("button", { name: RESTORE_DEFAULTS }));
 
     expect(await screen.findByText(RESTORE_FAILED)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Active work" })).toBeInTheDocument();
-    // A failed restore is not a reason to re-read a list nothing changed in.
-    expect(mockSpaces).toHaveBeenCalledTimes(1);
   });
 
   it("cannot be pressed with no vault open", async () => {

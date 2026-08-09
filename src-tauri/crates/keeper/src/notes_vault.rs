@@ -252,11 +252,6 @@ pub fn refresh(app: &AppHandle) {
     // Dropping a slot drops its work sender, which ends its reconciler task —
     // the whole of "unflagging a vault costs nothing and deletes nothing".
     guard.retain(|id, _| keep.contains(id.as_str()));
-    // The vaults this process had not registered a moment ago. Seeding is
-    // driven off exactly this set, and the writes happen after the lock is
-    // dropped: four small files is not work to hold the registry for, and a
-    // command arriving mid-seed must not block behind it.
-    let mut fresh: Vec<Vault> = Vec::new();
     for vault in wanted {
         match guard.get_mut(&vault.id) {
             // Same root: adopt the new configuration in place, so a settings
@@ -271,19 +266,27 @@ pub fn refresh(app: &AppHandle) {
             // process lifetime.
             _ => {
                 let slot = spawn_reconciler(app, vault);
-                fresh.push(slot.vault.clone());
                 guard.insert(slot.vault.id.clone(), slot);
             }
         }
     }
+    let registered: Vec<Vault> = guard.values().map(|slot| slot.vault.clone()).collect();
     drop(guard);
-    // Seed the default spaces (Story 44.3, FR-156, AD-79). This deliberately
-    // does NOT wait for the first scan: seeding asks the `spaces/` directory
-    // what is there rather than an index that has not been built yet, so a cold
-    // vault converges on its first registration instead of on the second. The
-    // notes it writes are announced with `touch`, which is how every other
-    // keeper-authored write reaches the reconciler.
-    for vault in fresh {
+    // Seed the default spaces (Story 44.3, FR-156, AD-79), after the lock is
+    // dropped: a command arriving mid-seed must not queue behind it.
+    //
+    // **Every registered vault, not only a newly registered one.** The run plans
+    // against what is on `spaces/` and refuses to write when it cannot read, so
+    // repeating it is free and a run that declined once gets another chance the
+    // next time anything refreshes. Restricting it to first registration bought
+    // one directory listing per refresh and cost exactly that second chance —
+    // which is the difference between a vault that heals itself and one that
+    // needs the user to find a menu item they have no reason to press.
+    //
+    // It deliberately does NOT wait for the first scan: seeding asks the
+    // directory, not an index that has not been built yet, so a cold vault
+    // converges on its first registration instead of on the second.
+    for vault in registered {
         crate::notes_ipc::seed_default_spaces(&vault);
     }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
@@ -1405,33 +1408,14 @@ fn is_capture(fm: &Frontmatter) -> bool {
     }
 }
 
-/// A note's title: an explicit frontmatter `title`, else the first heading or
-/// line of the body, else the filename stem — which is what Obsidian shows.
-fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
-    if let Some(title) = fm.as_string("title") {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    let from_body = naming::title_from_body(body);
-    if from_body.trim().is_empty() {
-        stem(rel).to_owned()
-    } else {
-        from_body
-    }
-}
-
-/// The same title rule, applied to a note keeper is reading straight off disk.
+/// A note's title, through the one rule in `keeper-core::notes::naming`.
 ///
-/// The seeder (Story 44.3) runs before the vault has an index, so it cannot ask
-/// an `IndexEntry` what a space is called. It asks this instead, rather than
-/// re-deriving the rule — a seeder that read only the frontmatter `title` would
-/// miss every space keeper itself wrote, because keeper writes the name as the
-/// body's heading and no `title` key at all.
-pub fn title_of_source(source: &str, rel: &str) -> String {
-    let (fm, body_offset) = Frontmatter::parse(source);
-    note_title(&fm, &source[body_offset..], rel)
+/// The rule moved out of this file when the default-space seeder needed it on a
+/// vault that has no index yet (Story 44.3). Two copies of a three-branch
+/// fallback is the kind of drift nobody notices until a seeded space stands down
+/// against a name only one of them can see.
+fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
+    naming::note_title(fm.as_string("title"), body, stem(rel))
 }
 
 /// The first [`SNIPPET_CHARS`] characters of body, whitespace folded.
