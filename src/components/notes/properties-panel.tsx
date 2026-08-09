@@ -23,12 +23,35 @@
  * `keeper_core::notes::frontmatter` parses. A block it cannot read is not an
  * error and not hidden: it renders raw, with a line saying so, because the
  * note is the user's and the panel is ours.
+ *
+ * One family of keys is read rather than edited: the `session:`, `recording:`
+ * and `files:` a recording note carries (Story 42.4). Those are keeper's own
+ * record of where a recording's bytes landed, written in relative form because
+ * FR-145 keeps absolute paths out of a synced file — which leaves the reader
+ * holding text that names a file and cannot open it. So each of those paths
+ * gets one dropdown of actions whose targets Rust composed (AD-65), and the
+ * text beside it stays exactly the relative path the note says.
  */
-import { useState } from "react";
+import { Copy, FolderOpen, MoreHorizontal, Play } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { type NoteWriteVm, notesSave } from "@/lib/ipc/client";
+import {
+  type NoteWriteVm,
+  notesSave,
+  type RecordingNoteTargetVm,
+  recordingNoteTargets,
+  recordingOpenPath,
+  revealPath,
+} from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 
 /** Which control the value's shape implies. */
 export type PropertyKind = "text" | "number" | "boolean" | "date" | "list";
@@ -265,6 +288,36 @@ export function PropertiesPanel({
   const parsed = readFrontmatter(frontmatter);
   const [newKey, setNewKey] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
+  const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
+  const sessionId = recordingSessionId(parsed);
+  const [targets, setTargets] = useState<RecordingNoteTargetVm[] | null>(null);
+
+  // Resolved by session id, once per note: the id is the handle that survives
+  // a Story 40.4 retitle, so this answers "where is this recording NOW" while
+  // the note goes on saying where it was when the stub was written. A failure
+  // and an unknown session are the same state — no targets — because the
+  // surface's answer to both is the note's own text and no dead affordance.
+  useEffect(() => {
+    if (sessionId === null) {
+      setTargets(null);
+      return;
+    }
+    let live = true;
+    void recordingNoteTargets(sessionId)
+      .then((resolved) => {
+        if (live) {
+          setTargets(resolved);
+        }
+      })
+      .catch(() => {
+        if (live) {
+          setTargets(null);
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [sessionId]);
 
   const write = (nextBlock: string): void => {
     if (subscriptionId === null) {
@@ -298,15 +351,25 @@ export function PropertiesPanel({
 
   return (
     <section aria-label="Properties" className="flex flex-col gap-1 border-b px-3 py-2 text-xs">
-      {parsed.entries.map((entry) => (
-        <div key={entry.key} className="flex items-center gap-2">
-          <span className="w-32 shrink-0 truncate text-muted-foreground">{entry.key}</span>
-          <PropertyControl
-            entry={entry}
-            onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
-          />
-        </div>
-      ))}
+      {parsed.entries.map((entry) => {
+        // A recording note's own two path keys get actions; a `files:` key in
+        // somebody else's note is somebody else's list, and stays a control.
+        const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
+        const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
+        return (
+          <div key={entry.key} className="flex items-start gap-2">
+            <span className="w-32 shrink-0 truncate text-muted-foreground">{entry.key}</span>
+            {showsRecordingPaths ? (
+              <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
+            ) : (
+              <PropertyControl
+                entry={entry}
+                onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
+              />
+            )}
+          </div>
+        );
+      })}
       <div className="flex items-center gap-2 pt-1">
         <Input
           value={newKey}
@@ -425,5 +488,220 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
         }
       }}
     />
+  );
+}
+
+/**
+ * The frontmatter key carrying a recording note's immutable session identity
+ * (Story 42.4). Its presence is what makes a note a recording note.
+ */
+const SESSION_KEY = "session";
+
+/** The key carrying the session folder, relative to the recordings destination. */
+const RECORDING_KEY = "recording";
+
+/** The key carrying the session's files, each relative to the same root. */
+const FILES_KEY = "files";
+
+/**
+ * The dropdown's accessible name. Every path in the block gets one, so the name
+ * carries the path it acts on — otherwise a screen reader walking a session's
+ * files hears the same control four times.
+ */
+export const NOTE_PATH_ACTIONS_LABEL = "Actions for";
+
+/**
+ * The Reveal item's label. Worded identically to `RECORDINGS_REVEAL_LABEL` (the
+ * recordings browser) and `REVEAL_IN_FINDER_LABEL` (the recording completion
+ * card): one affordance, one wording, wherever it appears.
+ */
+export const NOTE_REVEAL_LABEL = "Reveal in Finder";
+
+/** The Preview item's label — it hands the file to the system handler and stops caring. */
+export const NOTE_PREVIEW_LABEL = "Preview";
+
+/** The copy item's label. */
+export const NOTE_COPY_PATH_LABEL = "Copy path";
+
+/**
+ * The note's session id, or `null` for a note that is not about a recording.
+ *
+ * `session:` is the whole test. It is the identity Story 42.4 writes and the
+ * only handle that survives a retitle, so a note carrying one is a recording
+ * note; a note without one that happens to have a `files:` key is somebody's
+ * own note, and keeper does not put buttons in it.
+ */
+function recordingSessionId(parsed: ParsedFrontmatter): string | null {
+  if (parsed.unparsed) {
+    return null;
+  }
+  const entry = parsed.entries.find((candidate) => candidate.key === SESSION_KEY);
+  if (entry === undefined || entry.nested) {
+    return null;
+  }
+  const id = entry.text.trim();
+  return id === "" ? null : id;
+}
+
+/** The last `/`-separated component of a relative path. */
+function fileName(relativePath: string): string {
+  const segments = relativePath.split("/").filter((segment) => segment !== "");
+  return segments[segments.length - 1] ?? relativePath;
+}
+
+/**
+ * Where one of the note's paths is now, or `undefined` when keeper cannot say.
+ *
+ * The folder is matched by KIND and a file by NAME — never by comparing the
+ * note's relative path to the target's. The two frames legitimately disagree:
+ * Story 40.4 renames a session folder after the stub is written, so a note made
+ * before the rename carries the old path while the index carries the new one.
+ * File names do not change when their folder does, which is what makes the name
+ * the one join key that survives a retitle.
+ *
+ * This is a lookup, never a composition: the surface reads targets Rust built
+ * and joins nothing itself (AD-65).
+ */
+function targetFor(
+  targets: RecordingNoteTargetVm[] | null,
+  relativePath: string,
+  wanted: "folder" | "file",
+): RecordingNoteTargetVm | undefined {
+  if (targets === null) {
+    return undefined;
+  }
+  if (wanted === "folder") {
+    return targets.find((target) => target.kind === "folder");
+  }
+  const name = fileName(relativePath);
+  return targets.find(
+    (target) => target.kind !== "folder" && fileName(target.relativePath) === name,
+  );
+}
+
+interface RecordingPathsProps {
+  /** The `recording:` or `files:` entry, verbatim from the block. */
+  entry: PropertyEntry;
+  /** The session's targets, or `null` when keeper cannot locate the session. */
+  targets: RecordingNoteTargetVm[] | null;
+  /** Whether this platform has a user-visible file manager to reveal into. */
+  canReveal: boolean;
+}
+
+/**
+ * A recording note's paths: the text the note carries, and what you can do
+ * about it (Story 42.4, FR-142, FR-145).
+ *
+ * Read-only, unlike every other control in this panel, and deliberately: these
+ * two keys are keeper's record of where a recording's bytes actually landed.
+ * Typing a different path into them moves no file — it only makes the note lie
+ * about a folder that still exists under its old name. The `id` key above is
+ * read-only for the same reason, and this is that rule applied to the other
+ * facts keeper owns in a note it wrote.
+ */
+function RecordingPaths({ entry, targets, canReveal }: RecordingPathsProps) {
+  // `recording:` is one scalar — the session folder — and `files:` is a list.
+  // Each `files:` entry is written relative to the destination root, not to the
+  // folder line above it, precisely so it resolves on its own.
+  const paths = entry.key === RECORDING_KEY ? [entry.text] : entry.items;
+  const wanted = entry.key === RECORDING_KEY ? "folder" : "file";
+
+  return (
+    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+      {paths.map((path) => (
+        <RecordingPath
+          key={path}
+          relativePath={path}
+          target={targetFor(targets, path, wanted)}
+          canReveal={canReveal}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface RecordingPathProps {
+  /** The path exactly as the note carries it: relative, and the visible text. */
+  relativePath: string;
+  /** Where it is now, or `undefined` when keeper cannot say. */
+  target: RecordingNoteTargetVm | undefined;
+  canReveal: boolean;
+}
+
+/**
+ * One path, one dropdown.
+ *
+ * The visible text is always the note's own relative path (FR-145): the
+ * absolute path is the ARGUMENT of an action and never appears on screen, so
+ * nothing here can leak a home directory into a screenshot — or, worse, into
+ * the note, since the panel writes back what it renders.
+ *
+ * **An action is offered only when it has a target.** A session keeper cannot
+ * locate — unknown to the index, or a folder that is not on this machine —
+ * keeps its text and its Copy path (the relative text is still worth having on
+ * the clipboard) and loses the two actions that would open something. A Reveal
+ * that opens nothing is worse than an absent one twice over: it tells the
+ * reader the recording is there, and then fails at the moment they believed
+ * it. Absence says the true thing immediately, and it is the same rule
+ * `revealInFileManager` is gated by one line down.
+ */
+function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) {
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={relativePath}>
+        {relativePath}
+      </span>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="size-6 shrink-0"
+            aria-label={`${NOTE_PATH_ACTIONS_LABEL} ${relativePath}`}
+          >
+            <MoreHorizontal aria-hidden="true" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canReveal && target !== undefined && (
+            <DropdownMenuItem
+              onSelect={() => {
+                // Best effort: the reveal either happens or the file manager
+                // said no, and neither is something to interrupt a note with.
+                void revealPath(target.absolutePath).catch(() => {});
+              }}
+            >
+              <FolderOpen aria-hidden="true" />
+              {NOTE_REVEAL_LABEL}
+            </DropdownMenuItem>
+          )}
+          {target?.kind === "video" && (
+            <DropdownMenuItem
+              onSelect={() => {
+                void recordingOpenPath(target.absolutePath).catch(() => {});
+              }}
+            >
+              <Play aria-hidden="true" />
+              {NOTE_PREVIEW_LABEL}
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            onSelect={() => {
+              // The absolute path is the useful one — it pastes into a terminal
+              // or a Finder "Go to folder" and lands. The relative text is the
+              // fallback for a session keeper could not locate: it is what the
+              // note says, and copying what is on screen is never wrong.
+              void navigator.clipboard
+                ?.writeText(target?.absolutePath ?? relativePath)
+                .catch(() => {});
+            }}
+          >
+            <Copy aria-hidden="true" />
+            {NOTE_COPY_PATH_LABEL}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   );
 }

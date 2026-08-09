@@ -86,6 +86,15 @@ pub struct SessionFacts<'a> {
     /// The session folder **relative to the destination root**, `/`-separated.
     /// Not a `Path`, and not absolute: FR-145.
     pub relative_folder: Option<&'a str>,
+    /// The session's files — every segment, and the manifest that describes
+    /// them — each **relative to the destination root**, `/`-separated. The
+    /// same frame [`Self::relative_folder`] is in, so a reader resolves any one
+    /// of them on its own rather than by joining it to the folder above it.
+    ///
+    /// Not a `Path`, and not absolute, for the reason `relative_folder` is not:
+    /// FR-145 is enforced by this signature rather than by a filter, because a
+    /// filter is a thing that can be forgotten on the next field added here.
+    pub files: &'a [&'a str],
 }
 
 /// A composed stub: what to call the file, and what to put in it.
@@ -130,7 +139,7 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     let date = start.or(end).map(iso_date).unwrap_or_default();
     let title = title_of(facts, &date);
 
-    let mut pairs: Vec<(String, FieldValue)> = Vec::with_capacity(9);
+    let mut pairs: Vec<(String, FieldValue)> = Vec::with_capacity(10);
     pairs.push(("title".to_owned(), FieldValue::Str(title.clone())));
     push_text(&mut pairs, "date", &date);
     if let Some(stamp) = start {
@@ -158,9 +167,10 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
         pairs.push(("tags".to_owned(), FieldValue::List(tags)));
     }
 
-    // Last, and in this order, because these two are keeper's own bookkeeping
+    // Last, and in this order, because these three are keeper's own bookkeeping
     // rather than anything the writer typed: the identity that outlives the
-    // folder name, then where the folder was relative to its root.
+    // folder name, then where the folder was relative to its root, then what is
+    // inside it — in that same frame, so the reader never has to join the two.
     pairs.push((
         "session".to_owned(),
         FieldValue::Str(facts.session_id.to_owned()),
@@ -170,6 +180,21 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
         "recording",
         facts.relative_folder.unwrap_or_default(),
     );
+
+    // Blank entries dropped and the key omitted when nothing survives, exactly
+    // as `tags` above and for the same reason: `- ` under `files:` is a
+    // nameless entry, which is worse than no key at all — nobody can act on it,
+    // and nobody can tell from the note what it was supposed to have been.
+    let files: Vec<FieldValue> = facts
+        .files
+        .iter()
+        .map(|file| file.trim())
+        .filter(|file| !file.is_empty())
+        .map(|file| FieldValue::Str(file.to_owned()))
+        .collect();
+    if !files.is_empty() {
+        pairs.push(("files".to_owned(), FieldValue::List(files)));
+    }
 
     let front = Frontmatter::serialise_new(&pairs);
     // A heading and then room. Composed the way `create_note` composes a note —
@@ -274,6 +299,7 @@ mod tests {
             participants: Some("Jane Doe, Sam"),
             tags: &[],
             relative_folder: Some("2026/keeper-rec 2026-08-08 14.23.45"),
+            files: &[],
         }
     }
 
@@ -352,6 +378,160 @@ mod tests {
             stub.contents
                 .contains("recording: 2026/keeper-rec 2026-08-08 14.23.45"),
             "the location is recorded, but relative to the destination root"
+        );
+    }
+
+    /// The files are the session's own ledger order — the screen track, then
+    /// the camera track beside it, then the manifest that describes them — and
+    /// never a sort. Sorting would lift `camera-0000.mov` above the screen
+    /// segment it accompanies, and the note would read like a directory
+    /// listing rather than like a recording.
+    #[test]
+    fn every_file_of_a_session_is_listed_under_its_folder_in_ledger_order() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+
+        assert_eq!(
+            fm.as_list("files"),
+            Some(
+                files
+                    .iter()
+                    .map(|file| (*file).to_owned())
+                    .collect::<Vec<_>>()
+            ),
+            "every file reads back through the parser, in the order it arrived"
+        );
+        assert!(
+            stub.contents.contains(concat!(
+                "recording: 2026/keeper-rec 2026-08-08 14.23.45\n",
+                "files:\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/manifest.json\n",
+            )),
+            "the list follows `recording:` immediately, one file per line: {}",
+            stub.contents
+        );
+    }
+
+    /// Omitted, never labelled: a session that closed no segment must not leave
+    /// `files:` standing over nothing. Asserted against the rendered text and
+    /// not against a length, because an empty list and a bare key both measure
+    /// zero and both are exactly what this forbids.
+    #[test]
+    fn a_session_with_no_files_carries_no_files_key_at_all() {
+        let stub = compose(
+            &SessionFacts {
+                files: &[],
+                ..facts()
+            },
+            &[],
+        );
+
+        assert!(
+            !stub.contents.contains("files"),
+            "the key is absent from the block entirely, not present and empty: {}",
+            stub.contents
+        );
+        assert_eq!(Frontmatter::parse(&stub.contents).0.as_list("files"), None);
+    }
+
+    /// The same rule the tags list obeys, for the same reason: a nameless entry
+    /// in a note is worse than no key, because nothing can be done with it and
+    /// the note does not even say what went missing.
+    #[test]
+    fn a_blank_file_entry_is_dropped_rather_than_listed_nameless() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "   ",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+
+        assert_eq!(
+            fm.as_list("files"),
+            Some(vec![files[0].to_owned(), files[2].to_owned()])
+        );
+        assert!(
+            stub.contents.contains(concat!(
+                "files:\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/manifest.json\n",
+            )),
+            "the two real files are adjacent, so the blank produced no line at all: {}",
+            stub.contents
+        );
+
+        // Nothing but blanks is nothing: the key goes with them.
+        let all_blank = compose(
+            &SessionFacts {
+                files: &["", "  "],
+                ..facts()
+            },
+            &[],
+        );
+        assert!(
+            !all_blank.contents.contains("files"),
+            "a list that emptied out takes its key with it: {}",
+            all_blank.contents
+        );
+    }
+
+    /// FR-145 for the new key, asserted the way
+    /// `no_line_of_the_stub_carries_an_absolute_path` asserts it for the rest of
+    /// the block: over every value the list actually holds, so a file that
+    /// arrived absolute is caught here whichever one it is.
+    #[test]
+    fn no_file_in_the_list_is_written_as_an_absolute_path() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let listed = Frontmatter::parse(&stub.contents)
+            .0
+            .as_list("files")
+            .expect("this session has files");
+
+        assert_eq!(listed.len(), 2);
+        for path in &listed {
+            assert!(
+                !path.starts_with('/'),
+                "a note never carries an absolute path, got {path}"
+            );
+            assert!(
+                path.starts_with("2026/keeper-rec 2026-08-08 14.23.45/"),
+                "each file is in the same frame as `recording:` — relative to the destination \
+                 root — got {path}"
+            );
+        }
+        assert!(
+            !stub.contents.contains("/Users/"),
+            "and no absolute prefix reaches any other line either"
         );
     }
 

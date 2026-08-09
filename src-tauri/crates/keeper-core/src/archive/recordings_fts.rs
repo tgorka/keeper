@@ -50,7 +50,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::ArchiveError;
 use crate::recording::SessionMetaField;
-use crate::vm::{RecordingFilterVm, RecordingHitVm};
+use crate::vm::{
+    RecordingFilterVm, RecordingHitVm, RecordingNoteTargetKind, RecordingNoteTargetVm,
+};
 
 use super::recordings::{in_transaction, RecordingRow};
 
@@ -702,25 +704,7 @@ pub fn search_recording_vms(
     filter: &RecordingFilter,
     destination_root: &Path,
 ) -> Result<Vec<RecordingHitVm>, ArchiveError> {
-    // An `archive.db` written before Story 42.1 has no `recordings` table at
-    // all, and a machine that has not re-opened the WRITER since upgrading
-    // still has one — nothing ensures the schema on a read-only connection, and
-    // nothing can. The browser must read that as "nothing recorded", exactly as
-    // it reads an absent database, rather than as `no such table: recordings`:
-    // it is the same fact for the same user, and the writer heals it the next
-    // time anything records. One `sqlite_master` probe per query, against a
-    // b-tree the connection has already opened.
-    let indexed: Option<bool> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()
-        .map_err(|e| {
-            ArchiveError::Sqlite(format!("could not probe for the recordings table: {e}"))
-        })?;
-    if indexed.is_none() {
+    if !recordings_indexed(conn)? {
         return Ok(Vec::new());
     }
     let hits = search_recordings(conn, filter)?;
@@ -811,6 +795,160 @@ fn recording_hit_vm(
         durability: hit.durability,
         tags,
     }
+}
+
+/// Whether this `archive.db` has a `recordings` table to read at all.
+///
+/// A database written before Story 42.1 has none, and a machine that has not
+/// re-opened the WRITER since upgrading still has one — nothing ensures the
+/// schema on a read-only connection, and nothing can. Every read path must
+/// report that as "nothing recorded", exactly as it reports an absent
+/// database, rather than as `no such table: recordings`: it is the same fact
+/// for the same user, and the writer heals it the next time anything records.
+/// One `sqlite_master` probe per query, against a b-tree the connection has
+/// already opened.
+fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
+        [],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|found| found.unwrap_or(false))
+    .map_err(|e| ArchiveError::Sqlite(format!("could not probe for the recordings table: {e}")))
+}
+
+/// Everything the reader of a recording note can act on, for the session that
+/// note names by id (Story 42.4, FR-142, FR-145, AD-65): the session folder
+/// first, then every file in it, in name order.
+///
+/// **Resolved by session id, not by trusting the note's own paths.** A note
+/// carries the relative path the recording had the minute the stub was
+/// written, and Story 40.4 renames folders afterwards. Story 42.1's row
+/// follows the session, so the index is right about where the folder is NOW
+/// and the note is only right until the first retitle.
+///
+/// **The files are read off the disk, not out of `recording_segments`.** A
+/// note's `files:` list includes `manifest.json`, which is not a segment and
+/// never will be, so a segments-only answer would leave the one file every
+/// session has without an action. Reading the folder also makes the guarantee
+/// the surface leans on true by construction: every target handed back was
+/// there a moment ago, so an action offered for one is an action that opens
+/// something.
+///
+/// **`None`, never an error, in all three ways this can come up empty**: a
+/// session this archive does not know, a session whose folder is not on this
+/// machine, and a pre-42.1 `archive.db` with no `recordings` table. To the
+/// person holding the note those are one fact — keeper cannot say where this
+/// recording is — and the surface answers all three the same way: the note's
+/// own text, and no action that would open nothing.
+///
+/// `destination_root` is the EFFECTIVE recordings destination, resolved by the
+/// shell and passed in for [`search_recording_vms`]' reason: this crate reads
+/// no registry and knows no platform, and the join happens exactly once
+/// (AD-65).
+pub fn session_note_targets(
+    conn: &Connection,
+    session_id: &str,
+    destination_root: &Path,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, ArchiveError> {
+    if !recordings_indexed(conn)? {
+        return Ok(None);
+    }
+    let indexed_folder: Option<String> = conn
+        .query_row(
+            "SELECT relative_path FROM recordings WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ArchiveError::Sqlite(format!("could not look up a session's folder: {e}")))?;
+    let Some(relative_folder) = indexed_folder else {
+        return Ok(None);
+    };
+    let folder = join_relative(destination_root, &relative_folder);
+    // A folder that cannot be listed is a folder nothing can be opened inside
+    // of — moved outside keeper, on a volume that is not mounted, or behind a
+    // permission this process does not have. All of those are "keeper cannot
+    // reach this recording", which is the same answer as an unknown session.
+    let Ok(entries) = std::fs::read_dir(&folder) else {
+        return Ok(None);
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        // Files only: nothing the recorder writes nests, and a note's `files:`
+        // never names a directory.
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        // A name that is not UTF-8 is a name no note can carry either — the
+        // stub is composed from the same bytes — so it is skipped rather than
+        // lossily spelled into a target that would match nothing and open
+        // nothing.
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        names.push(name);
+    }
+    // `read_dir` yields the filesystem's order, which differs between machines
+    // and between two calls on one machine. The surface looks a target up by
+    // name and does not care, but an unordered list makes a test assert
+    // whatever the last run happened to produce.
+    names.sort();
+
+    let mut targets = Vec::with_capacity(names.len() + 1);
+    targets.push(RecordingNoteTargetVm {
+        relative_path: relative_folder.clone(),
+        absolute_path: path_string(&folder),
+        kind: RecordingNoteTargetKind::Folder,
+    });
+    for name in names {
+        targets.push(RecordingNoteTargetVm {
+            // A session filed directly at the destination root has the empty
+            // relative path, and `"/" + name` there would be a relative path
+            // that reads as an absolute one — the exact shape FR-145 exists to
+            // keep out of a note.
+            relative_path: if relative_folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative_folder}/{name}")
+            },
+            absolute_path: path_string(&folder.join(&name)),
+            kind: if is_video_name(&name) {
+                RecordingNoteTargetKind::Video
+            } else {
+                RecordingNoteTargetKind::File
+            },
+        });
+    }
+    Ok(Some(targets))
+}
+
+/// The extensions Preview is offered for: what the recorder writes video into
+/// (`.mov`, Story 20.1) and the two containers a synced recordings folder
+/// plausibly already holds beside it.
+const VIDEO_EXTENSIONS: [&str; 3] = ["mov", "mp4", "m4v"];
+
+/// Whether a file name is one Preview means something for.
+///
+/// By extension, and deliberately not by reading the file. Targets are
+/// composed for every file in a session folder at once, so sniffing each one's
+/// header would turn opening a note into a burst of reads on what may be a
+/// network share — and the cost of being wrong is the system opening the file
+/// in the wrong application, not a lost byte.
+///
+/// Case-insensitively, because a file copied in from another machine may be
+/// `.MOV`, and a Preview that is absent for the same video under a different
+/// spelling reads as a bug.
+fn is_video_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
 }
 
 /// Join a stored `/`-joined relative path onto the destination root, one
@@ -2174,5 +2312,130 @@ mod tests {
         );
         // And the boundary still holds: `client/acmecorp` is not under it.
         assert!(found_tag(&conn, "Client/AcmeCorp").is_empty());
+    }
+
+    /// A session folder on disk holding exactly what a finished session holds,
+    /// plus one subfolder, which is not a target.
+    fn session_folder(root: &Path, relative: &str, files: &[&str]) {
+        let folder = root.join(relative);
+        std::fs::create_dir_all(folder.join("nested")).expect("session folder");
+        for name in files {
+            std::fs::write(folder.join(name), b"bytes").expect("a file in the session folder");
+        }
+    }
+
+    /// The relative path and kind of each target, which is what the note
+    /// surface matches on and renders by.
+    fn target_shapes(targets: &[RecordingNoteTargetVm]) -> Vec<(&str, RecordingNoteTargetKind)> {
+        targets
+            .iter()
+            .map(|target| (target.relative_path.as_str(), target.kind))
+            .collect()
+    }
+
+    /// Story 42.4: the note's reader gets the folder and every file in it, and
+    /// only a video is a Preview target — `manifest.json` is not, and neither
+    /// is the folder.
+    #[test]
+    fn a_session_offers_its_folder_then_its_files_with_only_videos_marked_playable() {
+        let root = temp_dir();
+        session_folder(
+            &root,
+            "2026/2026-08-08 15.52 test",
+            &["screen-0000.mov", "camera-0000.MOV", "manifest.json"],
+        );
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01SESSION", Some(1_000));
+        row.relative_path = "2026/2026-08-08 15.52 test".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+
+        let targets = session_note_targets(&conn, "01DEVICE-01SESSION", &root)
+            .expect("a known session resolves")
+            .expect("a session on disk has targets");
+
+        assert_eq!(
+            target_shapes(&targets),
+            vec![
+                (
+                    "2026/2026-08-08 15.52 test",
+                    RecordingNoteTargetKind::Folder
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/camera-0000.MOV",
+                    RecordingNoteTargetKind::Video
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/manifest.json",
+                    RecordingNoteTargetKind::File
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/screen-0000.mov",
+                    RecordingNoteTargetKind::Video
+                ),
+            ],
+            "the folder leads, its files follow in name order, and `nested` is not a target"
+        );
+        assert_eq!(
+            targets[1].absolute_path,
+            path_string(&root.join("2026/2026-08-08 15.52 test/camera-0000.MOV")),
+            "the absolute path is composed here, once, from the destination root"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Story 42.4 × Story 40.4: the note keeps saying where the recording was
+    /// when it was written; the index says where it is now, and the actions
+    /// follow the index.
+    #[test]
+    fn the_targets_follow_a_session_whose_folder_was_retitled() {
+        let root = temp_dir();
+        session_folder(&root, "2026/2026-08-08 1552 standup", &["screen-0000.mov"]);
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01MOVED", Some(1_000));
+        row.relative_path = "2026/2026-08-08 1552".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+        move_session(&conn, "01DEVICE-01MOVED", "2026/2026-08-08 1552 standup")
+            .expect("retitle the session");
+
+        let targets = session_note_targets(&conn, "01DEVICE-01MOVED", &root)
+            .expect("a retitled session resolves")
+            .expect("its folder is on disk under the new name");
+
+        assert_eq!(
+            targets[0].absolute_path,
+            path_string(&root.join("2026/2026-08-08 1552 standup")),
+            "the old folder is gone; a target pointing at it would open nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Story 42.4: the three ways this comes up empty are one answer, and none
+    /// of them is an error — the note still renders its own text, and the
+    /// surface offers nothing that would open nothing.
+    #[test]
+    fn an_unknown_session_a_vanished_folder_and_a_pre_42_1_archive_all_have_no_targets() {
+        let root = temp_dir();
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01GONE", Some(1_000));
+        row.relative_path = "2026/2026-08-08 1552".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+
+        assert_eq!(
+            session_note_targets(&conn, "01DEVICE-01UNKNOWN", &root).expect("no error"),
+            None,
+            "a session this archive has never seen"
+        );
+        assert_eq!(
+            session_note_targets(&conn, "01DEVICE-01GONE", &root).expect("no error"),
+            None,
+            "a session whose folder is not on this machine"
+        );
+
+        let bare = Connection::open_in_memory().expect("open in-memory archive");
+        assert_eq!(
+            session_note_targets(&bare, "01DEVICE-01GONE", &root).expect("no error"),
+            None,
+            "an archive that predates the recordings table"
+        );
     }
 }

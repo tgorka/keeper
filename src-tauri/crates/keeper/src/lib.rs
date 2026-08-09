@@ -467,6 +467,7 @@ pub fn run() {
                 ipc::draft_mirror_unsubscribe,
                 ipc::search_archive,
                 ipc::search_recordings,
+                ipc::recording_note_targets,
                 ipc::export_start,
                 ipc::export_cancel,
                 ipc::reveal_path,

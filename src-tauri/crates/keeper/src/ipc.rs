@@ -56,11 +56,12 @@ use keeper_core::vm::{
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
     RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingNoteStubVm,
-    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm,
-    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
-    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
-    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
-    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
+    RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
+    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
+    RecordingTargetVm, RecordingUiState, RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm,
+    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
+    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
+    VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -2346,6 +2347,59 @@ fn search_recordings_in(
     )
     .map_err(CoreError::from)
     .map_err(to_ipc_error)
+}
+
+/// Everything a recording note's reader can act on, for the session the note
+/// names by id (Story 42.4, FR-142, FR-145, AD-65).
+///
+/// A recording note carries only relative paths — `recording:` and the entries
+/// of `files:` — because FR-145 keeps absolute paths out of a file the user
+/// syncs between machines. That leaves the reader holding text that names a
+/// recording and cannot open it, and AD-65 forbids the surface from making it
+/// openable by joining a root onto it. This command is that join, composed
+/// here from the EFFECTIVE recordings destination (Story 41.2) exactly as
+/// [`search_recordings`] composes a row's, so the two surfaces can never
+/// disagree about where a session is.
+///
+/// **By session id, because that is the handle that survives.** Story 40.4
+/// renames a session's folder and Story 42.1's row follows it, so the index
+/// knows where the recording is NOW while a note written before the rename
+/// still says where it was. The note keeps its own text; the actions follow
+/// the index.
+///
+/// `None` — never an error — for a session no archive row knows, for one whose
+/// folder is not on this machine, and on a first run with no `archive.db` at
+/// all. All three mean the same thing to the person reading the note, and the
+/// surface answers all three by rendering the note's text with no action
+/// attached: an affordance that opens nothing is worse than an absent one.
+#[tauri::command]
+pub fn recording_note_targets(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let destination_root = effective_destination_dir(&data_dir, &state.platform);
+    recording_note_targets_in(&data_dir, &destination_root, &session_id)
+}
+
+/// The whole of [`recording_note_targets`] except the two answers only the app
+/// state can give — [`search_recordings_in`]'s split, and for its reason: the
+/// rules above are then asserted over a temp directory with no Tauri app and
+/// no registry, including the first-run one.
+fn recording_note_targets_in(
+    data_dir: &Path,
+    destination_root: &Path,
+    session_id: &str,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, IpcError> {
+    if !keeper_core::archive::db::db_path(data_dir).exists() {
+        return Ok(None);
+    }
+    let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    keeper_core::archive::recordings_fts::session_note_targets(&conn, session_id, destination_root)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)
 }
 
 /// Start a background archive export (Story 5.5, FR-35, AD-11).
@@ -7852,6 +7906,37 @@ fn stub_epoch_ms(stamp: &str) -> Option<i64> {
         .map(|at| at.timestamp_millis())
 }
 
+/// The session's files, each relative to the destination root — what the
+/// stub's `files:` list carries, in the same frame as its `recording:` folder.
+///
+/// **The manifest's ledger order, never a sort.** That is the order the session
+/// recorded in, and a sorted list would lift `camera-0000.mov` above the screen
+/// segment it belongs beside.
+///
+/// `manifest.json` is in the list because the session really has one: it is the
+/// file [`SessionManifest::write`] renames its temp over
+/// (`<folder>/manifest.json`, FR-146 — written once at finalize), and the
+/// terminal reconcile has done exactly that before [`write_recording_note_stub`]
+/// composes anything. Nothing else in the folder is named here, because nothing
+/// else is a file this path *knows* is there rather than guesses at.
+///
+/// A file whose path will not express itself relative to the anchor is dropped
+/// rather than written absolute: FR-145 admits no exception, and a note that is
+/// silent about one file is better than a note that is wrong on every machine
+/// but this one.
+#[cfg(desktop)]
+fn stub_files(manifest: &SessionManifest, dest: &StubDestination) -> Vec<String> {
+    let folder = manifest.folder();
+    manifest
+        .segments
+        .iter()
+        .map(|segment| segment.file.trim())
+        .filter(|file| !file.is_empty())
+        .chain(std::iter::once("manifest.json"))
+        .filter_map(|file| relative_session_path(&dest.anchor, &folder.join(file)))
+        .collect()
+}
+
 /// Compose one session's stub from its manifest. Pure but for reading the
 /// manifest it is handed — every byte of IO is in this module's callers.
 #[cfg(desktop)]
@@ -7863,6 +7948,8 @@ fn compose_stub(
     let meta = manifest.meta.as_ref()?;
     let session_id = meta.session_id.as_deref()?;
     let relative_folder = relative_session_path(&dest.anchor, manifest.folder());
+    let file_paths = stub_files(manifest, dest);
+    let files: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     Some(recording_note::compose(
         &SessionFacts {
             session_id,
@@ -7874,6 +7961,7 @@ fn compose_stub(
             participants: meta.participants.as_deref(),
             tags: meta.tags.as_deref().unwrap_or(&[]),
             relative_folder: relative_folder.as_deref(),
+            files: &files,
         },
         taken,
     ))
@@ -17004,6 +17092,68 @@ mod tests {
             "a filter that matches nothing is an empty list, not an error"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- a recording note's file actions (Story 42.4) -----------------------
+
+    /// Story 42.4: the note's reader gets the session folder and every file in
+    /// it, each resolved against the destination root the shell passed in —
+    /// the only place a root and a subfolder are ever joined (AD-65) — and
+    /// only a video is marked as something Preview can open.
+    #[test]
+    fn a_recording_note_resolves_its_session_folder_and_files_against_the_destination_root() {
+        use keeper_core::vm::RecordingNoteTargetKind;
+
+        let base = scan_temp_dir("rec-42-4-targets");
+        let data_dir = base.join("data");
+        let destination_root = base.join("Movies").join("keeper");
+        index_browsable_session(&data_dir, "01DEVICE-01STANDUP", "Standup");
+        let folder = destination_root.join("2026").join("Standup");
+        std::fs::create_dir_all(&folder).expect("the session folder");
+        for name in ["screen-0000.mov", "manifest.json"] {
+            std::fs::write(folder.join(name), b"bytes").expect("a session file");
+        }
+
+        let targets = recording_note_targets_in(&data_dir, &destination_root, "01DEVICE-01STANDUP")
+            .expect("a known session resolves")
+            .expect("a session on disk has targets");
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.relative_path.as_str(), target.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026/Standup", RecordingNoteTargetKind::Folder),
+                ("2026/Standup/manifest.json", RecordingNoteTargetKind::File),
+                (
+                    "2026/Standup/screen-0000.mov",
+                    RecordingNoteTargetKind::Video
+                ),
+            ]
+        );
+        assert_eq!(
+            targets[0].absolute_path,
+            folder.to_string_lossy(),
+            "Reveal opens the folder the recorder wrote to, composed here and nowhere else"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 42.4: a note can outlive the archive that knows its session — a
+    /// fresh install syncing an old vault has the note and no `archive.db` at
+    /// all. That is `None`, not `SQLITE_CANTOPEN`, so the surface renders the
+    /// note's own text and offers nothing that would open nothing.
+    #[test]
+    fn a_recording_note_on_a_machine_with_no_archive_has_no_targets_and_no_error() {
+        let data_dir = scan_temp_dir("rec-42-4-no-archive");
+
+        let targets =
+            recording_note_targets_in(&data_dir, &data_dir.join("Movies"), "01DEVICE-01STANDUP")
+                .expect("an absent archive is an empty answer, never an error");
+
+        assert_eq!(targets, None);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Story 42.3, the security-relevant one: a command that opened whatever

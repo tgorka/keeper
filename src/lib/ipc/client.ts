@@ -130,6 +130,8 @@ export type { RecordingDurabilityVm } from "./gen/RecordingDurabilityVm";
 export type { RecordingFilterVm } from "./gen/RecordingFilterVm";
 export type { RecordingHitVm } from "./gen/RecordingHitVm";
 export type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
+export type { RecordingNoteTargetKind } from "./gen/RecordingNoteTargetKind";
+export type { RecordingNoteTargetVm } from "./gen/RecordingNoteTargetVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -236,6 +238,7 @@ import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
 import type { RecordingHitVm } from "./gen/RecordingHitVm";
 import type { RecordingNoteStubVm } from "./gen/RecordingNoteStubVm";
+import type { RecordingNoteTargetVm } from "./gen/RecordingNoteTargetVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
@@ -810,6 +813,32 @@ export async function revealPath(path: string): Promise<void> {
  */
 export async function recordingOpenPath(path: string): Promise<void> {
   await invoke<void>("recording_open_path", { path });
+}
+
+/**
+ * Everything the reader of a recording note can act on, for the session the
+ * note names by id (FR-142, FR-145, AD-65, Story 42.4). The session folder
+ * first, then every file in it, each as a {@link RecordingNoteTargetVm}
+ * carrying the relative path the note itself is written in, the absolute path
+ * composed in Rust from the effective recordings destination, and whether it
+ * is a video.
+ *
+ * `sessionId` is the note's `session:` value, not one of its paths: a note
+ * records where the recording was when the stub was written, and a Story 40.4
+ * retitle moves the folder afterwards. The id is the handle that survives, so
+ * this is where the recording is NOW.
+ *
+ * Resolves `null` — never rejects — when no archive row knows the session,
+ * when its folder is not on this machine, and on a machine with no archive at
+ * all (a fresh install syncing an old vault). The surface renders the note's
+ * relative text either way and attaches an action only to a target it was
+ * handed. Rejects with the {@link IpcError} envelope only on an archive read
+ * failure.
+ */
+export async function recordingNoteTargets(
+  sessionId: string,
+): Promise<RecordingNoteTargetVm[] | null> {
+  return await invoke<RecordingNoteTargetVm[] | null>("recording_note_targets", { sessionId });
 }
 
 /**
