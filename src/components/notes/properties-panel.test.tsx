@@ -10,6 +10,7 @@ const recordingNoteTargets =
   vi.fn<(sessionId: string) => Promise<RecordingNoteTargetVm[] | null>>();
 const revealPath = vi.fn();
 const recordingOpenPath = vi.fn();
+const tagsVocabulary = vi.fn<() => Promise<{ entries: { path: string; count: number }[] }>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   notesSave: (id: string, text: string, rev: string, frontmatter: string | null) =>
@@ -17,8 +18,10 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingNoteTargets: (sessionId: string) => recordingNoteTargets(sessionId),
   revealPath: (path: string) => revealPath(path),
   recordingOpenPath: (path: string) => recordingOpenPath(path),
+  tagsVocabulary: () => tagsVocabulary(),
 }));
 
+import { tagComboboxAlreadyChosen, tagComboboxCreate } from "@/components/notes/tag-combobox";
 import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
 import {
   COLUMN_FITTED_VALUE_TEXT,
@@ -30,10 +33,12 @@ import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabiliti
 import { ELLIPSIS } from "@/lib/truncate";
 import { withRect, withTextLayout } from "@/test/layout";
 import {
+  ADD_NOTE_TAG,
   PROPERTIES_COLUMN_LABEL,
   PROPERTY_KEY_COLUMN,
   PropertiesPanel,
   readFrontmatter,
+  recordingsTagRefusal,
   UNPARSED_BLOCK_LABEL,
 } from "./properties-panel";
 
@@ -65,6 +70,7 @@ beforeEach(() => {
   recordingNoteTargets.mockResolvedValue(null);
   revealPath.mockResolvedValue(undefined);
   recordingOpenPath.mockResolvedValue(undefined);
+  tagsVocabulary.mockResolvedValue({ entries: [] });
   // jsdom lacks a clipboard by default.
   Object.assign(navigator, { clipboard: { writeText: vi.fn(() => Promise.resolve()) } });
   capabilitiesStore
@@ -525,5 +531,198 @@ describe("PropertiesPanel — content you can read", () => {
     expect(
       screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: ${UNPARSED_BLOCK_LABEL}`),
     ).toHaveTextContent("👍");
+  });
+});
+
+/**
+ * Story 44.14 — the recording note's tags are the note's tags (FR-170).
+ *
+ * The block below is the shape `keeper-core`'s stub writer produces: what the
+ * user typed leads, keeper's own bookkeeping trails it, and keeper's kind tag
+ * is appended to the session's own tags rather than prepended. Every write
+ * assertion below is stated as "the original block with exactly this one line
+ * added or removed", because byte-preservation (FR-121) is the promise that
+ * breaks silently and a `toContain` would not notice it breaking.
+ */
+describe("PropertiesPanel — a recording note's tags", () => {
+  const SESSION = "01KYH5DXGP1XQRHTME8CJFVEJ6-01KZHS7EJB5QKR8T9CHXQ46RNS";
+
+  /** A stub as written, carrying two tags of the user's and keeper's own. */
+  const TAGGED = [
+    "---",
+    "title: Standup",
+    "date: 2026-08-08",
+    "participants: Alice, Bob",
+    "tags:",
+    "  - work",
+    "  - client/acme",
+    "  - recordings",
+    `session: ${SESSION}`,
+    "recording: recordings/2026/2026-08-08 1552 standup",
+    "files:",
+    "  - recordings/2026/2026-08-08 1552 standup/manifest.json",
+    "---",
+    "",
+  ].join("\n");
+
+  /** The vault's vocabulary, as 42.5's `tags_vocabulary` hands it over. */
+  const VOCABULARY = ["work", "client/acme", "client/anvil", "recordings"];
+
+  /** Open the chooser and hand back the field, once the vocabulary has landed. */
+  async function openChooser(): Promise<HTMLElement> {
+    fireEvent.click(screen.getByRole("button", { name: ADD_NOTE_TAG }));
+    await waitFor(() => expect(tagsVocabulary).toHaveBeenCalled());
+    return await screen.findByRole("combobox", { name: ADD_NOTE_TAG });
+  }
+
+  beforeEach(() => {
+    tagsVocabulary.mockResolvedValue({
+      entries: VOCABULARY.map((path) => ({ path, count: 1 })),
+    });
+  });
+
+  it("adds a tag, and the rest of the block is the same bytes", async () => {
+    renderPanel(TAGGED);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "client/an" } });
+    expect(await screen.findByRole("option", { name: "client/anvil" })).toBeInTheDocument();
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    // One write, through the panel's own path: the whole note, at the revision
+    // the buffer opened at. A second write path is what this story refused to
+    // add, and this is the assertion that would catch one.
+    expect(notesSave.mock.calls[0][0]).toBe("sub-1");
+    expect(notesSave.mock.calls[0][1]).toBe(BODY);
+    expect(notesSave.mock.calls[0][2]).toBe("rev-1");
+    // The list keeps the block style the note already used, the new tag goes
+    // last, and removing that one line gives the file back exactly (FR-121).
+    expect(notesSave.mock.calls[0][3] ?? "").toContain("  - recordings\n  - client/anvil\n");
+    expect((notesSave.mock.calls[0][3] ?? "").replace("  - client/anvil\n", "")).toBe(TAGGED);
+  });
+
+  it("removes a tag the user put there, and the rest of the block is the same bytes", async () => {
+    renderPanel(TAGGED);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove work from tags" }));
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][3] ?? "").toBe(TAGGED.replace("  - work\n", ""));
+  });
+
+  it("refuses to remove the tag that makes the note findable, and says why", async () => {
+    renderPanel(TAGGED);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove recordings from tags" }));
+
+    // Not a disabled × and not a silent no-op: the consequence is invisible
+    // from this panel, so the panel is where it has to be said.
+    expect(await screen.findByRole("alert")).toHaveTextContent(recordingsTagRefusal("recordings"));
+    expect(notesSave).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Remove recordings from tags" })).toBeInTheDocument();
+  });
+
+  it("refuses whatever spelling of it the note carries", async () => {
+    // Rust folds `Recordings`, `RECORDINGS` and `recordings ` onto one tag, so
+    // a `===` here would have protected one of them and left the others
+    // looking identical on screen and removable.
+    renderPanel(TAGGED.replace("  - recordings", "  - Recordings"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove Recordings from tags" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(recordingsTagRefusal("Recordings"));
+    expect(notesSave).not.toHaveBeenCalled();
+  });
+
+  it("lets an ordinary note drop a tag it happens to call recordings", async () => {
+    // No `session:`, so this is somebody's own note and keeper owns no row in
+    // it — the same rule that keeps a stranger's `files:` key a plain control.
+    renderPanel(TAGGED.replace(`session: ${SESSION}\n`, ""));
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove recordings from tags" }));
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("never offers to edit the session id", async () => {
+    renderPanel(TAGGED);
+
+    // Everything about the recording resolves through it and none of that is
+    // visible from here, so there is no control to type a typo into.
+    expect(screen.queryByRole("textbox", { name: "session" })).toBeNull();
+    expect(screen.queryByRole("spinbutton", { name: "session" })).toBeNull();
+    // It is still readable and still copyable — protected, not hidden.
+    expect(await screen.findByText(SESSION)).toBeInTheDocument();
+  });
+
+  it("will not make a second tag out of a different casing of one already here", async () => {
+    renderPanel(TAGGED);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "Work" } });
+
+    // No create row, because `Work` is `work` written twice — and the vault's
+    // vocabulary is where that is known, which is the point of reading it.
+    expect(screen.queryByText(tagComboboxCreate("Work"))).toBeNull();
+    expect(screen.getByText(tagComboboxAlreadyChosen("Work"))).toBeInTheDocument();
+
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(notesSave).not.toHaveBeenCalled();
+  });
+
+  it("writes the vault's spelling of a tag, not the one that was typed", async () => {
+    renderPanel(TAGGED);
+    const field = await openChooser();
+
+    // A whole tag, spelled the way somebody's shift key spelled it. No offer
+    // to create: the vault already has this tag and a second casing of it is
+    // the duplicate this story's AC is about.
+    fireEvent.change(field, { target: { value: "CLIENT/ANVIL" } });
+    expect(await screen.findByRole("option", { name: "client/anvil" })).toBeInTheDocument();
+    expect(screen.queryByText(tagComboboxCreate("CLIENT/ANVIL"))).toBeNull();
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    const block = notesSave.mock.calls[0][3] ?? "";
+    expect(block).toContain("  - client/anvil\n");
+    expect(block).not.toContain("CLIENT/ANVIL");
+  });
+
+  it("still creates a tag the vault has never seen, verbatim", async () => {
+    renderPanel(TAGGED);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "client/newco" } });
+    expect(await screen.findByText(tagComboboxCreate("client/newco"))).toBeInTheDocument();
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect((notesSave.mock.calls[0][3] ?? "").replace("  - client/newco\n", "")).toBe(TAGGED);
+  });
+
+  it("does not read the vocabulary until the chooser is asked for", async () => {
+    renderPanel(TAGGED);
+
+    await waitFor(() => expect(recordingNoteTargets).toHaveBeenCalled());
+    // The panel is on screen for as long as someone is reading the note; the
+    // vocabulary is wanted for the seconds they are picking from it.
+    expect(tagsVocabulary).not.toHaveBeenCalled();
+  });
+
+  it("keeps the chooser usable when the vocabulary cannot be read", async () => {
+    tagsVocabulary.mockRejectedValue(new Error("no vault"));
+    renderPanel(TAGGED);
+    const field = await openChooser();
+
+    // Nothing to browse costs the completion, never the edit — creating is
+    // allowed here, so the tag the user can already name still goes in.
+    fireEvent.change(field, { target: { value: "offline" } });
+    expect(await screen.findByText(tagComboboxCreate("offline"))).toBeInTheDocument();
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect((notesSave.mock.calls[0][3] ?? "").replace("  - offline\n", "")).toBe(TAGGED);
   });
 });

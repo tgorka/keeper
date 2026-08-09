@@ -169,6 +169,11 @@ export async function saveFilterAsSpace(name: string): Promise<NoteRefVm | null>
     sort: "modified desc",
     limit,
     icon: null,
+    // Unpositioned, so a space made from the filter bar lands in the rail's
+    // alphabetical block rather than jumping above spaces somebody placed by
+    // hand. There is nowhere on this path to ask, and guessing a number would
+    // be keeper deciding the shape of a rail it was not asked about.
+    order: 0,
   });
 }
 

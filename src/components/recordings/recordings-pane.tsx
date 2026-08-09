@@ -56,7 +56,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useWindowedRows } from "@/components/ui/window-list";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
 import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -64,6 +64,18 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 
 /** Debounce (ms) before a filter change fires `searchRecordings`. */
 const DEBOUNCE_MS = 200;
+
+/**
+ * The height a recordings row is assumed to be until it has been mounted once,
+ * and the space between two of them.
+ *
+ * An assumption, not a fact, and that is the point: a row grows a third line
+ * when it has enough tags to wrap the badges, and a fourth where the platform
+ * has no Finder and the path renders as text instead. The window measures what
+ * a row really is on first mount; this is only what it starts from.
+ */
+const RECORDING_ROW_ESTIMATE = 60;
+const RECORDING_ROW_GAP = 8;
 
 /** The pane's heading, and the accessible name of the surface itself. */
 export const RECORDINGS_PANE_TITLE = "Recordings";
@@ -212,6 +224,17 @@ export function RecordingsPane() {
     emptyKind = filtered ? "no-matches" : "no-recordings";
   }
 
+  // Keyed by session id, so a re-query that re-orders the archive carries each
+  // row's measured height with the row rather than leaving the previous
+  // occupant's height at that position.
+  const getKey = useCallback((index: number) => hits[index]?.sessionId ?? String(index), [hits]);
+  const list = useWindowedRows({
+    count: hits.length,
+    getKey,
+    rowHeight: RECORDING_ROW_ESTIMATE,
+    gap: RECORDING_ROW_GAP,
+  });
+
   return (
     <section
       aria-label={RECORDINGS_PANE_TITLE}
@@ -355,7 +378,7 @@ export function RecordingsPane() {
         )}
       </div>
 
-      <ScrollArea className="min-h-0 flex-1">
+      <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex min-h-0 flex-col gap-2 p-6">
           {error !== null ? (
             <div role="alert" className="rounded-md bg-destructive/10 p-3 text-destructive text-sm">
@@ -376,31 +399,43 @@ export function RecordingsPane() {
               }
             />
           ) : (
-            <ul aria-label={RECORDINGS_LIST_LABEL} className="flex flex-col gap-2">
-              {hits.map((hit) => (
-                <RecordingRow
-                  key={hit.sessionId}
-                  hit={hit}
-                  canReveal={canReveal}
-                  onReveal={(h) => {
-                    // The absolute path Rust resolved for this session as it is
-                    // stored RIGHT NOW: story 40.4 moves folders on a retitle and
-                    // 42.1's row follows the session, so the row's path is the
-                    // current one and Reveal never points at where it used to be.
-                    void revealPath(h.absolutePath).catch(() => {});
-                  }}
-                  onPlay={(h) => {
-                    if (h.playablePath === null) {
-                      return;
-                    }
-                    void recordingOpenPath(h.playablePath).catch(() => {});
-                  }}
-                />
-              ))}
+            <ul
+              aria-label={RECORDINGS_LIST_LABEL}
+              className="relative w-full"
+              style={{ height: `${list.totalSize}px` }}
+            >
+              {list.rows.map((row) => {
+                const hit = hits[row.index];
+                if (hit === undefined) {
+                  return null;
+                }
+                return (
+                  <li key={hit.sessionId} {...list.rowProps(row)}>
+                    <RecordingRow
+                      hit={hit}
+                      canReveal={canReveal}
+                      onReveal={(h) => {
+                        // The absolute path Rust resolved for this session as it
+                        // is stored RIGHT NOW: story 40.4 moves folders on a
+                        // retitle and 42.1's row follows the session, so the
+                        // row's path is the current one and Reveal never points
+                        // at where it used to be.
+                        void revealPath(h.absolutePath).catch(() => {});
+                      }}
+                      onPlay={(h) => {
+                        if (h.playablePath === null) {
+                          return;
+                        }
+                        void recordingOpenPath(h.playablePath).catch(() => {});
+                      }}
+                    />
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>
-      </ScrollArea>
+      </div>
     </section>
   );
 }

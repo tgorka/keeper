@@ -1,8 +1,10 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vitest";
-import { NoteList } from "@/components/notes/note-list";
-import { NOTE_MORE_TAGS_LABEL } from "@/components/notes/note-row";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { NOTE_ROW_HEIGHT, NoteList } from "@/components/notes/note-list";
+import { NOTE_MORE_TAGS_LABEL, NOTE_ORDER_UNREADABLE_MARK } from "@/components/notes/note-row";
+import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { type ListGeometry, withListGeometry } from "@/test/layout";
 
 /**
  * jsdom reports every element as zero-sized, and a virtualiser fed a zero-height
@@ -41,6 +43,9 @@ function row(overrides: Partial<NoteRowVm> & { id: string; title: string }): Not
     conflict: false,
     origin: "",
     headRev: "",
+    // Every note has one, which is the point of 44.5's default; a fixture that
+    // omitted it would be a list state the shell cannot produce.
+    order: { value: 0, source: "default" },
     ...overrides,
   };
 }
@@ -233,5 +238,192 @@ describe("NoteList — the tags a row could not fit", () => {
     );
 
     expect(screen.queryByRole("button", { name: new RegExp(NOTE_MORE_TAGS_LABEL) })).toBeNull();
+  });
+});
+
+/**
+ * Story 44.5 — the list's side of it.
+ *
+ * `note-row.test.tsx` proves one row renders one order. What only the list can
+ * get wrong is the two things below: showing an order on SOME rows, which is the
+ * half-ordered list the default exists to prevent; and re-deriving the order
+ * here, which would make the webview a second opinion about a sequence Rust
+ * already decided.
+ */
+describe("NoteList — the order beside every note", () => {
+  /** Rows exactly as `notes_list` hands them over: already sorted by Rust. */
+  const SORTED = [
+    row({ id: "f", title: "First", order: { value: -1, source: "own" } }),
+    row({ id: "d1", title: "Alpha", order: { value: 0, source: "default" } }),
+    row({ id: "d2", title: "Beta", order: { value: 0, source: "unreadable" } }),
+    row({ id: "l", title: "Last", order: { value: 10, source: "own" } }),
+  ];
+
+  function orderCells(): string[] {
+    return Array.from(document.querySelectorAll('[data-slot="note-order"]')).map(
+      (cell) => cell.textContent ?? "",
+    );
+  }
+
+  it("shows an order on every row, never on only the placed ones", () => {
+    renderList(SORTED);
+
+    // Four rows, four orders. A list where the defaulted notes showed nothing is
+    // the half-ordered list of the story's first sentence.
+    expect(orderCells()).toHaveLength(SORTED.length);
+    expect(orderCells().every((text) => text !== "")).toBe(true);
+  });
+
+  it("renders the orders in the sequence Rust sent, without re-sorting them", () => {
+    renderList(SORTED);
+
+    // Ascending here only because the shell already sorted; the assertion is that
+    // the list echoed its input. A webview that sorted by `order` itself would
+    // pass this and then disagree with Rust the moment the space's sort is `name`
+    // — which is why the sort lives in exactly one place.
+    expect(orderCells()).toEqual(["-1", "0", `0${NOTE_ORDER_UNREADABLE_MARK}`, "10"]);
+
+    const reversed = [...SORTED].reverse();
+    cleanup();
+    renderList(reversed);
+    expect(orderCells()).toEqual([`10`, `0${NOTE_ORDER_UNREADABLE_MARK}`, "0", "-1"]);
+  });
+});
+
+/**
+ * Story 44.10 — a vault, not a screenful.
+ *
+ * Every assertion here counts MOUNTED rows, because that is the only thing
+ * AD-84 is about. `withListGeometry` is not optional scaffolding: jsdom lays
+ * nothing out, so without it the scroll offset can never leave zero and a list
+ * that mounted all ten thousand rows in a browser would satisfy every one of
+ * these on the first window it happened to render.
+ *
+ * What this cannot prove is named plainly: whether a real note row is really
+ * 64 px at the real font. That is a browser fact, and this is not a browser.
+ */
+describe("NoteList — a vault, not a screenful", () => {
+  /** Ten rows fit; nothing exists above row 0 to overscan into. */
+  const VISIBLE_ROWS = 10;
+  const OVERSCAN = 8;
+
+  const MANY = Array.from({ length: 4000 }, (_, index) =>
+    row({ id: `n${index}`, title: `Note ${index}` }),
+  );
+
+  let geometry: ListGeometry | null = null;
+
+  afterEach(() => {
+    geometry?.undo();
+    geometry = null;
+  });
+
+  function install(): void {
+    geometry = withListGeometry({ viewport: VISIBLE_ROWS * NOTE_ROW_HEIGHT, row: NOTE_ROW_HEIGHT });
+  }
+
+  function mountedRows(): number[] {
+    return Array.from(document.querySelectorAll(`[${WINDOW_ROW_ATTR}]`)).map((element) =>
+      Number(element.getAttribute(WINDOW_ROW_ATTR)),
+    );
+  }
+
+  function viewport(): HTMLElement {
+    const element = document.querySelector(`[${WINDOW_VIEWPORT_ATTR}]`);
+    if (!(element instanceof HTMLElement)) {
+      throw new Error("the note list has no scroll viewport");
+    }
+    return element;
+  }
+
+  it("mounts a window over four thousand notes, not four thousand rows", () => {
+    install();
+    renderList(MANY);
+
+    expect(mountedRows()).toHaveLength(VISIBLE_ROWS + OVERSCAN);
+    expect(screen.getByRole("button", { name: /Note, Note 0/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Note, Note 3999/ })).toBeNull();
+  });
+
+  it("reaches the last note by scrolling, and still mounts only a window", () => {
+    install();
+    renderList(MANY);
+
+    act(() =>
+      geometry?.scrollTo(
+        viewport(),
+        MANY.length * NOTE_ROW_HEIGHT - VISIBLE_ROWS * NOTE_ROW_HEIGHT,
+      ),
+    );
+
+    expect(screen.getByRole("button", { name: /Note, Note 3999/ })).toBeInTheDocument();
+    // Everything between the two ends is gone. Note 0 is NOT: it is the tab
+    // stop, and the window keeps it mounted deliberately (see the tab-order
+    // test below) — one row's worth of cost for a surface Tab can still enter.
+    expect(mountedRows()).not.toContain(2000);
+    expect(mountedRows()).toContain(0);
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2 + 1);
+  });
+
+  it("moves the cursor to a row that was never rendered, and lands focus on it", () => {
+    install();
+    renderList(MANY);
+
+    // `↑` with no cursor wraps to the LAST note — three thousand nine hundred
+    // rows past anything in the DOM. Focus has to land on an element that only
+    // exists because the move put it there.
+    fireEvent.keyDown(screen.getByRole("button", { name: /Note, Note 0/ }), { key: "ArrowUp" });
+
+    const last = screen.getByRole("button", { name: /Note, Note 3999/ });
+    expect(document.activeElement).toBe(last);
+    // And one step back is the row before it, not a DOM sibling that happens to
+    // be adjacent in the window.
+    fireEvent.keyDown(last, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /Note, Note 3998/ }));
+  });
+
+  it("keeps the open note selected across scrolling it out of view and back", () => {
+    install();
+    render(
+      <NoteList
+        rows={MANY}
+        total={MANY.length}
+        selectedId="n2"
+        onSelect={vi.fn()}
+        onToggleTag={vi.fn()}
+        onVerb={vi.fn()}
+        onGrow={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /Note, Note 2/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+
+    act(() => geometry?.scrollTo(viewport(), 100_000));
+    act(() => geometry?.scrollTo(viewport(), 0));
+
+    // Still selected, and the list did not decide to go somewhere else on the
+    // way back.
+    expect(screen.getByRole("button", { name: /Note, Note 2/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    expect(viewport().scrollTop).toBe(0);
+  });
+
+  it("keeps exactly one note in the tab order, wherever the list is scrolled", () => {
+    install();
+    renderList(MANY);
+    const stops = () => document.querySelectorAll('[data-slot="note-row"][tabindex="0"]');
+
+    expect(stops()).toHaveLength(1);
+
+    act(() => geometry?.scrollTo(viewport(), 100_000));
+
+    // The tab stop is row 0, now nowhere near the viewport. Unmounting it would
+    // leave the notes list with no tab stop at all and Tab would skip it.
+    expect(stops()).toHaveLength(1);
+    expect(stops()[0]).toHaveAccessibleName(/Note, Note 0/);
   });
 });

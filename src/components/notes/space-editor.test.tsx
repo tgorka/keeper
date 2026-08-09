@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 
@@ -11,6 +11,8 @@ vi.mock("@/lib/ipc/client", () => ({
 import {
   SPACE_NO_NAME,
   SPACE_NO_TERMS,
+  SPACE_SORT_NOTES,
+  SPACE_SORT_RECORDED_NOTE,
   SPACE_TERMS_BROKEN,
   SPACE_TERMS_READONLY,
   SpaceEditor,
@@ -46,9 +48,12 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
     name: p.name ?? "Active work",
     query: p.query ?? "tag:client/acme -tag:draft",
     sort: p.sort ?? "modified desc",
+    sortEffective: p.sortEffective ?? "modified desc",
     limit: p.limit ?? 500,
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
+    warnings: p.warnings ?? [],
+    order: p.order ?? 0,
     error: p.error ?? null,
   };
 }
@@ -124,11 +129,14 @@ describe("editing a space changes what it selects", () => {
     const field = screen.getByLabelText("Add a tag");
     // The list is populated before a key is pressed — that is the browse half
     // the `<select>` this replaced was the only half of. `draft` is absent
-    // because the space already carries it.
-    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
-      "client",
-      "urgent",
-    ]);
+    // because the space already carries it. Scoped to the combobox's own
+    // listbox, because Story 44.4 put two real `<select>`s on this form and
+    // their `<option>`s answer to the same role.
+    expect(
+      within(screen.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((row) => row.textContent),
+    ).toEqual(["client", "urgent"]);
 
     fireEvent.change(field, { target: { value: "urg" } });
     fireEvent.keyDown(field, { key: "Enter" });
@@ -273,6 +281,182 @@ describe("the icon", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().icon).toBeNull();
+  });
+
+  /**
+   * The set has to cover the four seeded defaults (Story 44.3) or the rail that
+   * replaced the fixed rows cannot draw the glyphs those rows drew. Named one by
+   * one rather than counted, because a count passes while the wrong twenty-four
+   * icons are in the map.
+   */
+  it("offers every glyph a seeded default asks for", async () => {
+    open();
+
+    for (const name of ["inbox", "calendar-days", "pin", "video"]) {
+      expect(await screen.findByRole("button", { name })).toBeInTheDocument();
+    }
+  });
+});
+
+describe("the sort", () => {
+  it("shows the ordering the list is actually running, and saves it back", async () => {
+    open(space({ sort: "created asc", sortEffective: "created asc" }));
+
+    expect(await screen.findByLabelText("Sort by")).toHaveValue("created");
+    expect(screen.getByLabelText("Direction")).toHaveValue("asc");
+
+    fireEvent.change(screen.getByLabelText("Sort by"), { target: { value: "recorded" } });
+    fireEvent.change(screen.getByLabelText("Direction"), { target: { value: "desc" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().sort).toBe("recorded desc");
+  });
+
+  it("offers all five facts a space can order by", async () => {
+    open();
+
+    expect(
+      within(await screen.findByLabelText("Sort by"))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["order", "name", "created", "modified", "recorded"]);
+  });
+
+  /**
+   * "Ascending" is a word about the machine. What a reader wants to know is
+   * whether the newest is at the top — and for `name` that question has
+   * different words, so the labels follow the key.
+   */
+  it("words the direction in the terms of whatever is being sorted", async () => {
+    open();
+
+    const direction = await screen.findByLabelText("Direction");
+    expect(
+      within(direction)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["Oldest first", "Newest first"]);
+
+    fireEvent.change(screen.getByLabelText("Sort by"), { target: { value: "name" } });
+    expect(
+      within(direction)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["A to Z", "Z to A"]);
+  });
+
+  /**
+   * `recorded` and `order` are the two keys whose behaviour their own name does
+   * not give away, and both rules are decisions rather than accidents. The other
+   * three carry no line, because a sentence under every control is a sentence
+   * nobody reads.
+   */
+  it("explains the two sorts whose names do not give their behaviour away", async () => {
+    open();
+
+    await screen.findByLabelText("Sort by");
+    expect(screen.queryByText(SPACE_SORT_RECORDED_NOTE)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-slot='sort-note']")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Sort by"), { target: { value: "recorded" } });
+    expect(screen.getByText(SPACE_SORT_RECORDED_NOTE)).toBeInTheDocument();
+
+    // `order` promises a manual ordering while most notes have never been given
+    // one. A reader not told that concludes the sort is broken rather than that
+    // the vault is unordered, which is the misreading AD-81 exists to prevent.
+    //
+    // Changing the key deliberately does NOT reset the direction. Rust owns the
+    // table of which key means which way, and reproducing it here to reset a
+    // dropdown would be a second copy of it in the language that cannot run its
+    // tests. Nothing is hidden by keeping it: the direction's own labels follow
+    // the key, so this still-`desc` control now reads "Highest first".
+    fireEvent.change(screen.getByLabelText("Sort by"), { target: { value: "order" } });
+    expect(screen.getByLabelText("Direction")).toHaveValue("desc");
+    expect(screen.getByText(SPACE_SORT_NOTES["order desc"] ?? "")).toBeInTheDocument();
+
+    // The alphabet does not reverse with the direction; only the position does,
+    // which is why neither line says "reverse alphabetically".
+    fireEvent.change(screen.getByLabelText("Direction"), { target: { value: "asc" } });
+    expect(screen.getByText(SPACE_SORT_NOTES["order asc"] ?? "")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Sort by"), { target: { value: "modified" } });
+    expect(document.querySelector("[data-slot='sort-note']")).toBeNull();
+  });
+
+  /**
+   * The repair path for Story 44.4's visible fallback.
+   *
+   * The form is seeded from `sortEffective` — what Rust decided — never from the
+   * stored text, so a value keeper could not read shows as the ordering the list
+   * is running. Working that out in TypeScript would be a second copy of the
+   * fallback rule in the language that cannot run its tests.
+   */
+  it("shows the fallback for a sort keeper could not read, and says why", async () => {
+    const said =
+      'keeper doesn\'t know the sort "bananas", so this space is sorted by modified, newest first.';
+    open(space({ sort: "bananas", sortEffective: "modified desc", warnings: [said] }));
+
+    expect(await screen.findByLabelText("Sort by")).toHaveValue("modified");
+    expect(screen.getByLabelText("Direction")).toHaveValue("desc");
+    expect(screen.getByText(said)).toBeInTheDocument();
+  });
+
+  /**
+   * Saving writes the canonical spelling over `bananas`. That IS a rewrite of a
+   * value keeper did not understand — the one in this surface — and it is
+   * allowed here for a reason the icon does not have: the form showed the
+   * fallback and the sentence explaining it, so pressing Save is the user
+   * agreeing to the repair rather than keeper editing a file behind their back.
+   */
+  it("repairs an unreadable sort on save, having shown what it was going to write", async () => {
+    open(space({ sort: "bananas", sortEffective: "modified desc", warnings: ["…"] }));
+
+    await screen.findByLabelText("Sort by");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().sort).toBe("modified desc");
+  });
+});
+
+describe("the rail position", () => {
+  it("shows an empty box for a space nobody positioned, and saves it as unpositioned", async () => {
+    open();
+
+    expect(await screen.findByLabelText("Rail position")).toHaveValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().order).toBe(0);
+  });
+
+  it("shows and saves a position, including a negative and a fraction", async () => {
+    open(space({ order: -1 }));
+
+    expect(await screen.findByLabelText("Rail position")).toHaveValue(-1);
+
+    fireEvent.change(screen.getByLabelText("Rail position"), { target: { value: "1.5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().order).toBe(1.5);
+  });
+
+  /**
+   * Clearing the box to retype is a state that exists for as long as it takes to
+   * type a digit. It must mean "unpositioned", which is the same 0 an absent
+   * `keeper.order` means — never a refusal to save the name the user also
+   * changed.
+   */
+  it("treats an emptied box as unpositioned rather than as a reason to refuse", async () => {
+    open(space({ order: 4 }));
+
+    fireEvent.change(await screen.findByLabelText("Rail position"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().order).toBe(0);
   });
 });
 
@@ -431,8 +615,14 @@ describe("a space whose query the chips cannot hold", () => {
     expect(savedRequest().query).toBe(LOSSY_QUERY);
   });
 
-  it("carries the sort and limit it never showed", async () => {
-    open(space({ query: LOSSY_QUERY, sort: "created asc", limit: 42 }));
+  it("carries the limit it never showed, and the sort it now does (Story 44.4)", async () => {
+    // `limit` is still a value the form does not render, so it round-trips
+    // untouched. `sort` used to be one of those and is not any more: the form
+    // shows it, so what it saves is what the controls said — spelled the one
+    // canonical way, which is what makes the fallback below a repair.
+    open(
+      space({ query: LOSSY_QUERY, sort: "created asc", sortEffective: "created asc", limit: 42 }),
+    );
 
     await screen.findByText(SPACE_TERMS_READONLY);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));

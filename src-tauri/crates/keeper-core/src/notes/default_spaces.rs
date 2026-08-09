@@ -247,6 +247,66 @@ pub enum SeedOutcome {
     },
 }
 
+/// The lowest level the desktop app's own subscriber will print.
+///
+/// `debug_log::init` installs `EnvFilter::try_from_default_env()` falling back
+/// to `EnvFilter::new("info")`, and nothing sets `RUST_LOG` for the macOS app —
+/// a GUI process launched from Finder inherits none. So **`tracing::debug!` is
+/// dead code in production**, on stderr and in `keeper.log` alike.
+///
+/// This constant exists because the second attempt at this story replaced a
+/// silent code path with a log line at a level the app cannot emit, which is the
+/// same defect one layer out: the run said `AlreadySatisfied` at `debug!` and
+/// the field report was still a blank log. A number here plus the test below is
+/// what stops the third attempt doing it again.
+pub const REPORT_FLOOR: tracing::Level = tracing::Level::INFO;
+
+impl SeedOutcome {
+    /// The level and the sentence this outcome deserves in the log.
+    ///
+    /// The choice lives here rather than at the `tracing::` call site so it can
+    /// be asserted: every variant reports at [`REPORT_FLOOR`] or above, so no
+    /// outcome of this run can ever be invisible on the machine it ran on.
+    ///
+    /// `AlreadySatisfied` is `INFO` rather than `DEBUG` on purpose. It is the
+    /// ordinary case and it is chatty — one line per vault per refresh — and it
+    /// is also the single line that answers "did the seed run at all", which is
+    /// the question two field reports in a row have turned on. A handful of
+    /// lines per launch is a trade already made in favour of being able to read
+    /// the log.
+    pub fn report(&self) -> (tracing::Level, String) {
+        match self {
+            Self::Wrote(written) if written.is_empty() => (
+                REPORT_FLOOR,
+                "seeded no default spaces; the plan was empty".to_owned(),
+            ),
+            Self::Wrote(written) => (
+                REPORT_FLOOR,
+                format!(
+                    "seeded {} default spaces: {}",
+                    written.len(),
+                    written.join(", ")
+                ),
+            ),
+            Self::AlreadySatisfied => (
+                REPORT_FLOOR,
+                "default spaces already settled for this vault; wrote nothing".to_owned(),
+            ),
+            Self::Blocked(why) => (
+                tracing::Level::WARN,
+                format!("did not seed the default spaces; will try again next refresh. {why}"),
+            ),
+            Self::Stopped { written, reason } => (
+                tracing::Level::WARN,
+                format!(
+                    "stopped after seeding {} default spaces; recorded what landed. {reason}",
+                    written.len()
+                ),
+            ),
+        }
+    }
+}
+
 /// Run the seed against a vault.
 ///
 /// The order is forced: read the ledger, read `spaces/`, plan, write, record.
@@ -1317,5 +1377,60 @@ mod tests {
                 "the seeded query must parse: {query}"
             );
         }
+    }
+
+    /// **Every outcome has to be printable on the machine it ran on.**
+    ///
+    /// The second attempt at this story replaced a silent code path with
+    /// `tracing::debug!`, and the desktop subscriber's default filter is
+    /// `EnvFilter::new("info")` with no `RUST_LOG` anywhere in the macOS app —
+    /// so the ordinary outcome was still invisible and the third field report
+    /// was still a blank log. This is the assertion that would have caught it,
+    /// and it is worth more than its two lines: it converts "remember not to use
+    /// debug! here" into something the compiler's test runner enforces.
+    #[test]
+    fn no_seed_outcome_reports_below_the_level_the_app_can_print() {
+        // Pinned to the literal level, not merely to itself. Comparing every
+        // outcome against `REPORT_FLOOR` alone is vacuous the moment somebody
+        // lowers the constant to make a `debug!` fit — which is exactly the
+        // pressure that produced the round-2 defect. The number is the one
+        // `debug_log::init` installs: `EnvFilter::new("info")`, with no
+        // `RUST_LOG` anywhere in the macOS app to raise it.
+        assert_eq!(
+            REPORT_FLOOR,
+            tracing::Level::INFO,
+            "the desktop subscriber's default filter is `info`; a floor below it \
+             means this whole test asserts nothing"
+        );
+        let every = [
+            SeedOutcome::Wrote(vec!["spaces/a.md".to_owned()]),
+            SeedOutcome::Wrote(Vec::new()),
+            SeedOutcome::AlreadySatisfied,
+            SeedOutcome::Blocked("the ledger could not be read".to_owned()),
+            SeedOutcome::Stopped {
+                written: vec!["spaces/a.md".to_owned()],
+                reason: "no space left on device".to_owned(),
+            },
+        ];
+        for outcome in &every {
+            let (level, message) = outcome.report();
+            // `tracing::Level` orders ERROR below WARN below INFO, so "at least
+            // as severe as INFO" is `<=`.
+            assert!(
+                level <= REPORT_FLOOR,
+                "{outcome:?} reports at {level}, which the app's own filter drops"
+            );
+            assert!(!message.is_empty(), "{outcome:?} says nothing");
+        }
+
+        // And a refusal keeps the reason it was given, so the sentence in the
+        // log is the one that names the file.
+        let (level, message) = SeedOutcome::Blocked(
+            ".keeper-spaces.json could not be read (permission denied)".to_owned(),
+        )
+        .report();
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(message.contains(".keeper-spaces.json"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
     }
 }

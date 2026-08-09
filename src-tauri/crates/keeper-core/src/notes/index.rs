@@ -33,6 +33,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::notes::order::NoteOrder;
 use crate::notes::search;
 use crate::notes::tags::{normalise, TagNode};
 
@@ -40,7 +41,7 @@ use crate::notes::tags::{normalise, TagNode};
 /// the shape of an [`IndexEntry`] field changes; the loader's only response to a
 /// mismatch is discard-and-cold-scan, so a bump is always safe and never a
 /// migration.
-pub const INDEX_SCHEMA: u32 = 1;
+pub const INDEX_SCHEMA: u32 = 2;
 
 /// The `IndexEntry.fields` key carrying the note's provenance class, written by
 /// the reconciler from the trailers of the last commit touching the file
@@ -139,6 +140,16 @@ pub struct IndexEntry {
     /// A short body excerpt for the list row, so rendering a window of rows never
     /// touches the filesystem.
     pub snippet: String,
+    /// The note's own position in a list (Story 44.5, AD-81), parsed from
+    /// frontmatter once here rather than re-read from `fields["order"]` on every
+    /// comparison: sorting a ten-thousand-note vault is ~130 000 comparisons, and
+    /// a comparator that parses a string is a string parse in each of them.
+    ///
+    /// The raw text stays in `fields` as well, because `field:order=3` is an
+    /// ordinary space predicate and must keep working. This is the *typed* copy,
+    /// carrying whether the note actually stated a position or took the default —
+    /// see [`crate::notes::order`].
+    pub order: NoteOrder,
 }
 
 impl IndexEntry {
@@ -895,6 +906,7 @@ mod tests {
             links: Vec::new(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: NoteOrder::default(),
         }
     }
 

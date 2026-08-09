@@ -18,8 +18,10 @@ import {
   RECORDINGS_REFRESH_LABEL,
   RecordingsPane,
 } from "@/components/recordings/recordings-pane";
+import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { type ListGeometry, withListGeometry } from "@/test/layout";
 
 /** The two empty-state sentences, verbatim — they are the assertion. */
 const NOTHING_RECORDED = "Nothing recorded yet. Record a session and it lands here.";
@@ -246,5 +248,79 @@ describe("RecordingsPane", () => {
     expect(alert).toHaveTextContent("archive.db is locked");
     // A failure is not the same fact as an empty archive.
     expect(screen.queryByText(NOTHING_RECORDED)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Story 44.10 — the archive, not a screenful.
+ *
+ * A recordings row is the one row of the three whose height genuinely varies:
+ * enough tags wrap the badges onto a third line, and a machine with no Finder
+ * grows a path line. So this asserts the window over a MEASURED list, where the
+ * total the scrollbar reports is a running correction rather than a constant
+ * times a count. `withListGeometry` is what makes any of it observable — jsdom
+ * lays nothing out and would report a list that mounted all two thousand rows
+ * as perfectly bounded.
+ */
+describe("RecordingsPane — the archive, not a screenful", () => {
+  const ROW_PX = 68;
+  const VISIBLE_ROWS = 10;
+  const OVERSCAN = 6;
+
+  const MANY = Array.from({ length: 2000 }, (_, index) =>
+    hit({ sessionId: `s${index}`, title: `Session ${index}` }),
+  );
+
+  let geometry: ListGeometry | null = null;
+
+  afterEach(() => {
+    geometry?.undo();
+    geometry = null;
+  });
+
+  function mountedRows(): number[] {
+    return Array.from(document.querySelectorAll(`[${WINDOW_ROW_ATTR}]`)).map((element) =>
+      Number(element.getAttribute(WINDOW_ROW_ATTR)),
+    );
+  }
+
+  function viewport(): HTMLElement {
+    const element = document.querySelector(`[${WINDOW_VIEWPORT_ATTR}]`);
+    if (!(element instanceof HTMLElement)) {
+      throw new Error("the recordings list has no scroll viewport");
+    }
+    return element;
+  }
+
+  async function renderArchive(): Promise<void> {
+    geometry = withListGeometry({ viewport: VISIBLE_ROWS * ROW_PX, row: ROW_PX });
+    searchRecordings.mockResolvedValue(MANY);
+    render(<RecordingsPane />);
+    await screen.findByRole("list", { name: RECORDINGS_LIST_LABEL }, { timeout: 2000 });
+    await screen.findByText("Session 0");
+  }
+
+  it("mounts a window over two thousand sessions, not two thousand rows", async () => {
+    await renderArchive();
+
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
+    expect(screen.queryByText("Session 1999")).toBeNull();
+  });
+
+  it("reaches the last session by scrolling", async () => {
+    await renderArchive();
+
+    // The total is a measured running estimate, so the bottom moves as rows are
+    // seen; scrolling to whatever the list currently claims is the bottom is
+    // what a person with a scrollbar actually does.
+    for (let attempt = 0; attempt < 12 && screen.queryByText("Session 1999") === null; attempt++) {
+      const height = Number.parseFloat(
+        screen.getByRole("list", { name: RECORDINGS_LIST_LABEL }).style.height,
+      );
+      act(() => geometry?.scrollTo(viewport(), height - VISIBLE_ROWS * ROW_PX));
+    }
+
+    expect(screen.getByText("Session 1999")).toBeInTheDocument();
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
   });
 });

@@ -49,6 +49,7 @@ use keeper_core::notes::index::{
     link_key, IndexBuilder, IndexCache, IndexEntry, IndexSnapshot, NoteDelta, RecordingTagDelta,
     FIELD_DEVICE, FIELD_ORIGIN, INDEX_SCHEMA,
 };
+use keeper_core::notes::order;
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
     NoteVaultVm,
@@ -225,6 +226,7 @@ fn tap_flag() -> MutexGuard<'static, bool> {
 /// no vaults, and this returns quietly — `CapabilitiesVm.notes` is already
 /// `false` there.
 pub fn start(app: &AppHandle) {
+    tracing::info!("notes: starting the vault registry");
     refresh(app);
     start_tap();
 }
@@ -235,7 +237,15 @@ pub fn start(app: &AppHandle) {
 /// vault list *is* a filter over the profile list" (AD-54): flagging a folder
 /// adds a vault, unflagging removes one and deletes nothing.
 pub fn refresh(app: &AppHandle) {
+    // Every early return below says so, at a level the app can actually print.
+    // Two field reports in a row on Story 44.3 turned on "did this even run",
+    // and the answer was unreadable because this function could return three
+    // different ways in silence: no engine, an unreadable profile set, and — the
+    // one that is easiest to miss — a profile set with no flagged vault in it,
+    // which leaves the loops below nothing to iterate and produces exactly the
+    // same blank log as never being called at all.
     let Some(engine) = crate::sync::engine_if_open() else {
+        tracing::info!("notes: no sync engine yet, so no vaults; the next refresh re-enters here");
         return;
     };
     let profiles = match engine.list_profiles() {
@@ -246,6 +256,11 @@ pub fn refresh(app: &AppHandle) {
         }
     };
     let wanted: Vec<Vault> = profiles.iter().filter_map(register_one).collect();
+    tracing::info!(
+        profiles = profiles.len(),
+        vaults = wanted.len(),
+        "notes: refreshing the vault registry"
+    );
     let keep: HashSet<&str> = wanted.iter().map(|vault| vault.id.as_str()).collect();
 
     let mut guard = registry();
@@ -1393,6 +1408,10 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
             .collect(),
         flags,
         snippet: snippet(body),
+        // Read once, here, so the list's comparator never re-parses a string
+        // (Story 44.5). The raw text stays in `fields` so `field:order=…` — an
+        // ordinary space predicate over the note's own frontmatter — keeps working.
+        order: order::read_order(&fm),
     }
 }
 
@@ -2638,6 +2657,7 @@ mod tests {
             links: Vec::new(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: keeper_core::notes::order::NoteOrder::default(),
         }
     }
 

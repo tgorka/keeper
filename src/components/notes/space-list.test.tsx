@@ -16,6 +16,7 @@ import {
   RESTORE_DEFAULTS,
   RESTORE_FAILED,
   RESTORE_NOTHING_MISSING,
+  SPACE_SETTINGS_SUBTITLE,
   SpaceList,
 } from "@/components/notes/space-list";
 import {
@@ -39,9 +40,12 @@ function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): Note
     name: p.name,
     query: p.query ?? "tag:client/acme",
     sort: p.sort ?? "modified desc",
+    sortEffective: p.sortEffective ?? "modified desc",
     limit: p.limit ?? 500,
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
+    warnings: p.warnings ?? [],
+    order: p.order ?? 0,
     error: p.error ?? null,
   };
 }
@@ -115,6 +119,85 @@ describe("SpaceList rows", () => {
     expect(
       await screen.findByRole("button", { name: /Broken, This space's query can't be read/ }),
     ).toBeInTheDocument();
+  });
+
+  /**
+   * The visible half of Story 44.4's fallback.
+   *
+   * A space's frontmatter is a file a person and an agent both edit, so
+   * `sort: bananas` will happen. keeper still lists the space — it selects what
+   * it selects — and the ordering it runs is the default. A row that said
+   * nothing about that is indistinguishable from keeper ignoring what the user
+   * wrote, which is the whole failure this replaces.
+   */
+  it("says so when it could not read a space's sort, rather than quietly not obeying it", async () => {
+    const said =
+      'keeper doesn\'t know the sort "bananas", so this space is sorted by modified, newest first.';
+    mockSpaces.mockResolvedValue([
+      space({ id: "s1", name: "Odd", sort: "bananas", warnings: [said] }),
+    ]);
+    render(<SpaceList vaultId="vault-1" />);
+
+    const row = await screen.findByRole("button", {
+      name: `Odd, ${SPACE_SETTINGS_SUBTITLE}`,
+    });
+    expect(row).toHaveAttribute("title", said);
+    expect(screen.getByText(SPACE_SETTINGS_SUBTITLE)).toBeInTheDocument();
+  });
+
+  it("says nothing about the settings of a space it read entirely", async () => {
+    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Fine" })]);
+    render(<SpaceList vaultId="vault-1" />);
+
+    await screen.findByRole("button", { name: "Fine" });
+    expect(screen.queryByText(SPACE_SETTINGS_SUBTITLE)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Fine" })).not.toHaveAttribute("title");
+  });
+
+  /**
+   * A space can be both broken and misread, and the two are not the same news:
+   * one means the space selects NOTHING, the other means it still works and is
+   * ordered differently from what its file says. Sending someone to fix a query
+   * that is fine is worse than saying nothing, so the parse failure wins the one
+   * line the row has.
+   */
+  it("leads with the parse failure when a space is both broken and misread", async () => {
+    mockSpaces.mockResolvedValue([
+      space({
+        id: "s1",
+        name: "Both",
+        error: "unknown search key `nope`",
+        warnings: ['keeper doesn\'t know the sort "bananas"…'],
+      }),
+    ]);
+    render(<SpaceList vaultId="vault-1" />);
+
+    await screen.findByRole("button", { name: /Both, This space's query can't be read/ });
+    expect(screen.queryByText(SPACE_SETTINGS_SUBTITLE)).not.toBeInTheDocument();
+  });
+
+  /**
+   * The rail's order is Rust's (FR-157): `notes_spaces` sorts by each space's
+   * `keeper.order` and then by name. This asserts the list renders that answer
+   * as given — a component that re-sorted by name here would throw the
+   * positions away and the whole feature would be invisible.
+   */
+  it("renders the rail in the order it was handed, not in its own", async () => {
+    mockSpaces.mockResolvedValue([
+      space({ id: "s1", name: "Zebra", order: -1 }),
+      space({ id: "s2", name: "Apple", order: 0 }),
+      space({ id: "s3", name: "Mango", order: 3 }),
+    ]);
+    render(<SpaceList vaultId="vault-1" />);
+
+    await screen.findByRole("button", { name: "Zebra" });
+    expect(
+      screen
+        .getAllByRole("button")
+        .map((row) => row.getAttribute("aria-label"))
+        .filter((label) => label !== null && !label.startsWith("Edit space "))
+        .filter((label) => label !== RESTORE_DEFAULTS),
+    ).toEqual(["Zebra", "Apple", "Mango"]);
   });
 });
 

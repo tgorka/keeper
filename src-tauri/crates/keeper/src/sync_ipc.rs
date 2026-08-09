@@ -12,7 +12,10 @@
 
 use std::sync::Arc;
 
-use keeper_core::vm::{FilesEntryVm, FilesListingState, FilesListingVm, IpcError, IpcErrorCode};
+use keeper_core::vm::{
+    FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm, FilesSyncStatusVm, IpcError,
+    IpcErrorCode,
+};
 use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
@@ -1471,6 +1474,19 @@ pub async fn sync_unsubscribe_progress(
 /// pendrive can take hundreds of milliseconds to stat, and stalling the async
 /// runtime would freeze every other profile's poll behind a click.
 ///
+/// **The sync mark is read, not recomputed** (Story 44.17, FR-173).
+/// [`keeper_sync::engine::Engine::pending`] is already the one derived answer
+/// to "what has this folder not synced yet, and why", and [`sync_pending`]
+/// renders the same list as the Pending card. Calling it here rather than
+/// asking git a second question is what keeps the two surfaces from ever
+/// wording the same file differently — and it is the reason a mark cannot
+/// become a second source of sync truth.
+///
+/// An engine that cannot produce that list does not fail the listing. A folder
+/// whose repository is unreadable is exactly the folder somebody most needs to
+/// look inside, so the entries still come back, marked
+/// [`FilesSyncStatusVm::Unknown`] with the engine's own words attached.
+///
 /// Rejects with: `unsupported`, `internal` (no such profile, a malformed
 /// profile exclude pattern, a subpath that escapes the root, an unreadable
 /// directory).
@@ -1485,16 +1501,28 @@ pub async fn sync_browse(
     let profile = find_profile(&profiles, &id)?.clone();
     let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
 
+    // Before the walk, so one answer covers every entry in the directory and a
+    // thousand-row folder asks the engine once.
+    let (pending, unavailable) = match engine.pending(&id).await {
+        Ok(files) => (browse::PendingView::from_pending(files), None),
+        Err(error) => (browse::PendingView::Unavailable, Some(error.to_string())),
+    };
+
     let listing = {
         let profile = profile.clone();
         let subpath = subpath.clone();
-        tokio::task::spawn_blocking(move || browse::browse(&profile, &subpath, &excludes))
+        tokio::task::spawn_blocking(move || browse::browse(&profile, &subpath, &excludes, &pending))
             .await
             .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
     }
     .map_err(|refusal| open_failure(refusal.to_string()))?;
 
-    Ok(files_listing_vm(&profile, subpath, listing))
+    Ok(files_listing_vm(
+        &profile,
+        subpath,
+        listing,
+        unavailable.as_deref(),
+    ))
 }
 
 /// Project one [`BrowseListing`] into the VM the Files tab renders.
@@ -1503,10 +1531,15 @@ pub async fn sync_browse(
 /// `Some` only under [`FilesListingState::Listed`], so a pane cannot render
 /// "this folder is empty" for a drive that is out without first unwrapping and
 /// meeting the state that says otherwise.
+///
+/// `engine_failure` is the engine's own words for why it could not produce a
+/// pending list, threaded through so an `unknown` mark carries a reason
+/// instead of a shrug.
 fn files_listing_vm(
     profile: &SyncProfile,
     subpath: String,
     listing: browse::BrowseListing,
+    engine_failure: Option<&str>,
 ) -> FilesListingVm {
     let (state, entries, detail, truncated) = match listing {
         browse::BrowseListing::Listed(dir) => {
@@ -1514,11 +1547,13 @@ fn files_listing_vm(
                 .entries
                 .into_iter()
                 .map(|entry| {
+                    let sync = sync_mark(&entry.sync, engine_failure);
                     FilesEntryVm::new(
                         entry.name,
                         entry.relative_path,
                         entry.absolute_path.to_string_lossy().into_owned(),
                         entry.is_dir,
+                        sync,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1570,6 +1605,64 @@ fn files_listing_vm(
         entries,
         detail,
         truncated,
+    }
+}
+
+/// Word one entry's sync state (Story 44.17, FR-173).
+///
+/// **The sentence is composed here and not in TypeScript** — the same rule the
+/// listing's own `detail` follows. The reason is not tidiness: the browser and
+/// the Pending card describe the same engine state, and a second copy of these
+/// words in the frontend is a second copy that will be edited once.
+///
+/// A folder's roll-up carries no [`PendingReason`] of its own, and it is worded
+/// as a folder rather than borrowing whichever descendant's word came first
+/// alphabetically. "This folder is untracked" about a folder holding one new
+/// file would be a small, confident lie.
+fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> FilesEntrySyncVm {
+    match status {
+        browse::EntrySyncStatus::Synced => FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+        browse::EntrySyncStatus::Waiting { reason } => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Waiting,
+            match reason {
+                Some(PendingReason::Settling { .. }) => {
+                    "keeper is waiting for this file to finish being written."
+                }
+                Some(PendingReason::Untracked) => {
+                    "This file is new and has not been committed yet."
+                }
+                Some(PendingReason::Modified) => {
+                    "This file has changed and has not been committed yet."
+                }
+                Some(PendingReason::Added) => "This file is staged and has not been committed yet.",
+                Some(PendingReason::Deleted) => {
+                    "This file has been deleted and the deletion has not been committed yet."
+                }
+                None => "Something in this folder is waiting to sync.",
+            },
+        ),
+        browse::EntrySyncStatus::Excluded => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Excluded,
+            "A pattern in this folder's sync settings excludes it, so keeper will never \
+             copy it.",
+        ),
+        browse::EntrySyncStatus::NotInRepository => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::NotInRepository,
+            "This folder is not a repository yet. The first sync sets one up and takes \
+             everything in it.",
+        ),
+        // The engine's own words, verbatim, for the same reason an unreadable
+        // directory shows the OS's: a reason someone can act on beats a
+        // sentence that only says something went wrong.
+        browse::EntrySyncStatus::Unknown => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Unknown,
+            match engine_failure {
+                Some(reason) => {
+                    format!("keeper could not read this folder's sync state: {reason}")
+                }
+                None => "keeper could not read this folder's sync state.".to_owned(),
+            },
+        ),
     }
 }
 

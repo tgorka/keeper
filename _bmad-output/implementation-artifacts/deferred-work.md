@@ -2204,6 +2204,83 @@ reason: F4 was that `SyncPhase::is_transferring` claimed `Pushing` carries a rat
   someone chose is fine; an exception nobody recorded becomes the precedent for the next one.
 status: open
 
+### DW-162: `tracing::debug!` cannot print in the shipped desktop app, so 127 diagnostic call sites across all three crates are dead code — and the Settings "debug mode" toggle does not turn them on.
+
+origin: found while diagnosing the third field report on story 44.3 (default spaces seeded nothing and logged nothing), 2026-08-09
+location: src-tauri/crates/keeper/src/debug_log.rs:122-129 (`init`, the only place the process-wide subscriber is built) + the 127 `tracing::debug!` call sites outside test modules, principally keeper-core/src/account.rs (24), keeper-sync/src/engine.rs (19), keeper/src/ipc.rs (18)
+reason: `init` installs
+  `EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`, and nothing sets
+  `RUST_LOG` for the macOS desktop app — the only occurrences in the tree are `info` in
+  `gen/apple/project.yml` and the iOS Xcode scheme, plus `keeper-syncd`, which resolves its own
+  filter from `--verbose` and its config. A GUI process launched from Finder inherits no shell
+  environment. So the effective floor is `info` on every machine a user runs, and `tracing::debug!`
+  reaches neither stderr nor `keeper.log`, whatever the user does.
+  The count is 127 across `keeper` (42), `keeper-core` (55) and `keeper-sync` (30), and the content
+  is what makes this worth an entry rather than a shrug: they are overwhelmingly the line that
+  explains a refusal or a fallback — `keeper-note: refused a path outside the vault`,
+  `recordings sync: the push policy says not now, so the commits stay local until it does`,
+  `recording note: this stub is no longer what keeper composed, so it is kept`,
+  `notes: cadence push deferred`, `no synced folders to default to; recording into the plain
+  folder`. Every one answers "why did keeper not do the thing I expected", and every one is
+  invisible at exactly the moment somebody asks. `GatedMakeWriter` already makes the right call for
+  the file leg — `WARN`/`ERROR` are always recorded, `INFO` joins them while debug mode is on — but
+  `DEBUG` is filtered out one layer above it, by the subscriber, before the writer is consulted. The
+  consequence a user meets is that the Settings toggle called "debug mode" does not enable debug
+  logging.
+  Cost of the absence, measured rather than asserted: story 44.3 took three field reports and three
+  rounds to diagnose. Round 1 was a silent code path; round 2 replaced it with a `tracing::debug!`
+  that could not print, which looked like a fix and reproduced the same defect one layer out; round
+  3 found this. Any future silent-behaviour bug in any subsystem starts from the same place.
+  Not fixed in 44.3 because the fix is a judgement about the whole app and there are at least three
+  defensible shapes: (1) `EnvFilter::new("debug")` when `debug.mode` is on — cheapest, matches what
+  the toggle's name promises, needs a volume review because 127 sites include hot paths in
+  `engine.rs` and `account.rs` and the file leg is unrotated; (2) promote the diagnostic sites to
+  `INFO` and leave the floor — precise, no volume surprise, but 127 individual judgements that will
+  drift straight back; (3) per-target filtering (`info,keeper_lib::notes_vault=debug`) driven by a
+  setting — most control, most machinery. Story 44.3 did (2) for its own module only, with a test
+  that pins the floor to the literal `Level::INFO` and names `EnvFilter::new("info")` as its source
+  (`keeper-core::notes::default_spaces::no_seed_outcome_reports_below_the_level_the_app_can_print`),
+  which is the smallest honest thing one story can do and is not a fix for the other 126.
+  Whoever takes this: the test above is the pattern worth copying, and the reason it works is worth
+  copying too. Its first version compared each outcome's level against the `REPORT_FLOOR` constant
+  alone, and a mutation that *lowered the constant* passed it — a self-consistent floor accommodates
+  whatever level someone reaches for. Pinning the literal is what closed it.
+status: open
+
+### DW-163: A space's `keeper.limit` is read, shipped to the frontend and written back on save, and nothing has ever applied it — the list window is sized entirely by the request.
+
+origin: found while implementing story 44.4, which applied `keeper.sort` and left its neighbour where it was, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`SpaceDef.limit`, `project_list`)
+reason: `space_def` parses `limit` and clamps it, `notes_spaces` puts it on `NoteSpaceVm`, and
+  `notes_space_save` writes it back — but `project_list` sizes its window from `req.limit`
+  (`DEFAULT_LIMIT` when zero) and never looks at the space's. So a space that says `limit: 42`
+  yields whatever the caller asked for, and the value is a round-tripped decoration.
+  This is the identical defect story 44.4 fixed for `sort`, one key over, and it was left alone on
+  purpose: 44.4's scope is the icon, the order and the sort, and applying `limit` is a change to how
+  many rows every space returns — which interacts with 44.10's virtualisation and 44.11's counts
+  (a space capped at 42 makes "how many notes does this select" ambiguous in a way the counts story
+  has to answer, not this one). Whoever takes it must decide that first: whether `limit` caps what
+  the space *selects* or only what it *renders*, because 44.11's count means different things under
+  each reading.
+status: open
+
+### DW-164: The `recorded` sort reads a session's instant out of the stub's `date` and `start` keys, so a recording note whose stamps a person edited by hand sorts by what they typed rather than by the session.
+
+origin: found while implementing story 44.4, 2026-08-09
+location: src-tauri/crates/keeper-core/src/notes/sort.rs (`recorded_ms`)
+reason: `recording_note::compose` writes the session's local calendar day into `date` and its clock
+  into `start`, and there is no single stored instant to read — so `recorded_ms` composes those two.
+  That is the honest reading of what is on disk, and it is also the user's own text: a note is the
+  user's, and FR-121 says keeper does not overwrite what they wrote. The consequence is that
+  `recorded` is only as true as those two keys, and a note whose `date` was retyped sorts by the
+  retyped day even though `manifest.json` still knows the real one.
+  Not fixed here because the fix is a schema decision rather than a sort decision: it would mean the
+  stub writing a machine key (`keeper.recorded`, an RFC 3339 instant beside `session:`) that keeper
+  owns and a person is not invited to edit, which changes what `compose` emits for every recording
+  note and wants its own story beside 44.2. The sort would then prefer that key and fall back to
+  `date`/`start` for every note written before it.
+status: open
+
 ## DW-N1 — the editor caret opens in front of the frontmatter block
 
 **Status:** done 2026-08-04, by the design correction below. **Found:** 2026-08-03,

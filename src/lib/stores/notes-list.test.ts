@@ -16,6 +16,7 @@ function row(id: string, title = id): NoteRowVm {
     conflict: false,
     origin: "",
     headRev: "",
+    order: { value: 0, source: "default" },
   };
 }
 

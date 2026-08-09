@@ -6,8 +6,8 @@
  * A complete description of the space, not a patch: an update rewrites the
  * definition wholesale, so a caller that omits a field is saying "this space
  * has none" rather than "leave it alone". That is the opposite of
- * [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is four
- * values on one form, all of them on screen at once, so "absent means
+ * [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is a handful
+ * of values on one form, all of them on screen at once, so "absent means
  * unchanged" would only be a way for a stale form to resurrect a term the
  * user deleted.
  */
@@ -21,8 +21,22 @@ id: string | null,
  * file, so it is the one field here that touches bytes outside the
  * `keeper:` key.
  */
-name: string, query: string, sort: string, limit: number, 
+name: string, query: string, 
+/**
+ * How the space orders what it lists: `<key> <dir>`, the text
+ * [`crate::notes::sort::read`] accepts. The editor sends the canonical
+ * spelling of whatever it had selected, which is the one place a value
+ * keeper could not read *is* rewritten — the form showed the fallback and
+ * said why, so pressing Save is a repair the user watched happen rather
+ * than a rewrite behind their back.
+ */
+sort: string, limit: number, 
 /**
  * The chosen icon's name, or `None` to leave the space without one.
  */
-icon: string | null, };
+icon: string | null, 
+/**
+ * The space's position in the rail. Zero is "unpositioned" and is not
+ * written to the file, so a space nobody ordered grows no key to explain.
+ */
+order: number, };

@@ -3688,6 +3688,84 @@ pub enum FilesListingState {
     Missing,
 }
 
+/// What sync knows about one browsed entry (Story 44.17, FR-173).
+///
+/// **The distinction this enum exists for is `excluded` against `waiting`.**
+/// They look the same on screen if you collapse them — a file that is not
+/// there yet — and they are opposite facts: one is arriving, the other never
+/// will. A user watching an excluded file "sync" is a user waiting forever,
+/// and that is the failure Story 44.17 was written from.
+///
+/// `notInRepository` is the third way a file fails to arrive, and it has its
+/// own next step: the folder has no repository, so the first sync has to adopt
+/// it before anything in it can travel. `unknown` exists for the same reason
+/// [`FilesListingState`] separates an absent drive from an empty folder — when
+/// the engine could not answer, every other value is a claim with nothing
+/// behind it, and the two available guesses are "your work is safe" and "keep
+/// waiting". Neither is honest.
+///
+/// Deliberately keeper's own vocabulary and not git's. `staged`, `untracked`
+/// and `ahead` are answers to a question nobody browsing a folder is asking;
+/// the sentence in [`FilesEntrySyncVm::detail`] is where the specific reason
+/// goes, composed in Rust like every other sentence this surface renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FilesSyncStatusVm {
+    /// In a repository, not excluded, and the engine has no outstanding work
+    /// about it. For a folder, the same is true of everything inside it.
+    Synced,
+    /// The engine still has something to do about this entry before it is on
+    /// the remote.
+    Waiting,
+    /// A pattern in this folder's own sync settings excludes it. It is listed
+    /// *only* so it can say so; keeper's built-in noise corpus is not listed at
+    /// all, because nobody chose those patterns and nobody is waiting on them.
+    Excluded,
+    /// The folder is not a git repository yet, so nothing in it is going
+    /// anywhere until the first sync adopts it.
+    NotInRepository,
+    /// The engine was asked and could not say.
+    Unknown,
+}
+
+/// One entry's sync mark, with the sentence that explains it.
+///
+/// A struct rather than two loose fields on [`FilesEntryVm`] because they are
+/// one fact: the status decides the glyph, the detail is the words, and a row
+/// that showed one without the other would be a row saying "waiting" with no
+/// way to learn what for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesEntrySyncVm {
+    /// Which mark to render.
+    pub status: FilesSyncStatusVm,
+    /// The one sentence naming *why*, composed in Rust so the browser and the
+    /// Pending list cannot come to word the same engine state differently.
+    /// `None` when the status says everything there is to say — a synced file
+    /// has no story.
+    pub detail: Option<String>,
+}
+
+impl FilesEntrySyncVm {
+    /// A mark with no sentence behind it.
+    pub fn plain(status: FilesSyncStatusVm) -> Self {
+        Self {
+            status,
+            detail: None,
+        }
+    }
+
+    /// A mark and the sentence that explains it.
+    pub fn explained(status: FilesSyncStatusVm, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
 /// One entry in a browsed synced folder (Story 43.8, FR-153, FR-145, AD-65,
 /// AD-73).
 ///
@@ -3721,6 +3799,8 @@ pub struct FilesEntryVm {
     /// dirent said directory; every other value is decided by extension in
     /// [`crate::archive::recordings_fts::kind_for_file_name`].
     pub kind: RecordingNoteTargetKind,
+    /// Whether sync has this entry, and why not (Story 44.17, FR-173).
+    pub sync: FilesEntrySyncVm,
 }
 
 impl FilesEntryVm {
@@ -3734,6 +3814,7 @@ impl FilesEntryVm {
         relative_path: impl Into<String>,
         absolute_path: impl Into<String>,
         is_dir: bool,
+        sync: FilesEntrySyncVm,
     ) -> Self {
         let name = name.into();
         let kind = if is_dir {
@@ -3746,6 +3827,7 @@ impl FilesEntryVm {
             relative_path: relative_path.into(),
             absolute_path: absolute_path.into(),
             kind,
+            sync,
         }
     }
 }
@@ -5588,8 +5670,13 @@ mod tests {
             ("manifest.json", RecordingNoteTargetKind::File),
             ("Makefile", RecordingNoteTargetKind::File),
         ] {
-            let entry =
-                FilesEntryVm::new(name, format!("sub/{name}"), format!("/v/sub/{name}"), false);
+            let entry = FilesEntryVm::new(
+                name,
+                format!("sub/{name}"),
+                format!("/v/sub/{name}"),
+                false,
+                FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+            );
             assert_eq!(entry.kind, expected, "{name}");
         }
     }
@@ -5599,7 +5686,13 @@ mod tests {
     /// a text editor.
     #[test]
     fn a_directory_is_a_folder_whatever_it_is_named() {
-        let entry = FilesEntryVm::new("notes.md", "notes.md", "/v/notes.md", true);
+        let entry = FilesEntryVm::new(
+            "notes.md",
+            "notes.md",
+            "/v/notes.md",
+            true,
+            FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+        );
         assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
     }
 
@@ -5643,6 +5736,10 @@ mod tests {
             "2026/clip.mov",
             "/Volumes/m/2026/clip.mov",
             false,
+            FilesEntrySyncVm::explained(
+                FilesSyncStatusVm::Waiting,
+                "This file has changed and has not been committed yet.",
+            ),
         );
         let json = serde_json::to_string(&entry).expect("serialize files entry");
         assert!(
@@ -5654,5 +5751,14 @@ mod tests {
             "json was: {json}"
         );
         assert!(json.contains("\"kind\":\"video\""), "json was: {json}");
+        // The mark crosses as one nested object, so a surface reads
+        // `entry.sync.status` and cannot render a glyph with no sentence.
+        assert!(
+            json.contains(
+                "\"sync\":{\"status\":\"waiting\",\"detail\":\"This file has changed and \
+                 has not been committed yet.\"}"
+            ),
+            "json was: {json}"
+        );
     }
 }

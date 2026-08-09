@@ -42,7 +42,7 @@ use keeper_core::notes::vm::{
     NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm,
     NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
-use keeper_core::notes::{naming, query, search, templates, NotesError};
+use keeper_core::notes::{naming, query, search, sort, templates, NotesError};
 use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
@@ -360,6 +360,11 @@ fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> Note
         // list cannot acknowledge a revision that moved in between; empty when the
         // note has no commit yet.
         head_rev: head.map(|head| head.rev.clone()).unwrap_or_default(),
+        // Straight through from the index, `source` included: the row shows the
+        // number the sort used, so the reader can account for the ordering
+        // (Story 44.5). Nothing is recomputed here — a second reading of the
+        // note's `order` is a second chance to disagree with the sort.
+        order: entry.order,
     }
 }
 
@@ -467,37 +472,53 @@ fn project_list(
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault.id.clone())))?;
     let heads = notes_vault::heads(&vault.id).unwrap_or_default();
 
-    // A space is the query DSL; everything else is the chip filter.
+    // A space is the query DSL; everything else is the chip filter. A space also
+    // brings its own ordering (Story 44.4) — the value that has sat in
+    // `keeper.sort` since Story 37.4 and that nothing read until now.
     let space = match req.space_id.as_ref() {
-        Some(space_id) if !space_id.is_empty() => Some(space_query(vault, &snapshot, space_id)?),
+        Some(space_id) if !space_id.is_empty() => Some(space_lens(vault, &snapshot, space_id)?),
         _ => None,
     };
-    let mut matched: Vec<&IndexEntry> = match space {
-        Some(mut parsed) => {
+    let (mut matched, ordering): (Vec<&IndexEntry>, Option<sort::SpaceSort>) = match space {
+        Some((mut parsed, ordering)) => {
             // Bound to this snapshot so `backlink:` and title-resolved `link:`
             // can be answered at all; the binding is per snapshot revision.
             query::bind_index(&mut parsed, &snapshot);
             let now_ms = notes_vault::local_now_ms();
-            snapshot
-                .entries()
-                .iter()
-                .filter(|entry| {
-                    let mut body = body_reader(vault, &entry.path);
-                    query::eval(&parsed, entry, &mut body, now_ms)
-                })
-                .collect()
+            (
+                snapshot
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        let mut body = body_reader(vault, &entry.path);
+                        query::eval(&parsed, entry, &mut body, now_ms)
+                    })
+                    .collect(),
+                Some(ordering),
+            )
         }
         None => {
             // Folded once for the whole walk, not once per entry (NFR-28).
             let tags = TagTerms::new(&req.tags);
-            snapshot
-                .entries()
-                .iter()
-                .filter(|entry| matches_filter(entry, req, &tags, heads.get(&entry.path)))
-                .collect()
+            (
+                snapshot
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches_filter(entry, req, &tags, heads.get(&entry.path)))
+                    .collect(),
+                None,
+            )
         }
     };
-    matched.sort_by(|a, b| list_order(a, b));
+    // Inside a space the sort is the WHOLE ordering: pins do not float, because
+    // a sort with a hidden first term is not the sort the user chose (AD-81).
+    // The plain list is unchanged and still puts pinned first — that rule was
+    // never a space's, and taking it away from the default lens would be a
+    // different story's decision.
+    match ordering {
+        Some(ordering) => matched.sort_by(|a, b| sort::compare(ordering, a, b)),
+        None => matched.sort_by(|a, b| list_order(a, b)),
+    }
 
     let total = u32::try_from(matched.len()).unwrap_or(u32::MAX);
     let offset = req.offset.min(total);
@@ -542,13 +563,21 @@ struct SpaceDef {
     id: String,
     name: String,
     query: String,
+    /// `keeper.sort`, exactly as stored — never the parsed ordering. What the
+    /// list runs comes from [`sort::read`], and what the file says has to
+    /// survive a round trip through the editor unrewritten.
     sort: String,
     limit: u32,
     icon: Option<String>,
+    /// `keeper.order` — where the space sits in the rail (Story 44.4).
+    order: f64,
     /// `keeper.default` — which seeded default this space is, when it is one
     /// (Story 44.3). Never written by the editor; carried through a save so
     /// editing a default does not quietly demote it.
     default_key: Option<String>,
+    /// What keeper could not read in the two presentation keys, already worded
+    /// (Story 44.4). Empty for a file keeper understood entirely.
+    warnings: Vec<String>,
 }
 
 /// Read the space definition out of a space note's frontmatter.
@@ -559,16 +588,24 @@ struct SpaceDef {
 /// `keeper.space.query` the architecture companion's example shows. A nested map
 /// is still accepted where the parser hands one back, so the deeper form starts
 /// working the day the subset grows, and neither spelling is a parse error.
+///
+/// `sort` and `order` are read through `keeper-core` rather than interpreted
+/// here, and both of them can fail *visibly*: this file does not build on Linux
+/// (AD-55/AD-56), so the rule that decides what `sort: bananas` does and the
+/// sentence the sidebar shows about it are both somewhere they can be proved.
+/// All this does is hand over the text and collect what comes back.
 fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
     let (fm, _) = Frontmatter::parse(source);
     let mut def = SpaceDef {
         id: entry.id.clone(),
         name: entry.title.clone(),
         query: String::new(),
-        sort: "modified desc".to_owned(),
+        sort: String::new(),
         limit: MAX_LIMIT,
         icon: None,
+        order: sort::DEFAULT_SPACE_ORDER,
         default_key: None,
+        warnings: Vec::new(),
     };
     let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
         return def;
@@ -581,13 +618,22 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
             // is claimed as opaque, never as a map. An arm for it would be code
             // that cannot run, which is worse than an absent feature because it
             // reads as support.
-            ("sort", FieldValue::Str(sort)) => def.sort = sort.clone(),
+            ("sort", FieldValue::Str(stored)) => def.sort = stored.clone(),
             ("limit", FieldValue::Num(limit)) => def.limit = clamp_limit(*limit),
             ("icon", FieldValue::Str(icon)) => def.icon = space_icon(icon),
+            // Matched on the key alone and flattened to text, so `order: 2`,
+            // `order: "2"` and `order: [a, b]` all reach one reader instead of
+            // the first two working and the third being silently absent.
+            ("order", value) => {
+                let read = sort::read_order(&value.index_string());
+                def.order = read.order;
+                def.warnings.extend(read.warning);
+            }
             _ => {}
         }
     }
-    // The marker is read through `keeper-core`'s one rule rather than a fifth
+    def.warnings.extend(sort::read(&def.sort).warning);
+    // The marker is read through `keeper-core`'s one rule rather than a sixth
     // arm here, so the seeder — which reads notes off disk before the index
     // exists — and this cannot disagree about what a default is.
     def.default_key = default_spaces::default_key(pairs);
@@ -626,23 +672,34 @@ fn space_icon(raw: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// Parse the query of one space, by note id.
-fn space_query(
+/// The two halves of a space's lens, by note id: what it selects and how it
+/// orders what it selected.
+///
+/// One read of the note rather than two. They were separable while the sort was
+/// a value nobody applied; now that the list runs it, fetching the query here
+/// and the sort somewhere else would be two file reads that can disagree if the
+/// note changes between them.
+fn space_lens(
     vault: &Vault,
     snapshot: &IndexSnapshot,
     space_id: &str,
-) -> Result<query::Query, IpcError> {
+) -> Result<(query::Query, sort::SpaceSort), IpcError> {
     let entry = snapshot
         .by_id(space_id)
         .ok_or_else(|| notes_error(NotesError::NotFound(space_id.to_owned())))?;
     let source = notes_vault::read_note(vault, &entry.path).map_err(notes_error)?;
     let def = space_def(entry, &source);
-    query::parse(&def.query).map_err(|error| {
+    let parsed = query::parse(&def.query).map_err(|error| {
         notes_error(NotesError::Query {
             message: error.message,
             token_index: error.token_index,
         })
-    })
+    })?;
+    // A sort keeper cannot read never fails the list — the space still selects
+    // what it selects, and the row is already saying the file and the ordering
+    // disagree. Refusing here would turn one bad word in frontmatter into an
+    // empty pane with an error in it.
+    Ok((parsed, sort::read(&def.sort).sort))
 }
 
 // ---------------------------------------------------------------------------
@@ -954,15 +1011,21 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
                 id: def.id,
                 name: def.name,
                 query: def.query,
+                sort_effective: sort::read(&def.sort).sort.canonical(),
                 sort: def.sort,
                 limit: def.limit,
                 icon: def.icon,
                 default_key: def.default_key,
+                warnings: def.warnings,
+                order: def.order,
                 error,
             }
         })
         .collect();
-    spaces.sort_by(|a, b| a.name.cmp(&b.name));
+    // The rail is ordered by what each space says, then by name — which is what
+    // it sorted by before Story 44.4, so a vault nobody has positioned does not
+    // move (FR-157).
+    spaces.sort_by(|a, b| sort::rail_order((a.order, a.name.as_str()), (b.order, b.name.as_str())));
     Ok(spaces)
 }
 
@@ -1038,47 +1101,26 @@ impl default_spaces::SeedVault for VaultSeedFiles<'_> {
 /// The frontend does not drive this. A vault reached only from the tray or the
 /// capture window has to be seeded too.
 ///
-/// **Four outcomes, four log lines, no silence.** The first version logged only
-/// the two interesting ones and left "planned nothing" quiet, which is why a
-/// field report of "it did nothing" could not be answered from 305k lines of
-/// debug log. `AlreadySatisfied` is the ordinary case and is `debug`; a refusal
-/// is `warn` and names the file and the errno, because a refusal is keeper
-/// declining to do the thing it was installed to do.
+/// **Four outcomes, four log lines, and none of them below `INFO`.** The level
+/// is [`default_spaces::SeedOutcome::report`]'s, not this call site's, because
+/// this call site got it wrong once: the second attempt logged the ordinary
+/// outcome at `debug!`, and `debug_log::init` installs `EnvFilter::new("info")`
+/// with no `RUST_LOG` anywhere in the macOS app — so a run that did exactly what
+/// it should still produced a blank log and a third field report. A refusal is
+/// `warn` and names the file and the errno.
 pub fn seed_default_spaces(vault: &Vault) {
     let outcome = default_spaces::seed(
         &mut VaultSeedFiles { vault },
         default_spaces::SeedMode::FirstRun,
     );
-    match outcome {
-        default_spaces::SeedOutcome::Wrote(written) => {
-            tracing::info!(
-                vault = %vault.id,
-                count = written.len(),
-                paths = ?written,
-                "notes: seeded default spaces"
-            );
-        }
-        default_spaces::SeedOutcome::AlreadySatisfied => {
-            tracing::debug!(
-                vault = %vault.id,
-                "notes: default spaces already settled for this vault"
-            );
-        }
-        default_spaces::SeedOutcome::Blocked(why) => {
-            tracing::warn!(
-                vault = %vault.id,
-                %why,
-                "notes: did not seed the default spaces; will try again next launch"
-            );
-        }
-        default_spaces::SeedOutcome::Stopped { written, reason } => {
-            tracing::warn!(
-                vault = %vault.id,
-                count = written.len(),
-                %reason,
-                "notes: stopped part way through seeding the default spaces"
-            );
-        }
+    // `tracing`'s macros take a const level, so the runtime choice is a match
+    // over two arms rather than one `event!`. The *choice* is `keeper-core`'s
+    // and is asserted there against the floor the app's own filter sets.
+    let (level, message) = outcome.report();
+    if level <= tracing::Level::WARN {
+        tracing::warn!(vault = %vault.id, "notes: {message}");
+    } else {
+        tracing::info!(vault = %vault.id, "notes: {message}");
     }
 }
 
@@ -1137,6 +1179,10 @@ pub async fn notes_space_save(
     })?;
     let pairs = vec![
         ("space".to_owned(), FieldValue::Str(space.query.clone())),
+        // The canonical spelling of whatever the form had selected. This is the
+        // one place a value keeper could not read is rewritten, and it is a
+        // repair rather than a rewrite: the editor showed the fallback and said
+        // why, so pressing Save is the user agreeing to it.
         ("sort".to_owned(), FieldValue::Str(space.sort.clone())),
         (
             "limit".to_owned(),
@@ -1144,10 +1190,15 @@ pub async fn notes_space_save(
         ),
     ];
     // Written only when there is one, so a space nobody gave an icon keeps the
-    // frontmatter it had rather than growing an empty key to explain.
-    let with_icon = |mut pairs: Vec<(String, FieldValue)>| {
+    // frontmatter it had rather than growing an empty key to explain. The same
+    // rule for the rail position: zero *is* unpositioned, so stamping
+    // `order: 0` into every space would claim each of them was placed there.
+    let with_presentation = |mut pairs: Vec<(String, FieldValue)>| {
         if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
             pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
+        }
+        if space.order != sort::DEFAULT_SPACE_ORDER {
+            pairs.push(("order".to_owned(), FieldValue::Num(space.order)));
         }
         pairs
     };
@@ -1158,7 +1209,7 @@ pub async fn notes_space_save(
     if let Some(id) = space.id.as_ref().filter(|id| !id.is_empty()) {
         let entry = entry_of(&vault_id, id)?;
         let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
-        let mut pairs = with_icon(pairs);
+        let mut pairs = with_presentation(pairs);
         // `keeper` is spliced whole, so a key this request does not carry is a
         // key the save would delete. `default` is keeper's own marker and the
         // editor has no control for it (Story 44.3) — dropping it here would
@@ -1209,7 +1260,10 @@ pub async fn notes_space_save(
         ("id".to_owned(), FieldValue::Str(id.clone())),
         ("created".to_owned(), FieldValue::Str(now_local())),
         ("updated".to_owned(), FieldValue::Str(now_local())),
-        ("keeper".to_owned(), FieldValue::Map(with_icon(pairs))),
+        (
+            "keeper".to_owned(),
+            FieldValue::Map(with_presentation(pairs)),
+        ),
     ]);
     let body = format!("# {}\n", space.name);
     notes_vault::write_note(&vault, &rel, &format!("{front}\n{body}")).map_err(notes_error)?;
@@ -1630,6 +1684,32 @@ pub async fn notes_set_flag(
         Frontmatter::set_in(&source, key, FieldValue::Bool(true))
     } else {
         Frontmatter::remove_in(&source, key)
+    };
+    notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)
+}
+
+/// Place a note in its list, or return it to the default (Story 44.5, FR-159).
+///
+/// `order: None` REMOVES the key rather than writing `order: 0`. The two are not
+/// the same statement: 0 with the key present claims the user deliberately put
+/// this note where every silent note already is, and it would also mean keeper
+/// had written a property into a file nobody asked it to touch (FR-121).
+///
+/// Same splice discipline as [`notes_set_flag`], and for the same reason: the
+/// note is Obsidian's file too, and a re-serialisation would reorder somebody
+/// else's keys.
+#[tauri::command]
+pub async fn notes_set_order(
+    vault_id: String,
+    note_id: String,
+    order: Option<f64>,
+) -> Result<(), IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    let updated = match order {
+        Some(order) => keeper_core::notes::order::set_order_in(&source, order),
+        None => keeper_core::notes::order::clear_order_in(&source),
     };
     notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)
 }
@@ -2709,6 +2789,7 @@ mod tests {
             links: Vec::new(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: keeper_core::notes::order::NoteOrder::default(),
         }
     }
 
@@ -2810,6 +2891,7 @@ mod tests {
             conflict: false,
             origin: "local".to_owned(),
             head_rev: String::new(),
+            order: keeper_core::notes::order::NoteOrder::default(),
         }
     }
 
@@ -3105,6 +3187,79 @@ mod tests {
         assert_eq!(clamp_limit(100_000.0), MAX_LIMIT);
         assert_eq!(clamp_limit(0.0), MAX_LIMIT);
         assert_eq!(clamp_limit(-5.0), MAX_LIMIT);
+    }
+
+    /// Both presentation keys, in the one form the parser can hold, plus what
+    /// happens when they hold nonsense.
+    ///
+    /// Everything the assertions below check about *meaning* is
+    /// `keeper-core::notes::sort`'s and is proved there on this host. What is
+    /// proved only here — and only on the macOS gate, because this file does not
+    /// build on Linux — is the wiring: that `keeper.order` and `keeper.sort`
+    /// reach that module at all, and that what it says comes back out.
+    #[test]
+    fn a_space_definition_reads_its_position_and_its_sort() {
+        let positioned = concat!(
+            "---\n",
+            "id: 01J8ZQ4M7T5R9V3XK2B6C0DFGH\n",
+            "keeper:\n",
+            "  space: 'is:pinned'\n",
+            "  sort: recorded asc\n",
+            "  order: -1\n",
+            "---\n",
+            "\n# Pinned\n"
+        );
+        let def = space_def(&entry("spaces/pinned.md", "Pinned"), positioned);
+        assert_eq!(def.order, -1.0);
+        assert_eq!(def.sort, "recorded asc");
+        assert!(def.warnings.is_empty());
+
+        // A quoted position is still a position: nobody hand-editing YAML thinks
+        // about scalar types, and `order: "2"` is what a template produces.
+        let quoted = positioned.replace("  order: -1\n", "  order: '2.5'\n");
+        assert_eq!(space_def(&entry("spaces/p.md", "P"), &quoted).order, 2.5);
+
+        // Neither key is required, and a space that names neither says nothing
+        // about it — an absent value is not a mistake to report.
+        let bare = space_def(&entry("spaces/new.md", "New"), "---\nid: x\n---\n");
+        assert_eq!(bare.order, sort::DEFAULT_SPACE_ORDER);
+        assert!(bare.sort.is_empty());
+        assert!(bare.warnings.is_empty());
+    }
+
+    /// The visible half of the fallback, at the seam where it is assembled.
+    ///
+    /// A space is a file a person and an agent both edit, so both keys WILL hold
+    /// something keeper cannot read. The list still runs; the row says so. This
+    /// asserts the two sentences reach `warnings` together rather than one of
+    /// them being dropped, which would send whoever is fixing the file round the
+    /// loop twice.
+    #[test]
+    fn a_sort_and_a_position_keeper_cannot_read_are_both_reported() {
+        let broken = concat!(
+            "---\n",
+            "id: 01J8ZQ4M7T5R9V3XK2B6C0DFGH\n",
+            "keeper:\n",
+            "  space: 'is:pinned'\n",
+            "  sort: bananas\n",
+            "  order: first\n",
+            "---\n",
+            "\n# Pinned\n"
+        );
+        let def = space_def(&entry("spaces/pinned.md", "Pinned"), broken);
+        assert_eq!(def.warnings.len(), 2, "{:?}", def.warnings);
+        assert!(def.warnings.iter().any(|said| said.contains("\"bananas\"")));
+        assert!(def.warnings.iter().any(|said| said.contains("\"first\"")));
+
+        // The stored text survives untouched, so the editor can put it back and
+        // the sentence can quote it. keeper does not rewrite a value it could
+        // not read — the same promise the query and the icon make.
+        assert_eq!(def.sort, "bananas");
+
+        // And the space still selects what it selects. A bad word in a
+        // presentation key must not turn into an empty pane with an error in it.
+        assert_eq!(def.query, "is:pinned");
+        assert_eq!(sort::read(&def.sort).sort, sort::DEFAULT_SORT);
     }
 
     /// The icon sits beside `space` under `keeper:`, at ONE level of nesting,

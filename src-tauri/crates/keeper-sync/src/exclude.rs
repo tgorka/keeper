@@ -174,6 +174,45 @@ pub struct ExcludeSet {
     /// the one list in [`ExcludeSet::new`] — including the profile's own
     /// patterns — so there is still exactly one place a path can be named.
     dir_set: GlobSet,
+    /// The profile's own `extra` patterns, and only those, compiled a second
+    /// time. Not a second rule: the same strings, asked a narrower question —
+    /// *did the user write this rule, or did keeper?* See
+    /// [`ExcludeSet::verdict`] for why anything needs to know.
+    profile_set: GlobSet,
+    /// The directory form of the profile's own patterns, derived exactly as
+    /// [`Self::dir_set`] is.
+    profile_dir_set: GlobSet,
+}
+
+/// How a *browser* should treat a path the exclusion corpus matches (Story
+/// 44.17, FR-173).
+///
+/// The sync path only ever needs a boolean, and [`ExcludeSet::is_excluded`]
+/// stays that boolean for every caller that stages, queues or counts. A
+/// browser needs one distinction on top of it, and it needs it because of a
+/// specific failure: the Files tab used to drop every excluded entry silently,
+/// so a user who had written `*.psd` into their own profile saw their
+/// photoshop files simply *absent* from the folder they were looking at, with
+/// nothing on screen connecting that to the rule they typed. Marking them
+/// excluded is what turns a hole in a listing into an answer.
+///
+/// The built-in corpus gets the opposite treatment for the opposite reason.
+/// Nobody chose `.DS_Store`, `.git/**` or `*.crdownload`; showing them marked
+/// would fill every folder with rows about keeper's own housekeeping, which is
+/// the browser nobody scrolls twice that Story 43.8 exists to avoid.
+///
+/// A path both a profile pattern and the corpus match reads as
+/// [`Self::ProfilePattern`]. The user's own rule wins the naming, because a
+/// rule someone typed is a rule they are entitled to see working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcludeVerdict {
+    /// No pattern matches; the entry is ordinary content.
+    Included,
+    /// A pattern from this profile's own configuration matches. Show it, and
+    /// say why it will never sync.
+    ProfilePattern,
+    /// Only [`BUILTIN_EXCLUDES`] matches. Keeper's own noise; do not list it.
+    BuiltinNoise,
 }
 
 impl ExcludeSet {
@@ -186,26 +225,40 @@ impl ExcludeSet {
     pub fn new(extra: &[String]) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         let mut dir_builder = GlobSetBuilder::new();
+        let mut profile_builder = GlobSetBuilder::new();
+        let mut profile_dir_builder = GlobSetBuilder::new();
         let corpus = BUILTIN_EXCLUDES
             .iter()
             .copied()
-            .chain(extra.iter().map(String::as_str));
-        for pattern in corpus {
+            .map(|pattern| (pattern, false))
+            .chain(extra.iter().map(|pattern| (pattern.as_str(), true)));
+        for (pattern, from_profile) in corpus {
             add_pattern(&mut builder, pattern)?;
             // A `…/**` pattern is already anchored by its own `/`, so its
             // directory form goes in verbatim rather than back through the
             // basename rule.
-            if let Some(directory) = pattern.trim().strip_suffix("/**") {
+            let directory = pattern.trim().strip_suffix("/**");
+            if let Some(directory) = directory {
                 add_glob(&mut dir_builder, directory, pattern)?;
             }
+            if from_profile {
+                add_pattern(&mut profile_builder, pattern)?;
+                if let Some(directory) = directory {
+                    add_glob(&mut profile_dir_builder, directory, pattern)?;
+                }
+            }
         }
-        let set = builder
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))?;
-        let dir_set = dir_builder
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))?;
-        Ok(Self { set, dir_set })
+        let build = |builder: GlobSetBuilder| {
+            builder
+                .build()
+                .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))
+        };
+        Ok(Self {
+            set: build(builder)?,
+            dir_set: build(dir_builder)?,
+            profile_set: build(profile_builder)?,
+            profile_dir_set: build(profile_dir_builder)?,
+        })
     }
 
     /// Whether `relative_path` — repository-relative, never absolute — is
@@ -241,6 +294,34 @@ impl ExcludeSet {
         }
         let candidate = match_string(relative_path);
         !candidate.is_empty() && self.dir_set.is_match(candidate.as_str())
+    }
+
+    /// Which kind of exclusion, if any, applies to one browsed entry.
+    ///
+    /// `is_dir` selects the same question [`Self::is_excluded_directory`] asks,
+    /// so a browser gets one call rather than a branch it could get backwards.
+    /// The two halves stay in lockstep by construction: the profile sets are
+    /// built from the same strings, in the same loop, by the same two helpers.
+    pub fn verdict(&self, relative_path: &Path, is_dir: bool) -> ExcludeVerdict {
+        let candidate = match_string(relative_path);
+        if candidate.is_empty() {
+            return ExcludeVerdict::Included;
+        }
+        let profile = self.profile_set.is_match(candidate.as_str())
+            || (is_dir && self.profile_dir_set.is_match(candidate.as_str()));
+        if profile {
+            return ExcludeVerdict::ProfilePattern;
+        }
+        let any = if is_dir {
+            self.is_excluded_directory(relative_path)
+        } else {
+            self.set.is_match(candidate.as_str())
+        };
+        if any {
+            ExcludeVerdict::BuiltinNoise
+        } else {
+            ExcludeVerdict::Included
+        }
     }
 }
 

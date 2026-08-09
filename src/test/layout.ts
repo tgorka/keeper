@@ -22,6 +22,7 @@
  * the ellipsis is applied at all, and whether the real font makes a real value
  * overflow a real pane. Those are browser facts and this is not a browser.
  */
+import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 
 /** Every glyph is this wide. A monospace font, in a world with one font. */
 export const TEST_CHAR_PX = 8;
@@ -87,4 +88,76 @@ export function withRect(element: Element, left: number, width = 0): void {
         toJSON: () => ({}),
       }) as DOMRect,
   });
+}
+
+/** The installed scrolling box: a way to scroll it, and the undo the caller
+ * MUST run — `Element.prototype` is shared with every other test in the file. */
+export interface ListGeometry {
+  scrollTo: (element: Element, top: number) => void;
+  undo: () => void;
+}
+
+/**
+ * A scrolling box with real numbers in it, for the assertions a windowed list
+ * needs (Story 44.10).
+ *
+ * jsdom is worse here than merely unlaid-out. `clientHeight` is hard-coded
+ * zero, `scrollTop`'s setter is a no-op that always reads back zero, and no
+ * scroll event is ever dispatched. A list that renders the window under the
+ * scroll position therefore renders its FIRST window forever — so "scrolling
+ * reaches the last row" passes for the wrong reason, having never scrolled, and
+ * "only a bounded number of rows mount" passes on a list that would mount all
+ * ten thousand in a browser. Both are assertions about jsdom, not about keeper.
+ *
+ * This answers the three properties the window reads, and only for the two
+ * kinds of element the window marks — the viewport and a mounted row — so
+ * nothing else on screen has its geometry quietly redefined. What is modelled
+ * is the browser, not keeper: the real scroll handler runs, the real binary
+ * search runs, the real window is what mounts.
+ *
+ * What this cannot prove is named in each caller: whether a row's real height
+ * at a real font is what the estimate says, and whether the browser's own
+ * scroll anchoring moves the list when a measurement changes the total height.
+ */
+export function withListGeometry(sizes: { viewport: number; row: number }): ListGeometry {
+  const descriptors = {
+    clientHeight: Object.getOwnPropertyDescriptor(Element.prototype, "clientHeight"),
+    scrollTop: Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop"),
+  };
+  const tops = new WeakMap<Element, number>();
+
+  Object.defineProperty(Element.prototype, "clientHeight", {
+    configurable: true,
+    get(this: Element) {
+      if (this.hasAttribute(WINDOW_VIEWPORT_ATTR)) {
+        return sizes.viewport;
+      }
+      return this.hasAttribute(WINDOW_ROW_ATTR) ? sizes.row : 0;
+    },
+  });
+  Object.defineProperty(Element.prototype, "scrollTop", {
+    configurable: true,
+    get(this: Element) {
+      return tops.get(this) ?? 0;
+    },
+    set(this: Element, value: number) {
+      tops.set(this, value);
+    },
+  });
+
+  return {
+    scrollTo: (element, top) => {
+      element.scrollTop = top;
+      element.dispatchEvent(new Event("scroll"));
+    },
+    undo: () => {
+      for (const [name, descriptor] of Object.entries(descriptors)) {
+        if (descriptor === undefined) {
+          Reflect.deleteProperty(Element.prototype, name);
+        } else {
+          Object.defineProperty(Element.prototype, name, descriptor);
+        }
+      }
+    },
+  };
 }

@@ -37,9 +37,20 @@
  * does not fit truncates — with the whole value one click away. What it
  * replaces was a `w-32` guess beside a `title=` tooltip, which is a cut value
  * with nowhere a keyboard could read the rest.
+ *
+ * `tags:` is the one key that gets a control of its own (Story 44.14). It is
+ * the user's, in the user's note, including on the notes keeper writes — but a
+ * tag belongs to a vocabulary, so the row asks the same chooser every other
+ * tag surface asks rather than the generic list's bare text box. Two things it
+ * will not do, for two different reasons, and it says which: `session:` is
+ * read-only beside `id:` because everything about a recording resolves through
+ * it, and the `recordings` tag is refused with a sentence because it is what
+ * makes the note findable as a recording at all.
  */
-import { Copy, FolderOpen, MoreHorizontal, Play } from "lucide-react";
-import { Fragment, useEffect, useState } from "react";
+import { Copy, FolderOpen, MoreHorizontal, Play, Plus } from "lucide-react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { TagCombobox } from "@/components/notes/tag-combobox";
+import { namesTag } from "@/components/tags/tag-match";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -62,6 +73,7 @@ import {
   recordingNoteTargets,
   recordingOpenPath,
   revealPath,
+  tagsVocabulary,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { truncateGraphemes } from "@/lib/truncate";
@@ -405,6 +417,14 @@ export function PropertiesPanel({
             // somebody else's note is somebody else's list, and stays a control.
             const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
             const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
+            // `tags:` written as an empty scalar is still the tag row: clearing
+            // the last tag in Obsidian leaves the key with nothing after it, and
+            // falling back to the text box there would put the one surface this
+            // story replaced in front of the one note that has no tags yet.
+            const isTagRow =
+              entry.key === TAGS_KEY &&
+              !entry.nested &&
+              (entry.kind === "list" || entry.text === "");
             return (
               <Fragment key={entry.key}>
                 <div className="col-start-1 min-w-0 pr-2 text-muted-foreground">
@@ -413,6 +433,12 @@ export function PropertiesPanel({
                 <div className="col-start-3 flex min-w-0 items-start gap-2 pl-2">
                   {showsRecordingPaths ? (
                     <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
+                  ) : isTagRow ? (
+                    <TagsProperty
+                      entry={entry}
+                      sessionId={sessionId}
+                      onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
+                    />
                   ) : (
                     <PropertyControl
                       entry={entry}
@@ -471,11 +497,18 @@ const INPUT_TYPES: Record<PropertyKind, string> = {
 };
 
 function PropertyControl({ entry, onChange }: PropertyControlProps) {
-  // The ULID is identity, not metadata: links resolve through it (FR-97), so
-  // it is shown and copyable but never editable. Being read-only is exactly
-  // what makes it need the overflow affordance: an editable value can be
-  // scrolled with the caret, and this one cannot be scrolled at all.
-  if (entry.key === "id") {
+  // The ULID is identity, not metadata: links resolve through it (FR-97). So
+  // is `session:` — 42.6's targets, 43.2's `is:recording` predicate and the
+  // Recordings space every one resolve through it, and not one of them is
+  // visible from this panel, so a typo here would break a note in a way its
+  // author could not see from where they made it. Both are shown and copyable
+  // and neither is editable, which is one rule for keeper's two identity keys
+  // rather than two rules that can drift.
+  //
+  // Being read-only is exactly what makes them need the overflow affordance:
+  // an editable value can be scrolled with the caret, and these cannot be
+  // scrolled at all.
+  if (entry.key === "id" || entry.key === SESSION_KEY) {
     return (
       <div className="min-w-0 flex-1 text-[11px] text-muted-foreground">
         <OverflowValue name={entry.key} value={entry.text} monospace />
@@ -550,6 +583,189 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
         }
       }}
     />
+  );
+}
+
+/**
+ * The frontmatter key holding a note's tags.
+ *
+ * Singled out of the generic list control because a tag is not an arbitrary
+ * string. The vault has a vocabulary of them (Story 42.5) and a bare text box
+ * beside it is how `Standup` and `standup` become two tags nobody meant.
+ */
+const TAGS_KEY = "tags";
+
+/**
+ * keeper's classification tag (Story 43.2, FR-147): what a *person* browsing
+ * the tag tree sees to know this note is a recording, since [`SESSION_KEY`] is
+ * a machine predicate and invisible there.
+ *
+ * Spelled here as well as in `keeper_core::notes::recording_note::RECORDINGS_TAG`,
+ * which stays the authority. This surface only ever asks whether a tag on
+ * screen NAMES that tag, and it asks `namesTag` — so every spelling Rust folds
+ * onto it (`Recordings`, `RECORDINGS`, `recordings `) is protected here too.
+ * Comparing with `===` would have protected exactly one of them and left the
+ * other three looking identical on screen and removable.
+ */
+export const RECORDINGS_TAG = "recordings";
+
+/** The tag row's chooser, named on both the toggle and the field it opens. */
+export const ADD_NOTE_TAG = "Add a tag";
+
+/**
+ * Why keeper will not take `recordings` off a recording note.
+ *
+ * A sentence, not a disabled `×`. The tag sits in a row of chips that all come
+ * off with one press, so removing only this one's affordance would be a
+ * control that does nothing and says nothing — and the consequence is
+ * invisible from this panel: the note would vanish from the Recordings space
+ * and from the tag tree while still being on disk, which reads as data loss.
+ */
+export function recordingsTagRefusal(tag: string): string {
+  return (
+    `"${tag}" is how keeper marks this note as a recording — it is what puts the note in the ` +
+    "Recordings space and in the tag tree, so keeper kept it. Every other tag here is yours."
+  );
+}
+
+interface TagsPropertyProps {
+  entry: PropertyEntry;
+  /** The note's session id, or null when it is not a recording note. */
+  sessionId: string | null;
+  /** Receives the serialised list, ready to splice after `tags:`. */
+  onChange: (value: string) => void;
+}
+
+/**
+ * The tag row (Story 44.14, FR-170).
+ *
+ * These are the USER's tags in the user's note. What stood here was the
+ * generic list control's bare text box: no vocabulary, so a second casing of a
+ * tag the vault already had silently became a second tag, and nothing on
+ * screen said which of them keeper depends on. The chips and the chooser are
+ * the two halves Story 44.13 settled — a field you can type into over a list
+ * you can browse — reading the one vocabulary Story 42.5 owns.
+ *
+ * The vocabulary is read when the chooser opens, not when the panel mounts:
+ * the panel is on screen for as long as someone is reading a note and the
+ * vocabulary is wanted for the few seconds they are picking from it.
+ *
+ * Exactly one tag is refused, and only on a recording note — see
+ * [`recordingsTagRefusal`]. Everything else, including a tag keeper itself
+ * wrote into the stub, comes off with one press.
+ */
+function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
+  const [adding, setAdding] = useState(false);
+  const [vocabulary, setVocabulary] = useState<readonly string[]>([]);
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const addRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!adding) {
+      return;
+    }
+    let cancelled = false;
+    void tagsVocabulary()
+      .then((vm) => {
+        if (!cancelled) {
+          setVocabulary(vm.entries.map((tag) => tag.path));
+        }
+      })
+      .catch(() => {
+        // Nothing to browse, and typing still works: creating is allowed here,
+        // so an unreadable vocabulary costs the completion and not the edit.
+        if (!cancelled) {
+          setVocabulary([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adding]);
+
+  // A stable ref callback, so the field takes focus once when the chooser
+  // opens and not again on every render of the panel behind it.
+  const focusChooser = useCallback((node: HTMLInputElement | null) => {
+    node?.focus();
+  }, []);
+
+  function closeChooser(): void {
+    setAdding(false);
+    addRef.current?.focus();
+  }
+
+  function remove(item: string): void {
+    // Only on a recording note: `recordings` on somebody's own note is
+    // somebody's own tag, and keeper does not own rows in a vault it did not
+    // write. The predicate is the note's `session:`, the same one the file
+    // actions above read, so there is no second answer to "is this a
+    // recording note" in this file.
+    if (sessionId !== null && namesTag(item, [RECORDINGS_TAG])) {
+      setRefusal(recordingsTagRefusal(item));
+      return;
+    }
+    setRefusal(null);
+    onChange(
+      serialiseList(
+        entry.items.filter((candidate) => candidate !== item),
+        entry.style,
+      ),
+    );
+  }
+
+  return (
+    <div className="flex min-w-0 flex-1 flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-1">
+        {entry.items.map((item) => (
+          <button
+            key={item}
+            type="button"
+            className="rounded bg-muted px-1.5 py-0.5"
+            aria-label={`Remove ${item} from ${entry.key}`}
+            onClick={() => remove(item)}
+          >
+            {item} ×
+          </button>
+        ))}
+        <Button
+          ref={addRef}
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="shrink-0 text-muted-foreground"
+          aria-expanded={adding}
+          onClick={() => (adding ? closeChooser() : setAdding(true))}
+        >
+          <Plus aria-hidden="true" className="size-3" />
+          {ADD_NOTE_TAG}
+        </Button>
+      </div>
+      {adding && (
+        <TagCombobox
+          label={ADD_NOTE_TAG}
+          placeholder="Type or browse"
+          vocabulary={vocabulary}
+          chosen={entry.items}
+          // A note may carry a tag no other note carries yet — that is what a
+          // first note about a new client is — so this surface creates, and
+          // the text goes out exactly as typed. What a tag MEANS is settled in
+          // `keeper-core/src/notes/tags.rs`, at the boundary, and folding it
+          // here would be the second place that decides (AD-20, Story 42.5).
+          allowCreate
+          inputRef={focusChooser}
+          onChoose={(tag) => {
+            setRefusal(null);
+            onChange(serialiseList([...entry.items, tag], entry.style));
+          }}
+          onDismiss={closeChooser}
+        />
+      )}
+      {refusal !== null && (
+        <p role="alert" className="text-destructive">
+          {refusal}
+        </p>
+      )}
+    </div>
   );
 }
 

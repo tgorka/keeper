@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::notes::index::NoteTagTerm;
+use crate::notes::order::NoteOrder;
 
 /// One notes-flagged sync profile, with its index state (FR-94, FR-95).
 ///
@@ -127,6 +128,16 @@ pub struct NoteRowVm {
     /// is exactly the failure NFR-30 exists to forbid. Empty when the note has no
     /// commit yet, the same "absent" spelling `origin` uses.
     pub head_rev: String,
+    /// The note's own position, and whether the note said so (Story 44.5,
+    /// AD-81).
+    ///
+    /// The row renders it, which is the whole point of the story: an ordering the
+    /// reader cannot account for reads as randomness, and the cheapest way to
+    /// account for it is to show the number the sort used. `source` is on the row
+    /// because "0 because the note is silent" and "0 because the note says
+    /// `order: soon` and that is not a number" are different sentences, and the
+    /// second one has to be sayable.
+    pub order: NoteOrder,
 }
 
 /// One window of the note list, with the total behind it (FR-103).
@@ -208,8 +219,24 @@ pub struct NoteSpaceVm {
     pub name: String,
     /// The query source text, exactly as stored.
     pub query: String,
-    /// Presentation, deliberately outside the query grammar, e.g. `modified desc`.
+    /// How this space orders the notes it lists, exactly as stored, e.g.
+    /// `modified desc` (FR-158, Story 44.4). Kept as the file's own text rather
+    /// than as a parsed enum, so a value keeper could not read survives a round
+    /// trip through the editor unrewritten — the same promise the query and the
+    /// icon make. [`crate::notes::sort::read`] is what turns it into an
+    /// ordering, and into the sentence in `warnings` when it cannot.
     pub sort: String,
+    /// The ordering the list is actually running, as the canonical
+    /// `<key> <dir>` — always one of the ten [`crate::notes::sort`] knows, even
+    /// when `sort` above holds nothing, or holds `bananas`.
+    ///
+    /// It exists so the editor never parses `sort`. A dropdown that had to work
+    /// out for itself what an empty string or an unknown word resolves to would
+    /// be a second copy of the fallback rule, in the language that cannot run
+    /// the tests — and the two copies would disagree the first time the rule
+    /// changed. Rust decides; the form selects what Rust decided; saving sends
+    /// that back.
+    pub sort_effective: String,
     /// Maximum rows the space yields.
     pub limit: u32,
     /// The icon the sidebar draws for this space, as the name of one member of
@@ -229,6 +256,34 @@ pub struct NoteSpaceVm {
     /// second copy. Read from `keeper.default`, which only keeper writes and the
     /// editor never touches.
     pub default_key: Option<String>,
+    /// The presentation keys of this space's frontmatter that keeper could not
+    /// read, each already worded as a finished sentence (Story 44.4).
+    ///
+    /// Separate from `error` because the severity is different and so is the
+    /// remedy: a query that does not parse means the space selects **nothing**,
+    /// while an unreadable `sort` or `order` means the space still works and is
+    /// simply not obeying one line of its own file. Both have to be visible —
+    /// frontmatter is hand-edited and agent-edited, so these values will be
+    /// wrong, and a fallback nobody is told about is indistinguishable from
+    /// keeper ignoring what the user wrote.
+    ///
+    /// A list rather than an `Option`, because a file with a bad `sort` usually
+    /// has a bad `order` too — whoever was guessing at one was guessing at both
+    /// — and showing one of the two would send them round the loop twice.
+    pub warnings: Vec<String>,
+    /// Where this space sits in the rail: lower first, ties by name
+    /// (FR-157, AD-81).
+    ///
+    /// Zero for a space nobody has positioned, which is every space that exists
+    /// before this story — so a rail nobody has ordered is still the
+    /// alphabetical rail it was, and the seeded defaults still render Inbox,
+    /// Journal, Pinned, Recordings in the order the deleted fixed rows did.
+    /// Negative is allowed and is how a space floats above that block.
+    ///
+    /// `f64` for the reason a note's own order is one (Story 44.5): `1.5` is how
+    /// a person slots a row between 1 and 2 without renumbering everything under
+    /// it, and an integer would read `1.5` and `1.2` as the same position.
+    pub order: f64,
     /// The parse failure, when the stored query does not parse. A broken space
     /// matches nothing and says so; it never falls back to matching everything.
     pub error: Option<String>,
@@ -616,8 +671,8 @@ pub struct NoteSearchReq {
 /// A complete description of the space, not a patch: an update rewrites the
 /// definition wholesale, so a caller that omits a field is saying "this space
 /// has none" rather than "leave it alone". That is the opposite of
-/// [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is four
-/// values on one form, all of them on screen at once, so "absent means
+/// [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is a handful
+/// of values on one form, all of them on screen at once, so "absent means
 /// unchanged" would only be a way for a stale form to resurrect a term the
 /// user deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -631,10 +686,19 @@ pub struct NoteSpaceReq {
     /// `keeper:` key.
     pub name: String,
     pub query: String,
+    /// How the space orders what it lists: `<key> <dir>`, the text
+    /// [`crate::notes::sort::read`] accepts. The editor sends the canonical
+    /// spelling of whatever it had selected, which is the one place a value
+    /// keeper could not read *is* rewritten — the form showed the fallback and
+    /// said why, so pressing Save is a repair the user watched happen rather
+    /// than a rewrite behind their back.
     pub sort: String,
     pub limit: u32,
     /// The chosen icon's name, or `None` to leave the space without one.
     pub icon: Option<String>,
+    /// The space's position in the rail. Zero is "unpositioned" and is not
+    /// written to the file, so a space nobody ordered grows no key to explain.
+    pub order: f64,
 }
 
 /// Change a vault's settings (FR-120).
@@ -696,11 +760,18 @@ mod tests {
             conflict: false,
             origin: String::new(),
             head_rev: String::new(),
+            order: NoteOrder::own(2.5),
         };
         let json = serde_json::to_string(&row).expect("serialize row");
         assert!(json.contains("\"updatedMs\":1700000000000"), "json: {json}");
         assert!(json.contains("\"headRev\":\"\""), "json: {json}");
         assert!(json.contains("\"origin\":\"\""), "json: {json}");
+        // The webview switches on this discriminant, so it has to be the
+        // camelCase name and not a Rust variant spelling.
+        assert!(
+            json.contains("\"order\":{\"value\":2.5,\"source\":\"own\"}"),
+            "json: {json}"
+        );
         let back: NoteRowVm = serde_json::from_str(&json).expect("deserialize row");
         assert_eq!(back.id, row.id);
         assert!(back.unread);

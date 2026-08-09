@@ -61,6 +61,7 @@ function row(id: string, title: string, tags: string[]): NoteRowVm {
     conflict: false,
     origin: "",
     headRev: "",
+    order: { value: 0, source: "default" },
   };
 }
 
@@ -118,7 +119,19 @@ function space(
   icon: string,
   defaultKey: string | null,
 ): NoteSpaceVm {
-  return { id, name, query, sort: "modified desc", limit: 500, icon, defaultKey, error: null };
+  return {
+    id,
+    name,
+    query,
+    sort: "modified desc",
+    sortEffective: "modified desc",
+    limit: 500,
+    icon,
+    defaultKey,
+    warnings: [],
+    order: 0,
+    error: null,
+  };
 }
 
 /** What the vault's `spaces/` currently holds, as the rail will read it. */

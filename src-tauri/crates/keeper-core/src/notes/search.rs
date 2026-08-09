@@ -18,6 +18,8 @@
 //! of the haystack: a 1 MiB note would otherwise cost a second megabyte plus an
 //! offset map, and the cold-scan budget (NFR-28) has no room for either.
 
+use std::cmp::Ordering;
+
 /// How many characters of context a snippet keeps on each side of the match,
 /// clipped to the matched line.
 const SNIPPET_CONTEXT: usize = 48;
@@ -219,16 +221,80 @@ fn fold_char(c: char) -> Folded {
     out
 }
 
+/// The folded characters of `s`, one at a time, without materialising the fold.
+///
+/// The one folding walk in the crate: [`fold_str`] and [`fold_cmp`] are both
+/// this iterator, so a needle, a title comparison and a tag path can never end
+/// up folded by two slightly different rules.
+struct FoldChars<'a> {
+    chars: std::str::Chars<'a>,
+    /// The expansion of the character being drained; `ß` yields two.
+    pending: Folded,
+    /// How far into `pending` the caller has read.
+    at: usize,
+}
+
+impl<'a> FoldChars<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            chars: s.chars(),
+            pending: Folded::empty(),
+            at: 0,
+        }
+    }
+}
+
+impl Iterator for FoldChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        loop {
+            if let Some(c) = self.pending.as_slice().get(self.at) {
+                self.at += 1;
+                return Some(*c);
+            }
+            // A combining mark folds to nothing, so an empty expansion is a
+            // skip rather than the end of the string.
+            self.pending = fold_char(self.chars.next()?);
+            self.at = 0;
+        }
+    }
+}
+
 /// Fold a whole string. For short inputs only — needles, titles, tag paths.
 /// The haystack side of [`find`] never allocates one of these.
 pub(crate) fn fold_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        for f in fold_char(c).as_slice() {
-            out.push(*f);
+    out.extend(FoldChars::new(s));
+    out
+}
+
+/// Order two short strings by their folded form, allocating nothing.
+///
+/// This exists because the alternative is `fold_str(a).cmp(&fold_str(b))` inside
+/// a comparator, and a comparator runs O(n log n) times: sorting a
+/// ten-thousand-note vault by a folded title that way is a quarter of a million
+/// throwaway `String`s for an answer that never needed one.
+///
+/// Folded-equal is reported as [`Ordering::Equal`], so a caller that needs a
+/// *total* order over distinct notes must follow this with a term that cannot
+/// tie — `Ábc` and `abc` are equal here by design, exactly as they are to
+/// [`find`].
+pub(crate) fn fold_cmp(a: &str, b: &str) -> Ordering {
+    let mut left = FoldChars::new(a);
+    let mut right = FoldChars::new(b);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+            }
         }
     }
-    out
 }
 
 /// The combining-mark blocks a decomposed Latin string actually uses.

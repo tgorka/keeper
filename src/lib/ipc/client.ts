@@ -59,9 +59,11 @@ export type { ExportPhase } from "./gen/ExportPhase";
 export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
+export type { FilesEntrySyncVm } from "./gen/FilesEntrySyncVm";
 export type { FilesEntryVm } from "./gen/FilesEntryVm";
 export type { FilesListingState } from "./gen/FilesListingState";
 export type { FilesListingVm } from "./gen/FilesListingVm";
+export type { FilesSyncStatusVm } from "./gen/FilesSyncStatusVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -98,6 +100,8 @@ export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 export type { NoteListOp } from "./gen/NoteListOp";
 export type { NoteListVm } from "./gen/NoteListVm";
+export type { NoteOrder } from "./gen/NoteOrder";
+export type { NoteOrderSource } from "./gen/NoteOrderSource";
 export type { NoteQueryCheckVm } from "./gen/NoteQueryCheckVm";
 export type { NoteQueryReq } from "./gen/NoteQueryReq";
 export type { NoteRefVm } from "./gen/NoteRefVm";
@@ -3567,6 +3571,23 @@ export async function notesSetFlag(
   on: boolean,
 ): Promise<void> {
   await invoke<void>("notes_set_flag", { vaultId, noteId, flag, on });
+}
+
+/**
+ * Place a note in its list, or return it to the default (Story 44.5, FR-159).
+ *
+ * `order: null` removes the key instead of writing `order: 0`. The note is
+ * Obsidian's file too, so "this note has no stated position" has to be spelled
+ * as the absence of the property, not as a zero keeper put there.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesSetOrder(
+  vaultId: string,
+  noteId: string,
+  order: number | null,
+): Promise<void> {
+  await invoke<void>("notes_set_order", { vaultId, noteId, order });
 }
 
 /**

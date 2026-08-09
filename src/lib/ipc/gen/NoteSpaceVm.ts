@@ -17,9 +17,27 @@ name: string,
  */
 query: string, 
 /**
- * Presentation, deliberately outside the query grammar, e.g. `modified desc`.
+ * How this space orders the notes it lists, exactly as stored, e.g.
+ * `modified desc` (FR-158, Story 44.4). Kept as the file's own text rather
+ * than as a parsed enum, so a value keeper could not read survives a round
+ * trip through the editor unrewritten — the same promise the query and the
+ * icon make. [`crate::notes::sort::read`] is what turns it into an
+ * ordering, and into the sentence in `warnings` when it cannot.
  */
 sort: string, 
+/**
+ * The ordering the list is actually running, as the canonical
+ * `<key> <dir>` — always one of the ten [`crate::notes::sort`] knows, even
+ * when `sort` above holds nothing, or holds `bananas`.
+ *
+ * It exists so the editor never parses `sort`. A dropdown that had to work
+ * out for itself what an empty string or an unknown word resolves to would
+ * be a second copy of the fallback rule, in the language that cannot run
+ * the tests — and the two copies would disagree the first time the rule
+ * changed. Rust decides; the form selects what Rust decided; saving sends
+ * that back.
+ */
+sortEffective: string, 
 /**
  * Maximum rows the space yields.
  */
@@ -45,6 +63,38 @@ icon: string | null,
  * editor never touches.
  */
 defaultKey: string | null, 
+/**
+ * The presentation keys of this space's frontmatter that keeper could not
+ * read, each already worded as a finished sentence (Story 44.4).
+ *
+ * Separate from `error` because the severity is different and so is the
+ * remedy: a query that does not parse means the space selects **nothing**,
+ * while an unreadable `sort` or `order` means the space still works and is
+ * simply not obeying one line of its own file. Both have to be visible —
+ * frontmatter is hand-edited and agent-edited, so these values will be
+ * wrong, and a fallback nobody is told about is indistinguishable from
+ * keeper ignoring what the user wrote.
+ *
+ * A list rather than an `Option`, because a file with a bad `sort` usually
+ * has a bad `order` too — whoever was guessing at one was guessing at both
+ * — and showing one of the two would send them round the loop twice.
+ */
+warnings: Array<string>, 
+/**
+ * Where this space sits in the rail: lower first, ties by name
+ * (FR-157, AD-81).
+ *
+ * Zero for a space nobody has positioned, which is every space that exists
+ * before this story — so a rail nobody has ordered is still the
+ * alphabetical rail it was, and the seeded defaults still render Inbox,
+ * Journal, Pinned, Recordings in the order the deleted fixed rows did.
+ * Negative is allowed and is how a space floats above that block.
+ *
+ * `f64` for the reason a note's own order is one (Story 44.5): `1.5` is how
+ * a person slots a row between 1 and 2 without renumbering everything under
+ * it, and an integer would read `1.5` and `1.2` as the same position.
+ */
+order: number, 
 /**
  * The parse failure, when the stored query does not parse. A broken space
  * matches nothing and says so; it never falls back to matching everything.

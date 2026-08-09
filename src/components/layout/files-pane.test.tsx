@@ -1,6 +1,11 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { FilesEntryVm, FilesListingVm, SyncProfileVm } from "@/lib/ipc/client";
+import type {
+  FilesEntrySyncVm,
+  FilesEntryVm,
+  FilesListingVm,
+  SyncProfileVm,
+} from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the pane never touches Tauri.
 const syncProfiles = vi.fn();
@@ -29,9 +34,14 @@ import {
   FILES_WRITE_CONTROL_LABELS,
   FilesPane,
 } from "@/components/layout/files-pane";
+import {
+  FILES_SYNC_MARK_LABEL,
+  FILES_SYNC_MARK_TESTID,
+} from "@/components/layout/sync-status-mark";
 import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
+import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { withTextLayout } from "@/test/layout";
+import { type ListGeometry, withListGeometry, withTextLayout } from "@/test/layout";
 
 /** The exact sentence Rust composes for an unplugged profile. Verbatim, because
  * the whole point of the state is that this reaches the screen unaltered. */
@@ -81,9 +91,16 @@ function profile(p: Partial<SyncProfileVm> & Pick<SyncProfileVm, "id" | "name">)
   } as SyncProfileVm;
 }
 
-function entry(name: string, kind: FilesEntryVm["kind"], relativePath?: string): FilesEntryVm {
+/** A synced entry — the state a row is in when nothing is wrong with it, so
+ * every test that is not about the mark keeps reading as before. */
+function entry(
+  name: string,
+  kind: FilesEntryVm["kind"],
+  relativePath?: string,
+  sync: FilesEntrySyncVm = { status: "synced", detail: null },
+): FilesEntryVm {
   const rel = relativePath ?? name;
-  return { name, relativePath: rel, absolutePath: `/Users/alice/Vault/${rel}`, kind };
+  return { name, relativePath: rel, absolutePath: `/Users/alice/Vault/${rel}`, kind, sync };
 }
 
 function listed(
@@ -627,5 +644,272 @@ describe("FilesPane — a name too long for the tree", () => {
     for (const label of FILES_WRITE_CONTROL_LABELS) {
       expect(within(rows).queryByRole("button", { name: label })).toBeNull();
     }
+  });
+});
+
+/**
+ * Story 44.10 — a folder, not a screenful.
+ *
+ * A synced folder with a thousand photos in it is ordinary, and 43.8's roving
+ * tabindex is the thing windowing this tree is most likely to destroy quietly:
+ * "the next visible row" stops being a DOM sibling the moment rows unmount, and
+ * a focus target that is not mounted cannot receive focus. Every assertion below
+ * counts mounted rows or follows focus.
+ *
+ * `withListGeometry` is load-bearing. jsdom lays nothing out, so without it the
+ * scroll offset can never leave zero and a tree that mounted all three thousand
+ * entries in a browser would satisfy these on whatever window it first rendered.
+ * What it cannot prove is whether a real row is really 32 px at the real font.
+ */
+describe("FilesPane — a folder, not a screenful", () => {
+  const VISIBLE_ROWS = 10;
+  const ROW_PX = 32;
+  const OVERSCAN = 6;
+
+  /** One profile root plus three thousand files under it. */
+  const CHILDREN = Array.from({ length: 3000 }, (_, index) =>
+    entry(`photo-${String(index).padStart(4, "0")}.jpg`, "image"),
+  );
+
+  let geometry: ListGeometry | null = null;
+
+  afterEach(() => {
+    geometry?.undo();
+    geometry = null;
+  });
+
+  function mountedRows(): number[] {
+    return Array.from(document.querySelectorAll(`[${WINDOW_ROW_ATTR}]`)).map((element) =>
+      Number(element.getAttribute(WINDOW_ROW_ATTR)),
+    );
+  }
+
+  function viewport(): HTMLElement {
+    const element = document.querySelector(`[${WINDOW_VIEWPORT_ATTR}]`);
+    if (!(element instanceof HTMLElement)) {
+      throw new Error("the files tree has no scroll viewport");
+    }
+    return element;
+  }
+
+  /** Render the pane with the big folder already open. */
+  async function openBigFolder(): Promise<void> {
+    geometry = withListGeometry({ viewport: VISIBLE_ROWS * ROW_PX, row: ROW_PX });
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", CHILDREN));
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button"));
+    await screen.findByRole("treeitem", { name: "photo-0000.jpg" });
+  }
+
+  it("mounts a window over three thousand files, not three thousand rows", async () => {
+    await openBigFolder();
+
+    // One root row plus a window into its children — nowhere near 3001.
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
+    expect(screen.queryByRole("treeitem", { name: "photo-2999.jpg" })).toBeNull();
+  });
+
+  it("reaches the last file by scrolling", async () => {
+    await openBigFolder();
+
+    act(() => geometry?.scrollTo(viewport(), 3001 * ROW_PX));
+
+    expect(screen.getByRole("treeitem", { name: "photo-2999.jpg" })).toBeInTheDocument();
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2 + 1);
+  });
+
+  it("walks End and Home across rows that were never rendered", async () => {
+    await openBigFolder();
+
+    const first = screen.getByRole("treeitem", { name: "Vault" });
+    first.focus();
+    fireEvent.keyDown(first, { key: "End" });
+
+    // Three thousand rows away, and mounted only because End put it there.
+    const last = screen.getByRole("treeitem", { name: "photo-2999.jpg" });
+    expect(document.activeElement).toBe(last);
+
+    // One step back is the row before it in the DATA, which is also the row
+    // above it on screen — the two must not have come apart.
+    fireEvent.keyDown(last, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(screen.getByRole("treeitem", { name: "photo-2998.jpg" }));
+
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Home" });
+    expect(document.activeElement).toBe(screen.getByRole("treeitem", { name: "Vault" }));
+  });
+
+  it("keeps exactly one row in the tab order, however far it is scrolled away", async () => {
+    await openBigFolder();
+    const stops = () => document.querySelectorAll('[role="treeitem"][tabindex="0"]');
+
+    expect(stops()).toHaveLength(1);
+
+    act(() => geometry?.scrollTo(viewport(), 3001 * ROW_PX));
+
+    // The tab stop is the Vault root, three thousand rows above the viewport.
+    // Unmounting it would leave the tree with no row carrying `tabIndex=0`, and
+    // Tab would walk straight past the whole Files surface.
+    expect(stops()).toHaveLength(1);
+    expect(stops()[0]).toHaveAccessibleName("Vault");
+  });
+
+  it("keeps the remembered row focused after it is scrolled out and back", async () => {
+    await openBigFolder();
+
+    const chosen = screen.getByRole("treeitem", { name: "photo-0003.jpg" });
+    fireEvent.focus(chosen);
+    expect(chosen).toHaveAttribute("tabindex", "0");
+
+    act(() => geometry?.scrollTo(viewport(), 3001 * ROW_PX));
+    act(() => geometry?.scrollTo(viewport(), 0));
+
+    // Same row, still the one tab stop, and the tree came back to where it was
+    // rather than to wherever the remembered row happened to be.
+    expect(screen.getByRole("treeitem", { name: "photo-0003.jpg" })).toHaveAttribute(
+      "tabindex",
+      "0",
+    );
+    expect(viewport().scrollTop).toBe(0);
+  });
+});
+
+/**
+ * Story 44.17 — whether a file is synced.
+ *
+ * The listing is mocked here on purpose: what a real repository produces is
+ * proved in `keeper-sync`'s `browse::` tests against a real commit and the
+ * engine's real pending list. What is only provable in a DOM is that each
+ * state reaches the screen as its own thing, that the sentence Rust composed
+ * arrives unaltered, and that the mark does not join the tab order 43.8 spent
+ * a story getting right.
+ */
+describe("FilesPane — is this file synced", () => {
+  /** Verbatim, because the whole point is that Rust's words reach the screen. */
+  const EXCLUDED_SENTENCE =
+    "A pattern in this folder's sync settings excludes it, so keeper will never copy it.";
+  const WAITING_SENTENCE = "This file is new and has not been committed yet.";
+  const NO_REPO_SENTENCE =
+    "This folder is not a repository yet. The first sync sets one up and takes everything in it.";
+  const UNKNOWN_SENTENCE =
+    "keeper could not read this folder's sync state: status failed: index is sparse";
+
+  function marked(
+    name: string,
+    status: FilesEntrySyncVm["status"],
+    detail: string | null,
+  ): FilesEntryVm {
+    return entry(name, "file", name, { status, detail });
+  }
+
+  /** Open a vault holding one entry of every state. */
+  async function openMixedFolder(): Promise<void> {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [
+        marked("clean.md", "synced", null),
+        marked("fresh.md", "waiting", WAITING_SENTENCE),
+        marked("scratch.tmp", "excluded", EXCLUDED_SENTENCE),
+        marked("orphan.md", "notInRepository", NO_REPO_SENTENCE),
+        marked("puzzling.md", "unknown", UNKNOWN_SENTENCE),
+      ]),
+    );
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button"));
+    await screen.findByRole("treeitem", { name: "clean.md" });
+  }
+
+  function markOf(rowName: string): HTMLElement {
+    return within(screen.getByRole("treeitem", { name: rowName })).getByTestId(
+      FILES_SYNC_MARK_TESTID,
+    );
+  }
+
+  it("gives each state its own mark, so an excluded file never reads as waiting", async () => {
+    await openMixedFolder();
+
+    const states = [
+      ["clean.md", "synced"],
+      ["fresh.md", "waiting"],
+      ["scratch.tmp", "excluded"],
+      ["orphan.md", "notInRepository"],
+      ["puzzling.md", "unknown"],
+    ] as const;
+    for (const [name, status] of states) {
+      expect(markOf(name)).toHaveAttribute("data-sync-status", status);
+    }
+
+    // The distinction the story turns on, asserted as the two things a person
+    // actually perceives: a different shape and a different name. A file that
+    // will never sync must not be wearing the mark of one that is about to.
+    const excluded = markOf("scratch.tmp");
+    const waiting = markOf("fresh.md");
+    expect(excluded).toHaveAccessibleName(EXCLUDED_SENTENCE);
+    expect(waiting).toHaveAccessibleName(WAITING_SENTENCE);
+    expect(excluded.innerHTML).not.toEqual(waiting.innerHTML);
+  });
+
+  it("renders the sentence Rust composed rather than one of its own", async () => {
+    await openMixedFolder();
+
+    // Not a paraphrase and not a shortened form: the browser and the Pending
+    // card describe the same engine state, and a second copy of these words
+    // here is the copy that would be edited alone.
+    expect(markOf("orphan.md")).toHaveAccessibleName(NO_REPO_SENTENCE);
+    // Including the engine's own failure, verbatim — a reason someone can act
+    // on beats a sentence that only says something went wrong.
+    expect(markOf("puzzling.md")).toHaveAccessibleName(UNKNOWN_SENTENCE);
+    // A synced file has no story, so it falls back to the short name.
+    expect(markOf("clean.md")).toHaveAccessibleName(FILES_SYNC_MARK_LABEL.synced);
+  });
+
+  it("stays out of the tab order, on the focused row and every other one", async () => {
+    await openMixedFolder();
+
+    // 43.8's roving tabindex: exactly one row is a tab stop and its actions
+    // join the tab order only while it is focused. A mark is not an action —
+    // there is nothing to activate — so it must never be a stop at all, focused
+    // row or not.
+    const focused = screen.getByRole("treeitem", { name: "fresh.md" });
+    fireEvent.focus(focused);
+    expect(focused).toHaveAttribute("tabindex", "0");
+
+    for (const mark of screen.getAllByTestId(FILES_SYNC_MARK_TESTID)) {
+      expect(mark).not.toHaveAttribute("tabindex");
+    }
+    expect(document.querySelectorAll('[role="treeitem"][tabindex="0"]')).toHaveLength(1);
+  });
+
+  it("gives a profile root no mark, because its children answer for themselves", async () => {
+    await openMixedFolder();
+
+    const root = screen.getByRole("treeitem", { name: "Vault" });
+    expect(within(root).queryByTestId(FILES_SYNC_MARK_TESTID)).toBeNull();
+  });
+
+  it("shows the new mark once sync has moved on", async () => {
+    await openMixedFolder();
+    expect(markOf("fresh.md")).toHaveAttribute("data-sync-status", "waiting");
+
+    // The mark is part of the listing, so it is only ever as old as the listing
+    // — and Refresh re-reads every open folder. A cached mark that outlived the
+    // sync it described would be the "waiting forever" this story removes,
+    // wearing a different hat.
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [
+        marked("clean.md", "synced", null),
+        marked("fresh.md", "synced", null),
+        marked("scratch.tmp", "excluded", EXCLUDED_SENTENCE),
+        marked("orphan.md", "notInRepository", NO_REPO_SENTENCE),
+        marked("puzzling.md", "unknown", UNKNOWN_SENTENCE),
+      ]),
+    );
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    await waitFor(() => expect(markOf("fresh.md")).toHaveAttribute("data-sync-status", "synced"));
+    // …and the states that did not move did not move.
+    expect(markOf("scratch.tmp")).toHaveAttribute("data-sync-status", "excluded");
   });
 });

@@ -503,6 +503,148 @@ correct, and the recovery is Restore. If it logs `notes: did not seed the defaul
 sentence names the file and the errno. Either way it is one grep, which is what this story owed and
 did not deliver the first time.
 
+## Postmortem, round three: the loud outcomes were logged at a level the app drops
+
+The fix above was installed and the log was **still blank** — no seed line of any level, and none
+from `keeper_lib::notes_vault` either. The natural reading is "the four-arm outcome cannot produce
+silence, therefore `seed_default_spaces` was never reached". That reading is wrong, and the reason
+is mine.
+
+**Round 2's fix reproduced round 1's defect one layer out.** Round 1 was a silent code path. Round 2
+replaced it with a log line the application cannot emit. The same failure — an outcome that cannot
+be observed — wearing a different hat, and it took a third round to see because the second one
+looked like a fix. That is the sentence to carry out of this story.
+
+### The finding
+
+`debug_log::init` installs
+`EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`, and **nothing sets
+`RUST_LOG` for the macOS desktop app** — the only `RUST_LOG` in the tree is `info`, in the iOS
+Xcode scheme and `gen/apple/project.yml`; `keeper-syncd` has its own. A GUI process launched from
+Finder inherits none. So the effective floor is `info` and **`tracing::debug!` is dead code in
+production**, on stderr and in `keeper.log` alike.
+
+`AlreadySatisfied` — the ordinary outcome, the one that means "the run happened and had nothing to
+do" — was logged at `debug!`. It could not print. So a completely silent log is consistent with
+exactly one of the four arms firing normally, and the round-two fix reproduced the round-one defect
+one layer out: **I replaced a silent code path with a log line the app cannot emit.**
+
+Note what this does to the inference chain. It does not prove the run reached
+`AlreadySatisfied` — the registry could equally have been empty, which the parent is right to
+suspect. It proves something worse: after two rounds of work the log still could not distinguish
+those two, which is the same failure both previous rounds were about.
+
+### The fix
+
+- **The level is a property of the outcome, in `keeper-core`.**
+  `SeedOutcome::report() -> (tracing::Level, String)`, with `REPORT_FLOOR = Level::INFO` named and
+  documented as the filter the app actually installs. The shell emits what core chose; it no longer
+  picks a level.
+- **`AlreadySatisfied` is `INFO`.** It is chatty — one line per vault per refresh — and it is the
+  single line that answers "did the seed run at all", which is the question three field reports have
+  now turned on. That trade is made, deliberately, in favour of a readable log.
+- **The caller is audible too.** `notes_vault::start` says it started. `refresh` logs
+  `profiles=N vaults=M` before it touches the registry, and each of its three early returns now says
+  which one it took — including the no-engine case, which was a bare `return`. "The profile set has
+  no flagged vault in it" and "this function was never called" produced identical blank logs before;
+  they do not now.
+
+### The test that would have caught it
+
+`no_seed_outcome_reports_below_the_level_the_app_can_print` walks every `SeedOutcome` variant and
+asserts `report()`'s level is at or above `REPORT_FLOOR`, and — this part matters — asserts
+`REPORT_FLOOR == Level::INFO` against the literal, naming `EnvFilter::new("info")` as the source.
+
+The first version of that test compared each variant against the constant alone. A mutation that
+**lowered the constant to `DEBUG`** passed it, which is exactly the pressure that produced the bug:
+a self-consistent floor accommodates whatever level someone reaches for. With the literal pinned,
+all four mutations fail:
+
+| Mutation | Caught by |
+|---|---|
+| `AlreadySatisfied` goes back to `DEBUG` — **the round-2 bug** | `no_seed_outcome_reports_below_the_level_the_app_can_print` |
+| `REPORT_FLOOR` is lowered to `DEBUG`, making the test vacuous | same |
+| A refusal is reported at `INFO` instead of `WARN` | same |
+| A refusal drops the reason it was given | same |
+
+### What this round still cannot settle
+
+Whether the owner's run reached `AlreadySatisfied` or whether `refresh` found no vaults. Both are
+live, and the parent's registration hypothesis is untested here because `refresh` needs an
+`AppHandle` and the shell does not build on Linux. What the next install can settle in one grep:
+
+- `notes: starting the vault registry` — `start` ran.
+- `notes: no sync engine yet…` — the early return that leaves the registry empty.
+- `notes: refreshing the vault registry profiles=N vaults=M` — **`vaults=0` is the parent's
+  hypothesis, confirmed**, and `N` tells you whether the profile set was loaded at all.
+- `notes: default spaces already settled for this vault` — the run happened and planned nothing.
+- `notes: did not seed the default spaces…` — a refusal, naming the file and the errno.
+
+Absence of *all* of those now means the subsystem genuinely never ran, which is a different
+investigation and a readable one.
+
+## A finding about the app, not about default spaces
+
+**`tracing::debug!` is dead code in the shipped desktop app, everywhere — not just here.**
+
+This story tripped over it, but nothing about it belongs to default spaces, and leaving it recorded
+only in a spec about the notes rail is how it gets rediscovered by whoever debugs the next silent
+thing.
+
+### The evidence
+
+`debug_log::init` (`keeper/src/debug_log.rs`) installs the process-wide subscriber with
+`EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`. `RUST_LOG` appears
+exactly three places in this tree, none of which is the macOS desktop app: `gen/apple/project.yml`
+and the iOS Xcode scheme (both `info`), and `keeper-syncd`, which resolves its own filter from
+`--verbose` and its config. A GUI process launched from Finder inherits no environment from a shell.
+So the floor is `info`, always, on the machine every user runs.
+
+There are **127 `tracing::debug!` call sites** outside test modules:
+
+| Crate | Sites | Heaviest files |
+|---|---|---|
+| `keeper-core` | 55 | `account.rs` 24, `bridges/discovery.rs` 6, `drafts.rs` 5, `bridges/transport/provisioning.rs` 5 |
+| `keeper-sync` | 30 | `engine.rs` 19 |
+| `keeper` | 42 | `ipc.rs` 18, `note_protocol.rs` 5, `recording_protocol.rs` 5, `notes_vault.rs` 4 |
+
+Not one of them can print in production.
+
+### Why it matters more than the count suggests
+
+Read what they say. They are almost all the same *kind* of line — the one that explains a refusal or
+a fallback, written by someone who correctly thought "a future reader will need to know why this
+took the quiet branch":
+
+- `keeper-note: refused a path outside the vault`
+- `recordings sync: the push policy says not now, so the commits stay local until it does`
+- `recording note: this stub is no longer what keeper composed, so it is kept`
+- `notes: cadence push deferred`
+- `no synced folders to default to; recording into the plain folder`
+
+Every one is a "why did keeper not do the thing I expected" answer, and every one is invisible at
+precisely the moment somebody asks. This is the same failure this story hit three times, distributed
+across the app: `WARN`/`ERROR` reach the file whatever the toggle says (a deliberate and good
+decision in `GatedMakeWriter`), `INFO` reaches it when debug mode is on — and `DEBUG` reaches
+nothing, ever, no matter what the user turns on. The debug-mode toggle in Settings does not do what
+its name says.
+
+### It is worth its own story, and the shape is not obvious
+
+Deliberately not fixed here, because the fix is a judgement about the whole app rather than about
+four notes, and there are at least three defensible answers:
+
+1. **Make the toggle mean what it says** — `EnvFilter::new("debug")` when `debug.mode` is on. Cheap,
+   and it is what a user turning on "debug logging" expects. Costs a volume review: 127 sites, some
+   in hot paths (`engine.rs`, `account.rs`), and the file leg is unrotated.
+2. **Promote the diagnostic ones to `INFO`** and leave the floor alone. Precise, no volume surprise,
+   but it is 127 individual judgements and it will drift straight back.
+3. **Filter by target rather than level** — `info,keeper_lib::notes_vault=debug` and friends, driven
+   by a setting. Most control, most machinery.
+
+What this story did for its own module is (2) with a test that pins the floor, which is the smallest
+honest thing one story can do. Recorded in `deferred-work.md` so it is discoverable.
+
 ## Deliberately NOT Done
 
 - **No `order` or `sort` on a space.** Story 44.4 owns both. The seeded defaults carry

@@ -33,10 +33,26 @@
 //! at the recordings destination and is not widened to reach a synced folder
 //! (AD-74). This module hands out names, and the actions on those names are the
 //! ones the shell already had.
+//!
+//! # Saying whether a file is synced, without becoming a second answer
+//!
+//! Story 44.17 puts a state on every entry, and the state is *read*, never
+//! recomputed here. [`crate::engine::Engine::pending`] is already the one
+//! derived answer to "what has this folder not synced yet, and why" — it reads
+//! `file_state` for what is settling and git for what is uncommitted, and it
+//! is documented as computed-never-stored precisely so a visible answer cannot
+//! drift from the real one. This module takes that list as an argument
+//! ([`PendingView`]) and joins it to the dirents it just read. It does not open
+//! a repository, run a status walk or touch the journal, which is the same
+//! reason it takes a `&SyncProfile` and not an `&Engine`: a browser that could
+//! reach the engine is a browser that will eventually spend something.
 
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 
-use crate::exclude::ExcludeSet;
+use crate::engine::{PendingFile, PendingReason};
+use crate::exclude::{ExcludeSet, ExcludeVerdict};
 use crate::profile::SyncProfile;
 use crate::volume::{self, VolumeStatus};
 
@@ -78,6 +94,106 @@ pub struct BrowseEntry {
     /// folder expands like the folder it points at, and [`resolve`] refuses it
     /// on the next call if it points outside the root.
     pub is_dir: bool,
+    /// What sync knows about this entry right now (Story 44.17, FR-173).
+    pub sync: EntrySyncStatus,
+}
+
+/// What the engine's own state says about one browsed entry.
+///
+/// Four answers a person acts on differently, and the distinction the story
+/// turns on is [`Self::Excluded`] against [`Self::Waiting`]: a file that will
+/// never be carried, rendered as one that is about to be, is a file somebody
+/// waits for forever. [`Self::NotInRepository`] is the third way a file can
+/// fail to arrive and it has its own next step — the folder has no repository,
+/// so nothing in it is going anywhere until the first sync adopts it.
+///
+/// [`Self::Unknown`] is the fifth, and it exists for the same reason
+/// [`BrowseListing`] separates an absent drive from an empty folder: when the
+/// engine could not answer, every other value would be a claim this module has
+/// no grounds for. Guessing [`Self::Synced`] tells someone their work is safe;
+/// guessing [`Self::Waiting`] tells them to keep waiting. Neither is honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntrySyncStatus {
+    /// The folder is a repository, the entry is not excluded, and nothing in
+    /// the engine's pending list is about it.
+    Synced,
+    /// The engine still has work to do about this entry.
+    Waiting {
+        /// Why, when the pending list named this exact path. `None` for a
+        /// directory whose mark is a roll-up of something beneath it — the
+        /// folder itself is not untracked or modified, something inside it is,
+        /// and borrowing that word for the folder would be a small lie about
+        /// which thing git has never heard of.
+        reason: Option<PendingReason>,
+    },
+    /// A pattern in this profile's own configuration excludes it. Sync will
+    /// never carry it, and it is listed *only* so it can say so — keeper's
+    /// built-in noise corpus stays hidden (see [`ExcludeVerdict`]).
+    Excluded,
+    /// The profile's folder is not a git repository, so there is nothing for
+    /// this entry to be synced with yet.
+    NotInRepository,
+    /// The engine was asked and could not say.
+    Unknown,
+}
+
+/// The engine's pending list, indexed for the one question a listing asks.
+///
+/// A [`BTreeMap`] rather than a set of strings because a directory's mark is a
+/// roll-up: the ordered map answers "is any path below `dir/` waiting" with one
+/// range probe instead of a scan per row, which is what keeps a folder of a
+/// thousand entries linear rather than quadratic against a long pending list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingView {
+    /// The engine answered. Keys are profile-relative, `/`-joined paths exactly
+    /// as [`crate::engine::Engine::pending`] produces them — the same frame
+    /// [`BrowseEntry::relative_path`] is in, which is why no path arithmetic
+    /// happens on either side of the join.
+    Known(BTreeMap<String, PendingReason>),
+    /// The engine could not produce a pending list. The reason belongs to the
+    /// caller that failed to get one and is not copied onto every row; every
+    /// entry reads [`EntrySyncStatus::Unknown`].
+    Unavailable,
+}
+
+impl PendingView {
+    /// Index one [`crate::engine::Engine::pending`] result.
+    ///
+    /// Takes the vector by value: the paths are moved into the map, so an
+    /// answer about ten thousand pending files costs no second copy of them.
+    pub fn from_pending(files: Vec<PendingFile>) -> Self {
+        Self::Known(
+            files
+                .into_iter()
+                .map(|file| (file.path, file.reason))
+                .collect(),
+        )
+    }
+
+    /// The pending reason for one entry, if the engine named it.
+    ///
+    /// A directory is asked about twice — for itself, then for anything
+    /// beneath it — because both are real: a tracked directory can be reported
+    /// deleted by name, and an ordinary folder is waiting when its contents
+    /// are.
+    fn waiting(&self, relative_path: &str, is_dir: bool) -> Option<Option<PendingReason>> {
+        let Self::Known(map) = self else {
+            return None;
+        };
+        if let Some(reason) = map.get(relative_path) {
+            return Some(Some(reason.clone()));
+        }
+        if !is_dir {
+            return None;
+        }
+        let mut prefix = String::with_capacity(relative_path.len() + 1);
+        prefix.push_str(relative_path);
+        prefix.push('/');
+        map.range::<String, _>((Bound::Included(&prefix), Bound::Unbounded))
+            .next()
+            .is_some_and(|(path, _)| path.starts_with(prefix.as_str()))
+            .then_some(None)
+    }
 }
 
 /// One directory's worth of entries.
@@ -241,7 +357,8 @@ pub fn resolve(root: &Path, subpath: &str) -> Result<Option<PathBuf>, BrowseRefu
 /// `subpath` is `""` for the profile root and otherwise a `/`-joined path this
 /// module previously handed out. `excludes` is compiled by the caller so a
 /// surface expanding a tree pays for the glob compilation once rather than per
-/// click.
+/// click. `pending` is the engine's own pending list, gathered once by the
+/// caller for the same reason and read here rather than re-derived.
 ///
 /// The order of the checks is the contract:
 ///
@@ -254,6 +371,7 @@ pub fn browse(
     profile: &SyncProfile,
     subpath: &str,
     excludes: &ExcludeSet,
+    pending: &PendingView,
 ) -> Result<BrowseListing, BrowseRefusal> {
     let resolved = resolve(&profile.local_path, subpath)?;
 
@@ -287,6 +405,14 @@ pub fn browse(
         return Ok(BrowseListing::Missing);
     }
 
+    // One `.exists()` for the whole listing, and deliberately the same
+    // expression `Engine::pending` uses to decide whether git has anything to
+    // say — a `.git` that is a file rather than a directory is a worktree or a
+    // submodule and counts either way. Asking gitoxide to open the repository
+    // would be the more thorough answer and is exactly what this module must
+    // not do: opening is where trust levels, config enforcement and index
+    // refreshes live, and browsing has no business near any of them.
+    let in_repository = profile.local_path.join(".git").exists();
     let prefix = subpath.trim_end_matches('/');
     let read = std::fs::read_dir(&dir).map_err(|error| BrowseRefusal::Unreadable {
         reason: error.to_string(),
@@ -318,23 +444,23 @@ pub fn browse(
         let absolute_path = entry.path();
         let is_dir = std::fs::metadata(&absolute_path).is_ok_and(|meta| meta.is_dir());
         let match_path = Path::new(&relative_path);
-        let excluded = if is_dir {
-            excludes.is_excluded_directory(match_path)
-        } else {
-            excludes.is_excluded(match_path)
-        };
-        if excluded {
+        let verdict = excludes.verdict(match_path, is_dir);
+        if verdict == ExcludeVerdict::BuiltinNoise {
+            // Keeper's own noise, hidden as it has been since 43.8. A profile's
+            // own pattern falls through and is listed, marked.
             continue;
         }
         if entries.len() == LISTING_CAP {
             truncated = true;
             break;
         }
+        let sync = classify(&relative_path, is_dir, verdict, pending, in_repository);
         entries.push(BrowseEntry {
             name,
             relative_path,
             absolute_path,
             is_dir,
+            sync,
         });
     }
 
@@ -356,9 +482,53 @@ pub fn browse(
     }))
 }
 
+/// Decide one entry's mark from state that already existed before the call.
+///
+/// The precedence is the whole of the story's rule, in order:
+///
+/// 1. **A profile pattern wins over everything.** An excluded file is never
+///    going to sync, and saying anything else about it — waiting, or worse,
+///    synced — is the "waiting forever" this story exists to remove.
+/// 2. **An engine that could not answer says so**, rather than letting the
+///    absence of a pending row read as success.
+/// 3. **Waiting beats not-in-a-repository.** Both are true of a settling file
+///    in a folder that has never been adopted, and "the engine is holding this
+///    file right now" is the more specific and more actionable of the two.
+/// 4. **Synced is only ever reached with a repository present.** Without one,
+///    absence from the pending list means nothing at all, and reporting it as
+///    synced would tell someone their files are safe on a remote that has never
+///    heard of them.
+fn classify(
+    relative_path: &str,
+    is_dir: bool,
+    verdict: ExcludeVerdict,
+    pending: &PendingView,
+    in_repository: bool,
+) -> EntrySyncStatus {
+    if verdict == ExcludeVerdict::ProfilePattern {
+        return EntrySyncStatus::Excluded;
+    }
+    if matches!(pending, PendingView::Unavailable) {
+        return EntrySyncStatus::Unknown;
+    }
+    if let Some(reason) = pending.waiting(relative_path, is_dir) {
+        return EntrySyncStatus::Waiting { reason };
+    }
+    if in_repository {
+        EntrySyncStatus::Synced
+    } else {
+        EntrySyncStatus::NotInRepository
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::engine::Engine;
+    use crate::platform::{SyncPlatform, TestPlatform};
+    use crate::provenance::SyncSource;
 
     fn profile(local_path: &Path) -> SyncProfile {
         SyncProfile::new(
@@ -371,6 +541,13 @@ mod tests {
 
     fn no_excludes() -> ExcludeSet {
         ExcludeSet::new(&[]).expect("builtin corpus compiles")
+    }
+
+    /// A profile with nothing outstanding — the engine answered, and its answer
+    /// was "nothing". Distinct from [`PendingView::Unavailable`], which is the
+    /// engine failing to answer, and the tests below rely on that difference.
+    fn nothing_pending() -> PendingView {
+        PendingView::Known(BTreeMap::new())
     }
 
     fn names(listing: &BrowseListing) -> Vec<String> {
@@ -452,7 +629,12 @@ mod tests {
         );
         // And the whole browse call refuses, not merely the resolver.
         assert_eq!(
-            browse(&profile(root.path()), "escape", &no_excludes()),
+            browse(
+                &profile(root.path()),
+                "escape",
+                &no_excludes(),
+                &nothing_pending()
+            ),
             Err(BrowseRefusal::EscapesAfterResolution {
                 subpath: "escape".to_owned()
             })
@@ -468,7 +650,7 @@ mod tests {
         let mut removable = profile(&root.path().join("gone"));
         removable.removable = true;
         assert_eq!(
-            browse(&removable, "../..", &no_excludes()),
+            browse(&removable, "../..", &no_excludes(), &nothing_pending()),
             Err(BrowseRefusal::Escapes {
                 subpath: "../..".to_owned()
             })
@@ -484,7 +666,7 @@ mod tests {
         removable.removable = true;
         removable.volume_id = Some("01VOLUME".to_owned());
         assert_eq!(
-            browse(&removable, "", &no_excludes()).expect("no refusal"),
+            browse(&removable, "", &no_excludes(), &nothing_pending()).expect("no refusal"),
             BrowseListing::MediaAbsent
         );
     }
@@ -493,7 +675,13 @@ mod tests {
     fn an_empty_folder_on_a_fixed_disk_is_an_empty_listing_not_absent_media() {
         let root = tempfile::tempdir().expect("temp");
         assert_eq!(
-            browse(&profile(root.path()), "", &no_excludes()).expect("no refusal"),
+            browse(
+                &profile(root.path()),
+                "",
+                &no_excludes(),
+                &nothing_pending()
+            )
+            .expect("no refusal"),
             BrowseListing::Listed(BrowseDirectory {
                 entries: Vec::new(),
                 truncated: false,
@@ -515,7 +703,7 @@ mod tests {
         removable.removable = true;
         removable.volume_id = Some("01NOTTHEIRS".to_owned());
         assert!(matches!(
-            browse(&removable, "", &no_excludes()).expect("no refusal"),
+            browse(&removable, "", &no_excludes(), &nothing_pending()).expect("no refusal"),
             BrowseListing::MediaUnexpected { .. }
         ));
     }
@@ -531,7 +719,7 @@ mod tests {
         removable.removable = true;
         removable.volume_id = Some(marker.volume_id.clone());
         assert_eq!(
-            names(&browse(&removable, "", &no_excludes()).expect("no refusal")),
+            names(&browse(&removable, "", &no_excludes(), &nothing_pending()).expect("no refusal")),
             vec!["clip.mov"]
         );
     }
@@ -543,7 +731,8 @@ mod tests {
             browse(
                 &profile(&root.path().join("moved-away")),
                 "",
-                &no_excludes()
+                &no_excludes(),
+                &nothing_pending()
             )
             .expect("no refusal"),
             BrowseListing::Missing
@@ -562,20 +751,52 @@ mod tests {
             std::fs::write(root.path().join(file), "x").expect("file");
         }
         assert_eq!(
-            names(&browse(&profile(root.path()), "", &no_excludes()).expect("no refusal")),
+            names(
+                &browse(
+                    &profile(root.path()),
+                    "",
+                    &no_excludes(),
+                    &nothing_pending()
+                )
+                .expect("no refusal")
+            ),
             vec!["Notes", "notes.md"]
         );
     }
 
+    /// Story 44.17 changed this deliberately, and 43.8's original assertion —
+    /// that a profile-excluded file is absent — is the thing it changed.
+    ///
+    /// Dropping the row made a user's own rule invisible: someone who put
+    /// `*.tmp` in their profile saw those files simply missing from the folder
+    /// they were looking at, with nothing on screen tying the hole to the
+    /// pattern they typed. Keeper's own noise corpus keeps the old treatment
+    /// (see the test above); a rule a person wrote is shown working.
     #[test]
-    fn a_profile_pattern_excludes_on_top_of_the_builtin_corpus() {
+    fn a_profile_pattern_lists_the_file_and_marks_it_rather_than_hiding_it() {
         let root = tempfile::tempdir().expect("temp");
         std::fs::write(root.path().join("keep.md"), "x").expect("file");
         std::fs::write(root.path().join("drop.tmp"), "x").expect("file");
+        // Builtin noise beside it, so the two treatments are asserted against
+        // each other in one listing rather than in two tests that could drift.
+        std::fs::write(root.path().join(".DS_Store"), "x").expect("file");
         let excludes = ExcludeSet::new(&["*.tmp".to_owned()]).expect("compiles");
+
+        let BrowseListing::Listed(dir) =
+            browse(&profile(root.path()), "", &excludes, &nothing_pending()).expect("no refusal")
+        else {
+            panic!("expected a listing");
+        };
         assert_eq!(
-            names(&browse(&profile(root.path()), "", &excludes).expect("no refusal")),
-            vec!["keep.md"]
+            dir.entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.sync.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("drop.tmp", EntrySyncStatus::Excluded),
+                ("keep.md", EntrySyncStatus::NotInRepository),
+            ],
+            "the profile's own pattern is listed and marked; keeper's noise is not listed"
         );
     }
 
@@ -589,7 +810,15 @@ mod tests {
             std::fs::write(root.path().join(file), "x").expect("file");
         }
         assert_eq!(
-            names(&browse(&profile(root.path()), "", &no_excludes()).expect("no refusal")),
+            names(
+                &browse(
+                    &profile(root.path()),
+                    "",
+                    &no_excludes(),
+                    &nothing_pending()
+                )
+                .expect("no refusal")
+            ),
             vec!["Alpha", "zeta", "A.md", "b.md"]
         );
     }
@@ -600,8 +829,13 @@ mod tests {
         std::fs::create_dir_all(root.path().join("2026/Standup")).expect("tree");
         std::fs::write(root.path().join("2026/Standup/manifest.json"), "{}").expect("file");
 
-        let listing =
-            browse(&profile(root.path()), "2026/Standup", &no_excludes()).expect("no refusal");
+        let listing = browse(
+            &profile(root.path()),
+            "2026/Standup",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal");
         let BrowseListing::Listed(dir) = listing else {
             panic!("expected a listing");
         };
@@ -634,7 +868,13 @@ mod tests {
         std::fs::create_dir_all(root.path().join("deep/deeper")).expect("tree");
         std::fs::write(root.path().join("deep/deeper/buried.md"), "x").expect("file");
 
-        let listing = browse(&profile(root.path()), "", &no_excludes()).expect("no refusal");
+        let listing = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal");
         let BrowseListing::Listed(dir) = listing else {
             panic!("expected a listing");
         };
@@ -649,9 +889,13 @@ mod tests {
         for index in 0..(LISTING_CAP + 5) {
             std::fs::write(root.path().join(format!("f{index:06}.md")), "x").expect("file");
         }
-        let BrowseListing::Listed(dir) =
-            browse(&profile(root.path()), "", &no_excludes()).expect("no refusal")
-        else {
+        let BrowseListing::Listed(dir) = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal") else {
             panic!("expected a listing");
         };
         assert_eq!(dir.entries.len(), LISTING_CAP);
@@ -663,8 +907,331 @@ mod tests {
         let root = tempfile::tempdir().expect("temp");
         std::fs::write(root.path().join("notes.md"), "x").expect("file");
         assert_eq!(
-            browse(&profile(root.path()), "notes.md", &no_excludes()).expect("no refusal"),
+            browse(
+                &profile(root.path()),
+                "notes.md",
+                &no_excludes(),
+                &nothing_pending()
+            )
+            .expect("no refusal"),
             BrowseListing::Missing
+        );
+    }
+
+    // --- The mark, against a real repository the real engine answered about --
+    //
+    // Everything above this line is a pure listing test and would happily pass
+    // while the feature did nothing on a real machine. The mark is a join
+    // between two things that only exist on disk — dirents, and what
+    // `Engine::pending` says after a real `git status` walk over a real commit
+    // — so these build both and join them for real. A hand-written
+    // `PendingView` would prove the `match` arms and nothing about the feature.
+
+    /// A committed repository with one of each state in it.
+    ///
+    /// Returns the engine alongside the profile because the caller has to ask
+    /// it for the pending list — that call is the point of the fixture.
+    /// Everything is driven through public engine API: no test reaches into
+    /// `file_state`, the gate or the index by hand, so the states asserted
+    /// below are states the shipping code actually produces.
+    async fn committed_fixture(
+        data: &Path,
+        work: &Path,
+        remote: &Path,
+    ) -> Option<(Engine, Arc<TestPlatform>, SyncProfile)> {
+        gix::init_bare(remote).ok()?;
+        let platform = Arc::new(TestPlatform::new(data));
+        // A machine with no usable git cannot host the engine at all, which is
+        // AD-41's contract — skip rather than fake it, as engine's own tests do.
+        let engine = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>).ok()?;
+
+        let mut p = SyncProfile::new(
+            "01BROWSESTATUS",
+            "Vault",
+            work,
+            remote.to_string_lossy().into_owned(),
+        );
+        p.excludes = vec!["*.tmp".to_owned()];
+        std::fs::create_dir_all(work.join("notes")).expect("notes dir");
+        std::fs::create_dir_all(work.join("archive")).expect("archive dir");
+        std::fs::write(work.join("tracked.md"), b"tracked").expect("write");
+        std::fs::write(work.join("notes/kept.md"), b"kept").expect("write");
+        std::fs::write(work.join("archive/old.md"), b"old").expect("write");
+        // The user's own pattern, and keeper's noise, side by side.
+        std::fs::write(work.join("drop.tmp"), b"scratch").expect("write");
+        std::fs::write(work.join(".DS_Store"), b"finder").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Two passes a settle window apart: the completeness gate needs two
+        // identical observations before it lets anything through, so one pass
+        // only opens the episode.
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the first pass adopts and opens the settle episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the second pass commits and publishes");
+        Some((engine, platform, p))
+    }
+
+    /// Every file under `root`, as path → bytes, so a caller can assert that a
+    /// whole directory tree is byte-identical before and after something ran.
+    fn tree_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, at: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let Ok(read) = std::fs::read_dir(at) else {
+                return;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(
+                        path.strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        bytes,
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    fn marks(listing: &BrowseListing) -> Vec<(String, EntrySyncStatus)> {
+        match listing {
+            BrowseListing::Listed(dir) => dir
+                .entries
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.sync.clone()))
+                .collect(),
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    /// The story's four states, each produced by real state rather than by a
+    /// constructed fixture of the answer.
+    ///
+    /// `tracked.md` is committed and clean; `notes/fresh.md` is genuinely
+    /// untracked so a real `git status` reports it; `settling.bin` is inside a
+    /// real settle episode the gate opened; `drop.tmp` matches the profile's
+    /// own pattern. Each mark is therefore falsifiable by breaking the thing it
+    /// names.
+    #[tokio::test]
+    async fn each_state_comes_from_state_that_already_existed() {
+        let data = tempfile::tempdir().expect("data");
+        let work = tempfile::tempdir().expect("work");
+        let remote = tempfile::tempdir().expect("remote");
+        let Some((engine, platform, p)) =
+            committed_fixture(data.path(), work.path(), remote.path()).await
+        else {
+            return;
+        };
+
+        // A file the gate is holding right now. One scan observes it and opens
+        // the episode; without the clock advancing, the second observation the
+        // gate needs never happens, so it is still settling when we look.
+        std::fs::write(p.local_path.join("settling.bin"), b"still arriving").expect("write");
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("a pass that opens an episode and commits nothing");
+
+        // …and a file git has never heard of, created after the last scan so
+        // the gate has no opinion about it and only `git status` can answer.
+        std::fs::write(p.local_path.join("notes/fresh.md"), b"new").expect("write");
+
+        let pending = PendingView::from_pending(engine.pending(&p.id).await.expect("pending"));
+        let excludes = ExcludeSet::new(&p.excludes).expect("compiles");
+        let listing = browse(&p, "", &excludes, &pending).expect("no refusal");
+
+        assert_eq!(
+            marks(&listing),
+            vec![
+                // A folder whose every file is committed and clean.
+                ("archive".to_owned(), EntrySyncStatus::Synced),
+                // …and one holding an untracked file. The folder itself is not
+                // untracked, so it carries no reason of its own.
+                (
+                    "notes".to_owned(),
+                    EntrySyncStatus::Waiting { reason: None }
+                ),
+                ("drop.tmp".to_owned(), EntrySyncStatus::Excluded),
+                (
+                    "settling.bin".to_owned(),
+                    EntrySyncStatus::Waiting {
+                        reason: Some(PendingReason::Settling {
+                            since_ms: platform.now_ms(),
+                        }),
+                    }
+                ),
+                ("tracked.md".to_owned(), EntrySyncStatus::Synced),
+            ],
+            "keeper's own noise stays hidden; every other state is named"
+        );
+
+        // The child listing, where the untracked file is a file rather than a
+        // roll-up, carries git's own word for why it is waiting.
+        assert_eq!(
+            marks(&browse(&p, "notes", &excludes, &pending).expect("no refusal")),
+            vec![
+                (
+                    "fresh.md".to_owned(),
+                    EntrySyncStatus::Waiting {
+                        reason: Some(PendingReason::Untracked),
+                    }
+                ),
+                ("kept.md".to_owned(), EntrySyncStatus::Synced),
+            ]
+        );
+    }
+
+    /// AD-74's spirit, asserted rather than asserted-to.
+    ///
+    /// Two bugs in this session had exactly one shape: a caller that only meant
+    /// to look also changed something. A file browser asking "is this synced"
+    /// is the third opportunity, so the listing is run against a real engine's
+    /// real repository with every byte of `.git` and of the engine's own data
+    /// directory recorded on both sides of the call.
+    #[tokio::test]
+    async fn a_listing_changes_no_byte_of_the_engine_or_the_repository() {
+        let data = tempfile::tempdir().expect("data");
+        let work = tempfile::tempdir().expect("work");
+        let remote = tempfile::tempdir().expect("remote");
+        let Some((engine, _platform, p)) =
+            committed_fixture(data.path(), work.path(), remote.path()).await
+        else {
+            return;
+        };
+        std::fs::write(p.local_path.join("notes/fresh.md"), b"new").expect("write");
+        let pending = PendingView::from_pending(engine.pending(&p.id).await.expect("pending"));
+        let excludes = ExcludeSet::new(&p.excludes).expect("compiles");
+
+        let git_before = tree_bytes(&p.local_path.join(".git"));
+        let data_before = tree_bytes(data.path());
+        assert!(
+            !git_before.is_empty() && !data_before.is_empty(),
+            "the fixture must have produced a repository and a database, or this \
+             test compares two empty maps and proves nothing"
+        );
+
+        for subpath in ["", "notes", "archive"] {
+            browse(&p, subpath, &excludes, &pending).expect("no refusal");
+        }
+
+        assert_eq!(
+            tree_bytes(&p.local_path.join(".git")),
+            git_before,
+            "browsing rewrote something in .git — the index, a ref or a lock"
+        );
+        assert_eq!(
+            tree_bytes(data.path()),
+            data_before,
+            "browsing wrote to sync.db — the journal, file_state or the activity log"
+        );
+    }
+
+    /// A folder that is not a repository at all, and the one thing this state
+    /// exists to prevent: reading "nothing is pending" as "everything is safe".
+    #[tokio::test]
+    async fn a_folder_with_no_repository_never_reports_its_files_as_synced() {
+        let data = tempfile::tempdir().expect("data");
+        let work = tempfile::tempdir().expect("work");
+        let platform = Arc::new(TestPlatform::new(data.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = SyncProfile::new(
+            "01NOTAREPO",
+            "Vault",
+            work.path(),
+            "https://example.invalid/r.git",
+        );
+        std::fs::write(p.local_path.join("notes.md"), b"never synced").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // The engine's own answer for a folder it has never adopted: nothing is
+        // pending, because there is no repository for anything to be pending
+        // against. That emptiness is exactly what must not read as success.
+        let files = engine.pending(&p.id).await.expect("pending");
+        assert!(files.is_empty(), "the fixture must have nothing pending");
+
+        assert_eq!(
+            marks(
+                &browse(
+                    &p,
+                    "",
+                    &ExcludeSet::new(&p.excludes).expect("compiles"),
+                    &PendingView::from_pending(files),
+                )
+                .expect("no refusal")
+            ),
+            vec![("notes.md".to_owned(), EntrySyncStatus::NotInRepository)]
+        );
+    }
+
+    /// An engine that could not answer must not be read as an engine that said
+    /// "nothing". Both produce an empty pending list; only one of them means
+    /// the files are safe.
+    #[test]
+    fn an_engine_that_could_not_answer_marks_every_entry_unknown() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join(".git")).expect("a repository");
+        std::fs::write(root.path().join("notes.md"), "x").expect("file");
+        std::fs::write(root.path().join("drop.tmp"), "x").expect("file");
+        let excludes = ExcludeSet::new(&["*.tmp".to_owned()]).expect("compiles");
+
+        assert_eq!(
+            marks(
+                &browse(
+                    &profile(root.path()),
+                    "",
+                    &excludes,
+                    &PendingView::Unavailable
+                )
+                .expect("no refusal")
+            ),
+            vec![
+                // The exclusion is known without asking the engine, so it is
+                // still named — a file that will never sync does not become
+                // uncertain because something else failed.
+                ("drop.tmp".to_owned(), EntrySyncStatus::Excluded),
+                ("notes.md".to_owned(), EntrySyncStatus::Unknown),
+            ]
+        );
+    }
+
+    /// The roll-up must not match a sibling by string prefix: `notes` and
+    /// `notes-archive` share five characters and share nothing else.
+    #[test]
+    fn a_directory_rolls_up_its_own_descendants_and_not_its_neighbours() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join(".git")).expect("a repository");
+        for dir in ["notes", "notes-archive"] {
+            std::fs::create_dir(root.path().join(dir)).expect("dir");
+        }
+        let pending = PendingView::from_pending(vec![PendingFile {
+            path: "notes-archive/late.md".to_owned(),
+            reason: PendingReason::Untracked,
+        }]);
+
+        assert_eq!(
+            marks(
+                &browse(&profile(root.path()), "", &no_excludes(), &pending).expect("no refusal")
+            ),
+            vec![
+                ("notes".to_owned(), EntrySyncStatus::Synced),
+                (
+                    "notes-archive".to_owned(),
+                    EntrySyncStatus::Waiting { reason: None }
+                ),
+            ]
         );
     }
 }

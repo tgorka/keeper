@@ -1,12 +1,14 @@
 /**
- * The virtualised note list (Epic 37, Story 37.2, AD-58, UX-DR37, UX-DR41).
+ * The windowed note list (Epic 37, Story 37.2, AD-58, UX-DR37, UX-DR41).
  *
- * The app's first virtualised list, and it is virtualised for a reason a
- * fixture will not show you: a 10 000-note vault has to paint its first screen
- * inside 100 ms (NFR-28), and 10 000 mounted rows do not. `@tanstack/react-virtual`
- * renders the visible window plus a small overscan over a fixed 64 px row, which
- * is also why the height is a constant rather than measured — a measured row
- * costs a layout pass per row and buys nothing when every row is the same shape.
+ * The app's first windowed list, and it is windowed for a reason a fixture will
+ * not show you: a 10 000-note vault has to paint its first screen inside 100 ms
+ * (NFR-28), and 10 000 mounted rows do not. {@link useWindowedRows} — the one
+ * window this app has, shared with the recordings list and the Files tree
+ * (Story 44.10, AD-84) — mounts the visible rows plus a small overscan. A note
+ * row is a fixed 64 px (`h-16` on the row itself), so the estimate here is
+ * exactly right and no row ever measures differently; the hook measures anyway,
+ * for the two callers whose rows wrap.
  *
  * The list renders {@link NoteRowVm}s in Rust's order and never re-sorts.
  * Conflicts above pins above the active sort is a decision `notes_list` already
@@ -22,26 +24,21 @@
  *
  * The roving cursor is keyed by note id rather than index (the chat list's rule,
  * and for the same reason): a streamed re-order or a filter change must move the
- * row, never the cursor.
+ * row, never the cursor. Rendered rows are held by id too, and not by index: a
+ * window remounts rows constantly, and an array indexed by position hands back
+ * the element that used to be there.
  */
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { NoteRow } from "@/components/notes/note-row";
+import { useWindowedRows } from "@/components/ui/window-list";
 import type { NoteRowVm } from "@/lib/ipc/client";
 
-/** The row height the virtualiser paces by; matches chat-row density. */
+/** The row height the window paces by; matches chat-row density, and matches
+ * `h-16` on the row itself. */
 export const NOTE_ROW_HEIGHT = 64;
 
 /** How many rows to render beyond the viewport, so a fast scroll never tears. */
 const OVERSCAN = 8;
-
-/**
- * The viewport height the virtualiser assumes before the scroll element has been
- * measured — about one screen of rows. Real layout replaces it on the first
- * measurement pass; environments that never lay out (jsdom) keep it, which is
- * what makes the list testable without faking a bounding rect.
- */
-const INITIAL_VIEWPORT_HEIGHT = 640;
 
 /**
  * How close to the end the viewport has to get before more rows are asked for,
@@ -70,35 +67,7 @@ export function NoteList({
   /** Ask for a wider window; called as the viewport nears the last row. */
   onGrow: () => void;
 }) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
-
-  const virtualizer = useVirtualizer({
-    count: rows.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => NOTE_ROW_HEIGHT,
-    overscan: OVERSCAN,
-    // A viewport to assume until the real one is measured. Without it the first
-    // paint of a freshly mounted list is empty — the scroll element has no
-    // measured height yet, so the window is zero rows tall — and it stays empty
-    // anywhere layout never runs at all, which is every jsdom test. One screen
-    // of rows is the right guess: it is what the measurement almost always
-    // comes back with.
-    initialRect: { width: 0, height: INITIAL_VIEWPORT_HEIGHT },
-    // Keyed by note id so a re-ordered stream moves a row's measurement with it
-    // rather than leaving the previous row's geometry at that index.
-    getItemKey: (index) => rows[index]?.id ?? index,
-  });
-
-  const items = virtualizer.getVirtualItems();
-  const lastVisible = items[items.length - 1]?.index ?? -1;
-  // Grow in an effect, never during render: `onGrow` writes to a store, and a
-  // store write mid-render is a cross-component update React is right to refuse.
-  useEffect(() => {
-    if (rows.length < total && lastVisible >= rows.length - GROW_THRESHOLD) {
-      onGrow();
-    }
-  }, [lastVisible, rows.length, total, onGrow]);
+  const rowRefs = useRef(new Map<string, HTMLButtonElement>());
 
   // The roving keyboard cursor, kept apart from the open note on purpose: `↓`
   // must move the ring, not stream a body per row. `Enter` and a click are what
@@ -108,9 +77,39 @@ export function NoteList({
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const cursor = focusedId === null ? -1 : rows.findIndex((row) => row.id === focusedId);
   // The list always has exactly one tab stop: the cursor's row, or the open
-  // note's, or the first.
+  // note's, or the first. It is handed to the window as the row that must stay
+  // mounted: unmount the tab stop and the list has no tab stop at all, and Tab
+  // walks straight past the notes.
   const openAt = selectedId === null ? -1 : rows.findIndex((row) => row.id === selectedId);
   const tabStop = cursor >= 0 ? cursor : openAt >= 0 ? openAt : 0;
+
+  // Keyed by note id so a re-ordered stream carries a row's measurement with it
+  // rather than leaving the previous row's geometry at that index.
+  const getKey = useCallback((index: number) => rows[index]?.id ?? String(index), [rows]);
+  const list = useWindowedRows({
+    count: rows.length,
+    getKey,
+    rowHeight: NOTE_ROW_HEIGHT,
+    overscan: OVERSCAN,
+    pinnedIndex: tabStop,
+    // Runs once the revealed row is mounted, which is the whole reason focus is
+    // the window's business at all: `↓` from the last visible row targets a row
+    // that does not exist in the DOM yet.
+    onReveal: (index) => {
+      const id = rows[index]?.id;
+      if (id !== undefined) {
+        rowRefs.current.get(id)?.focus();
+      }
+    },
+  });
+
+  // Grow in an effect, never during render: `onGrow` writes to a store, and a
+  // store write mid-render is a cross-component update React is right to refuse.
+  useEffect(() => {
+    if (rows.length < total && list.lastVisible >= rows.length - GROW_THRESHOLD) {
+      onGrow();
+    }
+  }, [list.lastVisible, rows.length, total, onGrow]);
 
   const moveTo = (index: number) => {
     const row = rows[index];
@@ -118,10 +117,7 @@ export function NoteList({
       return;
     }
     setFocusedId(row.id);
-    virtualizer.scrollToIndex(index);
-    // A row the virtualiser has only just scrolled to is not mounted yet, so
-    // focus is taken after the browser has had a frame to mount it.
-    requestAnimationFrame(() => rowRefs.current[index]?.focus());
+    list.reveal(index);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -171,29 +167,27 @@ export function NoteList({
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: the scroll container hosts the list's roving-key handler; every row inside stays independently focusable and operable, so this is additive rather than a replacement for row semantics.
     <div
-      ref={scrollRef}
+      {...list.viewportProps}
       onKeyDown={onKeyDown}
       className="min-h-0 flex-1 overflow-y-auto outline-none"
     >
-      <ul
-        aria-label="Notes"
-        className="relative w-full"
-        style={{ height: `${virtualizer.getTotalSize()}px` }}
-      >
-        {items.map((item) => {
+      <ul aria-label="Notes" className="relative w-full" style={{ height: `${list.totalSize}px` }}>
+        {list.rows.map((item) => {
           const row = rows[item.index];
           if (row === undefined) {
             return null;
           }
           return (
-            <li
-              key={row.id}
-              className="absolute top-0 left-0 w-full"
-              style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
-            >
+            <li key={row.id} {...list.rowProps(item)}>
               <NoteRow
                 ref={(element) => {
-                  rowRefs.current[item.index] = element;
+                  if (element === null) {
+                    return;
+                  }
+                  rowRefs.current.set(row.id, element);
+                  return () => {
+                    rowRefs.current.delete(row.id);
+                  };
                 }}
                 row={row}
                 selected={row.id === selectedId}

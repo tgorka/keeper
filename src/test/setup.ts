@@ -67,17 +67,3 @@ Element.prototype.getBoundingClientRect = function shimmedRect(this: Element): D
     toJSON: () => ({}),
   } as DOMRect;
 };
-
-// The same absence, through the other door: `@tanstack/react-virtual` sizes its
-// window from the scroll element's `offsetWidth`/`offsetHeight`, and jsdom's
-// getters are hard-coded to 0 — so the list renders zero rows however generous
-// the bounding rect is. Defining them here (configurable, and only as a
-// fallback of last resort) is what makes a virtualised list assertable at all.
-for (const dimension of ["offsetWidth", "offsetHeight"] as const) {
-  Object.defineProperty(HTMLElement.prototype, dimension, {
-    configurable: true,
-    get(this: HTMLElement) {
-      return dimension === "offsetWidth" ? VIEWPORT.width : VIEWPORT.height;
-    },
-  });
-}

@@ -216,8 +216,13 @@ enum CmpOp {
 }
 
 /// Which of the index's three timestamps a `date:` predicate reads.
+///
+/// Public because a space's `sort` names the same two facts the DSL does
+/// (Story 44.4): `sort: created` and `date:created` have to resolve through
+/// one chain, or a space could list notes in an order its own query
+/// contradicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DateField {
+pub enum DateField {
     Created,
     Modified,
     Touched,
@@ -1157,7 +1162,11 @@ fn eval_origin(e: &IndexEntry, spec: &OriginSpec) -> bool {
 /// slot for, so it reads [`FIELD_TOUCHED`] when something supplies one and
 /// otherwise degrades to `modified` — a missing local fact must never break a
 /// shared space.
-fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
+///
+/// Public for the same reason [`DateField`] is: a space sorted by `created`
+/// and a space filtered by `date:created` must be answering the same question
+/// about the same note (Story 44.4).
+pub fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
     match field {
         DateField::Created => field_ms(e, "created").unwrap_or(e.created_ms),
         DateField::Modified => field_ms(e, "updated").unwrap_or_else(|| {
@@ -1173,10 +1182,20 @@ fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
     }
 }
 
+/// Read a stored timestamp — `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or full RFC 3339
+/// — as epoch milliseconds, or `None` when the text is not a date.
+///
+/// The one reading of a frontmatter stamp. A space's `recorded` sort composes
+/// the recording stub's own `date` and `start` keys and has to land on the
+/// instant `date:` would have compared against, so it comes through here rather
+/// than through a second parser (Story 44.4).
+pub fn stamp_ms(spec: &str) -> Option<i64> {
+    parse_absolute(spec.trim()).map(|(ms, _)| ms)
+}
+
 /// Read one field as a timestamp, or `None` when it is absent or not a date.
 fn field_ms(e: &IndexEntry, key: &str) -> Option<i64> {
-    let raw = e.fields.get(key)?;
-    parse_absolute(raw.trim()).map(|(ms, _)| ms)
+    stamp_ms(e.fields.get(key)?)
 }
 
 /// Apply an operator to a timestamp against the half-open window a datespec names.
@@ -1341,6 +1360,7 @@ mod tests {
             links: Vec::new(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: crate::notes::order::NoteOrder::default(),
         }
     }
 

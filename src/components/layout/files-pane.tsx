@@ -59,14 +59,26 @@ import {
 } from "lucide-react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useWindowedRows } from "@/components/ui/window-list";
 import type { FilesEntryVm, FilesListingVm, IpcError, SyncProfileVm } from "@/lib/ipc/client";
 import { revealPath, syncBrowse, syncOpenEntry, syncProfiles } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { cn } from "@/lib/utils";
+
+/**
+ * The height a tree row is assumed to be until it has been mounted once: an
+ * `h-6` control inside a `py-1` row.
+ *
+ * An assumption, not a fact. The tree interleaves prose rows — "this folder is
+ * empty", and the sentence Rust composes for a drive that is not plugged in —
+ * and those wrap to two and three lines in a narrow pane. The window measures
+ * what a row really is on first mount; this is only where it starts.
+ */
+const FILES_ROW_ESTIMATE = 32;
 
 /** The pane's heading, and the accessible name of the surface itself. */
 export const FILES_PANE_TITLE = "Files";
@@ -501,6 +513,10 @@ export function FilesPane() {
     [rows],
   );
 
+  /** Where a row key sits in the flat render order — the window works in
+   * indices, and the keyboard model works in keys. */
+  const positions = useMemo(() => new Map(rows.map((row, index) => [row.key, index])), [rows]);
+
   /**
    * The one row in the tree that is in the page's tab order.
    *
@@ -518,10 +534,43 @@ export function FilesPane() {
       ? rememberedKey
       : (nodes[0]?.key ?? null);
 
-  const focusRow = useCallback((key: string) => {
-    setRememberedKey(key);
-    rowRefs.current.get(key)?.focus();
-  }, []);
+  const getKey = useCallback((index: number) => rows[index]?.key ?? String(index), [rows]);
+  const list = useWindowedRows({
+    count: rows.length,
+    getKey,
+    rowHeight: FILES_ROW_ESTIMATE,
+    // The tab stop stays mounted at any scroll position. A tree scrolled away
+    // from its one `tabIndex=0` row would otherwise have none, and Tab would
+    // walk straight past the whole tree — the exact way windowing destroys a
+    // roving tabindex without breaking a single visible thing.
+    pinnedIndex: activeKey === null ? undefined : positions.get(activeKey),
+    onReveal: (index) => {
+      const key = rows[index]?.key;
+      if (key !== undefined) {
+        rowRefs.current.get(key)?.focus();
+      }
+    },
+  });
+
+  /**
+   * Move focus to one row, wherever it is in the tree.
+   *
+   * The row may not be in the DOM: Home from the bottom of a thousand-file
+   * folder targets a row a thousand positions away. `reveal` scrolls it into
+   * the window, mounts it, and only then runs the focus above — which is why
+   * this does not simply reach into `rowRefs` and hope.
+   */
+  const focusRow = useCallback(
+    (key: string) => {
+      setRememberedKey(key);
+      const index = positions.get(key);
+      if (index === undefined) {
+        return;
+      }
+      list.reveal(index);
+    },
+    [list.reveal, positions],
+  );
 
   /**
    * The tree's keyboard model (WAI-ARIA APG, Tree View).
@@ -608,7 +657,6 @@ export function FilesPane() {
     }
     return (
       <div
-        key={node.key}
         ref={(element) => {
           if (element === null) {
             rowRefs.current.delete(node.key);
@@ -664,6 +712,10 @@ export function FilesPane() {
             )
           }
         </RowName>
+        {/* Between the name and the actions: what this file's sync state is.
+        Never focusable — see {@link SyncStatusMark}. A profile root has no
+        entry of its own and takes no mark; its children answer for themselves. */}
+        {entry !== null && <SyncStatusMark sync={entry.sync} />}
         {entry !== null && (
           <span className="flex shrink-0 items-center gap-1">
             {!node.isFolder && (
@@ -725,38 +777,53 @@ export function FilesPane() {
         </Button>
       </header>
 
-      <ScrollArea className="min-h-0 flex-1">
+      <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-4 py-3">
           {emptySentence !== null ? (
             <Alert>
               <AlertDescription>{emptySentence}</AlertDescription>
             </Alert>
           ) : (
-            <div aria-label={FILES_TREE_LABEL} role="tree" className="flex flex-col">
-              {rows.map((row) =>
-                row.kind === "node" ? (
-                  renderNode(row)
-                ) : (
-                  <p
-                    key={row.key}
-                    data-testid={row.plain === true ? undefined : FILES_STATE_DETAIL_TESTID}
-                    data-state={row.state ?? undefined}
-                    className={cn(
-                      "px-2 py-1 text-sm",
-                      row.state === null && row.text !== FILES_READING_SENTENCE
-                        ? "text-destructive"
-                        : "text-muted-foreground",
+            <div
+              aria-label={FILES_TREE_LABEL}
+              role="tree"
+              className="relative w-full"
+              style={{ height: `${list.totalSize}px` }}
+            >
+              {list.rows.map((item) => {
+                const row = rows[item.index];
+                if (row === undefined) {
+                  return null;
+                }
+                return (
+                  // Presentational, so the tree still owns its `treeitem`s
+                  // directly: the window needs a box to position, and a box
+                  // between a tree and its items is a box with no role.
+                  <div key={row.key} role="presentation" {...list.rowProps(item)}>
+                    {row.kind === "node" ? (
+                      renderNode(row)
+                    ) : (
+                      <p
+                        data-testid={row.plain === true ? undefined : FILES_STATE_DETAIL_TESTID}
+                        data-state={row.state ?? undefined}
+                        className={cn(
+                          "px-2 py-1 text-sm",
+                          row.state === null && row.text !== FILES_READING_SENTENCE
+                            ? "text-destructive"
+                            : "text-muted-foreground",
+                        )}
+                        style={{ paddingInlineStart: `${(row.level - 1) * 16 + 8}px` }}
+                      >
+                        {row.text}
+                      </p>
                     )}
-                    style={{ paddingInlineStart: `${(row.level - 1) * 16 + 8}px` }}
-                  >
-                    {row.text}
-                  </p>
-                ),
-              )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
-      </ScrollArea>
+      </div>
     </section>
   );
 }

@@ -31,6 +31,19 @@ import { cn } from "@/lib/utils";
 /** The subtitle a space with an unparseable query carries, kept verbatim. */
 export const SPACE_BROKEN_SUBTITLE = "This space's query can't be read";
 
+/**
+ * The subtitle a space whose `sort` or `order` keeper could not read carries
+ * (Story 44.4), kept verbatim.
+ *
+ * Short and generic on purpose: the row is a sidebar entry and the sentences
+ * Rust composed name a value and a fallback, which does not fit here. This is
+ * the marker that something is wrong; the whole of it is on the row's `title`
+ * and, for a keyboard, in the editor the pencil opens. What it must not be is
+ * absent — a space quietly ignoring a line of its own file is the failure this
+ * replaces.
+ */
+export const SPACE_SETTINGS_SUBTITLE = "Some of this space's settings can't be read";
+
 /** The restore control's accessible name, kept verbatim. */
 export const RESTORE_DEFAULTS = "Restore default spaces";
 
@@ -146,6 +159,17 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
       <ul className="flex flex-col gap-0.5">
         {spaces.map((space) => {
           const broken = space.error !== null;
+          // A presentation key keeper could not read is not a broken space: it
+          // still selects what it selects, it is simply not obeying one line of
+          // its own file. It gets its own quieter line rather than the parse
+          // failure's, because sending someone to fix a query that is fine is
+          // worse than saying nothing.
+          const misread = space.warnings.length > 0;
+          const subtitle = broken
+            ? SPACE_BROKEN_SUBTITLE
+            : misread
+              ? SPACE_SETTINGS_SUBTITLE
+              : null;
           const active = space.id === activeSpaceId;
           const Glyph = spaceIcon(space.icon);
           return (
@@ -154,9 +178,14 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                 type="button"
                 aria-current={active ? "true" : undefined}
                 aria-pressed={active}
-                // The parse failure belongs in the accessible name too: a dot is
-                // not a carrier on its own (UX-DR43).
-                aria-label={broken ? `${space.name}, ${SPACE_BROKEN_SUBTITLE}` : space.name}
+                // The failure belongs in the accessible name too: a dot is not a
+                // carrier on its own (UX-DR43).
+                aria-label={subtitle === null ? space.name : `${space.name}, ${subtitle}`}
+                // The whole sentence, for a pointer. The keyboard path to it is
+                // the pencil beside this row, which lists every warning in full
+                // — a row in a sidebar this narrow cannot hold one of them, and
+                // the editor is where the value gets fixed anyway.
+                title={misread ? space.warnings.join(" ") : undefined}
                 className={cn(
                   "flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left outline-none",
                   "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
@@ -187,9 +216,12 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                 />
                 <span className="flex min-w-0 flex-col">
                   <span className="truncate text-sm">{space.name}</span>
-                  {broken && (
-                    <span className="truncate text-muted-foreground text-xs">
-                      {SPACE_BROKEN_SUBTITLE}
+                  {subtitle !== null && (
+                    <span
+                      data-slot="space-subtitle"
+                      className="truncate text-muted-foreground text-xs"
+                    >
+                      {subtitle}
                     </span>
                   )}
                 </span>

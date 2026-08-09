@@ -684,6 +684,7 @@ pub fn run() {
         notes_ipc::notes_save,
         notes_ipc::notes_rename,
         notes_ipc::notes_set_flag,
+        notes_ipc::notes_set_order,
         notes_ipc::notes_delete,
         notes_ipc::notes_search,
         notes_ipc::notes_link_targets,
