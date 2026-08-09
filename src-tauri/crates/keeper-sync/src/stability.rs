@@ -493,26 +493,38 @@ impl StabilityGate {
     /// `verdict` applies and which would otherwise push the deadline out to a
     /// broken clock's idea of later and hold the file forever.
     pub fn next_stable_ms(&self, now_ms: i64) -> Option<i64> {
-        let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
         self.entries
             .values()
-            .map(|entry| {
-                let effective = if entry.close_write {
-                    CLOSE_WRITE_SETTLE_MS
-                } else {
-                    self.settle_ms
-                };
-                let window = i64::try_from(effective.min(SETTLE_CEILING_MS)).unwrap_or(i64::MAX);
-                let mut by_window = entry.unchanged_since_ms.saturating_add(window);
-                let mtime_ms = entry.last.mtime_ms();
-                if mtime_ms <= now_ms.saturating_add(FUTURE_MTIME_GRACE_MS) {
-                    by_window = by_window.max(mtime_ms.saturating_add(window));
-                }
-                // The ceiling outvotes every other condition in `verdict`, so
-                // it caps the wait here too.
-                by_window.min(entry.pending_since_ms.saturating_add(ceiling))
-            })
+            .map(|entry| self.stable_at_ms(entry, now_ms))
             .min()
+    }
+
+    /// The instant one entry stops being mid-episode: the earliest `now_ms` at
+    /// which [`Self::verdict`] would answer [`StabilityVerdict::Stable`] for
+    /// it.
+    ///
+    /// The single definition [`Self::next_stable_ms`] and [`Self::tracked`]
+    /// both read. They used to compute their answers independently — one
+    /// mirroring `verdict` term for term, the other just counting map entries
+    /// — and a count that disagreed with the deadline it is counting down to
+    /// is how a closed recording came to be reported as a file still being
+    /// written.
+    fn stable_at_ms(&self, entry: &Entry, now_ms: i64) -> i64 {
+        let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
+        let effective = if entry.close_write {
+            CLOSE_WRITE_SETTLE_MS
+        } else {
+            self.settle_ms
+        };
+        let window = i64::try_from(effective.min(SETTLE_CEILING_MS)).unwrap_or(i64::MAX);
+        let mut by_window = entry.unchanged_since_ms.saturating_add(window);
+        let mtime_ms = entry.last.mtime_ms();
+        if mtime_ms <= now_ms.saturating_add(FUTURE_MTIME_GRACE_MS) {
+            by_window = by_window.max(mtime_ms.saturating_add(window));
+        }
+        // The ceiling outvotes every other condition in `verdict`, so it caps
+        // the wait here too.
+        by_window.min(entry.pending_since_ms.saturating_add(ceiling))
     }
 
     /// Whether tier 0 filters this path out entirely.
@@ -608,9 +620,21 @@ impl StabilityGate {
         self.pending_close_write.clear();
     }
 
-    /// How many paths are mid-episode. Feeds the "N pending" status line.
-    pub fn tracked(&self) -> usize {
-        self.entries.len()
+    /// How many paths are genuinely mid-episode — the number behind
+    /// "N waiting for writes to stop".
+    ///
+    /// Deliberately not `entries.len()`. An entry whose window has already
+    /// elapsed is still held here until a walk collects it, and so is one an
+    /// authoritative producer declared **finished** through
+    /// [`Self::note_finished`] — that call's whole purpose is to say the
+    /// writing is over. Counting either of them told the user a closed
+    /// recording was still being written. Only a path [`Self::verdict`] would
+    /// answer [`StabilityVerdict::Settling`] for is counted.
+    pub fn tracked(&self, now_ms: i64) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| now_ms < self.stable_at_ms(entry, now_ms))
+            .count()
     }
 
     /// Drop every tracked entry whose path is not in `keep`.
@@ -1088,7 +1112,7 @@ mod tests {
         // file's epoch mtime is far ahead of the injected clock, so the
         // future-mtime hatch retires the mtime arm as well.
         assert_eq!(g.is_stable(&path, 1_000), StabilityVerdict::Stable);
-        assert_eq!(g.tracked(), 0, "a stable path must not stay pending");
+        assert_eq!(g.tracked(1_000), 0, "a stable path must not stay pending");
 
         // ...and the ceiling anchor moves with the episode. Without that, a
         // file that keeps changing would be forced through on *every* call
@@ -1149,7 +1173,7 @@ mod tests {
         // Nothing about the primed entry is special-cased in `verdict`: it went
         // through `is_stable`, which ends the episode like any other stable
         // path, so only the settling twin is still held.
-        assert_eq!(g.tracked(), 1);
+        assert_eq!(g.tracked(now_ms), 1);
 
         // A prime is a claim about bytes that exist. Neither an absent path nor
         // an excluded one is primed, and neither is an error.
@@ -1229,7 +1253,11 @@ mod tests {
             "tier 0 declines the assertion rather than recording it"
         );
         assert_eq!(g.is_stable(&partial, 1_000), StabilityVerdict::Excluded);
-        assert_eq!(g.tracked(), 0, "an excluded path is never even pending");
+        assert_eq!(
+            g.tracked(1_000),
+            0,
+            "an excluded path is never even pending"
+        );
     }
 
     /// A producer that retries, or two events for one close, must not produce a
@@ -1256,7 +1284,11 @@ mod tests {
 
         // And a late repeat neither duplicates the entry nor restarts a wait.
         assert!(g.note_finished(&closed, 1_000 + SETTLE as i64));
-        assert_eq!(g.tracked(), 1);
+        assert_eq!(g.export().len(), 1, "one entry, not two");
+        // It is held, but it is not *settling*: the producer said the writing
+        // is over, and the count behind "N waiting for writes to stop" must not
+        // contradict the assertion that put the entry there.
+        assert_eq!(g.tracked(1_000 + SETTLE as i64), 0);
         assert_eq!(
             g.is_stable(&closed, 1_000 + SETTLE as i64),
             StabilityVerdict::Stable
@@ -1327,11 +1359,11 @@ mod tests {
             g.is_stable(&path, 0),
             StabilityVerdict::Settling { .. }
         ));
-        assert_eq!(g.tracked(), 1);
+        assert_eq!(g.tracked(0), 1);
 
         std::fs::remove_file(&path).expect("remove");
         assert_eq!(g.is_stable(&path, 1_000), StabilityVerdict::Vanished);
-        assert_eq!(g.tracked(), 0);
+        assert_eq!(g.tracked(1_000), 0);
         assert_eq!(FileSample::of(&path).expect("absent is not an error"), None);
     }
 
@@ -1347,7 +1379,7 @@ mod tests {
         // `Vanished`, so the verdict pins the ordering, not just the filter.
         let path = dir.path().join("movie.mkv.crdownload");
         assert_eq!(g.is_stable(&path, 0), StabilityVerdict::Excluded);
-        assert_eq!(g.tracked(), 0);
+        assert_eq!(g.tracked(0), 0);
     }
 
     #[test]
@@ -1606,9 +1638,9 @@ mod tests {
         let mut g = gate();
         g.observe(&p("a"), sample(1, 0, 1), 0, false);
         g.observe(&p("b"), sample(2, 0, 2), 0, false);
-        assert_eq!(g.tracked(), 2);
+        assert_eq!(g.tracked(0), 2);
         g.forget_all();
-        assert_eq!(g.tracked(), 0);
+        assert_eq!(g.tracked(0), 0);
     }
 
     #[test]
@@ -1637,11 +1669,11 @@ mod tests {
         let mut gate = StabilityGate::new(root, ExcludeSet::new(&[]).expect("excludes"), 5_000);
         gate.is_stable(&kept, 1_000);
         gate.is_stable(&dropped, 1_000);
-        assert_eq!(gate.tracked(), 2);
+        assert_eq!(gate.tracked(1_000), 2);
 
         let keep: std::collections::HashSet<PathBuf> = [kept.clone()].into_iter().collect();
         gate.retain(&keep);
-        assert_eq!(gate.tracked(), 1);
+        assert_eq!(gate.tracked(1_000), 1);
         assert!(gate.export().iter().all(|(path, _)| *path == kept));
     }
 

@@ -549,8 +549,11 @@ describe("RecordingSummaryCard", () => {
     // body alone — keeper's frontmatter is never on screen to be broken.
     expect(mockNoteStub).toHaveBeenCalledWith(FOLDER);
     expect(body.value).toBe(STUB_BODY);
-    // UX-DR51: the cursor is in the body, not on the card.
-    expect(body).toHaveFocus();
+    // UX-DR51: the cursor is in the body, not on the card. Waited for rather
+    // than asserted straight after the `findBy` — the textarea is in the DOM as
+    // soon as the stub resolves and the focus lands an effect later, and that
+    // gap is only wide enough to lose under the load of a full run.
+    await waitFor(() => expect(body).toHaveFocus());
     // Story 42.4 does not displace Story 20.3 — the recording still reports
     // what it saved, and where.
     expect(screen.getByText(/Saved 3 segments · 412 MB/)).toBeInTheDocument();

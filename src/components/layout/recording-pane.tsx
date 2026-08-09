@@ -387,8 +387,18 @@ export function RecordingPane() {
                 <CardContent>
                   {/* Pause the ~3s source poll while recording (Story 19.1):
                       the setup cards stay mounted during a live session, so the
-                      picker must stop spawning enumeration children. */}
-                  <RecordingSourcePicker active={!live} />
+                      picker must stop spawning enumeration children.
+
+                      The Screen Recording verdict comes from THIS pane's single
+                      pre-flight (the same one the Permissions row above renders).
+                      The picker's enumeration prompts when the grant is missing, so
+                      it must not run before then — and it must resume the instant
+                      the pre-flight re-probes to "granted" on the return from
+                      System Settings, which passing the live value here does. */}
+                  <RecordingSourcePicker
+                    active={!live}
+                    screenRecording={permission.screenRecording}
+                  />
                 </CardContent>
               </Card>
             ) : title === "Audio" ? (

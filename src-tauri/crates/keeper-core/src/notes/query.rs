@@ -53,9 +53,18 @@ pub const MAX_TOKENS: usize = 256;
 /// The closed `is:` flag set. Closed on purpose: an unknown flag is a located
 /// parse error rather than a predicate that is silently false forever, because a
 /// space whose filter quietly stopped filtering is worse than one that refuses.
-const IS_FLAGS: [&str; 10] = [
-    "pinned", "archived", "unread", "conflict", "journal", "template", "space", "capture",
-    "orphan", "untagged",
+const IS_FLAGS: [&str; 11] = [
+    "pinned",
+    "archived",
+    "unread",
+    "conflict",
+    "journal",
+    "template",
+    "space",
+    "capture",
+    "recording",
+    "orphan",
+    "untagged",
 ];
 
 /// The one `is:` flag derived from the entry rather than read out of `flags`.
@@ -1436,6 +1445,17 @@ mod tests {
         assert!(!hit("is:archived", &pinned));
         assert!(!hit("is:untagged", &pinned));
         assert!(hit("is:untagged", &entry("b.md")));
+    }
+
+    /// The Recordings lens is a saved `is:` scope, so a space must be able to
+    /// say the same thing the sidebar row says — and `is:recording` was a parse
+    /// error before the flag joined the closed set.
+    #[test]
+    fn is_recording_is_a_flag_a_space_can_name() {
+        let mut note = entry("recordings/standup.md");
+        note.flags = vec!["recording".to_owned()];
+        assert!(hit("is:recording", &note));
+        assert!(!hit("is:recording", &entry("groceries.md")));
     }
 
     #[test]

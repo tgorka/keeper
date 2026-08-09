@@ -354,6 +354,15 @@ development_status:
   41-4-the-gate-learns-the-word-finished: review
   41-5-committed-at-close-pushed-on-policy: review
   41-6-durability-you-can-read: review
+  # Added 2026-08-08 from a field report on the owner's own machine. Story 41.1
+  # built `RecordingsConfig` and 41.2 built the destination picker, but nothing
+  # in the app could ever write the flag they both depend on: the notes vault
+  # got its switch and recordings did not, so every profile stays
+  # `recordings: null` and the picker never appears. The reporter's two profiles
+  # are also both on a pendrive, which `DestinationProfileRow` could not see —
+  # so a chosen profile on a detached drive was indistinguishable from one on an
+  # internal disk.
+  41-7-recording-into-a-synced-folder-you-can-choose: review
   epic-41-retrospective: optional
   epic-42: in-progress
   # 42.1 went through an adversarial pass (an acceptance auditor against all 11
@@ -369,6 +378,15 @@ development_status:
   42-3-the-recordings-browser: review
   42-4-the-note-stub-at-the-only-moment-it-will-be-written: review
   42-5-one-tag-vocabulary: review
+  # Added 2026-08-08 from a field report on the owner's own machine. 42.4's stub
+  # named the session FOLDER and nothing inside it, and neither the folder nor a
+  # file in it could be acted on from the note - so the one artifact written at
+  # the only moment anyone documents a recording could not take you to the
+  # recording. Files are listed in the same root-relative frame as `recording:`;
+  # the actions resolve BY SESSION ID through 42.1's index, because a Story 40.4
+  # retitle moves the folder after the note is written and the index row follows
+  # the session while the note does not.
+  42-6-a-note-knows-where-its-files-are: review
   epic-42-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42

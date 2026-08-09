@@ -27,6 +27,11 @@ mod notes_vault;
 #[cfg(desktop)]
 mod notes_window;
 mod recorder;
+// The `keeper-recording://` asset scheme (Story 42.4). Desktop-only for the same
+// reason `note_protocol` is: it serves the recordings a desktop records into,
+// embedded in notes a desktop syncs.
+#[cfg(desktop)]
+mod recording_protocol;
 #[cfg(desktop)]
 mod sync;
 #[cfg(desktop)]
@@ -173,6 +178,18 @@ pub fn run() {
         "keeper-note",
         |ctx, request, responder| {
             note_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
+    // Recording files — the video a recording note embeds — reach the webview
+    // only over this scheme (Story 42.4). A third handler rather than a wider
+    // `keeper-note://`, because that one's vault containment is what makes it
+    // safe and a recording provably lives outside every vault; this one is
+    // contained to the effective recordings destination instead.
+    #[cfg(desktop)]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        recording_protocol::SCHEME,
+        |ctx, request, responder| {
+            recording_protocol::handle(ctx.app_handle().clone(), &request, responder);
         },
     );
     let builder = builder
@@ -467,6 +484,7 @@ pub fn run() {
                 ipc::draft_mirror_unsubscribe,
                 ipc::search_archive,
                 ipc::search_recordings,
+                ipc::recording_note_targets,
                 ipc::export_start,
                 ipc::export_cancel,
                 ipc::reveal_path,

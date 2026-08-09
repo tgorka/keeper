@@ -213,6 +213,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    recordingsSubfolder: "recordings",
     authorOverride: null,
     enabled: true,
     ...over,

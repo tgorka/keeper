@@ -25,7 +25,7 @@
  * the editor stays alive behind them so Escape returns to the caret it left,
  * which is a promise a remount could not keep.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesTagTree } from "@/lib/ipc/client";
@@ -34,7 +34,7 @@ import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NoteHistoryPanel } from "./note-history-panel";
-import { PropertiesPanel } from "./properties-panel";
+import { PropertiesPanel, readFrontmatter, recordingSessionId } from "./properties-panel";
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
@@ -165,6 +165,14 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   pathRef.current = path;
   const followRef = useRef(onFollowLink);
   followRef.current = onFollowLink;
+  // The recording note's identity (Story 42.4), read from the block the
+  // properties panel owns and by the predicate that panel decides with. It
+  // reaches the decoration layer as a getter for `pathRef`'s reason: the editor
+  // outlives the note in it, and a value captured at construction would make
+  // every later note's embeds resolve against the first note's recording.
+  const sessionId = useMemo(() => recordingSessionId(readFrontmatter(frontmatter)), [frontmatter]);
+  const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -264,6 +272,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
                   .map(encodeURIComponent)
                   .join("/")}`,
               onOpenLink: (target) => followRef.current?.(target),
+              recordingSession: () => sessionRef.current,
             }),
             view.EditorView.updateListener.of((update) => {
               if (!update.docChanged) {

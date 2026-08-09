@@ -15,6 +15,14 @@
  * focus re-enumeration is coalesced onto the trailing edge of one poll interval, so
  * a focus burst costs one enumeration rather than one per event (AD-34-6).
  *
+ * All of that is gated on the Screen Recording grant, which arrives as the
+ * `screenRecording` prop from the one pre-flight the pane already runs (never a
+ * second probe here). `list_sources` enumerates applications through
+ * `SCShareableContent`, which posts the macOS permission prompt when the grant is
+ * missing — polling it ungated meant a fresh install got a system popup every 3 s
+ * until the user gave in. The prop is required and has no default: a caller that
+ * forgets it must fail to compile, not fall back to prompting.
+ *
  * When an application is selected, an inline disclosure states the exclusion
  * plainly (recording voice, sentence case): only that app's windows land in the
  * file — keeper, other apps, and notification banners stay out. A selection that
@@ -24,7 +32,7 @@
 import { AppWindow, AudioLines, LoaderCircle, Monitor } from "lucide-react";
 import { type ReactNode, useEffect } from "react";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import type { RecordingTargetVm } from "@/lib/ipc/client";
+import type { RecordingTargetVm, ScreenRecordingAccess } from "@/lib/ipc/client";
 import { useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
   isSameTarget,
@@ -32,6 +40,7 @@ import {
   RECORDING_SOURCE_POLL_MS,
   refreshRecordingSources,
   selectRecordingTarget,
+  setScreenRecordingAccess,
   startRecordingSourcePolling,
   stopRecordingSourcePolling,
   useRecordingSources,
@@ -123,13 +132,32 @@ function SourceRow({
   );
 }
 
-export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
+export function RecordingSourcePicker({
+  active = true,
+  screenRecording,
+}: {
+  active?: boolean;
+  screenRecording: ScreenRecordingAccess;
+}) {
   const sources = useRecordingSources();
   const selected = useSelectedRecordingTarget();
   const refreshing = useRecordingSourcesRefreshing();
   // Story 19.3 (deferred from 19.2): the app-scope disclosure must not claim
   // the app's audio is recorded while the Audio card has system audio off.
   const systemAudioOn = useSystemAudioEnabled();
+
+  // Mirror the pane's resolved Screen Recording verdict into the store's poll
+  // gate. This runs BEFORE the polling effect below, so a mount that already
+  // holds the grant arms the poll on the same commit rather than a tick later —
+  // and, far more importantly, a mount that does NOT hold it enumerates nothing.
+  // The verdict is re-pushed on every change, which is what makes the grant
+  // *arriving* resume the poll at once: the pre-flight re-probes on return from
+  // System Settings, the prop flips to "granted", and the picker fills without a
+  // relaunch. This is a mirror, not an observer — the pane owns the single
+  // permission probe; adding another here would spawn a second sidecar per return.
+  useEffect(() => {
+    setScreenRecordingAccess(screenRecording);
+  }, [screenRecording]);
 
   // Poll while the idle setup surface is visible (`active`); stop while a session
   // is recording (`active === false`) or on unmount — otherwise a fresh
@@ -148,6 +176,10 @@ export function RecordingSourcePicker({ active = true }: { active?: boolean }) {
   // the window sat in the background. Superseding is by monotonic token (the idiom
   // `useRecordingPermission` uses for the same reason) — a queued refresh whose
   // token has been outrun, including by unmount, is a no-op rather than a spawn.
+  //
+  // Both `startRecordingSourcePolling` and the coalesced focus refresh are
+  // *requests*: neither reaches the sidecar until the gate above says the grant is
+  // held, so this effect is deliberately unaware of the permission state.
   useEffect(() => {
     if (!active) {
       stopRecordingSourcePolling();

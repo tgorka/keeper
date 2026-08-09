@@ -387,22 +387,20 @@ fn list_order(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
 
 /// Whether an entry satisfies the plain (non-space) filter.
 ///
-/// Index-only, deliberately: `text` matches the title, the snippet, the tags and
-/// the path, which is what keeps NFR-28's 100 ms list paint true. Full-body
-/// matching is `notes_search`, which streams because it reads files.
+/// Index-only, deliberately: the free-text axis is
+/// [`IndexEntry::matches_text`], which reads the title, the snippet, the path,
+/// the tags and the note's own frontmatter values and never opens a file — that
+/// is what keeps NFR-28's 100 ms list paint true. Full-body matching is
+/// `notes_search`, which streams because it reads files.
+///
+/// The predicate itself lives in `keeper-core` rather than here, so what a
+/// search term is allowed to see is stated once, in the crate that can be
+/// tested on any host (AD-55/AD-56). This function keeps only the axes that
+/// need the shell's own facts — the commit head behind `origin:`.
 fn matches_filter(entry: &IndexEntry, req: &NoteQueryReq, head: Option<&HeadRevision>) -> bool {
     if let Some(text) = req.text.as_ref() {
-        // Trimmed, so a needle of nothing but whitespace is not a filter. A user
-        // resting on the space bar must not empty their own note list.
-        let needle = fold(text.trim());
-        if !needle.is_empty() {
-            let hit = fold(&entry.title).contains(&needle)
-                || fold(&entry.snippet).contains(&needle)
-                || fold(&entry.path).contains(&needle)
-                || entry.tags.iter().any(|tag| fold(tag).contains(&needle));
-            if !hit {
-                return false;
-            }
+        if !entry.matches_text(text) {
+            return false;
         }
     }
     // Every chip must match: chips narrow, they do not widen.
@@ -454,8 +452,11 @@ fn tag_matches(actual: &str, wanted: &str) -> bool {
             && actual.as_bytes().get(wanted.len()) == Some(&b'/'))
 }
 
-/// Case-fold for matching. Diacritic folding lives in `search::find`, which is
-/// the surface that promises it; this is the cheap index-only comparison.
+/// Case-fold for the wikilink completion prefix, its one caller. Cheap on
+/// purpose: a `[[` prefix is matched on every keystroke against every entry,
+/// and a completion list is a ranked guess rather than a promise about what
+/// "café" equals — which is a promise `search::fold_str` makes, for the
+/// surfaces that need it.
 fn fold(value: &str) -> String {
     value.to_lowercase()
 }
@@ -2592,10 +2593,16 @@ mod tests {
         assert!(matches_filter(&entry("c.md", "c"), &req, None));
     }
 
+    /// The list's free-text axis, exercised through this call site: the predicate
+    /// is `keeper-core`'s, and what this asserts is that the shell hands it the
+    /// whole entry — including the frontmatter, which is where a recording note
+    /// keeps every fact about itself.
     #[test]
-    fn a_text_filter_matches_the_title_the_path_and_the_tags() {
+    fn a_text_filter_matches_the_title_the_path_the_tags_and_the_frontmatter() {
         let mut note = entry("journal/2026-08-02.md", "Vault as a lens");
         note.tags.push("project/keeper".to_owned());
+        note.fields
+            .insert("participants".to_owned(), "Ala Kowalska".to_owned());
         let filter = |text: &str| NoteQueryReq {
             text: Some(text.to_owned()),
             ..default_query()
@@ -2604,6 +2611,8 @@ mod tests {
         assert!(matches_filter(&note, &filter("LENS"), None));
         assert!(matches_filter(&note, &filter("journal/"), None));
         assert!(matches_filter(&note, &filter("keeper"), None));
+        // Nowhere in the title, the path, the tags or the body.
+        assert!(matches_filter(&note, &filter("kowalska"), None));
         assert!(!matches_filter(&note, &filter("nothing here"), None));
         // An empty needle is not a filter.
         assert!(matches_filter(&note, &filter("   "), None));

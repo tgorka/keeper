@@ -2715,7 +2715,11 @@ pub struct RecordingDeviceVm {
 pub struct RecordingSourcesVm {
     /// The active displays (real, from the sidecar's display enumeration).
     pub displays: Vec<RecordingDisplayVm>,
-    /// Recordable applications (real since Story 19.1).
+    /// Recordable applications (real since Story 19.1). Empty means "not
+    /// enumerated or none available" — NEVER a permission verdict. The sidecar
+    /// skips this leg entirely while Screen Recording is ungranted, because
+    /// enumerating it prompts; the honest verdict is [`ScreenRecordingAccess`],
+    /// which the picker's surface already holds.
     pub applications: Vec<RecordingApplicationVm>,
     /// Microphone devices (real since Story 19.3).
     pub microphones: Vec<RecordingDeviceVm>,
@@ -3165,6 +3169,56 @@ pub struct RecordingProfileVm {
     pub recordings_root: String,
 }
 
+/// Whether the recordings destination's volume is here right now (Story 41.7,
+/// AD-48).
+///
+/// The three answers `keeper-sync`'s `VolumeStatus` gives, reduced to what a
+/// surface can say a sentence about. Deliberately NOT a boolean: "a different
+/// stick is mounted where yours lives" and "no stick at all" take different
+/// actions from the person holding the drive, and collapsing them would make
+/// the card tell one of the two a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingVolumeState {
+    /// The volume the profile is bound to is attached: recording into it works.
+    Attached,
+    /// No volume marker at or above the folder — the media is not attached.
+    /// A first-class state, not a fault (AD-48), and the one that makes
+    /// `recording_start` refuse rather than quietly record somewhere else.
+    Absent,
+    /// Something is mounted where this profile's volume lives, but it is not
+    /// provably that volume — a foreign marker, or one that could not be read.
+    /// Refused for the same reason `Absent` is, with a different sentence.
+    Unexpected,
+}
+
+/// The recordings destination's removable media, when it has any (Story 41.7).
+///
+/// Present ⇒ the destination's synced folder is on removable media; absent ⇒ it
+/// is on a disk that is always there, and no surface says anything about drives.
+/// Modelling removability as the OPTION rather than as a `removable: bool`
+/// beside a state is what makes "not removable, but the volume is absent"
+/// unrepresentable instead of merely unlikely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingVolumeVm {
+    /// What the volume calls itself: its marker's label — the mount point's own
+    /// name, `"merope"`, recorded when the volume was adopted. Never derived by
+    /// slicing the local path apart: a stick re-mounted somewhere else is the
+    /// same volume with the same name, and the path is the one thing about it
+    /// that moves.
+    ///
+    /// `null` when the shell has never had this volume's marker in front of it —
+    /// a drive that has been out since the app launched carries its own name
+    /// away with it. The card has an unnamed phrasing for that; it does not
+    /// invent a name.
+    pub name: Option<String>,
+    /// Whether that volume is attached right now.
+    pub state: RecordingVolumeState,
+}
+
 /// The user-configurable recording settings (Story 17.5 + 19.5 + 40.2 + 41.2,
 /// FR-72, FR-131): the segment size, the duration-cap rotation fallback, the
 /// destination, the path template, the frame rate, the codec, the capture scale
@@ -3245,6 +3299,16 @@ pub struct RecordingSettingsVm {
     /// Resolved from the id on every read rather than cached beside it, which is
     /// what makes a rename show up here immediately with the same resolved root.
     pub destination_profile_name: Option<String>,
+    /// The chosen profile's removable media (Story 41.7), `None` under `Folder`
+    /// and for a synced folder on a disk that is always there.
+    ///
+    /// Output only, and re-scanned on every read for the same reason the name
+    /// is re-resolved: the answer changes when someone plugs a drive in, and a
+    /// value cached beside the choice would say "not attached" about a stick
+    /// that is sitting in the port. This is what lets the card say a
+    /// destination is on removable media BEFORE Record is pressed, instead of
+    /// letting the person find out from a failure (AD-48).
+    pub destination_volume: Option<RecordingVolumeVm>,
     /// Capture frame rate (Story 19.5): 10, 15, 30 (default), or 60,
     /// normalized on read/write; the sidecar's `fps`.
     pub fps: u32,
@@ -3445,6 +3509,69 @@ pub struct RecordingHitVm {
     /// written, so there is nothing to play, and the surface omits the action
     /// rather than opening the folder and calling that playback.
     pub playable_path: Option<String>,
+}
+
+/// What one [`RecordingNoteTargetVm`] is (Story 42.4, FR-142).
+///
+/// The surface asks exactly one question of a target beyond "where is it":
+/// does handing this to the system's default application mean anything a
+/// person would call Preview? For the session folder it does not — Reveal
+/// already does that job, and a Preview that opens a Finder window is Reveal
+/// wearing a different label. For `manifest.json` it does not either: a
+/// Preview that opens a text editor full of JSON is a mislabelled button.
+/// So the distinction the wire carries is video versus everything else, and
+/// the surface offers Preview for exactly one of the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RecordingNoteTargetKind {
+    /// The session folder itself — the target of the note's `recording:` line.
+    Folder,
+    /// A file the recorder writes video into. The one kind Preview is offered
+    /// for.
+    Video,
+    /// Any other file in the session folder: the manifest, an audio sidecar, a
+    /// file another tool dropped in. Reveal and Copy path, and nothing that
+    /// claims to play it.
+    File,
+}
+
+/// One thing the reader of a recording note can act on: the session's folder,
+/// or one file inside it (Story 42.4, FR-142, FR-145, AD-65).
+///
+/// **Why this VM exists at all.** A recording note names its recording only in
+/// relative terms — `recording:` and each entry of `files:` — because FR-145
+/// forbids an absolute path from ever being written into a file the user
+/// syncs to their other machines. Relative text cannot be opened, and the
+/// frontend is not allowed to make it openable by joining a destination root
+/// onto it (AD-65). This is that join, done once in Rust, for every path a
+/// note can name.
+///
+/// **The answer follows a retitle.** The list is composed from the session's
+/// CURRENT folder — Story 42.1's row follows the session through a Story 40.4
+/// rename — so a note written before a rename still opens the right thing,
+/// while its own text goes on saying where the recording was when it was made.
+/// That is the division of labour between the two: the note is the durable
+/// human-readable record, and the index is the answer to "where is it now".
+///
+/// **Every entry existed a moment ago.** The list is read off the session
+/// folder, so a surface that renders an action only for a target it was handed
+/// has no path by which it can offer to open something that is not there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingNoteTargetVm {
+    /// The target relative to the recordings destination root, `/`-joined —
+    /// the same frame the note's own `recording:` and `files:` lines are
+    /// written in, which is what lets a surface match one to the other without
+    /// composing anything (FR-145).
+    pub relative_path: String,
+    /// The same target resolved against the EFFECTIVE recordings destination
+    /// (Story 41.2). Only ever the argument of an action — never rendered as
+    /// the note's text, and never written back into a note.
+    pub absolute_path: String,
+    /// What the target is, which is what decides whether Preview is offered.
+    pub kind: RecordingNoteTargetKind,
 }
 
 /// The tag vocabulary a completion surface offers: every known tag, flat, with

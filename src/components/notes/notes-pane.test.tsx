@@ -62,6 +62,7 @@ const ROWS_A: NoteRowVm[] = [
   row("a1", "Pricing", ["work", "urgent"]),
   row("a2", "Standup", ["work"]),
   row("a3", "Garden", ["home"]),
+  row("a4", "Quarterly review", []),
 ];
 
 const ROWS_B: NoteRowVm[] = [row("b1", "Roadmap", ["work"])];
@@ -72,16 +73,34 @@ const contents: Record<string, NoteRowVm[]> = {
   "vault-b": ROWS_B,
 };
 
+/**
+ * The notes whose frontmatter carries `session:`, which is what makes the index
+ * flag them `recording` (Story 42.4).
+ *
+ * Held beside the rows rather than on them because that is where it lives in the
+ * real system: the flag is the index's, `NoteRowVm` carries no slot for it, and
+ * the only way the surface can ask about it is the request. So a Recordings
+ * assertion below fails unless the pane actually sent `is:recording`.
+ */
+let recordingIds: Record<string, true> = {};
+
 let activeVault = "vault-a";
 let vaultList: NoteVaultVm[] = [VAULT_A, VAULT_B];
 
-/** The predicate `notes_list` applies: tags intersect, text is a substring. */
+/**
+ * The predicate `notes_list` applies: tags intersect, text is a substring, and
+ * every requested flag must be one the entry carries. No row here carries any
+ * flag but `recording`, exactly as `has_flag` would report.
+ */
 function evaluate(vaultId: string, query: NoteQueryReq): NoteListVm {
   const rows = (contents[vaultId] ?? []).filter((candidate) => {
     if (!query.tags.every((tag) => candidate.tags.includes(tag))) {
       return false;
     }
     if (query.text !== null && !candidate.title.toLowerCase().includes(query.text.toLowerCase())) {
+      return false;
+    }
+    if (!query.flags.every((flag) => flag === "recording" && candidate.id in recordingIds)) {
       return false;
     }
     return true;
@@ -168,6 +187,8 @@ beforeEach(() => {
   vaultList = [VAULT_A, VAULT_B];
   contents["vault-a"] = ROWS_A;
   contents["vault-b"] = ROWS_B;
+  // `a4` is the one note keeper wrote about a recording.
+  recordingIds = { a4: true };
   resetNotesVaultsStoreForTest();
   resetNotesListStoreForTest();
   resetNotesFiltersStoreForTest();
@@ -284,5 +305,49 @@ describe("NotesPane empty states", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Open Settings → Sync" }));
     expect(primaryViewStore.getState().view).toBe("sync");
+  });
+});
+
+describe("NotesPane Recordings lens", () => {
+  it("lists exactly the notes keeper wrote about a recording", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Quarterly review");
+
+    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+
+    // `a4` carries `session:`; `a1` does not, and no tag, folder or filename
+    // convention distinguishes them — only the flag the request asked for.
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /Note, Quarterly review/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Note, Garden/ })).not.toBeInTheDocument();
+
+    // It is a filter like every other row, so it is dismissible in place and
+    // widening brings the rest back rather than needing a second visit.
+    fireEvent.click(screen.getByRole("button", { name: "Clear Recordings scope" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
+    });
+  });
+
+  it("says the vault has no recordings rather than blaming a filter the user did not set", async () => {
+    recordingIds = {};
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(screen.getByRole("button", { name: "Recordings" }));
+
+    await screen.findByText(
+      "No recording notes yet. keeper writes one each time a recording stops.",
+    );
+    // The generic sentence would send someone hunting for a chip to remove.
+    expect(screen.queryByText("No notes match these filters.")).not.toBeInTheDocument();
+
+    // And it is not a dead end: the one action returns to the whole vault.
+    fireEvent.click(screen.getByRole("button", { name: "Show all notes" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
+    });
   });
 });

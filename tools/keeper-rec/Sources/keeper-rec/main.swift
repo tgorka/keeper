@@ -219,7 +219,22 @@ private func iconDataURI(forPid pid: pid_t) -> String? {
 /// name/pid/bundleId + an optional ≤64px PNG icon data-URI. An enumeration
 /// failure (ungranted / ad-hoc-rejected process) degrades to an empty list —
 /// honest, never a hang or crash (the pre-flight, Story 16.5, owns the fix path).
+///
+/// THIS is the leg that prompts. `SCShareableContent` posts the macOS Screen
+/// Recording TCC prompt when the grant is missing — it does not fail quietly, it
+/// puts a system dialog on the user's screen. The host polls `listSources` every
+/// ~3s while the picker is visible, so on a fresh install that was a permission
+/// popup every 3s until the user gave in. Preflighting with the NON-prompting
+/// `CGPreflightScreenCaptureAccess` and returning an empty list instead is what
+/// makes "only the green Request permission button prompts" true regardless of
+/// caller: no host bug, no future caller, and no poll can produce a prompt from
+/// here, because the only call that can prompt is never made. An empty result
+/// means "not enumerated or none available" — never a permission verdict; that
+/// lives in the `permissions` reply, which the picker's surface already reads.
 private func listApplications() async -> [[String: Any]] {
+    guard CGPreflightScreenCaptureAccess() else {
+        return []
+    }
     guard
         let content = try? await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: true)
@@ -312,6 +327,16 @@ private func listCameras() -> [[String: Any]] {
 /// real applications (SCShareableContent), real microphones and real cameras
 /// (AVFoundation). `async` because application enumeration awaits shareable
 /// content.
+///
+/// No leg of this reply may prompt — the host polls it every ~3s. Only the
+/// applications leg ever could, and it preflights (see `listApplications`); it
+/// comes back empty, not prompting, when Screen Recording is not granted. The
+/// other three are prompt-free by construction: `CGGetActiveDisplayList` needs no
+/// TCC grant, and `AVCaptureDevice.DiscoverySession` only *enumerates* devices —
+/// the Microphone/Camera prompts come from `requestAccess` and from opening an
+/// `AVCaptureDeviceInput`, neither of which happens on this path. So these three
+/// stay ungated: gating a mic list on a screen grant would be a lie about which
+/// permission the picker needs.
 private func sourcesResult() async -> [String: Any] {
     return [
         "displays": listDisplays(),

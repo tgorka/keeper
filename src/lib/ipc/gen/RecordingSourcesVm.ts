@@ -15,7 +15,11 @@ export type RecordingSourcesVm = {
  */
 displays: Array<RecordingDisplayVm>, 
 /**
- * Recordable applications (real since Story 19.1).
+ * Recordable applications (real since Story 19.1). Empty means "not
+ * enumerated or none available" — NEVER a permission verdict. The sidecar
+ * skips this leg entirely while Screen Recording is ungranted, because
+ * enumerating it prompts; the honest verdict is [`ScreenRecordingAccess`],
+ * which the picker's surface already holds.
  */
 applications: Array<RecordingApplicationVm>, 
 /**

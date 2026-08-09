@@ -53,7 +53,7 @@ use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
     NoteVaultVm,
 };
-use keeper_core::notes::{links, naming, tags, NotesError};
+use keeper_core::notes::{links, naming, recording_note, tags, NotesError};
 use keeper_core::platform::Platform;
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::profile::{NotesCadence, NotesConfig, SyncProfile};
@@ -1319,6 +1319,14 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     if is_capture(&fm) {
         flags.push("capture".to_owned());
     }
+    // A note keeper wrote about a recording (Story 42.4). Read through the
+    // composer's own predicate rather than the key, so the surface that lists
+    // these notes and the code that writes them can never disagree about what
+    // one is — and note that the test is frontmatter, never the folder a stub
+    // happens to sit in: a stub can be filed anywhere and stays one.
+    if recording_note::is_recording_note(&fm) {
+        flags.push("recording".to_owned());
+    }
     if usize::try_from(stat.size).unwrap_or(usize::MAX) > MAX_INDEXED_BODY {
         flags.push("oversize".to_owned());
     }
@@ -2408,13 +2416,21 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
     };
     match action {
         Action::Commit => {
-            // `rescan` is how the engine is asked to notice *now*: its own next
-            // pass walks the tree, applies the stability gate and commits what
-            // settled. No second committer, and no second scheduler.
-            if let Err(error) = engine.rescan(vault_id) {
-                tracing::debug!(%error, "notes: could not request a rescan for the cadence");
-                return false;
-            }
+            // `wake_now`, never `rescan`: the cadence is asking the engine to
+            // notice *now*, and its own next pass walks the tree, applies the
+            // stability gate and commits what settled. No second committer, and
+            // no second scheduler.
+            //
+            // It used to call `rescan`, which is the "Recheck all files" button
+            // — it drops the gate for the WHOLE profile. On a folder that is
+            // both a notes vault and a recordings destination that ran about
+            // once a second, and nothing but a note could ever finish settling:
+            // a recording would stop, write its note stub, the stub would make
+            // the vault dirty, the cadence would fire, and the segments the
+            // recording had just closed lost the episode they needed. The
+            // recording could not sync because it had written a note about
+            // itself.
+            engine.wake_now(vault_id);
             true
         }
         Action::Push => {

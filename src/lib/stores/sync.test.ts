@@ -66,6 +66,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    // Resolved by Rust even for a folder that holds no recordings: it is the
+    // subfolder flagging it would use (Story 41.7).
+    recordingsSubfolder: "recordings",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -203,6 +207,8 @@ describe("actions", () => {
       commitSubjectTemplate: null,
       notes: false,
       notesSubfolder: null,
+      recordings: false,
+      recordingsSubfolder: null,
     });
 
     expect(result).toEqual(saved);
@@ -234,6 +240,8 @@ describe("actions", () => {
         commitSubjectTemplate: null,
         notes: false,
         notesSubfolder: null,
+        recordings: false,
+        recordingsSubfolder: null,
       }),
     ).rejects.toMatchObject({ message: "local path must be absolute" });
     // A rejected write is the caller's to surface; it is not a read failure.

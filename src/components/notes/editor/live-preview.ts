@@ -28,6 +28,8 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { MermaidWidget } from "./mermaid-widget";
+import { RecordingEmbedWidget } from "./recording-embed";
+import { WIKILINK, WIKILINK_ATTR } from "./wikilink";
 
 /** How long an externally applied change stays highlighted. */
 export const EXTERNAL_FLASH_MS = 1_200;
@@ -67,18 +69,22 @@ const LINE_CLASSES: Record<string, string> = {
   Blockquote: "cm-lp-quote",
 };
 
-/** `[[target]]`, `[[target|alias]]` and the `![[…]]` embed form. Lezer's
- *  markdown grammar knows nothing about wikilinks, so they are matched here. */
-const WIKILINK = /!?\[\[([^[\]|]+)(?:\|([^[\]]+))?]]/g;
-
-/** The attribute a click handler reads the link target back out of. */
-const WIKILINK_ATTR = "data-keeper-wikilink";
-
 export interface LivePreviewOptions {
   /** Turn a vault-relative asset path into its `keeper-note://` URL (AD-59). */
   assetUrl: (relPath: string) => string;
   /** Follow a wikilink. Called with the raw target, never a filesystem path. */
   onOpenLink: (target: string) => void;
+  /**
+   * The open note's `session:` frontmatter, or null when it has none.
+   *
+   * Read at decoration time rather than captured, because the editor is built
+   * once and outlives the note in it. Its presence is the whole test for "this
+   * is a recording note" (Story 42.4) — the same predicate the properties panel
+   * uses — and it is what turns an `![[…]]` embed into a player instead of a
+   * link. Absent, every embed stays the ordinary link it has always been, which
+   * is exactly right for somebody else's note that happens to contain one.
+   */
+  recordingSession?: () => string | null;
 }
 
 /** An embedded image, or — when the file is not there — its alt text and the
@@ -236,6 +242,23 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           const end = start + match[0].length;
           const target = match[1];
           const label = match[2] ?? target;
+
+          // `![[…]]` in a note that carries a session id: an embed of one of
+          // that recording's files. The widget renders this same link until the
+          // index confirms the path is a video, so the only thing decided here
+          // is that the embed gets to try (Story 42.4).
+          if (match[0].startsWith("!")) {
+            const sessionId = options.recordingSession?.() ?? null;
+            if (sessionId !== null) {
+              decorations.push(
+                Decoration.replace({
+                  widget: new RecordingEmbedWidget(sessionId, target, label),
+                }).range(start, end),
+              );
+              continue;
+            }
+          }
+
           const labelStart = start + match[0].indexOf(label, match[0].indexOf("[[") + 2);
           decorations.push(Decoration.replace({}).range(start, labelStart));
           decorations.push(
@@ -360,6 +383,16 @@ const livePreviewTheme = EditorView.baseTheme({
     backgroundColor: "var(--muted)",
   },
   ".cm-lp-image img": { maxWidth: "100%", borderRadius: "4px" },
+  // The host stays inline so an unresolved embed sits in its sentence like the
+  // link it still is; the player itself goes block, because a video wedged into
+  // a line of prose is neither readable nor watchable.
+  ".cm-lp-recording-player": {
+    display: "block",
+    maxWidth: "100%",
+    maxHeight: "60vh",
+    borderRadius: "4px",
+    backgroundColor: "var(--muted)",
+  },
   ".cm-lp-image-missing, .cm-mermaid-error-message": {
     color: "var(--muted-foreground)",
     fontSize: "0.85em",
