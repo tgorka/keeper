@@ -4888,13 +4888,34 @@ impl Engine {
         }
         self.with_db(|conn| db::clear_file_state(conn, id))?;
         Self::lock(&self.gates).remove(id);
-        // The walk must happen now, not at the end of the poll window: pressing
-        // this is a request to look, and a folder that sat unchanged for a minute
-        // afterwards would read as the button having done nothing.
-        Self::lock(&self.next_scan_ms).remove(id);
-        self.note_watch_wake(id);
+        self.wake_now(id);
         tracing::info!(profile = id, "forgot the remembered tree state on request");
         Ok(())
+    }
+
+    /// Ask for a walk **now**, remembering everything already known.
+    ///
+    /// The half of [`Self::rescan`] that is a request to *look*, without the
+    /// half that is a request to *forget*. Anything that merely knows the tree
+    /// changed wants this one. The part of `rescan` that does the damage is
+    /// `clear_file_state`, not `gates.remove`: the durable rows are what carry
+    /// an episode across a dropped gate — [`Self::ensure_gate`] imports them —
+    /// so deleting them restarts the settle window for every unrelated file in
+    /// the profile, and a caller on a short cadence does that forever.
+    ///
+    /// That is not hypothetical. The notes cadence called `rescan` for exactly
+    /// this purpose — its comment said "asked to notice now" — and on a folder
+    /// that is both a notes vault and a recordings destination it wiped the
+    /// gate roughly once a second. A recording stops, writes its note stub, the
+    /// stub makes the vault dirty, the cadence fires, and the segments the
+    /// recording just closed lose the episode they need to be committed. The
+    /// recording could not sync *because* it had written a note about itself.
+    pub fn wake_now(&self, id: &str) {
+        // Both halves, or neither works: the flag is what makes the next tick
+        // walk at all, and the cleared deadline is what stops it waiting out the
+        // rest of the poll interval first.
+        Self::lock(&self.next_scan_ms).remove(id);
+        self.note_watch_wake(id);
     }
 
     /// Re-verify stored content for a profile (Story 25.6).
@@ -8288,6 +8309,78 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "segment-000.mov"),
             "and the commit is real — an emptied gate is not a synced file"
+        );
+    }
+
+    /// A short-cadence caller that asks the engine to LOOK must not also make
+    /// it FORGET.
+    ///
+    /// The notes cadence called [`Engine::rescan`] to mean "notice now" — but
+    /// that is the "Recheck all files" button, and it drops the gate for the
+    /// whole profile. On a folder that is both a notes vault and a recordings
+    /// destination it ran about once a second, so nothing but a note could ever
+    /// finish settling: a recording stopped, wrote its note stub, the stub made
+    /// the vault dirty, the cadence fired, and the segments the recording had
+    /// just closed lost the episode they needed. The recording could not sync
+    /// because it had written a note about itself.
+    ///
+    /// Both halves are asserted here, because "wake keeps it" is only half the
+    /// claim — the other half is that `rescan` still forgets, deliberately, and
+    /// a fix that made them the same thing would break the button instead.
+    #[tokio::test]
+    async fn a_cadence_that_wakes_lets_a_file_settle_where_one_that_rescans_never_can() {
+        // The control. A forget on every pass, and the file never lands however
+        // long it has been quiet — the shape of the reported bug.
+        let forgetting = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(forgetting.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(forgetting.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        for _ in 0..4 {
+            engine.rescan(&p.id).expect("the cadence fires");
+            engine
+                .scan_and_enqueue(&p, SyncSource::Watch)
+                .expect("and the supervisor walks");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        }
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .is_empty(),
+            "a forget on every pass restarts every episode: nothing can ever settle"
+        );
+
+        // The same cadence, asking only to look.
+        let waking = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(waking.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(waking.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        for _ in 0..4 {
+            engine.wake_now(&p.id);
+            engine
+                .scan_and_enqueue(&p, SyncSource::Watch)
+                .expect("and the supervisor walks");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        }
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .iter()
+                .any(|entry| entry.path == "segment-000.mov"),
+            "a wake keeps the episode, so the second observation clears it"
         );
     }
 

@@ -2408,13 +2408,21 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
     };
     match action {
         Action::Commit => {
-            // `rescan` is how the engine is asked to notice *now*: its own next
-            // pass walks the tree, applies the stability gate and commits what
-            // settled. No second committer, and no second scheduler.
-            if let Err(error) = engine.rescan(vault_id) {
-                tracing::debug!(%error, "notes: could not request a rescan for the cadence");
-                return false;
-            }
+            // `wake_now`, never `rescan`: the cadence is asking the engine to
+            // notice *now*, and its own next pass walks the tree, applies the
+            // stability gate and commits what settled. No second committer, and
+            // no second scheduler.
+            //
+            // It used to call `rescan`, which is the "Recheck all files" button
+            // — it drops the gate for the WHOLE profile. On a folder that is
+            // both a notes vault and a recordings destination that ran about
+            // once a second, and nothing but a note could ever finish settling:
+            // a recording would stop, write its note stub, the stub would make
+            // the vault dirty, the cadence would fire, and the segments the
+            // recording had just closed lost the episode they needed. The
+            // recording could not sync because it had written a note about
+            // itself.
+            engine.wake_now(vault_id);
             true
         }
         Action::Push => {
