@@ -55,6 +55,21 @@ impl SyncPlatform for ShellSyncPlatform {
             .map_err(|err| SyncError::Config(format!("no data directory: {err}")))
     }
 
+    /// This profile's credential, read through the shell's single keychain memo.
+    ///
+    /// There is deliberately no cache here. The engine calls this on every push
+    /// and every fetch, which on macOS used to mean one "keeper wants to use your
+    /// confidential information" dialog per sync operation — the item's ACL is
+    /// re-evaluated on every read that returns data. The fix lives one layer down
+    /// in [`Platform::keychain_get`], which memoizes per key for the process, and
+    /// whose sibling `keychain_set`/`keychain_delete` invalidate the entry so a
+    /// corrected password takes effect without a relaunch.
+    ///
+    /// Delegating rather than memoizing again is the point: the shell builds a
+    /// fresh [`ShellSyncPlatform`] per IPC call ([`sync_platform`]), so a cache
+    /// held *here* would be a second cache over one keychain with its own
+    /// invalidation domain — the engine would keep spending a credential the user
+    /// had already corrected through `sync_set_credential`. Do not add one.
     fn secret_get(&self, key: &str) -> SyncResult<Option<String>> {
         self.platform
             .keychain_get(key)

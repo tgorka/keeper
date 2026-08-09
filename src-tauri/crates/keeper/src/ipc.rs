@@ -34,6 +34,8 @@ use keeper_core::notes::recording_note::{self, NoteStub, SessionFacts};
 use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
+#[cfg(desktop)]
+use keeper_core::platform::SecretCache;
 use keeper_core::recording::path_template::{
     PathTemplate, RelativePath, RenderCtx, DEFAULT_TEMPLATE,
 };
@@ -617,6 +619,25 @@ pub fn set_badge_app_handle(handle: tauri::AppHandle) {
     let _ = BADGE_APP.set(handle);
 }
 
+/// The one memo in front of this process's login keychain (Story: keychain-prompt
+/// reduction).
+///
+/// Process-wide rather than a field on [`DesktopPlatform`] for two reasons. The
+/// struct is deliberately a unit struct that reaches process state through
+/// write-once globals (the same shape as [`NOTIFY_APP`] and [`BADGE_APP`]). And,
+/// decisively, the shell hands out *fresh* adapters over the very same keychain —
+/// `crate::sync::sync_platform` builds a new `ShellSyncPlatform` per IPC call —
+/// so a per-instance memo would split one keychain across several caches with
+/// several invalidation domains, and a credential corrected through one of them
+/// would keep being spent by another. One keychain, one cache.
+///
+/// Every `Platform` keychain call in this impl goes through it: reads memoized,
+/// writes and deletes invalidating. `ShellSyncPlatform`'s `secret_*` methods
+/// delegate to these three, so the folder-sync engine's credential reads are
+/// covered by this same instance and must NOT gain a second one.
+#[cfg(desktop)]
+static KEYCHAIN_CACHE: LazyLock<SecretCache> = LazyLock::new(SecretCache::new);
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -637,26 +658,49 @@ impl Platform for DesktopPlatform {
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
             .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        entry
-            .set_password(value)
-            .map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
+        let written = entry.set_password(value);
+        // Invalidate after the attempt and regardless of its outcome: a write that
+        // failed part-way may still have replaced the stored item, and continuing
+        // to hand out the pre-write value would spend a credential the user has
+        // already corrected — a failure strictly worse than the prompt the cache
+        // removes.
+        KEYCHAIN_CACHE.invalidate(key);
+        written.map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
         Ok(())
     }
 
+    /// Read a secret, reaching the OS at most once per key per process.
+    ///
+    /// macOS re-evaluates a keychain item's ACL on every read that *returns
+    /// data*, so an unmemoized read is one "keeper wants to use your confidential
+    /// information stored in dev.tgorka.keeper in your keychain" dialog **per
+    /// read** until the item's ACL trusts this exact binary. That is why a machine
+    /// syncing continuously kept being asked all session long: the folder-sync
+    /// credential was read again on every push and every fetch.
     fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
-            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(PlatformError::Keychain(format!("could not read secret: {e}")).into()),
-        }
+        KEYCHAIN_CACHE.read_through(key, || {
+            let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key).map_err(|e| {
+                PlatformError::Keychain(format!("could not open keychain entry: {e}"))
+            })?;
+            match entry.get_password() {
+                Ok(secret) => Ok(Some(secret)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => {
+                    Err(PlatformError::Keychain(format!("could not read secret: {e}")).into())
+                }
+            }
+        })
     }
 
     fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
             .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.delete_credential() {
+        let deleted = entry.delete_credential();
+        // Same reasoning as `keychain_set`: drop the memo after the attempt
+        // whatever it reported, so a half-failed delete cannot leave this process
+        // serving a secret that is no longer there.
+        KEYCHAIN_CACHE.invalidate(key);
+        match deleted {
             // Deleting a missing entry is a no-op (rollback safety).
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(PlatformError::Keychain(format!("could not delete secret: {e}")).into()),

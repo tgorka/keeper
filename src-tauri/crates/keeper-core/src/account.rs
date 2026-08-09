@@ -798,6 +798,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -937,7 +938,7 @@ impl AccountManager {
         // producers stop feeding a stale merger/channel.
         self.unsubscribe_inbox_inner().await;
 
-        let accounts = auth::find_restorable_accounts(platform.as_ref())?;
+        let accounts = auth::scan_restorable_accounts(platform.as_ref())?;
         // Seed the merger's pin map from keeper-local state (Story 4.3): pins have
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
@@ -971,17 +972,25 @@ impl AccountManager {
             let mut index = self.palette.lock().await;
             *index = PaletteIndex::new();
         }
-        for account in &accounts {
+        for restorable in &accounts {
             merger
-                .register_account(&account.account_id, account.hue_index)
+                .register_account(&restorable.vm.account_id, restorable.vm.hue_index)
                 .await;
         }
-        for account in accounts {
+        for restorable in accounts {
+            // Split the pair the scan returned: the rest of this loop works on the
+            // non-secret VM, and the session blob the scan already read goes
+            // straight into activation. Re-reading `session/<id>` there would cost
+            // a second macOS authorization dialog for a secret already in hand.
+            let auth::RestorableAccount { vm: account, session } = restorable;
             let account_id = account.account_id.clone();
             // Activate + acquire the room list. A single account's activation
             // failure is not fatal to the whole inbox: skip it (its rooms simply
             // don't appear) so the other accounts keep syncing.
-            let room_list = match self.acquire_room_list(platform, &account_id).await {
+            let room_list = match self
+                .acquire_room_list(platform, &account_id, Some(session))
+                .await
+            {
                 Ok(room_list) => room_list,
                 Err(e) => {
                     tracing::warn!(
@@ -1116,6 +1125,7 @@ impl AccountManager {
         &self,
         platform: &Arc<dyn Platform>,
         account_id: &str,
+        session: Option<auth::SessionBlob>,
     ) -> Result<RoomList, CoreError> {
         let (sync, did_activate) = {
             let mut accounts = self.accounts.lock().await;
@@ -1135,6 +1145,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    session,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1232,6 +1243,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1390,6 +1402,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1514,6 +1527,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1637,6 +1651,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1804,6 +1819,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -1967,6 +1983,7 @@ impl AccountManager {
             ) = activate(
                 platform,
                 account_id,
+                None,
                 self.archive.clone(),
                 self.draft_mirror_tx.clone(),
                 self.notify.clone(),
@@ -2873,6 +2890,7 @@ impl AccountManager {
                 ) = activate(
                     platform,
                     account_id,
+                    None,
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
@@ -4744,6 +4762,14 @@ fn recovery_key_keychain_key(account_id: &str) -> String {
 /// Lazily rebuild the `Client` from the persisted session and start a
 /// `SyncService`. Also the Story 1.8 cold-start restore path.
 ///
+/// `session` is the `session/<id>` Keychain blob when the caller already read it
+/// — the restore scan ([`auth::scan_restorable_accounts`]) always has — and
+/// `None` when it did not. It is a parameter rather than an unconditional read
+/// because on macOS every keychain read that returns data re-evaluates the
+/// item's ACL: reading one item twice in a launch is two "keeper wants to use
+/// your confidential information" dialogs, not one, and the cold-launch path ran
+/// the scan and then this function over the same secret.
+///
 /// The `SyncService` is built with `.with_offline_mode()` so it exposes a real
 /// `Offline` state (auto-resumed via `/_matrix/client/versions`). After
 /// `sync.start()`, the send queue is enabled once so any persisted queued sends
@@ -4751,20 +4777,30 @@ fn recovery_key_keychain_key(account_id: &str) -> String {
 /// lifetime-of-account reconnect supervisor is spawned to re-enable the send
 /// queue on every transition back into `Running`; its `JoinHandle` is returned
 /// for the caller to store on the `AccountHandle`.
-#[tracing::instrument(skip(platform, archive), fields(account_id = %account_id))]
+#[tracing::instrument(skip(platform, session, archive), fields(account_id = %account_id))]
 async fn activate(
     platform: &Arc<dyn Platform>,
     account_id: &str,
+    session: Option<auth::SessionBlob>,
     archive: Option<ArchiveHandle>,
     draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
     notify_config: Arc<NotifyConfig>,
 ) -> Result<ActivatedAccount, CoreError> {
-    let session_json = platform
-        .keychain_get(&session_keychain_key(account_id))?
-        .ok_or(AccountError::SessionMissing)?;
+    // Use the blob the caller already holds when there is one; otherwise read it
+    // here, once. `None` is the honest answer for the callers that activate an
+    // account without having scanned first (a room-list, timeline or outbox
+    // subscribe on an account that is not live yet).
+    let session_json = match session {
+        Some(blob) => blob,
+        None => auth::SessionBlob::new(
+            platform
+                .keychain_get(&session_keychain_key(account_id))?
+                .ok_or(AccountError::SessionMissing)?,
+        ),
+    };
     // Legacy-tolerant read: a tagged `StoredSession` (password or OAuth), or a
     // pre-2.2 bare `MatrixSession` blob read as a password session.
-    let stored = auth::StoredSession::from_json(&session_json)
+    let stored = auth::StoredSession::from_json(session_json.as_str())
         .map_err(|e| AccountError::RestoreFailed(e.to_string()))?;
 
     let data_dir = platform.data_dir()?;
@@ -6064,16 +6100,22 @@ pub fn vector_diff_to_op(diff: VectorDiff<RoomVm>) -> RoomListOp {
 mod tests {
     use super::*;
     use crate::error::CoreError;
+    use crate::platform::SecretCache;
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
 
     /// Fake platform with a fixed data dir, an in-memory keychain (so `activate`
-    /// can read back a stored session), and a Story 14.7 **spy recorder** of every
-    /// path passed to `exclude_from_backup` — optionally failing that call to
-    /// prove exclusion is best-effort, never fatal.
+    /// can read back a stored session), a **spy recorder** of every key passed to
+    /// `keychain_get` — one recorded read is one macOS authorization dialog, so
+    /// the recording is how the prompt count becomes assertable — and a Story 14.7
+    /// spy recorder of every path passed to `exclude_from_backup`, optionally
+    /// failing that call to prove exclusion is best-effort, never fatal.
     struct FakePlatform {
         data_dir: PathBuf,
         keychain: std::sync::Mutex<HashMap<String, String>>,
+        /// Every key passed to `keychain_get`, in call order — including keys with
+        /// no stored value, because a read is a read whatever it finds.
+        keychain_reads: std::sync::Mutex<Vec<String>>,
         /// Every path passed to `exclude_from_backup`, in call order.
         excluded: std::sync::Mutex<Vec<PathBuf>>,
         /// When true, `exclude_from_backup` returns `Err` (after recording).
@@ -6085,6 +6127,7 @@ mod tests {
             Self {
                 data_dir,
                 keychain: std::sync::Mutex::new(HashMap::new()),
+                keychain_reads: std::sync::Mutex::new(Vec::new()),
                 excluded: std::sync::Mutex::new(Vec::new()),
                 fail_exclusion: false,
             }
@@ -6103,6 +6146,25 @@ mod tests {
         fn excluded_paths(&self) -> Vec<PathBuf> {
             self.excluded.lock().expect("lock excluded").clone()
         }
+
+        /// How many times `key` was read out of the keychain. This is the number
+        /// of authorization dialogs the user would see for that one item.
+        fn keychain_reads_of(&self, key: &str) -> usize {
+            self.keychain_reads
+                .lock()
+                .expect("lock keychain reads")
+                .iter()
+                .filter(|read| *read == key)
+                .count()
+        }
+
+        /// Every recorded keychain read, in call order — the total dialog count.
+        fn keychain_reads(&self) -> Vec<String> {
+            self.keychain_reads
+                .lock()
+                .expect("lock keychain reads")
+                .clone()
+        }
     }
 
     impl Platform for FakePlatform {
@@ -6117,6 +6179,10 @@ mod tests {
             Ok(())
         }
         fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+            self.keychain_reads
+                .lock()
+                .expect("lock keychain reads")
+                .push(key.to_owned());
             Ok(self
                 .keychain
                 .lock()
@@ -6157,6 +6223,67 @@ mod tests {
         }
         fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
             Ok(())
+        }
+    }
+
+    /// A [`Platform`] that memoizes keychain reads in front of an inner one, the
+    /// way the desktop shell's `DesktopPlatform` does: one [`SecretCache`], reads
+    /// through it, writes and deletes invalidating.
+    ///
+    /// It exists so the *end-to-end* cold-launch dialog count can be asserted
+    /// here, against the real `scan_restorable_accounts` and `activate` — the
+    /// shell's own wiring is fifteen lines of exactly this shape over `keyring`,
+    /// which only the macOS gate can execute.
+    struct CachingPlatform {
+        inner: Arc<FakePlatform>,
+        cache: SecretCache,
+    }
+
+    impl CachingPlatform {
+        fn new(inner: Arc<FakePlatform>) -> Self {
+            Self {
+                inner,
+                cache: SecretCache::new(),
+            }
+        }
+    }
+
+    impl Platform for CachingPlatform {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            self.inner.data_dir()
+        }
+        fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+            let written = self.inner.keychain_set(key, value);
+            self.cache.invalidate(key);
+            written
+        }
+        fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+            self.cache.read_through(key, || self.inner.keychain_get(key))
+        }
+        fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+            let deleted = self.inner.keychain_delete(key);
+            self.cache.invalidate(key);
+            deleted
+        }
+        fn open_url(&self, url: &str) -> Result<(), CoreError> {
+            self.inner.open_url(url)
+        }
+        fn notify(
+            &self,
+            title: &str,
+            body: &str,
+            target: &crate::vm::NotifyTarget,
+        ) -> Result<(), CoreError> {
+            self.inner.notify(title, body, target)
+        }
+        fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+            self.inner.sidecar_path(name)
+        }
+        fn exclude_from_backup(&self, path: &Path) -> Result<(), CoreError> {
+            self.inner.exclude_from_backup(path)
+        }
+        fn set_badge_count(&self, count: Option<u32>) -> Result<(), CoreError> {
+            self.inner.set_badge_count(count)
         }
     }
 
@@ -6255,20 +6382,35 @@ mod tests {
     /// build/restore time, and the session blob is the tagged password shape the
     /// Keychain stores (same flat `MatrixSession` JSON as the auth tests).
     fn seed_restorable_account(platform: &FakePlatform, data_dir: &Path, account_id: &str) {
+        seed_restorable_account_as(platform, data_dir, account_id, "@alice:example.org", "DEVID");
+    }
+
+    /// As [`seed_restorable_account`], with the Matrix identity named — so a test
+    /// seeding two accounts can prove each activation restored *its own* session
+    /// rather than a sibling's blob threaded to the wrong account.
+    fn seed_restorable_account_as(
+        platform: &FakePlatform,
+        data_dir: &Path,
+        account_id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) {
         registry::insert_account(
             data_dir,
             account_id,
-            "@alice:example.org",
+            user_id,
             "https://example.invalid",
-            "DEVID",
+            device_id,
             1,
             0,
             "password",
         )
         .expect("insert registry row");
-        let session_json = r#"{"kind":"Password","user_id":"@alice:example.org","device_id":"DEVID","access_token":"test-access-token"}"#;
+        let session_json = format!(
+            r#"{{"kind":"Password","user_id":"{user_id}","device_id":"{device_id}","access_token":"test-access-token"}}"#
+        );
         platform
-            .keychain_set(&session_keychain_key(account_id), session_json)
+            .keychain_set(&session_keychain_key(account_id), &session_json)
             .expect("seed keychain session");
     }
 
@@ -6366,6 +6508,7 @@ mod tests {
             &platform,
             account_id,
             None,
+            None,
             draft_tx.clone(),
             Arc::new(NotifyConfig::new(true)),
         )
@@ -6387,6 +6530,7 @@ mod tests {
         let activated = activate(
             &platform,
             account_id,
+            None,
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
@@ -6420,6 +6564,7 @@ mod tests {
             &platform,
             account_id,
             None,
+            None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
         )
@@ -6436,6 +6581,235 @@ mod tests {
         assert!(
             sdk_dir.is_dir(),
             "the sdk store survives the exclusion failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The cold-launch contract, and the reason the keychain dialog was appearing
+    /// twice per account: the restore scan reads `session/<id>` to decide the
+    /// account is restorable, and `activate` used to read the very same item
+    /// again. macOS re-evaluates a keychain item's ACL on every read that returns
+    /// data, so that second read was a second "keeper wants to use your
+    /// confidential information stored in dev.tgorka.keeper in your keychain"
+    /// dialog for a secret already in hand.
+    ///
+    /// Two accounts, because that is the shape the report came from: each item is
+    /// read exactly once, and each activation must restore *its own* session (a
+    /// blob threaded to the wrong account would come back with the wrong user id).
+    /// The store passphrase is pinned at one read per activation in the same pass,
+    /// so a future re-read of it cannot slip in unnoticed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_restore_then_activate_reads_each_secret_exactly_once() {
+        let data_dir = unique_temp_dir("scan-once");
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        let accounts = [
+            ("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@alice:example.org", "DEVA"),
+            ("01BX5ZZKBKACTAV9WEVGEMMVS0", "@bob:example.org", "DEVB"),
+        ];
+        for (account_id, user_id, device_id) in accounts {
+            seed_restorable_account_as(&fake, &data_dir, account_id, user_id, device_id);
+        }
+        let platform: Arc<dyn Platform> = fake.clone();
+
+        // The restore scan: one `session/<id>` read per account, and the blob is
+        // carried out rather than dropped.
+        let scanned = auth::scan_restorable_accounts(platform.as_ref()).expect("scan succeeds");
+        assert_eq!(scanned.len(), 2, "both seeded accounts are restorable");
+
+        // Activation, handed the blob the scan already read.
+        let (draft_tx, _) = tokio::sync::broadcast::channel(4);
+        for restorable in scanned {
+            let auth::RestorableAccount { vm, session } = restorable;
+            let activated = activate(
+                &platform,
+                &vm.account_id,
+                Some(session),
+                None,
+                draft_tx.clone(),
+                Arc::new(NotifyConfig::new(true)),
+            )
+            .await
+            .expect("offline activation succeeds");
+            assert_eq!(
+                activated.0.user_id().map(|user| user.as_str()),
+                Some(vm.user_id.as_str()),
+                "each account must have been restored from its own session blob"
+            );
+            teardown_activated(activated).await;
+        }
+
+        for (account_id, _, _) in accounts {
+            assert_eq!(
+                fake.keychain_reads_of(&session_keychain_key(account_id)),
+                1,
+                "session/{account_id} must be read once across scan + activate, \
+                 not once per step — a second read is a second keychain dialog"
+            );
+            assert_eq!(
+                fake.keychain_reads_of(&auth::store_passphrase_keychain_key(account_id)),
+                1,
+                "store_passphrase/{account_id} is read exactly once per activation"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The other half of the same contract: a caller that did *not* scan first —
+    /// a room-list, timeline or bridge-discovery subscribe on an account that is
+    /// not live yet — passes `None` and `activate` reads the session itself, once.
+    /// Without this, threading the blob could be "fixed" by dropping the read
+    /// entirely and every non-scan activation would fail to restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_without_a_scanned_session_reads_it_itself_once() {
+        let data_dir = unique_temp_dir("activate-unscanned");
+        let account_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        seed_restorable_account(&fake, &data_dir, account_id);
+        let platform: Arc<dyn Platform> = fake.clone();
+
+        let (draft_tx, _) = tokio::sync::broadcast::channel(4);
+        let activated = activate(
+            &platform,
+            account_id,
+            None,
+            None,
+            draft_tx,
+            Arc::new(NotifyConfig::new(true)),
+        )
+        .await
+        .expect("activation succeeds without a pre-read session");
+        assert_eq!(
+            activated.0.user_id().map(|user| user.as_str()),
+            Some("@alice:example.org"),
+            "the session it read for itself is the one it restored"
+        );
+        teardown_activated(activated).await;
+
+        assert_eq!(
+            fake.keychain_reads_of(&session_keychain_key(account_id)),
+            1,
+            "no scan ran, so this is the only read of the session — and there is one"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The number the report was actually counting: how many keychain dialogs one
+    /// cold launch raises with two accounts.
+    ///
+    /// A launch runs the restore scan **twice** — `session_restore` on app mount
+    /// and `subscribe_inbox` when the chat list mounts are two independent IPC
+    /// commands, and neither may assume the other ran — and then activates each
+    /// account. Unmemoized that was three `session/<id>` reads and one
+    /// `store_passphrase/<id>` read per account: eight dialogs for four items.
+    ///
+    /// Threading fixes the scan→activate duplicate; the process-wide
+    /// [`SecretCache`] fixes the scan→scan one, which threading cannot reach
+    /// because the two commands may arrive in either order. Both are needed, and
+    /// together the floor is one read per distinct item. The sync credential is
+    /// asserted on the same seam because the engine reads it per push and per
+    /// fetch, which is what made the dialog return all session long.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_launch_reads_each_keychain_item_from_the_os_exactly_once() {
+        let data_dir = unique_temp_dir("cold-launch");
+        let fake = Arc::new(FakePlatform::new(data_dir.clone()));
+        let accounts = [
+            ("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@alice:example.org", "DEVA"),
+            ("01BX5ZZKBKACTAV9WEVGEMMVS0", "@bob:example.org", "DEVB"),
+        ];
+        for (account_id, user_id, device_id) in accounts {
+            seed_restorable_account_as(&fake, &data_dir, account_id, user_id, device_id);
+        }
+        // Two sync profiles with a stored credential, seeded through the inner
+        // platform so the seeding itself is not counted as a read.
+        let credential_keys = ["sync/p1/credential", "sync/p2/credential"];
+        for key in credential_keys {
+            fake.keychain_set(key, "forge-token").expect("seed credential");
+        }
+        let platform: Arc<dyn Platform> = Arc::new(CachingPlatform::new(fake.clone()));
+
+        // `session_restore` (App mount): the non-secret projection, which still has
+        // to read each session to know the account is restorable.
+        let restored =
+            auth::find_restorable_accounts(platform.as_ref()).expect("session_restore scan");
+        assert_eq!(restored.len(), 2);
+
+        // `subscribe_inbox` (chat list mount): the second, independent scan.
+        let scanned = auth::scan_restorable_accounts(platform.as_ref()).expect("inbox scan");
+        assert_eq!(scanned.len(), 2);
+
+        // Activation per account, handed the blob the second scan read.
+        let (draft_tx, _) = tokio::sync::broadcast::channel(4);
+        for restorable in scanned {
+            let auth::RestorableAccount { vm, session } = restorable;
+            let activated = activate(
+                &platform,
+                &vm.account_id,
+                Some(session),
+                None,
+                draft_tx.clone(),
+                Arc::new(NotifyConfig::new(true)),
+            )
+            .await
+            .expect("offline activation succeeds");
+            teardown_activated(activated).await;
+        }
+
+        // Five sync operations per profile, as a continuously syncing machine does.
+        for _ in 0..5 {
+            for key in credential_keys {
+                assert_eq!(
+                    platform.keychain_get(key).expect("credential read").as_deref(),
+                    Some("forge-token"),
+                    "every sync operation still gets the credential"
+                );
+            }
+        }
+
+        for (account_id, _, _) in accounts {
+            assert_eq!(
+                fake.keychain_reads_of(&session_keychain_key(account_id)),
+                1,
+                "session/{account_id}: two scans + one activation must reach the OS once"
+            );
+            assert_eq!(
+                fake.keychain_reads_of(&auth::store_passphrase_keychain_key(account_id)),
+                1,
+                "store_passphrase/{account_id}: one read for the launch"
+            );
+        }
+        for key in credential_keys {
+            assert_eq!(
+                fake.keychain_reads_of(key),
+                1,
+                "{key}: ten sync operations must not be ten dialogs"
+            );
+        }
+        assert_eq!(
+            fake.keychain_reads().len(),
+            6,
+            "six distinct items, six reads — the whole cold launch"
+        );
+
+        // And a credential corrected mid-session takes effect without a relaunch:
+        // the write invalidates, so the next sync operation re-reads the OS.
+        platform
+            .keychain_set("sync/p1/credential", "corrected-token")
+            .expect("store the corrected credential");
+        assert_eq!(
+            platform
+                .keychain_get("sync/p1/credential")
+                .expect("read back")
+                .as_deref(),
+            Some("corrected-token"),
+            "a stale cached credential that keeps failing auth would be the worse bug"
+        );
+        assert_eq!(
+            fake.keychain_reads_of("sync/p1/credential"),
+            2,
+            "exactly one extra read: the one the correction made necessary"
         );
 
         let _ = std::fs::remove_dir_all(&data_dir);
