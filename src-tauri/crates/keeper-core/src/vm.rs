@@ -2715,7 +2715,11 @@ pub struct RecordingDeviceVm {
 pub struct RecordingSourcesVm {
     /// The active displays (real, from the sidecar's display enumeration).
     pub displays: Vec<RecordingDisplayVm>,
-    /// Recordable applications (real since Story 19.1).
+    /// Recordable applications (real since Story 19.1). Empty means "not
+    /// enumerated or none available" — NEVER a permission verdict. The sidecar
+    /// skips this leg entirely while Screen Recording is ungranted, because
+    /// enumerating it prompts; the honest verdict is [`ScreenRecordingAccess`],
+    /// which the picker's surface already holds.
     pub applications: Vec<RecordingApplicationVm>,
     /// Microphone devices (real since Story 19.3).
     pub microphones: Vec<RecordingDeviceVm>,

@@ -63,7 +63,7 @@ afterEach(() => {
 
 describe("RecordingSourcePicker", () => {
   it("polls list_sources on mount and renders Displays then Applications", async () => {
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await waitFor(() => expect(mockList).toHaveBeenCalled());
 
     expect(screen.getByText(DISPLAYS_HEADING)).toBeInTheDocument();
@@ -76,13 +76,13 @@ describe("RecordingSourcePicker", () => {
   });
 
   it("defaults the selection to the main display", async () => {
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await waitFor(() => expect(mockList).toHaveBeenCalled());
     expect(selectedRecordingTarget()).toEqual({ kind: "display", displayId: null });
   });
 
   it("selecting an application updates the target and shows the app-scope disclosure", async () => {
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     const safari = await screen.findByText("Safari");
     fireEvent.click(safari);
 
@@ -101,7 +101,7 @@ describe("RecordingSourcePicker", () => {
     // The 19.2-deferred contradiction: with system audio off, the disclosure
     // must not claim the app's audio is recorded.
     setSystemAudioEnabled(false);
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     const safari = await screen.findByText("Safari");
     fireEvent.click(safari);
 
@@ -112,7 +112,7 @@ describe("RecordingSourcePicker", () => {
   });
 
   it("keyboard arrow navigation updates the selection (not only mouse clicks)", async () => {
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await screen.findByText("Safari");
     const radios = screen.getAllByRole("radio");
     // The main display is the default selection; arrow-navigate off it. Radix
@@ -128,17 +128,35 @@ describe("RecordingSourcePicker", () => {
   });
 
   it("does not poll while inactive (a live recording keeps the setup mounted)", async () => {
-    render(<RecordingSourcePicker active={false} />);
+    render(<RecordingSourcePicker active={false} screenRecording="granted" />);
     // The picker stays mounted during recording; polling must be paused so no
     // fresh keeper-rec child spawns every ~3s.
     await Promise.resolve();
     expect(mockList).not.toHaveBeenCalled();
   });
 
+  it("does not enumerate until the pane reports the Screen Recording grant", async () => {
+    // Mounting with the pre-flight's safe default (the state a fresh install sits
+    // in) must reach the sidecar zero times: `list_sources` prompts through
+    // `SCShareableContent`, so a mount-time enumeration is a system popup the user
+    // never asked for. The picker still RENDERS — the pane's Permissions card is
+    // what tells the user what to do.
+    const { rerender } = render(<RecordingSourcePicker screenRecording="notYetRequested" />);
+    await Promise.resolve();
+    expect(mockList).not.toHaveBeenCalled();
+    expect(screen.getByText(MAIN_DISPLAY_LABEL)).toBeInTheDocument();
+
+    // The user grants and returns; the pre-flight re-probes and the prop flips.
+    // The list must fill on that flip, not on a relaunch.
+    rerender(<RecordingSourcePicker screenRecording="granted" />);
+    await waitFor(() => expect(mockList).toHaveBeenCalled());
+    expect(await screen.findByText("Safari")).toBeInTheDocument();
+  });
+
   it("does not enumerate on the focus event itself; a burst costs one read (AD-34-6)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
-      render(<RecordingSourcePicker />);
+      render(<RecordingSourcePicker screenRecording="granted" />);
       await waitFor(() => expect(mockList).toHaveBeenCalled());
       // Halt the 3 s timer so the count below is about the focus path alone —
       // `stopRecordingSourcePolling` clears the interval without unbinding the
@@ -165,7 +183,7 @@ describe("RecordingSourcePicker", () => {
   });
 
   it("renders the real icon for apps that have one and a fallback glyph otherwise", async () => {
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await screen.findByText("Safari");
     // The app with an icon renders an <img> data-URI.
     const icon = document.querySelector('img[src="data:image/png;base64,AA=="]');
@@ -174,7 +192,7 @@ describe("RecordingSourcePicker", () => {
 
   it("shows the empty-applications note when none are recordable", async () => {
     mockList.mockResolvedValue(EMPTY);
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await waitFor(() => expect(mockList).toHaveBeenCalled());
     expect(await screen.findByText(NO_APPLICATIONS_NOTE)).toBeInTheDocument();
   });
@@ -182,7 +200,7 @@ describe("RecordingSourcePicker", () => {
   it("marks a vanished selection unavailable without swapping it", async () => {
     // Pre-select an app that will not be in the polled list.
     selectRecordingTarget({ kind: "application", pid: 999, bundleId: "com.gone.App" });
-    render(<RecordingSourcePicker />);
+    render(<RecordingSourcePicker screenRecording="granted" />);
     await waitFor(() => expect(mockList).toHaveBeenCalled());
     await screen.findByText("Safari");
 

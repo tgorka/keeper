@@ -15,6 +15,7 @@ import {
   resetRecordingSourceForTest,
   selectedRecordingTarget,
   selectRecordingTarget,
+  setScreenRecordingAccess,
   startRecordingSourcePolling,
   stopRecordingSourcePolling,
 } from "@/lib/stores/recording-source";
@@ -38,6 +39,11 @@ beforeEach(() => {
   vi.useFakeTimers();
   mockList.mockReset();
   mockList.mockResolvedValue(SOURCES);
+  // Every enumeration is gated on the Screen Recording grant, so the default
+  // state for the tests about enumeration behaviour is "granted". The gate's own
+  // tests below set the ungranted states explicitly; `resetRecordingSourceForTest`
+  // fails it closed again after each one.
+  setScreenRecordingAccess("granted");
 });
 
 afterEach(() => {
@@ -99,6 +105,64 @@ describe("recording-source store", () => {
     await vi.advanceTimersByTimeAsync(9000);
     // No further polls after stop.
     expect(mockList).toHaveBeenCalledTimes(3);
+  });
+
+  it("issues no enumeration at all while Screen Recording is not granted", async () => {
+    // The install-day bug: `list_sources` enumerates applications through
+    // `SCShareableContent`, which POSTS the macOS permission prompt when the
+    // grant is missing. The picker polls it every 3 s and refreshes on focus, so
+    // an ungated poll threw a system popup at the user every 3 s forever. Not one
+    // read may leave here until the grant is held — from any path.
+    setScreenRecordingAccess("notYetRequested");
+    startRecordingSourcePolling();
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Ten poll intervals: ten popups, before.
+    expect(mockList).not.toHaveBeenCalled();
+
+    // The focus path funnels through the same gate, not around it.
+    await refreshRecordingSources();
+    expect(mockList).not.toHaveBeenCalled();
+    // And a gated call must not leave the spinner stuck on a read never made.
+    expect(recordingSourceStore.getState().refreshing).toBe(false);
+
+    // An explicit denial is just as ungranted — polling it would prompt too.
+    setScreenRecordingAccess("denied");
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mockList).not.toHaveBeenCalled();
+  });
+
+  it("resumes enumeration the moment the grant lands (no relaunch, no second click)", async () => {
+    setScreenRecordingAccess("notYetRequested");
+    startRecordingSourcePolling();
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(mockList).not.toHaveBeenCalled();
+
+    // The user grants and returns; the pre-flight re-probes and reports it. The
+    // picker must fill NOW — a user staring at an empty picker until they relaunch
+    // is the same bug wearing different clothes — and it must keep polling.
+    setScreenRecordingAccess("granted");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockList).toHaveBeenCalledTimes(1);
+    expect(recordingSourceStore.getState().sources).toEqual(SOURCES);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(mockList).toHaveBeenCalledTimes(2);
+
+    // A revoke re-closes the gate: the very next tick would be the next popup.
+    setScreenRecordingAccess("denied");
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(mockList).toHaveBeenCalledTimes(2);
+  });
+
+  it("a grant that arrives after the surface is gone resumes nothing", async () => {
+    // Start (or unmount) stops the poll; a late-arriving grant must not revive a
+    // poll nobody asked for — that would spawn a `keeper-rec` every 3 s through a
+    // live recording.
+    setScreenRecordingAccess("notYetRequested");
+    startRecordingSourcePolling();
+    stopRecordingSourcePolling();
+    setScreenRecordingAccess("granted");
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(mockList).not.toHaveBeenCalled();
   });
 
   it("marks a vanished application selection unavailable (never silently swaps)", () => {

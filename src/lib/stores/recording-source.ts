@@ -20,6 +20,16 @@
  * surface unmounts. A vanished selection (the polled list no longer contains the
  * selected app) is *marked*, not silently swapped — Start against it yields the
  * sidecar's clean `Failed` (the pid is re-resolved live at Start).
+ *
+ * Every enumeration here is gated on the Screen Recording grant
+ * ({@link setScreenRecordingAccess}). `listSources` enumerates applications via
+ * `SCShareableContent`, which POSTS the macOS Screen Recording TCC prompt when the
+ * grant is missing — so an ungated 3 s poll threw a system prompt at the user every
+ * 3 s, forever, on a fresh install. Nothing here may reach the sidecar until the
+ * resolved access is `"granted"`; the only thing allowed to prompt is the explicit
+ * request behind the Permissions card's button. The gate is a *gate*, not a
+ * one-shot check: the moment the grant lands the poll starts on that same tick, so
+ * a user who grants sees the picker fill without another click or a relaunch.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -27,6 +37,7 @@ import {
   listRecordingSources,
   type RecordingSourcesVm,
   type RecordingTargetVm,
+  type ScreenRecordingAccess,
 } from "@/lib/ipc/client";
 
 /** How often the picker re-enumerates while the idle setup surface is visible. */
@@ -111,6 +122,22 @@ export const recordingSourceStore = createStore<RecordingSourceState>()((set) =>
   select: (target) => set({ selected: target }),
 }));
 
+/**
+ * The latest resolved Screen Recording verdict, pushed in by the surface that
+ * already probes it ({@link setScreenRecordingAccess}). Module-level rather than
+ * store state on purpose: nothing renders it — it only decides whether an
+ * enumeration is allowed to reach the sidecar. Starts at the safe, fail-closed
+ * default, so a caller that never reports a verdict enumerates never (and so
+ * prompts never) instead of enumerating always.
+ */
+let screenRecordingAccess: ScreenRecordingAccess = "notYetRequested";
+
+/** Whether the surface wants the poll running, independent of the grant. Kept
+ * apart from {@link pollTimer} so a grant arriving later can resume a poll the
+ * picker already asked for, and so a grant arriving after the picker unmounted
+ * (or after Start) resumes nothing. */
+let pollWanted = false;
+
 /** In-flight enumeration, deduped so a focus refresh never races a poll tick. */
 let inFlight: Promise<void> | null = null;
 
@@ -119,8 +146,16 @@ let inFlight: Promise<void> | null = null;
  * the mirror. Best-effort — a failure leaves the prior list rendered (a transient
  * enumeration failure never blanks the picker) and clears `refreshing`. Deduped:
  * a call while one is in flight joins it rather than issuing a second read.
+ *
+ * A no-op — no IPC, no `refreshing` flicker — while Screen Recording is not
+ * granted. This is the hard gate every path funnels through (poll tick, focus
+ * refresh, first mount), because the command's application leg prompts: one call
+ * with the grant missing is one macOS permission popup the user never asked for.
  */
 export async function refreshRecordingSources(): Promise<void> {
+  if (screenRecordingAccess !== "granted") {
+    return;
+  }
   if (inFlight !== null) {
     return inFlight;
   }
@@ -139,16 +174,11 @@ export async function refreshRecordingSources(): Promise<void> {
   return inFlight;
 }
 
-/** The active poll timer, or `null` when polling is stopped. */
+/** The active poll timer, or `null` when polling is stopped (or gated off). */
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-/**
- * Start the live source poll (Story 19.1): an immediate enumeration, then a
- * fixed-interval re-enumeration while the idle setup surface is visible. Idempotent
- * — a second start does not stack timers. Callers also re-enumerate on window
- * focus (a focus refresh is just a {@link refreshRecordingSources} call).
- */
-export function startRecordingSourcePolling(): void {
+/** Enumerate now and arm the interval. Callers must have checked the gate. */
+function armPolling(): void {
   void refreshRecordingSources();
   if (pollTimer !== null) {
     return;
@@ -159,13 +189,61 @@ export function startRecordingSourcePolling(): void {
 }
 
 /**
+ * Start the live source poll (Story 19.1): an immediate enumeration, then a
+ * fixed-interval re-enumeration while the idle setup surface is visible. Idempotent
+ * — a second start does not stack timers. Callers also re-enumerate on window
+ * focus (a focus refresh is just a {@link refreshRecordingSources} call).
+ *
+ * Records the *intent* to poll unconditionally, but arms nothing until Screen
+ * Recording is granted — the picker mounts before the permission probe resolves,
+ * and an eager first enumeration there is exactly the popup-on-install bug. When
+ * the grant lands, {@link setScreenRecordingAccess} arms this same poll.
+ */
+export function startRecordingSourcePolling(): void {
+  pollWanted = true;
+  if (screenRecordingAccess !== "granted") {
+    return;
+  }
+  armPolling();
+}
+
+/**
  * Stop the live source poll (Story 19.1): halts re-enumeration while a session is
  * recording or the surface is unmounted. Idempotent.
  */
 export function stopRecordingSourcePolling(): void {
+  pollWanted = false;
   if (pollTimer !== null) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+}
+
+/**
+ * Report the resolved Screen Recording verdict (the picker mirrors it in from the
+ * pre-flight the Permissions card already runs — this store never probes, so there
+ * is exactly one permission observer in the app).
+ *
+ * A grant arriving resumes a poll the surface already asked for, immediately: an
+ * enumeration on this tick plus the interval, so the picker fills the moment the
+ * user grants rather than after a relaunch. A grant going away (revoked in System
+ * Settings, or the pre-flight degrading to its safe default) disarms the interval —
+ * the next tick would be the next unwanted prompt.
+ */
+export function setScreenRecordingAccess(access: ScreenRecordingAccess): void {
+  if (access === screenRecordingAccess) {
+    return;
+  }
+  screenRecordingAccess = access;
+  if (access !== "granted") {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    return;
+  }
+  if (pollWanted) {
+    armPolling();
   }
 }
 
@@ -194,9 +272,12 @@ export function selectRecordingTarget(target: RecordingTargetVm): void {
   recordingSourceStore.getState().select(target);
 }
 
-/** Test-only reset: clear the mirror, restore the default selection, stop polling. */
+/** Test-only reset: clear the mirror, restore the default selection, stop polling,
+ * and fail the grant gate closed again (a test that granted must not leak the
+ * grant into the next one, which would silently un-gate its enumerations). */
 export function resetRecordingSourceForTest(): void {
   stopRecordingSourcePolling();
+  screenRecordingAccess = "notYetRequested";
   inFlight = null;
   recordingSourceStore.setState({
     sources: null,

@@ -4572,10 +4572,17 @@ pub(crate) fn epoch_ms_now() -> u64 {
 /// wedged sidecar resolves a clean error, never a hung poll) and returns the live
 /// [`RecordingSourcesVm`]: real displays plus real applications (name/pid/bundleId
 /// + an optional ≤64px PNG icon data-URI, keeper excluded). Called on a ~3s poll
-/// while the idle setup surface is visible and on window focus. Gated by the
-/// `recording` capability — an unsupported platform answers `Unsupported` with no
-/// spawn. Failures funnel through [`to_ipc_error`]; the picker swallows them to
-/// the prior list (a transient enumeration failure never blanks the picker).
+/// while the idle setup surface is visible and on window focus — but only once
+/// Screen Recording is granted: the picker gates the poll on the pre-flight
+/// verdict, and the sidecar independently skips the `SCShareableContent` leg
+/// behind its non-prompting preflight, because that leg posts the OS permission
+/// prompt. Two layers, one invariant: nothing but the explicit
+/// `request_screen_recording_permission` may ever prompt. An empty `applications`
+/// therefore means "not enumerated or none available", never "denied". Gated by
+/// the `recording` capability — an unsupported platform answers `Unsupported`
+/// with no spawn. Failures funnel through [`to_ipc_error`]; the picker swallows
+/// them to the prior list (a transient enumeration failure never blanks the
+/// picker).
 #[tauri::command]
 pub async fn recording_list_sources(
     state: State<'_, AppState>,
