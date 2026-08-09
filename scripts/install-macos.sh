@@ -78,6 +78,39 @@ remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun run rec:build && bunx tauri 
 remote "test -d $BUNDLE" || fail "no bundle at $BUNDLE"
 say "built: $(remote "/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' $BUNDLE/Contents/Info.plist") ($(remote "stat -f '%Sm' $BUNDLE/Contents/MacOS/keeper"))"
 
+# --- Signature: never leave it a mystery -----------------------------------
+#
+# A `tauri build` with no identity produces an ad-hoc, linker-signed bundle
+# whose designated requirement is a bare `cdhash` — the hash of that exact
+# binary. Every rebuild is therefore a brand-new app to macOS: the Screen
+# Recording grant stops matching and Privacy & Security grows another "keeper"
+# row, and every keychain item's "Always Allow" is void, so the login-keychain
+# prompt returns once per stored secret on the next launch. That is roughly ten
+# prompts per install here, and it repeated for weeks because this script said
+# nothing about it.
+#
+# This script REPORTS the signature; it does not try to fix it. Signing needs
+# the identity's private key out of the login keychain, and a non-GUI session
+# cannot have it — over ssh `codesign` fails with `errSecInternalComponent`,
+# and `launchctl asuser` needs root. Since this script exists precisely to
+# build from a Linux workstation over ssh, an attempt here can never succeed,
+# and `codesign --force` on a bundle it is then going to install is a real risk
+# taken for a guaranteed failure. `build-macos-signed.sh` is the tool that
+# signs, run from Terminal.app on the Mac; this one points at it.
+DR="$(remote "codesign -d -r- $BUNDLE 2>&1 | sed -n 's/^.*designated => //p'" || true)"
+say "designated requirement: ${DR:-<unsigned>}"
+case "$DR" in
+  *cdhash*)
+    printf '\033[33m%s\033[0m\n' "    ad-hoc: this build has a fresh identity, so macOS will re-prompt for"
+    printf '\033[33m%s\033[0m\n' "    Screen Recording and for every keychain item, and Privacy & Security"
+    printf '\033[33m%s\033[0m\n' "    will gain another 'keeper' row. To stop that for good, run ONCE from"
+    printf '\033[33m%s\033[0m\n' "    Terminal.app on $HOST (not over ssh):"
+    printf '\033[33m%s\033[0m\n' "        bun run tauri:build:signed -- --install"
+    printf '\033[33m%s\033[0m\n' "    Then remove BOTH stale 'keeper' rows from Privacy & Security first —"
+    printf '\033[33m%s\033[0m\n' "    a row for an identity that no longer exists is checked and does nothing."
+    ;;
+esac
+
 if [ -n "${KEEPER_MACOS_BUILD_ONLY:-}" ]; then
   say "build only; leaving $DEST alone"
   exit 0
