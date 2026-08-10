@@ -31,6 +31,7 @@ use ts_rs::TS;
 
 use crate::notes::index::NoteTagTerm;
 use crate::notes::order::NoteOrder;
+use crate::vm::RecordingNoteTargetKind;
 
 /// One notes-flagged sync profile, with its index state (FR-94, FR-95).
 ///
@@ -140,17 +141,30 @@ pub struct NoteRowVm {
     pub order: NoteOrder,
 }
 
-/// One window of the note list, with the total behind it (FR-103).
+/// One window of the note list, with the counts behind it (FR-103, FR-166).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteListVm {
     /// The rows in this window, in list order.
     pub rows: Vec<NoteRowVm>,
-    /// Total matching notes, so the scrollbar is honest about a window it has not
-    /// been sent.
+    /// How many notes this lens SELECTS, so the scrollbar is honest about a
+    /// window it has not been sent and the count is honest about a vault the
+    /// viewport never rendered (Story 44.11).
+    ///
+    /// Never a count of rendered rows and never a count of the page: it is
+    /// [`crate::notes::counts::Selection::total`], taken over the whole matched
+    /// set before any offset or window.
     pub total: u32,
-    /// Offset of `rows[0]` within the total.
+    /// How many notes the lens MATCHED, before the space's `keeper.limit`
+    /// declined any (Story 44.11, DW-163).
+    ///
+    /// Equal to `total` for every lens with no cap in force, which is every
+    /// list outside a space and every space that sets no limit. When it is
+    /// larger, the surface says both numbers — a cap that quietly shrank a
+    /// count is the same defect as a count of the rendered window.
+    pub matched: u32,
+    /// Offset of `rows[0]` within `total`.
     pub offset: u32,
 }
 
@@ -237,7 +251,15 @@ pub struct NoteSpaceVm {
     /// changed. Rust decides; the form selects what Rust decided; saving sends
     /// that back.
     pub sort_effective: String,
-    /// Maximum rows the space yields.
+    /// The most notes this space holds — a cap on what it SELECTS, not on what
+    /// a surface renders (Story 44.11, DW-163). Zero is "no cap", which is what
+    /// a space with no `keeper.limit` key sends and what saving zero back
+    /// leaves the file without.
+    ///
+    /// Applied after the sort, so a space capped at twenty keeps the twenty its
+    /// own ordering put first. Not clamped to the list's page size: the page is
+    /// how many rows one read carries, and shrinking a space to fit one would
+    /// drop notes the space genuinely holds.
     pub limit: u32,
     /// The icon the sidebar draws for this space, as the name of one member of
     /// the fixed set the editor offers (FR-149, UX-DR55). `None` for a space
@@ -256,6 +278,15 @@ pub struct NoteSpaceVm {
     /// second copy. Read from `keeper.default`, which only keeper writes and the
     /// editor never touches.
     pub default_key: Option<String>,
+    /// The template a note created in this space starts from — a vault-relative
+    /// path, or a bare name inside the template directory (FR-162, Story 44.7).
+    /// `None` for a space that hands out no template, which is most of them.
+    ///
+    /// Carried as the stored text, unresolved: whether the path still names a
+    /// note is a question about the vault at create time, not at render time, so
+    /// the editor shows what the file says and the create path is what reports a
+    /// template that has gone missing.
+    pub template: Option<String>,
     /// The presentation keys of this space's frontmatter that keeper could not
     /// read, each already worded as a finished sentence (Story 44.4).
     ///
@@ -437,6 +468,21 @@ pub struct NoteChangeBatch {
     pub vault_id: String,
     /// Ops in order; apply them in sequence.
     pub ops: Vec<NoteListOp>,
+    /// The lens's counts as of this batch, on
+    /// [`NoteListVm::total`]/[`NoteListVm::matched`]'s terms (Story 44.11).
+    ///
+    /// **On the envelope rather than inside `Reset`, and not derived by the
+    /// receiver.** Both numbers are recomputed over the whole matched set for
+    /// every batch this loop sends, so the count on screen is the count Rust
+    /// just took. The frontend used to carry `total` forward itself, adding one
+    /// per `Upsert` of an unseen id and subtracting one per `Remove` — which is
+    /// right only while every change to the matched set also changes the
+    /// window. A note that starts matching a filter three thousand rows below
+    /// the page moves no row and used to move no count, and after Story 44.10
+    /// windowed the list there is no scroll that would have corrected it.
+    pub total: u32,
+    /// How many the lens matched before `keeper.limit` declined any.
+    pub matched: u32,
 }
 
 /// One index-based note-list operation.
@@ -449,11 +495,11 @@ pub struct NoteChangeBatch {
 #[ts(export)]
 pub enum NoteListOp {
     /// Replace the whole window. Opens every subscription.
-    Reset {
-        rows: Vec<NoteRowVm>,
-        /// Total matching notes behind the window.
-        total: u32,
-    },
+    ///
+    /// Carries no count of its own: [`NoteChangeBatch::total`] is the one
+    /// answer, and a second copy on the op that only some batches contain is a
+    /// second copy that goes stale between them.
+    Reset { rows: Vec<NoteRowVm> },
     /// Insert or replace the row at `index`.
     Upsert { index: u32, row: NoteRowVm },
     /// Drop the row with this note id, wherever it currently sits.
@@ -558,6 +604,108 @@ pub struct NoteAttachmentVm {
     pub markdown: String,
 }
 
+/// A CSV attachment projected as a table (Story 44.16, FR-172).
+///
+/// Cells, not bytes: the file's quoting, terminators and byte-order mark stay
+/// in [`crate::notes::csv`], which is the only thing that ever writes them
+/// back. The webview holds displayed values and the coordinates they came from,
+/// so an edit is "row 4, column 2 is now this" rather than a re-serialised
+/// file — the webview cannot reformat what it cannot spell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCsvVm {
+    /// Vault-relative path of the file that was actually read, which may differ
+    /// from the embed's target: `![[data.csv]]` names a file the shell locates.
+    pub rel_path: String,
+    /// Content revision of the bytes these cells came from. An edit sends it
+    /// back, so a file that changed underneath is refused instead of clobbered.
+    pub rev: String,
+    /// Columns the first record has — the width the table draws.
+    pub columns: u32,
+    /// Records in the whole file, which `rows` may be only the first of.
+    pub total_rows: u32,
+    /// The records this table shows, in file order.
+    pub rows: Vec<NoteCsvRowVm>,
+    /// Finished sentences about anything odd: a ragged row, a quote that never
+    /// closes, a row count that was capped. Empty when there is nothing to say.
+    /// Worded here rather than in the webview, on this module's standing rule.
+    pub notices: Vec<String>,
+}
+
+/// One record of a CSV table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCsvRowVm {
+    /// 0-based index of this record in the **file**, not in `rows`. An edit
+    /// sends this back, so a capped window still names the right record.
+    pub index: u32,
+    /// 1-based line the record starts on, so a notice about it points at
+    /// something the user can find in a text editor.
+    pub line: u32,
+    /// The displayed values, exactly as many as the record has.
+    pub cells: Vec<String>,
+    /// Whether this record's field count differs from `columns`. Shown as odd
+    /// rather than padded or dropped: a table that loses somebody's row is
+    /// worse than a table that admits the row is strange.
+    pub ragged: bool,
+}
+
+/// One folder, listed for a note's gallery block (Story 44.15, FR-171, AD-84).
+///
+/// **Every entry, classified — not only the ones a gallery shows.** The kind is
+/// [`crate::vm::RecordingNoteTargetKind`], decided by the one classifier
+/// (AD-73), and a `File` or a `Folder` crosses the wire with the rest. Which
+/// kinds a gallery renders is the gallery's rule and not the listing's, and
+/// filtering here would make "a non-media file is skipped" a claim no test
+/// outside the Tauri shell can reach.
+///
+/// **Pinning is nowhere in this VM, on purpose.** A pin lives in the NOTE that
+/// holds the block, so two notes over one folder pin different things. A pin
+/// stored beside the photos would be one note editing another note's view, and
+/// there is no field here it could be written into.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteGalleryVm {
+    /// The vault-relative folder that was listed, echoed back so a reply that
+    /// arrives after the block was retargeted can be discarded rather than
+    /// rendered under the wrong heading.
+    pub folder: String,
+    /// The folder's entries in the listing's own order, or empty when
+    /// `problem` says why there are none.
+    pub items: Vec<NoteGalleryItemVm>,
+    /// Whether the listing cap cut the folder short. Said, never hidden.
+    pub truncated: bool,
+    /// A finished sentence for a folder that could not be listed — missing,
+    /// unreadable, or a path that escapes the vault. Composed in Rust because
+    /// the reason is Rust's: the webview never learns which of the three it
+    /// was, only what to show. `None` when the listing succeeded, including
+    /// when it succeeded and found nothing.
+    pub problem: Option<String>,
+}
+
+/// One entry of a listed gallery folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteGalleryItemVm {
+    /// The entry's own file name, with no path in it — what a tile is labelled.
+    pub name: String,
+    /// The entry's vault-relative path, `/`-joined. This is what a pin is
+    /// written as, so the note holds a path Obsidian resolves and never an
+    /// absolute one (FR-145).
+    pub rel_path: String,
+    /// What this entry is, from the one classifier (Story 43.5, AD-73).
+    pub kind: RecordingNoteTargetKind,
+    /// The `keeper-note://…` URL a tile's element loads, composed here so the
+    /// webview never joins a root and a subpath (AD-65). Present for every
+    /// entry the protocol will serve and `None` for the rest — a `File` or a
+    /// `Folder` has no URL because nothing asks for its bytes.
+    pub url: Option<String>,
+}
+
 /// One wikilink autocomplete candidate (FR-108).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -637,7 +785,12 @@ pub struct NoteQueryReq {
     pub origin: Option<String>,
     /// `is:` flag names the result must carry.
     pub flags: Vec<String>,
+    /// Where this page starts in the selected set.
     pub offset: u32,
+    /// How many rows this PAGE carries — the transport window, and the only
+    /// limit a caller owns. A space's own `keeper.limit` caps what the space
+    /// selects and is not this (Story 44.11); the page walks over whatever the
+    /// space selected.
     pub limit: u32,
 }
 
@@ -655,6 +808,35 @@ pub struct NoteCreateReq {
     /// Destination directory, vault-relative; the vault root when absent.
     pub dest: Option<String>,
     pub tags: Vec<String>,
+    /// The id of the space note this create was asked for from, when the ask
+    /// came from a space row rather than from the rail (Story 44.6, FR-160).
+    ///
+    /// The space's **id**, never its query text: the shell reads the space note
+    /// and derives what the new note has to carry through
+    /// [`crate::notes::seed`], so no surface outside Rust ever parses a query
+    /// or decides what `is:pinned` means (AD-58). An id naming no space creates
+    /// an ordinary note — a space deleted between the click and the write is
+    /// not a reason to lose the thought.
+    pub space: Option<String>,
+}
+
+/// What a create produced, and anything the person who asked for it has to be
+/// told (Story 44.6).
+///
+/// `notices` exists because creation can succeed and still not do what the user
+/// meant: a note created in a space whose query no new note can satisfy is in
+/// the vault and not in that space, and a create that returned only a
+/// [`NoteRefVm`] would leave the surface to guess at that — or, worse, to work
+/// it out by parsing the query itself. Each entry is a finished sentence
+/// composed in Rust; an empty list is the ordinary case and renders nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCreateVm {
+    /// The note that now exists.
+    pub note: NoteRefVm,
+    /// Sentences to show beside the list, in the order they were decided.
+    pub notices: Vec<String>,
 }
 
 /// A streamed content search (FR-118).
@@ -693,12 +875,20 @@ pub struct NoteSpaceReq {
     /// said why, so pressing Save is a repair the user watched happen rather
     /// than a rewrite behind their back.
     pub sort: String,
+    /// The selection cap to store, or zero for none. Zero writes no
+    /// `keeper.limit` key at all, on the same rule `icon` and `order` follow: a
+    /// space nobody capped keeps the frontmatter it had rather than growing a
+    /// key to explain a cap it does not have (Story 44.11).
     pub limit: u32,
     /// The chosen icon's name, or `None` to leave the space without one.
     pub icon: Option<String>,
     /// The space's position in the rail. Zero is "unpositioned" and is not
     /// written to the file, so a space nobody ordered grows no key to explain.
     pub order: f64,
+    /// The template to hand out, or `None`/empty to leave the space without one.
+    /// An empty string clears the key rather than storing a template whose path
+    /// is nothing.
+    pub template: Option<String>,
 }
 
 /// Change a vault's settings (FR-120).

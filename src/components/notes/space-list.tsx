@@ -18,8 +18,15 @@
  * bare dot used to be, so a column of saved views is told apart by shape rather
  * than by reading eight labels. A space with no icon, and a space whose stored
  * icon is not in the set any more, both draw the fallback glyph — never a hole.
+ *
+ * **A note can be made in a space** (Story 44.6, FR-160). The `+` beside the
+ * pencil creates a note *that space will list*, which is a different promise
+ * from "create a note somewhere": the create carries the space's id and Rust
+ * derives the tags, folder and flags the space's own query needs. This file
+ * therefore knows nothing about the DSL — the row hands up a space and the pane
+ * hands up an id.
  */
-import { Pencil, RotateCcw } from "lucide-react";
+import { FilePlus, Pencil, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { SpaceEditor, spaceIcon } from "@/components/notes/space-editor";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
@@ -59,7 +66,18 @@ export const RESTORE_NOTHING_MISSING = "Nothing was missing.";
 /** What restore says when keeper could not write. */
 export const RESTORE_FAILED = "keeper couldn't restore the default spaces.";
 
-export function SpaceList({ vaultId }: { vaultId: string | null }) {
+export function SpaceList({
+  vaultId,
+  onNewNote,
+}: {
+  vaultId: string | null;
+  /**
+   * Make a note in this space. Absent means the group renders no `+` at all —
+   * an affordance that cannot do anything is worse than none, and every caller
+   * that can create passes one.
+   */
+  onNewNote?: (space: NoteSpaceVm) => void;
+}) {
   const [spaces, setSpaces] = useState<NoteSpaceVm[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
   const [restoring, setRestoring] = useState(false);
@@ -226,6 +244,24 @@ export function SpaceList({ vaultId }: { vaultId: string | null }) {
                   )}
                 </span>
               </button>
+              {/* Always in the DOM, revealed on hover or focus, for the pencil's
+                  reason. The accessible name carries the space, because a
+                  column of eight rows would otherwise offer eight controls all
+                  called "New note". */}
+              {onNewNote !== undefined && (
+                <button
+                  type="button"
+                  aria-label={`New note in ${space.name}`}
+                  onClick={() => onNewNote(space)}
+                  className={cn(
+                    "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                    "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                    "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                  )}
+                >
+                  <FilePlus aria-hidden="true" className="size-3.5" />
+                </button>
+              )}
               {/* Always in the DOM, revealed on hover or focus: an affordance
                   that only exists under a pointer is one a keyboard cannot
                   reach. */}

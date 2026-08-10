@@ -720,6 +720,18 @@ describe("FilesPane — a folder, not a screenful", () => {
     expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2 + 1);
   });
 
+  /**
+   * Story 44.11, and the AC's own shape: virtualisation ON, a fixture two
+   * orders of magnitude larger than one window, and a count that is of the
+   * folder rather than of the DOM.
+   */
+  it("says how many entries the folder holds, not how many rows are mounted", async () => {
+    await openBigFolder();
+
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
+    expect(countOf("Vault")).toBe(`${(3000).toLocaleString()} items`);
+  });
+
   it("walks End and Home across rows that were never rendered", async () => {
     await openBigFolder();
 
@@ -911,5 +923,105 @@ describe("FilesPane — is this file synced", () => {
     await waitFor(() => expect(markOf("fresh.md")).toHaveAttribute("data-sync-status", "synced"));
     // …and the states that did not move did not move.
     expect(markOf("scratch.tmp")).toHaveAttribute("data-sync-status", "excluded");
+  });
+});
+
+/**
+ * The count a folder row is described by, or `null` when it carries none.
+ *
+ * Read through `aria-describedby`, which is where the count lives: a tree row's
+ * NAME is the folder, and folding a number into it would stop "Vault" being the
+ * row called Vault for anyone navigating by first letter.
+ */
+function countOf(name: string): string | null {
+  const row = screen.getByRole("treeitem", { name });
+  const id = row.getAttribute("aria-describedby");
+  return id === null ? null : (document.getElementById(id)?.textContent ?? null);
+}
+
+describe("FilesPane — how many entries", () => {
+  it("counts an open folder and says nothing about a closed one", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockImplementation((id: string, subpath: string) =>
+      Promise.resolve(
+        subpath === ""
+          ? listed(id, "", [entry("2026", "folder"), entry("readme.md", "file")])
+          : listed(id, subpath, [
+              entry("clip.mov", "video", "2026/clip.mov"),
+              entry("notes.md", "file", "2026/notes.md"),
+              entry("still.png", "image", "2026/still.png"),
+            ]),
+      ),
+    );
+    render(<FilesPane />);
+
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    // A closed folder has no count: keeper has not read it, and reading every
+    // folder to number it is exactly what lazy expansion exists not to do.
+    expect(countOf("Vault")).toBeNull();
+
+    await click(within(root).getByRole("button"));
+    await screen.findByRole("treeitem", { name: "2026" });
+    expect(countOf("Vault")).toBe("2 items");
+    expect(countOf("2026")).toBeNull();
+
+    await click(screen.getByRole("button", { name: "2026" }));
+    await screen.findByRole("treeitem", { name: "clip.mov" });
+    expect(countOf("2026")).toBe("3 items");
+
+    // Closing it takes the count with it. The listing survives in memory, so a
+    // count left behind would be a number taken at a moment nobody can name,
+    // about rows nobody can see.
+    await click(screen.getByRole("button", { name: "2026" }));
+    await waitFor(() => expect(countOf("2026")).toBeNull());
+  });
+
+  it("says zero for an empty folder rather than dropping the count", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", []));
+    render(<FilesPane />);
+
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button"));
+    await screen.findByText(FILES_EMPTY_FOLDER_SENTENCE);
+
+    expect(countOf("Vault")).toBe("0 items");
+  });
+
+  it("marks a capped listing as a floor instead of passing it off as a total", async () => {
+    // `keeper_sync::browse` stops at `LISTING_CAP` and says it did — a bit that
+    // has been on the wire since Story 43.8 and that nothing read until now. It
+    // is exactly what tells an exact count from a floor, and `1,000+` declines
+    // to be a total in the number rather than in a sentence below it.
+    const CAPPED = Array.from({ length: 1000 }, (_, index) =>
+      entry(`f${String(index).padStart(4, "0")}.md`, "file"),
+    );
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", CAPPED, "This folder holds more than 1000 items."),
+    );
+    render(<FilesPane />);
+
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button"));
+    await screen.findByRole("treeitem", { name: "f0000.md" });
+
+    expect(countOf("Vault")).toBe(`${(1000).toLocaleString()}+ items`);
+  });
+
+  it("gives no count to a folder keeper could not read", async () => {
+    // An absent drive knows no number, and `0 items` would be a claim about a
+    // folder nobody opened. The sentence Rust composed is the whole answer.
+    syncProfiles.mockResolvedValue([profile({ id: "01FIELD", name: "Field", removable: true })]);
+    syncBrowse.mockResolvedValue(
+      notListed("01FIELD", "mediaAbsent", "/Volumes/merope/Field is not there."),
+    );
+    render(<FilesPane />);
+
+    const root = await screen.findByRole("treeitem", { name: "Field" });
+    await click(within(root).getByRole("button"));
+    await screen.findByText("/Volumes/merope/Field is not there.");
+
+    expect(countOf("Field")).toBeNull();
   });
 });

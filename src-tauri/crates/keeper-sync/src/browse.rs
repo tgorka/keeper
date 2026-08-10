@@ -396,6 +396,49 @@ pub fn browse(
         }
     }
 
+    list_resolved(&profile.local_path, resolved, subpath, excludes, pending)
+}
+
+/// List one directory of a plain root that is not a sync profile.
+///
+/// The note gallery (Story 44.15, FR-171) reads a folder of a notes vault, and
+/// a vault is not a profile: it has no volume marker, no removable flag and
+/// nothing for [`volume::scan`] to answer about. What it does need is every
+/// other rule this module already carries — the lexical containment test, the
+/// canonicalizing one behind it, the built-in noise filter, the cap and the
+/// stable order — and a second `read_dir` written beside it to get them would
+/// be a second place for the containment rule to be wrong. It is one rule, and
+/// this is the entry point for a caller that has a root instead of a profile.
+///
+/// `pending` is still asked for rather than defaulted, because a caller that
+/// knows nothing about sync must say so with [`PendingView::Unavailable`]
+/// rather than be handed an empty [`PendingView::Known`] — an empty known list
+/// marks every entry `Synced`, which is the exact lie [`EntrySyncStatus`]
+/// documents against.
+pub fn browse_root(
+    root: &Path,
+    subpath: &str,
+    excludes: &ExcludeSet,
+    pending: &PendingView,
+) -> Result<BrowseListing, BrowseRefusal> {
+    let resolved = resolve(root, subpath)?;
+    list_resolved(root, resolved, subpath, excludes, pending)
+}
+
+/// Read the directory [`resolve`] already located, or say why there is none.
+///
+/// Split out of [`browse`] so [`browse_root`] can skip the volume question
+/// without skipping anything else, and so neither entry point resolves the
+/// subpath twice: the canonicalisation is two syscalls on a path that may live
+/// on a network share, and paying for it once per listing is the difference
+/// between a browser and a prober.
+fn list_resolved(
+    root: &Path,
+    resolved: Option<PathBuf>,
+    subpath: &str,
+    excludes: &ExcludeSet,
+    pending: &PendingView,
+) -> Result<BrowseListing, BrowseRefusal> {
     let Some(dir) = resolved else {
         return Ok(BrowseListing::Missing);
     };
@@ -412,7 +455,7 @@ pub fn browse(
     // would be the more thorough answer and is exactly what this module must
     // not do: opening is where trust levels, config enforcement and index
     // refreshes live, and browsing has no business near any of them.
-    let in_repository = profile.local_path.join(".git").exists();
+    let in_repository = root.join(".git").exists();
     let prefix = subpath.trim_end_matches('/');
     let read = std::fs::read_dir(&dir).map_err(|error| BrowseRefusal::Unreadable {
         reason: error.to_string(),
@@ -1232,6 +1275,92 @@ mod tests {
                     EntrySyncStatus::Waiting { reason: None }
                 ),
             ]
+        );
+    }
+
+    // --- A root that is not a profile (Story 44.15) -------------------------
+
+    /// The note gallery's listing is the Files tab's listing. If these two ever
+    /// disagree about what a folder holds, one of them grew a second reader.
+    #[test]
+    fn a_plain_root_lists_exactly_what_the_same_folder_lists_through_a_profile() {
+        let root = tempfile::tempdir().expect("temp");
+        for name in ["b.png", "a.mov", "notes.txt"] {
+            std::fs::write(root.path().join(name), b"x").expect("file");
+        }
+        std::fs::create_dir(root.path().join("sub")).expect("sub");
+        std::fs::create_dir(root.path().join(".git")).expect("noise");
+
+        let through_a_profile = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal");
+        let through_a_root =
+            browse_root(root.path(), "", &no_excludes(), &nothing_pending()).expect("no refusal");
+
+        assert_eq!(names(&through_a_root), names(&through_a_profile));
+        assert_eq!(
+            names(&through_a_root),
+            vec!["sub", "a.mov", "b.png", "notes.txt"],
+        );
+    }
+
+    /// The containment rule is not a property of having a profile. A gallery
+    /// block is text in a note, so `> [!gallery] ../../.ssh` is one line an
+    /// agent can write by accident, and it must be refused here rather than
+    /// somewhere above.
+    #[test]
+    fn a_plain_root_refuses_every_escape_a_profile_refuses() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join("inner")).expect("inner");
+        for subpath in ["..", "../..", "inner/..", "/etc", "inner//child", "."] {
+            assert!(
+                matches!(
+                    browse_root(root.path(), subpath, &no_excludes(), &nothing_pending()),
+                    Err(BrowseRefusal::Escapes { .. })
+                ),
+                "{subpath} must not be listed"
+            );
+        }
+    }
+
+    /// A vault has no volume marker and must not be treated as though it might:
+    /// a folder that is simply not there is `Missing`, which is the answer the
+    /// gallery turns into a sentence.
+    #[test]
+    fn a_plain_root_reports_a_folder_that_is_not_there_as_missing() {
+        let root = tempfile::tempdir().expect("temp");
+        assert_eq!(
+            browse_root(root.path(), "gone", &no_excludes(), &nothing_pending())
+                .expect("no refusal"),
+            BrowseListing::Missing,
+        );
+    }
+
+    /// A directory that exists and cannot be opened is a refusal carrying the
+    /// OS's own words, never an empty folder — the gallery says so rather than
+    /// rendering nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_root_refuses_an_unreadable_directory_with_the_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp");
+        let shut = root.path().join("shut");
+        std::fs::create_dir(&shut).expect("dir");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let refusal = browse_root(root.path(), "shut", &no_excludes(), &nothing_pending());
+
+        // Restored before the assertion so a failure does not leave the temp
+        // directory undeletable.
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            matches!(refusal, Err(BrowseRefusal::Unreadable { .. })),
+            "expected an unreadable refusal, got {refusal:?}"
         );
     }
 }

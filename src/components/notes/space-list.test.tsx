@@ -3,13 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the list never touches Tauri. The editor this
-// list opens reaches for three more commands, so they are stubbed here too.
+// list opens reaches for four more commands, so they are stubbed here too.
 vi.mock("@/lib/ipc/client", () => ({
   notesSpaces: vi.fn(),
   notesSpacesRestoreDefaults: vi.fn(),
   notesSpaceTerms: vi.fn(),
   notesSpaceSave: vi.fn(),
   notesTagTree: vi.fn(),
+  notesTemplates: vi.fn(),
 }));
 
 import {
@@ -25,6 +26,7 @@ import {
   notesSpacesRestoreDefaults,
   notesSpaceTerms,
   notesTagTree,
+  notesTemplates,
 } from "@/lib/ipc/client";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 
@@ -33,6 +35,7 @@ const mockRestore = vi.mocked(notesSpacesRestoreDefaults);
 const mockTerms = vi.mocked(notesSpaceTerms);
 const mockSave = vi.mocked(notesSpaceSave);
 const mockTagTree = vi.mocked(notesTagTree);
+const mockTemplates = vi.mocked(notesTemplates);
 
 function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): NoteSpaceVm {
   return {
@@ -44,6 +47,7 @@ function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): Note
     limit: p.limit ?? 500,
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
+    template: p.template ?? null,
     warnings: p.warnings ?? [],
     order: p.order ?? 0,
     error: p.error ?? null,
@@ -58,6 +62,8 @@ beforeEach(() => {
   mockSave.mockReset();
   mockTagTree.mockReset();
   mockTagTree.mockResolvedValue({ nodes: [] });
+  mockTemplates.mockReset();
+  mockTemplates.mockResolvedValue([]);
   mockTerms.mockResolvedValue({
     kind: "chips",
     tags: [{ tag: "client/acme", term: "include" }],

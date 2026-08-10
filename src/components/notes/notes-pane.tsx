@@ -32,7 +32,16 @@
  * every other space, editable and deleteable like every other space. Today is
  * gone (AD-80) — it never filtered anything, and opening today's journal entry
  * is still `⌘⌥J`, the tray and the palette.
+ *
+ * **A note can be created from the column** (Story 44.6, FR-160). Two places,
+ * and they mean different things: the button at the head of the column makes a
+ * note in the vault, and the `+` on a space row makes a note *that space will
+ * list* — which is a promise about where it turns up, so Rust reads the
+ * space's query and gives the note the tags, folder and flags it needs. When it
+ * cannot, the create still happens and the sentence Rust composed is shown
+ * above the list. Nothing here parses a query; the surface sends a space id.
  */
+import { FilePlus } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
@@ -44,6 +53,7 @@ import { TagTree } from "@/components/notes/tag-tree";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
 import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
+import { countLabel, NOTES } from "@/lib/count-label";
 import type { NoteRowVm } from "@/lib/ipc/client";
 import {
   emptyFilterReason,
@@ -61,12 +71,31 @@ import {
 } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
+import { cn } from "@/lib/utils";
 
 /** What a failed verb reads as when the rejection carries no message. */
 const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
 
 /** The name a saved space gets when it is promoted from the chip bar. */
 export const UNTITLED_SPACE_NAME = "Saved filter";
+
+/** The rail's create control, kept verbatim so a test names what a user reads. */
+export const NEW_NOTE_LABEL = "New note";
+
+/**
+ * Test id for the line that says how many notes this lens holds (Story 44.11).
+ * A slot rather than a text match, so a test asserts the NUMBER rather than
+ * re-deriving the sentence the label module composes.
+ */
+export const NOTES_COUNT_SLOT = "notes-count";
+
+/**
+ * Test id for a sentence Rust composed about a create it could not fully
+ * honour (Story 44.6). A slot rather than a text match, because the wording is
+ * Rust's and asserting it here would put a second copy of the sentence in the
+ * language that cannot produce it.
+ */
+export const NOTES_NOTICE_SLOT = "notes-create-notice";
 
 export function NotesPane() {
   const vaults = useNotesVaultsStore((s) => s.vaults);
@@ -83,6 +112,7 @@ export function NotesPane() {
   const searchNonce = useNotesFiltersStore((s) => s.searchNonce);
   const rows = useNotesListStore((s) => s.rows);
   const total = useNotesListStore((s) => s.total);
+  const matched = useNotesListStore((s) => s.matched);
   const loaded = useNotesListStore((s) => s.loaded);
   const selected = useNotesListStore((s) => s.selected);
   const actions = useNotesActions(activeVaultId);
@@ -90,6 +120,11 @@ export function NotesPane() {
   // A verb's failure belongs to the surface that asked for it, so it is shown
   // here rather than swallowed or pushed into the read mirror.
   const [actionError, setActionError] = useState<string | null>(null);
+  // What Rust had to say about a create that succeeded and still did not do
+  // what was asked — a note in a space whose query no new note can satisfy.
+  // Separate from `actionError` because it is not a failure: the note exists,
+  // and rendering it as an error would send someone looking for a broken write.
+  const [notices, setNotices] = useState<string[]>([]);
 
   useEffect(() => {
     void ensureNotesVaultsHydrated();
@@ -111,6 +146,27 @@ export function NotesPane() {
   const report = useCallback((raw: unknown) => {
     setActionError(syncErrorMessage(raw, NOTES_ACTION_FAILED));
   }, []);
+
+  /**
+   * Make a note and open it (FR-160, Story 44.6).
+   *
+   * `spaceId` is `null` from the rail's own button — a note in the vault, which
+   * the default list shows — and a space's id from that space's `+`. The
+   * difference is Rust's to act on; this only says which.
+   *
+   * Rust's notices are adopted whatever they are, including the empty list, so
+   * a second create clears the first one's sentence rather than leaving a
+   * stale explanation over a note it is not about.
+   */
+  const onCreate = useCallback(
+    (spaceId: string | null) => {
+      setActionError(null);
+      void createNote(spaceId)
+        .then((created) => setNotices(created?.notices ?? []))
+        .catch(report);
+    },
+    [report],
+  );
 
   /**
    * Promote the chip set to a space note (`⌘⇧S`, FR-105, UX-DR37).
@@ -235,7 +291,7 @@ export function NotesPane() {
         primaryViewStore.getState().setView("sync");
         return;
       case "empty-vault":
-        void createNote().catch(report);
+        onCreate(null);
         return;
       case "no-search-matches":
         notesFiltersStore.getState().setText("");
@@ -257,12 +313,32 @@ export function NotesPane() {
         <div className="shrink-0 p-2">
           <VaultSwitcher />
         </div>
+        {/* The rail's own create (Story 44.6). At the head of the column and
+            not inside the Spaces group: this one makes a note in the vault,
+            which the default list shows, while the `+` on a space row makes a
+            note that space will list. Two different promises need two
+            different controls. */}
+        <div className="shrink-0 px-2 pb-2">
+          <button
+            type="button"
+            disabled={activeVaultId === null}
+            onClick={() => onCreate(null)}
+            className={cn(
+              "flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left text-sm outline-none",
+              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              "disabled:pointer-events-none disabled:opacity-50",
+            )}
+          >
+            <FilePlus aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+            {NEW_NOTE_LABEL}
+          </button>
+        </div>
         {/* Every group below is unbounded — spaces as much as tags, now that
             the four fixed rows are spaces too — so they share one scroll
             container and everything in it stays reachable at every size
             (AD-34-4). */}
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
-          <SpaceList vaultId={activeVaultId} />
+          <SpaceList vaultId={activeVaultId} onNewNote={(space) => onCreate(space.id)} />
           <TagTree vaultId={activeVaultId} />
           <PhysicalTree vaultId={activeVaultId} />
         </div>
@@ -293,6 +369,41 @@ export function NotesPane() {
         {actionError !== null && (
           <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
             {actionError}
+          </p>
+        )}
+        {/* What Rust said about a create that could not be what the space asked
+            for. `status` and not `alert`: the note was written, and the only
+            thing wrong is where it is not. Each sentence is composed in Rust,
+            because the reason names query terms and this surface does not read
+            queries. */}
+        {notices.map((notice) => (
+          <p
+            key={notice}
+            role="status"
+            data-slot={NOTES_NOTICE_SLOT}
+            className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
+          >
+            {notice}
+          </p>
+        ))}
+        {/* How many notes this lens selects (Story 44.11, FR-166).
+
+            Above the list rather than inside it, and a sibling of the empty
+            state rather than a child of `NoteList`, because an empty set has to
+            say zero. `NoteList` is not rendered at all when the vault or the
+            filter comes up empty, and a count that vanishes exactly when the
+            answer is "none" is a count that never answers the question anyone
+            asks it.
+
+            `total` and never `rows.length`: the list is windowed and the page
+            is 200, so the array on screen is a screenful of a vault. */}
+        {!noVault && loaded && (
+          <p
+            role="status"
+            data-slot={NOTES_COUNT_SLOT}
+            className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
+          >
+            {countLabel(total, NOTES, { of: matched })}
           </p>
         )}
         {emptyKind !== null ? (

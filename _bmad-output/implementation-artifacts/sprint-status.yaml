@@ -429,17 +429,17 @@ development_status:
   44-3-default-spaces-replace-the-fixed-rail: review
   44-4-a-space-has-an-icon-an-order-and-a-sort: review
   44-5-a-note-has-an-order-you-can-see: review
-  44-6-new-note: backlog
-  44-7-templates: backlog
-  44-8-update-notes-from-their-template: backlog
+  44-6-new-note: review
+  44-7-templates: review
+  44-8-update-notes-from-their-template: review
   44-9-a-formatting-menu: review
   44-10-lists-that-render-what-you-can-see: review
-  44-11-counts: backlog
+  44-11-counts: review
   44-12-columns-you-can-size-content-you-can-read: review
   44-13-tag-entry-that-completes: review
   44-14-recording-notes-are-editable-notes: review
-  44-15-a-gallery-in-a-note: backlog
-  44-16-csv-as-a-table-you-can-edit: backlog
+  44-15-a-gallery-in-a-note: review
+  44-16-csv-as-a-table-you-can-edit: review
   44-17-sync-status-in-files: review
   epic-44-retrospective: optional
 

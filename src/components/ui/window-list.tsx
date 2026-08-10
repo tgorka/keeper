@@ -150,6 +150,88 @@ function indexAt(offsets: Float64Array, count: number, position: number): number
   return best;
 }
 
+/**
+ * Where every index starts, and — at `[count]` — where the list ends.
+ *
+ * Split out of the hook, with {@link windowSlice}, because Story 44.15's
+ * gallery is a CodeMirror widget: imperative DOM in the editor's React-free
+ * lazy chunk, which cannot call a hook and must not mount a React root to get
+ * one. Two bindings over one piece of arithmetic keeps the promise 44.10 made
+ * — that "which indices are on screen" is answered in exactly one place — while
+ * letting the surfaces that ask differ. The React hook adds measurement, a
+ * ResizeObserver and a scroll subscription on top; a grid of uniform tiles
+ * needs none of those and supplies a constant `heightAt`.
+ */
+export function rowOffsets(count: number, heightAt: (index: number) => number): Float64Array {
+  const out = new Float64Array(count + 1);
+  let running = 0;
+  for (let index = 0; index < count; index += 1) {
+    out[index] = running;
+    running += heightAt(index);
+  }
+  out[count] = running;
+  return out;
+}
+
+/** Which indices a window over `offsets` may render, and where its viewport
+ *  really ends. */
+export interface WindowSlice {
+  /** Ascending, and the only indices that may be rendered. Includes anything
+   *  `forced` named, however far off screen it is. */
+  indices: number[];
+  /** The last index the viewport actually shows, ignoring overscan and the
+   *  forced rows. `-1` for an empty list. */
+  lastVisible: number;
+}
+
+/**
+ * The window over a laid-out list: what is on screen, plus the overscan, plus
+ * whatever the caller insists stays mounted.
+ *
+ * `forced` carries indices that must be rendered wherever they are, and
+ * `undefined` entries are ignored so a caller can pass optional slots without
+ * filtering first. Each one prevents a specific way virtualising a list
+ * destroys it in silence — the roving tab stop, and the row that holds focus —
+ * and they are inserted in index order so the result stays ascending, which is
+ * what a positioned container needs to paint in one pass.
+ */
+export function windowSlice(
+  offsets: Float64Array,
+  count: number,
+  top: number,
+  height: number,
+  overscan: number,
+  forced: readonly (number | undefined)[] = [],
+): WindowSlice {
+  if (count === 0) {
+    return { indices: [], lastVisible: -1 };
+  }
+  const first = indexAt(offsets, count, top);
+  let last = first;
+  while (last + 1 < count && offsets[last + 1] < top + height) {
+    last += 1;
+  }
+  const from = Math.max(0, first - overscan);
+  const to = Math.min(count - 1, last + overscan);
+
+  const indices: number[] = [];
+  for (const extra of forced) {
+    if (extra !== undefined && extra >= 0 && extra < from && !indices.includes(extra)) {
+      indices.push(extra);
+    }
+  }
+  indices.sort((a, b) => a - b);
+  for (let index = from; index <= to; index += 1) {
+    indices.push(index);
+  }
+  for (const extra of forced) {
+    if (extra !== undefined && extra > to && extra < count && !indices.includes(extra)) {
+      indices.push(extra);
+    }
+  }
+  return { indices, lastVisible: last };
+}
+
 export function useWindowedRows<K>({
   count,
   getKey,
@@ -230,16 +312,10 @@ export function useWindowedRows<K>({
   // `revision` in the dependency list is a re-run trigger, not a read: a new
   // measurement mutates the store in place and bumps it, and that bump is what
   // makes these offsets a function of everything measured so far.
-  const offsets = useMemo(() => {
-    const out = new Float64Array(count + 1);
-    let running = 0;
-    for (let index = 0; index < count; index += 1) {
-      out[index] = running;
-      running += measured.current.get(getKey(index)) ?? box;
-    }
-    out[count] = running;
-    return out;
-  }, [count, getKey, box, revision]);
+  const offsets = useMemo(
+    () => rowOffsets(count, (index) => measured.current.get(getKey(index)) ?? box),
+    [count, getKey, box, revision],
+  );
 
   const totalSize = offsets[count];
 
@@ -283,36 +359,13 @@ export function useWindowedRows<K>({
   }, [anchor]);
 
   const { rows, lastVisible } = useMemo(() => {
-    if (count === 0) {
-      return { rows: [] as WindowedRow<K>[], lastVisible: -1 };
-    }
-    const first = indexAt(offsets, count, view.top);
-    let last = first;
-    while (last + 1 < count && offsets[last + 1] < view.top + view.height) {
-      last += 1;
-    }
-    const from = Math.max(0, first - overscan);
-    const to = Math.min(count - 1, last + overscan);
-
-    const indices: number[] = [];
-    for (const extra of [pinnedIndex, anchor?.index]) {
-      if (extra !== undefined && extra >= 0 && extra < from && !indices.includes(extra)) {
-        indices.push(extra);
-      }
-    }
-    indices.sort((a, b) => a - b);
-    for (let index = from; index <= to; index += 1) {
-      indices.push(index);
-    }
-    for (const extra of [pinnedIndex, anchor?.index]) {
-      if (extra !== undefined && extra > to && extra < count && !indices.includes(extra)) {
-        indices.push(extra);
-      }
-    }
-
+    const slice = windowSlice(offsets, count, view.top, view.height, overscan, [
+      pinnedIndex,
+      anchor?.index,
+    ]);
     return {
-      rows: indices.map((index) => ({ index, key: getKey(index), start: offsets[index] })),
-      lastVisible: last,
+      rows: slice.indices.map((index) => ({ index, key: getKey(index), start: offsets[index] })),
+      lastVisible: slice.lastVisible,
     };
   }, [anchor, count, getKey, offsets, overscan, pinnedIndex, view]);
 

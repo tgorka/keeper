@@ -36,4 +36,15 @@ origin: string | null,
 /**
  * `is:` flag names the result must carry.
  */
-flags: Array<string>, offset: number, limit: number, };
+flags: Array<string>, 
+/**
+ * Where this page starts in the selected set.
+ */
+offset: number, 
+/**
+ * How many rows this PAGE carries — the transport window, and the only
+ * limit a caller owns. A space's own `keeper.limit` caps what the space
+ * selects and is not this (Story 44.11); the page walks over whatever the
+ * space selected.
+ */
+limit: number, };

@@ -38,8 +38,20 @@ export interface NotesListState {
    * read yet", because the two want opposite copy on screen.
    */
   rows: NoteRowVm[];
-  /** How many notes the active filter matches in total, across every window. */
+  /**
+   * How many notes the active lens SELECTS, across every window (Story 44.11).
+   *
+   * Always Rust's number, never derived here: `reset` takes it and every batch
+   * carries a fresh one. The list is windowed (AD-58, Story 44.10), so this is
+   * the only honest thing to show a reader and the only honest thing to page
+   * against — `rows.length` is a screenful.
+   */
   total: number;
+  /**
+   * How many the lens MATCHED before a space's `keeper.limit` declined any.
+   * Equal to `total` unless a cap bit.
+   */
+  matched: number;
   /** Where this window starts in the filtered set. */
   offset: number;
   /** Whether a first list read has landed. */
@@ -81,20 +93,26 @@ export interface NotesListState {
 export const notesListStore = createStore<NotesListState>()((set) => ({
   rows: [],
   total: 0,
+  matched: 0,
   offset: 0,
   loaded: false,
   selected: null,
   limit: NOTES_PAGE_SIZE,
-  reset: (vm) => set({ rows: vm.rows, total: vm.total, offset: vm.offset, loaded: true }),
+  reset: (vm) =>
+    set({
+      rows: vm.rows,
+      total: vm.total,
+      matched: vm.matched,
+      offset: vm.offset,
+      loaded: true,
+    }),
   applyBatch: (batch) =>
     set((state) => {
       let rows = state.rows;
-      let total = state.total;
       for (const op of batch.ops) {
         switch (op.op) {
           case "reset": {
             rows = op.rows;
-            total = op.total;
             break;
           }
           case "upsert": {
@@ -108,9 +126,6 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
             const existing = next.findIndex((row) => row.id === op.row.id);
             if (existing >= 0) {
               next.splice(existing, 1);
-            } else {
-              // A row that was not in the window is one more row in the set.
-              total += 1;
             }
             next.splice(Math.min(op.index, next.length), 0, op.row);
             rows = next;
@@ -122,21 +137,36 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
               break;
             }
             rows = rows.slice(0, at).concat(rows.slice(at + 1));
-            total = Math.max(0, total - 1);
             break;
           }
         }
       }
+      // The counts come off the envelope rather than being carried forward by
+      // one per op (Story 44.11). The arithmetic version was right only while
+      // every change to the matched set also changed the window: a note that
+      // starts matching the filter three thousand rows below the page produces
+      // no op, so it moved no count — and once the list is windowed there is no
+      // scroll that would have corrected it. Rust recounts the whole set for
+      // every batch it sends, so this is a copy, not a derivation.
+      //
       // The cursor is NOT cleared when its row leaves the window. The note stays
       // open in the editor and the row is simply no longer listed (UX-DR41); a
       // cursor that reset itself would move the user's place on every agent
       // write.
-      return { rows, total, loaded: true };
+      return { rows, total: batch.total, matched: batch.matched, loaded: true };
     }),
   select: (vaultId, noteId) => set({ selected: { vaultId, noteId } }),
   clearSelection: () => set({ selected: null }),
   growWindow: () => set((state) => ({ limit: state.limit + NOTES_PAGE_SIZE })),
-  clear: () => set({ rows: [], total: 0, offset: 0, loaded: false, limit: NOTES_PAGE_SIZE }),
+  clear: () =>
+    set({
+      rows: [],
+      total: 0,
+      matched: 0,
+      offset: 0,
+      loaded: false,
+      limit: NOTES_PAGE_SIZE,
+    }),
 }));
 
 /**
@@ -152,6 +182,7 @@ export function resetNotesListStoreForTest(): void {
   notesListStore.setState({
     rows: [],
     total: 0,
+    matched: 0,
     offset: 0,
     loaded: false,
     selected: null,

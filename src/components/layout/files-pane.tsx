@@ -64,6 +64,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
 import { useWindowedRows } from "@/components/ui/window-list";
+import { countLabel, ITEMS } from "@/lib/count-label";
 import type { FilesEntryVm, FilesListingVm, IpcError, SyncProfileVm } from "@/lib/ipc/client";
 import { revealPath, syncBrowse, syncOpenEntry, syncProfiles } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -138,6 +139,12 @@ export const FILES_WRITE_CONTROL_LABELS = [
 /** Test id for one tree row, suffixed with the row's node key. */
 export const FILES_ROW_TESTID = "files-row";
 
+/**
+ * Test id for the count beside an open folder's name (Story 44.11). A slot, so
+ * a test asserts the number rather than re-deriving the sentence.
+ */
+export const FILES_COUNT_SLOT = "files-entry-count";
+
 /** Test id for the sentence a non-`listed` state produces — the absent drive,
  * the folder that moved, the volume that is not the expected one. Distinct from
  * the empty-folder sentence on purpose: that distinction is the story. */
@@ -191,6 +198,17 @@ interface TreeNodeRow {
   /** `null` for a profile root, which is a folder with no dirent behind it and
    * therefore no reveal / copy / open actions of its own. */
   entry: FilesEntryVm | null;
+  /**
+   * How many entries this folder's listing holds, already worded — or `null`
+   * for anything that is not an open folder with a listing in hand (Story
+   * 44.11).
+   *
+   * Only an OPEN folder carries one. A listing survives a collapse in
+   * `listings`, so a closed folder could show the number it had when it was
+   * last read — a count of rows nobody can see, taken at a time nobody can
+   * name. A count belongs beside the rows it counts.
+   */
+  count: string | null;
 }
 
 /** One line of prose between rows: "Reading…", the empty-folder sentence, the
@@ -220,6 +238,36 @@ function isIpcError(value: unknown): value is IpcError {
   }
   const v = value as Record<string, unknown>;
   return typeof v.code === "string" && typeof v.message === "string";
+}
+
+/**
+ * How many entries one folder holds, worded — or `null` where there is nothing
+ * honest to say (Story 44.11, FR-166).
+ *
+ * **The count is of the listing, and it says when the listing is a floor.**
+ * `keeper_sync::browse` stops at `LISTING_CAP` entries and reports that it did
+ * (`truncated`), a bit that has been on the wire since Story 43.8 and that
+ * nothing has ever read. It is exactly the fact this count needs: below the cap
+ * the number is the folder, at the cap it is a floor, and `1,000+ items` says
+ * so in the number rather than leaving the reader to find the sentence
+ * underneath.
+ *
+ * Counting past the cap was considered and rejected. The reader would have to
+ * keep `stat`ing dirents to apply the same exclusion rule to each one, which on
+ * the fifty-thousand-entry folder that motivated the cap is fifty thousand
+ * syscalls to turn `1,000+` into `48,213` — a worse answer to the same
+ * question, since "more than a thousand, open it in Finder" is already what the
+ * reader can act on.
+ *
+ * `null` for every state that is not a listing: an absent drive, a foreign
+ * volume, a folder that moved, a read in flight. None of those knows a number,
+ * and `0 items` would be a claim about a folder keeper could not open.
+ */
+function entryCount(listing: FilesListingVm | undefined): string | null {
+  if (listing?.entries == null) {
+    return null;
+  }
+  return countLabel(listing.entries.length, ITEMS, { atLeast: listing.truncated });
 }
 
 /** What the affordance opens, for its accessible name. Every row's is the
@@ -471,6 +519,7 @@ export function FilesPane() {
           open,
           parentKey: key,
           entry,
+          count: open ? entryCount(listings.get(childKey)) : null,
         });
         if (open) {
           walk(profileId, entry.relativePath, level + 1);
@@ -500,6 +549,7 @@ export function FilesPane() {
         open,
         parentKey: null,
         entry: null,
+        count: open ? entryCount(listings.get(key)) : null,
       });
       if (open) {
         walk(profile.id, "", 2);
@@ -655,6 +705,12 @@ export function FilesPane() {
     if (!node.isFolder && entry !== null) {
       Icon = KIND_ICON[entry.kind];
     }
+    // Derived from the row's own key, which is already unique per row and
+    // stable across a re-render. Percent-encoded because the key joins two
+    // user-supplied strings with a NUL, and an `aria-describedby` value is a
+    // space-separated list of ids — a raw path with a space in it would name
+    // two ids, neither of which exists.
+    const countId = `files-count-${encodeURIComponent(node.key)}`;
     return (
       <div
         ref={(element) => {
@@ -669,6 +725,15 @@ export function FilesPane() {
         aria-level={node.level}
         aria-expanded={node.isFolder ? node.open : undefined}
         aria-label={node.name}
+        // The count DESCRIBES the row; it is not part of its name (Story
+        // 44.11). A tree row's name is the folder — that is what a person
+        // navigating by first letter is matching against, and folding a number
+        // into it would make "Vault" stop being the row called Vault. The
+        // description is where supplementary facts belong, and `aria-label`
+        // would otherwise swallow the count entirely: it replaces the subtree's
+        // contribution to the name, so a count rendered only as a child would be
+        // visible and unspeakable.
+        aria-describedby={node.count === null ? undefined : countId}
         data-testid={`${FILES_ROW_TESTID}-${entry === null ? node.profileId : node.subpath}`}
         onKeyDown={(event) => onRowKeyDown(event, node)}
         onFocus={() => setRememberedKey(node.key)}
@@ -712,6 +777,19 @@ export function FilesPane() {
             )
           }
         </RowName>
+        {/* How many entries this open folder holds (Story 44.11, FR-166).
+            The listing's own count, not the number of rows the window mounted
+            under it — the tree is virtualised (Story 44.10), so what is in the
+            DOM below this row is a screenful whatever the folder holds. */}
+        {node.count !== null && (
+          <span
+            id={countId}
+            data-slot={FILES_COUNT_SLOT}
+            className="shrink-0 text-muted-foreground text-xs tabular-nums"
+          >
+            {node.count}
+          </span>
+        )}
         {/* Between the name and the actions: what this file's sync state is.
         Never focusable — see {@link SyncStatusMark}. A profile root has no
         entry of its own and takes no mark; its children answer for themselves. */}

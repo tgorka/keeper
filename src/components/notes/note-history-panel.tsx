@@ -1,5 +1,6 @@
 /**
- * Per-note history and diff (Story 38.5/38.4, FR-114, AD-63).
+ * Per-note history, diff and restore (Story 38.5/38.4/44.8, FR-114, FR-163,
+ * AD-63).
  *
  * There is no history store. Every revision here is projected from the commits
  * the sync engine already writes, and the device, origin and source on each row
@@ -10,14 +11,37 @@
  * It renders **in place of the editor**, not over it: history is read while
  * scanning the list, and a dialog would cover the list and force a decision.
  * `Back to editor` and Escape both return.
+ *
+ * **Restore, added by 44.8.** Until then this surface could show you a revision
+ * and could not act on one, which made "the note's history can undo it" a claim
+ * nothing in the app could keep. Restoring is an ordinary write, so it becomes a
+ * revision of its own and is itself undoable — which is why it needs no
+ * confirmation dialog and gets a two-step press instead: nothing here is
+ * destructive, but nothing here should be one stray click away either.
  */
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { type NoteDiffVm, type NoteRevisionVm, notesDiff, notesHistory } from "@/lib/ipc/client";
+import {
+  type NoteDiffVm,
+  type NoteRevisionVm,
+  notesDiff,
+  notesHistory,
+  notesRestoreRevision,
+} from "@/lib/ipc/client";
+import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** Bounded by decision: a 400-revision note paginates rather than revwalking
  *  itself into memory. */
 export const NOTE_HISTORY_PAGE = 50;
+
+/** The restore control before it is armed. */
+export const RESTORE_REVISION = "Restore this version";
+
+/** And after, so the second press is the one that writes. */
+export const RESTORE_REVISION_CONFIRM = "Restore — press again";
+
+/** What restore says when the write did not happen. */
+export const RESTORE_REVISION_FAILED = "keeper couldn't restore that version.";
 
 export interface NoteHistoryPanelProps {
   vaultId: string;
@@ -31,6 +55,8 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
   const [selected, setSelected] = useState<string | null>(null);
   const [diff, setDiff] = useState<NoteDiffVm | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const [armed, setArmed] = useState<string | null>(null);
+  const [restored, setRestored] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -93,9 +119,39 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
         <Button size="sm" variant="ghost" onClick={onBack}>
           Back to editor
         </Button>
+        <span className="flex-1" />
+        {selected === null ? null : (
+          <Button
+            size="sm"
+            variant={armed === selected ? "default" : "ghost"}
+            disabled={restored === selected}
+            onClick={() => {
+              if (armed !== selected) {
+                setArmed(selected);
+                setFailure(null);
+                return;
+              }
+              setArmed(null);
+              void notesRestoreRevision(vaultId, noteId, selected)
+                .then(() => setRestored(selected))
+                .catch((raw: unknown) =>
+                  setFailure(syncErrorMessage(raw, RESTORE_REVISION_FAILED)),
+                );
+            }}
+          >
+            {armed === selected ? RESTORE_REVISION_CONFIRM : RESTORE_REVISION}
+          </Button>
+        )}
       </div>
+      {restored === null ? null : (
+        <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+          Restored. That write is a version of its own, so this is undoable too.
+        </p>
+      )}
       {failure === null ? null : (
-        <p className="px-3 py-2 text-xs text-muted-foreground">{failure}</p>
+        <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
+          {failure}
+        </p>
       )}
       {failure === null && revisions.length === 0 ? (
         <p className="px-3 py-2 text-xs text-muted-foreground">

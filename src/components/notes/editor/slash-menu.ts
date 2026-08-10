@@ -61,6 +61,15 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { label: "Table", detail: "two columns, one row", text: () => TABLE_SKELETON },
   { label: "Code fence", detail: "```", text: () => "```\n\n```\n" },
   { label: "Mermaid diagram", detail: "```mermaid", text: () => "```mermaid\ngraph TD\n\n```\n" },
+  // The one way into Story 44.15's block that does not require knowing its
+  // syntax. The caret lands after the space, where the folder goes; the block
+  // stays source until the caret leaves it, so a half-typed folder is never
+  // listed.
+  {
+    label: "Gallery",
+    detail: "> [!gallery] a folder of media",
+    text: () => "> [!gallery] ",
+  },
 ];
 
 export function slashMenuSource(

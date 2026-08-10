@@ -809,6 +809,97 @@ pub fn decompose(input: &str) -> Result<NoteSpaceTermsVm, QueryError> {
     }
 }
 
+/// One term of a flat conjunction, in the vocabulary a surface that has to
+/// *act* on a query speaks (Story 44.6).
+///
+/// Beside [`decompose`] rather than inside it because the two answer different
+/// questions about the same tokens. `decompose` asks "can the chip bar hold all
+/// of this?" and refuses everything the moment one term is outside the chip
+/// vocabulary, because a chip that saved three terms of a four-term query would
+/// silently delete the fourth. Creation asks "which of these can a new note be
+/// made to satisfy?" and must answer term by term: a space filtered
+/// `tag:work date:created>=-7d` has one term creation acts on and one it does
+/// not need to, and refusing the pair wholesale would leave the new note
+/// untagged for no reason.
+///
+/// The two therefore share the tokenizer and nothing else — there is still one
+/// grammar and one definition of a token, which is the property that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Term {
+    /// This term's own source text, verbatim, so a surface can name a term it
+    /// could not act on without inventing a spelling for it.
+    pub source: String,
+    /// Whether the term was written with a leading `-`.
+    pub negated: bool,
+    /// The predicate key — `tag`, `is`, `path`, … — or `None` for a bareword,
+    /// which the grammar treats as `text:`.
+    pub key: Option<String>,
+    /// Everything after the first unquoted colon, with the quotes already gone;
+    /// the whole word for a bareword.
+    pub value: String,
+}
+
+/// Split a query into the flat conjunction of terms it is, or `None` when it is
+/// not one.
+///
+/// `None` for any query carrying `|`, a group, or a dangling `-`: those have
+/// structure, and a term lifted out of a disjunction is not a term the whole
+/// query requires. A caller that cannot act on the structure must then act on
+/// nothing rather than on half of it — the same refusal [`decompose`] makes,
+/// for the same reason.
+///
+/// The input is **not** validated here; a caller that needs a parseable query
+/// calls [`parse`] first. Splitting is deliberately total so a surface can
+/// still name the terms of a query that does not parse.
+pub fn conjunction(input: &str) -> Option<Vec<Term>> {
+    let tokens = tokenize(input);
+    let mut words = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        let Tok::Word { text, colon } = &token.tok else {
+            return None;
+        };
+        words.push((text.as_str(), *colon, token.span));
+    }
+
+    let mut terms = Vec::with_capacity(words.len());
+    let mut at = 0;
+    while at < words.len() {
+        let (word, colon, span) = words[at];
+        at += 1;
+        // A lone `-` negates the term after it, so the pair is one term and is
+        // reported as one. A trailing `-` negates nothing and is a parse error
+        // the caller will meet in `parse`; there is no honest term to report
+        // for it.
+        let (word, colon, span) = if word == "-" {
+            let (next, next_colon, next_span) = *words.get(at)?;
+            at += 1;
+            (
+                format!("-{next}"),
+                next_colon.map(|c| c + 1),
+                (span.0, next_span.1),
+            )
+        } else {
+            (word.to_owned(), colon, span)
+        };
+        let source = input.get(span.0..span.1).unwrap_or(&word).trim().to_owned();
+        let (negated, body, colon) = match word.strip_prefix('-') {
+            Some(after) => (true, after, colon.map(|c| c.saturating_sub(1))),
+            None => (false, word.as_str(), colon),
+        };
+        let (key, value) = match colon {
+            Some(split) => (Some(body[..split].to_owned()), body[split + 1..].to_owned()),
+            None => (None, body.to_owned()),
+        };
+        terms.push(Term {
+            source,
+            negated,
+            key,
+            value,
+        });
+    }
+    Some(terms)
+}
+
 /// The tag a chip would carry for a `tag:` value, or `None` when no chip can.
 ///
 /// Two refusals, both because a chip names a node: `tag:x/*` is the subtree
@@ -2129,5 +2220,76 @@ mod tests {
         assert!(decompose("(tag:a").is_err());
         assert!(decompose("").is_err());
         assert!(decompose("   ").is_err());
+    }
+
+    /// The term list a surface acting on a query reads (Story 44.6). Asserted
+    /// on `source` because that is the field a refusal is *worded* from: a term
+    /// reported as anything but what its author typed sends them looking for a
+    /// query they never wrote.
+    fn sources(query: &str) -> Vec<String> {
+        conjunction(query)
+            .expect("a flat conjunction")
+            .into_iter()
+            .map(|term| term.source)
+            .collect()
+    }
+
+    #[test]
+    fn a_flat_conjunction_splits_into_its_terms_verbatim() {
+        assert_eq!(
+            sources("tag:work is:pinned date:created>=-7d"),
+            ["tag:work", "is:pinned", "date:created>=-7d"]
+        );
+    }
+
+    /// The key/value split is the tokenizer's, so a colon the author quoted
+    /// stays inside the value instead of cutting the term in half.
+    #[test]
+    fn a_quoted_colon_does_not_split_a_term() {
+        let terms = conjunction("text:\"12:30\"").expect("a flat conjunction");
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].key.as_deref(), Some("text"));
+        assert_eq!(terms[0].value, "12:30");
+    }
+
+    /// A bareword is sugar for `text:`, and it has no key of its own to report.
+    #[test]
+    fn a_bareword_is_one_term_with_no_key() {
+        let terms = conjunction("agenda").expect("a flat conjunction");
+        assert_eq!(terms[0].key, None);
+        assert_eq!(terms[0].value, "agenda");
+        assert!(!terms[0].negated);
+    }
+
+    /// Both spellings of negation are one term, and `- tag:a` keeps the space
+    /// its author typed so the reported text is the query's own.
+    #[test]
+    fn negation_is_one_term_however_it_was_spaced() {
+        for query in ["-tag:draft", "- tag:draft"] {
+            let terms = conjunction(query).expect("a flat conjunction");
+            assert_eq!(terms.len(), 1, "{query}");
+            assert!(terms[0].negated, "{query}");
+            assert_eq!(terms[0].key.as_deref(), Some("tag"), "{query}");
+            assert_eq!(terms[0].value, "draft", "{query}");
+            assert_eq!(terms[0].source, query, "{query}");
+        }
+    }
+
+    /// Structure is not a term. A caller that cannot act on `|` or a group must
+    /// act on nothing rather than lift one branch out of it and treat it as
+    /// required — the note it created would then be filed for a condition the
+    /// query never insisted on.
+    #[test]
+    fn a_query_with_structure_is_not_a_conjunction() {
+        assert_eq!(conjunction("tag:a | tag:b"), None);
+        assert_eq!(conjunction("(tag:a tag:b) tag:c"), None);
+        assert_eq!(conjunction("tag:a -"), None);
+    }
+
+    /// Total on purpose: a surface has to be able to name the terms of a query
+    /// that does not parse, which is exactly when it has something to explain.
+    #[test]
+    fn an_unparseable_query_still_splits_into_terms() {
+        assert_eq!(sources("nope:x tag:a"), ["nope:x", "tag:a"]);
     }
 }

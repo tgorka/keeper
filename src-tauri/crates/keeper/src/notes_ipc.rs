@@ -28,28 +28,39 @@
 //! `cargo check --target aarch64-apple-ios` stays green.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
+use keeper_core::archive::recordings_fts::kind_for_file_name;
 use keeper_core::notes::default_spaces::{self, SPACES_DIR};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
+use keeper_core::notes::template_update::{
+    self, TemplateUpdateAppliedVm, TemplateUpdateApplyReq, TemplateUpdateOfferVm,
+    TemplateUpdateResultVm,
+};
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteBodyBatch, NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm,
-    NoteCreateReq, NoteDiffVm, NoteFlag, NoteFolderVm, NoteIndexProgressVm, NoteLinkTargetVm,
-    NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq, NoteRefVm, NoteRevisionVm, NoteRowVm,
-    NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm,
-    NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
+    NoteCreateReq, NoteCreateVm, NoteCsvVm, NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm,
+    NoteGalleryVm, NoteIndexProgressVm, NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm,
+    NoteQueryReq, NoteRefVm, NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm,
+    NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm,
+    NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
-use keeper_core::notes::{naming, query, search, sort, templates, NotesError};
-use keeper_core::vm::{IpcError, IpcErrorCode, TagVocabularyEntryVm, TagVocabularyVm};
+use keeper_core::notes::{
+    counts, csv, naming, query, search, seed, sort, tags, templates, NotesError,
+};
+use keeper_core::vm::{
+    IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm, TagVocabularyVm,
+};
+use keeper_sync::browse;
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ipc::AppState;
-use crate::notes_vault::{self, HeadRevision, Vault};
+use crate::notes_vault::{self, HeadRevision, Vault, ATTACHMENTS_DIR};
 
 /// How often a changes subscription may speak, at most.
 ///
@@ -86,12 +97,11 @@ const MAX_LINK_TARGETS: usize = 30;
 /// an icon. Lucide's longest name is well under this.
 const MAX_ICON_BYTES: usize = 64;
 
-/// The vault-relative template directory keeper creates lazily, on first use.
-///
-/// `spaces/` has no twin here: it is `keeper-core`'s `SPACES_DIR`, because the
-/// seeder composes paths under it and two constants spelling one directory is a
-/// rename waiting to half-land.
-const TEMPLATES_DIR: &str = "templates";
+// `TEMPLATES_DIR` used to be declared here, beside a comment explaining why
+// `spaces/` was not. Story 44.7 gave the template seeder the same shape as the
+// space seeder, so the constant moved to `keeper-core` for the same reason
+// `SPACES_DIR` lives there: the seeder composes paths under it, and two
+// constants spelling one directory is a rename waiting to half-land.
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -462,7 +472,20 @@ fn fold(value: &str) -> String {
     value.to_lowercase()
 }
 
-/// Build the windowed list for a query.
+/// Build the windowed page for a query, and the counts behind it (Story 44.11).
+///
+/// Three numbers, and keeping them apart is the whole of this function's second
+/// job:
+///
+/// - **matched** — every entry the lens admits. Taken over the whole snapshot,
+///   before anything is dropped.
+/// - **total** — how many the lens SELECTS: `matched`, capped by the space's
+///   `keeper.limit` (see [`counts`]). This is what a count shows and what
+///   pagination walks, so a caller cannot page past the cap into notes the
+///   space declined.
+/// - **the page** — `req.offset`/`req.limit`, how many rows this one read
+///   carries over the wire. Never a count of anything, and after Story 44.10
+///   never a count of what is rendered either.
 fn project_list(
     platform: &dyn keeper_core::platform::Platform,
     vault: &Vault,
@@ -474,13 +497,21 @@ fn project_list(
 
     // A space is the query DSL; everything else is the chip filter. A space also
     // brings its own ordering (Story 44.4) — the value that has sat in
-    // `keeper.sort` since Story 37.4 and that nothing read until now.
+    // `keeper.sort` since Story 37.4 and that nothing read until now — and its
+    // own selection cap (Story 44.11), which is the neighbouring value 44.4
+    // left where it was.
     let space = match req.space_id.as_ref() {
         Some(space_id) if !space_id.is_empty() => Some(space_lens(vault, &snapshot, space_id)?),
         _ => None,
     };
-    let (mut matched, ordering): (Vec<&IndexEntry>, Option<sort::SpaceSort>) = match space {
-        Some((mut parsed, ordering)) => {
+    let (mut matched, ordering, cap, space_name): (
+        Vec<&IndexEntry>,
+        Option<sort::SpaceSort>,
+        Option<u32>,
+        String,
+    ) = match space {
+        Some(lens) => {
+            let mut parsed = lens.query;
             // Bound to this snapshot so `backlink:` and title-resolved `link:`
             // can be answered at all; the binding is per snapshot revision.
             query::bind_index(&mut parsed, &snapshot);
@@ -494,7 +525,9 @@ fn project_list(
                         query::eval(&parsed, entry, &mut body, now_ms)
                     })
                     .collect(),
-                Some(ordering),
+                Some(lens.ordering),
+                lens.limit,
+                lens.name,
             )
         }
         None => {
@@ -507,6 +540,11 @@ fn project_list(
                     .filter(|entry| matches_filter(entry, req, &tags, heads.get(&entry.path)))
                     .collect(),
                 None,
+                // The plain lens has no cap and never will: `keeper.limit` is a
+                // property of a space note, and there is no file to read one
+                // out of when nobody is in a space.
+                None,
+                String::new(),
             )
         }
     };
@@ -520,21 +558,45 @@ fn project_list(
         None => matched.sort_by(|a, b| list_order(a, b)),
     }
 
-    let total = u32::try_from(matched.len()).unwrap_or(u32::MAX);
-    let offset = req.offset.min(total);
-    let limit = if req.limit == 0 {
+    // The cap is applied AFTER the ordering, which is what makes "the twenty
+    // most recent" mean what it says: sort first, then keep the first twenty.
+    // Capping the unsorted set would keep twenty arbitrary matches and change
+    // which ones every time the index walked in a different order.
+    let selection = counts::select(matched.len(), cap);
+    // A cap that declined notes is the one way this function does nothing on
+    // purpose, and a decline nobody is told about is indistinguishable from a
+    // vault that simply has fewer notes in it. `debug!` reaches no log the
+    // shipped app writes (DW-162), so the level is `keeper-core`'s — asserted
+    // there against the floor the app's own filter sets — and this call site
+    // matches over it rather than picking one, the shape `seed_default_spaces`
+    // uses and for the reason it learned.
+    if let Some((level, message)) = selection.report(&space_name) {
+        if level <= tracing::Level::WARN {
+            tracing::warn!(vault = %vault.id, "notes: {message}");
+        } else {
+            tracing::info!(vault = %vault.id, "notes: {message}");
+        }
+    }
+    // The page size is the caller's, bounded so nobody can ask for 10 000 rows
+    // of JSON and undo AD-58. WHICH rows that page names is `counts::page`'s,
+    // in the crate that can prove it: the cap has to bind before the offset, or
+    // a second read walks straight into the notes the space declined.
+    let size = if req.limit == 0 {
         DEFAULT_LIMIT
     } else {
         req.limit.min(MAX_LIMIT)
     };
+    let span = counts::page(selection, req.offset, size);
+    let offset = u32::try_from(span.start).unwrap_or(u32::MAX);
     let window: Vec<&IndexEntry> = matched
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
+        .take(span.end)
+        .skip(span.start)
         .collect();
     Ok(NoteListVm {
         rows: rows_of(platform, &vault.id, &window),
-        total,
+        total: selection.total,
+        matched: selection.matched,
         offset,
     })
 }
@@ -567,7 +629,12 @@ struct SpaceDef {
     /// list runs comes from [`sort::read`], and what the file says has to
     /// survive a round trip through the editor unrewritten.
     sort: String,
-    limit: u32,
+    /// `keeper.limit` — the most notes this space holds, or `None` for a space
+    /// that sets no cap (Story 44.11). Read through
+    /// [`counts::read_limit`], because "unset" and "capped at the page size"
+    /// used to be the same value and that conflation is what made the editor
+    /// stamp `limit: 500` into files that never had the key.
+    limit: Option<u32>,
     icon: Option<String>,
     /// `keeper.order` — where the space sits in the rail (Story 44.4).
     order: f64,
@@ -575,6 +642,11 @@ struct SpaceDef {
     /// (Story 44.3). Never written by the editor; carried through a save so
     /// editing a default does not quietly demote it.
     default_key: Option<String>,
+    /// `keeper.template` — the template notes created in this space start from
+    /// (Story 44.7, FR-162). A vault-relative path, or a bare name inside the
+    /// template directory. `None` when the space hands out no template, which
+    /// is the ordinary case.
+    template: Option<String>,
     /// What keeper could not read in the two presentation keys, already worded
     /// (Story 44.4). Empty for a file keeper understood entirely.
     warnings: Vec<String>,
@@ -601,10 +673,11 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
         name: entry.title.clone(),
         query: String::new(),
         sort: String::new(),
-        limit: MAX_LIMIT,
+        limit: None,
         icon: None,
         order: sort::DEFAULT_SPACE_ORDER,
         default_key: None,
+        template: None,
         warnings: Vec::new(),
     };
     let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
@@ -619,7 +692,7 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
             // that cannot run, which is worse than an absent feature because it
             // reads as support.
             ("sort", FieldValue::Str(stored)) => def.sort = stored.clone(),
-            ("limit", FieldValue::Num(limit)) => def.limit = clamp_limit(*limit),
+            ("limit", FieldValue::Num(limit)) => def.limit = counts::read_limit(*limit),
             ("icon", FieldValue::Str(icon)) => def.icon = space_icon(icon),
             // Matched on the key alone and flattened to text, so `order: 2`,
             // `order: "2"` and `order: [a, b]` all reach one reader instead of
@@ -637,17 +710,12 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
     // arm here, so the seeder — which reads notes off disk before the index
     // exists — and this cannot disagree about what a default is.
     def.default_key = default_spaces::default_key(pairs);
+    // Same reasoning as `default_key` above, and the same shape: the rule for
+    // what `keeper.template` means lives beside the code that applies it, so the
+    // space editor and the create path cannot disagree about which value is a
+    // template and which is a cleared field.
+    def.template = templates::space_default_template(&fm);
     def
-}
-
-/// A limit from frontmatter, clamped into the window the list will honour.
-fn clamp_limit(raw: f64) -> u32 {
-    if raw <= 0.0 {
-        return MAX_LIMIT;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let limit = raw.min(f64::from(MAX_LIMIT)) as u32;
-    limit
 }
 
 /// The icon name a space carries, or `None` when the key holds nothing usable.
@@ -672,18 +740,28 @@ fn space_icon(raw: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// The two halves of a space's lens, by note id: what it selects and how it
-/// orders what it selected.
+/// Everything one space's lens decides, by note id: what it selects, how it
+/// orders what it selected, and how much of that it keeps.
 ///
-/// One read of the note rather than two. They were separable while the sort was
-/// a value nobody applied; now that the list runs it, fetching the query here
-/// and the sort somewhere else would be two file reads that can disagree if the
-/// note changes between them.
+/// One read of the note rather than three. They were separable while the sort
+/// and the limit were values nobody applied; now that the list runs both,
+/// fetching the query here and either of the others somewhere else would be
+/// reads that can disagree if the note changes between them.
+struct SpaceLens {
+    query: query::Query,
+    ordering: sort::SpaceSort,
+    /// The space's `keeper.limit`, or `None` for a space that sets no cap.
+    limit: Option<u32>,
+    /// The space's title, for the one log line a cap that bites has to write.
+    name: String,
+}
+
+/// Read one space's whole lens off its note.
 fn space_lens(
     vault: &Vault,
     snapshot: &IndexSnapshot,
     space_id: &str,
-) -> Result<(query::Query, sort::SpaceSort), IpcError> {
+) -> Result<SpaceLens, IpcError> {
     let entry = snapshot
         .by_id(space_id)
         .ok_or_else(|| notes_error(NotesError::NotFound(space_id.to_owned())))?;
@@ -699,7 +777,12 @@ fn space_lens(
     // what it selects, and the row is already saying the file and the ordering
     // disagree. Refusing here would turn one bad word in frontmatter into an
     // empty pane with an error in it.
-    Ok((parsed, sort::read(&def.sort).sort))
+    Ok(SpaceLens {
+        query: parsed,
+        ordering: sort::read(&def.sort).sort,
+        limit: def.limit,
+        name: def.name,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1074,134 @@ pub async fn notes_tree(
     })
 }
 
+/// What a gallery says about a folder that is simply not in the vault.
+///
+/// Worded here rather than in the webview, on this module's standing rule that
+/// a finished sentence about the filesystem is composed where the filesystem
+/// was asked. It names the two things the reader can act on — the block's own
+/// text and the folder's absence — and claims nothing about why.
+const GALLERY_MISSING_FOLDER: &str =
+    "this folder is not in the vault, so there is nothing to show; check the folder named on the \
+     gallery's first line";
+
+/// One folder of the vault, for a note's gallery block (Story 44.15, FR-171,
+/// AD-84, AD-65).
+///
+/// **`notes_tree` cannot answer this and must not learn to.** That command
+/// reads the index, and the index holds notes — a folder of four hundred
+/// photographs is invisible to it. This reads the disk, once, through
+/// [`keeper_sync::browse`], which is the repo's one directory reader: the
+/// lexical containment test, the canonicalizing one behind it, the built-in
+/// noise filter, the cap and the stable order all come from there rather than
+/// from a second `read_dir` written next to it.
+///
+/// **The frontend never joins a root and a subpath.** `folder` is the text of
+/// the block's own callout title; `browse_root` resolves it against the vault
+/// root and gets to say no. Each item's `keeper-note://` URL is composed here
+/// too, so no path arithmetic happens in the webview at all (AD-65).
+///
+/// **Nothing is filtered.** Every entry crosses with the kind the one
+/// classifier gave it (AD-73), including the ones a gallery will not show. The
+/// gallery's rule — media tiles, everything else skipped and counted — belongs
+/// to the surface that renders it, and is asserted where that surface's tests
+/// run.
+///
+/// **A folder that cannot be listed is not an error.** A missing folder, an
+/// unreadable one and a path that escapes the vault all come back as a
+/// `problem` sentence inside a normal reply, because the block has to render
+/// something and a rejected promise gives a widget nothing to say. Each is
+/// logged at INFO: this command declining to list a folder is a thing the
+/// user's log must show, and `debug!` does not reach it (DW-162).
+#[tauri::command]
+pub async fn notes_gallery(vault_id: String, folder: String) -> Result<NoteGalleryVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let listing = {
+        let root = vault.root.clone();
+        let excludes = Arc::clone(&vault.excludes);
+        let folder = folder.clone();
+        // A directory of hundreds on a network share can take a long time to
+        // stat, and the async runtime carries every other vault's watcher.
+        tokio::task::spawn_blocking(move || {
+            // `Unavailable` and never an empty `Known`: a gallery asks the
+            // engine nothing, and an empty known list would mark every photo
+            // `Synced` — a claim nobody here is entitled to make.
+            browse::browse_root(&root, &folder, &excludes, &browse::PendingView::Unavailable)
+        })
+        .await
+        .map_err(|error| {
+            notes_error(NotesError::Name(format!(
+                "the gallery folder could not be read: {error}"
+            )))
+        })?
+    };
+
+    let listed = match listing {
+        Ok(keeper_sync::browse::BrowseListing::Listed(dir)) => dir,
+        Ok(other) => {
+            // `Missing` is the only other variant reachable here: `browse_root`
+            // asks no volume question, because a vault is not removable media.
+            tracing::info!(
+                vault = %vault_id,
+                folder = %folder,
+                listing = ?other,
+                "gallery: the folder was not listed",
+            );
+            return Ok(NoteGalleryVm {
+                folder,
+                items: Vec::new(),
+                truncated: false,
+                problem: Some(GALLERY_MISSING_FOLDER.to_owned()),
+            });
+        }
+        Err(refusal) => {
+            tracing::info!(
+                vault = %vault_id,
+                folder = %folder,
+                "gallery: {refusal}",
+            );
+            return Ok(NoteGalleryVm {
+                folder,
+                items: Vec::new(),
+                truncated: false,
+                problem: Some(refusal.to_string()),
+            });
+        }
+    };
+
+    let items = listed
+        .entries
+        .into_iter()
+        .map(|entry| {
+            // A directory is known from the dirent that listed it; every other
+            // kind is the extension table's answer and nobody else's (AD-73).
+            let kind = if entry.is_dir {
+                RecordingNoteTargetKind::Folder
+            } else {
+                kind_for_file_name(&entry.name)
+            };
+            NoteGalleryItemVm {
+                url: matches!(
+                    kind,
+                    RecordingNoteTargetKind::Video
+                        | RecordingNoteTargetKind::Image
+                        | RecordingNoteTargetKind::Audio
+                )
+                .then(|| notes_vault::asset_url(&vault_id, &entry.relative_path)),
+                name: entry.name,
+                rel_path: entry.relative_path,
+                kind,
+            }
+        })
+        .collect();
+
+    Ok(NoteGalleryVm {
+        folder,
+        items,
+        truncated: listed.truncated,
+        problem: None,
+    })
+}
+
 /// Every space in the vault, each with its parse status (FR-105).
 #[tauri::command]
 pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError> {
@@ -1013,9 +1224,13 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
                 query: def.query,
                 sort_effective: sort::read(&def.sort).sort.canonical(),
                 sort: def.sort,
-                limit: def.limit,
+                // Zero is the wire's "no cap" (Story 44.11) — the same value
+                // the editor sends back for a space nobody capped, so the
+                // round trip writes no `keeper.limit` key.
+                limit: def.limit.unwrap_or(0),
                 icon: def.icon,
                 default_key: def.default_key,
+                template: def.template,
                 warnings: def.warnings,
                 order: def.order,
                 error,
@@ -1066,10 +1281,12 @@ impl default_spaces::SeedVault for VaultSeedFiles<'_> {
     }
 
     fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()> {
-        // A space is a note and is announced to the reconciler; the ledger is
-        // not one, and telling the index to re-read a `.json` it never collects
-        // would be a lie about what changed.
-        let result = if rel == default_spaces::LEDGER_REL {
+        // A space or a template is a note and is announced to the reconciler;
+        // a ledger is not one, and telling the index to re-read a `.json` it
+        // never collects would be a lie about what changed. Both ledgers, or
+        // the template one would be announced as a note that does not exist.
+        let ledger = rel == default_spaces::LEDGER_REL || rel == templates::TEMPLATE_LEDGER_REL;
+        let result = if ledger {
             notes_vault::write_vault_file(self.vault, rel, text)
         } else {
             notes_vault::write_note(self.vault, rel, text)
@@ -1121,6 +1338,58 @@ pub fn seed_default_spaces(vault: &Vault) {
         tracing::warn!(vault = %vault.id, "notes: {message}");
     } else {
         tracing::info!(vault = %vault.id, "notes: {message}");
+    }
+}
+
+/// Seed this vault's default templates, and **say what happened** either way
+/// (Story 44.7, FR-161).
+///
+/// Same port, same mode, same call site and the same rule about levels as
+/// [`seed_default_spaces`] — a template lands in somebody's real vault exactly
+/// as a space does, so it gets the same care. What differs is the ledger, the
+/// three notes and the wording, all of which are `keeper-core`'s.
+///
+/// Its own ledger and its own run rather than a fourth and fifth entry in the
+/// spaces seed: a vault seeded by the build before this one has the spaces
+/// ledger and no templates ledger, and that state has to read as "offer the
+/// templates". One ledger could not say both.
+pub fn seed_default_templates(vault: &Vault) {
+    let outcome = templates::seed_templates(
+        &mut VaultSeedFiles { vault },
+        default_spaces::SeedMode::FirstRun,
+    );
+    // The level is `keeper-core`'s and is asserted there against the floor the
+    // app's own filter sets, because `debug!` reaches no log the shipped app
+    // writes (DW-162) and a seed that declined must never be invisible.
+    let (level, message) = templates::report_template_seed(&outcome);
+    if level <= tracing::Level::WARN {
+        tracing::warn!(vault = %vault.id, "notes: {message}");
+    } else {
+        tracing::info!(vault = %vault.id, "notes: {message}");
+    }
+}
+
+/// Re-create the default templates this vault is missing (FR-161).
+///
+/// The user asking, so the ledger does not get a vote — the twin of
+/// `notes_spaces_restore_defaults`, and for the same reason: the ledger exists
+/// to stop keeper acting on its own, and this is not keeper acting on its own.
+#[tauri::command]
+pub async fn notes_templates_restore_defaults(vault_id: String) -> Result<u32, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let outcome = templates::seed_templates(
+        &mut VaultSeedFiles { vault: &vault },
+        default_spaces::SeedMode::Restore,
+    );
+    match outcome {
+        default_spaces::SeedOutcome::Wrote(written) => {
+            Ok(u32::try_from(written.len()).unwrap_or(u32::MAX))
+        }
+        default_spaces::SeedOutcome::AlreadySatisfied => Ok(0),
+        default_spaces::SeedOutcome::Blocked(why) => Err(notes_error(NotesError::Name(why))),
+        default_spaces::SeedOutcome::Stopped { reason, .. } => {
+            Err(notes_error(NotesError::Name(reason)))
+        }
     }
 }
 
@@ -1184,21 +1453,42 @@ pub async fn notes_space_save(
         // repair rather than a rewrite: the editor showed the fallback and said
         // why, so pressing Save is the user agreeing to it.
         ("sort".to_owned(), FieldValue::Str(space.sort.clone())),
-        (
-            "limit".to_owned(),
-            FieldValue::Num(f64::from(space.limit.min(MAX_LIMIT))),
-        ),
     ];
     // Written only when there is one, so a space nobody gave an icon keeps the
     // frontmatter it had rather than growing an empty key to explain. The same
     // rule for the rail position: zero *is* unpositioned, so stamping
     // `order: 0` into every space would claim each of them was placed there.
+    //
+    // And the same rule for the cap, which until Story 44.11 was the exception:
+    // `limit` was written unconditionally from a value the form does not render,
+    // and a reader that turned an ABSENT key into the page size meant every
+    // space saved once grew a `limit: 500` it had never asked for — a cap the
+    // user never set, in a file they can read, that nothing was applying.
+    // Now zero is no cap and no cap writes no key.
     let with_presentation = |mut pairs: Vec<(String, FieldValue)>| {
         if let Some(icon) = space.icon.as_deref().and_then(space_icon) {
             pairs.push(("icon".to_owned(), FieldValue::Str(icon)));
         }
         if space.order != sort::DEFAULT_SPACE_ORDER {
             pairs.push(("order".to_owned(), FieldValue::Num(space.order)));
+        }
+        if space.limit > 0 {
+            pairs.push(("limit".to_owned(), FieldValue::Num(f64::from(space.limit))));
+        }
+        // Same rule as the icon: written only when there is one, so clearing the
+        // field removes the key rather than leaving `template: ""` behind for a
+        // reader to decide about. `keeper-core` already treats empty and absent
+        // as one state; this is what stops the empty one ever being written.
+        if let Some(template) = space
+            .template
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            pairs.push((
+                templates::SPACE_TEMPLATE_KEY.to_owned(),
+                FieldValue::Str(template.to_owned()),
+            ));
         }
         pairs
     };
@@ -1410,15 +1700,143 @@ fn now_local() -> String {
     chrono::Local::now().to_rfc3339()
 }
 
-/// Create a note (FR-98). No dialog anywhere in the path (UX-DR35).
+/// Create a note (FR-98, FR-160). No dialog anywhere in the path (UX-DR35).
 #[tauri::command]
-pub async fn notes_create(vault_id: String, req: NoteCreateReq) -> Result<NoteRefVm, IpcError> {
+pub async fn notes_create(vault_id: String, req: NoteCreateReq) -> Result<NoteCreateVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    create_note(&vault, &req, false)
+    create_for_space(&vault, &req)
+}
+
+/// Create a note the space it was asked for from will actually list
+/// (Story 44.6).
+///
+/// "New note in this space" is a promise about where the note turns up, so the
+/// space's own query decides what the note carries — its tags, its folder, its
+/// flags — through [`seed::inherit`]. Nothing here reads the query: the whole
+/// reading of the DSL stays in `keeper-core`, which is also the only crate that
+/// can be tested on this host (AD-55, AD-56).
+///
+/// **The verdict is taken from the bytes that were written**, not from the
+/// seed's intentions: the note is indexed through the reconciler's own parser
+/// and the space's query is run over it. A seed that was not enough therefore
+/// cannot report success, and a query the seed never touched but creation
+/// happened to satisfy (`date:created>=-7d`, `origin:local`) cannot report a
+/// failure.
+///
+/// A create that could not do what was asked **says so at `INFO`**, because a
+/// decision only the returned value carries is a decision nobody can debug from
+/// a log (DW-162).
+fn create_for_space(vault: &Vault, req: &NoteCreateReq) -> Result<NoteCreateVm, IpcError> {
+    let mut notices = Vec::new();
+    let asked = req.space.as_deref().filter(|id| !id.trim().is_empty());
+    let Some(space_id) = asked else {
+        let note = create_note(vault, req, &seed::Seed::default(), None, &mut notices)?;
+        return Ok(NoteCreateVm { note, notices });
+    };
+    let Some(space) = space_source(vault, space_id) else {
+        // Deleted between the click and the write, or never indexed. The note
+        // is still worth having, so this is a log line and not a refusal.
+        tracing::info!(
+            space = %space_id,
+            "notes: the space this note was asked for is not in the index; creating an ordinary note"
+        );
+        let note = create_note(vault, req, &seed::Seed::default(), None, &mut notices)?;
+        return Ok(NoteCreateVm { note, notices });
+    };
+    let seeded = seed::inherit(&space.query);
+    // The space's own default template, the middle rung of `template_source`'s
+    // three (Story 44.7). Read from the same one read of the space note that
+    // produced the query, so a note cannot be seeded from one version of the
+    // space and templated from another.
+    let note = create_note(vault, req, &seeded, space.template.as_deref(), &mut notices)?;
+    match notes_vault::read_note(vault, &note.path) {
+        Ok(source) => {
+            let (_, body_at) = Frontmatter::parse(&source);
+            let body = source.get(body_at..).unwrap_or_default();
+            let entry = notes_vault::index_written(&note.path, &source);
+            if let Some(sentence) = seed::verdict(
+                &space.name,
+                &space.query,
+                &entry,
+                body,
+                notes_vault::local_now_ms(),
+            ) {
+                tracing::info!(
+                    space = %space.name,
+                    note = %note.path,
+                    "notes: {sentence}"
+                );
+                notices.push(sentence);
+            }
+        }
+        Err(error) => {
+            // The note is on disk — `create_note` returned — so this is keeper
+            // failing to check its own work, not a failed create. Saying
+            // nothing would be the honest half of it; saying it at `INFO` is
+            // the rest.
+            tracing::info!(
+                %error,
+                note = %note.path,
+                "notes: created the note but could not re-read it to check the space would list it"
+            );
+        }
+    }
+    Ok(NoteCreateVm { note, notices })
+}
+
+/// The three things a create needs to know about the space it was asked for.
+struct SpaceForCreate {
+    name: String,
+    /// The stored query text, unparsed.
+    query: String,
+    /// `keeper.template`, the template this space hands out (Story 44.7).
+    template: Option<String>,
+}
+
+/// One space's name, stored query text and default template, or `None` when no
+/// space in the index carries that id.
+///
+/// Deliberately not [`space_lens`]: that one refuses a query that does not
+/// parse, which is right for listing (a broken space selects nothing) and wrong
+/// here (a broken space must still be able to hold a new note, and the user has
+/// to be told which of the two facts they are looking at).
+///
+/// **One read of the note, three answers.** Fetching the template separately
+/// would be a second read that can disagree with the first if the file changes
+/// in between — the same reasoning [`space_lens`] gives for taking the query and
+/// the sort together.
+fn space_source(vault: &Vault, space_id: &str) -> Option<SpaceForCreate> {
+    let snapshot = notes_vault::snapshot(&vault.id)?;
+    let entry = snapshot.by_id(space_id)?;
+    let source = notes_vault::read_note(vault, &entry.path).ok()?;
+    let def = space_def(entry, &source);
+    Some(SpaceForCreate {
+        name: def.name,
+        query: def.query,
+        template: def.template,
+    })
 }
 
 /// The shared create path, used by `notes_create` and by capture.
-fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<NoteRefVm, IpcError> {
+///
+/// `seed` is everything beyond the caller's request that shapes the note: the
+/// space's inherited tags, folder and flags (Story 44.6), and the capture
+/// mark, which is one of those flags rather than a parameter of its own.
+///
+/// `space_template` is the template the space hands out, the middle rung of
+/// [`template_source`]'s three (Story 44.7).
+///
+/// `notices` collects the finished sentences the caller must show. It is an
+/// out-parameter rather than a return value because the note is created either
+/// way: a notice is something to say about a note that exists, never a reason
+/// not to write one.
+fn create_note(
+    vault: &Vault,
+    req: &NoteCreateReq,
+    seed: &seed::Seed,
+    space_template: Option<&str>,
+    notices: &mut Vec<String>,
+) -> Result<NoteRefVm, IpcError> {
     let id = crate::sync_ipc::new_ulid();
     let body_source = req.body.clone().unwrap_or_default();
     // A title the caller gave, else the first line of the body — which is the
@@ -1438,32 +1856,48 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
         title
     };
 
-    // A template is expanded through the pure core, caret offset included. The
-    // offset is into the expanded body, which is exactly the space the body channel
-    // speaks in — one `\n` away, because the document keeper writes puts a blank
-    // line between the block and the body.
-    let (body, caret) = match template_source(vault, req) {
-        Some(template) => {
-            let (expanded, caret) = templates::expand(
-                &template,
+    // A template is applied through the pure core, which splits its frontmatter
+    // off, resolves the placeholders, drops the `template` tag and hands back
+    // the tags and properties the copy inherits (AD-82). The caret offset is
+    // into the expanded BODY, which is exactly the space the body channel speaks
+    // in — one `\n` away, because the document keeper writes puts a blank line
+    // between the block and the body.
+    let choice = template_source(vault, req, space_template);
+    let (applied, provenance) = match &choice {
+        TemplateChoice::Found { rel, source } => {
+            let applied = templates::expand(
+                source,
                 &templates::TemplateCtx {
                     title: title.clone(),
                     id: id.clone(),
                     now_local: now_local(),
                 },
             );
-            if body_source.trim().is_empty() {
-                (expanded, caret)
-            } else {
-                (format!("{expanded}\n{body_source}"), caret)
-            }
+            let provenance = templates::provenance_pairs(rel, applied.source_id.as_deref());
+            (Some(applied), provenance)
         }
+        TemplateChoice::Missing { named } => {
+            // The note is still created. The sentence says both halves, or it
+            // reads as a failure while the note sits right there.
+            notices.push(templates::missing_template_notice(named));
+            (None, Vec::new())
+        }
+        TemplateChoice::None => (None, Vec::new()),
+    };
+    let (body, caret) = match &applied {
+        Some(applied) if body_source.trim().is_empty() => (applied.body.clone(), applied.caret),
+        Some(applied) => (format!("{}\n{body_source}", applied.body), applied.caret),
         None => (body_source, None),
     };
 
+    // The caller's destination wins over the space's. A space seeds a folder
+    // because its query names one; a caller that names one is answering a
+    // question the space only implied, and the more specific answer is the one
+    // to obey.
     let dest = req
         .dest
         .clone()
+        .or_else(|| seed.dest.clone())
         .unwrap_or_default()
         .trim_matches('/')
         .to_owned();
@@ -1474,29 +1908,95 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
         format!("{dest}/{filename}")
     };
 
+    // A create must never overwrite. The uniqueness of `filename` rests on
+    // `siblings`, which reports a directory it CANNOT READ as an empty one
+    // (`read_dir(...).unwrap_or_default()`) — so a folder keeper cannot list
+    // yields a name keeper believes is free, and `write_note`'s `atomic_write`
+    // would then replace a note that is already there, in a vault whose next
+    // commit carries the replacement to every machine.
+    //
+    // Unreachable before Story 44.6: every caller passed `dest: None`, so the
+    // only directory ever listed was the vault root, and a root keeper cannot
+    // read is a vault that is already gone. The space seed is the first thing
+    // in this app to choose a subdirectory, which is what makes the backstop
+    // worth its four lines now and not before.
+    //
+    // Refusing rather than picking another name: keeper cannot list the folder
+    // it is writing into, so it does not know what else is in there either, and
+    // a blank note is the cheapest thing in the app to ask for again.
+    if notes_vault::contained(vault, &rel)
+        .map_err(notes_error)?
+        .exists()
+    {
+        // `NotesInvalid`, the code every other notes refusal uses — there is no
+        // `InvalidInput` in `IpcErrorCode`, which the compiler on this host
+        // would have said and could not (DW-170).
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: format!(
+                "keeper won't create this note: {rel} is already there and keeper couldn't read \
+                 its folder to pick a free name. Nothing has been changed."
+            ),
+            account_id: None,
+            retriable: false,
+        });
+    }
+
     let mut pairs = vec![
         ("id".to_owned(), FieldValue::Str(id.clone())),
         ("created".to_owned(), FieldValue::Str(now_local())),
         ("updated".to_owned(), FieldValue::Str(now_local())),
     ];
-    if !req.tags.is_empty() {
+    // The caller's tags, the space's, and the TEMPLATE's — unioned in that order
+    // and de-duplicated through the one definition of a tag, so a space that
+    // names `#Work`, a caller that names `work` and a template that names
+    // `Work` do not put three spellings of one tag in the file.
+    //
+    // The template's list arrives from `keeper-core` already stripped of
+    // `template` (AD-82): the copy is not a template, and this is the union it
+    // would otherwise be smuggled back in through.
+    let template_tags: &[String] = applied.as_ref().map_or(&[], |applied| &applied.tags);
+    let note_tags = tags::normalise_all(
+        req.tags
+            .iter()
+            .chain(seed.tags.iter())
+            .chain(template_tags.iter())
+            .map(String::as_str),
+    );
+    if !note_tags.is_empty() {
         pairs.push((
             "tags".to_owned(),
-            FieldValue::List(
-                req.tags
-                    .iter()
-                    .map(|tag| FieldValue::Str(tag.clone()))
-                    .collect(),
-            ),
+            FieldValue::List(note_tags.into_iter().map(FieldValue::Str).collect()),
         ));
     }
-    if capture {
-        // The reserved namespace's one documented sub-key, so the inbox lens can
-        // find unfiled thoughts.
-        pairs.push((
-            "keeper".to_owned(),
-            FieldValue::Map(vec![("capture".to_owned(), FieldValue::Bool(true))]),
-        ));
+    // The two boolean flags a space can ask a new note to carry. They are
+    // ordinary frontmatter Obsidian shows as properties, which is why the index
+    // can read them back and `is:pinned` can be satisfied by creating at all.
+    if seed.pinned {
+        pairs.push(("pinned".to_owned(), FieldValue::Bool(true)));
+    }
+    if seed.archived {
+        pairs.push(("archived".to_owned(), FieldValue::Bool(true)));
+    }
+    // The template's own properties, after everything keeper decides and before
+    // the reserved map. `keeper-core` already removed the six that belong to the
+    // template itself, so what is left is the author's: `status: draft`,
+    // `project:`, whatever they put in the scaffold to be filled in.
+    if let Some(applied) = &applied {
+        pairs.extend(applied.properties.iter().cloned());
+    }
+    // One reserved map, assembled once. Two `pairs.push(("keeper", …))` would
+    // write the key twice, and `Frontmatter`'s reader takes the first — so a
+    // captured note made from a template would have silently lost whichever of
+    // the two came second.
+    let mut reserved = provenance;
+    if seed.capture {
+        // The reserved namespace's other documented sub-key, so the inbox lens
+        // can find unfiled thoughts.
+        reserved.push(("capture".to_owned(), FieldValue::Bool(true)));
+    }
+    if !reserved.is_empty() {
+        pairs.push(("keeper".to_owned(), FieldValue::Map(reserved)));
     }
     let front = Frontmatter::serialise_new(&pairs);
     notes_vault::write_note(vault, &rel, &format!("{front}\n{body}")).map_err(notes_error)?;
@@ -1514,27 +2014,69 @@ fn create_note(vault: &Vault, req: &NoteCreateReq, capture: bool) -> Result<Note
     })
 }
 
-/// The template text a create should expand, if any.
+/// What a create resolved its template to.
 ///
-/// An explicitly named template wins; otherwise the vault's configured default.
+/// Three answers, not two. "No template was asked for" and "a template was asked
+/// for and is not there" produce the same note and must not produce the same
+/// silence: the second is the one the user has to be told about, because they
+/// chose a template and did not get it.
+enum TemplateChoice {
+    /// Nobody named one.
+    None,
+    /// Found, with the path it was found at — the path that becomes the note's
+    /// provenance.
+    Found { rel: String, source: String },
+    /// Named, and not in the vault.
+    Missing { named: String },
+}
+
+/// The template a create should apply, if any.
+///
+/// **Three rungs, most specific first** (FR-161, FR-162): the template the
+/// caller named, else the template the space hands out, else the vault's
+/// configured default. A caller naming one is answering a question the space
+/// only implied, and a space naming one is answering a question the vault only
+/// implied.
+///
 /// A template path that names nothing is **not** a failure: the note is created
 /// plain, because losing a thought over a missing scaffold is the wrong trade.
-fn template_source(vault: &Vault, req: &NoteCreateReq) -> Option<String> {
+/// It is also not silent — see [`TemplateChoice::Missing`], whose sentence is
+/// composed in `keeper-core` and reaches both the log and the caller.
+fn template_source(
+    vault: &Vault,
+    req: &NoteCreateReq,
+    space_template: Option<&str>,
+) -> TemplateChoice {
     let named = req
         .template
         .clone()
         .filter(|path| !path.trim().is_empty())
-        .or_else(|| vault.config.default_template.clone())?;
+        .or_else(|| space_template.map(str::to_owned))
+        .or_else(|| vault.config.default_template.clone());
+    let Some(named) = named.filter(|path| !path.trim().is_empty()) else {
+        return TemplateChoice::None;
+    };
+    // A bare name is a file in the template directory; anything with a slash is
+    // already vault-relative, which is what AD-82 buys — a template may live
+    // wherever its author put it.
     let rel = if named.contains('/') {
-        named
+        named.clone()
     } else {
-        format!("{TEMPLATES_DIR}/{named}")
+        format!("{}/{named}", templates::TEMPLATES_DIR)
     };
     match notes_vault::read_note(vault, &rel) {
-        Ok(source) => Some(source),
+        Ok(source) => TemplateChoice::Found { rel, source },
         Err(error) => {
-            tracing::info!(%error, "notes: template not found; creating a plain note");
-            None
+            // `info!`, not `debug!`: nothing sets `RUST_LOG` in the packaged app,
+            // so a `debug!` here is a decision nobody can see on the machine that
+            // made it (DW-162). This is a path that declines to act, and a path
+            // that declines to act says so.
+            tracing::info!(
+                %error,
+                template = %rel,
+                "notes: the named template is not in this vault; creating a plain note"
+            );
+            TemplateChoice::Missing { named: rel }
         }
     }
 }
@@ -1587,6 +2129,9 @@ pub async fn notes_journal_today(vault_id: String) -> Result<NoteRefVm, IpcError
         template: vault.config.default_template.clone(),
         dest: None,
         tags: Vec::new(),
+        // Today's journal is reached by `⌘⌥J`, the tray and the palette, never
+        // from a space row, so there is no space to inherit from.
+        space: None,
     };
     create_journal(&vault, &rel, &req)
 }
@@ -1599,25 +2144,59 @@ pub async fn notes_journal_today(vault_id: String) -> Result<NoteRefVm, IpcError
 fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteRefVm, IpcError> {
     let id = crate::sync_ipc::new_ulid();
     let title = req.title.clone().unwrap_or_else(today);
-    let (body, caret) = match template_source(vault, req) {
-        Some(template) => {
-            let (expanded, caret) = templates::expand(
-                &template,
+    // The journal's template comes from `req.template`, which the caller filled
+    // from the vault's configured default. No space rung: today's entry is
+    // opened by a shortcut, a tray item and the palette, none of which is inside
+    // a space.
+    let (applied, provenance) = match template_source(vault, req, None) {
+        TemplateChoice::Found { rel, source } => {
+            let applied = templates::expand(
+                &source,
                 &templates::TemplateCtx {
                     title: title.clone(),
                     id: id.clone(),
                     now_local: now_local(),
                 },
             );
-            (expanded, caret)
+            let provenance = templates::provenance_pairs(&rel, applied.source_id.as_deref());
+            (Some(applied), provenance)
         }
+        // A journal entry is created either way — the whole point of `⌘⌥J` is
+        // that today's page is always there. `template_source` has already said
+        // so at `INFO`; there is no surface here to carry a notice to.
+        TemplateChoice::Missing { .. } | TemplateChoice::None => (None, Vec::new()),
+    };
+    let (body, caret) = match &applied {
+        Some(applied) => (applied.body.clone(), applied.caret),
         None => (format!("# {title}\n"), None),
     };
-    let front = Frontmatter::serialise_new(&[
+    let mut pairs = vec![
         ("id".to_owned(), FieldValue::Str(id.clone())),
         ("created".to_owned(), FieldValue::Str(now_local())),
         ("updated".to_owned(), FieldValue::Str(now_local())),
-    ]);
+    ];
+    // The journal template's tags and properties reach the entry too. Without
+    // this the one note keeper creates on a schedule would be the one note a
+    // template could not shape.
+    if let Some(applied) = &applied {
+        if !applied.tags.is_empty() {
+            pairs.push((
+                "tags".to_owned(),
+                FieldValue::List(
+                    applied
+                        .tags
+                        .iter()
+                        .map(|tag| FieldValue::Str(tag.clone()))
+                        .collect(),
+                ),
+            ));
+        }
+        pairs.extend(applied.properties.iter().cloned());
+    }
+    if !provenance.is_empty() {
+        pairs.push(("keeper".to_owned(), FieldValue::Map(provenance)));
+    }
+    let front = Frontmatter::serialise_new(&pairs);
     notes_vault::write_note(vault, rel, &format!("{front}\n{body}")).map_err(notes_error)?;
     if let Some(at) = caret {
         remember_caret(&id, at + 1);
@@ -1750,6 +2329,12 @@ pub async fn notes_open(
     let text = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
     let rev = notes_vault::content_rev(&text);
     let (frontmatter, body) = split_note(&text);
+    // The baseline Story 44.8 diffs a template edit against: the template as the
+    // user found it when they opened it. Captured on OPEN rather than on save,
+    // because the autosave fires every few hundred milliseconds — a baseline
+    // taken at save time would be "the text before the last keystroke burst",
+    // and the offer would show the tail of an edit instead of the edit.
+    remember_template_before(&vault_id, &entry.path, &text);
 
     channel
         .send(NoteBodyBatch::Reset {
@@ -2173,6 +2758,400 @@ pub async fn notes_resolve_conflict(
 }
 
 // ---------------------------------------------------------------------------
+// Updating notes from their template (Story 44.8, FR-163, UX-DR59)
+// ---------------------------------------------------------------------------
+
+/// What a template said when the user opened it, keyed
+/// `<vault id>\0<vault-relative path>`.
+///
+/// **The baseline of an editing session, not of a write.** Captured in
+/// `notes_open`, and deliberately not in `notes_save`: the autosave fires a few
+/// hundred milliseconds after typing stops, so a save-time baseline would be
+/// "the text before the last burst of keystrokes" and the offer would show the
+/// tail of an edit rather than the edit. Opening the template again re-takes it,
+/// which is the right reset — a session is what a person means by "I changed the
+/// template".
+///
+/// git cannot supply this either: the vault commits on an idle debounce, so at
+/// the moment a template is saved `HEAD` is usually the version before the
+/// PREVIOUS edit, and diffing against it would re-offer changes the user already
+/// decided about last week.
+///
+/// Nothing here survives a restart, and that is the honest behaviour: keeper
+/// offers to propagate an edit it watched happen, never one it inferred.
+static TEMPLATE_BEFORE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How many opened templates are remembered at once. A template is a note a
+/// person opens, so this is bounded by hands; the cap exists so an agent opening
+/// a thousand notes cannot grow the map without limit.
+const MAX_TEMPLATE_BEFORE: usize = 32;
+
+fn template_before_key(vault_id: &str, rel: &str) -> String {
+    format!("{vault_id}\0{rel}")
+}
+
+/// Take the session baseline, if the note being opened is a template.
+///
+/// Cheap for the overwhelmingly common case — one frontmatter parse of text
+/// already in memory — and it does nothing at all for an ordinary note, which is
+/// what makes `notes_template_update_preview` free to answer "not a template"
+/// without touching the vault.
+fn remember_template_before(vault_id: &str, rel: &str, disk: &str) {
+    let (fm, _) = Frontmatter::parse(disk);
+    if !templates::is_template(&fm) {
+        return;
+    }
+    let mut before = TEMPLATE_BEFORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if before.len() >= MAX_TEMPLATE_BEFORE {
+        before.clear();
+    }
+    before.insert(template_before_key(vault_id, rel), disk.to_owned());
+}
+
+fn template_before(vault_id: &str, rel: &str) -> Option<String> {
+    TEMPLATE_BEFORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&template_before_key(vault_id, rel))
+        .cloned()
+}
+
+/// What keeper would offer to change in the notes made from a template that was
+/// just edited (FR-163, UX-DR59).
+///
+/// `Ok(None)` means there is nothing to say at all — the note saved was not a
+/// template, or keeper did not watch it change. `Ok(Some(offer))` means the
+/// surface opens, and the offer itself may carry a `declined` sentence. The two
+/// are different: "this is not a template" is not a refusal and must not read as
+/// one.
+///
+/// Nothing here writes. The whole command is reads plus
+/// [`keeper_core::notes::template_update`]'s arithmetic, which is what makes
+/// "offered, never automatic" a property of the code rather than of the UI.
+#[tauri::command]
+pub async fn notes_template_update_preview(
+    app: AppHandle,
+    vault_id: String,
+    note_id: String,
+) -> Result<Option<TemplateUpdateOfferVm>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let Some(before) = template_before(&vault_id, &entry.path) else {
+        return Ok(None);
+    };
+    let after = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    if after == before {
+        return Ok(None);
+    }
+
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    let offer = tokio::task::spawn_blocking(move || {
+        build_offer(&app, &vault, &snapshot, &entry, &before, &after)
+    })
+    .await
+    .map_err(|error| notes_error(NotesError::NotFound(error.to_string())))?;
+
+    if let Some(reason) = offer.declined.as_deref() {
+        // INFO, not debug: this is the whole of what the user sees keeper do
+        // when it decides to do nothing, and `RUST_LOG` is unset on the owner's
+        // machine, so a `debug!` here would be a decision nobody could ever
+        // observe (DW-162).
+        tracing::info!(template = %offer.template_path, "notes: template update declined: {reason}");
+    } else {
+        tracing::info!(
+            template = %offer.template_path,
+            notes = offer.notes.len(),
+            "notes: offering a template update"
+        );
+    }
+    Ok(Some(offer))
+}
+
+/// Resolve the whole offer. Blocking: it reads one file per candidate note and
+/// asks git one question for the vault.
+fn build_offer(
+    app: &AppHandle,
+    vault: &Vault,
+    snapshot: &IndexSnapshot,
+    template: &IndexEntry,
+    before: &str,
+    after: &str,
+) -> TemplateUpdateOfferVm {
+    let (fm, _) = Frontmatter::parse(after);
+    let template_id = fm.as_string("id").map(str::to_owned);
+    let reference = template_update::TemplateRef {
+        path: &template.path,
+        id: template_id.as_deref(),
+    };
+
+    let candidates: Vec<(&IndexEntry, templates::Provenance)> = snapshot
+        .entries()
+        .iter()
+        // A template made from a template is still not its own child: skipping
+        // the file being edited is what stops an offer to rewrite itself.
+        .filter(|entry| entry.path != template.path)
+        .filter_map(|entry| {
+            let provenance = template_update::provenance_from_index(&entry.fields);
+            template_update::made_from(&provenance, &reference).map(|_| (entry, provenance))
+        })
+        .collect();
+
+    let found = candidates.len();
+    if found == 0 || found > template_update::MAX_OFFER_NOTES {
+        return template_update::offer(&template.path, &template.title, found, &[]);
+    }
+
+    // One `git status` for the vault. `None` — no git, no repository — means
+    // nothing can be proven recoverable, so nothing is offered as such.
+    let dirty = notes_vault::uncommitted_paths(app, vault);
+    let plans: Vec<template_update::NotePlan> = candidates
+        .iter()
+        .filter_map(|(entry, provenance)| {
+            let source = notes_vault::read_note(vault, &entry.path).ok()?;
+            let (_, body) = split_note(&source);
+            let recoverability = match dirty.as_ref() {
+                Some(dirty) if !dirty.contains(&entry.path) => {
+                    template_update::Recoverability::Committed
+                }
+                Some(_) => template_update::Recoverability::Modified,
+                None => template_update::Recoverability::Untracked,
+            };
+            let stale_path = provenance
+                .path
+                .as_deref()
+                .filter(|recorded| *recorded != template.path)
+                .map(str::to_owned);
+            Some(template_update::plan_note(
+                before,
+                after,
+                &template_update::NoteInput {
+                    id: &entry.id,
+                    title: &entry.title,
+                    path: &entry.path,
+                    body,
+                    ctx: note_ctx(entry),
+                    stale_path,
+                    recoverability,
+                },
+            ))
+        })
+        .collect();
+
+    template_update::offer(&template.path, &template.title, found, &plans)
+}
+
+/// The expansion context a note was created with, as far as the note still
+/// records it.
+///
+/// `created` is the note's own frontmatter, so `{{date:…}}` is compared against
+/// the date the note actually carries rather than today's — which is the whole
+/// reason a placeholder line in a year-old journal entry is recognised as the
+/// template's and not as something the user typed.
+fn note_ctx(entry: &IndexEntry) -> templates::TemplateCtx {
+    templates::TemplateCtx {
+        title: entry.title.clone(),
+        id: entry.id.clone(),
+        now_local: entry
+            .fields
+            .get("created")
+            .cloned()
+            .unwrap_or_else(now_local),
+    }
+}
+
+/// Apply the changes the user accepted, note by note (FR-163).
+///
+/// The plan is rebuilt from disk here rather than trusted from the request: the
+/// preview may be minutes old, the notes may have been written in since, and a
+/// change that no longer matches must not be applied because a dialog once said
+/// it would. The request selects *which* changes; it never carries their text.
+#[tauri::command]
+pub async fn notes_template_update_apply(
+    app: AppHandle,
+    vault_id: String,
+    req: TemplateUpdateApplyReq,
+) -> Result<TemplateUpdateResultVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    let entry = snapshot
+        .entries()
+        .iter()
+        .find(|entry| entry.path == req.template_path)
+        .cloned()
+        .ok_or_else(|| notes_error(NotesError::NotFound(req.template_path.clone())))?;
+    let before = template_before(&vault_id, &entry.path).ok_or_else(|| {
+        notes_error(NotesError::Template(
+            "keeper no longer knows what this template said before it was edited, so it will \
+             not change any note from it. Edit the template again to see a fresh offer."
+                .to_owned(),
+        ))
+    })?;
+    let after = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+
+    tokio::task::spawn_blocking(move || {
+        run_template_update(&app, &vault, &snapshot, &entry, &before, &after, &req)
+    })
+    .await
+    .map_err(|error| notes_error(NotesError::NotFound(error.to_string())))
+}
+
+/// Write the accepted changes. Blocking; one file read and at most one write per
+/// selected note.
+fn run_template_update(
+    app: &AppHandle,
+    vault: &Vault,
+    snapshot: &IndexSnapshot,
+    template: &IndexEntry,
+    before: &str,
+    after: &str,
+    req: &TemplateUpdateApplyReq,
+) -> TemplateUpdateResultVm {
+    let dirty = notes_vault::uncommitted_paths(app, vault);
+    let mut updated = Vec::new();
+    let mut skipped = Vec::new();
+
+    for selection in &req.selections {
+        let accepted: Vec<usize> = selection
+            .changes
+            .iter()
+            .map(|index| *index as usize)
+            .collect();
+        if accepted.is_empty() {
+            continue;
+        }
+        let Some(entry) = snapshot
+            .entries()
+            .iter()
+            .find(|e| e.id == selection.note_id)
+        else {
+            skipped.push(format!(
+                "keeper could not find the note {} any more, so it was left alone.",
+                selection.note_id
+            ));
+            continue;
+        };
+        let Ok(source) = notes_vault::read_note(vault, &entry.path) else {
+            skipped.push(format!(
+                "\u{201c}{}\u{201d} could not be read, so it was left alone.",
+                entry.title
+            ));
+            continue;
+        };
+        let (block, body) = split_note(&source);
+        let recoverability = match dirty.as_ref() {
+            Some(dirty) if !dirty.contains(&entry.path) => {
+                template_update::Recoverability::Committed
+            }
+            Some(_) => template_update::Recoverability::Modified,
+            None => template_update::Recoverability::Untracked,
+        };
+        let plan = template_update::plan_note(
+            before,
+            after,
+            &template_update::NoteInput {
+                id: &entry.id,
+                title: &entry.title,
+                path: &entry.path,
+                body,
+                ctx: note_ctx(entry),
+                stale_path: None,
+                recoverability,
+            },
+        );
+        if let Some(reason) = plan.blocked.as_deref() {
+            skipped.push(reason.to_owned());
+            continue;
+        }
+        let Some(new_body) = template_update::apply(body, &plan, &accepted) else {
+            skipped.push(format!(
+                "\u{201c}{}\u{201d} has changed since the preview, so keeper applied nothing to \
+                 it rather than something you have not seen.",
+                entry.title
+            ));
+            continue;
+        };
+        // Resolved BEFORE the write, so it names the commit holding the note as
+        // it is right now — which is exactly what undoing this has to restore.
+        let Some(undo_rev) = notes_vault::head_rev_of(app, vault, &entry.path) else {
+            skipped.push(format!(
+                "\u{201c}{}\u{201d} has no revision keeper could put it back from, so it was \
+                 left alone.",
+                entry.title
+            ));
+            continue;
+        };
+        // The block goes back byte for byte: a template edit changes prose, and
+        // `updated` is deliberately NOT restamped — that key means "when someone
+        // last wrote in this note", and keeper propagating a heading is not that.
+        if let Err(error) =
+            notes_vault::write_note(vault, &entry.path, &join_note(block, &new_body))
+        {
+            skipped.push(format!(
+                "\u{201c}{}\u{201d} could not be written ({error}), so it is unchanged.",
+                entry.title
+            ));
+            continue;
+        }
+        updated.push(TemplateUpdateAppliedVm {
+            note_id: entry.id.clone(),
+            title: entry.title.clone(),
+            applied: u32::try_from(accepted.len()).unwrap_or(u32::MAX),
+            undo_rev,
+        });
+    }
+
+    tracing::info!(
+        template = %template.path,
+        updated = updated.len(),
+        skipped = skipped.len(),
+        "notes: applied a template update"
+    );
+    TemplateUpdateResultVm { updated, skipped }
+}
+
+/// Write one note back to the text it had at `rev` (FR-114, FR-163).
+///
+/// The verb the history panel has always implied and never had: `notes_history`
+/// could show you the revision and `notes_diff` could show you what changed, and
+/// there was no way to act on either. It is also what makes Story 44.8's
+/// "accepting is undoable" true rather than aspirational — the undo of a
+/// template update is this command against the revision the apply reported.
+///
+/// A restore is an ordinary write, so it becomes a revision of its own and is
+/// itself undoable. Nothing is destroyed by undoing an undo.
+#[tauri::command]
+pub async fn notes_restore_revision(
+    app: AppHandle,
+    vault_id: String,
+    note_id: String,
+    rev: String,
+) -> Result<(), IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let path = entry.path.clone();
+    let text = {
+        let app = app.clone();
+        let vault = vault.clone();
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || notes_vault::revision_text(&app, &vault, &path, &rev))
+            .await
+            .ok()
+            .flatten()
+    };
+    let text = text.ok_or_else(|| {
+        notes_error(NotesError::NotFound(format!(
+            "{path} has no text at that revision"
+        )))
+    })?;
+    notes_vault::write_note(&vault, &path, &text).map_err(notes_error)
+}
+
+// ---------------------------------------------------------------------------
 // Attachments
 // ---------------------------------------------------------------------------
 
@@ -2227,6 +3206,177 @@ pub async fn notes_attachment_drop(
         imported.push(notes_vault::import_attachment(&vault, &source).map_err(notes_error)?);
     }
     Ok(imported)
+}
+
+// ---------------------------------------------------------------------------
+// CSV tables
+// ---------------------------------------------------------------------------
+
+/// Resolve a `![[…]]` embed target to the CSV file it names.
+///
+/// **The webview never joins a root to a subpath** (AD-65). It hands over the
+/// text between the brackets — which is what the user typed, or what the
+/// attachments panel wrote — and the two candidates are formed here, in the
+/// only process that knows where the vault is:
+///
+/// 1. the target read as a vault-relative path, which is the form
+///    `import_attachment` produces (`attachments/data.csv`);
+/// 2. and, only when the target names no directory at all, the same name inside
+///    `attachments/` — because that is the one folder keeper itself drops files
+///    into, so `![[data.csv]]` finds the file the user just dragged in.
+///
+/// Two candidates and no search: a resolver that walked the vault looking for a
+/// matching name would make which file an embed opens depend on what else is in
+/// the vault, and an edit would then write to whichever one it found today.
+fn csv_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError> {
+    let mut candidates = vec![target.to_owned()];
+    if !target.contains('/') {
+        candidates.push(format!("{ATTACHMENTS_DIR}/{target}"));
+    }
+    for rel in candidates {
+        // `contained_read` is the whole containment check and it is stricter
+        // than "inside the vault": it refuses `..`, canonicalises so a symlink
+        // out of the vault cannot escape, and — because it stats with
+        // `symlink_metadata` — refuses a symlink, a fifo and a device outright.
+        // That last part matters more here than it does for a read-only asset:
+        // `atomic_write` finishes with a `rename`, which REPLACES a symlink with
+        // a regular file rather than writing through it, so an editable table
+        // over a symlink would quietly destroy the link on the first edit. It
+        // never gets that far.
+        //
+        // The `is_file` filter is therefore belt-and-braces, and deliberately
+        // kept: it makes this function's precondition true on its own terms
+        // rather than by depending on which `stat` another module chose.
+        if let Some(path) = crate::note_protocol::contained_read(vault, &rel)
+            .filter(|candidate| candidate.is_file())
+        {
+            return Ok((rel, path));
+        }
+    }
+    Err(notes_error(NotesError::NotFound(format!(
+        "{target}: this note embeds a file the vault does not have"
+    ))))
+}
+
+/// Read a CSV attachment as text, or refuse in a sentence.
+///
+/// The two refusals are the ones a real vault produces. A file over
+/// [`csv::MAX_CSV_BYTES`] is not opened as a table at all — the cells would
+/// cross IPC as JSON and land in the DOM, and a 6 GB export is exactly the case
+/// `keeper-sync`'s LFS threshold already names. A file that is not UTF-8 is a
+/// Latin-1 export, and keeper declines rather than guessing an encoding: a
+/// wrong guess would write the wrong bytes back over somebody's data.
+///
+/// Both are `warn!`, not `debug!`: a refusal is a problem the user is asking
+/// about, and only `WARN` and above reach the on-disk log while debug mode is
+/// off (see `debug_log::GatedMakeWriter`) — which is the default, and the state
+/// the machine is in when the thing goes wrong.
+fn read_csv(rel: &str, path: &Path) -> Result<String, IpcError> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| notes_error(NotesError::NotFound(format!("{rel}: {error}"))))?
+        .len();
+    if size > csv::MAX_CSV_BYTES {
+        let message = csv::too_large_notice(rel, size);
+        tracing::warn!(%rel, bytes = size, "notes: csv too large to open as a table");
+        return Err(IpcError {
+            code: IpcErrorCode::Unsupported,
+            message,
+            account_id: None,
+            retriable: false,
+        });
+    }
+    std::fs::read_to_string(path).map_err(|error| {
+        tracing::warn!(%rel, %error, "notes: csv is not valid UTF-8 or could not be read");
+        IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: format!(
+                "{rel} is not UTF-8 text, so keeper cannot show it as a table without \
+                 guessing an encoding — and a wrong guess would write the wrong bytes back"
+            ),
+            account_id: None,
+            retriable: false,
+        }
+    })
+}
+
+/// A CSV attachment projected as a table (Story 44.16, FR-172).
+#[tauri::command]
+pub async fn notes_csv_read(vault_id: String, target: String) -> Result<NoteCsvVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let (rel, path) = csv_path(&vault, &target)?;
+    let text = read_csv(&rel, &path)?;
+    let rev = notes_vault::content_rev(&text);
+    Ok(csv::project(&text, rel, rev))
+}
+
+/// Write one cell and return the table the file now is (Story 44.16, FR-172).
+///
+/// **One write path, and it is the vault's own.** `write_vault_file` is the same
+/// temp-and-rename `write_note` uses, so a `kill -9` mid-write leaves no torn
+/// CSV, and `mark_dirty` is the same announcement `import_attachment` makes so
+/// the commit cadence picks the change up. What is deliberately absent is
+/// `touch`: that asks the reconciler to re-read a path, and the notes walk never
+/// collects a `.csv`, so it would be a request for an index entry that cannot
+/// exist. Nothing here reaches into the sync engine — the engine's own
+/// `EchoSuppressor` is engine-internal by design, and this write is meant to be
+/// seen by the watcher, because a file the user edited is a file that must be
+/// committed.
+///
+/// `rev` is the revision the table was read at. A file that changed underneath —
+/// a sync pull, the user's spreadsheet — is refused rather than clobbered, on
+/// the same reasoning `notes_save`'s `base_rev` carries; there is no conflict
+/// copy here because there is nothing of the user's to lose yet, only a stale
+/// table to reload.
+#[tauri::command]
+pub async fn notes_csv_set_cell(
+    vault_id: String,
+    target: String,
+    rev: String,
+    row: u32,
+    column: u32,
+    value: String,
+) -> Result<NoteCsvVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let (rel, path) = csv_path(&vault, &target)?;
+    let text = read_csv(&rel, &path)?;
+    let disk_rev = notes_vault::content_rev(&text);
+    if disk_rev != rev {
+        tracing::warn!(%rel, "notes: csv changed on disk since the table was read");
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: format!(
+                "{rel} changed on disk since this table was opened, \
+                 so the edit was not applied; the table has been reloaded"
+            ),
+            account_id: None,
+            retriable: true,
+        });
+    }
+
+    let written = csv::set_cell(&text, row as usize, column as usize, &value).map_err(|error| {
+        tracing::info!(%rel, "notes: csv cell edit refused: {error}");
+        IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: error.to_string(),
+            account_id: None,
+            retriable: false,
+        }
+    })?;
+
+    if written == text {
+        // The cell already held this. Saying so out loud rather than writing
+        // identical bytes: a no-op write still makes a commit, a sync round and
+        // a diff on every machine the vault reaches (DW-162 — a code path that
+        // declines to act has to be able to say it declined).
+        tracing::info!(%rel, row, column, "notes: csv cell unchanged, nothing written");
+        return Ok(csv::project(&text, rel, disk_rev));
+    }
+
+    notes_vault::write_vault_file(&vault, &rel, &written).map_err(notes_error)?;
+    notes_vault::mark_dirty(&vault.id);
+    tracing::info!(%rel, row, column, "notes: csv cell written");
+    let next_rev = notes_vault::content_rev(&written);
+    Ok(csv::project(&written, rel, next_rev))
 }
 
 // ---------------------------------------------------------------------------
@@ -2306,8 +3456,22 @@ fn commit_buffer(
             template: None,
             dest: None,
             tags: Vec::new(),
+            space: None,
         },
-        true,
+        // Capture's one mark, spelled as the seed it always was: the note is
+        // written with `keeper.capture` so the Inbox lens can find an unfiled
+        // thought.
+        &seed::Seed {
+            capture: true,
+            ..seed::Seed::default()
+        },
+        // Capture has no space, so no space template. The vault's configured
+        // default still applies, inside `template_source`.
+        None,
+        // Nowhere to show a notice from: capture is the path with no dialog and
+        // no return surface (UX-DR35). A missing template is still logged at
+        // `INFO` by `template_source`, which is the only channel this path has.
+        &mut Vec::new(),
     )?;
     if let Ok(data_dir) = platform.data_dir() {
         if let Err(error) = keeper_core::registry::set_capture_buffer(&data_dir, "") {
@@ -2356,31 +3520,38 @@ async fn stream_changes(
         return;
     };
     let mut previous: Vec<(String, String)> = Vec::new();
+    // The counts last sent, so a change that moves no row but does move the
+    // count still reaches the surface. Before Story 44.11 nothing carried the
+    // count after the opening `Reset`, and a note that started matching the
+    // lens below the page produced no op and no message — invisible then,
+    // because nothing showed the number, and a stale count on screen now.
+    let mut sent: Option<(u32, u32)> = None;
     // The opening snapshot, then one message per change at most every
     // CHANGE_BATCH_MS. `while let` rather than `loop`: the window read is the
     // condition — a vault that stops answering has nothing left to stream.
     while let Ok(rows) = current_window(platform.as_ref(), &vault) {
         let next = fingerprints(&rows.rows);
+        let counts = (rows.total, rows.matched);
         let ops = if previous.is_empty() {
-            vec![NoteListOp::Reset {
-                rows: rows.rows,
-                total: rows.total,
-            }]
+            vec![NoteListOp::Reset { rows: rows.rows }]
         } else {
             diff_ops(&previous, &next, &rows.rows)
         };
         previous = next;
-        if !ops.is_empty()
+        if (!ops.is_empty() || sent != Some(counts))
             && channel
                 .send(NoteChangeBatch {
                     vault_id: vault.id.clone(),
                     ops,
+                    total: counts.0,
+                    matched: counts.1,
                 })
                 .is_err()
         {
             // The webview is gone; a closed window unsubscribes itself.
             return;
         }
+        sent = Some(counts);
         if index.changed().await.is_err() {
             return;
         }
@@ -2574,7 +3745,15 @@ pub fn tray_new_note(app: &AppHandle) {
     let Some(vault) = active_vault_of(app) else {
         return;
     };
-    match create_note(&vault, &blank_note(), false) {
+    // The tray creates outside any space, and it has no surface to show a
+    // notice on. A missing default template is logged at `INFO` regardless.
+    match create_note(
+        &vault,
+        &blank_note(),
+        &seed::Seed::default(),
+        None,
+        &mut Vec::new(),
+    ) {
         Ok(reference) => emit_open(app, &reference),
         Err(error) => {
             tracing::warn!(message = %error.message, "notes: tray could not create a note");
@@ -2656,6 +3835,7 @@ fn blank_note() -> NoteCreateReq {
         template: None,
         dest: None,
         tags: Vec::new(),
+        space: None,
     }
 }
 
@@ -2834,8 +4014,11 @@ mod tests {
                 template: None,
                 dest: None,
                 tags: Vec::new(),
+                space: None,
             },
-            false,
+            &seed::Seed::default(),
+            None,
+            &mut Vec::new(),
         )
         .expect("create the note");
 
@@ -3172,21 +4355,47 @@ mod tests {
         let def = space_def(&entry("spaces/active.md", "Active keeper work"), flat);
         assert_eq!(def.query, "tag:project/keeper -tag:archive");
         assert_eq!(def.sort, "modified desc");
-        assert_eq!(def.limit, 500);
+        assert_eq!(def.limit, Some(500));
 
         // A note with no definition at all is a space with an empty query, not a
         // parse failure — an empty query is what the UI shows as "not defined
         // yet".
         let bare = space_def(&entry("spaces/new.md", "New"), "---\nid: x\n---\n");
         assert!(bare.query.is_empty());
+        assert_eq!(
+            bare.limit, None,
+            "a space with no `keeper.limit` sets no cap; it does not inherit \
+             the page size as one (Story 44.11, DW-163)"
+        );
     }
 
+    /// The wiring, not the rule: what a `limit` value MEANS is
+    /// `keeper-core::notes::counts::read_limit`'s and is proved there on this
+    /// host. What is proved only here is that a `keeper.limit` in frontmatter
+    /// reaches that reader, and that a key holding nonsense leaves the space
+    /// uncapped rather than capped at something arbitrary.
     #[test]
-    fn a_frontmatter_limit_is_clamped_into_the_window_the_list_will_honour() {
-        assert_eq!(clamp_limit(200.0), 200);
-        assert_eq!(clamp_limit(100_000.0), MAX_LIMIT);
-        assert_eq!(clamp_limit(0.0), MAX_LIMIT);
-        assert_eq!(clamp_limit(-5.0), MAX_LIMIT);
+    fn a_frontmatter_limit_reaches_the_one_reader_of_it() {
+        let capped = space_def(
+            &entry("spaces/recent.md", "Recent"),
+            "---\nid: x\nkeeper:\n  space: 'is:pinned'\n  limit: 20\n---\n",
+        );
+        assert_eq!(capped.limit, Some(20));
+
+        // Not a number at all: the key is a `Str`, no arm matches, and the
+        // space is uncapped. A cap keeper cannot read must never become a cap
+        // keeper invented — that would hide notes the file never asked to hide.
+        let nonsense = space_def(
+            &entry("spaces/odd.md", "Odd"),
+            "---\nid: x\nkeeper:\n  space: 'is:pinned'\n  limit: soon\n---\n",
+        );
+        assert_eq!(nonsense.limit, None);
+
+        let zero = space_def(
+            &entry("spaces/zero.md", "Zero"),
+            "---\nid: x\nkeeper:\n  space: 'is:pinned'\n  limit: 0\n---\n",
+        );
+        assert_eq!(zero.limit, None);
     }
 
     /// Both presentation keys, in the one form the parser can hold, plus what

@@ -30,7 +30,14 @@ name: string, query: string,
  * said why, so pressing Save is a repair the user watched happen rather
  * than a rewrite behind their back.
  */
-sort: string, limit: number, 
+sort: string, 
+/**
+ * The selection cap to store, or zero for none. Zero writes no
+ * `keeper.limit` key at all, on the same rule `icon` and `order` follow: a
+ * space nobody capped keeps the frontmatter it had rather than growing a
+ * key to explain a cap it does not have (Story 44.11).
+ */
+limit: number, 
 /**
  * The chosen icon's name, or `None` to leave the space without one.
  */
@@ -39,4 +46,10 @@ icon: string | null,
  * The space's position in the rail. Zero is "unpositioned" and is not
  * written to the file, so a space nobody ordered grows no key to explain.
  */
-order: number, };
+order: number, 
+/**
+ * The template to hand out, or `None`/empty to leave the space without one.
+ * An empty string clears the key rather than storing a template whose path
+ * is nothing.
+ */
+template: string | null, };

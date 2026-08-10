@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { useWindowedRows } from "@/components/ui/window-list";
+import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
 import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -89,6 +90,12 @@ export const RECORDINGS_LIST_LABEL = "Recording sessions";
 
 /** The header control that re-runs the current query against the archive. */
 export const RECORDINGS_REFRESH_LABEL = "Refresh";
+
+/**
+ * Test id for the line that says how many sessions the filter found (Story
+ * 44.11). A slot, so a test asserts the number rather than the sentence.
+ */
+export const RECORDINGS_COUNT_SLOT = "recordings-count";
 
 /**
  * The durability words the archive column can hold, and how the filter names
@@ -125,6 +132,11 @@ export function RecordingsPane() {
   const [endDate, setEndDate] = useState<string | null>(null);
   const [durability, setDurability] = useState<string | null>(null);
   const [hits, setHits] = useState<RecordingHitVm[]>([]);
+  // How many sessions the filter matches in the whole archive, which is NOT
+  // `hits.length` (Story 44.11): the engine's page stops at 200, so an archive
+  // of nine thousand and one of exactly two hundred both hand back two hundred
+  // rows. Zero until a query lands, and shown only once one has.
+  const [total, setTotal] = useState(0);
   const [error, setError] = useState<IpcError | null>(null);
   // Whether a query has actually landed. An empty list is not yet "empty" while
   // the first answer is in flight, and neither empty-state sentence is true of
@@ -168,7 +180,8 @@ export function RecordingsPane() {
         if (seq !== seqRef.current) {
           return;
         }
-        setHits(result);
+        setHits(result.rows);
+        setTotal(result.total);
         setError(null);
         setLoaded(true);
       })
@@ -177,6 +190,7 @@ export function RecordingsPane() {
           return;
         }
         setHits([]);
+        setTotal(0);
         setError(
           isIpcError(e)
             ? e
@@ -244,6 +258,22 @@ export function RecordingsPane() {
         <div className="min-w-0">
           <h1 className="font-heading font-medium text-lg">{RECORDINGS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{RECORDINGS_PANE_SUBTITLE}</p>
+          {/* How many sessions the filter found (Story 44.11, FR-166).
+
+              In the header, which is rendered in every state, so an archive
+              that matches nothing says `0 sessions` instead of dropping the
+              count exactly when the reader most wants to know it was asked.
+              Suppressed only before the first answer lands: `0` before a query
+              has run is a claim nobody has checked yet. */}
+          {loaded && (
+            <p
+              role="status"
+              data-slot={RECORDINGS_COUNT_SLOT}
+              className="text-muted-foreground text-xs"
+            >
+              {countLabel(total, SESSIONS)}
+            </p>
+          )}
         </div>
         <Button
           type="button"

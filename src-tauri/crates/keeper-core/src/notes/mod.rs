@@ -9,6 +9,8 @@
 //! (AD-56). That split is the reason this phase is testable at all: every rule
 //! below is exercised over `&str` inputs, with no vault, no tokio and no Tauri.
 
+pub mod counts;
+pub mod csv;
 pub mod default_spaces;
 pub mod frontmatter;
 pub mod index;
@@ -18,8 +20,10 @@ pub mod order;
 pub mod query;
 pub mod recording_note;
 pub mod search;
+pub mod seed;
 pub mod sort;
 pub mod tags;
+pub mod template_update;
 pub mod templates;
 pub mod vm;
 
@@ -73,6 +77,21 @@ pub(crate) fn line_number(s: &str, offset: usize) -> usize {
         .filter(|b| *b == b'\n')
         .count()
         + 1
+}
+
+/// Length in bytes of a leading UTF-8 byte-order mark, or zero.
+///
+/// Shared rather than duplicated because two span-recording scanners depend on
+/// it agreeing with itself: frontmatter must not read the BOM as part of its
+/// opening `---` fence, and the CSV scanner must not read it as part of the
+/// first cell's text. A disagreement of three bytes between them would make one
+/// of the two eat Excel's marker on the first edit.
+pub(crate) fn bom_len(source: &str) -> usize {
+    if source.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

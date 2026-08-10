@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RecordingHitVm } from "@/lib/ipc/client";
+import type { RecordingHitVm, RecordingSearchVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the pane never touches Tauri.
 const searchRecordings = vi.fn();
@@ -13,6 +13,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import {
+  RECORDINGS_COUNT_SLOT,
   RECORDINGS_LIST_LABEL,
   RECORDINGS_PANE_TITLE,
   RECORDINGS_REFRESH_LABEL,
@@ -47,9 +48,19 @@ function hit(p: Partial<RecordingHitVm> & Pick<RecordingHitVm, "sessionId">): Re
   };
 }
 
+/**
+ * What the command resolves with: the page, and the archive-wide count behind
+ * it (Story 44.11). `total` defaults to the page's length — every fixture
+ * below is under the engine's 200-row page except where a test says otherwise,
+ * and those are the fixtures where the two numbers must differ.
+ */
+function found(rows: RecordingHitVm[], total = rows.length): RecordingSearchVm {
+  return { rows, total };
+}
+
 beforeEach(() => {
   searchRecordings.mockReset();
-  searchRecordings.mockResolvedValue([]);
+  searchRecordings.mockResolvedValue(found([]));
   recordingOpenPath.mockReset();
   recordingOpenPath.mockResolvedValue(undefined);
   revealPath.mockReset();
@@ -108,13 +119,15 @@ describe("RecordingsPane", () => {
   });
 
   it("discards a slow response that a newer query has already superseded", async () => {
-    let resolveStale: (hits: RecordingHitVm[]) => void = () => {};
+    let resolveStale: (result: RecordingSearchVm) => void = () => {};
     searchRecordings.mockReturnValueOnce(
-      new Promise<RecordingHitVm[]>((resolve) => {
+      new Promise<RecordingSearchVm>((resolve) => {
         resolveStale = resolve;
       }),
     );
-    searchRecordings.mockResolvedValueOnce([hit({ sessionId: "new", title: "The newer answer" })]);
+    searchRecordings.mockResolvedValueOnce(
+      found([hit({ sessionId: "new", title: "The newer answer" })]),
+    );
 
     render(<RecordingsPane />);
     await waitFor(() => expect(searchRecordings).toHaveBeenCalledTimes(1));
@@ -126,7 +139,7 @@ describe("RecordingsPane", () => {
     // The first query finally answers — too late, and about a question nobody
     // is asking any more.
     await act(async () => {
-      resolveStale([hit({ sessionId: "stale", title: "The stale answer" })]);
+      resolveStale(found([hit({ sessionId: "stale", title: "The stale answer" })]));
     });
 
     expect(screen.queryByText("The stale answer")).not.toBeInTheDocument();
@@ -167,10 +180,12 @@ describe("RecordingsPane", () => {
   });
 
   it("narrows the list through the engine when a tag chip is added", async () => {
-    searchRecordings.mockResolvedValue([
-      hit({ sessionId: "s1", title: "Standup", tags: ["standup"] }),
-      hit({ sessionId: "s2", title: "Retro", tags: ["retro"] }),
-    ]);
+    searchRecordings.mockResolvedValue(
+      found([
+        hit({ sessionId: "s1", title: "Standup", tags: ["standup"] }),
+        hit({ sessionId: "s2", title: "Retro", tags: ["retro"] }),
+      ]),
+    );
     render(<RecordingsPane />);
     expect(await screen.findByText("Standup")).toBeInTheDocument();
 
@@ -191,9 +206,9 @@ describe("RecordingsPane", () => {
   });
 
   it("hands a row's play request the absolute media path, and reveal the session folder", async () => {
-    searchRecordings.mockResolvedValue([
-      hit({ sessionId: "s1", title: "Standup", relativePath: "2026/standup" }),
-    ]);
+    searchRecordings.mockResolvedValue(
+      found([hit({ sessionId: "s1", title: "Standup", relativePath: "2026/standup" })]),
+    );
     render(<RecordingsPane />);
     expect(await screen.findByText("Standup")).toBeInTheDocument();
     expect(screen.getByRole("list", { name: RECORDINGS_LIST_LABEL })).toBeInTheDocument();
@@ -213,9 +228,9 @@ describe("RecordingsPane", () => {
       recording: true,
       revealInFileManager: false,
     });
-    searchRecordings.mockResolvedValue([
-      hit({ sessionId: "s1", title: "Standup", relativePath: "2026/standup" }),
-    ]);
+    searchRecordings.mockResolvedValue(
+      found([hit({ sessionId: "s1", title: "Standup", relativePath: "2026/standup" })]),
+    );
     render(<RecordingsPane />);
     expect(await screen.findByText("Standup")).toBeInTheDocument();
 
@@ -225,11 +240,13 @@ describe("RecordingsPane", () => {
   });
 
   it("re-asks the archive on Refresh, so a session recorded just now appears without a restart", async () => {
-    searchRecordings.mockResolvedValueOnce([]);
+    searchRecordings.mockResolvedValueOnce(found([]));
     render(<RecordingsPane />);
     expect(await screen.findByText(NOTHING_RECORDED)).toBeInTheDocument();
 
-    searchRecordings.mockResolvedValue([hit({ sessionId: "fresh", title: "Recorded just now" })]);
+    searchRecordings.mockResolvedValue(
+      found([hit({ sessionId: "fresh", title: "Recorded just now" })]),
+    );
     fireEvent.click(screen.getByRole("button", { name: RECORDINGS_REFRESH_LABEL }));
 
     expect(await screen.findByText("Recorded just now")).toBeInTheDocument();
@@ -294,7 +311,7 @@ describe("RecordingsPane — the archive, not a screenful", () => {
 
   async function renderArchive(): Promise<void> {
     geometry = withListGeometry({ viewport: VISIBLE_ROWS * ROW_PX, row: ROW_PX });
-    searchRecordings.mockResolvedValue(MANY);
+    searchRecordings.mockResolvedValue(found(MANY));
     render(<RecordingsPane />);
     await screen.findByRole("list", { name: RECORDINGS_LIST_LABEL }, { timeout: 2000 });
     await screen.findByText("Session 0");
@@ -322,5 +339,83 @@ describe("RecordingsPane — the archive, not a screenful", () => {
 
     expect(screen.getByText("Session 1999")).toBeInTheDocument();
     expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
+  });
+
+  /**
+   * Story 44.11, and this is the AC's own shape: the count is asserted with
+   * virtualisation ON, over a fixture two orders of magnitude larger than one
+   * window. Two thousand sessions, about twenty rows in the DOM, and the header
+   * says two thousand.
+   */
+  it("says how many sessions exist, not how many rows the window mounted", async () => {
+    await renderArchive();
+
+    expect(mountedRows().length).toBeLessThanOrEqual(VISIBLE_ROWS + OVERSCAN * 2);
+    expect(count()).toBe(`${(2000).toLocaleString()} sessions`);
+  });
+
+  /**
+   * The trap the backend change exists for. The engine's page stops at 200, so
+   * an archive of two thousand hands back two hundred rows — and a count taken
+   * from the array would read `200 sessions` on a machine with ten times that.
+   */
+  it("says the archive's count even when the page it was sent is smaller", async () => {
+    geometry = withListGeometry({ viewport: VISIBLE_ROWS * ROW_PX, row: ROW_PX });
+    searchRecordings.mockResolvedValue(found(MANY.slice(0, 200), 2000));
+    render(<RecordingsPane />);
+    await screen.findByText("Session 0");
+
+    expect(count()).toBe(`${(2000).toLocaleString()} sessions`);
+  });
+});
+
+/** The count the pane's header shows, or `null` while it shows none. */
+function count(): string | null {
+  return document.querySelector(`[data-slot="${RECORDINGS_COUNT_SLOT}"]`)?.textContent ?? null;
+}
+
+describe("RecordingsPane — how many sessions", () => {
+  it("says zero rather than hiding the count when nothing matches", async () => {
+    render(<RecordingsPane />);
+    await screen.findByText(NOTHING_RECORDED);
+
+    // The empty state replaces the LIST; the count sits in the header, which is
+    // rendered in every state. A count that vanished exactly when the answer is
+    // "none" would be a count that never answers the question it was asked.
+    expect(count()).toBe("0 sessions");
+  });
+
+  it("counts the filtered set, and moves when the filter does", async () => {
+    searchRecordings.mockResolvedValue(
+      found([
+        hit({ sessionId: "s1", title: "Standup", tags: ["standup"] }),
+        hit({ sessionId: "s2", title: "Retro", tags: ["retro"] }),
+      ]),
+    );
+    render(<RecordingsPane />);
+    await screen.findByText("Standup");
+    expect(count()).toBe("2 sessions");
+
+    searchRecordings.mockResolvedValue(
+      found([hit({ sessionId: "s1", title: "Standup", tags: ["standup"] })]),
+    );
+    fireEvent.change(screen.getByLabelText("Participant"), { target: { value: "ada" } });
+
+    await waitFor(() => expect(count()).toBe("1 session"));
+  });
+
+  it("says nothing at all before the first answer lands", () => {
+    // `0 sessions` before a query has run is a claim nobody has checked. The
+    // count appears with the answer, not with the pane.
+    render(<RecordingsPane />);
+
+    expect(count()).toBeNull();
+  });
+
+  it("groups a five-digit archive rather than setting it solid", async () => {
+    searchRecordings.mockResolvedValue(found([hit({ sessionId: "s1" })], 12_345));
+    render(<RecordingsPane />);
+
+    await waitFor(() => expect(count()).toBe(`${(12_345).toLocaleString()} sessions`));
   });
 });

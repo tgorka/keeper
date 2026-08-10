@@ -20,7 +20,7 @@
  * there is no optimistic overlay to get out of step.
  */
 import { useCallback } from "react";
-import type { NoteRefVm, NoteRowVm } from "@/lib/ipc/client";
+import type { NoteCreateVm, NoteRefVm, NoteRowVm } from "@/lib/ipc/client";
 import {
   notesCaptureShow,
   notesCreate,
@@ -48,30 +48,43 @@ function activeVaultId(): string | null {
 }
 
 /**
- * Create an empty note and put the cursor on it (FR-98).
+ * Create an empty note, put the cursor on it, and report anything the person
+ * who asked has to be told (FR-98, FR-160, Story 44.6).
  *
  * No title, no folder, no template: the destination is a rule and not a
  * question, because the user has not written the words yet and so cannot answer
  * one (UX-DR35). The first line becomes the title afterwards.
  *
+ * `spaceId` is the space the ask came from — a space row's own New Note — and
+ * `null` is the rail's, which creates into the default list. It is the space's
+ * **id** and nothing else: Rust reads that space's query and derives the tags,
+ * folder and flags the new note needs, so a note created in a space is selected
+ * by it. Working that out here would put a second copy of the space DSL in
+ * TypeScript, and the second copy is always the one that is wrong.
+ *
+ * Selecting the note is what puts the caret in its body: the editor mounts on
+ * the selected note and focuses itself, and the buffer it focuses is the body
+ * alone — the frontmatter block never enters it.
+ *
  * Resolves with `null` when no vault is flagged — the caller sends the user to
  * Settings → Sync rather than reporting a failure, because there is nothing
  * broken, only nothing configured.
  */
-export async function createNote(): Promise<NoteRefVm | null> {
+export async function createNote(spaceId: string | null = null): Promise<NoteCreateVm | null> {
   const vaultId = activeVaultId();
   if (vaultId === null) {
     return null;
   }
-  const ref = await notesCreate(vaultId, {
+  const created = await notesCreate(vaultId, {
     title: null,
     body: null,
     template: null,
     dest: null,
     tags: [],
+    space: spaceId,
   });
-  notesListStore.getState().select(vaultId, ref.id);
-  return ref;
+  notesListStore.getState().select(vaultId, created.note.id);
+  return created;
 }
 
 /** Open today's journal entry, creating it from the template if needed (FR-99). */
@@ -174,6 +187,10 @@ export async function saveFilterAsSpace(name: string): Promise<NoteRefVm | null>
     // hand. There is nowhere on this path to ask, and guessing a number would
     // be keeper deciding the shape of a rail it was not asked about.
     order: 0,
+    // No template either, and for the same reason: this path saves the filter
+    // that is on screen, and a template is not part of a filter. The space
+    // editor is where one is chosen (Story 44.7).
+    template: null,
   });
 }
 

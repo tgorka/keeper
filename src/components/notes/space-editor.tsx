@@ -75,8 +75,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
-import type { NoteSpaceVm } from "@/lib/ipc/client";
-import { notesSpaceSave, notesSpaceTerms, notesTagTree } from "@/lib/ipc/client";
+import type { NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
+import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
 import {
   nextTagChipState,
   type TagChip,
@@ -204,6 +204,28 @@ export const SPACE_SORT_RECORDED_NOTE =
   "A note that isn't about a recording is placed by the date it was created, in among the recordings rather than at either end.";
 
 /**
+ * What the template chooser calls "hand out nothing".
+ *
+ * A sentinel `""` rather than a `null` option value, because a `<select>`'s
+ * value is always a string and a `null` would arrive back as the literal text
+ * `"null"` — which is a path, and one keeper would then go looking for.
+ */
+export const SPACE_NO_TEMPLATE = "";
+
+/**
+ * What the editor says when the space names a template that is not in the
+ * vault.
+ *
+ * The stored value is still shown and still selected. keeper does not silently
+ * drop a setting it cannot resolve — the template may be on the other machine,
+ * mid-sync, or simply renamed, and clearing the field on the user's behalf
+ * would lose the one clue about what it used to point at. Notes created here
+ * are still created; the create path says the same thing in its own words.
+ */
+export const SPACE_TEMPLATE_MISSING =
+  "This space names a template that isn't in the vault. Notes created here are still created, just without it — pick another, or restore the template.";
+
+/**
  * The line under the sort control, for the two keys whose behaviour their own
  * name does not give away. Keyed by the canonical `<key> <dir>`.
  *
@@ -266,6 +288,7 @@ export function SpaceEditor({
   const sortKeyId = useId();
   const sortDirId = useId();
   const orderId = useId();
+  const templateId = useId();
   const [name, setName] = useState(space.name);
   const [icon, setIcon] = useState<string | null>(space.icon);
   // Seeded from `sortEffective`, never from `sort`: the raw value may be empty
@@ -281,6 +304,17 @@ export function SpaceEditor({
   const [order, setOrder] = useState(() => (space.order === 0 ? "" : String(space.order)));
   const [terms, setTerms] = useState<Terms>({ kind: "pending" });
   const [vaultTags, setVaultTags] = useState<readonly string[]>([]);
+  // The stored path, verbatim. Seeded from the file rather than resolved
+  // against the list, so a template that is missing right now stays selected
+  // and stays visible instead of being cleared by a render.
+  const [template, setTemplate] = useState(space.template ?? SPACE_NO_TEMPLATE);
+  const [templateChoices, setTemplateChoices] = useState<readonly NoteTemplateVm[]>([]);
+  // Whether the list above is an ANSWER or merely the absence of one. A vault
+  // with genuinely no templates and a read that failed both leave `choices`
+  // empty, and only the first of them is evidence that a stored template is
+  // gone. Without this the two were one state and a transient IPC failure would
+  // have accused a perfectly good setting.
+  const [templatesLoaded, setTemplatesLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
 
@@ -338,6 +372,26 @@ export function SpaceEditor({
     };
   }, [vaultId]);
 
+  useEffect(() => {
+    let cancelled = false;
+    void notesTemplates(vaultId)
+      .then((found) => {
+        if (!cancelled) {
+          setTemplateChoices(found);
+          setTemplatesLoaded(true);
+        }
+      })
+      .catch(() => {
+        // A list that will not load leaves the chooser with nothing to browse.
+        // The stored value is still rendered and still saved: a failed read of
+        // the vault's templates is not evidence that this space's one is gone,
+        // and clearing it here would turn a transient error into a lost setting.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultId]);
+
   const trimmedName = name.trim();
   // "No terms left" is the refusal the AC names: an empty query is not
   // "everything", and every axis a draft can carry is enumerated here so a term
@@ -350,6 +404,15 @@ export function SpaceEditor({
     terms.draft.text === null;
   const refusal =
     trimmedName === "" ? SPACE_NO_NAME : emptyDraft ? SPACE_NO_TERMS : (failure ?? null);
+  // The stored template is not one of the options the chooser can offer —
+  // either because it is gone, or because the list has not arrived yet.
+  const templateUnlisted =
+    template !== SPACE_NO_TEMPLATE && !templateChoices.some((choice) => choice.path === template);
+  // …and keeper actually knows it is gone. Only ever asserted against a list
+  // that ANSWERED: an empty list because the read failed is not evidence the
+  // template is missing, and saying it is would put a red sentence under a
+  // perfectly good setting and invite the user to clear it.
+  const templateMissing = templateUnlisted && templatesLoaded;
 
   // A query may name the same unhandled term twice, so the read-only rows carry
   // an occurrence counter rather than the bare text: two identical keys is a
@@ -392,6 +455,9 @@ export function SpaceEditor({
         // An empty or unreadable box is "unpositioned" — the same 0 an absent
         // `keeper.order` means — rather than a reason to refuse the whole save.
         order: Number.parseFloat(order.trim()) || 0,
+        // Trimmed to the sentinel, so "no template" reaches Rust as the empty
+        // string it already treats as absent rather than as a path of spaces.
+        template: template.trim() === "" ? null : template.trim(),
       });
       onSaved();
     } catch {
@@ -515,6 +581,46 @@ export function SpaceEditor({
               {SPACE_SORT_NOTES[`${sortKey} ${sortDir}`]}
             </p>
           )}
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={templateId}>New notes start from</Label>
+            <select
+              id={templateId}
+              value={template}
+              onChange={(event) => setTemplate(event.target.value)}
+              className="h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <option value={SPACE_NO_TEMPLATE}>No template</option>
+              {templateChoices.map((choice) => (
+                <option key={choice.path} value={choice.path}>
+                  {choice.name}
+                </option>
+              ))}
+              {/* The stored value, whenever it is not one of the options above.
+                  Rendered as its own option so the select can show what the
+                  file says: a `<select>` whose value matches no option renders
+                  the FIRST one, which here reads as "No template" — a lie about
+                  the file, and one the next Save would make true. Keyed on
+                  `unlisted` rather than on `missing`, because a list that has
+                  not arrived yet tells the same lie as a template that is gone;
+                  only the SENTENCE below waits for keeper to actually know. */}
+              {templateUnlisted && (
+                <option value={template}>
+                  {templateMissing ? `${template} — not in this vault` : template}
+                </option>
+              )}
+            </select>
+            {templateMissing ? (
+              <p data-slot="template-missing" className="text-destructive text-sm">
+                {SPACE_TEMPLATE_MISSING}
+              </p>
+            ) : (
+              <p className="text-muted-foreground text-sm">
+                A template is a note tagged <code>template</code>. Notes created in this space copy
+                its body and its other tags.
+              </p>
+            )}
+          </div>
 
           <section aria-label="Terms" className="flex flex-col gap-2">
             <span className="font-medium text-sm">Terms</span>

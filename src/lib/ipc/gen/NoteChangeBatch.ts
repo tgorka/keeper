@@ -11,4 +11,23 @@ export type NoteChangeBatch = { vaultId: string,
 /**
  * Ops in order; apply them in sequence.
  */
-ops: Array<NoteListOp>, };
+ops: Array<NoteListOp>, 
+/**
+ * The lens's counts as of this batch, on
+ * [`NoteListVm::total`]/[`NoteListVm::matched`]'s terms (Story 44.11).
+ *
+ * **On the envelope rather than inside `Reset`, and not derived by the
+ * receiver.** Both numbers are recomputed over the whole matched set for
+ * every batch this loop sends, so the count on screen is the count Rust
+ * just took. The frontend used to carry `total` forward itself, adding one
+ * per `Upsert` of an unseen id and subtracting one per `Remove` — which is
+ * right only while every change to the matched set also changes the
+ * window. A note that starts matching a filter three thousand rows below
+ * the page moves no row and used to move no count, and after Story 44.10
+ * windowed the list there is no scroll that would have corrected it.
+ */
+total: number, 
+/**
+ * How many the lens matched before `keeper.limit` declined any.
+ */
+matched: number, };

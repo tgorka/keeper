@@ -92,9 +92,14 @@ export type { NoteChangeBatch } from "./gen/NoteChangeBatch";
 export type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
 export type { NoteConflictVm } from "./gen/NoteConflictVm";
 export type { NoteCreateReq } from "./gen/NoteCreateReq";
+export type { NoteCreateVm } from "./gen/NoteCreateVm";
+export type { NoteCsvRowVm } from "./gen/NoteCsvRowVm";
+export type { NoteCsvVm } from "./gen/NoteCsvVm";
 export type { NoteDiffVm } from "./gen/NoteDiffVm";
 export type { NoteFlag } from "./gen/NoteFlag";
 export type { NoteFolderVm } from "./gen/NoteFolderVm";
+export type { NoteGalleryItemVm } from "./gen/NoteGalleryItemVm";
+export type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 export type { NoteHunkVm } from "./gen/NoteHunkVm";
 export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
@@ -146,6 +151,7 @@ export type { RecordingNoteTargetVm } from "./gen/RecordingNoteTargetVm";
 export type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 export type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 export type { RecordingProfileVm } from "./gen/RecordingProfileVm";
+export type { RecordingSearchVm } from "./gen/RecordingSearchVm";
 export type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 export type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 export type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -183,6 +189,13 @@ export type { SyncStatusVm } from "./gen/SyncStatusVm";
 export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
 export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 export type { TccPermission } from "./gen/TccPermission";
+export type { TemplateChangeVm } from "./gen/TemplateChangeVm";
+export type { TemplateUpdateAppliedVm } from "./gen/TemplateUpdateAppliedVm";
+export type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
+export type { TemplateUpdateNoteVm } from "./gen/TemplateUpdateNoteVm";
+export type { TemplateUpdateOfferVm } from "./gen/TemplateUpdateOfferVm";
+export type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
+export type { TemplateUpdateSelectionVm } from "./gen/TemplateUpdateSelectionVm";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
@@ -222,9 +235,12 @@ import type { NoteChangeBatch } from "./gen/NoteChangeBatch";
 import type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
 import type { NoteConflictVm } from "./gen/NoteConflictVm";
 import type { NoteCreateReq } from "./gen/NoteCreateReq";
+import type { NoteCreateVm } from "./gen/NoteCreateVm";
+import type { NoteCsvVm } from "./gen/NoteCsvVm";
 import type { NoteDiffVm } from "./gen/NoteDiffVm";
 import type { NoteFlag } from "./gen/NoteFlag";
 import type { NoteFolderVm } from "./gen/NoteFolderVm";
+import type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 import type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 import type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 import type { NoteListVm } from "./gen/NoteListVm";
@@ -254,6 +270,7 @@ import type { RecordingNoteTargetVm } from "./gen/RecordingNoteTargetVm";
 import type { RecordingPathPreviewVm } from "./gen/RecordingPathPreviewVm";
 import type { RecordingPermissionVm } from "./gen/RecordingPermissionVm";
 import type { RecordingProfileVm } from "./gen/RecordingProfileVm";
+import type { RecordingSearchVm } from "./gen/RecordingSearchVm";
 import type { RecordingSettingsVm } from "./gen/RecordingSettingsVm";
 import type { RecordingSourcesVm } from "./gen/RecordingSourcesVm";
 import type { RecordingStatusVm } from "./gen/RecordingStatusVm";
@@ -277,6 +294,9 @@ import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 import type { TccPermission } from "./gen/TccPermission";
+import type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
+import type { TemplateUpdateOfferVm } from "./gen/TemplateUpdateOfferVm";
+import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
@@ -757,17 +777,24 @@ export async function searchArchive(filter: SearchFilterVm): Promise<SearchHitVm
  * unrestricted, and several tags AND together (each matched hierarchically, so
  * `client/acme` matches `client/acme/renewal` and never `client/acmecorp`).
  *
- * Resolves with at most `limit` (default and maximum 200) {@link RecordingHitVm}
- * rows, newest first, each carrying its absolute folder (composed in Rust from
- * the effective recordings destination — never join one here), its duration, its
- * summed size and its decoded tags. An empty array means "nothing matched";
- * a machine that has never recorded has no `archive.db` and also resolves with
- * `[]`, so the caller distinguishes the two facts by the filter it sent, not by
- * an error. Rejects with the {@link IpcError} envelope only on a genuine archive
- * failure.
+ * Resolves with a {@link RecordingSearchVm}: at most `limit` (default and
+ * maximum 200) {@link RecordingHitVm} rows, newest first, each carrying its
+ * absolute folder (composed in Rust from the effective recordings destination —
+ * never join one here), its duration, its summed size and its decoded tags; and
+ * `total`, how many sessions the filter matches in the whole archive.
+ *
+ * **`rows.length` is not the count and never was** (Story 44.11). The page stops
+ * at 200, so an archive of nine thousand sessions and one of exactly two hundred
+ * both hand back two hundred rows. `total` is a `COUNT(*)` over the same
+ * predicates; a surface saying how many sessions it found says `total`.
+ *
+ * `rows: []` with `total: 0` means "nothing matched"; a machine that has never
+ * recorded has no `archive.db` and resolves the same way, so the caller
+ * distinguishes the two facts by the filter it sent, not by an error. Rejects
+ * with the {@link IpcError} envelope only on a genuine archive failure.
  */
-export async function searchRecordings(filter: RecordingFilterVm): Promise<RecordingHitVm[]> {
-  return await invoke<RecordingHitVm[]>("search_recordings", { filter });
+export async function searchRecordings(filter: RecordingFilterVm): Promise<RecordingSearchVm> {
+  return await invoke<RecordingSearchVm>("search_recordings", { filter });
 }
 
 /**
@@ -3372,6 +3399,27 @@ export async function notesTree(vaultId: string, relDir: string): Promise<NoteFo
 }
 
 /**
+ * One folder of the vault, listed for a note's gallery block (FR-171, AD-84,
+ * Story 44.15).
+ *
+ * `folder` is the vault-relative path the block's own first line names, handed
+ * over verbatim: Rust resolves it against the vault root and refuses anything
+ * that is not a plain descendant, so nothing here joins a root and a subpath
+ * (AD-65). Each item comes back with the kind the one classifier decided
+ * (Story 43.5) and, for the kinds `keeper-note://` will serve, the URL to load
+ * — also composed in Rust.
+ *
+ * A folder that could not be listed is NOT a rejection: it resolves with an
+ * empty `items` and a `problem` sentence to render, because a block on screen
+ * has to say something and a rejected promise gives it nothing to say.
+ *
+ * Rejects with: `unsupported`, `internal` (no such vault).
+ */
+export async function notesGallery(vaultId: string, folder: string): Promise<NoteGalleryVm> {
+  return await invoke<NoteGalleryVm>("notes_gallery", { vaultId, folder });
+}
+
+/**
  * Every space in the vault (FR-105) — ordinary notes under `spaces/`, each
  * carrying a saved query. A space whose query does not parse comes back with its
  * `error` set rather than being dropped: it is an agent-writable plain note, so
@@ -3437,15 +3485,23 @@ export async function notesSpaceTerms(query: string): Promise<NoteSpaceTermsVm> 
 }
 
 /**
- * Create a note (FR-98). Every field of `req` is optional-shaped because there
- * is no dialog anywhere in this path (UX-DR35): a title comes from the first
- * line if it is not supplied, and the destination is a rule rather than a
+ * Create a note (FR-98, FR-160). Every field of `req` is optional-shaped because
+ * there is no dialog anywhere in this path (UX-DR35): a title comes from the
+ * first line if it is not supplied, and the destination is a rule rather than a
  * question.
+ *
+ * `req.space` is the id of the space the note was asked for from, and it is the
+ * *only* thing a surface has to say about the space. Rust reads that space's
+ * note, derives the tags, folder and flags its query needs, writes them, and
+ * then re-runs the query over the bytes it wrote — so a note created in a space
+ * appears in it, and a space no new note can satisfy comes back with one
+ * finished sentence in `notices` rather than with a silently misfiled note. No
+ * caller here parses a query.
  *
  * Rejects with: `invalidInput` (an illegal name), `unsupported`, `internal`.
  */
-export async function notesCreate(vaultId: string, req: NoteCreateReq): Promise<NoteRefVm> {
-  return await invoke<NoteRefVm>("notes_create", { vaultId, req });
+export async function notesCreate(vaultId: string, req: NoteCreateReq): Promise<NoteCreateVm> {
+  return await invoke<NoteCreateVm>("notes_create", { vaultId, req });
 }
 
 /**
@@ -3459,10 +3515,15 @@ export async function notesJournalToday(vaultId: string): Promise<NoteRefVm> {
 }
 
 /**
- * Every `templates/*.md` in the vault (FR-100). An empty vault answers with an
- * empty list, never an error — keeper creates `templates/` lazily, on first use,
- * because an empty scaffold in someone's existing vault is exactly the "keeper
- * moved my stuff" failure FR-121 forbids.
+ * Every template in the vault (FR-100, FR-161). **A template is a note tagged
+ * `template`** (AD-82), wherever it lives — not a file in a directory keeper
+ * owns. Notes under the template directory still count, so a vault seeded by an
+ * earlier build keeps the templates it already had.
+ *
+ * An empty vault answers with an empty list, never an error: keeper seeds its
+ * three defaults once and a vault that deleted them stays deleted, because an
+ * empty scaffold in someone's existing vault is exactly the "keeper moved my
+ * stuff" failure FR-121 forbids.
  *
  * Rejects with: `unsupported`, `internal`.
  */
@@ -3672,6 +3733,71 @@ export async function notesDiff(
 }
 
 /**
+ * Write a note back to the text it had at `rev` (FR-114, FR-163).
+ *
+ * The verb the history panel implied and never had. A restore is an ordinary
+ * write, so it becomes a revision of its own and undoing an undo costs nothing;
+ * the open editor sees it as an external change, through the same body channel
+ * any other write arrives on.
+ *
+ * This is also the undo of a template update: pass the `undoRev` that
+ * {@link notesTemplateUpdateApply} reported for the note.
+ *
+ * Rejects with: `invalidInput`, `internal` (no such revision of that note).
+ */
+export async function notesRestoreRevision(
+  vaultId: string,
+  noteId: string,
+  rev: string,
+): Promise<void> {
+  await invoke<void>("notes_restore_revision", { vaultId, noteId, rev });
+}
+
+/**
+ * What keeper would offer to change in the notes made from a template that was
+ * just edited (FR-163, UX-DR59).
+ *
+ * `null` means there is nothing to say at all: the saved note was not a
+ * template, or keeper did not watch it change (the "before" text is captured at
+ * save time and does not survive a restart). A returned offer may itself carry
+ * `declined` — a finished sentence composed in Rust — and then `notes` is empty.
+ * The two are different states and the surface must not collapse them: "this is
+ * not a template" is not a refusal.
+ *
+ * Reads only. Nothing keeper offers here has happened.
+ *
+ * Rejects with: `invalidInput`, `internal`.
+ */
+export async function notesTemplateUpdatePreview(
+  vaultId: string,
+  noteId: string,
+): Promise<TemplateUpdateOfferVm | null> {
+  return await invoke<TemplateUpdateOfferVm | null>("notes_template_update_preview", {
+    vaultId,
+    noteId,
+  });
+}
+
+/**
+ * Apply the changes the user picked, note by note (FR-163).
+ *
+ * The request names notes and change indices; it never carries their text. Rust
+ * rebuilds every plan from disk before writing, so a note edited since the
+ * preview is skipped with a sentence rather than given a change nobody saw.
+ * Each updated note comes back with the revision that undoes it — feed it to
+ * {@link notesRestoreRevision}.
+ *
+ * Rejects with: `invalidInput` (keeper no longer holds the template's previous
+ * text), `internal`.
+ */
+export async function notesTemplateUpdateApply(
+  vaultId: string,
+  req: TemplateUpdateApplyReq,
+): Promise<TemplateUpdateResultVm> {
+  return await invoke<TemplateUpdateResultVm>("notes_template_update_apply", { vaultId, req });
+}
+
+/**
  * Acknowledge a revision, clearing the note's unread mark and — when it was the
  * last one — the tray dot (FR-113).
  *
@@ -3741,6 +3867,55 @@ export async function notesAttachmentDrop(
   paths: string[],
 ): Promise<NoteAttachmentVm[]> {
   return await invoke<NoteAttachmentVm[]>("notes_attachment_drop", { vaultId, noteId, paths });
+}
+
+/**
+ * A CSV attachment as a table (Story 44.16, FR-172). `target` is the text
+ * between an embed's brackets, verbatim — the webview never joins a vault root
+ * to a subpath (AD-65), so Rust resolves it and answers with the `relPath` it
+ * actually read.
+ *
+ * The bytes stay in Rust. What comes back is decoded cells plus the file's
+ * revision; the file's quoting, line endings and byte-order mark are never
+ * spelled here, because a webview that could spell them could reformat them.
+ *
+ * Rejects with: `notesInvalid` (not UTF-8), `unsupported` (too large to table),
+ * `internal` (no such file).
+ */
+export async function notesCsvRead(vaultId: string, target: string): Promise<NoteCsvVm> {
+  return await invoke<NoteCsvVm>("notes_csv_read", { vaultId, target });
+}
+
+/**
+ * Write one cell and answer with the table the file now is (Story 44.16,
+ * FR-172). `row` and `column` are 0-based, and `row` indexes the **file's**
+ * records rather than the rows shown, which is why `NoteCsvRowVm` carries its
+ * own `index`.
+ *
+ * `rev` is the revision the table was read at: a file that changed underneath
+ * is refused rather than overwritten. A value equal to what the cell already
+ * holds writes nothing at all — that is deliberate, so a save-on-blur cannot
+ * reformat a file the user only looked at.
+ *
+ * Rejects with: `notesInvalid` (stale `rev`, or a column the row does not
+ * have), `unsupported`, `internal`.
+ */
+export async function notesCsvSetCell(
+  vaultId: string,
+  target: string,
+  rev: string,
+  row: number,
+  column: number,
+  value: string,
+): Promise<NoteCsvVm> {
+  return await invoke<NoteCsvVm>("notes_csv_set_cell", {
+    vaultId,
+    target,
+    rev,
+    row,
+    column,
+    value,
+  });
 }
 
 /**

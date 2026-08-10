@@ -561,6 +561,7 @@ describe("livePreview, over a recording note", () => {
         doc,
         extensions: [
           livePreview({
+            vaultId: "vault-1",
             assetUrl: (rel) => rel,
             onOpenLink: () => {},
             recordingSession: () => session,

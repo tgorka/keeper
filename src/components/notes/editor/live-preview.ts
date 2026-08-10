@@ -27,6 +27,9 @@ import {
   type ViewUpdate,
   WidgetType,
 } from "@codemirror/view";
+import type { NoteGalleryVm } from "@/lib/ipc/client";
+import { CsvTableWidget, isCsvTarget } from "./csv-table";
+import { galleryLayer } from "./gallery-block";
 import { MermaidWidget } from "./mermaid-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
 import { transportFor } from "./recording-transport";
@@ -71,6 +74,13 @@ const LINE_CLASSES: Record<string, string> = {
 };
 
 export interface LivePreviewOptions {
+  /**
+   * The open vault's id, so a `![[….csv]]` embed can be read and written.
+   *
+   * The editor is built per vault, so this is a value rather than a getter —
+   * unlike `recordingSession`, which changes with the note in the editor.
+   */
+  vaultId: string;
   /** Turn a vault-relative asset path into its `keeper-note://` URL (AD-59). */
   assetUrl: (relPath: string) => string;
   /** Follow a wikilink. Called with the raw target, never a filesystem path. */
@@ -86,6 +96,17 @@ export interface LivePreviewOptions {
    * is exactly right for somebody else's note that happens to contain one.
    */
   recordingSession?: () => string | null;
+  /**
+   * List a vault folder for a gallery block (Story 44.15, FR-171).
+   *
+   * Injected rather than imported for the same reason `assetUrl` is: this
+   * module knows nothing about which vault is open, and the editor that built
+   * it does. Absent — a note rendered outside the editor, or a test driving the
+   * renderer directly — a gallery block stays the folder name and the pinned
+   * links it degrades to, and says that keeper is not listing here rather than
+   * showing an empty grid.
+   */
+  listFolder?: (folder: string) => Promise<NoteGalleryVm>;
 }
 
 /** An embedded image, or — when the file is not there — its alt text and the
@@ -172,6 +193,13 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
       from: visible.from,
       to: visible.to,
       enter: (node) => {
+        // A gallery block is decorated by `galleryLayer` below and not here:
+        // it replaces several lines with one element, and CodeMirror refuses
+        // both a block decoration and a line-break-spanning replace from a
+        // `ViewPlugin`. Nothing needs excluding at this point — the field's
+        // replacement covers the whole callout, so the quote's line class and
+        // the pins' wikilink marks fall inside a range nothing paints.
+
         const lineClass = LINE_CLASSES[node.name];
         if (lineClass !== undefined) {
           const first = doc.lineAt(node.from).number;
@@ -243,6 +271,27 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           const end = start + match[0].length;
           const target = match[1];
           const label = match[2] ?? target;
+
+          // `![[….csv]]`: the one embed syntax, rendered as the table Story
+          // 44.16 adds. Checked before the recording branch because a session's
+          // own files are video, audio and images — never a spreadsheet — so a
+          // `.csv` in a recording note is an ordinary attachment like any
+          // other, and a table is what it should be either way.
+          if (match[0].startsWith("!") && isCsvTarget(target)) {
+            // An INLINE replace with a block-styled host, not `block: true`.
+            // These decorations come from a `ViewPlugin`, and CodeMirror refuses
+            // a block decoration from one — the embed is a single line, so the
+            // inline form is available and is the shape `RecordingEmbedWidget`
+            // already uses. (The mermaid fence above asks for `block: true` from
+            // this same plugin and throws for it; that is Story 37.8's to fix,
+            // and the fix is moving this whole set into a `StateField`.)
+            decorations.push(
+              Decoration.replace({
+                widget: new CsvTableWidget(options.vaultId, target),
+              }).range(start, end),
+            );
+            continue;
+          }
 
           // `![[…]]` in a note that carries a session id: an embed of one of
           // that recording's files. The widget renders this same link until the
@@ -527,6 +576,56 @@ const livePreviewTheme = EditorView.baseTheme({
     color: "var(--muted-foreground)",
   },
   ".cm-lp-recording-mix-volume": { flex: "1 1 3rem", minWidth: "3rem", width: "auto" },
+  // The gallery block (Story 44.15). The grid is the scroll container the
+  // window measures, so its height is fixed here and its content is what
+  // scrolls — a grid that grew with its folder would defeat the window it is
+  // built on.
+  ".cm-lp-gallery": {
+    border: "1px solid var(--border)",
+    borderRadius: "0.5rem",
+    padding: "0.5rem",
+    margin: "0.25rem 0",
+  },
+  ".cm-lp-gallery-head": {
+    display: "flex",
+    alignItems: "baseline",
+    gap: "0.5rem",
+    flexWrap: "wrap",
+  },
+  ".cm-lp-gallery-folder": { fontWeight: "600" },
+  ".cm-lp-gallery-note": { color: "var(--muted-foreground)", fontSize: "0.85em" },
+  ".cm-lp-gallery-pins": { display: "flex", gap: "0.5rem", flexWrap: "wrap" },
+  ".cm-lp-gallery-grid": {
+    position: "relative",
+    overflowY: "auto",
+    maxHeight: "24rem",
+    marginTop: "0.5rem",
+  },
+  ".cm-lp-gallery-canvas": { position: "relative", width: "100%" },
+  ".cm-lp-gallery-row": { display: "flex", gap: "0.5rem" },
+  ".cm-lp-gallery-tile": {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.25rem",
+    margin: "0",
+    overflow: "hidden",
+  },
+  // The pinned tiles float to the top of the grid; the outline is what says
+  // WHY they are there rather than leaving the order looking arbitrary.
+  '.cm-lp-gallery-tile[data-gallery-pinned="true"]': {
+    outline: "2px solid var(--primary)",
+    outlineOffset: "-2px",
+    borderRadius: "0.25rem",
+  },
+  ".cm-lp-gallery-media": { width: "100%", height: "6.5rem", objectFit: "cover" },
+  ".cm-lp-gallery-caption": {
+    fontSize: "0.75em",
+    color: "var(--muted-foreground)",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  ".cm-lp-gallery-pin": { fontSize: "0.75em", color: "var(--primary)", cursor: "pointer" },
   ".cm-lp-image-missing, .cm-mermaid-error-message": {
     color: "var(--muted-foreground)",
     fontSize: "0.85em",
@@ -535,6 +634,33 @@ const livePreviewTheme = EditorView.baseTheme({
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     whiteSpace: "pre-wrap",
   },
+  ".cm-csv-block": { display: "block", overflowX: "auto" },
+  ".cm-csv-table": { borderCollapse: "collapse", fontSize: "0.9em", width: "max-content" },
+  ".cm-csv-cell": {
+    border: "1px solid var(--border)",
+    padding: "0.15em 0.4em",
+    textAlign: "left",
+    // A cell is one line. A value with an embedded newline in it would
+    // otherwise make one row as tall as the paragraph it is quoting, and the
+    // row's height is what makes a table scannable.
+    whiteSpace: "pre",
+    maxWidth: "24em",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  // A column the row does not have is drawn as absent, not as blank: hatching
+  // says "there is nothing here" where an empty box says "this is empty", and
+  // those are different files.
+  ".cm-csv-missing": {
+    border: "1px dashed var(--border)",
+    backgroundColor: "color-mix(in oklch, var(--muted-foreground) 8%, transparent)",
+  },
+  ".cm-csv-ragged .cm-csv-cell": {
+    borderColor: "color-mix(in oklch, var(--primary) 45%, var(--border))",
+  },
+  ".cm-csv-input": { font: "inherit", width: "100%", border: "none", background: "transparent" },
+  ".cm-csv-notice": { color: "var(--muted-foreground)", fontSize: "0.85em" },
+  ".cm-csv-error": { color: "var(--destructive)", fontSize: "0.85em" },
   // 1.2 s is long enough to notice and short enough not to become furniture.
   ".cm-lp-external": {
     backgroundColor: "color-mix(in oklch, var(--primary) 18%, transparent)",
@@ -580,5 +706,5 @@ export function livePreview(options: LivePreviewOptions): Extension {
       },
     },
   );
-  return [plugin, externalFlashField, livePreviewTheme];
+  return [plugin, galleryLayer({ list: options.listFolder }), externalFlashField, livePreviewTheme];
 }

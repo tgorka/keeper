@@ -3511,6 +3511,29 @@ pub struct RecordingHitVm {
     pub playable_path: Option<String>,
 }
 
+/// One page of the Recordings browser, with the count behind it (Story 44.11,
+/// FR-166).
+///
+/// **The page and the count are different numbers and this is where they stop
+/// being confusable.** `search_recordings` has always stopped at
+/// `recordings_fts::DEFAULT_LIMIT`, so `rows.len()` is 200 for an archive of
+/// two hundred sessions and 200 for an archive of nine thousand. Until Story
+/// 44.10 that at least LOOKED like a list that ended; windowed, a list that
+/// stops at row 200 is indistinguishable on screen from a complete one. A
+/// surface that counted the vector would have said "200 sessions" to somebody
+/// with nine thousand of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecordingSearchVm {
+    /// The sessions in this page, newest first.
+    pub rows: Vec<RecordingHitVm>,
+    /// How many sessions the filter matches in the whole archive, counted by
+    /// SQL over the same predicates that selected `rows` — never `rows.len()`,
+    /// and never a count of what a viewport rendered.
+    pub total: u32,
+}
+
 /// What one [`RecordingNoteTargetVm`] is (Story 42.4, FR-142; widened by Story
 /// 43.5, FR-150, AD-73).
 ///

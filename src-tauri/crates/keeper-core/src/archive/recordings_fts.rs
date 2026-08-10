@@ -52,6 +52,7 @@ use crate::error::ArchiveError;
 use crate::recording::SessionMetaField;
 use crate::vm::{
     RecordingFilterVm, RecordingHitVm, RecordingNoteTargetKind, RecordingNoteTargetVm,
+    RecordingSearchVm,
 };
 
 use super::recordings::{in_transaction, RecordingRow};
@@ -582,77 +583,21 @@ pub fn search_recordings(
         .limit
         .unwrap_or(DEFAULT_LIMIT)
         .clamp(1, DEFAULT_LIMIT);
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let mut clauses: Vec<String> = Vec::new();
-
-    let index_join = if filter.query.is_empty() {
-        ""
-    } else {
-        if filter.query.chars().count() >= TRIGRAM_MIN_CHARS {
-            let quoted = filter.query.replace('"', "\"\"");
-            clauses.push("recordings_fts MATCH ?".to_owned());
-            params.push(Box::new(format!("\"{quoted}\"")));
-        } else {
-            clauses.push(
-                "LOWER(recordings_fts.text) LIKE '%' || LOWER(?) || '%' ESCAPE '\\'".to_owned(),
-            );
-            params.push(Box::new(escape_like(&filter.query)));
-        }
-        INDEX_JOIN
-    };
-
-    // Story 42.5: a filter tag joins the one vocabulary here, at the boundary
-    // where it becomes SQL. `crate::notes::query` normalises a `tag:` term the
-    // same way for the same reason — a person typing `Client/Acme ` into a chip
-    // means the tag the rows actually carry. A term that normalises to nothing
-    // narrows nothing and is dropped, which is also what the old
-    // `!tag.is_empty()` guard was for.
-    for tag in crate::notes::tags::normalise_all(filter.tags.iter().map(String::as_str)) {
-        clauses.push(TAG_PREDICATE_SQL.to_owned());
-        // The equality arm takes the canonical tag; the descendant arm is a LIKE
-        // and takes it escaped.
-        params.push(Box::new(tag.clone()));
-        params.push(Box::new(escape_like(&tag)));
-    }
-    if let Some(participant) = filter.participant.as_deref().filter(|p| !p.is_empty()) {
-        clauses.push(PARTICIPANT_PREDICATE_SQL.to_owned());
-        params.push(Box::new(escape_like(participant)));
-    }
-    if let Some(start_ts) = filter.start_ts {
-        clauses.push("recordings.started_ts >= ?".to_owned());
-        params.push(Box::new(start_ts));
-    }
-    if let Some(end_ts) = filter.end_ts {
-        clauses.push("recordings.started_ts <= ?".to_owned());
-        params.push(Box::new(end_ts));
-    }
-    if let Some(durability) = &filter.durability {
-        clauses.push("recordings.durability = ?".to_owned());
-        params.push(Box::new(durability.clone()));
-    }
-    if let Some(profile_id) = &filter.profile_id {
-        clauses.push("recordings.profile_id = ?".to_owned());
-        params.push(Box::new(profile_id.clone()));
-    }
-
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
-    };
+    let predicates = Predicates::of(filter);
     // `limit` is an i64 this function clamped, never caller text.
     let sql = format!(
-        "SELECT {HIT_COLUMNS} FROM recordings{index_join}{where_sql} \
+        "SELECT {HIT_COLUMNS} FROM recordings{join}{where_sql} \
          ORDER BY recordings.started_ts DESC, recordings.session_id ASC \
-         LIMIT {limit}"
+         LIMIT {limit}",
+        join = predicates.join,
+        where_sql = predicates.where_sql,
     );
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| ArchiveError::Sqlite(format!("could not prepare recording search: {e}")))?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt
-        .query_map(param_refs.as_slice(), |r| {
+        .query_map(predicates.params().as_slice(), |r| {
             Ok(RecordingHit {
                 session_id: r.get(0)?,
                 relative_path: r.get(1)?,
@@ -677,6 +622,123 @@ pub fn search_recordings(
     Ok(hits)
 }
 
+/// How many sessions this filter matches — every one of them, not the page
+/// [`search_recordings`] hands back (Story 44.11, FR-166).
+///
+/// **This is the whole reason the story needed a backend change here.**
+/// `search_recordings` stops at [`DEFAULT_LIMIT`], so `hits.len()` is 200 for an
+/// archive of two hundred sessions and 200 for an archive of nine thousand. A
+/// surface counting the vector it was handed would show the same number for
+/// both, and Story 44.10 removed the one thing that used to make the difference
+/// visible: with every row rendered, a list that stopped at 200 rows looked like
+/// a list that stopped; windowed, it looks exactly like a complete archive.
+///
+/// A `COUNT(*)` over the same predicates, built by the same [`Predicates`] the
+/// search uses, so the count and the rows can never disagree about what "this
+/// filter" means. `COUNT` needs neither the ordering nor the hit columns, and
+/// the free-text join is present only when there is text to match — so an
+/// unfiltered count is a single covering scan of the `recordings` table rather
+/// than a walk through the index.
+pub fn count_recordings(conn: &Connection, filter: &RecordingFilter) -> Result<u32, ArchiveError> {
+    let predicates = Predicates::of(filter);
+    let sql = format!(
+        "SELECT COUNT(*) FROM recordings{join}{where_sql}",
+        join = predicates.join,
+        where_sql = predicates.where_sql,
+    );
+    let total: i64 = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| stmt.query_row(predicates.params().as_slice(), |r| r.get(0)))
+        .map_err(|e| ArchiveError::Sqlite(format!("could not count recording hits: {e}")))?;
+    Ok(u32::try_from(total).unwrap_or(u32::MAX))
+}
+
+/// One filter, compiled to SQL once and used by both the page and the count.
+///
+/// Extracted for Story 44.11 rather than copied: a count that applied a
+/// different set of predicates from the list beneath it is a count that is
+/// wrong in exactly the way nobody checks, because both numbers look plausible
+/// and only one of them is being read.
+struct Predicates {
+    /// [`INDEX_JOIN`] when there is free text to match, empty otherwise.
+    join: &'static str,
+    /// `" WHERE …"`, or empty when nothing narrows.
+    where_sql: String,
+    values: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl Predicates {
+    fn of(filter: &RecordingFilter) -> Self {
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+
+        let join = if filter.query.is_empty() {
+            ""
+        } else {
+            if filter.query.chars().count() >= TRIGRAM_MIN_CHARS {
+                let quoted = filter.query.replace('"', "\"\"");
+                clauses.push("recordings_fts MATCH ?".to_owned());
+                values.push(Box::new(format!("\"{quoted}\"")));
+            } else {
+                clauses.push(
+                    "LOWER(recordings_fts.text) LIKE '%' || LOWER(?) || '%' ESCAPE '\\'".to_owned(),
+                );
+                values.push(Box::new(escape_like(&filter.query)));
+            }
+            INDEX_JOIN
+        };
+
+        // Story 42.5: a filter tag joins the one vocabulary here, at the boundary
+        // where it becomes SQL. `crate::notes::query` normalises a `tag:` term the
+        // same way for the same reason — a person typing `Client/Acme ` into a chip
+        // means the tag the rows actually carry. A term that normalises to nothing
+        // narrows nothing and is dropped, which is also what the old
+        // `!tag.is_empty()` guard was for.
+        for tag in crate::notes::tags::normalise_all(filter.tags.iter().map(String::as_str)) {
+            clauses.push(TAG_PREDICATE_SQL.to_owned());
+            // The equality arm takes the canonical tag; the descendant arm is a LIKE
+            // and takes it escaped.
+            values.push(Box::new(tag.clone()));
+            values.push(Box::new(escape_like(&tag)));
+        }
+        if let Some(participant) = filter.participant.as_deref().filter(|p| !p.is_empty()) {
+            clauses.push(PARTICIPANT_PREDICATE_SQL.to_owned());
+            values.push(Box::new(escape_like(participant)));
+        }
+        if let Some(start_ts) = filter.start_ts {
+            clauses.push("recordings.started_ts >= ?".to_owned());
+            values.push(Box::new(start_ts));
+        }
+        if let Some(end_ts) = filter.end_ts {
+            clauses.push("recordings.started_ts <= ?".to_owned());
+            values.push(Box::new(end_ts));
+        }
+        if let Some(durability) = &filter.durability {
+            clauses.push("recordings.durability = ?".to_owned());
+            values.push(Box::new(durability.clone()));
+        }
+        if let Some(profile_id) = &filter.profile_id {
+            clauses.push("recordings.profile_id = ?".to_owned());
+            values.push(Box::new(profile_id.clone()));
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        Predicates {
+            join,
+            where_sql,
+            values,
+        }
+    }
+
+    fn params(&self) -> Vec<&dyn rusqlite::ToSql> {
+        self.values.iter().map(|p| p.as_ref()).collect()
+    }
+}
+
 /// Search the recordings archive and project the hits into the rows Story 42.3
 /// renders (FR-141, UX-DR50).
 ///
@@ -699,14 +761,27 @@ pub fn search_recordings(
 /// `session_id`, so each of the at most [`DEFAULT_LIMIT`] lookups is a keyed
 /// b-tree probe, where a `GROUP BY` over every segment ever recorded is a full
 /// scan whose cost grows with the archive instead of with the answer.
+///
+/// The `total` beside the rows is [`count_recordings`]' — the whole matched
+/// set, not this page and not what a viewport rendered (Story 44.11). It costs
+/// one extra `COUNT(*)` per query, which is the price of a surface that can say
+/// how many sessions it found.
 pub fn search_recording_vms(
     conn: &Connection,
     filter: &RecordingFilter,
     destination_root: &Path,
-) -> Result<Vec<RecordingHitVm>, ArchiveError> {
+) -> Result<RecordingSearchVm, ArchiveError> {
     if !recordings_indexed(conn)? {
-        return Ok(Vec::new());
+        // A pre-42.1 `archive.db` has nothing to count and nothing to list.
+        // Zero, and zero is a number the surface shows: an archive that holds
+        // nothing says so, rather than hiding the count and leaving the reader
+        // to guess whether it is empty or still loading.
+        return Ok(RecordingSearchVm {
+            rows: Vec::new(),
+            total: 0,
+        });
     }
+    let total = count_recordings(conn, filter)?;
     let hits = search_recordings(conn, filter)?;
     let mut total_bytes_stmt = conn
         .prepare("SELECT COALESCE(SUM(bytes), 0) FROM recording_segments WHERE session_id = ?1")
@@ -742,7 +817,7 @@ pub fn search_recording_vms(
             playable_relative.as_deref(),
         ));
     }
-    Ok(vms)
+    Ok(RecordingSearchVm { rows: vms, total })
 }
 
 /// One hit, plus what only the database could add, as the row Story 42.3
@@ -2023,6 +2098,182 @@ mod tests {
         assert_eq!(limited(None), 5, "no cap is the default cap");
     }
 
+    /// Story 44.11: the count is of the archive, and the page is the page.
+    ///
+    /// This is the trap the story exists for. `search_recordings` stops at
+    /// [`DEFAULT_LIMIT`], so a surface counting the vector it was handed shows
+    /// the cap and calls it the archive. The fixture is deliberately larger
+    /// than the cap: at 200 rows returned out of 250 stored, `rows.len()` and
+    /// `total` are different numbers, and only one of them is the answer to
+    /// "how many sessions do I have".
+    #[test]
+    fn the_count_is_the_whole_archive_and_not_the_page_the_search_returned() {
+        let conn = memory_db();
+        let stored = usize::try_from(DEFAULT_LIMIT).expect("a positive cap") + 50;
+        for n in 0..stored {
+            upsert_recording(
+                &conn,
+                &row_with_meta(
+                    &format!("01DEVICE-{n:04}SESSION"),
+                    100 + n as i64,
+                    "Call",
+                    "Ada",
+                    "a note",
+                    &["internal"],
+                ),
+            )
+            .expect("index a session");
+        }
+
+        let filter = RecordingFilter::default();
+        let page = search_recordings(&conn, &filter).expect("search");
+        assert_eq!(
+            page.len(),
+            usize::try_from(DEFAULT_LIMIT).expect("a positive cap"),
+            "the page still stops at the cap; nothing about that changed"
+        );
+        assert_eq!(
+            count_recordings(&conn, &filter).expect("count"),
+            u32::try_from(stored).expect("a small fixture"),
+            "and the count reports every session, not the page"
+        );
+
+        // And the VM the surface actually receives carries that number, not its
+        // own `rows.len()`. Asserted here rather than left to the projection's
+        // other tests, all of whose fixtures are under the cap and would pass
+        // just as happily on a `total` derived from the vector.
+        let vm = search_recording_vms(&conn, &filter, Path::new("/recordings")).expect("browse");
+        assert_eq!(
+            vm.rows.len(),
+            usize::try_from(DEFAULT_LIMIT).expect("a positive cap")
+        );
+        assert_eq!(vm.total, u32::try_from(stored).expect("a small fixture"));
+        assert_ne!(
+            usize::try_from(vm.total).expect("a small fixture"),
+            vm.rows.len(),
+            "if these were ever equal at this fixture size the assertion above \
+             would be satisfied by a total taken from the page"
+        );
+    }
+
+    /// Story 44.11: a filtered list counts the filtered set, through the same
+    /// predicates that chose the rows. A count built from a second, separately
+    /// written `WHERE` is a count that disagrees with the list beneath it in
+    /// exactly the cases nobody checks.
+    #[test]
+    fn the_count_narrows_with_every_predicate_the_search_narrows_with() {
+        let conn = memory_db();
+        upsert_recording(
+            &conn,
+            &row_with_meta("01DEVICE-01A", 1_000, "Standup", "Ada", "n", &["internal"]),
+        )
+        .expect("index");
+        upsert_recording(
+            &conn,
+            &row_with_meta(
+                "01DEVICE-02B",
+                2_000,
+                "Standup",
+                "Grace",
+                "n",
+                &["client/acme"],
+            ),
+        )
+        .expect("index");
+        upsert_recording(
+            &conn,
+            &row_with_meta("01DEVICE-03C", 3_000, "Retro", "Ada", "n", &["internal"]),
+        )
+        .expect("index");
+
+        let counted = |filter: RecordingFilter| {
+            let total = count_recordings(&conn, &filter).expect("count");
+            let rows = search_recordings(&conn, &filter).expect("search").len();
+            assert_eq!(
+                usize::try_from(total).expect("small"),
+                rows,
+                "under the cap the two must agree exactly; if they ever do not, \
+                 the count and the list are answering different questions"
+            );
+            total
+        };
+
+        assert_eq!(counted(RecordingFilter::default()), 3);
+        assert_eq!(
+            counted(RecordingFilter {
+                query: "standup".to_owned(),
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                tags: vec!["internal".to_owned()],
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                participant: Some("grace".to_owned()),
+                ..RecordingFilter::default()
+            }),
+            1
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                start_ts: Some(2_000),
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                query: "nothing here".to_owned(),
+                ..RecordingFilter::default()
+            }),
+            0,
+            "an empty set counts zero rather than declining to answer"
+        );
+    }
+
+    /// Story 44.11: the caller's page size is not the archive's size. A count
+    /// that moved with `limit` would be the rendered-window defect wearing the
+    /// filter's clothes.
+    #[test]
+    fn the_page_size_a_caller_asks_for_does_not_move_the_count() {
+        let conn = memory_db();
+        for n in 0..5i64 {
+            upsert_recording(
+                &conn,
+                &row_with_meta(
+                    &format!("01DEVICE-{n:02}SESSION"),
+                    100 + n,
+                    "Call",
+                    "Ada",
+                    "a note",
+                    &["internal"],
+                ),
+            )
+            .expect("index a session");
+        }
+
+        for limit in [Some(1), Some(2), Some(DEFAULT_LIMIT), None] {
+            assert_eq!(
+                count_recordings(
+                    &conn,
+                    &RecordingFilter {
+                        limit,
+                        ..RecordingFilter::default()
+                    }
+                )
+                .expect("count"),
+                5,
+                "the count is of the archive, whatever page size was asked for"
+            );
+        }
+    }
+
     /// Story 42.3: the input seam is a total field move. Every optional is
     /// carried, because a filter that silently dropped one would narrow by less
     /// than the user asked and look like a search bug rather than a mapping bug.
@@ -2089,7 +2340,9 @@ mod tests {
 
     /// The rows the browser would render for an unrestricted filter.
     fn browsed(conn: &Connection, root: &Path) -> Vec<RecordingHitVm> {
-        search_recording_vms(conn, &RecordingFilter::default(), root).expect("browse")
+        search_recording_vms(conn, &RecordingFilter::default(), root)
+            .expect("browse")
+            .rows
     }
 
     /// Story 42.3: the row's two derived figures. Duration is the span between
@@ -2260,9 +2513,17 @@ mod tests {
         )
         .expect("search");
 
-        assert_eq!(matching.len(), 1);
-        assert_eq!(matching[0].title.as_deref(), Some("Standup"));
-        assert!(missing.is_empty());
+        assert_eq!(matching.rows.len(), 1);
+        assert_eq!(matching.rows[0].title.as_deref(), Some("Standup"));
+        assert_eq!(
+            matching.total, 1,
+            "the count is of the filtered set, not of the archive"
+        );
+        assert!(missing.rows.is_empty());
+        assert_eq!(
+            missing.total, 0,
+            "an empty result says zero rather than leaving the count behind"
+        );
     }
 
     /// Story 42.3: a stored path can never compose out of the destination root.
@@ -2293,11 +2554,12 @@ mod tests {
     fn browsing_an_archive_that_predates_the_recordings_tables_yields_no_rows() {
         let conn = Connection::open_in_memory().expect("open in-memory archive");
 
-        let rows =
+        let found =
             search_recording_vms(&conn, &RecordingFilter::default(), Path::new("/recordings"))
                 .expect("an archive with no recordings tables is an empty answer, never an error");
 
-        assert!(rows.is_empty());
+        assert!(found.rows.is_empty());
+        assert_eq!(found.total, 0);
     }
 
     #[test]

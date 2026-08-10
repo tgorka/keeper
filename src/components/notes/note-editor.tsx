@@ -28,7 +28,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import { type NoteWriteVm, notesTagTree } from "@/lib/ipc/client";
+import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
 import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { BacklinksPanel } from "./backlinks-panel";
@@ -38,6 +38,7 @@ import { FormatToolbar } from "./format-toolbar";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NoteHistoryPanel } from "./note-history-panel";
 import { PropertiesPanel, readFrontmatter, recordingSessionId } from "./properties-panel";
+import { TemplateUpdateOffer } from "./template-update-offer";
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
@@ -313,6 +314,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
               ],
             }),
             preview.livePreview({
+              vaultId,
               assetUrl: (rel) =>
                 `keeper-note://${vaultId}/${vaultRelative(pathRef.current, rel)
                   .split("/")
@@ -320,6 +322,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
                   .join("/")}`,
               onOpenLink: (target) => followRef.current?.(target),
               recordingSession: () => sessionRef.current,
+              // Handed the block's own folder text and nothing else: Rust
+              // resolves it against the vault root, so no path is composed
+              // here (AD-65).
+              listFolder: (folder) => notesGallery(vaultId, folder),
             }),
             view.EditorView.updateListener.of((update) => {
               if (!update.docChanged) {
@@ -482,6 +488,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           This note isn't on disk any more. Your text is still here and saving writes it back.
         </p>
       ) : null}
+
+      {/* Only in edit mode, and below the honest-state banners: the offer is a
+          consequence of editing THIS note, and it has no meaning while the pane
+          is showing history or a conflict. It renders nothing at all unless the
+          note is a template whose text changed in this session. */}
+      {mode === "edit" ? <TemplateUpdateOffer vaultId={vaultId} noteId={noteId} rev={rev} /> : null}
 
       {showProperties && mode === "edit" ? (
         <PropertiesPanel

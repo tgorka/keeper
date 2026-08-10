@@ -39,7 +39,15 @@ sort: string,
  */
 sortEffective: string, 
 /**
- * Maximum rows the space yields.
+ * The most notes this space holds — a cap on what it SELECTS, not on what
+ * a surface renders (Story 44.11, DW-163). Zero is "no cap", which is what
+ * a space with no `keeper.limit` key sends and what saving zero back
+ * leaves the file without.
+ *
+ * Applied after the sort, so a space capped at twenty keeps the twenty its
+ * own ordering put first. Not clamped to the list's page size: the page is
+ * how many rows one read carries, and shrinking a space to fit one would
+ * drop notes the space genuinely holds.
  */
 limit: number, 
 /**
@@ -63,6 +71,17 @@ icon: string | null,
  * editor never touches.
  */
 defaultKey: string | null, 
+/**
+ * The template a note created in this space starts from — a vault-relative
+ * path, or a bare name inside the template directory (FR-162, Story 44.7).
+ * `None` for a space that hands out no template, which is most of them.
+ *
+ * Carried as the stored text, unresolved: whether the path still names a
+ * note is a question about the vault at create time, not at render time, so
+ * the editor shows what the file says and the create path is what reports a
+ * template that has gone missing.
+ */
+template: string | null, 
 /**
  * The presentation keys of this space's frontmatter that keeper could not
  * read, each already worded as a finished sentence (Story 44.4).

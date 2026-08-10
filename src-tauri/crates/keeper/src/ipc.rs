@@ -57,8 +57,8 @@ use keeper_core::vm::{
     IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
     NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
     PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingNoteStubVm,
-    RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
+    RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm, RecordingNoteTargetVm,
+    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSearchVm,
     RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
     RecordingTargetVm, RecordingUiState, RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm,
     ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
@@ -2358,11 +2358,16 @@ pub fn search_archive(
 /// row's absolute path composed from it, so no frontend surface ever joins a
 /// root to a subfolder (AD-65) and Reveal cannot open a folder the recorder
 /// would not have written to.
+///
+/// Returns the page AND the archive-wide count (Story 44.11): the page has
+/// always stopped at `recordings_fts::DEFAULT_LIMIT`, and a surface that
+/// counted its own array would say "200 sessions" to somebody with nine
+/// thousand.
 #[tauri::command]
 pub fn search_recordings(
     state: State<'_, AppState>,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let destination_root = effective_destination_dir(&data_dir, &state.platform);
     search_recordings_in(&data_dir, &destination_root, filter)
@@ -2376,9 +2381,13 @@ fn search_recordings_in(
     data_dir: &Path,
     destination_root: &Path,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     if !keeper_core::archive::db::db_path(data_dir).exists() {
-        return Ok(Vec::new());
+        // No archive is zero sessions, and zero is a number the surface prints.
+        return Ok(RecordingSearchVm {
+            rows: Vec::new(),
+            total: 0,
+        });
     }
     let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
         .map_err(CoreError::from)
@@ -17121,7 +17130,7 @@ mod tests {
     fn browsing_recordings_with_no_archive_yields_no_rows_and_no_error() {
         let data_dir = scan_temp_dir("rec-42-3-no-archive");
 
-        let rows = search_recordings_in(
+        let found = search_recordings_in(
             &data_dir,
             &data_dir.join("Movies"),
             RecordingFilterVm {
@@ -17137,7 +17146,11 @@ mod tests {
         )
         .expect("an absent archive is an empty answer, never an error");
 
-        assert!(rows.is_empty());
+        assert!(found.rows.is_empty());
+        assert_eq!(
+            found.total, 0,
+            "no archive is zero sessions, said as a number (Story 44.11)"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -17166,22 +17179,29 @@ mod tests {
         let missing = search_recordings_in(&data_dir, &destination_root, filter("retrospective"))
             .expect("browse the archive");
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "01DEVICE-01STANDUP");
-        assert_eq!(rows[0].duration_ms, Some(60_000));
-        assert_eq!(rows[0].total_bytes, 4_096);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.total, 1,
+            "the count travels with the page (Story 44.11)"
+        );
+        assert_eq!(rows.rows[0].session_id, "01DEVICE-01STANDUP");
+        assert_eq!(rows.rows[0].duration_ms, Some(60_000));
+        assert_eq!(rows.rows[0].total_bytes, 4_096);
         let expected_folder = destination_root.join("2026").join("Standup");
         let expected_file = expected_folder
             .join("screen-0000.mov")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(rows[0].absolute_path, expected_folder.to_string_lossy());
         assert_eq!(
-            rows[0].playable_path.as_deref(),
+            rows.rows[0].absolute_path,
+            expected_folder.to_string_lossy()
+        );
+        assert_eq!(
+            rows.rows[0].playable_path.as_deref(),
             Some(expected_file.as_str())
         );
         assert!(
-            missing.is_empty(),
+            missing.rows.is_empty(),
             "a filter that matches nothing is an empty list, not an error"
         );
         let _ = std::fs::remove_dir_all(&base);

@@ -2262,7 +2262,23 @@ reason: `space_def` parses `limit` and clamps it, `notes_spaces` puts it on `Not
   has to answer, not this one). Whoever takes it must decide that first: whether `limit` caps what
   the space *selects* or only what it *renders*, because 44.11's count means different things under
   each reading.
-status: open
+status: done 2026-08-09, story 44.11 (see spec-44-11-counts.md)
+resolution: `keeper.limit` caps SELECTION. A rendering cap is incoherent after 44.10 — the viewport
+  already bounds rendering for every list, so a second render cap would bound only what can be
+  scrolled to, and the transport window already has an owner in `NoteQueryReq.limit`. A selection
+  cap is a thing a person can mean and cannot otherwise say ("this space holds the twenty most
+  recent"), and it composes with 44.4's sort: the cap is applied AFTER the ordering, so the space
+  keeps the twenty the sort put first. The count shows the CAPPED number, because that is what a
+  person can reach — and never silently: `NoteListVm.matched` travels beside `total` so the surface
+  reads `20 of 347 notes`, and `counts::Selection::report` words the decline at INFO (DW-162's
+  floor, pinned to the literal level). The rule lives in `keeper-core::notes::counts` so it is
+  provable on Linux; the shell only wires it.
+  Two repairs fell out. (1) Unset stopped meaning `MAX_LIMIT`: the old reader mapped an absent,
+  zero or negative `limit` onto 500, so "sets no cap" and "caps at 500" were the same value — and
+  because the editor round-trips a `limit` it does not render and `notes_space_save` wrote it
+  unconditionally, every space saved once grew a `limit: 500` it never had. Zero is now no cap and
+  no cap writes no key, the rule `icon` and `order` already followed. (2) The space's cap is no
+  longer clamped to the page size, so `limit: 2000` means 2 000 rather than silently dropping 1 500.
 
 ### DW-164: The `recorded` sort reads a session's instant out of the stub's `date` and `start` keys, so a recording note whose stamps a person edited by hand sorts by what they typed rather than by the session.
 
@@ -2279,6 +2295,281 @@ reason: `recording_note::compose` writes the session's local calendar day into `
   owns and a person is not invited to edit, which changes what `compose` emits for every recording
   note and wants its own story beside 44.2. The sort would then prefer that key and fall back to
   `date`/`start` for every note written before it.
+status: open
+
+### DW-165: A note containing a ```mermaid fence CRASHES the editor — `live-preview` supplies a block decoration from a `ViewPlugin`, which CodeMirror refuses, so the `EditorView` throws on construction.
+
+origin: found while wiring story 44.16's `![[….csv]]` table widget into the same decoration set,
+  2026-08-09
+location: src/components/notes/editor/live-preview.ts (`buildDecorations` mermaid branch, and the
+  `ViewPlugin.fromClass` at the bottom of the file that provides the whole set)
+severity: **crash, not a quiet no-op.** The three sibling defects this epic found — a scrub bar
+  whose `max` was `"0"`, a `/` menu that had never opened, a seed whose log line the app cannot
+  print — all shipped green while doing nothing. This one does something: a note with a mermaid
+  diagram in it cannot be opened at all. Rank it above the other three.
+reason: `livePreview` provides its decorations from a `ViewPlugin`
+  (`ViewPlugin.fromClass(…, { decorations: (value) => value.decorations })`). CodeMirror does not
+  allow a plugin to contribute a block decoration, and the mermaid branch pushes exactly one:
+  `Decoration.replace({ widget: new MermaidWidget(source), block: true })`. So the first time the
+  decoration set contains a rendered fence, CodeMirror throws and the view does not build.
+
+  **Reproduction, verbatim, run 2026-08-09 under `bun run vitest`.** Build an `EditorView`
+  with a parent in `document.body` and these two extensions, in this order:
+
+  ```ts
+  extensions: [
+    markdown({ base: markdownLanguage }),                    // @codemirror/lang-markdown
+    livePreview({ vaultId: "v", assetUrl: (r) => r, onOpenLink: () => {}, recordingSession: () => null }),
+  ]
+  ```
+
+  over exactly this document:
+
+  ```
+  intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n
+  ```
+
+  The `new EditorView({...})` call throws:
+
+  ```
+  RangeError: Block decorations may not be specified via plugins
+      at Object.point (@codemirror/view/dist/index.js:2747)
+      at RangeSet.spans (@codemirror/state/dist/index.js:3374)
+      at new DocView (@codemirror/view/dist/index.js:2922)
+      at new EditorView (@codemirror/view/dist/index.js:7915)
+  ```
+
+  Dropping `block: true` does **not** fix it: a fence spans several lines, and an inline replace
+  over a range containing a line break trades the error for
+  `RangeError: Decorations that replace line breaks may not be specified via plugins`. So the fence
+  genuinely needs a block decoration and the plugin genuinely cannot give it one.
+
+  **The fix shape.** Move the decoration source off the plugin and onto a `StateField`, which is
+  allowed block decorations:
+  `StateField.define<DecorationSet>({ create, update, provide: (f) => EditorView.decorations.from(f) })`.
+  Not a one-liner, and that is why it is here rather than in 44.16: `buildDecorations` takes an
+  `EditorView` and reads `view.visibleRanges`, which a `StateField` does not have — a field sees
+  only `EditorState`, so the viewport windowing has to be re-expressed (or the field has to hold the
+  whole document's decorations and the viewport optimisation dropped). The plugin also carries the
+  wikilink `mousedown` handler, which stays a plugin concern and has to be split out. Three agents
+  were editing this file when it was found, mid-wave; a decoration-source migration there is how a
+  green tree stops being green.
+
+  **Why the suite is green, and this is the transferable part.** `mermaid-widget.test.ts` drives
+  `renderMermaidInto` and constructs `MermaidWidget` directly — thorough about the widget, and it
+  never asks the renderer to place one. The one test in the suite that does build a real
+  `EditorView` around `livePreview` (`recording-embed.test.ts`, "livePreview, over a recording
+  note") loads `livePreview` **without** `@codemirror/lang-markdown`, so `syntaxTree` yields no
+  `FencedCode` node, the mermaid branch is never entered, and the decoration is never constructed.
+  A suite can be exhaustive about a widget and still never once assemble the thing the user
+  assembles. Shipped this way since story 37.8.
+
+  **The test it needs is the reproduction above**, and nothing in the suite currently does it: build
+  an `EditorView` with the markdown language AND `livePreview` over a document containing a fence.
+status: open
+
+### DW-166: `is:journal` is spelled twice — the index derives the flag from a literal `"journal/"` prefix and story 44.6's creation seed inverts it from its own constant.
+
+origin: found while implementing story 44.6, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_vault.rs (`parse_note`, the three
+  `rel.starts_with(…)` flag branches) and src-tauri/crates/keeper-core/src/notes/seed.rs
+  (`JOURNAL_DIR`)
+reason: `parse_note` decides `is:journal`, `is:space` and — until story 44.7 moved it — `is:template`
+  from a path prefix written as a bare literal. Story 44.6 needs the INVERSE of that rule: given
+  `is:journal`, which folder must a new note be created in for the flag to be true. So the seed
+  carries `JOURNAL_DIR`, with a doc comment naming the function it inverts, and `"journal"` is now
+  in the source twice. The two cannot drift silently in a way a test catches: the seed's own round
+  trip asserts against a hand-built entry, not against `parse_note`, because the `keeper` crate does
+  not build on Linux (AD-56).
+  Not fixed here because the obvious fix — hoist the constants into `keeper-core` beside
+  `default_spaces::SPACES_DIR` and have `parse_note` call one `index::path_flags(rel)` — lands three
+  lines away from story 44.7's in-flight change to the `is:template` predicate, which moves that one
+  flag off the folder and onto the note's own tag (AD-82). Doing both at once in one wave would have
+  been two agents rewriting the same nine lines. It is one constant, one `starts_with` and one
+  import once wave 3 has settled.
+status: open
+
+### DW-167: A space filtered `is:template` creates a note that says it will not appear, because story 44.6's seed deliberately declines a predicate story 44.7 was moving at the same time.
+
+origin: found while implementing story 44.6, 2026-08-09
+location: src-tauri/crates/keeper-core/src/notes/seed.rs (`seed_flag`)
+reason: The creation seed makes a new note satisfy `is:pinned`, `is:archived`, `is:capture` and
+  `is:journal`, and declines every other `is:` flag with a stated reason. `is:template` is the one
+  entry in that table whose reason is temporal rather than principled: while 44.6 was being written,
+  44.7 was moving the predicate from the `templates/` folder prefix onto the note's own `template`
+  tag. Seeding a folder would have been seeding against a rule that no longer exists, and seeding
+  the tag would have been seeding against a rule that did not exist yet.
+  The consequence today: New Note in a space filtered `is:template` writes a plain note at the vault
+  root and reports "A new note can't satisfy is:template, so this note is in the vault but won't
+  appear in <space>." That is honest and it is not right — creation CAN satisfy it now, by adding
+  the `template` tag, which is exactly what `seed_term`'s `tag:` arm already does for every other
+  tag.
+  The fix is one arm in `seed_flag`: `template` sets the `template` tag. `seed::verdict` needs no
+  change at all — it re-runs the real query over the real bytes, so it will simply stop declining.
+  A test exists to flip: `a_space_of_spaces_does_not_manufacture_a_broken_space` is its sibling and
+  shows the shape.
+resolution: **Closed 2026-08-09, in story 44.6, before its spec shipped.** The deferral was
+  temporal, and the reason expired inside the same wave: 44.7 landed while 44.6 was in its
+  verification pass, and `notes_vault::parse_note` now reads the predicate through
+  `templates::is_template` off the note's frontmatter tags (with `templates/` grandfathered). So
+  `seed_flag` gained the arm it was always going to get — `is:template` seeds the tag
+  `templates::TEMPLATE_TAG`, never a folder — and a space filtered `is:template` now makes a new
+  template, which is the only thing that ask can mean.
+  `seed::verdict` needed no change whatsoever, which is worth recording because it is the design
+  paying out: the verdict re-runs the real query over the real bytes through the reconciler's own
+  parser, so adding a seed arm made it stop declining without anybody teaching it a new rule. A
+  per-flag "can we satisfy this?" table would have needed editing in two places and could have
+  disagreed with itself.
+  Two tests (`a_template_space_creates_a_template`,
+  `a_template_space_that_also_names_the_tag_adds_it_once`) and two mutants: M9 removes the arm and
+  kills the first; M10 removes `add_tag`'s de-duplication and kills the second, because two
+  producers now reach the seed's tag list and a duplicate there is a duplicate in the note's
+  frontmatter.
+status: closed
+
+### DW-168: `IndexEntry.fields` flattens a nested frontmatter map into one string, so the space DSL's `field:` predicate cannot address `keeper.from_template` — or any other sub-key.
+
+origin: found while implementing story 44.8, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_vault.rs:1379-1384 (`parse_note`'s field loop),
+  src-tauri/crates/keeper-core/src/notes/frontmatter.rs (`FieldValue::index_string`),
+  src-tauri/crates/keeper-core/src/notes/index.rs (`RESERVED_FIELD_PREFIX`)
+reason: The reconciler stores every frontmatter key through `FieldValue::index_string()`, and a
+  one-level map renders as its pairs joined by `FIELD_LIST_SEPARATOR`. So story 44.7's
+  `keeper: { from_template, from_template_id }` lands in the index as ONE entry —
+  `fields["keeper"] = "from_template: templates/journal.md\nfrom_template_id: 01J…"` — and there is
+  no `fields["keeper.from_template"]` for `field:` to match. Two consequences. First, nobody can
+  write a space for "every note made from the journal template", which is the obvious next thing to
+  want and is one index change away. Second, `RESERVED_FIELD_PREFIX`'s own doc — "a user's top-level
+  `keeper:` map indexes under the bare key `keeper`, so this prefix can never shadow something they
+  wrote" — was written when the reserved namespace held only keeper-computed values
+  (`keeper.origin`, `keeper.device`, `keeper.touched`); now that keeper WRITES a `keeper:` map into
+  the note file, the reserved namespace and the user's own possible `keeper:` key are
+  indistinguishable at the index layer.
+  Story 44.8 works around it rather than changing the reconciler: `template_update::provenance_from_index`
+  inverts that one flattening for its own two keys, with a round-trip test against the real renderer.
+  That keeps the finder at zero file reads on a ten-thousand-note vault and touches nothing else.
+  The general fix — index a one-level map as `parent.child` entries alongside (or instead of) the
+  bare key — changes what `field:` means for every existing query in every vault, so it is a story
+  with a migration question in it, not a rider on 44.8.
+status: open
+
+### DW-169: `notes_restore_revision` now exists and works for any note, and only two surfaces can reach it.
+
+origin: found while implementing story 44.8, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`notes_restore_revision`),
+  src/components/notes/note-history-panel.tsx, src/components/notes/template-update-offer.tsx
+reason: Story 44.8 needed "accepting is undoable through the existing note history" to be true, and
+  found that the existing note history could show a revision and could not act on one — there was no
+  restore command anywhere in the app. It added one: `git show <rev>:<path>` into the ordinary write
+  path, so a restore is itself a revision and undoing an undo is free.
+  It is reachable from exactly two places: the history panel's `Restore this version`, and a template
+  update's per-note `Undo`. Three other surfaces are asking for it and predate it. The conflict
+  resolver can take theirs or take mine and cannot take "the one from before this morning". The
+  editor's "This note isn't on disk any more" banner tells the user their text is still in the buffer
+  and says nothing about the revision that still holds the file. `.keeper/trash/` holds every deleted
+  note (NFR-30) with no way to bring one back except a Finder window. None of these is a bug in 44.8;
+  they are three places where a verb that now exists has not been offered, and the reason to record
+  it is that "keeper never loses your bytes" is only as true as the number of doors back.
+status: open
+
+### DW-170: Story 44.6's shell wiring has never been through a compiler, on any machine — and neither a green test suite nor a green mutation sweep can tell you that.
+
+origin: found while re-verifying story 44.6 after the wave-3 `/tmp` harness incident, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`create_for_space`, `SpaceForCreate`,
+  `space_source`, and the seed application inside `create_note`) and
+  src-tauri/crates/keeper/src/notes_vault.rs (`index_written`)
+severity: **unknown, which is the point.** These are type questions, and no test in this repo can
+  reach them for this crate. A single wrong tuple order in `Frontmatter::parse`'s destructuring, or
+  a `FileStat` field that does not exist, is a build break on the owner's machine and invisible
+  here.
+reason: `cargo check -p keeper --lib` dies on this host inside `glib-sys`'s build script — there is
+  no `pkg-config` — before it reaches a single line of keeper's own source. So the five symbols
+  above have never been type-checked anywhere. This is not new to 44.6 (AD-56 says the shell is
+  untestable on Linux and every wave-3 story says so in its spec), but 44.6 is the sharpest
+  instance: it is the only wave-3 story whose new shell code is on the **write path**, so a
+  compile-time mistake there is a create that fails rather than a surface that renders oddly.
+  The general lesson, which W3Csv reached independently from a `tsc` error that survived a green
+  vitest suite AND a green 15/15 mutation sweep for hours: **a green test suite plus a green
+  mutation sweep is not a green build.** vitest transpiles without typechecking; `cargo test`
+  compiles only the crates it runs; and mutation testing cannot help with either, because a mutant
+  only probes behaviour the tests already assert. Both systems answer "does the code do the right
+  thing". Neither answers "does the code compile". On wave 3 the compile question was the one
+  nobody owned.
+  Mitigated as far as it can be from here: everything decidable was pushed into `keeper-core`
+  (`notes::seed` 27 tests, `notes::query` 45), and what is left in the shell is one read, one call
+  and one `push` per branch. But small is not compiled.
+evidence, and it is not theoretical: **hand-auditing the symbol list above found a real compile
+  error in code that had already passed every test in the story.** A refusal was built with
+  `IpcErrorCode::InvalidInput`, a variant that does not exist — notes refusals use `NotesInvalid`.
+  A compiler says that in milliseconds. 444 green Rust tests and 443 green frontend tests said
+  nothing, because none of them can reach this crate. Fixed at the site, with a comment naming this
+  entry so the next reader knows why a typo like that survived to be found by eye. The remaining
+  symbols were then checked against their definitions rather than against memory and are clean.
+  The same audit found a data-loss path this story made reachable, now closed in-story: `atomic_write`
+  overwrites unconditionally, and `siblings` reports an UNREADABLE directory as an EMPTY one, so a
+  folder keeper cannot list yields a filename keeper believes is free. Unreachable before 44.6
+  because `NoteCreateReq.dest` was a field every caller passed `None` for — the fifth dead value
+  this epic has found — and the space seed is the first thing to set it. `create_note` now refuses
+  when the path it is about to write already exists.
+what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` on the macOS host,
+  plus the six-step smoke test in section 11 of spec-44-6-new-note.md — create from the rail, from
+  Pinned (assert `pinned: true` on disk), from Journal (assert the `journal/` path), from
+  Recordings (assert BOTH the on-screen notice and the `INFO` line in Console.app, because DW-162
+  is the story of a decision that only existed in a `debug!` the packaged app cannot print), twice
+  from Inbox (the second create clears the first's notice), and the overwrite backstop —
+  `chmod 000` a seeded subfolder, create into that space, and confirm keeper refuses AND that the
+  file already there is byte-identical afterwards. That last one is the only item about data rather
+  than display, and byte equality is the check: a note replaced with a blank one looks exactly like
+  a note that was created.
+status: open
+
+### DW-171: Story 44.16's shell wiring has never been through a compiler either — and unlike 44.6's it writes over a file the user already has.
+
+origin: filed alongside DW-170, applying the same standard to 44.16 after W3NewNote argued a
+  one-line AD-56 caveat is too quiet for write-path code, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`csv_path`, `read_csv`, `notes_csv_read`,
+  `notes_csv_set_cell`) and the two lines added to `keeper::lib`'s `invoke_handler`
+severity: **unknown, and the blast radius is larger than DW-170's.** 44.6's uncompiled code
+  *creates* a note: a mistake there is a create that fails, and nothing the user had is lost.
+  44.16's uncompiled code *overwrites an existing file in a synced vault*. A mistake there is
+  somebody's export rewritten and committed, on every machine the vault reaches. Nothing was
+  observed wrong; nothing could have been, which is the entry.
+reason: `cargo check -p keeper` dies on this host inside `glib-sys`'s build script for want of
+  `pkg-config`, before reaching a line of keeper's own source (measured, not assumed). So these
+  four functions have never been type-checked anywhere.
+
+  The specific questions a compiler would settle, none of which a test in this repo can reach:
+
+  | Symbol | The type question |
+  | --- | --- |
+  | `csv_path` | `note_protocol::contained_read` returns `Option<PathBuf>`; the `.filter(\|candidate\| candidate.is_file())` closure takes `&PathBuf`, and the `for rel in candidates` loop moves each `String` before `Ok((rel, path))` returns it. |
+  | `read_csv` | `&PathBuf` coercing to the `&Path` parameter; `std::fs::metadata(path)?.len()` as `u64` against `csv::MAX_CSV_BYTES`. |
+  | `notes_csv_set_cell` | `csv::set_cell` takes `usize`, the command receives `u32`; `rel: String` is borrowed by `write_vault_file` and then **moved** into `csv::project` — an ordering a compiler checks and a reader can talk themselves into. |
+  | both commands | `CsvError` mapped to `IpcError` by hand rather than through `notes_error`, so `NotesError` gained no variant — nothing enforces that the mapping stays exhaustive if `CsvError` grows one. |
+  | the tracing calls | `tracing::info!(%rel, row, column, "…: {error}")` relies on implicit captured identifiers in the message; `rel` is a `String` behind `%`. |
+
+  Mitigated as far as it can be from here, on AD-55/AD-56's own argument: every decision, every
+  byte of the parser and every user-facing sentence is in `keeper-core` and is proved there
+  (`notes::csv` 21 tests, 16 mutants, 16 caught). What is left in the shell is resolution, IO and
+  error mapping — one read, one compare, one write. But small is not compiled, and the general
+  lesson DW-170 records applies unchanged: a green test suite plus a green mutation sweep is not a
+  green build, because neither answers whether the code compiles.
+what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` on the macOS host,
+  plus a smoke test that must include the cases the type system cannot reach:
+  1. Embed `![[data.csv]]` for a file dropped into `attachments/` — the bare-name candidate is the
+     branch a vault-relative path never exercises.
+  2. Edit one cell, then **compare the file on disk byte for byte against a copy taken before the
+     edit**. Only that cell's bytes may differ. A visual check of the table cannot see a rewritten
+     line ending or a dropped BOM, which is the entire promise of this story.
+  3. Open the table, enter a cell, change nothing, blur. The file's mtime must not move, and
+     Console.app must carry the `INFO` line "csv cell unchanged, nothing written". **Both halves.**
+     DW-162 is the story of a decision that existed only in a log the packaged app cannot print;
+     checking the screen and not the log would repeat it exactly, and this is a path whose whole
+     observable behaviour is that nothing happens.
+  4. Edit a cell in a file with a BOM and CRLF terminators, then confirm the sync engine commits it
+     — `mark_dirty` reaching the commit cadence is the one claim in this story that no test on any
+     platform covers.
+  5. Confirm a file over 4 MiB refuses with the sentence naming both sizes rather than hanging.
 status: open
 
 ## DW-N1 — the editor caret opens in front of the frontmatter block
@@ -2534,3 +2825,32 @@ own fixture reached the interrupted states it claims to cover. Everywhere else t
 tested well and the impure shell is tested by a manual procedure the specs record as unrun — which is
 why DW-135, DW-139, DW-146, DW-151, DW-156 and DW-157 are all the same entry wearing different
 clothes: a load-bearing token that a green suite cannot see.
+### DW-172: Two more notes event listeners are declared and subscribed by nothing — `listenNotesShowUnread` and `listenNotesCaptureShown`.
+
+origin: found while fixing the third of the trio in story 44.6, 2026-08-09
+location: src/lib/ipc/client.ts (`listenNotesShowUnread`, `listenNotesCaptureShown`), against
+  `keeper/src/notes_ipc.rs`'s `NOTES_SHOW_UNREAD_EVENT` and `NOTES_CAPTURE_SHOWN_EVENT`
+reason: Story 44.6 found that `listenNotesOpenNote` was exported from the IPC client and called
+  from nowhere, so the tray's New Note created a note, raised the window, and showed the user
+  whatever had been on screen. That one is fixed (`useNotesOpenNote`, mounted in `App.tsx`, with the
+  assertion in `App.test.tsx` rather than in the hook's own suite — see below). Its two siblings are
+  still in that state: Rust emits both events and no webview code subscribes to either.
+  The consequence for each, stated rather than assumed: choosing the tray's unread line is supposed
+  to open the notes view with the origin filter armed (FR-113) and currently raises the window and
+  does nothing else; the capture-shown event is supposed to let the main window react when the
+  panel appears and currently informs nobody.
+  Not fixed in 44.6 because neither is the creation path — they belong to Epic 36's tray and Epic
+  37's capture panel, and a story that fixed all three would be three stories wearing one spec.
+  `useNotesOpenNote` is the pattern to copy; it is ~40 lines including the graceful no-Tauri-host
+  branch.
+severity: the quiet kind. **Nothing fails**, which is why this survived two epics. It is the shape
+  W3TemplateUpdate named while 44.8 was landing: a dead value is not always an armed hazard, it is
+  sometimes a promise the app has been making and cannot keep, and that kind is harder to find
+  because there is no error anywhere.
+the testing lesson, which is the reusable part: a hook suite that does `renderHook(() => useThing())`
+  proves the hook works and can NEVER distinguish a mounted listener from an unmounted one. That is
+  exactly how this class of defect hides. The assertion has to live where the component tree is
+  really rendered — for 44.6 that is `App.test.tsx`, and the mutation that deletes the call from
+  `App.tsx` fails it. `use-notify-navigate.test.ts` has the same hook-only shape and is the reason
+  nobody noticed the notes trio; worth the same treatment when someone is next in that file.
+status: open

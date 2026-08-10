@@ -54,7 +54,7 @@ use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
     NoteVaultVm,
 };
-use keeper_core::notes::{links, naming, recording_note, tags, NotesError};
+use keeper_core::notes::{links, naming, recording_note, tags, templates, NotesError};
 use keeper_core::platform::Platform;
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::profile::{NotesCadence, NotesConfig, SyncProfile};
@@ -71,7 +71,12 @@ pub const KEEPER_DIR: &str = ".keeper";
 pub const OBSIDIAN_DIR: &str = ".obsidian";
 
 /// The vault-relative directory pasted and dropped assets land in (FR-110).
-const ATTACHMENTS_DIR: &str = "attachments";
+///
+/// Crate-visible because a `![[data.csv]]` embed resolves against it too
+/// (Story 44.16): a second string spelling `attachments` in `notes_ipc` is a
+/// rename waiting to half-land, and the two halves would then disagree about
+/// where the file the user just dropped went.
+pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
 
 /// The coalescing window notes applies on top of the sync watcher's own 500 ms
 /// debounce (AD-56). A sliding window, reset by each new path: a burst of writes
@@ -303,6 +308,11 @@ pub fn refresh(app: &AppHandle) {
     // converges on its first registration instead of on the second.
     for vault in registered {
         crate::notes_ipc::seed_default_spaces(&vault);
+        // The templates go in beside the spaces, from the same loop and on the
+        // same terms: idempotent by construction, planned against the directory
+        // rather than the index, and never on a vault that has already been
+        // offered them (Story 44.7).
+        crate::notes_ipc::seed_default_templates(&vault);
     }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
     // means the first profile write after a repair puts notes back too.
@@ -1319,6 +1329,35 @@ fn read_bounded(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(capped).into_owned())
 }
 
+/// Index a note keeper has just written, without waiting for the reconciler
+/// (Story 44.6).
+///
+/// The create path has to answer one question about the file it is writing —
+/// will the space it was created in list it? — and the reconciler will not have
+/// seen the file yet: it coalesces, so a write and the index knowing about it
+/// are separated by up to one coalescing window.
+///
+/// It goes through [`parse_note`], the reconciler's own parser, rather than
+/// through a second reading of the same bytes. That is the whole point: the
+/// answer given at creation time is produced by the rule that will produce the
+/// answer a second later, so "keeper said it would appear here and it did not"
+/// is unrepresentable.
+///
+/// The revalidation triple is synthesised — the file is on disk but has not
+/// been `lstat`ed, and this entry is never cached — so `size` is the text's own
+/// length and `ino` is zero. Nothing downstream of this call reads either; the
+/// timestamps a query compares against come from the frontmatter keeper just
+/// wrote.
+pub fn index_written(rel: &str, text: &str) -> IndexEntry {
+    let now = now_ms();
+    let stat = FileStat {
+        size: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        mtime_ns: i128::from(now) * 1_000_000,
+        ino: 0,
+    };
+    parse_note(rel, &stat, text, now)
+}
+
 /// Turn bytes into an [`IndexEntry`] through the pure core. No IO here.
 fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry {
     let (fm, body_offset) = Frontmatter::parse(text);
@@ -1340,7 +1379,19 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     if conflict_origin(rel).is_some() {
         flags.push("conflict".to_owned());
     }
-    if rel.starts_with("templates/") {
+    // **A template is a note tagged `template`** (AD-82, Story 44.7). This used
+    // to be `rel.starts_with("templates/")` — a directory keeper owns, which is
+    // the exact thing AD-82 rejects, and the reason the tag had never mattered
+    // to anything. The predicate now lives in `keeper-core` beside the code that
+    // strips the marker on copy, so "what is a template" has one answer.
+    //
+    // The folder still counts, and that is compatibility rather than a second
+    // rule: a vault seeded by an earlier build has untagged notes under
+    // `templates/` that the template list has always shown, and silently
+    // un-templating them on upgrade would be keeper taking a feature away from
+    // a file it did not change. A tagged template anywhere else now counts too,
+    // which is the half AD-82 was actually asking for.
+    if templates::is_template(&fm) || rel.starts_with(&format!("{}/", templates::TEMPLATES_DIR)) {
         flags.push("template".to_owned());
     }
     if rel.starts_with("spaces/") {
@@ -2280,6 +2331,101 @@ fn git_out(app: &AppHandle, repo: &Path, args: &[String]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The newest commit touching one note, or `None` when git has never seen it.
+///
+/// This is the revision Story 44.8 hands back as the undo of a template update:
+/// the same string [`revisions`] lists, so "undo" and "the history panel" are
+/// looking at one object rather than two that have to agree.
+pub fn head_rev_of(app: &AppHandle, vault: &Vault, rel: &str) -> Option<String> {
+    let out = git_out(
+        app,
+        &vault.local_path,
+        &[
+            "log".to_owned(),
+            "--no-color".to_owned(),
+            "-n1".to_owned(),
+            "--format=%H".to_owned(),
+            "--".to_owned(),
+            format!("{}/{rel}", vault.config.subfolder),
+        ],
+    )?;
+    let rev = out.trim();
+    (!rev.is_empty()).then(|| rev.to_owned())
+}
+
+/// One note's text as of `rev`, or `None` when that revision does not hold it.
+///
+/// `git show <rev>:<path>` — a read, like [`revisions`] and [`diff`], so it needs
+/// no engine API. Binary-safe by omission: a note is UTF-8 by construction and a
+/// file that is not is not a note keeper will restore.
+pub fn revision_text(app: &AppHandle, vault: &Vault, rel: &str, rev: &str) -> Option<String> {
+    git_out(
+        app,
+        &vault.local_path,
+        &[
+            "show".to_owned(),
+            format!("{rev}:{}/{rel}", vault.config.subfolder),
+        ],
+    )
+}
+
+/// Every vault-relative note path whose bytes on disk are NOT what git holds:
+/// modified, staged, renamed or never tracked at all.
+///
+/// **One** `git status` for the whole vault, not one call per note — the same
+/// arithmetic [`read_heads`] does, and for the same reason: a per-note process
+/// spawn over a ten-thousand-note vault is not a feature, it is a stall.
+///
+/// `None` means the question could not be asked (no git, no repository). Callers
+/// that gate a destructive action on recoverability must treat that as "nothing
+/// is recoverable", never as "everything is" — which is why this is an `Option`
+/// and not an empty set.
+pub fn uncommitted_paths(app: &AppHandle, vault: &Vault) -> Option<HashSet<String>> {
+    let prefix = format!("{}/", vault.config.subfolder);
+    let out = git_out(
+        app,
+        &vault.local_path,
+        &[
+            "status".to_owned(),
+            "--porcelain".to_owned(),
+            // NUL-delimited: a path with a space, a quote or a newline in it is
+            // reported verbatim instead of being quoted and escaped, so there is
+            // no unquoting rule here to get wrong.
+            "-z".to_owned(),
+            "--untracked-files=all".to_owned(),
+            "--".to_owned(),
+            vault.config.subfolder.clone(),
+        ],
+    )?;
+
+    let mut dirty = HashSet::new();
+    let mut records = out.split('\0');
+    // `while let` rather than a `for`, because a rename record consumes the field
+    // AFTER it and a `for` would have already taken it.
+    while let Some(record) = records.next() {
+        // `XY <path>`. `get` rather than indexing: a truncated or malformed
+        // record must not panic a read that only ever informs a refusal.
+        let (Some(status), Some(path)) = (record.get(..2), record.get(3..)) else {
+            continue;
+        };
+        // A rename or copy record is followed by its origin path in the next
+        // field; both sides are "not what git holds", and consuming the second
+        // one here is what stops it being read as the next status code.
+        if status.starts_with('R') || status.starts_with('C') {
+            if let Some(rel) = records
+                .next()
+                .and_then(|origin| origin.strip_prefix(&prefix))
+            {
+                dirty.insert(rel.to_owned());
+            }
+        }
+        if let Some(rel) = path.strip_prefix(&prefix) {
+            dirty.insert(rel.to_owned());
+        }
+    }
+    Some(dirty)
 }
 
 // ---------------------------------------------------------------------------

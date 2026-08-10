@@ -6,22 +6,26 @@ vi.mock("@/lib/ipc/client", () => ({
   notesSpaceTerms: vi.fn(),
   notesSpaceSave: vi.fn(),
   notesTagTree: vi.fn(),
+  notesTemplates: vi.fn(),
 }));
 
 import {
   SPACE_NO_NAME,
+  SPACE_NO_TEMPLATE,
   SPACE_NO_TERMS,
   SPACE_SORT_NOTES,
   SPACE_SORT_RECORDED_NOTE,
+  SPACE_TEMPLATE_MISSING,
   SPACE_TERMS_BROKEN,
   SPACE_TERMS_READONLY,
   SpaceEditor,
 } from "@/components/notes/space-editor";
-import { notesSpaceSave, notesSpaceTerms, notesTagTree } from "@/lib/ipc/client";
+import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
 
 const mockTerms = vi.mocked(notesSpaceTerms);
 const mockSave = vi.mocked(notesSpaceSave);
 const mockTagTree = vi.mocked(notesTagTree);
+const mockTemplates = vi.mocked(notesTemplates);
 
 /**
  * A hand-written space using every construct the chip vocabulary cannot hold.
@@ -52,6 +56,7 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
     limit: p.limit ?? 500,
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
+    template: p.template ?? null,
     warnings: p.warnings ?? [],
     order: p.order ?? 0,
     error: p.error ?? null,
@@ -78,6 +83,11 @@ beforeEach(() => {
   mockTerms.mockReset();
   mockSave.mockReset();
   mockTagTree.mockReset();
+  mockTemplates.mockReset();
+  mockTemplates.mockResolvedValue([
+    { name: "Journal entry", path: "templates/journal-entry.md" },
+    { name: "Inbox note", path: "templates/inbox-note.md" },
+  ]);
   mockSave.mockResolvedValue({
     vaultId: "vault-1",
     id: "s1",
@@ -652,5 +662,89 @@ describe("a space whose query does not parse", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().query).toBe("nope:x");
+  });
+});
+
+describe("a space names the template its notes start from", () => {
+  /** The chooser, once the vault's templates have loaded into it. */
+  async function chooser(vm = space()) {
+    const handles = open(vm);
+    const select = await screen.findByLabelText("New notes start from");
+    // The list arrives asynchronously; every assertion below depends on it.
+    await waitFor(() =>
+      expect(within(select).getByRole("option", { name: "Journal entry" })).toBeTruthy(),
+    );
+    return { ...handles, select: select as HTMLSelectElement };
+  }
+
+  it("offers every template in the vault, and no template at all", async () => {
+    const { select } = await chooser();
+    expect([...select.options].map((option) => option.textContent)).toEqual([
+      "No template",
+      "Journal entry",
+      "Inbox note",
+    ]);
+    // A space with no template is on "No template" rather than on whichever
+    // template happens to sort first.
+    expect(select.value).toBe(SPACE_NO_TEMPLATE);
+  });
+
+  it("saves the chosen template as its vault-relative path", async () => {
+    // The path, not the display name: two folders may both hold a `Daily.md`,
+    // and the name is the only one of the two that is not unique.
+    const { select } = await chooser();
+    fireEvent.change(select, { target: { value: "templates/journal-entry.md" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().template).toBe("templates/journal-entry.md");
+  });
+
+  it("opens on the template the space already names", async () => {
+    const { select } = await chooser(space({ template: "templates/inbox-note.md" }));
+    expect(select.value).toBe("templates/inbox-note.md");
+  });
+
+  it("clears the setting to null rather than to an empty path", async () => {
+    // `""` reaching Rust as a template would be a path of nothing for the
+    // create path to go looking for. Cleared is absent.
+    const { select } = await chooser(space({ template: "templates/inbox-note.md" }));
+    fireEvent.change(select, { target: { value: SPACE_NO_TEMPLATE } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().template).toBeNull();
+  });
+
+  it("keeps showing a template the vault no longer has, and says so", async () => {
+    // The AC's deleted-template case, at the surface that has to admit it. The
+    // value stays selected: a `<select>` whose value matches no option renders
+    // the first one, so without its own option this would read as "No template"
+    // and the next Save would silently store that.
+    const { select } = await chooser(space({ template: "templates/gone.md" }));
+    expect(select.value).toBe("templates/gone.md");
+    expect(screen.getByText(SPACE_TEMPLATE_MISSING)).toBeTruthy();
+    expect(
+      within(select).getByRole("option", { name: "templates/gone.md — not in this vault" }),
+    ).toBeTruthy();
+
+    // And saving without touching it keeps the setting rather than dropping it:
+    // the template may be mid-sync, or on the other machine.
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().template).toBe("templates/gone.md");
+  });
+
+  it("does not call a template missing when the list simply failed to load", async () => {
+    // An empty list because the read failed is not evidence the template is
+    // gone. Saying it is would put a red sentence under a good setting and
+    // invite the user to clear it.
+    mockTemplates.mockRejectedValue(new Error("no vault"));
+    open(space({ template: "templates/journal-entry.md" }));
+
+    const select = (await screen.findByLabelText("New notes start from")) as HTMLSelectElement;
+    await waitFor(() => expect(mockTemplates).toHaveBeenCalled());
+    expect(screen.queryByText(SPACE_TEMPLATE_MISSING)).toBeNull();
+    expect(select.value).toBe("templates/journal-entry.md");
   });
 });

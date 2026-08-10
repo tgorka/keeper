@@ -100,8 +100,12 @@ export function wikilinkSource(
             template: null,
             dest: null,
             tags: [],
+            // A wikilink names a note, not a space. The note it stubs out has
+            // to be reachable by the link that was just written and by nothing
+            // else, so it inherits nothing.
+            space: null,
           }).then((created) => {
-            onCreated?.(created.id);
+            onCreated?.(created.note.id);
           });
         },
       });

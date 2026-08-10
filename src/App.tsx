@@ -9,6 +9,7 @@ import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
+import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
@@ -28,6 +29,12 @@ function App() {
   // a notification click summons the app and lands it on the Inbox (message) or the
   // Bridges view (bridge alert). Coarse only — no exact-message deep landing in MVP.
   useNotifyNavigate();
+  // Open the note the tray just created (Story 44.6, FR-160). At the root and
+  // not in the notes view: the tray exists so the app window is optional for a
+  // whole day (FR-102), so this event routinely arrives while another view is
+  // on screen. Before this hook nothing listened, and the tray's New Note
+  // created a note the user was never shown.
+  useNotesOpenNote();
   // Drive the single Rust lifecycle entry from the webview `visibilitychange`
   // event on the reduced-capability (iOS) tier only (Epic 14-1): background
   // pauses each live sync loop gracefully, foreground routes through the same
