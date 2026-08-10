@@ -11,12 +11,16 @@
  * behavioural decision in this file.** `setActiveTarget` is the single-click
  * gesture: it REPLACES what the active panel shows. Pressing "Show in Files" on
  * the note you are reading would therefore close that note — the note panel is
- * the active one, and `NOTE_PANEL_LIMIT` means there is exactly one — so
- * arriving in Files you would have lost the thing you came from, and going back
- * to Notes you would find nothing open. `openPanel` is the open-beside gesture,
- * and a deliberate press that says "also show me this" is exactly that gesture:
- * a panel already holding the target is focused, a note target retargets the
- * one note panel, and otherwise it opens beside what you were reading.
+ * the active one — so arriving in Files you would have lost the thing you came
+ * from, and going back to Notes you would find nothing open. `openPanel` is the
+ * open-beside gesture, and a deliberate press that says "also show me this" is
+ * exactly that gesture: a panel already holding the target is focused, and
+ * otherwise it opens beside what you were reading.
+ *
+ * Before Story 46.12 the second sentence read "the note panel is the active one
+ * and `NOTE_PANEL_LIMIT` means there is exactly one". The limit is gone and
+ * there may now be several, which changes nothing here: the panel you pressed
+ * the control in is the active one, and replacing it is still the wrong answer.
  *
  * Living here rather than in the two components that press them keeps the pair
  * from drifting: they are one feature in two directions, and the day one of

@@ -34,6 +34,14 @@ import { syncErrorMessage } from "@/lib/stores/sync";
  *  itself into memory. */
 export const NOTE_HISTORY_PAGE = 50;
 
+/**
+ * The word on the control that opens this surface (Story 46.5 moved it into the
+ * note's Actions menu). Distinct from the `<section>`'s own accessible name
+ * "Note history": that names a region of a page full of notes, this names a
+ * verb in a menu that is already about one note.
+ */
+export const NOTE_HISTORY_LABEL = "History";
+
 /** The restore control before it is armed. */
 export const RESTORE_REVISION = "Restore this version";
 

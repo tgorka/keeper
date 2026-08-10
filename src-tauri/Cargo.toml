@@ -101,15 +101,24 @@ keyring = { version = "3", features = ["apple-native"] }
 # build stay byte-identical. Consumed by the `keeper` crate under an iOS-only target table
 # to pin `AfterFirstUnlockThisDeviceOnly`. MIT/Apache — passes the cargo-deny license firewall.
 security-framework = "3"
-# iOS backup exclusion (Story 14.7, FR-65, AD-29). Catalog entries only — objc2 0.6 /
-# objc2-foundation 0.3 are already resolved in the lock transitively (tao/wry/muda), so no
-# new crate version is pulled; the only Cargo.lock change is the dependency edge on the
-# `keeper` crate. Consumed under an iOS-only target table for the single audited
-# `NSURLIsExcludedFromBackupKey` FFI behind `Platform::exclude_from_backup`. The feature
-# list names exactly the Foundation surfaces that call touches (NSURL + its NSError result,
-# NSString path, NSNumber value). MIT — passes the cargo-deny license firewall.
+# iOS backup exclusion (Story 14.7, FR-65, AD-29) and the macOS out-of-vault trash
+# (Story 46.14, AD-102, NFR-30). Catalog entries only — objc2 0.6 / objc2-foundation 0.3
+# are already resolved in the lock transitively (tao/wry/muda), so no new crate version is
+# pulled; the only Cargo.lock change is the dependency edge on the `keeper` crate (iOS-only
+# target table, the single audited `NSURLIsExcludedFromBackupKey` FFI behind
+# `Platform::exclude_from_backup`) and on `keeper-sync` (macOS-only target table,
+# `files_write::finder_trash`'s SAFE `NSFileManager trashItemAtURL:` binding — no unsafe).
+# The feature list names exactly the Foundation surfaces those two calls touch (NSURL + its
+# NSError result, NSString path, NSNumber value, NSFileManager). MIT — passes the cargo-deny
+# license firewall.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSURL", "NSError", "NSString", "NSValue"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSURL",
+    "NSError",
+    "NSString",
+    "NSValue",
+    "NSFileManager",
+] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
 # transitively; MIT — passes the cargo-deny license firewall.
@@ -198,6 +207,18 @@ bytes = "1"
 # direct dep pulls no new crate version. MIT OR Apache-2.0 — passes
 # `cargo deny check`.
 base64 = "0.22"
+# C-style unquoting for `.gitattributes` pattern fields (Story 46.1). A
+# gitattributes line whose pattern holds a space MUST be quoted — git decides
+# to unquote from the line's FIRST BYTE, so a backslash escape is read as an
+# attribute separator and the rule silently covers nothing. Reading such a line
+# back needs the inverse, and `gix-attributes` already unquotes with exactly
+# this crate, so keeper's idempotence check and gitoxide's parser agree by
+# construction rather than by two hand-rolled decoders. It has no encoder,
+# which is why `lfs::stage::quote_pattern` is written by hand against
+# `ansi_c::undo`. Already resolved in the lock as gix-attributes' own
+# dependency, so a direct dep pulls no new crate. MIT OR Apache-2.0 — passes
+# `cargo deny check`.
+gix-quote = "0.7.2"
 # ---------------------------------------------------------------------------
 # Document rendering (Story 45.8, FR-181, FR-182). Consumed by `keeper-core`
 # only: DOCX, PPTX and XLSX are a ZIP of XML, so keeper parses them in Rust and

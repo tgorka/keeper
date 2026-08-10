@@ -39,8 +39,9 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { EditorView } from "@codemirror/view";
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { withRangeRects } from "@/test/layout";
+import { NOTE_ACTIONS_TEXT } from "../note-actions";
 import { NoteEditor } from "../note-editor";
 
 // jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
@@ -81,17 +82,17 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null });
+  resetNotesEditorStoreForTest();
 });
 
 /** The real editor, once its lazy chunk has landed. */
 async function mounted(): Promise<EditorView> {
   render(<NoteEditor vaultId="v1" noteId="n1" />);
-  await screen.findByText("Properties");
+  await screen.findByText(NOTE_ACTIONS_TEXT);
   return await waitFor(() => {
     const node = document.querySelector<HTMLElement>(".cm-content");
     expect(node).not.toBeNull();
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     const view = EditorView.findFromDOM(node as HTMLElement);
     expect(view).not.toBeNull();
     return view as EditorView;
@@ -119,7 +120,7 @@ describe("emoji, in the editor the user actually types into", () => {
     // Read back through `onEdit` → the notes store: the buffer that would be
     // written to disk, not a CodeMirror internal.
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("🎉alpha\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("🎉alpha\n");
     });
   });
 
@@ -141,7 +142,7 @@ describe("emoji, in the editor the user actually types into", () => {
     type(view, ":zzzznotanemoji:");
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(":zzzznotanemoji:alpha\n");
+      expect(readNoteDocument("v1", "n1").text).toBe(":zzzznotanemoji:alpha\n");
     });
   });
 });

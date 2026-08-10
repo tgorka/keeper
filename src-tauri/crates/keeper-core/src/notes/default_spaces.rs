@@ -45,9 +45,18 @@ use crate::notes::naming;
 /// with the vault — otherwise deleting Pinned on the desktop is undone the next
 /// time the laptop opens the same synced folder, which is exactly the forever-
 /// ownership AD-79 refuses. That rules out the two cheaper homes: the profile
-/// row in `keeper.db` is per-machine, and `.keeper/` is per-machine *and*
-/// documented as a deletable cache — a fact that cannot be recomputed must not
-/// live somewhere a user is invited to clear.
+/// row in `keeper.db` is per-machine, and `.keeper/` was, when this was
+/// written, per-machine *and* documented as a deletable cache — a fact that
+/// cannot be recomputed must not live somewhere a user is invited to clear.
+///
+/// AD-100 has since carved `.keeper/*.toml` out of the exclusion, so *part* of
+/// that directory now syncs and survives a rebuild. This file stays where it
+/// is: the carve-out is deliberately narrow — `*.toml` and nothing else — and
+/// a JSON ledger under `.keeper/` would still be excluded, still be swept by
+/// anyone who takes the old "delete the directory" advice, and still be the
+/// only unrecomputable thing in a directory whose other contents are a cache
+/// and a trash. The next reader who finds this comment and AD-100 together has
+/// their answer here rather than in a diff.
 ///
 /// A leading dot, and not a `.md` file: Obsidian's explorer hides it, the note
 /// walk only ever collects `.md`, and `keeper-sync`'s tier-0 corpus excludes the

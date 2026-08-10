@@ -51,19 +51,19 @@ use keeper_core::recording::{
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
-    DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
-    ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
-    NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm, RecordingNoteTargetVm,
-    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSearchVm,
-    RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm,
-    RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RecordingVolumeState,
-    RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    CapabilitiesVm, ChatNotifyMode, ConfigLayersVm, ConnectionStatusBatch, CouplingCaveatVm,
+    DemoBatch, DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
+    IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot,
+    NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch,
+    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingDestinationKind,
+    RecordingDurabilityState, RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm,
+    RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
+    RecordingSearchVm, RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm,
+    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -1719,6 +1719,51 @@ pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<Syn
             retriable: false,
         })
     }
+}
+
+/// Where every file-set setting came from, and everything wrong with the
+/// settings files (Story 46.7, AD-98).
+///
+/// **This command is the whole of AD-98's second half.** The layer stack makes
+/// a file keep winning; without a surface that says so, the visible effect is a
+/// switch that flips back on its own, which is worse than the destructive
+/// import it replaced — that one at least only lost the file's value once. So
+/// the answer to "where did this value come from?" is a first-class read, not a
+/// debug affordance.
+///
+/// Registered on every platform, like [`sync_git_status`] and unlike the rest
+/// of the sync surface: `~/.keeper/keeper.toml` is read by
+/// [`keeper_core::config`], which has no desktop gate, and a phone that
+/// answered `Command config_layers not found` would force the Settings surface
+/// to special-case a question it can always answer honestly (with an empty
+/// stack).
+///
+/// No `State` parameter, deliberately: the stack is process-global and was
+/// installed at phase one of `setup()`, before `AppState` had anything in it
+/// worth reading. Taking the state would imply this depends on it.
+#[tauri::command]
+pub fn config_layers() -> Result<ConfigLayersVm, IpcError> {
+    let vm = ConfigLayersVm::new(
+        keeper_core::config::overrides(),
+        keeper_core::config::faults(),
+        keeper_core::config::main_folder(),
+    );
+    // The two fault sources meet here and nowhere earlier. AD-40 keeps
+    // `keeper-sync` free of `keeper-core` and `keeper-core` free of
+    // `keeper-sync` (`bun run check:core-sync-free` asserts both edges), so the
+    // shell is the only crate that can see a folder tier's faults and the app
+    // layers' faults at the same time. A user does not care which crate
+    // noticed; one list.
+    #[cfg(desktop)]
+    let vm = vm.with_folder_faults(
+        keeper_sync::profile::folder_faults()
+            .iter()
+            // Fully qualified rather than imported: the only use is inside this
+            // `cfg`, and an import would be an unused-import warning on iOS.
+            .map(|fault| keeper_core::vm::ConfigFaultVm::folder(&fault.path, fault.message.clone()))
+            .collect(),
+    );
+    Ok(vm)
 }
 
 /// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of
@@ -7158,8 +7203,8 @@ pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
     recording_snapshot(state)
 }
 
-/// One sync profile, reduced to the five facts a recordings destination turns on
-/// (Story 41.2, FR-131; Story 41.7 added the fifth).
+/// One sync profile, reduced to the facts a recordings destination turns on
+/// (Story 41.2, FR-131; Story 41.7 added the volume, Story 46.10 the subfolder).
 ///
 /// `keeper-sync`'s `SyncProfile` is a thirty-field type that only exists on
 /// desktop; this is what the destination decision actually asks of it, mapped in
@@ -7181,6 +7226,16 @@ struct DestinationProfileRow {
     /// ([`keeper_sync::SyncProfile::recordings_root`]), or `None` when it does
     /// not say it holds recordings (Story 41.1's `recordings` block absent).
     recordings_root: Option<PathBuf>,
+    /// The profile-relative subfolder [`Self::recordings_root`] was joined FROM,
+    /// carried rather than sliced back out of the root (Story 46.10).
+    ///
+    /// `Some` exactly when `recordings_root` is: [`destination_profile_row`] is
+    /// the one place either is built and builds both from the same `recordings`
+    /// block. Recovering it from the root instead would be string surgery that
+    /// normalises — `20-media//sessions` and `20-media/sessions` join to one root
+    /// and are two different stored values — and only the stored one may be
+    /// echoed back to `sync_profile_save` by an edit box.
+    recordings_subfolder: Option<String>,
     /// Whether watch mode is armed. A paused profile is neither a destination nor
     /// a collision — see [`enclosing_destination_profile`].
     enabled: bool,
@@ -7574,6 +7629,14 @@ fn destination_profile_row(profile: &keeper_sync::SyncProfile) -> DestinationPro
         name: profile.name.clone(),
         local_path: profile.local_path.clone(),
         recordings_root: profile.recordings_root(),
+        // The head the root above was composed from, taken from the SAME block, so
+        // the pair cannot describe two different profiles (Story 46.10). Trimmed
+        // exactly as `recordings_root` trims before joining, so what the card
+        // shows is what the join used.
+        recordings_subfolder: profile
+            .recordings
+            .as_ref()
+            .map(|recordings| recordings.subfolder.trim().to_owned()),
         enabled: profile.enabled,
         // Only a profile that says it is on removable media is scanned. For every
         // ordinary folder this is the whole cost of the feature: one boolean.
@@ -9791,6 +9854,11 @@ fn destination_profile_vms(table: &DestinationProfileTable) -> Vec<RecordingProf
                 id: row.id.clone(),
                 name: row.name.clone(),
                 recordings_root: row.recordings_root.as_ref()?.to_string_lossy().into_owned(),
+                // The head, `?` for the same reason the root is: a row that
+                // cannot say where recordings live is not a destination, and one
+                // that named a root without a head would be a row this function
+                // had to invent half of.
+                subfolder: row.recordings_subfolder.clone()?,
             })
         })
         .collect()
@@ -12177,6 +12245,9 @@ mod tests {
             name: name.to_owned(),
             local_path: PathBuf::from(local),
             recordings_root: Some(PathBuf::from(local).join("recordings")),
+            // Spelled the same way the join above spells it, because this fixture
+            // is asserting that the pair agrees.
+            recordings_subfolder: Some("recordings".to_owned()),
             enabled: true,
             volume: None,
         }
@@ -13127,23 +13198,44 @@ mod tests {
     /// The picker's source: flagged AND enabled only, with the root RESOLVED here
     /// so no surface joins a local path and a subfolder. No engine ⇒ an empty
     /// list, never an error, so the card falls back to today's behaviour.
+    ///
+    /// Story 46.10: the row also carries the HEAD the root was joined from, and a
+    /// multi-segment one is carried verbatim — the Destination card shows and
+    /// edits it, so a truncated or re-normalised head would be a value the card
+    /// could not echo back to `sync_profile_save`.
     #[test]
     fn destination_profiles_lists_only_the_folders_that_hold_recordings() {
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
         unflagged.recordings_root = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
+        let mut nested = flagged_row("nest", "nested", "/Volumes/nest");
+        nested.recordings_subfolder = Some("40-media/recordings".to_owned());
+        nested.recordings_root = Some(PathBuf::from("/Volumes/nest/40-media/recordings"));
         let table = Ok(vec![
             flagged_row("tgd", "tgdrive", "/Volumes/tg"),
             unflagged,
             paused,
+            nested,
         ]);
 
         let offered = destination_profile_vms(&table);
-        assert_eq!(offered.len(), 1, "only one folder holds recordings");
+        assert_eq!(offered.len(), 2, "only two folders hold recordings");
         assert_eq!(offered[0].id, "tgd");
         assert_eq!(offered[0].name, "tgdrive");
         assert_eq!(offered[0].recordings_root, "/Volumes/tg/recordings");
+        assert_eq!(
+            offered[0].subfolder, "recordings",
+            "the head the root was composed from, beside it"
+        );
+        assert_eq!(
+            offered[1].recordings_root, "/Volumes/nest/40-media/recordings",
+            "a nested head resolves to a nested root"
+        );
+        assert_eq!(
+            offered[1].subfolder, "40-media/recordings",
+            "a multi-segment head is carried whole, not reduced to its last part"
+        );
 
         assert!(
             destination_profile_vms(&Err("git is not available".to_owned())).is_empty(),

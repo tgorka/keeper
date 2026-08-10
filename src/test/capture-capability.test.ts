@@ -37,8 +37,38 @@ const capability = JSON.parse(readFileSync(CAPABILITY, "utf8")) as {
 };
 
 const conf = JSON.parse(readFileSync(TAURI_CONF, "utf8")) as {
-  app: { windows: { label: string; url?: string }[] };
+  app: {
+    windows: {
+      label: string;
+      url?: string;
+      width?: number;
+      height?: number;
+      minWidth?: number;
+      minHeight?: number;
+      resizable?: boolean;
+    }[];
+  };
 };
+
+const CAPTURE_RS = readFileSync(
+  resolve(import.meta.dirname, "../../src-tauri/crates/keeper-core/src/capture.rs"),
+  "utf8",
+);
+
+/**
+ * A `pub const NAME: (u32, u32) = (w, h);` out of `capture.rs`.
+ *
+ * `_` separators are stripped with a global regex rather than `replaceAll`,
+ * which this project's `lib` target does not carry — raising `lib` is a
+ * repo-wide decision and does not belong in a story about window sizes.
+ */
+function coreSize(name: string): [number, number] {
+  const found = new RegExp(
+    `pub const ${name}: \\(u32, u32\\) = \\((\\d[\\d_]*), (\\d[\\d_]*)\\);`,
+  ).exec(CAPTURE_RS);
+  expect(found, `${name} is no longer declared in capture.rs`).not.toBeNull();
+  return [Number(found?.[1].replace(/_/g, "")), Number(found?.[2].replace(/_/g, ""))];
+}
 
 const CLIENT_TS = readFileSync(resolve(import.meta.dirname, "../lib/ipc/client.ts"), "utf8");
 
@@ -59,6 +89,54 @@ describe("the capture window's document", () => {
     const declared = conf.app.windows.find((window) => window.url?.startsWith("capture."));
     expect(declared?.url, "tauri.conf.json no longer declares a capture document").toBeDefined();
     expect(NOTES_WINDOW_RS).toContain(`const CAPTURE_DOCUMENT: &str = "${declared?.url}";`);
+  });
+});
+
+describe("the capture window's size", () => {
+  const declared = () => {
+    const window = conf.app.windows.find((entry) => entry.url?.startsWith("capture."));
+    expect(window, "tauri.conf.json no longer declares a capture window").toBeDefined();
+    return window;
+  };
+
+  /**
+   * Story 46.15 made a capture window resizable, which made its size a value
+   * with **three** namers: `tauri.conf.json` for the prewarmed window,
+   * `CAPTURE_DEFAULT_SIZE` for every window `notes_window::open` builds, and
+   * `Placement::window_size`, which normalises a locked window back to it. If
+   * they drift, a locked prewarmed window is silently re-sized to a number
+   * nobody chose on its first open — the window is *fine*, which is what makes
+   * it survive review. `keeper-core` is the namer; the other two follow it.
+   */
+  it("is the same number in tauri.conf.json and in keeper-core", () => {
+    const [width, height] = coreSize("CAPTURE_DEFAULT_SIZE");
+    expect(declared()?.width).toBe(width);
+    expect(declared()?.height).toBe(height);
+  });
+
+  /**
+   * The floor is enforced twice on purpose — by the clamp, and by the window's
+   * own `minWidth`/`minHeight` so the compositor refuses the drag before the
+   * user gets there. A floor declared on only one of them is a floor the user
+   * can drag straight through and then have keeper argue with on the next open.
+   */
+  it("declares the same floor the clamp enforces", () => {
+    const [width, height] = coreSize("CAPTURE_MIN_SIZE");
+    expect(declared()?.minWidth).toBe(width);
+    expect(declared()?.minHeight).toBe(height);
+    expect(NOTES_WINDOW_RS).toContain(".min_inner_size(CAPTURE_MIN_SIZE.0.into()");
+  });
+
+  /**
+   * The prewarmed window boots LOCKED, whatever it was last set to, because
+   * nothing has read a setting when `tauri.conf.json` is applied. Flipping this
+   * to `true` would hand a resizable window to someone who never unlocked it,
+   * and would make the lock's second verb a lie in the other direction.
+   * `lib.rs`'s setup applies the remembered placement immediately afterwards.
+   */
+  it("boots the prewarmed window non-resizable, and the lock flips it", () => {
+    expect(declared()?.resizable).toBe(false);
+    expect(NOTES_WINDOW_RS).toContain("window.set_resizable(!placement.locked)");
   });
 });
 

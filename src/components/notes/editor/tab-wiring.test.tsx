@@ -37,7 +37,8 @@ vi.mock("@/lib/ipc/client", () => ({
   revealPath: vi.fn(async () => {}),
 }));
 
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import { NOTE_ACTIONS_TEXT } from "../note-actions";
 import { NoteEditor } from "../note-editor";
 
 // jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
@@ -83,7 +84,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null });
+  resetNotesEditorStoreForTest();
 });
 
 /** The content DOM of the mounted editor, once its lazy chunk has landed. */
@@ -91,7 +92,7 @@ async function content(): Promise<HTMLElement> {
   return await waitFor(() => {
     const node = document.querySelector<HTMLElement>(".cm-content");
     expect(node).not.toBeNull();
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     return node as HTMLElement;
   });
 }
@@ -117,7 +118,7 @@ function press(node: HTMLElement, key: string, options: { shift?: boolean } = {}
 describe("Tab, in the editor the user actually types into", () => {
   it("indents the caret's line rather than escaping to the web view", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const node = await content();
 
     const claimed = press(node, "Tab");
@@ -126,14 +127,14 @@ describe("Tab, in the editor the user actually types into", () => {
     // Read back through `onEdit` → the notes store: the buffer that would be
     // written to disk, not a CodeMirror internal.
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("  alpha\nbeta\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("  alpha\nbeta\n");
     });
-    expect(notesEditorStore.getState().text).not.toContain("\t");
+    expect(readNoteDocument("v1", "n1").text).not.toContain("\t");
   });
 
   it("keeps the escape hatch: Escape then Tab leaves, and writes nothing", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const node = await content();
 
     press(node, "Escape");
@@ -141,22 +142,22 @@ describe("Tab, in the editor the user actually types into", () => {
     // Not claimed: the browser is free to move focus, which is the contract
     // CodeMirror's unbound default exists to keep.
     expect(press(node, "Tab")).toBe(false);
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
   });
 
   it("outdents on Shift-Tab", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const node = await content();
 
     press(node, "Tab");
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("  alpha\nbeta\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("  alpha\nbeta\n");
     });
     press(node, "Tab", { shift: true });
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(OPENED);
+      expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     });
   });
 });

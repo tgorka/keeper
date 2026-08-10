@@ -91,6 +91,7 @@ import {
   SYNC_DIRECTIONS,
   SYNC_LFS_MODES,
   SYNC_MIN_POLL_INTERVAL_MS,
+  SYNC_RECORDINGS_SUBFOLDER_LABEL,
   SYNC_REMOVABLE_SETTLE_MS,
   type SyncDirection,
   type SyncLfsMode,
@@ -230,7 +231,6 @@ export const SYNC_NOTES_GUARANTEES = [
 export const SYNC_RECORDINGS_LABEL = "This folder holds recordings";
 export const SYNC_RECORDINGS_NOTE =
   "keeper saves recordings into a subfolder of this folder and syncs them with everything else here. A folder flagged this way can be chosen as the destination in Recording.";
-export const SYNC_RECORDINGS_SUBFOLDER_LABEL = "Recordings subfolder";
 
 /**
  * Shown only while adding a folder, where no stored profile has resolved the

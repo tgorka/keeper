@@ -66,6 +66,14 @@ pub struct NoteExportPlan {
 
 /// Whether an embed target names a note rather than a file to copy.
 ///
+/// **Pinned to its TypeScript mirror by `attach-vectors.json`** since Story
+/// 46.11 — see the test at the bottom of this module. It was private and merely
+/// cited by `src/lib/notes/attach.ts` while the only reader of the rule in the
+/// webview was 46.2's `attachments/`-scoped panel. 46.11 gave it two more: the
+/// panel now lists a file wherever the vault holds it, and the in-vault chooser
+/// declines to offer a `.md`. A drift would make the chooser offer a file the
+/// panel does not list and the export refuses to carry.
+///
 /// Two shapes, both of which a real vault contains. `![[daily.md]]` is explicit.
 /// `![[Other Note]]` has no extension at all, because a wikilink names a note by
 /// its title and the index resolves it — so an extensionless target is a note by
@@ -84,7 +92,7 @@ pub struct NoteExportPlan {
 /// `.hidden.md` — which it called a file, and a `.md` file is a note by every
 /// other rule in this codebase. Untested and wrong; removed rather than kept
 /// for the reassurance.
-fn names_a_note(target: &str) -> bool {
+pub fn names_a_note(target: &str) -> bool {
     let name = attach::attachment_name(target);
     match name.rsplit_once('.') {
         Some((_, extension)) => extension.eq_ignore_ascii_case("md"),
@@ -255,6 +263,48 @@ mod tests {
     fn the_extension_is_read_off_the_last_segment_only() {
         assert!(names_a_note("photo.png/index"));
         assert!(!names_a_note("notes.d/photo.png"));
+    }
+
+    /// The vector table shared with the TypeScript mirror (Story 46.11).
+    ///
+    /// **This is the anti-drift mechanism, and it exists because the rule grew
+    /// consumers.** Story 46.2 mirrored [`names_a_note`] in
+    /// `src/lib/notes/attach.ts` and deliberately did NOT pin it, recording the
+    /// trigger for pinning: a second caller. Story 46.11 added two — the
+    /// Attachments panel now lists a body embed wherever the vault holds it, and
+    /// the in-vault chooser declines to offer a file this rule calls a note. A
+    /// drift now means a chooser offering a file the panel will not list and the
+    /// export will not carry, which is the "two answers to one question" shape
+    /// this whole feature keeps failing on.
+    ///
+    /// `include_str!` rather than a runtime read, like `attach.rs`'s: a deleted
+    /// or renamed fixture has to be a build failure and not a test that quietly
+    /// passes over no vectors.
+    #[test]
+    fn every_shared_note_target_vector_matches_and_the_table_is_not_empty() {
+        const VECTORS_JSON: &str = include_str!("attach-vectors.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(VECTORS_JSON).expect("the shared vector fixture parses");
+        let vectors = parsed["noteTargets"]
+            .as_array()
+            .expect("the fixture carries a noteTargets array");
+        assert!(
+            vectors.len() >= 12,
+            "the shared table has been truncated to {} vectors; it is the contract with \
+             src/lib/notes/attach.ts and shrinking it silently weakens both suites",
+            vectors.len()
+        );
+        for vector in vectors {
+            let target = vector["target"].as_str().expect("target is a string");
+            let expected = vector["isNote"].as_bool().expect("isNote is a bool");
+            assert_eq!(
+                names_a_note(target),
+                expected,
+                "vector {:?} ({})",
+                target,
+                vector["why"].as_str().unwrap_or_default()
+            );
+        }
     }
 
     #[test]

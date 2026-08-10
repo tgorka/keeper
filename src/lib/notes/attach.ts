@@ -98,6 +98,19 @@ export function attachmentName(relativePath: string): string {
 const WIKILINK_HOSTILE = /[[\]|#\n\r]/;
 
 /**
+ * Whether an embed can name this path at all.
+ *
+ * The same rule {@link planAttachments} refuses on, asked *before* the offer
+ * rather than after it (Story 46.11). A file browser over a real vault can show
+ * a file whose name holds a `#`, and a row that offers a button and then answers
+ * with a refusal is the shape this feature already decided against for the
+ * duplicate case: the reason goes where the button would have been.
+ */
+export function wikilinkNameable(relPath: string): boolean {
+  return !WIKILINK_HOSTILE.test(relPath);
+}
+
+/**
  * The file names this body already embeds, in either embed spelling, folded to
  * lower case.
  *
@@ -122,6 +135,150 @@ export function embeddedAttachmentNames(body: string): Set<string> {
     }
   }
   return names;
+}
+
+/**
+ * Whether an embed target names a note rather than a file.
+ *
+ * Mirrors `keeper_core::notes::export::names_a_note` and is pinned to it by
+ * `attach-vectors.json`, which both test suites load. It has to be *that* rule
+ * rather than a new one: if a surface called something an attachment that
+ * `export::plan` classifies as a transclusion, it would list — or offer — a file
+ * the export then refuses to carry, and the two receipts for one note would
+ * disagree.
+ *
+ * Pinned rather than merely cited since Story 46.11, which is the second caller
+ * 46.2 named as the trigger: {@link bodyEmbedTargets} reads it and the in-vault
+ * chooser declines to offer a `.md` by it, so a drift would now show up as a
+ * chooser offering a file the panel will not list.
+ *
+ * `![[daily.md]]` is explicit. `![[Other Note]]` has no extension at all,
+ * because a wikilink names a note by its title — so an extensionless target is
+ * a note by construction, not a file whose extension somebody forgot. The test
+ * is on the last segment, so a folder called `photo.png` cannot make
+ * `photo.png/index` look like an image. A dotfile needs no special case:
+ * `.gitignore` yields the extension `gitignore`, which is not `md`, so the
+ * ordinary arm already answers "file".
+ */
+export function namesANote(target: string): boolean {
+  const name = attachmentName(target);
+  const dot = name.lastIndexOf(".");
+  return dot === -1 ? true : name.slice(dot + 1).toLowerCase() === "md";
+}
+
+/**
+ * Every embed target in this body that names a **file** rather than a note,
+ * spelled as the note spells it, in document order, deduplicated on the folded
+ * target.
+ *
+ * The syntactic half of "what does this note have" (Story 46.2, AD-103; widened
+ * by Story 46.11). It is deliberately only a half, and saying which half is the
+ * whole design of this pair:
+ *
+ * - This function knows what the *text* says. It is pure, it runs over an
+ *   unsaved buffer on every keystroke, and it has no disk.
+ * - Whether the vault actually holds any of these files is a question only a
+ *   `stat` answers, and `notes_embed_paths` answers it — through the same
+ *   `embed::candidates` + containment resolution `notes_embed_read`, the
+ *   `keeper-note://` protocol and `export::plan` all use. {@link bodyEmbedPlan}
+ *   joins the two answers.
+ *
+ * **No `attachments/` prefix test.** 46.2 had one, because it had no disk and a
+ * prefix is a fact about the text: the folder the copy path writes into was the
+ * only thing it could be sure of. Story 46.11 makes an in-vault attach point at
+ * the file where it already lives — `photos/a.png`, which never acquires the
+ * prefix — so the prefix would now hide exactly the files this epic added. The
+ * spine's ruling: a row is made by the note embedding a file and the vault
+ * holding it, wherever it lives. This is the first clause; the probe is the
+ * second. A bare `![[photo.png]]` is therefore no longer excluded either — it
+ * was excluded because only a `stat` could say which of two candidates it
+ * meant, and now something does the `stat`.
+ *
+ * A mention is not an attachment: `!` is the whole of the difference, exactly
+ * as {@link embeddedAttachmentNames} and `export::plan` both read it. Code is
+ * not a use, anchors are dropped and an external URL is not a file — all three
+ * come from {@link extractLinks}, the one link grammar, and none of them is
+ * decided here.
+ */
+export function bodyEmbedTargets(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const link of extractLinks(body)) {
+    if (!link.embed) {
+      continue;
+    }
+    const folded = link.target.toLowerCase();
+    if (namesANote(link.target) || seen.has(folded)) {
+      continue;
+    }
+    seen.add(folded);
+    out.push(link.target);
+  }
+  return out;
+}
+
+/** What the note embeds, split by what the vault could be asked about it. */
+export interface BodyEmbedPlan {
+  /**
+   * The vault-relative paths of the files the vault holds, in document order,
+   * deduplicated on the resolved path.
+   *
+   * The *resolved* path and not the target as written, because those differ for
+   * a bare name: `![[photo.png]]` resolving in the attachments folder is a row
+   * for `attachments/photo.png`, which is the file the note actually shows.
+   * Deduplicated after resolution for the same reason `export::plan` is — two
+   * spellings that land on one file are one file.
+   */
+  present: readonly string[];
+  /**
+   * Targets the vault does not hold, as the note spells them. A real state: a
+   * file deleted or moved after the embed was written.
+   */
+  missing: readonly string[];
+  /**
+   * Targets nothing has been asked about yet. Never empty on the first frame
+   * after an embed is typed, and the reason a surface must not say "no
+   * attachments" from `present.length === 0` alone.
+   */
+  pending: readonly string[];
+}
+
+/**
+ * Join {@link bodyEmbedTargets} to what the vault said about each target.
+ *
+ * `resolved` maps a target to the vault-relative path it resolves to, `null`
+ * when the vault holds no such file, and is *absent* for a target that has not
+ * been asked about. Three answers and not two: "not asked yet" and "not there"
+ * are different facts, and a surface that collapsed them would accuse the vault
+ * of having lost a file for the first frame after every keystroke that writes
+ * an embed.
+ *
+ * Line for line with `keeper_core::notes::export::plan`, which takes its own
+ * probe as `&dyn Fn(&str) -> bool` for the same reason: the rule is pure and
+ * the disk is the caller's. `plan`'s `notes` bucket is this function's silence
+ * — {@link bodyEmbedTargets} has already dropped transclusions — and its
+ * `missing` is this one's.
+ */
+export function bodyEmbedPlan(
+  body: string,
+  resolved: ReadonlyMap<string, string | null>,
+): BodyEmbedPlan {
+  const present: string[] = [];
+  const missing: string[] = [];
+  const pending: string[] = [];
+  for (const target of bodyEmbedTargets(body)) {
+    if (!resolved.has(target)) {
+      pending.push(target);
+      continue;
+    }
+    const rel = resolved.get(target) ?? null;
+    if (rel === null) {
+      missing.push(target);
+    } else if (!present.includes(rel)) {
+      present.push(rel);
+    }
+  }
+  return { present, missing, pending };
 }
 
 /** What one gesture will write, what it will not, and why not. */
@@ -168,7 +325,7 @@ export function planAttachments(body: string, relativePaths: readonly string[]):
   const unnameable: string[] = [];
 
   for (const path of relativePaths) {
-    if (WIKILINK_HOSTILE.test(path)) {
+    if (!wikilinkNameable(path)) {
       unnameable.push(path);
       continue;
     }

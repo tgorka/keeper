@@ -82,6 +82,7 @@ export function NoteRow({
   selected,
   tabIndex,
   onSelect,
+  onSelectBeside,
   onToggleTag,
   ref,
 }: {
@@ -89,6 +90,8 @@ export function NoteRow({
   selected: boolean;
   tabIndex: number;
   onSelect: (row: NoteRowVm) => void;
+  /** Double click: open this note beside what is open (Story 46.12, AD-90). */
+  onSelectBeside: (row: NoteRowVm) => void;
   /** Clicking a tag chip filters by it; it never opens the note. */
   onToggleTag: (tag: string) => void;
   ref?: Ref<HTMLButtonElement>;
@@ -122,6 +125,11 @@ export function NoteRow({
       data-unread={row.unread ? "true" : undefined}
       data-conflict={row.conflict ? "true" : undefined}
       onClick={() => onSelect(row)}
+      // Story 46.12: the Files tree's pair. The single click that necessarily
+      // preceded this one is undone by the panel store, so the note that was
+      // showing comes back rather than being replaced by a second copy of this
+      // one — which is why no timer swallows the first click here either.
+      onDoubleClick={() => onSelectBeside(row)}
       className={cn(
         "flex h-16 w-full items-start gap-2 px-3 py-2 text-left outline-none",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",

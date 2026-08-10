@@ -5,9 +5,13 @@ import {
   type AttachmentPlan,
   attachmentEmbed,
   attachmentName,
+  bodyEmbedPlan,
+  bodyEmbedTargets,
   bodyWithAttachments,
   embeddedAttachmentNames,
+  namesANote,
   planAttachments,
+  wikilinkNameable,
 } from "@/lib/notes/attach";
 
 /**
@@ -37,6 +41,7 @@ const FIXTURE = resolve(
 
 interface AttachVectors {
   vectors: { body: string; embedded: string[]; why: string }[];
+  noteTargets: { target: string; isNote: boolean; why: string }[];
 }
 
 const shared = JSON.parse(readFileSync(FIXTURE, "utf8")) as AttachVectors;
@@ -55,6 +60,23 @@ describe("embeddedAttachmentNames, against keeper-core's own vectors", () => {
         [...embeddedAttachmentNames(vector.body)].sort(),
         `${vector.body}: ${vector.why}`,
       ).toEqual(vector.embedded);
+    }
+  });
+
+  /**
+   * The second pinned rule (Story 46.11).
+   *
+   * 46.2 mirrored `export::names_a_note` here and cited it rather than pinning
+   * it, recording the trigger: a second caller. 46.11 is that — the Attachments
+   * panel reads it for a body embed anywhere in the vault, and the in-vault
+   * chooser declines to offer a file it calls a note. Drift now means the
+   * chooser offering a file the panel will not list and the export will not
+   * carry.
+   */
+  it("matches keeper-core on every shared note-target vector", () => {
+    expect(shared.noteTargets.length).toBeGreaterThanOrEqual(12);
+    for (const vector of shared.noteTargets) {
+      expect(namesANote(vector.target), `${vector.target}: ${vector.why}`).toBe(vector.isNote);
     }
   });
 });
@@ -234,5 +256,186 @@ describe("bodyWithAttachments", () => {
   it("returns the body unchanged when the plan writes nothing", () => {
     const refused = planAttachments("![[a.png]]", ["a.png"]);
     expect(bodyWithAttachments("![[a.png]]", refused)).toBe("![[a.png]]");
+  });
+});
+
+/**
+ * What the note's text embeds (Story 46.2, AD-103; widened by Story 46.11).
+ *
+ * 46.2's reader answered "which embeds are attachments" with a prefix, because
+ * it had no disk: `attachments/` is where the copy path writes and a prefix is a
+ * fact about the text. 46.11 attaches a file where it already lives, so the
+ * prefix would hide the story's own files. The boundary is now "does this embed
+ * name a file at all" — everything else is the vault's answer, and
+ * {@link bodyEmbedPlan} is where the two meet.
+ */
+describe("bodyEmbedTargets", () => {
+  it("lists an embed the attach path wrote, spelled as the note spells it", () => {
+    expect(bodyEmbedTargets("intro\n\n![[attachments/photo.png]]\n")).toEqual([
+      "attachments/photo.png",
+    ]);
+  });
+
+  it("lists both embed spellings, because a note shows the file either way", () => {
+    expect(bodyEmbedTargets("![A photo](attachments/photo.png)\n")).toEqual([
+      "attachments/photo.png",
+    ]);
+  });
+
+  it("keeps document order and lists a nested attachment", () => {
+    expect(bodyEmbedTargets("![[attachments/b.png]]\n![[attachments/scans/a.pdf]]\n")).toEqual([
+      "attachments/b.png",
+      "attachments/scans/a.pdf",
+    ]);
+  });
+
+  it("does not mistake a mention for an attachment", () => {
+    // `!` is the whole of the difference, exactly as `embeddedAttachmentNames`
+    // and `export::plan` both read it. A third rule here would be a third
+    // answer to one question.
+    expect(bodyEmbedTargets("see [[attachments/photo.png]]\n")).toEqual([]);
+  });
+
+  /**
+   * The widening, at the reader (Story 46.11).
+   *
+   * 46.2 excluded both of these deliberately — a bare name because only a
+   * `stat` can say which of `embed::candidates`' two paths it means, and a path
+   * elsewhere in the vault because `attachments/` was the test. Both are now
+   * *targets*, because something does the `stat`: the reader's job stopped being
+   * "decide" and became "ask about the right things".
+   */
+  it("lists a bare name and a path anywhere in the vault, and leaves the disk to answer", () => {
+    expect(bodyEmbedTargets("![[photo.png]]\n")).toEqual(["photo.png"]);
+    expect(bodyEmbedTargets("![[photos/holiday.png]]\n![[data/people.csv]]\n")).toEqual([
+      "photos/holiday.png",
+      "data/people.csv",
+    ]);
+  });
+
+  it("does not list a transclusion, by the rule the export plan uses", () => {
+    // `notes.md` is a note by `export::names_a_note`, and `Some Note` is one by
+    // construction — a wikilink with no extension names a note by title. A
+    // surface listing either would show a row for a file `export::plan` refuses
+    // to carry, which is the disagreement the shared vector table now pins.
+    expect(bodyEmbedTargets("![[attachments/notes.md]]\n![[Some Note]]\n")).toEqual([]);
+    // The dotfile needs no special case: `.gitignore` has the extension
+    // `gitignore`, which is not `md`, so it is a file.
+    expect(bodyEmbedTargets("![[attachments/.gitignore]]\n")).toEqual(["attachments/.gitignore"]);
+  });
+
+  it("lists one target for a file the body embeds twice, in either case", () => {
+    // Deduplicated on the folded TARGET — not on the name, so two files that
+    // share a name in two folders stay two.
+    const twice = "![[attachments/photo.png]]\n![[attachments/PHOTO.PNG]]\n";
+    expect(bodyEmbedTargets(twice)).toEqual(["attachments/photo.png"]);
+    expect(bodyEmbedTargets("![[a/x.png]]\n![[b/x.png]]\n")).toEqual(["a/x.png", "b/x.png"]);
+  });
+
+  it("holds no attachment inside code, because code is not a use", () => {
+    expect(bodyEmbedTargets("```\n![[attachments/photo.png]]\n```\n")).toEqual([]);
+    expect(bodyEmbedTargets("`![[attachments/photo.png]]`\n")).toEqual([]);
+  });
+
+  it("finds nothing in a note that embeds nothing", () => {
+    expect(bodyEmbedTargets("# Title\n\nJust words.\n")).toEqual([]);
+  });
+});
+
+/**
+ * The join: what the text embeds, against what the vault said (Story 46.11).
+ *
+ * A mirror of `keeper_core::notes::export::plan`, which takes its own disk probe
+ * as an argument for the same reason. The third bucket is the one `plan` has no
+ * need for: `plan` runs when the disk is already there, and this runs while the
+ * answer is still in flight over IPC.
+ */
+describe("bodyEmbedPlan", () => {
+  /** A vault that holds exactly these paths, resolved the way Rust would. */
+  function answered(body: string, held: Record<string, string | null>) {
+    return bodyEmbedPlan(body, new Map(Object.entries(held)));
+  }
+
+  it("lists a file the vault holds wherever it lives, which is the whole ruling", () => {
+    const plan = answered("![[photos/holiday.png]]\n", {
+      "photos/holiday.png": "photos/holiday.png",
+    });
+
+    // No `attachments/` anywhere: the file is named where it already is, which
+    // is what makes an in-vault attach not a copy.
+    expect(plan.present).toEqual(["photos/holiday.png"]);
+    expect(plan.missing).toEqual([]);
+    expect(plan.pending).toEqual([]);
+  });
+
+  it("lists the path the vault RESOLVED, not the target as written", () => {
+    // `embed::candidates` tries a bare name where it is written first and in the
+    // attachments folder second. Whichever it landed on is the file the note
+    // shows, the file the viewer opens and the file the export carries — so it is
+    // the file the row is about.
+    expect(answered("![[photo.png]]\n", { "photo.png": "attachments/photo.png" }).present).toEqual([
+      "attachments/photo.png",
+    ]);
+    expect(answered("![[photo.png]]\n", { "photo.png": "photo.png" }).present).toEqual([
+      "photo.png",
+    ]);
+  });
+
+  it("names a file the vault does not hold instead of dropping it", () => {
+    const plan = answered("![[photos/gone.png]]\n![[here.png]]\n", {
+      "photos/gone.png": null,
+      "here.png": "attachments/here.png",
+    });
+
+    expect(plan.present).toEqual(["attachments/here.png"]);
+    // As the note spells it, because that is the text the person will go and
+    // look at. Silence here is the failure this whole epic is about.
+    expect(plan.missing).toEqual(["photos/gone.png"]);
+  });
+
+  it("says nothing about a target nothing has answered about yet", () => {
+    const plan = answered("![[photo.png]]\n![[other.png]]\n", { "photo.png": "photo.png" });
+
+    expect(plan.present).toEqual(["photo.png"]);
+    // Neither listed nor denied: "the vault does not have it" is a claim and it
+    // is not true yet. A surface reading `present.length === 0` as "no
+    // attachments" would accuse the vault on the first frame after a keystroke.
+    expect(plan.missing).toEqual([]);
+    expect(plan.pending).toEqual(["other.png"]);
+  });
+
+  it("collapses two targets that resolved to one file into one row", () => {
+    // `export::plan` deduplicates on the RESOLVED path for the same reason: the
+    // export copies files, and one photograph is one file however many ways the
+    // note spells it.
+    const plan = answered("![[photo.png]]\n![[attachments/photo.png]]\n", {
+      "photo.png": "attachments/photo.png",
+      "attachments/photo.png": "attachments/photo.png",
+    });
+
+    expect(plan.present).toEqual(["attachments/photo.png"]);
+  });
+
+  it("has nothing to say about a note that embeds nothing", () => {
+    const plan = answered("# Title\n\nJust words.\n", {});
+
+    expect(plan).toEqual({ present: [], missing: [], pending: [] });
+  });
+});
+
+describe("wikilinkNameable", () => {
+  /**
+   * The same rule {@link planAttachments} refuses on, exported so a chooser can
+   * ask before it offers. Every one of these is a legal macOS filename, which is
+   * why the answer is a sentence rather than an embed pointing at the wrong file.
+   */
+  it("refuses exactly the characters a wikilink cannot carry", () => {
+    expect(wikilinkNameable("photos/holiday.png")).toBe(true);
+    expect(wikilinkNameable("why#not.png")).toBe(false);
+    expect(wikilinkNameable("a|b.png")).toBe(false);
+    expect(wikilinkNameable("a[b].png")).toBe(false);
+    // And it is the same answer `planAttachments` gives, which is what makes
+    // asking early honest rather than a second opinion.
+    expect(planAttachments("", ["why#not.png"]).unnameable).toEqual(["why#not.png"]);
   });
 });

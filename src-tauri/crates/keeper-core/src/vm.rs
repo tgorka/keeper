@@ -3190,10 +3190,8 @@ pub enum RecordingDestinationKind {
 }
 
 /// One recordings-flagged sync profile, as the destination picker needs it
-/// (Story 41.2, FR-131).
+/// (Story 41.2, FR-131; Story 46.10 added the fourth field).
 ///
-/// Three fields and no more, because the picker asks exactly one question:
-/// "which synced folder should hold recordings, and where would they land?"
 /// `recordings_root` is RESOLVED here — `local_path` joined with the profile's
 /// recordings subfolder — for the same reason
 /// [`RecordingSettingsVm::destination_dir`] is: no surface anywhere joins a
@@ -3215,6 +3213,27 @@ pub struct RecordingProfileVm {
     pub name: String,
     /// The profile's RESOLVED recordings root, as an absolute path.
     pub recordings_root: String,
+    /// The profile-relative recordings subfolder `recordings_root` was composed
+    /// FROM — the "head" of the path a recording takes (Story 46.10).
+    ///
+    /// Carried beside the resolved root rather than sliced back out of it by the
+    /// surface, and read in the same breath as it, so the two can never disagree:
+    /// a card that showed a head from one read and a root from another would be
+    /// describing two different profiles a fraction of a second apart. It is also
+    /// not recoverable by string surgery — `local_path` is not on this row, and
+    /// the join normalised nothing, so `20-media//sessions` and `20-media/sessions`
+    /// resolve to one root and are two different stored values, only one of which
+    /// an edit box may echo back to `sync_profile_save`.
+    ///
+    /// May be more than one component (`40-media/recordings`): a nested subfolder
+    /// is valid and always has been (`RecordingsConfig::validate` refuses empty,
+    /// absolute, escaping and vault-overlapping values, and nothing else).
+    ///
+    /// This is the half of the destination path that TRAVELS. It lives in the
+    /// profile row in `sync.db`, so every machine syncing this folder records
+    /// into it; the other half — `recording.path_template` — is a per-machine
+    /// settings key and does not.
+    pub subfolder: String,
 }
 
 /// Whether the recordings destination's volume is here right now (Story 41.7,
@@ -4197,9 +4216,16 @@ pub struct FilesListingVm {
 /// follows, for the same reason: a second copy of these words is a second copy
 /// that will be edited once.
 ///
-/// `Some` exactly when `writable` is false. A refusal with no reason would be
-/// a control that vanished with no explanation, which is the failure this whole
-/// field exists to prevent.
+/// `reason` is `Some` exactly when `writable` is false. A refusal with no
+/// reason would be a control that vanished with no explanation, which is the
+/// failure this whole field exists to prevent.
+///
+/// `caveat` is the third state Story 46.14 introduced, and it is not a second
+/// refusal: AD-102 gave keeper a second writer for files no vault holds, so a
+/// location can now be writable *and* unmanaged. The caveat is what the surface
+/// shows standing, BEFORE the first keystroke — an edit that quietly does less
+/// than the vault path does is strictly worse than the refusal it replaces.
+/// `Some` only when `writable`; the two are never both set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -4208,14 +4234,32 @@ pub struct FilesWriteVm {
     pub writable: bool,
     /// Why not, as a whole sentence. `None` exactly when `writable`.
     pub reason: Option<String>,
+    /// What keeper will not do for this file even though it will write it, as
+    /// a whole sentence. `None` when keeper manages the file, and always
+    /// `None` when `writable` is false.
+    pub caveat: Option<String>,
 }
 
 impl FilesWriteVm {
-    /// keeper writes here.
+    /// keeper writes here and manages what it writes.
     pub fn allowed() -> Self {
         Self {
             writable: true,
             reason: None,
+            caveat: None,
+        }
+    }
+
+    /// keeper writes here through AD-102's second writer, and this sentence
+    /// says what that costs.
+    ///
+    /// Composed by `keeper_sync::files_write::WriteScope::unmanaged_caveat`
+    /// and rendered verbatim, exactly as `reason` is.
+    pub fn unmanaged(caveat: impl Into<String>) -> Self {
+        Self {
+            writable: true,
+            reason: None,
+            caveat: Some(caveat.into()),
         }
     }
 
@@ -4224,17 +4268,44 @@ impl FilesWriteVm {
         Self {
             writable: false,
             reason: Some(reason.into()),
+            caveat: None,
         }
     }
 
-    /// Project a `Result` from the write-scope decision, which is how every
-    /// call site actually holds this fact.
+    /// Project a `Result` from the write-scope decision, which is how the
+    /// create path holds this fact.
+    ///
+    /// Deliberately has no unmanaged arm: a `Result` carries two states and
+    /// the third one is a different question. The entry path answers it with
+    /// `keeper_sync::files_write::WriteOwner` and picks the constructor
+    /// itself, so a caller cannot reach [`Self::allowed`] for a file AD-102
+    /// says needs a caveat by routing through this.
     pub fn from_verdict<T, E: std::fmt::Display>(verdict: &Result<T, E>) -> Self {
         match verdict {
             Ok(_) => Self::allowed(),
             Err(refusal) => Self::refused(refusal.to_string()),
         }
     }
+}
+
+/// Which trash one file in a delete selection is bound for (Story 46.14,
+/// AD-102, NFR-30).
+///
+/// **An input to [`FilesDeletePlanVm::compose`] and never a field on the VM**,
+/// so it is deliberately not `TS`-exported: the frontend renders the sentence
+/// this decides, and a second reading of the same fact in TypeScript is a
+/// second reading that will eventually disagree. `keeper_sync`'s
+/// `WriteOwner` is where the fact is actually decided; this is that decision
+/// crossing into the crate that words it, since `keeper-core` must never name
+/// `keeper-sync` (AD-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesDeleteDestinationVm {
+    /// `<vault>/.keeper/trash/`, plus a recorded removal in this folder's
+    /// history.
+    VaultTrash,
+    /// The operating system's own trash. No vault trash exists to reach and no
+    /// note history records it.
+    SystemTrash,
 }
 
 /// One thing in a delete selection that keeper will not delete, and why
@@ -4289,8 +4360,14 @@ impl FilesDeletePlanVm {
     /// Word a delete over a set of entries and the reasons the rest were
     /// dropped.
     ///
-    /// `files` pairs each deletable profile-relative path with what sync says
-    /// about it right now.
+    /// `files` gives, for each deletable profile-relative path, what sync says
+    /// about it right now and where its bytes are about to go.
+    ///
+    /// **The destination is per file and not per call, because a selection can
+    /// hold both.** A person can select a note and the `AGENTS.md` beside the
+    /// vault in one drag, and after Story 46.14 those two go to two different
+    /// trashes with two different ways of getting them back. Wording the
+    /// commoner one and hoping is how a confirmation becomes a lie.
     ///
     /// **[`FilesSyncStatusVm::Unknown`] counts as syncing, and says so.** The
     /// two available guesses are "this deletion stays on this machine" and
@@ -4299,17 +4376,17 @@ impl FilesDeletePlanVm {
     /// [`FilesSyncStatusVm::Unknown`] was introduced to refuse.
     pub fn compose(
         profile_name: &str,
-        files: Vec<(String, FilesSyncStatusVm)>,
+        files: Vec<(String, FilesSyncStatusVm, FilesDeleteDestinationVm)>,
         refusals: Vec<FilesDeleteRefusalVm>,
     ) -> Self {
         let total = files.len();
         let unclear = files
             .iter()
-            .filter(|(_, status)| *status == FilesSyncStatusVm::Unknown)
+            .filter(|(_, status, _)| *status == FilesSyncStatusVm::Unknown)
             .count();
         let travels = files
             .iter()
-            .filter(|(_, status)| {
+            .filter(|(_, status, _)| {
                 matches!(
                     status,
                     FilesSyncStatusVm::Synced
@@ -4322,7 +4399,7 @@ impl FilesDeletePlanVm {
 
         let question = match files.first() {
             _ if total == 0 => "There is nothing here keeper can delete.".to_owned(),
-            Some((path, _)) if total == 1 => format!("Delete {path}?"),
+            Some((path, _, _)) if total == 1 => format!("Delete {path}?"),
             _ => format!("Delete {total} files?"),
         };
 
@@ -4369,20 +4446,49 @@ impl FilesDeletePlanVm {
             )
         };
 
-        let recovery = if total == 0 {
-            String::new()
-        } else if total == 1 {
-            "keeper moves it into the vault's trash rather than erasing it, and the removal \
-             is recorded in this folder's history."
-                .to_owned()
-        } else {
-            "keeper moves them into the vault's trash rather than erasing them, and the \
-             removals are recorded in this folder's history."
-                .to_owned()
+        // Where the bytes go, and Story 46.14's correction: until AD-102 there
+        // was one trash and one sentence, and that sentence promised the
+        // vault's trash and this folder's history. For a file no vault holds,
+        // both halves of it are lies — there is no vault trash to reach and no
+        // note history to record in. So the destination is counted the same way
+        // the sync consequence is, and a mixed selection says both.
+        let to_system = files
+            .iter()
+            .filter(|(_, _, destination)| *destination == FilesDeleteDestinationVm::SystemTrash)
+            .count();
+        let recovery = match (total, to_system) {
+            (0, _) => String::new(),
+            // Every file is a note.
+            (1, 0) => "keeper moves it into the vault's trash rather than erasing it, and the \
+                       removal is recorded in this folder's history."
+                .to_owned(),
+            (_, 0) => "keeper moves them into the vault's trash rather than erasing them, and \
+                       the removals are recorded in this folder's history."
+                .to_owned(),
+            // Nothing here is a note: there is no vault trash and no note
+            // history, and saying otherwise is the defect this arm exists for.
+            (1, 1) => "keeper moves it to this computer's trash rather than erasing it. It is \
+                       not a note, so there is no vault trash and no note history for it — \
+                       putting it back is your file manager's Put Back."
+                .to_owned(),
+            (total, system) if system == total => {
+                "keeper moves them to this computer's trash rather than erasing them. None of \
+                 them are notes, so there is no vault trash and no note history for them — \
+                 putting them back is your file manager's Put Back."
+                    .to_owned()
+            }
+            // Both, which one drag over a vault and the folder beside it
+            // produces.
+            (total, system) => format!(
+                "Nothing is erased: {} of these {total} go to the vault's trash and are \
+                 recorded in this folder's history, and the other {system} go to this \
+                 computer's trash, because they are not notes.",
+                total - system
+            ),
         };
 
         Self {
-            files: files.into_iter().map(|(path, _)| path).collect(),
+            files: files.into_iter().map(|(path, _, _)| path).collect(),
             question,
             consequence,
             recovery,
@@ -4544,6 +4650,296 @@ impl ExportReceiptVm {
             summary,
         }
     }
+}
+
+/// Which layer file a settings value came from (Epic 46, AD-98, AD-99),
+/// projected for the surface that answers "where did this value come from?".
+///
+/// A separate enum from [`crate::config::LayerTier`] rather than a re-export,
+/// and the mapping below is an exhaustive `match`. That is the point: the layer
+/// order is a user-visible contract, so adding a tier must break this file —
+/// which compiles on Linux — rather than silently reaching the frontend as a
+/// variant no surface has a sentence for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ConfigTierVm {
+    /// `~/.keeper/keeper.toml` — this user, every machine, every folder.
+    UserGlobal,
+    /// `~/.keeper/keeper.<host>.toml` — this user, this machine only.
+    UserGlobalMachine,
+    /// `<main>/.keeper/keeper.toml` — the designated main sync folder, shared
+    /// with every machine that syncs it.
+    MainShared,
+    /// `<main>/.keeper/keeper.<host>.toml` — the main sync folder, this machine.
+    MainMachine,
+    /// `<folder>/.keeper/keeper.toml` — one folder's own settings, shared.
+    FolderShared,
+    /// `<folder>/.keeper/keeper.<host>.toml` — one folder, this machine.
+    FolderMachine,
+}
+
+/// One settings key whose value is decided by a file rather than by the app
+/// (Epic 46, AD-98).
+///
+/// The presence of an entry here is the whole promise AD-98 makes: a control
+/// whose key appears in this list would be overridden, and says so, instead of
+/// accepting an edit that the next read throws away.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConfigOverrideVm {
+    /// The settings-table key, spelled as the file and the registry spell it
+    /// (`recording.fps`, `debug.mode`). This is what a control matches itself
+    /// against, so it is the raw key and never a prettified label.
+    pub key: String,
+    /// Which layer won it.
+    pub tier: ConfigTierVm,
+    /// The absolute path of the file that set it. Shown verbatim: the user
+    /// asked for a file they can edit, and the only useful answer to "where"
+    /// is a path they can paste into an editor.
+    pub path: String,
+    /// The folder this layer belongs to, when it is a folder layer.
+    pub folder: Option<String>,
+    /// The finished phrase the surface renders after the key — "your settings
+    /// file, for every machine and folder". Composed here so the wording is
+    /// asserted in a test rather than assembled in a component.
+    pub source: String,
+}
+
+/// One thing that is wrong with the layer files, named out loud (Epic 46).
+///
+/// **Faults are the reason this VM is not just a list of overrides.** Every
+/// failure mode of a settings file is silent by nature: a malformed file sets
+/// nothing, a `[settings]` block in a folder that may not carry one sets
+/// nothing, and a `mainSyncFolder` with a typo in it disables an entire layer
+/// of the stack while looking exactly like a file that works. Each of those
+/// reaches the user as an entry here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConfigFaultVm {
+    /// A stable machine name for what went wrong (`malformed`,
+    /// `settingsInNonMainFolder`, `mainFolderNotAProfile`, …). Not branched on
+    /// by any surface — it exists so a test can pin *which* fault was raised
+    /// rather than matching on prose.
+    pub kind: String,
+    /// The file the fault is about.
+    pub path: String,
+    /// The whole line the surface renders, composed by the config layer itself
+    /// (`<path>[:line]: <message>`). Rendered verbatim, the way
+    /// `SyncGitVm.problem` is: one spelling of one fact.
+    pub summary: String,
+}
+
+impl ConfigFaultVm {
+    /// A fault the sync engine's folder tier raised about one folder's own
+    /// `.keeper/*.toml` — including "the value you just set here was dropped
+    /// because that file owns it", which is AD-98's promise applied to the
+    /// settings that travel with a folder.
+    ///
+    /// **`&Path` and `String`, not two `String`s.** The one call site is in
+    /// `keeper/src/ipc.rs`, which does not compile on Linux, so a swapped pair
+    /// of same-typed arguments would type-check for nobody and be discovered by
+    /// a user reading a path where a reason belongs. Two different types cannot
+    /// be swapped. (`ExportReceiptVm::note` takes the same precaution for the
+    /// same reason.)
+    pub fn folder(path: &std::path::Path, message: String) -> Self {
+        Self {
+            kind: "folder".to_owned(),
+            path: path.display().to_string(),
+            summary: format!("{}: {message}", path.display()),
+        }
+    }
+}
+
+/// Everything the Settings surface needs to answer "where did this value come
+/// from, and is anything about my settings files broken?" (Epic 46, AD-98).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConfigLayersVm {
+    /// Every key a file decides, in key order.
+    pub overrides: Vec<ConfigOverrideVm>,
+    /// Every problem found while loading the layers, in the order they were
+    /// found — load-time faults first, then the ones raised after the sync
+    /// engine opened.
+    pub faults: Vec<ConfigFaultVm>,
+    /// The main sync folder `~/.keeper/keeper.toml` designates, if it named
+    /// one. Present even when it turned out to be wrong — the accompanying
+    /// fault says so, and a field that blanked itself on a bad value would hide
+    /// the typo the user has to fix.
+    pub main_folder: Option<String>,
+    /// The sentence the section leads with, covering both counts.
+    pub summary: String,
+}
+
+impl ConfigLayersVm {
+    /// Project the installed layer stack.
+    ///
+    /// Pure, and takes its three inputs rather than reading the process-global
+    /// config: the shell crate that calls this does not compile on Linux
+    /// (AD-55/AD-56), so a projection that reached for global state would be
+    /// testable on exactly one machine. Every sentence below is asserted in
+    /// this crate's own test module instead.
+    pub fn new(
+        overrides: Vec<(String, crate::config::LayerSource)>,
+        faults: Vec<crate::config::LayerFault>,
+        main_folder: Option<std::path::PathBuf>,
+    ) -> Self {
+        let overrides: Vec<ConfigOverrideVm> = overrides
+            .into_iter()
+            .map(|(key, source)| {
+                let tier = ConfigTierVm::of(source.tier);
+                ConfigOverrideVm {
+                    key,
+                    tier,
+                    path: source.path.display().to_string(),
+                    source: tier.phrase(source.folder.as_deref()),
+                    folder: source.folder,
+                }
+            })
+            .collect();
+        let faults: Vec<ConfigFaultVm> = faults
+            .into_iter()
+            .map(|fault| ConfigFaultVm {
+                kind: fault_kind(&fault.kind).to_owned(),
+                path: fault.path.display().to_string(),
+                // `summary()`, never `Display`: the two are different forms on
+                // purpose. `Display` is the log form and is deliberately
+                // multi-line for a malformed file, because `toml`'s own error
+                // carries the offending input and a caret and flattening it
+                // throws away the only thing that locates the mistake. A
+                // settings pane wants the one-line form.
+                summary: fault.summary(),
+            })
+            .collect();
+        let summary = layers_summary(overrides.len(), faults.len());
+        Self {
+            overrides,
+            faults,
+            main_folder: main_folder.map(|path| path.display().to_string()),
+            summary,
+        }
+    }
+
+    /// Fold in the faults the sync engine's own folder tier raised.
+    ///
+    /// A second entry point rather than a fourth argument to [`Self::new`],
+    /// because the two fault sources cannot meet any earlier than this. AD-40
+    /// makes `keeper-sync` deliberately `keeper-core`-free and `keeper-core`
+    /// deliberately `keeper-sync`-free — `bun run check:core-sync-free` asserts
+    /// both edges — so the only place that can see a `FolderFault` and a
+    /// `LayerFault` at once is the shell. The join is one `map` there and the
+    /// wording stays here, where it is tested.
+    ///
+    /// The summary is recomputed rather than appended to: a count that stopped
+    /// counting halfway is worse than no count.
+    pub fn with_folder_faults(mut self, mut faults: Vec<ConfigFaultVm>) -> Self {
+        self.faults.append(&mut faults);
+        self.summary = layers_summary(self.overrides.len(), self.faults.len());
+        self
+    }
+}
+
+impl ConfigTierVm {
+    /// The wire tier for a loaded layer's tier.
+    fn of(tier: crate::config::LayerTier) -> Self {
+        use crate::config::LayerTier;
+        match tier {
+            LayerTier::UserGlobal => Self::UserGlobal,
+            LayerTier::UserGlobalMachine => Self::UserGlobalMachine,
+            LayerTier::MainShared => Self::MainShared,
+            LayerTier::MainMachine => Self::MainMachine,
+            LayerTier::FolderShared => Self::FolderShared,
+            LayerTier::FolderMachine => Self::FolderMachine,
+        }
+    }
+
+    /// How this layer is described to the person reading Settings.
+    ///
+    /// Two axes, both of which the user has to be able to tell apart to know
+    /// which file to open: *whose* file it is (yours, the main folder's, this
+    /// folder's) and *how far it reaches* (every machine, or only this one).
+    /// A folder layer names its folder when the layer knew it, because "a
+    /// folder's settings file" is not an instruction anyone can act on.
+    fn phrase(self, folder: Option<&str>) -> String {
+        match (self, folder) {
+            (Self::UserGlobal, _) => "your settings file, for every machine and folder".to_owned(),
+            (Self::UserGlobalMachine, _) => "your settings file for this machine".to_owned(),
+            (Self::MainShared, Some(name)) => {
+                format!("the shared settings file in {name}, for every machine")
+            }
+            (Self::MainShared, None) => {
+                "the main folder's shared settings file, for every machine".to_owned()
+            }
+            (Self::MainMachine, Some(name)) => {
+                format!("the shared settings file in {name}, for this machine")
+            }
+            (Self::MainMachine, None) => {
+                "the main folder's shared settings file, for this machine".to_owned()
+            }
+            (Self::FolderShared, Some(name)) => {
+                format!("{name}'s own settings file, for every machine")
+            }
+            (Self::FolderShared, None) => {
+                "a folder's own settings file, for every machine".to_owned()
+            }
+            (Self::FolderMachine, Some(name)) => {
+                format!("{name}'s own settings file, for this machine")
+            }
+            (Self::FolderMachine, None) => {
+                "a folder's own settings file, for this machine".to_owned()
+            }
+        }
+    }
+}
+
+/// The stable machine name of a load fault.
+///
+/// An exhaustive `match` rather than the serde rename, for the same reason
+/// [`ConfigTierVm::of`] is one: a new fault kind should stop the build here,
+/// where someone will notice, rather than reach a surface that shows it as a
+/// string nobody wrote a test for.
+fn fault_kind(kind: &crate::config::LayerFaultKind) -> &'static str {
+    use crate::config::LayerFaultKind as K;
+    match kind {
+        K::Unreadable => "unreadable",
+        K::Malformed => "malformed",
+        K::NotATable => "notATable",
+        K::ScalarExpected => "scalarExpected",
+        K::ValueShape => "valueShape",
+        K::KeyRefused => "keyRefused",
+        K::SettingsInNonMainFolder => "settingsInNonMainFolder",
+        K::MainFolderInFolderLayer => "mainFolderInFolderLayer",
+        K::UnknownTable => "unknownTable",
+        K::MainFolderMissing => "mainFolderMissing",
+        K::MainFolderNotADirectory => "mainFolderNotADirectory",
+        K::MainFolderNotAProfile => "mainFolderNotAProfile",
+    }
+}
+
+/// The section's opening sentence.
+///
+/// It says what a file-set value *costs the reader* rather than reporting a
+/// count, because the count is already visible in the list underneath. The one
+/// thing the list cannot say is why the switch they just flipped went back.
+fn layers_summary(overrides: usize, faults: usize) -> String {
+    let mut summary = match overrides {
+        0 => "No setting is being set by a file. Everything here is stored by keeper.".to_owned(),
+        1 => "1 setting is set by a file. Changing it here will not take effect while the file sets it.".to_owned(),
+        many => format!(
+            "{many} settings are set by a file. Changing them here will not take effect while the files set them."
+        ),
+    };
+    match faults {
+        0 => {}
+        1 => summary.push_str(" keeper found 1 problem in your settings files."),
+        many => summary.push_str(&format!(
+            " keeper found {many} problems in your settings files."
+        )),
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -6560,12 +6956,24 @@ mod tests {
             FilesWriteVm::allowed(),
             FilesWriteVm {
                 writable: true,
-                reason: None
+                reason: None,
+                caveat: None
             }
         );
         let refused = FilesWriteVm::refused("nope, and here is why");
         assert!(!refused.writable);
         assert_eq!(refused.reason.as_deref(), Some("nope, and here is why"));
+        assert_eq!(refused.caveat, None);
+
+        // Story 46.14's third state: writable AND unmanaged. Never a refusal,
+        // and never silent — the two fields are still exclusive.
+        let unmanaged = FilesWriteVm::unmanaged("AGENTS.md is not one of keeper's notes");
+        assert!(unmanaged.writable);
+        assert_eq!(unmanaged.reason, None);
+        assert_eq!(
+            unmanaged.caveat.as_deref(),
+            Some("AGENTS.md is not one of keeper's notes")
+        );
 
         // The projection every call site actually uses: a `Result` from the
         // write-scope decision, whose `Err` already holds the whole sentence.
@@ -6578,13 +6986,38 @@ mod tests {
         );
     }
 
+    /// One vault file in a delete selection — what every Story 45.3 case is.
+    fn note(
+        path: &str,
+        status: FilesSyncStatusVm,
+    ) -> (String, FilesSyncStatusVm, FilesDeleteDestinationVm) {
+        (
+            path.to_owned(),
+            status,
+            FilesDeleteDestinationVm::VaultTrash,
+        )
+    }
+
+    /// One file no vault holds — AD-102's second writer's, bound for the
+    /// operating system's trash.
+    fn loose(
+        path: &str,
+        status: FilesSyncStatusVm,
+    ) -> (String, FilesSyncStatusVm, FilesDeleteDestinationVm) {
+        (
+            path.to_owned(),
+            status,
+            FilesDeleteDestinationVm::SystemTrash,
+        )
+    }
+
     /// Story 45.3, the confirmation's first requirement: it NAMES one file and
     /// COUNTS many.
     #[test]
     fn a_delete_confirmation_names_one_file_and_counts_several() {
         let one = FilesDeletePlanVm::compose(
             "Vault",
-            vec![("10-notes/Report.md".to_owned(), FilesSyncStatusVm::Synced)],
+            vec![note("10-notes/Report.md", FilesSyncStatusVm::Synced)],
             Vec::new(),
         );
         assert_eq!(one.question, "Delete 10-notes/Report.md?");
@@ -6593,9 +7026,9 @@ mod tests {
         let many = FilesDeletePlanVm::compose(
             "Vault",
             vec![
-                ("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced),
-                ("10-notes/b.md".to_owned(), FilesSyncStatusVm::Waiting),
-                ("10-notes/c.md".to_owned(), FilesSyncStatusVm::Synced),
+                note("10-notes/a.md", FilesSyncStatusVm::Synced),
+                note("10-notes/b.md", FilesSyncStatusVm::Waiting),
+                note("10-notes/c.md", FilesSyncStatusVm::Synced),
             ],
             Vec::new(),
         );
@@ -6618,7 +7051,7 @@ mod tests {
     fn a_delete_confirmation_says_whether_the_files_sync() {
         let synced = FilesDeletePlanVm::compose(
             "Vault",
-            vec![("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            vec![note("10-notes/a.md", FilesSyncStatusVm::Synced)],
             Vec::new(),
         );
         assert_eq!(
@@ -6633,8 +7066,7 @@ mod tests {
             FilesSyncStatusVm::Excluded,
             FilesSyncStatusVm::NotInRepository,
         ] {
-            let local =
-                FilesDeletePlanVm::compose("Vault", vec![("a.md".to_owned(), status)], Vec::new());
+            let local = FilesDeletePlanVm::compose("Vault", vec![note("a.md", status)], Vec::new());
             assert_eq!(
                 local.consequence,
                 "This file does not sync, so this removes it from this machine only.",
@@ -6645,8 +7077,8 @@ mod tests {
         let none = FilesDeletePlanVm::compose(
             "Vault",
             vec![
-                ("a.md".to_owned(), FilesSyncStatusVm::Excluded),
-                ("b.md".to_owned(), FilesSyncStatusVm::NotInRepository),
+                note("a.md", FilesSyncStatusVm::Excluded),
+                note("b.md", FilesSyncStatusVm::NotInRepository),
             ],
             Vec::new(),
         );
@@ -6658,9 +7090,9 @@ mod tests {
         let mixed = FilesDeletePlanVm::compose(
             "Vault",
             vec![
-                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
-                ("b.md".to_owned(), FilesSyncStatusVm::Excluded),
-                ("c.md".to_owned(), FilesSyncStatusVm::Waiting),
+                note("a.md", FilesSyncStatusVm::Synced),
+                note("b.md", FilesSyncStatusVm::Excluded),
+                note("c.md", FilesSyncStatusVm::Waiting),
             ],
             Vec::new(),
         );
@@ -6681,7 +7113,7 @@ mod tests {
     fn an_unreadable_sync_state_is_counted_as_syncing_and_admitted() {
         let all = FilesDeletePlanVm::compose(
             "Vault",
-            vec![("a.md".to_owned(), FilesSyncStatusVm::Unknown)],
+            vec![note("a.md", FilesSyncStatusVm::Unknown)],
             Vec::new(),
         );
         assert_eq!(
@@ -6693,8 +7125,8 @@ mod tests {
         let some = FilesDeletePlanVm::compose(
             "Vault",
             vec![
-                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
-                ("b.md".to_owned(), FilesSyncStatusVm::Unknown),
+                note("a.md", FilesSyncStatusVm::Synced),
+                note("b.md", FilesSyncStatusVm::Unknown),
             ],
             Vec::new(),
         );
@@ -6719,7 +7151,7 @@ mod tests {
     fn a_delete_confirmation_says_where_the_bytes_go() {
         let one = FilesDeletePlanVm::compose(
             "Vault",
-            vec![("a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            vec![note("a.md", FilesSyncStatusVm::Synced)],
             Vec::new(),
         );
         assert!(one.recovery.contains("vault's trash"), "{}", one.recovery);
@@ -6728,12 +7160,81 @@ mod tests {
         let many = FilesDeletePlanVm::compose(
             "Vault",
             vec![
-                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
-                ("b.md".to_owned(), FilesSyncStatusVm::Synced),
+                note("a.md", FilesSyncStatusVm::Synced),
+                note("b.md", FilesSyncStatusVm::Synced),
             ],
             Vec::new(),
         );
         assert!(many.recovery.contains("rather than erasing them"));
+    }
+
+    /// **Story 46.14: the recovery sentence stops promising a trash that does
+    /// not exist.** Before AD-102 there was one destination and one sentence;
+    /// for a file no vault holds, both halves of that sentence — the vault's
+    /// trash and this folder's history — were untrue.
+    #[test]
+    fn a_delete_out_of_the_vault_does_not_promise_the_vaults_trash() {
+        let one = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![loose("AGENTS.md", FilesSyncStatusVm::Synced)],
+            Vec::new(),
+        );
+        assert!(
+            one.recovery.contains("this computer's trash"),
+            "{}",
+            one.recovery
+        );
+        assert!(!one.recovery.contains("vault's trash"), "{}", one.recovery);
+        assert!(
+            !one.recovery.contains("folder's history"),
+            "{}",
+            one.recovery
+        );
+
+        let many = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                loose("AGENTS.md", FilesSyncStatusVm::Synced),
+                loose("README.md", FilesSyncStatusVm::Synced),
+            ],
+            Vec::new(),
+        );
+        assert!(
+            many.recovery.contains("None of them are notes"),
+            "{}",
+            many.recovery
+        );
+        assert!(
+            !many.recovery.contains("vault's trash"),
+            "{}",
+            many.recovery
+        );
+
+        // One drag over a vault and the folder beside it: both destinations
+        // are named and counted, because wording the commoner one and hoping
+        // is how a confirmation becomes a lie.
+        let mixed = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                note("10-notes/a.md", FilesSyncStatusVm::Synced),
+                note("10-notes/b.md", FilesSyncStatusVm::Synced),
+                loose("AGENTS.md", FilesSyncStatusVm::Synced),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            mixed.recovery,
+            "Nothing is erased: 2 of these 3 go to the vault's trash and are recorded in \
+             this folder's history, and the other 1 go to this computer's trash, because \
+             they are not notes."
+        );
+        // The sync consequence is a different question and is unchanged by the
+        // destination: all three of these travel.
+        assert!(
+            mixed.consequence.starts_with("These 3 files sync"),
+            "{}",
+            mixed.consequence
+        );
     }
 
     /// A selection keeper will only partly act on says so by name, and an
@@ -6757,7 +7258,7 @@ mod tests {
         // A partial selection keeps both halves.
         let partial = FilesDeletePlanVm::compose(
             "Vault",
-            vec![("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            vec![note("10-notes/a.md", FilesSyncStatusVm::Synced)],
             refusals.clone(),
         );
         assert_eq!(partial.question, "Delete 10-notes/a.md?");
@@ -6985,5 +7486,320 @@ mod tests {
             serde_json::to_string(&FilesFolderRoleVm::Recordings).expect("serialize"),
             "\"recordings\""
         );
+    }
+
+    /// Epic 46 / AD-98: the projection the "where did this value come from?"
+    /// surface renders.
+    ///
+    /// These live here rather than in the shell because the shell does not
+    /// compile on Linux. Every sentence a user reads about their settings files
+    /// is composed by `ConfigLayersVm::new`, so asserting it here asserts it on
+    /// every machine.
+    mod config_layers {
+        use std::path::PathBuf;
+
+        use super::*;
+        use crate::config::{LayerFault, LayerFaultKind, LayerSource, LayerTier};
+
+        fn source(tier: LayerTier, path: &str, folder: Option<&str>) -> LayerSource {
+            LayerSource {
+                tier,
+                path: PathBuf::from(path),
+                folder: folder.map(str::to_owned),
+            }
+        }
+
+        /// The empty case is the normal one, and it must not imply anything is
+        /// wrong: a user with no settings file has a healthy install.
+        #[test]
+        fn no_layers_reads_as_a_healthy_install_rather_than_a_problem() {
+            let vm = ConfigLayersVm::new(Vec::new(), Vec::new(), None);
+            assert_eq!(
+                vm.summary,
+                "No setting is being set by a file. Everything here is stored by keeper."
+            );
+            assert!(vm.overrides.is_empty());
+            assert!(vm.faults.is_empty());
+            assert_eq!(vm.main_folder, None);
+        }
+
+        /// One override names its key, its file, and what that file reaches —
+        /// the three things someone needs to go and change it.
+        #[test]
+        fn an_override_names_the_key_the_file_and_how_far_the_file_reaches() {
+            let vm = ConfigLayersVm::new(
+                vec![(
+                    "recording.fps".to_owned(),
+                    source(LayerTier::UserGlobal, "/Users/t/.keeper/keeper.toml", None),
+                )],
+                Vec::new(),
+                None,
+            );
+            let [only] = &vm.overrides[..] else {
+                panic!("expected exactly one override, got {:?}", vm.overrides);
+            };
+            assert_eq!(only.key, "recording.fps");
+            assert_eq!(only.tier, ConfigTierVm::UserGlobal);
+            assert_eq!(only.path, "/Users/t/.keeper/keeper.toml");
+            assert_eq!(
+                only.source,
+                "your settings file, for every machine and folder"
+            );
+            assert_eq!(
+                vm.summary,
+                "1 setting is set by a file. Changing it here will not take effect while the file sets it."
+            );
+        }
+
+        /// The singular/plural boundary, because "1 settings are set by a file"
+        /// is the kind of sentence that makes a user distrust the rest of it.
+        #[test]
+        fn the_summary_counts_in_words_that_agree_with_the_number() {
+            let two = ConfigLayersVm::new(
+                vec![
+                    (
+                        "debug.mode".to_owned(),
+                        source(LayerTier::UserGlobal, "/h/.keeper/keeper.toml", None),
+                    ),
+                    (
+                        "recording.fps".to_owned(),
+                        source(LayerTier::MainShared, "/m/.keeper/keeper.toml", None),
+                    ),
+                ],
+                Vec::new(),
+                None,
+            );
+            assert_eq!(
+                two.summary,
+                "2 settings are set by a file. Changing them here will not take effect while the files set them."
+            );
+        }
+
+        /// A machine-scoped layer says "this machine". Two people syncing one
+        /// folder need to be able to tell which of the two files they are
+        /// looking at from the sentence alone.
+        #[test]
+        fn every_tier_gets_a_distinct_sentence_naming_its_reach() {
+            let phrases: Vec<String> = [
+                (LayerTier::UserGlobal, None),
+                (LayerTier::UserGlobalMachine, None),
+                (LayerTier::MainShared, Some("tgdrive")),
+                (LayerTier::MainMachine, Some("tgdrive")),
+                (LayerTier::FolderShared, Some("photos")),
+                (LayerTier::FolderMachine, Some("photos")),
+            ]
+            .into_iter()
+            .map(|(tier, folder)| {
+                let vm = ConfigLayersVm::new(
+                    vec![(
+                        "k".to_owned(),
+                        source(tier, "/f/.keeper/keeper.toml", folder),
+                    )],
+                    Vec::new(),
+                    None,
+                );
+                vm.overrides[0].source.clone()
+            })
+            .collect();
+            assert_eq!(
+                phrases,
+                vec![
+                    "your settings file, for every machine and folder",
+                    "your settings file for this machine",
+                    "the shared settings file in tgdrive, for every machine",
+                    "the shared settings file in tgdrive, for this machine",
+                    "photos's own settings file, for every machine",
+                    "photos's own settings file, for this machine",
+                ]
+            );
+        }
+
+        /// A folder layer that arrived without a folder name still produces a
+        /// grammatical sentence rather than an empty slot.
+        #[test]
+        fn a_layer_with_no_folder_name_still_reads_as_a_sentence() {
+            let vm = ConfigLayersVm::new(
+                vec![(
+                    "k".to_owned(),
+                    source(LayerTier::FolderMachine, "/f/.keeper/keeper.h.toml", None),
+                )],
+                Vec::new(),
+                None,
+            );
+            assert_eq!(
+                vm.overrides[0].source,
+                "a folder's own settings file, for this machine"
+            );
+            assert_eq!(vm.overrides[0].folder, None);
+        }
+
+        /// A fault crosses with a stable machine name AND the config layer's
+        /// own finished line, rendered verbatim — the `SyncGitVm.problem`
+        /// contract: one fact, one spelling, composed once in Rust.
+        #[test]
+        fn a_fault_carries_a_stable_kind_and_the_line_the_surface_renders() {
+            let fault = LayerFault::late(
+                LayerFaultKind::MainFolderNotAProfile,
+                PathBuf::from("/Volumes/merope/tgdrive"),
+                "mainSyncFolder names a folder that is not a sync folder".to_owned(),
+            );
+            let vm = ConfigLayersVm::new(Vec::new(), vec![fault], None);
+            let [only] = &vm.faults[..] else {
+                panic!("expected exactly one fault, got {:?}", vm.faults);
+            };
+            assert_eq!(only.kind, "mainFolderNotAProfile");
+            assert_eq!(only.path, "/Volumes/merope/tgdrive");
+            assert_eq!(
+                only.summary,
+                "/Volumes/merope/tgdrive: mainSyncFolder names a folder that is not a sync folder"
+            );
+        }
+
+        /// The one that would otherwise be found by a user: a malformed TOML
+        /// fault's `Display` is deliberately multi-line — it carries `toml`'s
+        /// own caret diagram, which is the right thing in a log and wrecks a
+        /// settings pane. The projection takes `summary()`, which is one line.
+        #[test]
+        fn a_multi_line_parser_fault_reaches_the_surface_as_one_line() {
+            let mut fault = LayerFault::late(
+                LayerFaultKind::Malformed,
+                PathBuf::from("/h/.keeper/keeper.toml"),
+                "expected `=`, found a newline\n  |\n3 | recording.fps\n  |              ^",
+            );
+            fault.line = Some(3);
+            let vm = ConfigLayersVm::new(Vec::new(), vec![fault], None);
+            assert_eq!(
+                vm.faults[0].summary,
+                "/h/.keeper/keeper.toml:3: expected `=`, found a newline"
+            );
+            assert!(
+                !vm.faults[0].summary.contains('\n'),
+                "a settings pane renders one line per fault"
+            );
+        }
+
+        /// Faults are counted in the lead sentence, because the list below is
+        /// scrollable and the one thing that must not be scrolled past is
+        /// "part of your configuration did not load".
+        #[test]
+        fn the_summary_says_how_many_problems_were_found() {
+            let one = ConfigLayersVm::new(
+                Vec::new(),
+                vec![LayerFault::late(
+                    LayerFaultKind::Malformed,
+                    PathBuf::from("/h/.keeper/keeper.toml"),
+                    "expected `=`".to_owned(),
+                )],
+                None,
+            );
+            assert!(
+                one.summary
+                    .ends_with(" keeper found 1 problem in your settings files."),
+                "got {}",
+                one.summary
+            );
+            let two = ConfigLayersVm::new(
+                Vec::new(),
+                vec![
+                    LayerFault::late(
+                        LayerFaultKind::Malformed,
+                        PathBuf::from("/h/.keeper/keeper.toml"),
+                        "expected `=`".to_owned(),
+                    ),
+                    LayerFault::late(
+                        LayerFaultKind::Unreadable,
+                        PathBuf::from("/m/.keeper/keeper.toml"),
+                        "permission denied".to_owned(),
+                    ),
+                ],
+                None,
+            );
+            assert!(
+                two.summary
+                    .ends_with(" keeper found 2 problems in your settings files."),
+                "got {}",
+                two.summary
+            );
+        }
+
+        /// A designated main folder that turned out to be wrong is still
+        /// reported. Blanking the field on a bad value would hide the typo the
+        /// user has to fix — which is the failure this story exists to make
+        /// loud.
+        #[test]
+        fn a_rejected_main_folder_is_still_named_beside_its_fault() {
+            let vm = ConfigLayersVm::new(
+                Vec::new(),
+                vec![LayerFault::late(
+                    LayerFaultKind::MainFolderMissing,
+                    PathBuf::from("/Volumes/merope/tgdrve"),
+                    "no such folder".to_owned(),
+                )],
+                Some(PathBuf::from("/Volumes/merope/tgdrve")),
+            );
+            assert_eq!(vm.main_folder.as_deref(), Some("/Volumes/merope/tgdrve"));
+            assert_eq!(vm.faults.len(), 1);
+        }
+
+        /// The tier vocabulary crosses the wire camel-cased, so a surface can
+        /// switch on it without a translation table.
+        #[test]
+        fn the_tier_serializes_camel_case() {
+            assert_eq!(
+                serde_json::to_string(&ConfigTierVm::UserGlobalMachine).expect("serialize"),
+                "\"userGlobalMachine\""
+            );
+            assert_eq!(
+                serde_json::to_string(&ConfigTierVm::MainShared).expect("serialize"),
+                "\"mainShared\""
+            );
+        }
+
+        /// The engine's folder faults land in the same list as the loader's,
+        /// because a user does not care which crate noticed that part of their
+        /// configuration did not apply.
+        #[test]
+        fn folder_faults_join_the_same_list_and_are_counted_with_the_rest() {
+            let vm = ConfigLayersVm::new(
+                vec![(
+                    "recording.fps".to_owned(),
+                    source(LayerTier::UserGlobal, "/h/.keeper/keeper.toml", None),
+                )],
+                vec![LayerFault::late(
+                    LayerFaultKind::Malformed,
+                    PathBuf::from("/h/.keeper/keeper.toml"),
+                    "expected `=`".to_owned(),
+                )],
+                None,
+            )
+            .with_folder_faults(vec![ConfigFaultVm::folder(
+                &PathBuf::from("/Volumes/merope/photos/.keeper/keeper.toml"),
+                "the tag you set was dropped because this file owns it".to_owned(),
+            )]);
+            assert_eq!(vm.faults.len(), 2);
+            assert_eq!(vm.faults[1].kind, "folder");
+            assert_eq!(
+                vm.faults[1].summary,
+                "/Volumes/merope/photos/.keeper/keeper.toml: the tag you set was dropped because this file owns it"
+            );
+            // Recomputed, not appended to: a count that stopped counting is the
+            // failure this method exists to avoid.
+            assert!(
+                vm.summary
+                    .ends_with(" keeper found 2 problems in your settings files."),
+                "got {}",
+                vm.summary
+            );
+        }
+
+        /// Folding in nothing changes nothing — the common case, and the one
+        /// that would otherwise quietly restate a stale count.
+        #[test]
+        fn folding_in_no_folder_faults_leaves_the_summary_alone() {
+            let plain = ConfigLayersVm::new(Vec::new(), Vec::new(), None);
+            let folded =
+                ConfigLayersVm::new(Vec::new(), Vec::new(), None).with_folder_faults(Vec::new());
+            assert_eq!(plain, folded);
+        }
     }
 }

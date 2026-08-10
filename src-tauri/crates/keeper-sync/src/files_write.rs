@@ -17,10 +17,8 @@
 //! write", it is three narrower promises that this module exists to keep:
 //!
 //! 1. **Only inside a vault.** keeper writes where it already manages the
-//!    files — the notes vault — and nowhere else in the profile. A file outside
-//!    a vault is listed and viewed and *says why* it cannot be changed, because
-//!    an action that will fail is worse than an action that is absent (FR-145,
-//!    AD-65 unaffected: the frontend still never joins a root and a subpath).
+//!    files — the notes vault — and nowhere else in the profile (FR-145, AD-65
+//!    unaffected: the frontend still never joins a root and a subpath).
 //! 2. **One writer.** Every byte goes through `notes_vault::write_vault_file` +
 //!    `mark_dirty`, the same path notes and Story 44.16's CSV editor use. This
 //!    module writes nothing itself; it decides *whether* and *where*, and hands
@@ -31,6 +29,49 @@
 //!    and marks the vault dirty so the commit cadence carries the deletion. The
 //!    reconciler already understands that shape; inventing a second removal
 //!    would mean a deletion the index learns about on the next unrelated scan.
+//!
+//! # AD-102: a second writer, named rather than grown by accident
+//!
+//! Story 46.14. The owner asked to edit text files that are not in a notes
+//! vault and to delete files that are not notes, and the sentence keeper gave
+//! back — *"changing it is your file manager's job"* — was the whole of promise
+//! 1 read out loud.
+//!
+//! **AD-89 is not overturned; it is scoped to what it always described.** The
+//! three promises above are the promises keeper makes about a *vault* file, and
+//! they have teeth: `mark_dirty` is what makes an edit reach the reconciler and
+//! the commit cadence, and `trash_note` is what makes a deletion recoverable.
+//! Neither is reachable for a file no vault holds — there is no vault to mark
+//! and no vault trash to move bytes into. So the answer is not to relax the
+//! guard. It is a **second writer**, with different sync and recovery
+//! semantics, said out loud before it acts:
+//!
+//! * an out-of-vault edit is [`write_unmanaged`] — a plain atomic write, no
+//!   `mark_dirty`, no reconciler `touch`, no notes index, no note history and
+//!   no conflict copy;
+//! * an out-of-vault delete is [`trash_unmanaged`] — the *operating system's*
+//!   trash, which on macOS is `NSFileManager trashItem` and elsewhere the
+//!   freedesktop.org home trash. NFR-30 holds unchanged: never an `unlink`.
+//!
+//! **What keeps the two from merging six months from now is that they do not
+//! share a signature.** [`WriteScope::route`] is the one place the fork is
+//! decided, and it hands back a [`WriteRoute`] whose vault arm *carries the
+//! caller's vault* and whose unmanaged arm has nowhere to put one. The vault
+//! writer needs a `Vault` and a [`VaultPath`]; [`write_unmanaged`] takes an
+//! [`UnmanagedPath`], which only `route` can mint and only for a path no vault
+//! holds. Not a boolean, and not a comment: the mistake is not expressible.
+//!
+//! Two things AD-102 does **not** widen:
+//!
+//! * **A directory is still refused at every location.** "One confirmation over
+//!   a folder holding 100 000 files is not a confirmation" (spec-45-3), and
+//!   sending that folder to the OS trash rather than the vault's does not make
+//!   the confirmation any better informed.
+//! * **A file outside every sync profile is still not keeper's.** keeper
+//!   addresses a file as (profile id, profile-relative subpath); a file in no
+//!   profile has no id to pass, keeper does not list it, and
+//!   [`resolve_existing`] refuses anything whose canonical form leaves the
+//!   profile root — a symlink inside the profile pointing out of it included.
 //!
 //! # Why the decision lives in this crate and not in the shell
 //!
@@ -117,6 +158,27 @@ pub enum WriteRefusal {
         /// The OS's own words, which are the most useful thing to show.
         reason: String,
     },
+    /// This machine has no operating-system trash to put an out-of-vault file
+    /// into, so the deletion does not happen (AD-102, NFR-30).
+    ///
+    /// A refusal and never a fallback to `unlink`. The whole reason the second
+    /// writer is allowed to delete at all is that the bytes stay somewhere the
+    /// owner can reach; a machine that cannot offer that gets the refusal it
+    /// had before this story, not a quiet erasure.
+    NoSystemTrash {
+        /// What was missing — a home directory, usually.
+        reason: String,
+    },
+    /// [`WriteScope::route`] placed a path inside the vault and the caller
+    /// handed no vault to write it with.
+    ///
+    /// Distinct from [`Self::NoVault`], which is about *creating* and is what a
+    /// person reads where the New file control should be. This one is the two
+    /// answers `vault_and_scope` exists to keep identical having come apart —
+    /// a profile configured with a vault the registry has no live slot for,
+    /// mid-start. Reported rather than assumed away, because assuming it away
+    /// means writing a note through the unmanaged path.
+    VaultUnreachable { profile_name: String },
     /// The write itself failed once everything had been allowed.
     ///
     /// Distinct from every refusal above, which are all decisions: this is the
@@ -140,10 +202,17 @@ pub enum WriteRefusal {
 impl std::fmt::Display for WriteRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // The two sentences below are now reached ONLY from the create
+            // path — `directory` and `create` — because AD-102 routes an
+            // existing out-of-vault FILE to the second writer instead of
+            // refusing it. So they say what is actually still refused. The
+            // old wording ("changing it is your file manager's job") was the
+            // sentence the owner's field report quoted back at us, and leaving
+            // it anywhere on screen would be this story half done.
             Self::NoVault { profile_name } => write!(
                 f,
-                "{profile_name} holds no notes vault, so keeper will not change files in it. \
-                 You can open and reveal them here; changing them is your file manager's job."
+                "{profile_name} holds no notes vault, so keeper will not create a new file \
+                 in it. Files already there can still be edited and deleted."
             ),
             Self::OutsideVault {
                 profile_name,
@@ -152,8 +221,8 @@ impl std::fmt::Display for WriteRefusal {
             } => write!(
                 f,
                 "{subpath} is outside {profile_name}'s notes vault ({subfolder}), and keeper \
-                 only writes inside the vault it manages. You can open and reveal this file \
-                 here; changing it is your file manager's job."
+                 creates new files only inside the vault it manages. Files already there can \
+                 still be edited and deleted."
             ),
             Self::VaultRoot { subfolder } => write!(
                 f,
@@ -207,6 +276,16 @@ impl std::fmt::Display for WriteRefusal {
                 relative_path,
                 reason,
             } => write!(f, "keeper could not delete {relative_path}: {reason}"),
+            Self::NoSystemTrash { reason } => write!(
+                f,
+                "keeper could not find this computer's trash ({reason}), and it will not \
+                 erase a file it cannot put somewhere you can get it back from."
+            ),
+            Self::VaultUnreachable { profile_name } => write!(
+                f,
+                "keeper cannot reach {profile_name}'s notes vault right now, so it will not \
+                 change a file inside it. Try again once the folder has finished opening."
+            ),
         }
     }
 }
@@ -374,6 +453,532 @@ impl<'a> WriteScope<'a> {
             profile_relative: join(dir_subpath),
         })
     }
+
+    /// Which of keeper's two writers owns `subpath`, or why neither does
+    /// (Story 46.14, AD-102).
+    ///
+    /// **The one place the fork is decided.** A second site that worked out
+    /// "is this in the vault" for itself would eventually work it out
+    /// differently, and the disagreement that costs something is the one that
+    /// sends a *vault* file down the plain writer: an edit that never reaches
+    /// the reconciler, never marks the vault dirty, and so never gets
+    /// committed. `route` is therefore the only constructor of both
+    /// [`VaultPath`] and [`UnmanagedPath`].
+    ///
+    /// The order is the order that produces the useful sentence, and it is
+    /// deliberately not "vault first, everything else falls through":
+    ///
+    /// 1. **Containment and existence first, through [`resolve_existing`].** It
+    ///    refuses `..`, an absolute path, a platform separator and a symlink
+    ///    whose canonical form leaves the profile root — *before* the vault
+    ///    question is asked, which is the part that matters: [`Self::file`]'s
+    ///    `vault_relative` tests for a vault before it tests the path, so in a
+    ///    profile holding no vault it answers `NoVault` to `../etc`, and a
+    ///    fall-through would then route a traversal to the plain writer.
+    ///    Ordering, not a second check: a duplicate `plain_segments` call here
+    ///    was written, mutation-tested, found to kill nothing, and removed.
+    /// 2. **Both writers change a file; neither creates one.** A stale editor
+    ///    whose file was deleted elsewhere must not put it back.
+    ///    `sync_create_entry` is the create, and AD-102 does not widen it —
+    ///    see the module note.
+    /// 3. **The vault directory is refused as the vault**, not as "a folder":
+    ///    the next step differs.
+    /// 4. **A directory is refused at every location** (spec-45-3), which is
+    ///    why this check sits outside the vault/unmanaged split rather than in
+    ///    one arm of it.
+    ///
+    /// `vault` is the caller's own handle — this crate has never heard of
+    /// `notes_vault::Vault` and does not need to. It is carried *into* the
+    /// returned variant rather than looked up again afterwards, which is what
+    /// makes "the vault path is unreachable without a vault" a fact about the
+    /// types instead of a habit.
+    pub fn route<V>(
+        &self,
+        vault: Option<V>,
+        root: &Path,
+        subpath: &str,
+    ) -> Result<WriteRoute<V>, WriteRefusal> {
+        // Containment first, and it is `resolve_existing` that provides it —
+        // see the note on ordering above.
+        let resolved = resolve_existing(root, subpath)?;
+        match self.classify(subpath, resolved.is_dir())? {
+            Owned::Vault(relative) => Ok(WriteRoute::Vault {
+                vault: vault.ok_or_else(|| WriteRefusal::VaultUnreachable {
+                    profile_name: self.profile_name.to_owned(),
+                })?,
+                path: VaultPath(relative),
+            }),
+            Owned::Unmanaged => Ok(WriteRoute::Unmanaged(UnmanagedPath {
+                absolute: resolved,
+                profile_relative: subpath.to_owned(),
+            })),
+        }
+    }
+
+    /// [`Self::route`]'s verdict without the disk — the listing's question
+    /// (Story 46.14, AD-102).
+    ///
+    /// **One classifier, two callers, and that is the requirement rather than
+    /// a saving.** Story 45.3's rule is that the flag the surface renders and
+    /// the answer the command gives are the same question asked twice; a
+    /// listing that decided "in the vault?" on its own would eventually decide
+    /// it differently from the command, and the row that disagreed would be a
+    /// row offering the wrong writer.
+    ///
+    /// Lexical because the listing already holds the dirent. `route`
+    /// canonicalises, which is a `stat` per call; paying that for each of a
+    /// thousand rows to re-learn `is_dir` — which `read_dir` just handed over —
+    /// would make opening a folder slower for no new information.
+    pub fn owner(&self, subpath: &str, is_dir: bool) -> Result<WriteOwner, WriteRefusal> {
+        Ok(match self.classify(subpath, is_dir)? {
+            Owned::Vault(_) => WriteOwner::Vault,
+            Owned::Unmanaged => WriteOwner::Unmanaged,
+        })
+    }
+
+    /// The fork itself. Everything above it is arguments; everything below it
+    /// is consequences.
+    fn classify(&self, subpath: &str, is_dir: bool) -> Result<Owned, WriteRefusal> {
+        // With no vault, `vault_relative` tests for one before it tests the
+        // path, so an escape must already have been refused by the caller —
+        // `route` does it by resolving, `owner`'s caller by having read the
+        // subpath out of a dirent `browse` produced.
+        let inside = match self.vault_relative(subpath) {
+            Ok(relative) => Some(relative),
+            // The two ways a path is in no vault. Neither is a refusal any
+            // more; both are the second writer's business.
+            Err(WriteRefusal::NoVault { .. } | WriteRefusal::OutsideVault { .. }) => None,
+            Err(other) => return Err(other),
+        };
+        if inside.as_deref() == Some("") {
+            return Err(WriteRefusal::VaultRoot {
+                subfolder: self.subfolder.clone().unwrap_or_default(),
+            });
+        }
+        if is_dir {
+            return Err(WriteRefusal::IsDirectory {
+                name: last_segment(subpath).to_owned(),
+            });
+        }
+        Ok(inside.map_or(Owned::Unmanaged, Owned::Vault))
+    }
+
+    /// The sentence a surface must show BEFORE editing a file keeper does not
+    /// manage (Story 46.14, AD-102).
+    ///
+    /// **Before, and not after.** An edit that quietly does less than the vault
+    /// path does is strictly worse than the refusal it replaces: a person who
+    /// finds out after saving that this file has no history has already lost
+    /// the thing history would have given them.
+    ///
+    /// **It says what is absent and refuses to overstate it.** The tempting
+    /// sentence is "this will not sync", and for a file in a synced profile
+    /// that is simply false — the folder engine watches the whole profile and
+    /// carries whatever changes in it, exactly as it would for an edit made in
+    /// Finder. What is genuinely absent is everything the *vault* provides, and
+    /// naming that precisely is the difference between a caveat and a scare.
+    ///
+    /// Takes the file's own name, never its path (FR-145).
+    pub fn unmanaged_caveat(&self, name: &str) -> String {
+        let profile = self.profile_name;
+        let placing = match self.subfolder.as_deref() {
+            Some(subfolder) => {
+                format!("it is outside {profile}'s notes vault ({subfolder})")
+            }
+            None => format!("{profile} holds no notes vault"),
+        };
+        format!(
+            "{name} is not one of keeper's notes — {placing}. keeper saves it straight to \
+             the file and sends a delete to this computer's trash: no note history, no \
+             search index and no conflict copy. Nothing about how {profile} syncs this \
+             folder changes."
+        )
+    }
+}
+
+// ─── AD-102: the second writer ───────────────────────────────────────────────
+
+/// [`WriteScope::classify`]'s answer, with the vault-relative path the vault
+/// arm needs.
+///
+/// Private, because the path it carries is the raw string a [`VaultPath`] is
+/// made of, and letting that out of the module would be a way around the one
+/// constructor.
+enum Owned {
+    Vault(String),
+    Unmanaged,
+}
+
+/// Which writer owns a path, for a caller that only needs to know which
+/// (Story 46.14, AD-102).
+///
+/// [`Owned`] without the path — the listing's half of [`WriteScope::classify`],
+/// which decides a flag and a sentence rather than a destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOwner {
+    /// keeper manages this file: the vault writer, `mark_dirty`, the vault
+    /// trash, the notes index.
+    Vault,
+    /// keeper will write it and does not manage it — AD-102's second writer,
+    /// over a surface carrying [`WriteScope::unmanaged_caveat`].
+    Unmanaged,
+}
+
+/// A path inside the notes vault, and the only argument the vault writer takes.
+///
+/// A newtype over a `String`, and worth every character of it. AD-89's promise
+/// 2 is "one writer"; [`WriteRoute`] adds a second one for files no vault
+/// holds, and what stops the two merging six months from now is that they do
+/// not share a signature. This type has a private field, no `From<String>` and
+/// exactly one constructor — [`WriteScope::route`], which can only reach it
+/// through a scope that already holds a vault subfolder. A bare string cannot
+/// become a vault write by being handed to the wrong function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultPath(String);
+
+impl VaultPath {
+    /// Vault-relative and `/`-joined — what `notes_vault::write_vault_file`
+    /// and `notes_vault::trash_note` take, alongside the `Vault` that this
+    /// crate cannot see and therefore cannot forge.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A file inside a sync profile that no vault holds — the second writer's only
+/// argument.
+///
+/// Absolute and already canonicalised: [`resolve_existing`] proved it is a real
+/// descendant of the profile root *after* symlinks. That proof is why the type
+/// exists and why it is opaque — a `PathBuf` arriving at [`write_unmanaged`]
+/// from anywhere else would be a write to an arbitrary location on the machine,
+/// which is the failure AD-89's first promise was written against.
+///
+/// It carries no vault and cannot be given one: neither writer that takes it
+/// has a slot a `Vault` fits in. That is the whole of AD-102's type-level
+/// separation, from the other side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmanagedPath {
+    absolute: PathBuf,
+    profile_relative: String,
+}
+
+impl UnmanagedPath {
+    /// What the surface already shows, for a sentence and for a log line.
+    ///
+    /// The absolute path is deliberately not exposed: FR-145 keeps it off
+    /// screen, and the two functions that need it live in this module.
+    pub fn profile_relative(&self) -> &str {
+        &self.profile_relative
+    }
+}
+
+/// Which of keeper's two writers owns a path (AD-102).
+///
+/// `V` is the caller's vault handle. This crate has never heard of
+/// `notes_vault::Vault`, and generic-over-it is how the decision stays here —
+/// testable on Linux — while the vault stays in the shell. Carrying the vault
+/// *inside* the variant is the load-bearing part: the vault arm cannot be
+/// reached without a vault because it holds one, and the unmanaged arm cannot
+/// be handed a vault because it has nowhere to put one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteRoute<V> {
+    /// Inside the vault. `write_vault_file` + `touch` + `mark_dirty`,
+    /// unchanged by this story.
+    Vault {
+        /// The live vault the caller handed to [`WriteScope::route`].
+        vault: V,
+        /// Where in it the file sits.
+        path: VaultPath,
+    },
+    /// Inside the profile, outside every vault: [`write_unmanaged`] and
+    /// [`trash_unmanaged`], over a surface that said so first.
+    Unmanaged(UnmanagedPath),
+}
+
+/// Write `content` to a file no vault manages (Story 46.14, AD-102).
+///
+/// **A plain atomic write and nothing else.** Temp-and-rename in the same
+/// directory, under the `.keeper.<ulid>.tmp` name [`crate::exclude`] already
+/// makes a tier-0 exclusion — so a `kill -9` between write and rename leaves no
+/// torn file, and if the profile is a git repository there is nothing for the
+/// next commit to pick up.
+///
+/// **No `mark_dirty` and no reconciler `touch`, and their absence is the
+/// point.** `mark_dirty` marks a *vault*, and this file is in none: there is no
+/// reconciler to tell, no notes index this file belongs in, no note history and
+/// no conflict copy. Neither call is even reachable from here — this function's
+/// signature has no vault in it, by construction rather than by discipline.
+///
+/// What the file *does* still get, if the profile is a synced git repository,
+/// is the folder engine's own watcher and commit cadence — the same treatment a
+/// change made in Finder gets, and no more. That distinction is what the
+/// surface's caveat sentence has to carry, and why it says "keeper does not
+/// manage this file" rather than the flatly untrue "this will not sync".
+///
+/// Exact bytes: no trailing-newline normalisation and no re-encoding, for the
+/// same reason the vault path does not do it either — a file the user did not
+/// change must not change.
+pub fn write_unmanaged(target: &UnmanagedPath, content: &str) -> Result<(), WriteRefusal> {
+    let failed = |error: std::io::Error| WriteRefusal::WriteFailed {
+        relative_path: target.profile_relative.clone(),
+        reason: error.to_string(),
+    };
+    // The path resolved to an existing file, so it has a parent directory. The
+    // fallback keeps this total rather than asserting it.
+    let directory = target.absolute.parent().unwrap_or_else(|| Path::new("."));
+    let temp = directory.join(format!(".keeper.{}.tmp", ulid::Ulid::new()));
+    std::fs::write(&temp, content.as_bytes()).map_err(failed)?;
+    if let Err(error) = std::fs::rename(&temp, &target.absolute) {
+        // A failed rename must not leave the temp behind. It is excluded from
+        // sync, but it is still litter in the owner's folder.
+        let _ = std::fs::remove_file(&temp);
+        return Err(failed(error));
+    }
+    Ok(())
+}
+
+/// Where an out-of-vault removal puts the bytes (AD-102, NFR-30).
+///
+/// Not a boolean and not a bare path, because the two platforms answer the
+/// question in genuinely different shapes. macOS names no directory:
+/// `NSFileManager` picks the right `.Trashes` for the volume the file is on and
+/// records the Put Back location, and second-guessing it is how a file on a
+/// pendrive ends up in the boot volume's trash. freedesktop.org names one — and
+/// naming it is what lets the whole removal be asserted over a temp directory
+/// on the Linux box this is written on, rather than being a promise only macOS
+/// could ever check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrashTarget {
+    /// A freedesktop.org trash directory: `files/` beside `info/`.
+    Freedesktop(PathBuf),
+    /// Hand the file to `NSFileManager` and let macOS choose.
+    Finder,
+}
+
+/// This machine's trash, or why it has none.
+///
+/// Resolved per platform and never guessed: a machine with no home directory
+/// gets [`WriteRefusal::NoSystemTrash`] and keeps its file, because the only
+/// alternative is the `unlink` NFR-30 forbids.
+pub fn os_trash() -> Result<TrashTarget, WriteRefusal> {
+    if cfg!(target_os = "macos") {
+        return Ok(TrashTarget::Finder);
+    }
+    // The freedesktop.org "home trash": `$XDG_DATA_HOME/Trash`, defaulting to
+    // `$HOME/.local/share/Trash`. Read from the environment rather than from a
+    // platform port because this is the only caller and the port would have to
+    // be threaded through four Tauri commands to reach it.
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("share"))
+        })
+        .ok_or_else(|| WriteRefusal::NoSystemTrash {
+            reason: "neither XDG_DATA_HOME nor HOME is set".to_owned(),
+        })?;
+    Ok(TrashTarget::Freedesktop(base.join("Trash")))
+}
+
+/// This machine's local wall clock in milliseconds.
+///
+/// A freedesktop `DeletionDate` is defined as *local* time carrying no zone, so
+/// UTC would be an hour or thirteen wrong in the one field a person reads in
+/// their file manager. Taken as an argument by [`trash_unmanaged`] rather than
+/// read inside it, so the test can assert an exact string.
+pub fn local_now_ms() -> i64 {
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(0));
+    utc + i64::from(crate::platform::machine_utc_offset_minutes()) * 60_000
+}
+
+/// Move a file no vault manages into the operating system's trash (Story 46.14,
+/// AD-102, NFR-30).
+///
+/// **Never an `unlink`, and that promise is not weakened by being outside a
+/// vault — only relocated.** `trash_note` moves bytes into `<vault>/.keeper/
+/// trash/`, which does not exist here; the OS trash is the same shape of
+/// promise made by the machine instead of by keeper, and it is the one the
+/// owner already knows how to undo. Returns where the bytes landed, for the log
+/// line, exactly as `trash_note` does.
+///
+/// `local_now_ms` is the local wall clock — see [`local_now_ms`].
+pub fn trash_unmanaged(
+    target: &UnmanagedPath,
+    trash: &TrashTarget,
+    local_now_ms: i64,
+) -> Result<PathBuf, WriteRefusal> {
+    let failed = |reason: String| WriteRefusal::DeleteFailed {
+        relative_path: target.profile_relative.clone(),
+        reason,
+    };
+    match trash {
+        TrashTarget::Freedesktop(root) => freedesktop_trash(&target.absolute, root, local_now_ms)
+            .map_err(|error| failed(error.to_string())),
+        TrashTarget::Finder => finder_trash(&target.absolute).map_err(failed),
+    }
+}
+
+/// The freedesktop.org trash-spec removal: claim a name in `info/`, then move
+/// the bytes into `files/`.
+///
+/// **The `.trashinfo` file is written first, with `create_new`, and that is the
+/// lock.** The spec says so and the reason is a race this code can actually
+/// lose: two deletions of two files called `notes.md` from two folders, or one
+/// deletion racing the desktop's own. Creating the info file exclusively is
+/// what makes the name mine before any byte moves, so the loser picks the next
+/// name instead of overwriting the winner's file.
+///
+/// A move that fails takes the info file back out with it: a `.trashinfo`
+/// naming bytes that are not in `files/` is a broken row in the owner's trash.
+fn freedesktop_trash(path: &Path, root: &Path, local_now_ms: i64) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+
+    let files = root.join("files");
+    let info = root.join("info");
+    std::fs::create_dir_all(&files)?;
+    std::fs::create_dir_all(&info)?;
+
+    let original = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let mut claimed = None;
+    for attempt in 0..1_000u32 {
+        let candidate = numbered(original, attempt);
+        let ticket = info.join(format!("{candidate}.trashinfo"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ticket)
+        {
+            Ok(handle) => {
+                claimed = Some((candidate, ticket, handle));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let Some((name, ticket, mut handle)) = claimed else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("the trash already holds a thousand files called {original}"),
+        ));
+    };
+
+    let record = write!(
+        handle,
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        encoded_path(path),
+        deletion_date(local_now_ms)
+    )
+    .and_then(|()| handle.sync_all());
+    if let Err(error) = record {
+        let _ = std::fs::remove_file(&ticket);
+        return Err(error);
+    }
+
+    let grave = files.join(&name);
+    let moved = std::fs::rename(path, &grave).or_else(|_| {
+        // The home trash is very often on another filesystem from the folder
+        // being synced — an external drive, a network share — so a failed
+        // rename here is ordinary rather than exceptional. Copy-then-remove
+        // keeps the promise either way: the bytes exist in the trash before
+        // the original stops existing.
+        std::fs::copy(path, &grave).and_then(|_| std::fs::remove_file(path))
+    });
+    if let Err(error) = moved {
+        let _ = std::fs::remove_file(&grave);
+        let _ = std::fs::remove_file(&ticket);
+        return Err(error);
+    }
+    Ok(grave)
+}
+
+/// `NSFileManager trashItemAtURL:` — the macOS trash, with Put Back intact.
+///
+/// A **safe** objc2 binding, so no `unsafe` block and nothing to add to the
+/// audited-FFI inventory: `trashItemAtURL:resultingItemURL:error:` returns its
+/// failure as an `NSError`, which is the whole reason to prefer it over
+/// reimplementing `.Trashes` by hand.
+///
+/// This is the one part of this module that cannot be exercised on Linux, which
+/// is why it is ten lines with no decisions in it — every decision that reaches
+/// it was already made and asserted in [`WriteScope::route`].
+#[cfg(target_os = "macos")]
+fn finder_trash(path: &Path) -> Result<PathBuf, String> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("{} is not valid UTF-8", path.display()))?;
+    // `is_directory: false` rather than a stat: `route` refuses every directory
+    // before this is reachable.
+    let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(text), false);
+    let mut landed = None;
+    NSFileManager::defaultManager()
+        .trashItemAtURL_resultingItemURL_error(&url, Some(&mut landed))
+        .map_err(|error| error.to_string())?;
+    Ok(landed.and_then(|url| url.path()).map_or_else(
+        || path.to_path_buf(),
+        |grave| PathBuf::from(grave.to_string()),
+    ))
+}
+
+/// Unreachable off macOS — [`os_trash`] only ever answers
+/// [`TrashTarget::Finder`] there. A refusal rather than a `panic!` or an
+/// `unlink`, because an enum arm that cannot happen is exactly the one that
+/// happens after somebody constructs the variant by hand in a test.
+#[cfg(not(target_os = "macos"))]
+fn finder_trash(path: &Path) -> Result<PathBuf, String> {
+    Err(format!(
+        "{} would go to the macOS Trash, and this is not macOS",
+        path.display()
+    ))
+}
+
+/// `name`, then `name.2`, `name.3`, … keeping the extension where a file
+/// manager expects to find it.
+///
+/// The suffix goes before the extension so the trashed copy of `report.md` is
+/// still a Markdown file to everything that reads it, which `report.md.2` would
+/// not be.
+fn numbered(name: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        return name.to_owned();
+    }
+    let ordinal = attempt + 1;
+    match name.rsplit_once('.') {
+        // A leading dot is the whole name of a hidden file, not an extension.
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem}.{ordinal}.{extension}"),
+        _ => format!("{name}.{ordinal}"),
+    }
+}
+
+/// The absolute path as the trash spec wants it: percent-encoded, `/` left
+/// alone.
+///
+/// Through `url`, already a dependency of this crate, rather than a hand-rolled
+/// encoder — the set of characters that must be escaped is exactly the one a
+/// hand-rolled encoder gets subtly wrong, and getting it wrong means a Restore
+/// that puts the file back in the wrong place.
+fn encoded_path(path: &Path) -> String {
+    url::Url::from_file_path(path).map_or_else(
+        |()| path.to_string_lossy().into_owned(),
+        |url| url.path().to_owned(),
+    )
+}
+
+/// `YYYY-MM-DDThh:mm:ss` local, which is what a `.trashinfo` `DeletionDate` is.
+fn deletion_date(local_now_ms: i64) -> String {
+    let (year, month, day, hour, minute, second) =
+        crate::platform::civil_from_unix_ms(local_now_ms);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
 }
 
 /// Whether `name` is already taken in `directory`, matching case-insensitively.
@@ -829,5 +1434,506 @@ mod tests {
                 subpath: "escape".to_owned()
             })
         );
+    }
+
+    // ─── AD-102: the second writer (Story 46.14) ─────────────────────────
+
+    /// Stands in for the shell's `notes_vault::Vault`.
+    ///
+    /// A distinct type rather than `()`, so these tests instantiate the same
+    /// generic the shell does and a route that dropped the vault on the floor
+    /// would not typecheck here either.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeVault(&'static str);
+
+    /// A profile root with a vault at `10-notes`, a neighbour whose name
+    /// extends it, and a file at the top that no vault holds — the owner's
+    /// `AGENTS.md`.
+    fn profile() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("10-notes/daily")).expect("vault");
+        std::fs::create_dir_all(root.path().join("10-notes-archive")).expect("neighbour");
+        std::fs::create_dir_all(root.path().join("photos")).expect("photos");
+        std::fs::write(root.path().join("AGENTS.md"), b"before").expect("agents");
+        std::fs::write(root.path().join("10-notes/Report.md"), b"note").expect("note");
+        std::fs::write(root.path().join("10-notes/daily/Mon.md"), b"note").expect("nested");
+        std::fs::write(root.path().join("10-notes-archive/old.md"), b"old").expect("old");
+        std::fs::write(root.path().join("photos/a.png"), b"png").expect("png");
+        root
+    }
+
+    fn unmanaged(route: WriteRoute<FakeVault>) -> UnmanagedPath {
+        match route {
+            WriteRoute::Unmanaged(target) => target,
+            WriteRoute::Vault { path, .. } => {
+                panic!(
+                    "expected the plain writer, got the vault at {}",
+                    path.as_str()
+                )
+            }
+        }
+    }
+
+    /// **The separation, stated as a test.** A file inside the vault routes to
+    /// the vault writer carrying the vault, and never to the plain one.
+    ///
+    /// This is the mutation target for AD-102: make `route` fall through to
+    /// `WriteRoute::Unmanaged` for an in-vault path and this fails, because a
+    /// vault file written by the plain writer is an edit the reconciler never
+    /// hears about and the commit cadence never carries.
+    #[test]
+    fn a_vault_file_is_never_routed_to_the_plain_writer() {
+        let root = profile();
+        let scope = scope();
+        for (subpath, expected) in [
+            ("10-notes/Report.md", "Report.md"),
+            ("10-notes/daily/Mon.md", "daily/Mon.md"),
+        ] {
+            match scope
+                .route(Some(FakeVault("live")), root.path(), subpath)
+                .expect(subpath)
+            {
+                WriteRoute::Vault { vault, path } => {
+                    assert_eq!(vault, FakeVault("live"), "{subpath}");
+                    assert_eq!(path.as_str(), expected, "{subpath}");
+                }
+                WriteRoute::Unmanaged(target) => panic!(
+                    "{subpath} is in the vault and was handed to the plain writer as {}",
+                    target.profile_relative()
+                ),
+            }
+        }
+    }
+
+    /// The neighbour whose name merely extends the vault's is NOT in the
+    /// vault, and the route says so the same way the refusal used to — one
+    /// component at a time, never a `starts_with` over the string.
+    #[test]
+    fn a_folder_whose_name_extends_the_vaults_routes_to_the_plain_writer() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(
+                    Some(FakeVault("live")),
+                    root.path(),
+                    "10-notes-archive/old.md",
+                )
+                .expect("routed"),
+        );
+        assert_eq!(target.profile_relative(), "10-notes-archive/old.md");
+    }
+
+    /// The owner's report: `AGENTS.md` sits in the profile, outside the vault,
+    /// and is now written by a plain atomic write.
+    ///
+    /// **Nothing is marked dirty, and the test proves it structurally rather
+    /// than by watching for a call.** A live vault was available and the route
+    /// did not hand it over; [`write_unmanaged`]'s signature has no slot a
+    /// vault fits in, so there is no `mark_dirty` or `touch` to reach.
+    #[test]
+    fn a_file_outside_the_vault_is_written_by_the_plain_writer_and_marks_nothing() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        assert_eq!(target.profile_relative(), "AGENTS.md");
+
+        assert_eq!(write_unmanaged(&target, "after\n"), Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("AGENTS.md")).expect("read"),
+            "after\n"
+        );
+
+        // Temp-and-rename, and the temp is gone: a `.keeper.<ulid>.tmp` left in
+        // a synced folder is tier-0-excluded litter the owner still has to look
+        // at.
+        let litter = std::fs::read_dir(root.path())
+            .expect("listing")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".keeper."))
+            .count();
+        assert_eq!(litter, 0);
+    }
+
+    /// Exact bytes, no trailing-newline normalisation — a file the owner did
+    /// not change must not change.
+    #[test]
+    fn the_plain_writer_writes_the_exact_bytes_it_was_given() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        for content in ["no newline", "trailing\n\n\n", "\r\nwindows\r\n", ""] {
+            assert_eq!(write_unmanaged(&target, content), Ok(()));
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("AGENTS.md")).expect("read"),
+                content
+            );
+        }
+    }
+
+    /// **NFR-30 outside the vault: the bytes go to the OS trash and are still
+    /// there afterwards.** An `unlink` would pass "the file is gone" and fail
+    /// this.
+    #[test]
+    fn an_out_of_vault_delete_lands_in_the_os_trash_and_never_unlinks() {
+        let root = profile();
+        let home = tempfile::tempdir().expect("home");
+        let trash = TrashTarget::Freedesktop(home.path().join("Trash"));
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+
+        let grave = trash_unmanaged(&target, &trash, 1_775_000_000_000).expect("trashed");
+
+        assert!(
+            !root.path().join("AGENTS.md").exists(),
+            "still in the folder"
+        );
+        assert_eq!(grave, home.path().join("Trash/files/AGENTS.md"));
+        assert_eq!(std::fs::read(&grave).expect("the bytes"), b"before");
+
+        // The `.trashinfo` row is what makes it a trash entry rather than a
+        // file hidden in a directory: without it, Restore has nowhere to put
+        // the file back and most desktops will not list it at all.
+        let ticket = std::fs::read_to_string(home.path().join("Trash/info/AGENTS.md.trashinfo"))
+            .expect("trashinfo");
+        assert!(ticket.starts_with("[Trash Info]\n"), "{ticket}");
+        assert!(
+            ticket.contains(&format!(
+                "Path={}\n",
+                encoded_path(&root.path().canonicalize().expect("canon").join("AGENTS.md"))
+            )),
+            "{ticket}"
+        );
+        assert!(
+            ticket.contains("DeletionDate=2026-03-31T23:33:20\n"),
+            "{ticket}"
+        );
+    }
+
+    /// Two files with one name do not overwrite each other in the trash, and
+    /// the second keeps its extension where a file manager looks for it.
+    #[test]
+    fn a_second_file_of_the_same_name_gets_its_own_place_in_the_trash() {
+        let root = profile();
+        let home = tempfile::tempdir().expect("home");
+        let trash = TrashTarget::Freedesktop(home.path().join("Trash"));
+        let scope = scope();
+
+        let first = unmanaged(
+            scope
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        assert_eq!(
+            trash_unmanaged(&first, &trash, 1_775_000_000_000).expect("first"),
+            home.path().join("Trash/files/AGENTS.md")
+        );
+
+        std::fs::write(root.path().join("AGENTS.md"), b"the second one").expect("rewrite");
+        let second = unmanaged(
+            scope
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        let grave = trash_unmanaged(&second, &trash, 1_775_000_000_000).expect("second");
+
+        assert_eq!(grave, home.path().join("Trash/files/AGENTS.2.md"));
+        assert_eq!(std::fs::read(&grave).expect("bytes"), b"the second one");
+        // And the first one is untouched, which is the whole reason the info
+        // file is claimed with `create_new` before any byte moves.
+        assert_eq!(
+            std::fs::read(home.path().join("Trash/files/AGENTS.md")).expect("bytes"),
+            b"before"
+        );
+        assert!(home
+            .path()
+            .join("Trash/info/AGENTS.2.md.trashinfo")
+            .exists());
+    }
+
+    /// The suffix goes before the extension, and a dotfile has no extension to
+    /// go before.
+    #[test]
+    fn a_trash_name_keeps_its_extension_where_a_file_manager_looks_for_it() {
+        assert_eq!(numbered("report.md", 0), "report.md");
+        assert_eq!(numbered("report.md", 1), "report.2.md");
+        assert_eq!(numbered("report.md", 9), "report.10.md");
+        assert_eq!(numbered("Makefile", 1), "Makefile.2");
+        assert_eq!(numbered(".gitignore", 1), ".gitignore.2");
+        assert_eq!(numbered("a.tar.gz", 1), "a.tar.2.gz");
+    }
+
+    /// A path with a space in it is percent-encoded, because a `Path=` line a
+    /// desktop cannot parse is a Restore that puts the file somewhere else.
+    #[test]
+    fn a_trashinfo_path_is_percent_encoded() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join("my notes")).expect("dir");
+        std::fs::write(root.path().join("my notes/a b.md"), b"x").expect("file");
+        let home = tempfile::tempdir().expect("home");
+        let target = unmanaged(
+            WriteScope::new("Vault", None)
+                .route(None::<FakeVault>, root.path(), "my notes/a b.md")
+                .expect("routed"),
+        );
+        trash_unmanaged(
+            &target,
+            &TrashTarget::Freedesktop(home.path().join("Trash")),
+            1_775_000_000_000,
+        )
+        .expect("trashed");
+        let ticket = std::fs::read_to_string(home.path().join("Trash/info/a b.md.trashinfo"))
+            .expect("trashinfo");
+        assert!(ticket.contains("/my%20notes/a%20b.md\n"), "{ticket}");
+    }
+
+    /// A profile holding no vault at all can still be edited and deleted —
+    /// this is the second half of the owner's report, and the reason `route`
+    /// treats `NoVault` as "no vault holds it" rather than as a refusal.
+    #[test]
+    fn a_profile_with_no_vault_routes_everything_to_the_plain_writer() {
+        let root = profile();
+        let none = WriteScope::new("Field", None);
+        for subpath in ["AGENTS.md", "10-notes/Report.md", "photos/a.png"] {
+            let target = unmanaged(
+                none.route(None::<FakeVault>, root.path(), subpath)
+                    .expect(subpath),
+            );
+            assert_eq!(target.profile_relative(), subpath);
+        }
+        // Creating is still vault-only, and its sentence no longer sends the
+        // owner to their file manager for something keeper now does.
+        let refusal = none.create("", "x.md").expect_err("no vault");
+        assert!(
+            refusal
+                .to_string()
+                .contains("will not create a new file in it"),
+            "{refusal}"
+        );
+    }
+
+    /// **A directory is refused at every location** — spec-45-3's rule, which
+    /// AD-102 does not widen. The OS trash does not make one confirmation over
+    /// a hundred thousand files into a confirmation.
+    #[test]
+    fn a_directory_is_refused_inside_and_outside_the_vault() {
+        let root = profile();
+        let scope = scope();
+        for subpath in ["photos", "10-notes/daily", "10-notes-archive"] {
+            let refusal = scope
+                .route(Some(FakeVault("live")), root.path(), subpath)
+                .expect_err(subpath);
+            assert_eq!(
+                refusal,
+                WriteRefusal::IsDirectory {
+                    name: last_segment(subpath).to_owned()
+                },
+                "{subpath}"
+            );
+        }
+        // The vault directory itself is reported as the vault, not as "a
+        // folder": the next step differs.
+        assert_eq!(
+            scope
+                .route(Some(FakeVault("live")), root.path(), "10-notes")
+                .expect_err("vault root"),
+            WriteRefusal::VaultRoot {
+                subfolder: "10-notes".to_owned()
+            }
+        );
+        // And a profile with no vault still refuses the folder, because the
+        // rule is about folders and not about vaults.
+        assert_eq!(
+            WriteScope::new("Field", None)
+                .route(None::<FakeVault>, root.path(), "photos")
+                .expect_err("folder"),
+            WriteRefusal::IsDirectory {
+                name: "photos".to_owned()
+            }
+        );
+    }
+
+    /// **A path outside every sync profile is refused, and that is the line
+    /// this story draws.** keeper addresses a file as (profile id, subpath);
+    /// there is no id for a file in no profile, and a symlink is not a way to
+    /// borrow one.
+    #[test]
+    fn a_path_outside_the_profile_is_refused_by_both_writers() {
+        let root = profile();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), b"x").expect("write");
+        let scope = scope();
+
+        for subpath in ["../etc/passwd", "/etc/passwd", "10-notes/../../etc"] {
+            assert_eq!(
+                scope
+                    .route(Some(FakeVault("live")), root.path(), subpath)
+                    .expect_err(subpath),
+                WriteRefusal::Escapes {
+                    subpath: subpath.to_owned()
+                },
+                "{subpath}"
+            );
+            // Identically with no vault: without the explicit lexical check in
+            // `route`, `vault_relative` would answer `NoVault` here and the
+            // fall-through would route a traversal to the plain writer.
+            assert_eq!(
+                WriteScope::new("Field", None)
+                    .route(None::<FakeVault>, root.path(), subpath)
+                    .expect_err(subpath),
+                WriteRefusal::Escapes {
+                    subpath: subpath.to_owned()
+                },
+                "{subpath}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("escape"))
+                .expect("symlink");
+            assert_eq!(
+                scope
+                    .route(Some(FakeVault("live")), root.path(), "escape")
+                    .expect_err("symlink"),
+                WriteRefusal::Escapes {
+                    subpath: "escape".to_owned()
+                }
+            );
+        }
+    }
+
+    /// Neither writer creates a file. A stale editor whose file was deleted
+    /// elsewhere must not put it back, and a delete of something already gone
+    /// must not delete something else.
+    #[test]
+    fn neither_writer_creates_a_file_that_is_not_there() {
+        let root = profile();
+        for scope in [scope(), WriteScope::new("Field", None)] {
+            assert_eq!(
+                scope
+                    .route(None::<FakeVault>, root.path(), "gone.md")
+                    .expect_err("missing"),
+                WriteRefusal::Missing {
+                    subpath: "gone.md".to_owned()
+                }
+            );
+        }
+    }
+
+    /// A scope that says "in the vault" while the caller holds no vault is the
+    /// two answers `vault_and_scope` exists to keep identical having come
+    /// apart. Reported, never assumed away — assuming it away writes a note
+    /// through the unmanaged path.
+    #[test]
+    fn an_in_vault_path_with_no_vault_in_hand_is_refused_rather_than_downgraded() {
+        let root = profile();
+        let refusal = scope()
+            .route(None::<FakeVault>, root.path(), "10-notes/Report.md")
+            .expect_err("no live vault");
+        assert_eq!(
+            refusal,
+            WriteRefusal::VaultUnreachable {
+                profile_name: "Vault".to_owned()
+            }
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("cannot reach Vault's notes vault"),
+            "{refusal}"
+        );
+    }
+
+    /// The trash is resolved, never guessed — and a machine that cannot offer
+    /// one gets a refusal rather than an `unlink`.
+    #[test]
+    fn this_machine_resolves_a_trash_of_the_right_shape() {
+        let finder_country = cfg!(target_os = "macos");
+        match os_trash().expect("a trash") {
+            TrashTarget::Finder => assert!(finder_country, "Finder is macOS's trash and only its"),
+            TrashTarget::Freedesktop(root) => {
+                assert!(!finder_country, "macOS must not get a freedesktop trash");
+                assert!(root.is_absolute(), "{}", root.display());
+                assert!(root.ends_with("Trash"), "{}", root.display());
+            }
+        }
+    }
+
+    /// The refusal a machine with no trash gets says what is missing and does
+    /// not offer to erase anything.
+    #[test]
+    fn a_machine_with_no_trash_refuses_rather_than_erasing() {
+        let refusal = WriteRefusal::NoSystemTrash {
+            reason: "neither XDG_DATA_HOME nor HOME is set".to_owned(),
+        };
+        assert!(
+            refusal.to_string().contains("get it back from"),
+            "{refusal}"
+        );
+    }
+
+    /// **The listing's flag and the command's answer are the same question
+    /// asked twice.** [`WriteScope::owner`] is lexical and [`WriteScope::route`]
+    /// resolves; a row that disagreed with the command it launches is a row
+    /// offering the wrong writer.
+    #[test]
+    fn the_listings_verdict_and_the_commands_route_never_disagree() {
+        let root = profile();
+        for scope in [scope(), WriteScope::new("Field", None)] {
+            for (subpath, is_dir) in [
+                ("AGENTS.md", false),
+                ("10-notes/Report.md", false),
+                ("10-notes/daily/Mon.md", false),
+                ("10-notes-archive/old.md", false),
+                ("photos/a.png", false),
+                ("photos", true),
+                ("10-notes", true),
+                ("10-notes/daily", true),
+            ] {
+                let lexical = scope.owner(subpath, is_dir);
+                let routed = scope
+                    .route(Some(FakeVault("live")), root.path(), subpath)
+                    .map(|route| match route {
+                        WriteRoute::Vault { .. } => WriteOwner::Vault,
+                        WriteRoute::Unmanaged(_) => WriteOwner::Unmanaged,
+                    });
+                assert_eq!(lexical, routed, "{subpath}");
+            }
+        }
+    }
+
+    /// The standing sentence a reader sees before the first keystroke.
+    ///
+    /// It names what is absent — history, index, conflict copy — and must NOT
+    /// claim the file will not sync: for a file in a synced profile the folder
+    /// engine carries it exactly as it carries an edit made in Finder, and a
+    /// caveat that overstates is a caveat people learn to ignore.
+    #[test]
+    fn the_caveat_names_what_is_missing_without_overstating_it() {
+        let with_vault = scope().unmanaged_caveat("AGENTS.md");
+        assert!(with_vault.contains("AGENTS.md is not one of keeper's notes"));
+        assert!(with_vault.contains("outside Vault's notes vault (10-notes)"));
+
+        let without = WriteScope::new("Field", None).unmanaged_caveat("clip.txt");
+        assert!(without.contains("Field holds no notes vault"), "{without}");
+
+        for caveat in [&with_vault, &without] {
+            for absent in ["no note history", "no search index", "no conflict copy"] {
+                assert!(caveat.contains(absent), "{caveat}");
+            }
+            assert!(caveat.contains("this computer's trash"), "{caveat}");
+            // The overstatement this sentence exists to avoid.
+            assert!(!caveat.contains("will not sync"), "{caveat}");
+            assert!(!caveat.contains("does not sync"), "{caveat}");
+        }
     }
 }

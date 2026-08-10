@@ -323,6 +323,7 @@ import { notesCreate, notesDelete, notesDeletePlan } from "@/lib/ipc/client";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
+import { resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { type ListGeometry, withListGeometry } from "@/test/layout";
 
@@ -367,6 +368,10 @@ beforeEach(() => {
   resetNotesVaultsStoreForTest();
   resetNotesListStoreForTest();
   resetNotesFiltersStoreForTest();
+  // Story 46.12: the pane hosts the panel strip, so a test can leave a SECOND
+  // panel behind and the next one starts with two documents on screen. It was
+  // safe to omit while the pane could only ever retarget the one note panel.
+  resetPanelsStoreForTest();
   primaryViewStore.getState().setView("notes");
 });
 
@@ -374,6 +379,7 @@ afterEach(() => {
   resetNotesVaultsStoreForTest();
   resetNotesListStoreForTest();
   resetNotesFiltersStoreForTest();
+  resetPanelsStoreForTest();
   primaryViewStore.getState().setView("inbox");
 });
 
@@ -425,8 +431,86 @@ describe("NotesPane filters", () => {
   });
 });
 
+/**
+ * Story 46.12: the notes list gets the Files tree's gesture pair, and not a
+ * contract of its own.
+ *
+ * Single click replaces what the active panel shows; double click opens beside
+ * it. There was no twin here before, because the model refused a second note
+ * panel — so this block is the whole of the surface half of "several notes at
+ * once", and the mocked editor is enough to read it: one `note-editor` per
+ * panel, each told which note it is.
+ */
+describe("NotesPane opening several notes", () => {
+  it("replaces the active panel on a single click", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Garden");
+
+    fireEvent.click(screen.getByRole("button", { name: /Note, Pricing/ }));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("note-editor")).toHaveLength(1);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Note, Garden/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "a3");
+    });
+    // Still one panel. That is the whole difference between the two gestures.
+    expect(screen.getAllByTestId("note-editor")).toHaveLength(1);
+  });
+
+  it("opens a second note beside the first on a double click", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Garden");
+
+    // A double click is preceded by a real single click, so every gesture below
+    // is clicked and then double-clicked — which is what a mouse delivers, and
+    // what the store's `replaced` bookkeeping exists to undo.
+    //
+    // The first note is opened with the pair too, and that is not ceremony: a
+    // single click into the panel a fresh keeper starts with records "this
+    // displaced nothing", and a run of previews keeps the first such record. So
+    // a single-clicked first note is still a preview, and opening a second note
+    // beside a preview of nothing correctly fills the frame instead of leaving
+    // an empty one. Double-clicking pins it, which is the gesture that says
+    // "keep this".
+    const pricing = screen.getByRole("button", { name: /Note, Pricing/ });
+    fireEvent.click(pricing);
+    fireEvent.doubleClick(pricing);
+    await waitFor(() => {
+      expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "a1");
+    });
+
+    const garden = screen.getByRole("button", { name: /Note, Garden/ });
+    fireEvent.click(garden);
+    fireEvent.doubleClick(garden);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("note-editor")).toHaveLength(2);
+    });
+    // The note that was showing came back rather than being replaced by a
+    // second copy of the one that was just opened.
+    expect(
+      screen.getAllByTestId("note-editor").map((node) => node.getAttribute("data-note-id")),
+    ).toEqual(["a1", "a3"]);
+  });
+});
+
 describe("NotesPane vault switching", () => {
-  it("does not clear the open note when the vault changes", async () => {
+  /**
+   * Story 46.12 sharpened this. It used to assert that switching vaults BLANKED
+   * the editor and switching back restored it — the note was remembered but not
+   * shown, because a single editor slot had to be told which note and this pane
+   * would only name one from the active vault.
+   *
+   * The pane hosts the panel strip now, and the panel holds the note. A vault
+   * switch changes what the LIST shows, exactly as a filter does; it is not an
+   * instruction to put away a document the reader deliberately opened. Nothing
+   * about the note has changed — the vault is still configured, the file is
+   * still there — so hiding it would be this surface answering a question the
+   * user did not ask.
+   */
+  it("keeps the open note on screen when the vault changes, and lists the other vault", async () => {
     renderPane();
     await waitForRows("Pricing");
 
@@ -440,15 +524,23 @@ describe("NotesPane vault switching", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /Note, Roadmap/ })).toBeInTheDocument();
     });
-    // The other vault is listed and the note is not on screen — but it was not
-    // closed, which is what the switch back proves.
-    expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "");
+    // The other vault is listed, and the panel still holds the note it held.
+    expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "a1");
+    expect(screen.getByTestId("note-editor")).toHaveAttribute("data-vault-id", "vault-a");
+    // And the row is no longer marked open, because it is not in this list.
+    expect(screen.getByRole("button", { name: /Note, Roadmap/ })).not.toHaveAttribute(
+      "aria-current",
+    );
 
     const backMenu = await openVaultMenu();
     fireEvent.click(within(backMenu).getByRole("menuitem", { name: /Mind/ }));
     await waitFor(() => {
-      expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "a1");
+      expect(screen.getByRole("button", { name: /Note, Pricing/ })).toHaveAttribute(
+        "aria-current",
+        "true",
+      );
     });
+    expect(screen.getByTestId("note-editor")).toHaveAttribute("data-note-id", "a1");
   });
 });
 

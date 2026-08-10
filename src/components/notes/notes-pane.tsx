@@ -43,8 +43,8 @@
  */
 import { FilePlus } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { PanelStrip } from "@/components/layout/panel-strip";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
-import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
@@ -98,6 +98,17 @@ export const NOTES_COUNT_SLOT = "notes-count";
  * language that cannot produce it.
  */
 export const NOTES_NOTICE_SLOT = "notes-create-notice";
+
+/**
+ * What an empty panel says on the Notes surface (Story 46.12).
+ *
+ * `PanelStrip`'s own default names the gesture that fills a panel in Files —
+ * "Click a file to open it" — and beside a list of notes that is an instruction
+ * to do something this surface does not offer. The sentence is the first thing
+ * a fresh keeper shows on this tab, so it is the one place where naming the
+ * wrong noun is most expensive.
+ */
+export const NOTES_PANEL_EMPTY_SENTENCE = "Nothing is open here yet. Click a note to open it.";
 
 export function NotesPane() {
   const vaults = useNotesVaultsStore((s) => s.vaults);
@@ -223,15 +234,31 @@ export function NotesPane() {
   /**
    * A row's own click: the active panel now shows this note (Story 45.1).
    *
-   * There is no double-click twin here. A second note panel is refused by the
-   * model — the note document mirror is a module singleton, so two mounted
-   * editors would write each other's buffer — and this pane renders exactly the
-   * one note panel the model allows.
+   * Single click replaces, double click opens beside — AD-90's gesture pair,
+   * the same one the Files tree uses, and deliberately not a second contract of
+   * this pane's own. Before Story 46.12 there was no twin here at all, because
+   * the model refused a second note panel; the store handles the interleaving
+   * (a double click is always preceded by a real single click, and `openPanel`
+   * puts back what that click displaced).
    */
   const openRow = useCallback(
     (row: NoteRowVm) => {
       if (activeVaultId !== null) {
         panelsStore.getState().setActiveTarget({
+          kind: "note",
+          vaultId: activeVaultId,
+          noteId: row.id,
+        });
+      }
+    },
+    [activeVaultId],
+  );
+
+  /** Double click: open this note BESIDE what is already open (Story 46.12). */
+  const openRowBeside = useCallback(
+    (row: NoteRowVm) => {
+      if (activeVaultId !== null) {
+        panelsStore.getState().openPanel({
           kind: "note",
           vaultId: activeVaultId,
           noteId: row.id,
@@ -446,6 +473,7 @@ export function NotesPane() {
             total={total}
             selectedId={openNoteId}
             onSelect={openRow}
+            onSelectBeside={openRowBeside}
             onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
             onVerb={runVerb}
             onGrow={() => notesListStore.getState().growWindow()}
@@ -453,22 +481,25 @@ export function NotesPane() {
         )}
       </div>
 
-      {/* Pane 3 — the editor. It owns everything about the open document; this
-          view only tells it which note, and `null` means "nothing on screen"
-          rather than "close and forget". */}
-      <div className="flex h-full min-h-0 flex-1 flex-col bg-background">
-        {activeVaultId !== null && (
-          <NoteEditor
-            vaultId={activeVaultId}
-            noteId={openNoteId}
-            onOpenNote={(noteId) =>
-              panelsStore
-                .getState()
-                .setActiveTarget({ kind: "note", vaultId: activeVaultId, noteId })
-            }
-          />
-        )}
-      </div>
+      {/* Pane 3 — the panels (Story 46.12).
+
+          It used to be one `NoteEditor` and a note id, which is the shape that
+          could hold exactly one note. It is the same strip the Files surface
+          hosts, because "N targets side by side" is a solved problem in this
+          codebase and a second strip would be a second answer to it — with its
+          own gesture contract, its own focus rule and its own cookie, all of
+          which would drift.
+
+          The panel list is global and singular, and that is the point rather
+          than a compromise: a note opened here is still open when you go to
+          Files, and the file its `Show in Files` opened is still open when you
+          come back. Switching surfaces changes the browser beside the panels,
+          never the panels — and a vault switch is the same act one level down,
+          so a note panel is NOT hidden when its vault stops being the active
+          one. Before this story it was, because a single editor slot had to be
+          told which note; now the panel holds the note and the rail filters the
+          list. `NotePanelBody` says so out loud if the vault is actually gone. */}
+      <PanelStrip emptySentence={NOTES_PANEL_EMPTY_SENTENCE} />
 
       {/* The list's `Delete` key, confirmed. The same dialog and the same
           command the editor's actions menu and the sidebar's space rows use:

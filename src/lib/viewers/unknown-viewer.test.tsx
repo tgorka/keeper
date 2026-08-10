@@ -45,6 +45,7 @@ function unknownFile(overrides: Partial<ViewerFile> = {}): ViewerFile {
     absolutePath: ABSOLUTE,
     sizeLabel: "1.2 MB",
     openWith: null,
+    writeCaveat: null,
     ...overrides,
   };
 }

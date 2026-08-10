@@ -180,6 +180,7 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           fileName={file.name}
           entry={entry}
           state={state}
+          writeCaveat={file.writeCaveat}
           csv={csv}
           preview={preview}
         />

@@ -29,9 +29,15 @@
  *
  * `document.cookie`, following {@link "@/lib/column-widths"} and for the same
  * reason: `localStorage` is refused across this codebase, and a panel list is a
- * lens the viewer arranged rather than a fact Rust has any use for. Only the
- * targets travel — an id is regenerated on load, and {@link Panel.replaced} is
- * deliberately transient.
+ * lens the viewer arranged rather than a fact Rust has any use for. What travels
+ * is what the viewer arranged and nothing derived: the targets, which one had
+ * focus, and — since Story 46.13 — which of them are folded. An id is
+ * regenerated on load, and {@link Panel.replaced} is deliberately transient
+ * because it is the state of a gesture rather than of an arrangement.
+ *
+ * The cookie is versioned, and {@link PANELS_VERSION} carries the one ruling in
+ * this module that could not be derived: what a cookie written before folding
+ * existed restores as.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -57,25 +63,25 @@ export const PANELS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 export const PANELS_COOKIE_BUDGET = 3500;
 
 /**
- * How many `note` panels may exist at once, and why it is one.
+ * # A note is an ordinary target (Story 46.12)
  *
- * The note document mirror ({@link "@/lib/stores/notes-editor"}) is a module
- * singleton holding one buffer, one base and one `notes_open` subscription
- * (AD-58). Two mounted `NoteEditor`s would therefore write each other's text:
- * the second to mount would take the store, and the first would show the
- * second's document under the first's title. That is a data-loss bug, not a
- * cosmetic one.
+ * Until 46.12 this module exported `NOTE_PANEL_LIMIT = 1` and `openPanel`
+ * retargeted the one note panel instead of appending a twin. It was not
+ * tidiness. The note document mirror ({@link "@/lib/stores/notes-editor"}) was
+ * a module singleton holding one buffer, one base and one `notes_open`
+ * subscription (AD-58), so two mounted `NoteEditor`s would have written each
+ * other's text: the second to mount took the store, and the first showed the
+ * second's document under the first's title while its autosave wrote the
+ * second's body into the first's file. Data loss, not a cosmetic bug — and the
+ * model refused it rather than a surface declining to draw it, so no surface
+ * could reintroduce it by mounting a second editor of its own.
  *
- * So the model refuses the second note panel rather than the surface refusing to
- * render it: {@link PanelsState.openPanel} retargets the note panel that exists
- * instead of appending a twin. Lifting this is a real piece of work — the mirror
- * has to become per-document — and Story 45.15 (several capture windows, each
- * holding its own note) needs the same lift, so it is one job and not two.
- *
- * Everything else is unlimited: a file panel beside a note panel beside another
- * file panel is the arrangement this epic exists to make possible.
+ * The owner asked for several notes at once and 46.12 did the lift the constant
+ * was waiting on: the mirror is keyed by note, reference counted, one channel
+ * per note however many views. There is nothing left for a limit to protect, so
+ * the limit is gone rather than raised — a note panel is now exactly as
+ * unremarkable as a file panel, and `openPanel` has one fewer branch.
  */
-export const NOTE_PANEL_LIMIT = 1;
 
 /** One panel. */
 export interface Panel {
@@ -104,6 +110,33 @@ export interface Panel {
    * a row and pinning the third still puts the original document back.
    */
   readonly replaced: { readonly was: PanelTargetVm | null } | null;
+  /**
+   * Whether this panel is folded away: its header only, no body, and no share
+   * of the strip's width (Story 46.13, FR-217).
+   *
+   * A display state, and the first one this model has held — every other field
+   * says what the panel IS rather than how much of it is drawn. It is here
+   * rather than in `PanelStrip`'s component state for the reason 46.3 moved the
+   * Files tree's expansion out of `useState`: the lifetime of a lens the reader
+   * arranged is not the lifetime of the component that happens to render it,
+   * and `AppShell` unmounts the strip's host whenever the primary view changes.
+   *
+   * Folding is not closing, and the difference is what makes it worth having.
+   * A close is destructive — the target is gone and the last panel refuses to
+   * do it at all — where a fold keeps the panel, its place in the order and its
+   * target, and gives its width to its neighbours. So the fold is allowed on
+   * every panel including the only one: the control that undoes it is sitting
+   * in the strip where the panel was, which is exactly what closing the last
+   * panel could not offer.
+   *
+   * **A panel that is given something to show unfolds.** That rule lives in
+   * {@link PanelsState.setActiveTarget} and {@link PanelsState.openPanel}
+   * rather than here, and it is the whole reason this field is safe: without
+   * it, clicking a file in the tree would load it into a panel the reader
+   * cannot see, which is the defect shape this epic exists to remove — keeper
+   * does the thing and then fails to show you that it did.
+   */
+  readonly folded: boolean;
 }
 
 export interface PanelsState {
@@ -114,19 +147,25 @@ export interface PanelsState {
   /**
    * Single click: the active panel now shows this. The list does not grow —
    * that is the whole difference between the two gestures.
+   *
+   * Unfolds the panel it lands in: a target loaded into a folded panel is a
+   * read that the reader was given no sight of, and this store is where that
+   * rule belongs, not the four surfaces that call this.
    */
   setActiveTarget: (target: PanelTargetVm) => void;
   /**
    * Double click: open this beside what is already open, and focus it.
    *
-   * Three cases it deliberately does not append in, each because appending
+   * Two cases it deliberately does not append in, each because appending
    * would be a worse answer than the alternative:
    * - a panel already holds this exact target: focus it. Two identical panels
-   *   are two views that can never differ.
-   * - the target is a note and a note panel exists: retarget that one
-   *   ({@link NOTE_PANEL_LIMIT}).
+   *   are two views that can never differ. Folded, it unfolds — the gesture
+   *   asked to see the thing.
    * - the active panel is showing nothing: fill it rather than leave an empty
    *   frame sitting beside the thing that was just opened.
+   *
+   * A note target used to be a third case, retargeted rather than appended.
+   * Story 46.12 removed it: see the note above {@link Panel}.
    */
   openPanel: (target: PanelTargetVm) => void;
   /** Focus a panel without changing what anything shows. */
@@ -142,6 +181,16 @@ export interface PanelsState {
    */
   closePanel: (id: string) => void;
   /**
+   * Fold this panel away, or unfold it.
+   *
+   * Allowed on every panel including the only one — see {@link Panel.folded}
+   * for why that is not the same decision as {@link closePanel}'s refusal. Does
+   * not change focus: folding the panel you are looking at leaves it the active
+   * one, so the next single click in a browser still lands where the reader
+   * pointed it, and lands visibly, because it unfolds on the way in.
+   */
+  toggleFold: (id: string) => void;
+  /**
    * Stop showing this target anywhere.
    *
    * For the one case that is not "the target no longer resolves": the thing was
@@ -156,8 +205,8 @@ export interface PanelsState {
 /** Monotonic, so no two panels in one session share an id even after a close. */
 let nextPanelId = 1;
 
-function makePanel(target: PanelTargetVm | null): Panel {
-  const panel: Panel = { id: `panel-${nextPanelId}`, target, replaced: null };
+function makePanel(target: PanelTargetVm | null, folded = false): Panel {
+  const panel: Panel = { id: `panel-${nextPanelId}`, target, replaced: null, folded };
   nextPanelId += 1;
   return panel;
 }
@@ -226,26 +275,64 @@ function initialPanels(): { panels: Panel[]; activeId: string } {
 }
 
 /**
- * The persisted form: the targets, and which one had focus.
+ * The version this build writes. Bumped by Story 46.13, which added `f`.
  *
- * Versioned because the vocabulary is generated from Rust and will gain a
- * variant; an unrecognised version is discarded rather than guessed at, which
- * costs the user their arrangement once and never shows them a panel pointing at
- * something that no longer means what it meant.
+ * The reader accepts every version in {@link PANELS_READABLE_VERSIONS} and
+ * nothing else. Deliberately two numbers rather than one, and the reasoning is
+ * the interesting part of this module:
+ *
+ * **A `v: 1` cookie restores as a `v: 2` arrangement with nothing folded, and
+ * that is a ruling rather than an accident of the discard rule.** The rule this
+ * file shipped with — discard an unrecognised version — exists because the
+ * target vocabulary is generated from Rust and a future version might make an
+ * old `t` entry *mean* something different, and a panel pointing at something
+ * that no longer means what it meant is worse than no panel. That reason does
+ * not apply here. `v: 2` adds one field whose absence has an exact, safe reading
+ * — nothing is folded, which is both the state `v: 1` shipped with and the state
+ * every panel is reachable from — and applying the discard rule to it would cost
+ * every existing reader their whole workspace on the first launch after an
+ * update, in exchange for nothing. So `v: 1` is read, `f` is read only from
+ * `v: 2`, and a target that was folded in a `v: 1` world is a target that never
+ * was.
+ *
+ * The price is paid in the other direction and it is the price the discard rule
+ * always charged: a build older than 46.13 reading a `v: 2` cookie discards it
+ * and comes up clean. A downgrade costs one arrangement, once, which is why the
+ * writer bumps rather than smuggling `f` into a `v: 1` payload — a cookie that
+ * lies about its version to stay compatible is a cookie no future reader can
+ * trust.
+ */
+const PANELS_VERSION = 2;
+
+/** Every version this build can read. See {@link PANELS_VERSION}. */
+const PANELS_READABLE_VERSIONS: readonly number[] = [1, PANELS_VERSION];
+
+/**
+ * The persisted form: the targets, which one had focus, and which are folded.
+ *
+ * `f` holds INDICES into `t` rather than a parallel array of booleans, because
+ * folding is the rare state: an arrangement with nothing folded writes `[]`,
+ * where a boolean per panel would spend a fifth of the byte budget saying
+ * "false" four times. It is also why the reader can treat an absent `f` as
+ * "nothing folded" without inventing a length.
  */
 interface PersistedPanels {
-  readonly v: 1;
+  readonly v: number;
   readonly a: number;
   readonly t: readonly PanelTargetVm[];
+  readonly f?: readonly number[];
 }
 
-/** Structural guard over whatever the cookie actually held. */
+/** Structural guard over whatever the cookie actually held. `f` is optional and
+ *  is validated where it is used: a `v: 1` cookie has none, and a `v: 2` cookie
+ *  someone hand-edited may have anything at all in it. */
 function isPersisted(value: unknown): value is PersistedPanels {
   return (
     typeof value === "object" &&
     value !== null &&
     "v" in value &&
-    value.v === 1 &&
+    typeof value.v === "number" &&
+    PANELS_READABLE_VERSIONS.includes(value.v) &&
     "a" in value &&
     typeof value.a === "number" &&
     "t" in value &&
@@ -287,12 +374,18 @@ function isTarget(value: unknown): value is PanelTargetVm {
  * which the store renders as one empty panel. A malformed cookie is a lost
  * arrangement, never a thrown error at boot — this runs before anything is on
  * screen, so a throw here is a white window.
+ *
+ * `folded` comes back as indices into the RETURNED targets, not into the
+ * cookie's own array. The two differ whenever an entry was dropped for being
+ * unknown or unrestorable, and a fold index that still pointed into the original
+ * array would silently fold the panel next door.
  */
 export function readPanelTargets(cookie: string): {
   targets: PanelTargetVm[];
   activeIndex: number;
+  folded: number[];
 } {
-  const empty = { targets: [] as PanelTargetVm[], activeIndex: 0 };
+  const empty = { targets: [] as PanelTargetVm[], activeIndex: 0, folded: [] as number[] };
   for (const part of cookie.split(";")) {
     const trimmed = part.trim();
     if (!trimmed.startsWith(`${PANELS_COOKIE}=`)) {
@@ -308,12 +401,32 @@ export function readPanelTargets(cookie: string): {
     if (!isPersisted(decoded)) {
       return empty;
     }
-    const targets = decoded.t.filter(isTarget).filter(isRestorableTarget);
+    // A `v: 1` cookie predates folding, so it has no `f` and every panel comes
+    // back unfolded — see {@link PANELS_VERSION}. Anything in an `f` that is not
+    // a whole number is dropped rather than coerced: the cookie is a string a
+    // person can edit, and `NaN` in a Set would fold nothing while looking like
+    // it folded something.
+    const wanted = new Set<number>(
+      decoded.v === PANELS_VERSION && Array.isArray(decoded.f)
+        ? decoded.f.filter((at): at is number => Number.isInteger(at))
+        : [],
+    );
+    const targets: PanelTargetVm[] = [];
+    const folded: number[] = [];
+    for (const [at, entry] of decoded.t.entries()) {
+      if (!isTarget(entry) || !isRestorableTarget(entry)) {
+        continue;
+      }
+      if (wanted.has(at)) {
+        folded.push(targets.length);
+      }
+      targets.push(entry);
+    }
     if (targets.length === 0) {
       return empty;
     }
     const activeIndex = Math.min(Math.max(Math.trunc(decoded.a), 0), targets.length - 1);
-    return { targets, activeIndex };
+    return { targets, activeIndex, folded };
   }
   return empty;
 }
@@ -324,13 +437,22 @@ export function readPanelTargets(cookie: string): {
  * Takes the panels rather than the store so it is assertable without one, the
  * shape {@link "@/lib/column-widths"} established. A panel showing nothing is
  * not persisted — restoring an empty frame is indistinguishable from restoring
- * nothing, and the store makes an empty frame for free.
+ * nothing, and the store makes an empty frame for free. A panel showing nothing
+ * takes its fold with it for the same reason: there is no such thing as a folded
+ * empty frame worth a byte.
+ *
+ * The fold indices are counted over the panels that survive that filter, and
+ * they are re-counted after every trim, because both operations renumber the
+ * list. This is the one place in the module where an off-by-one would fold the
+ * wrong document rather than throw.
  */
 export function panelsCookie(panels: readonly Panel[], activeId: string): string {
-  const targets = panels
-    .map((panel) => panel.target)
-    .filter((target): target is PanelTargetVm => target !== null);
-  if (targets.length === 0) {
+  // Narrowed rather than merely filtered: `encode` below then has nothing to
+  // decide about an empty panel, which is what keeps the fold indices honest.
+  // A guard inside the encoder would be unreachable code that no test could pin,
+  // and unreachable code is where an off-by-one waits.
+  const holding = panels.filter((panel): panel is HoldingPanel => panel.target !== null);
+  if (holding.length === 0) {
     // Forget the arrangement rather than store an empty one, so a user who
     // closed everything comes back to a clean start instead of to a cookie that
     // decodes to nothing.
@@ -339,23 +461,43 @@ export function panelsCookie(panels: readonly Panel[], activeId: string): string
   const activeTarget = panels.find((panel) => panel.id === activeId)?.target ?? null;
   const activeIndex = Math.max(
     0,
-    targets.findIndex((target) => sameTarget(target, activeTarget)),
+    holding.findIndex((panel) => sameTarget(panel.target, activeTarget)),
   );
-  let kept = targets;
-  let value = encodeURIComponent(JSON.stringify({ v: 1, a: activeIndex, t: kept }));
+  let kept = holding;
+  let value = encode(kept, activeIndex);
   while (value.length > PANELS_COOKIE_BUDGET && kept.length > 1) {
     // Drop from the right — the panels furthest from the one in focus — and say
     // so. A browser silently discarding the whole cookie would lose all of them.
     kept = kept.slice(0, -1);
-    const clamped = Math.min(activeIndex, kept.length - 1);
-    value = encodeURIComponent(JSON.stringify({ v: 1, a: clamped, t: kept }));
+    value = encode(kept, Math.min(activeIndex, kept.length - 1));
   }
-  if (kept.length < targets.length) {
+  if (kept.length < holding.length) {
     console.info(
-      `keeper: remembering ${kept.length} of ${targets.length} panels — the rest do not fit in a cookie.`,
+      `keeper: remembering ${kept.length} of ${holding.length} panels — the rest do not fit in a cookie.`,
     );
   }
   return `${PANELS_COOKIE}=${value}; path=/; max-age=${PANELS_COOKIE_MAX_AGE}; samesite=lax`;
+}
+
+/** A panel that is actually showing something — the only kind that is worth a
+ *  cookie, and therefore the only kind the encoder counts. */
+type HoldingPanel = Panel & { readonly target: PanelTargetVm };
+
+/** The encoded cookie value for exactly these panels, in this order, with this
+ *  one in focus. Shared by the first attempt and every trim so the two cannot
+ *  come to disagree about what `f` counts. */
+function encode(kept: readonly HoldingPanel[], activeIndex: number): string {
+  const folded: number[] = [];
+  const targets: PanelTargetVm[] = [];
+  for (const panel of kept) {
+    if (panel.folded) {
+      folded.push(targets.length);
+    }
+    targets.push(panel.target);
+  }
+  return encodeURIComponent(
+    JSON.stringify({ v: PANELS_VERSION, a: activeIndex, t: targets, f: folded }),
+  );
 }
 
 /** Write the arrangement out. Best effort: a document that refuses cookies
@@ -387,14 +529,16 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
       // second click of a double click into a lost preview.
       return;
     }
-    const next = withPanel(panels, activeId, (panel) => ({
-      ...panel,
-      target,
-      // The first preview in a run records what the panel really held; the ones
-      // after it keep pointing at that, so pinning the fourth preview still puts
-      // the original document back.
-      replaced: panel.replaced ?? { was: panel.target },
-    }));
+    const next = withPanel(panels, activeId, (panel) =>
+      shown({
+        ...panel,
+        target,
+        // The first preview in a run records what the panel really held; the
+        // ones after it keep pointing at that, so pinning the fourth preview
+        // still puts the original document back.
+        replaced: panel.replaced ?? { was: panel.target },
+      }),
+    );
     set({ panels: next });
     persist(next, activeId);
   },
@@ -404,27 +548,14 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
 
     const existing = panels.find((panel) => sameTarget(panel.target, target));
     if (existing !== undefined && existing.id !== activeId) {
-      set({ activeId: existing.id, panels: withPanel(panels, existing.id, clearPreview) });
-      persist(panels, existing.id);
+      // Persisting the UPDATED list, not the one that came in: `replaced` is
+      // transient and never reached the cookie, but a fold does, so a focus that
+      // unfolds has to be written down or the next launch brings the fold back
+      // over a panel the reader deliberately opened.
+      const next = withPanel(panels, existing.id, (panel) => shown(clearPreview(panel)));
+      set({ activeId: existing.id, panels: next });
+      persist(next, existing.id);
       return;
-    }
-
-    if (target.kind === "note") {
-      const notePanels = panels.filter((panel) => panel.target?.kind === "note");
-      if (notePanels.length >= NOTE_PANEL_LIMIT) {
-        const host = notePanels[0];
-        if (host === undefined) {
-          return;
-        }
-        const next = withPanel(panels, host.id, (panel) => ({
-          ...panel,
-          target,
-          replaced: null,
-        }));
-        set({ panels: next, activeId: host.id });
-        persist(next, host.id);
-        return;
-      }
     }
 
     const active = panels.find((panel) => panel.id === activeId);
@@ -435,7 +566,7 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
         // Both mean the same thing: this target belongs HERE, and appending
         // would open it beside a frame that is either its own duplicate or
         // empty. Pinning it is the whole of the answer.
-        const pinned = withPanel(panels, activeId, clearPreview);
+        const pinned = withPanel(panels, activeId, (panel) => shown(clearPreview(panel)));
         set({ panels: pinned });
         persist(pinned, activeId);
         return;
@@ -453,11 +584,13 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
     }
 
     if (active !== undefined && active.target === null) {
-      const next = withPanel(panels, activeId, (panel) => ({
-        ...panel,
-        target,
-        replaced: null,
-      }));
+      const next = withPanel(panels, activeId, (panel) =>
+        shown({
+          ...panel,
+          target,
+          replaced: null,
+        }),
+      );
       set({ panels: next });
       persist(next, activeId);
       return;
@@ -474,6 +607,20 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
     const next = withPanel(panels, id, clearPreview);
     set({ activeId: id, panels: next });
     persist(next, id);
+  },
+
+  toggleFold: (id) => {
+    const { panels, activeId } = get();
+    if (!panels.some((panel) => panel.id === id)) {
+      return;
+    }
+    const next = withPanel(panels, id, (panel) => ({ ...panel, folded: !panel.folded }));
+    // Focus is untouched, deliberately: folding the panel you are looking at
+    // does not hand the next single click to a panel you were not pointing at.
+    // It comes back unfolded, because a target arriving in a folded panel is
+    // {@link shown}'s business.
+    set({ panels: next });
+    persist(next, activeId);
   },
 
   closePanel: (id) => {
@@ -523,6 +670,20 @@ function clearPreview(panel: Panel): Panel {
   return panel.replaced === null ? panel : { ...panel, replaced: null };
 }
 
+/**
+ * A panel that has just been given something to show.
+ *
+ * Every site that sets a panel's target goes through this, which is the only
+ * reason {@link Panel.folded} is safe to have: a load into a folded panel is a
+ * read the reader was shown nothing of, and the epic this field arrived in
+ * exists because keeper kept doing the thing and failing to show it. Folding is
+ * therefore a state a *gesture on the panel itself* puts it in, and any other
+ * gesture takes it out.
+ */
+function shown(panel: Panel): Panel {
+  return panel.folded ? { ...panel, folded: false } : panel;
+}
+
 /** Insert a new panel immediately after the active one and focus it. */
 function appendBeside(
   set: (partial: Partial<PanelsState>) => void,
@@ -557,11 +718,16 @@ export function hydratePanels(cookie: string): void {
     return;
   }
   hydrated = true;
-  const { targets, activeIndex } = readPanelTargets(cookie);
+  const { targets, activeIndex, folded } = readPanelTargets(cookie);
   if (targets.length === 0) {
     return;
   }
-  const panels = targets.map((target) => makePanel(target));
+  // A fold survives a restart, which is the point of putting it in the model
+  // rather than in the strip's component state. The focused panel is NOT
+  // unfolded on the way in: the reader folded it deliberately and focus is not a
+  // request to see anything (see `shown`).
+  const wasFolded = new Set(folded);
+  const panels = targets.map((target, at) => makePanel(target, wasFolded.has(at)));
   const active = panels[activeIndex] ?? panels[0];
   if (active === undefined) {
     return;

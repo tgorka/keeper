@@ -4,6 +4,13 @@ import { AppShell } from "@/components/layout/app-shell";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { detailStore } from "@/lib/stores/detail-ui";
 import {
+  FILES_TREE_COOKIE,
+  filesTreeCookie,
+  filesTreeStore,
+  nodeKey,
+  resetFilesTreeForTest,
+} from "@/lib/stores/files-tree";
+import {
   PANELS_COOKIE,
   panelsCookie,
   panelsStore,
@@ -71,6 +78,11 @@ afterEach(() => {
   resetSidebarFoldForTest();
   // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
   document.cookie = `${SIDEBAR_FOLD_COOKIE}=; path=/; max-age=0`;
+  // And so is the Files tree's expansion (Story 46.3), for the same reason and
+  // with the same two halves.
+  resetFilesTreeForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${FILES_TREE_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("AppShell", () => {
@@ -371,6 +383,7 @@ describe("AppShell", () => {
           id: "p",
           target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
           replaced: null,
+          folded: false,
         },
       ],
       "p",
@@ -390,6 +403,34 @@ describe("AppShell", () => {
     // correct behaviour and not what this test is about.
     expect(await screen.findByLabelText("report.pdf")).toBeInTheDocument();
     expect(panelsStore.getState().panels).toHaveLength(1);
+  });
+
+  /**
+   * The Files tree comes back open (Story 46.3), asserted at the SHELL for the
+   * third time and the third reason it is the only place that can fail.
+   *
+   * `FilesPane`'s own suite calls `hydrateFilesTree` itself, so it would pass
+   * unchanged on a build where `AppShell` never called it — which is precisely
+   * DW-172 again, and precisely the shape of the defect this story fixed: a
+   * restore that lives in a component the shell unmounts.
+   */
+  it("restores the folders the Files tree last had open", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = filesTreeCookie(new Set([nodeKey("p1", ""), nodeKey("p1", "docs")]));
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The store, not the tree on screen: with no Tauri host the profile list
+    // never arrives, so there is nothing to render the expansion against. What
+    // this asserts is the one thing only the shell can get wrong.
+    expect(filesTreeStore.getState().expanded).toEqual(
+      new Set([nodeKey("p1", ""), nodeKey("p1", "docs")]),
+    );
   });
 
   /**

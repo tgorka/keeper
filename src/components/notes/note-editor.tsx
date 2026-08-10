@@ -27,11 +27,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ExportNoteItem } from "@/components/export/export-note-item";
-import { Button } from "@/components/ui/button";
+import { PaneHeader } from "@/components/layout/pane-header";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
-import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
+import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { AttachFileButton } from "./attach-file-button";
@@ -42,8 +43,13 @@ import type { FormatAction } from "./editor/format-commands";
 import { FormatToolbar } from "./format-toolbar";
 import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
-import { NoteHistoryPanel } from "./note-history-panel";
-import { PropertiesPanel, readFrontmatter, recordingSessionId } from "./properties-panel";
+import { NOTE_HISTORY_LABEL, NoteHistoryPanel } from "./note-history-panel";
+import {
+  PROPERTIES_LABEL,
+  PropertiesPanel,
+  readFrontmatter,
+  recordingSessionId,
+} from "./properties-panel";
 import { TemplateUpdateOffer } from "./template-update-offer";
 
 /**
@@ -53,6 +59,17 @@ import { TemplateUpdateOffer } from "./template-update-offer";
  * other.
  */
 export const LINK_NOTICE_SLOT = "note-link-notice";
+
+/**
+ * Story 46.4's three-group header row, and where it lives now.
+ *
+ * The row was extracted into {@link "@/components/layout/pane-header"} by Story
+ * 46.13 on AD-104's rule of two, once the Files pane's Save caption became a
+ * second real consumer of the same variable-width status element. The slot ids
+ * a test scopes itself to are that module's `PANE_HEADER_*` constants; this
+ * editor no longer owns names for them, because two headers answering to two
+ * sets of names is exactly how a shared structure comes apart.
+ */
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
@@ -163,6 +180,52 @@ export function saveStateWord(state: SaveState): string {
   return `Saved · ${at}`;
 }
 
+/**
+ * An arbitrary instant, and the same instant twelve hours later. In every
+ * timezone one of the two falls before noon and the other after, so a locale
+ * that appends a day period contributes BOTH of its renderings to the
+ * measurement below, rather than whichever one this machine happened to save
+ * in.
+ */
+const SIZER_INSTANT_MS = Date.UTC(2001, 0, 1, 0, 0);
+const SIZER_HALF_DAY_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Every string the caption slot has to be wide enough to hold (Story 46.4).
+ *
+ * The slot is one fixed box, because a caption that changes width moves every
+ * control to its right — that is the jump this story removes. The box cannot be
+ * a width we guessed: `toLocaleTimeString` is a different length in every
+ * locale, and a box sized for `Saved · 14:32` in `en-GB` is a truncation bug on
+ * a machine neither we nor the owner has. So the browser measures it instead.
+ * These strings are rendered invisibly inside the slot in every save state, and
+ * the widest of them — in the font, the locale and the clock this machine
+ * actually has — is what the slot is wide.
+ *
+ * Produced by `saveStateWord` rather than written out, so a change to the
+ * wording cannot change what the caption shows without also changing what the
+ * slot reserves. The digits need no entry of their own: the slot is
+ * `tabular-nums`, so every digit is exactly as wide as every other one.
+ *
+ * The error string is deliberately absent, and it is the one caption that
+ * cannot be reserved for — it is Rust's message verbatim, so it is unbounded.
+ * It is ellipsised inside the slot instead, with the whole of it left in the
+ * DOM for a screen reader and on the element's `title` for a pointer.
+ */
+export const SAVE_CAPTION_SIZERS: readonly string[] = [
+  saveStateWord({ saving: true, dirty: false, savedAtMs: null, error: null }),
+  saveStateWord({ saving: false, dirty: false, savedAtMs: SIZER_INSTANT_MS, error: null }),
+  saveStateWord({
+    saving: false,
+    dirty: false,
+    savedAtMs: SIZER_INSTANT_MS + SIZER_HALF_DAY_MS,
+    error: null,
+  }),
+  // A locale that renders both instants identically would otherwise hand React
+  // two children under one key. Deduplicated here rather than at the render
+  // site so the exported list is the list that gets rendered.
+].filter((word, at, all) => all.indexOf(word) === at);
+
 export interface NoteEditorProps {
   vaultId: string;
   noteId: string | null;
@@ -172,14 +235,18 @@ export interface NoteEditorProps {
 
 export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
-  const base = useNotesEditorStore((state) => state.base);
-  const rev = useNotesEditorStore((state) => state.rev);
-  const frontmatter = useNotesEditorStore((state) => state.frontmatter);
-  const path = useNotesEditorStore((state) => state.path);
-  const subscriptionId = useNotesEditorStore((state) => state.subscriptionId);
-  const savedAtMs = useNotesEditorStore((state) => state.savedAtMs);
-  const conflictCopy = useNotesEditorStore((state) => state.conflictCopy);
-  const error = useNotesEditorStore((state) => state.error);
+  // Story 46.12: every one of these names the note THIS editor is showing.
+  // Two editors are two subscriptions to two documents in one store, and the
+  // only thing that keeps them apart is that the key is a prop rather than a
+  // module-scoped "current".
+  const base = useNoteDocument(vaultId, noteId, (document) => document.base);
+  const rev = useNoteDocument(vaultId, noteId, (document) => document.rev);
+  const frontmatter = useNoteDocument(vaultId, noteId, (document) => document.frontmatter);
+  const path = useNoteDocument(vaultId, noteId, (document) => document.path);
+  const subscriptionId = useNoteDocument(vaultId, noteId, (document) => document.subscriptionId);
+  const savedAtMs = useNoteDocument(vaultId, noteId, (document) => document.savedAtMs);
+  const conflictCopy = useNoteDocument(vaultId, noteId, (document) => document.conflictCopy);
+  const error = useNoteDocument(vaultId, noteId, (document) => document.error);
   // Story 45.18: the vault this note is in, for the one question the header
   // asks that the note itself cannot answer — where its file sits inside the
   // sync profile. Hydrated here rather than assumed, because this editor is
@@ -302,25 +369,24 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
       }
 
       let cachedTags: string[] | null = null;
+      // Story 46.12: read once, by note. Three reads of a module singleton
+      // would have been three reads of whatever note the store was pointing at
+      // when this chunk happened to land — which, with a second editor beside
+      // this one, is not necessarily this one.
+      const opened = readNoteDocument(vaultId, noteId);
       const editorView = new view.EditorView({
         parent: host,
         state: state.EditorState.create({
           // Read imperatively: whatever the channel has delivered by the time
           // the chunk lands. Later revisions arrive through the reconcile
           // effect below rather than by rebuilding the editor.
-          doc: notesEditorStore.getState().text,
+          doc: opened.text,
           // A template's `{{cursor}}`, clamped to the document. Absent a hint the
           // caret goes to the end, which is where a person continuing a note wants
           // it — and offset 0 is now simply the first character of the body, since
           // the frontmatter block is not in this buffer at all.
           selection: {
-            anchor: Math.max(
-              0,
-              Math.min(
-                notesEditorStore.getState().cursor ?? notesEditorStore.getState().text.length,
-                notesEditorStore.getState().text.length,
-              ),
-            ),
+            anchor: Math.max(0, Math.min(opened.cursor ?? opened.text.length, opened.text.length)),
           },
           extensions: [
             view.EditorView.lineWrapping,
@@ -475,7 +541,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
       // The document almost never exists yet when this chunk lands — the channel
       // delivers `Reset` after the lazy import resolves — so the caret hint is
       // consumed here, once the runtime is able to act on it.
-      const opening = notesEditorStore.getState().cursor;
+      const opening = readNoteDocument(vaultId, noteId).cursor;
       if (opening !== null) {
         runtimeRef.current.placeCaret(opening);
       }
@@ -508,17 +574,27 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
     }
   }, [mode]);
 
-  const adoptPanelWrite = useCallback((text: string, write: NoteWriteVm) => {
-    // A property edit goes straight to disk, and it writes the buffer with it, so
-    // its result is the editor's new base and the block Rust hands back — `updated`
-    // stamped — is the block the panel now renders.
-    markSaved(text, write);
-  }, []);
+  const adoptPanelWrite = useCallback(
+    (text: string, write: NoteWriteVm) => {
+      if (noteId === null) {
+        return;
+      }
+      // A property edit goes straight to disk, and it writes the buffer with it, so
+      // its result is the editor's new base and the block Rust hands back — `updated`
+      // stamped — is the block the panel now renders.
+      markSaved(vaultId, noteId, text, write);
+    },
+    [vaultId, noteId],
+  );
 
   const leaveMode = useCallback(() => {
     setConflictTheirs(null);
     setMode("edit");
   }, []);
+
+  // Story 46.4: read once, because the header both shows this word and hangs it
+  // on a `title` — an error is the one caption that can outgrow its slot.
+  const saveWord = saveStateWord({ saving: body.saving, dirty: body.dirty, savedAtMs, error });
 
   if (noteId === null) {
     return (
@@ -530,71 +606,114 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex items-center gap-2 border-b px-3 py-1.5">
-        <h1 className="min-w-0 flex-1 truncate font-medium text-sm">{deriveTitle(body.text)}</h1>
-        <span className="truncate font-mono text-[11px] text-muted-foreground">{path ?? ""}</span>
-        <span className="text-[11px] text-muted-foreground">
-          {saveStateWord({ saving: body.saving, dirty: body.dirty, savedAtMs, error })}
-        </span>
-        {/* Story 45.13. Beside Attachments rather than inside it: the panel
-            lists what THIS note already has, and this brings in what it does
-            not — including for a note that has no `files:` key and therefore
-            no panel worth opening. */}
-        <AttachFileButton
-          vaultId={vaultId}
-          body={body.text}
-          onInsert={insertAtCursor}
-          onOutcome={setAttachOutcome}
-        />
-        <Button size="sm" variant="ghost" onClick={toggleAttachments}>
-          {ATTACHMENTS_LABEL}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={toggleProperties}>
-          Properties
-        </Button>
-        <Button size="sm" variant="ghost" onClick={openHistory}>
-          History
-        </Button>
-        {/* Story 45.18: from a note, its file (FR-196, UX-DR79).
+      {/* Story 46.4's three groups, Story 46.13's component (AD-104).
 
-            Absent rather than disabled when there is nothing to show — the
-            vault list has not arrived, the note has no path yet, or the
-            profile carries no vault subfolder. `filePathForNote` answers "may
-            this be offered" and `showNoteInFiles` answers "do it"; the same
-            pure rule twice, deliberately, because a control whose presence and
-            whose effect came from different rules is a control that can be
-            present and fail.
+          The row is `flex` and does not wrap, so every sibling in it competes
+          for the same width: a caption that grows by the width of a clock takes
+          that width from whatever else is shrinkable, and in the capture window
+          (`keeper_core::capture::CAPTURE_DEFAULT_SIZE`, 560px, and since story
+          46.15 resizable by the user down to `CAPTURE_MIN_SIZE`) there is
+          nothing spare to take it from. That is why a save moved the toolbar,
+          and it is also why the toolbar moved once more per note open, when
+          `Show in Files` resolved and appeared. The structural answer — and the
+          group may change width — is documented on `PaneHeader` itself, so the
+          note editor and the Files pane's Save bar cannot come to disagree about
+          it. The capture window mounts this exact header, so one structure
+          answers both hosts. */}
+      <PaneHeader
+        className="border-b px-3 py-1.5"
+        // Group 1 — identity. The only member of the row allowed to give
+        // ground; see the component's doc for why that is a property of the
+        // wrapper and not of these two elements.
+        identity={
+          <>
+            <h1 className="min-w-0 flex-1 truncate font-medium text-sm">
+              {deriveTitle(body.text)}
+            </h1>
+            <span className="truncate font-mono text-[11px] text-muted-foreground">
+              {path ?? ""}
+            </span>
+          </>
+        }
+        // Group 2 — status. One box for all three captions, reserved from the
+        // strings this machine's own clock produces, so a save cannot widen it.
+        status={{ sizers: SAVE_CAPTION_SIZERS, caption: saveWord }}
+        // Group 3 — actions. Two controls, which is AD-104's rule of two for
+        // this row: the one verb that starts outside keeper, and the menu that
+        // holds the note's own verbs. What belongs in here is Story 46.5's
+        // decision, not the wrapper's.
+        actions={
+          <>
+            {/* Story 45.13. Beside Attachments rather than inside it: the panel
+                lists what THIS note already has, and this brings in what it does
+                not — including for a note that has no `files:` key and therefore
+                no panel worth opening. */}
+            <AttachFileButton
+              vaultId={vaultId}
+              body={body.text}
+              onInsert={insertAtCursor}
+              onOutcome={setAttachOutcome}
+            />
+            {/* Story 46.5. Everything in this menu opens a panel, a surface or a
+                dialog; none of them is a per-keystroke verb, and six controls
+                plus two spans do not fit the 560px quick-capture window. So they
+                are menu items, the header keeps the one control that starts
+                outside keeper (`AttachFileButton`, above), and the menu becomes
+                the note's one obvious home for its own verbs — which is what
+                makes Delete findable, structurally rather than by relabelling it.
 
-            Beside History rather than inside 45.17's menu: this is a
-            navigation, and burying a one-press navigation in a dropdown is a
-            regression. */}
-        {vault !== null && path !== null && filePathForNote(vault, path) !== null && (
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              showNoteInFiles(vault, path);
-            }}
-          >
-            {SHOW_IN_FILES_LABEL}
-          </Button>
-        )}
-        {/* Story 45.17. Last in the header, and a menu rather than a sixth
-            button: everything to its left changes what this pane SHOWS, and
-            these act on the note itself. `noteId` is non-null here — the
-            no-note branch returned above — so this control never renders
-            without something to act on. */}
-        {/* Story 45.21 takes 45.17's child slot: Export is a note-level act, it
-            belongs above the destructive item, and putting it here rather than
-            on the panel frame means a note open in a panel has one Export and
-            not two — the panel's could not flush this buffer before Rust reads
-            the file. */}
-        <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
-          <ExportNoteItem vaultId={vaultId} noteId={noteId} />
-        </NoteActions>
-      </header>
+                This reverses 45.17's "everything to the left changes what this
+                pane SHOWS, and the menu acts on the note itself" and 45.18's
+                "burying a one-press navigation in a dropdown is a regression".
+                Both were right about the taxonomy and wrong about the budget:
+                the row does not wrap, this cluster is its last child, and the
+                cost of keeping them out here was paid by the item at the end.
+                Order is preserved — panel, panel, surface, navigation — then a
+                rule, then the note-level acts. */}
+            <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
+              <DropdownMenuItem onSelect={toggleAttachments}>{ATTACHMENTS_LABEL}</DropdownMenuItem>
+              <DropdownMenuItem onSelect={toggleProperties}>{PROPERTIES_LABEL}</DropdownMenuItem>
+              <DropdownMenuItem onSelect={openHistory}>{NOTE_HISTORY_LABEL}</DropdownMenuItem>
+              {/* Story 45.18: from a note, its file (FR-196, UX-DR79).
+
+                  Absent rather than disabled when there is nothing to show — the
+                  vault list has not arrived, the note has no path yet, or the
+                  profile carries no vault subfolder. `filePathForNote` answers
+                  "may this be offered" and `showNoteInFiles` answers "do it";
+                  the same pure rule twice, deliberately, because a control whose
+                  presence and whose effect came from different rules is a
+                  control that can be present and fail.
+
+                  Inside the menu since 46.5, which makes its absence harder to
+                  assert honestly: a menu item that is not there because the menu
+                  is shut looks exactly like one the predicate refused. The three
+                  tests in `note-file-links.test.tsx` that read this absence open
+                  the menu first, for that reason. */}
+              {vault !== null && path !== null && filePathForNote(vault, path) !== null && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    showNoteInFiles(vault, path);
+                  }}
+                >
+                  {SHOW_IN_FILES_LABEL}
+                </DropdownMenuItem>
+              )}
+              {/* Story 45.21: Export is a note-level act, and putting it here
+                  rather than on the panel frame means a note open in a panel has
+                  one Export and not two — the panel's could not flush this
+                  buffer before Rust reads the file. The rule above it separates
+                  what acts on the note from what only shows it; `NoteActions`
+                  draws the second rule, above Delete. */}
+              <DropdownMenuSeparator />
+              <ExportNoteItem vaultId={vaultId} noteId={noteId} />
+            </NoteActions>
+          </>
+        }
+      />
 
       <NoteDiffBar
+        vaultId={vaultId}
+        noteId={noteId}
         onShowChanges={openHistory}
         onResolve={() => {
           setConflictTheirs(body.pending?.text ?? null);
@@ -660,7 +779,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           it holds no state worth keeping, and its `files:` reading is a
           function of the props it is given each time. */}
       {showAttachments && mode === "edit" ? (
-        <AttachmentsPanel frontmatter={frontmatter} body={body.text} onInsert={insertAtCursor} />
+        <AttachmentsPanel
+          vaultId={vaultId}
+          frontmatter={frontmatter}
+          body={body.text}
+          onInsert={insertAtCursor}
+        />
       ) : null}
 
       {/* Directly over the text it formats, and unmounted outside edit mode:

@@ -40,7 +40,8 @@ vi.mock("@/lib/ipc/client", () => ({
   revealPath: vi.fn(async () => {}),
 }));
 
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import { NOTE_ACTIONS_TEXT } from "./note-actions";
 import { NoteEditor } from "./note-editor";
 
 // jsdom has no `Range.getClientRects`, and CodeMirror's measure pass calls it
@@ -83,7 +84,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null });
+  resetNotesEditorStoreForTest();
 });
 
 /**
@@ -95,11 +96,13 @@ afterEach(() => {
  */
 async function mounted(): Promise<EditorView> {
   render(<NoteEditor vaultId="v1" noteId="n1" />);
-  await screen.findByText("Properties");
+  // The header's own always-present control, as a "the editor mounted" barrier.
+  // It used to be the word "Properties"; Story 46.5 moved that into this menu.
+  await screen.findByText(NOTE_ACTIONS_TEXT);
   return await waitFor(() => {
     const node = document.querySelector<HTMLElement>(".cm-content");
     expect(node).not.toBeNull();
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     const view = EditorView.findFromDOM(node as HTMLElement);
     expect(view).not.toBeNull();
     return view as EditorView;
@@ -130,7 +133,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     // Read back through `onEdit` → the notes store: the buffer that would be
     // written to disk, not a CodeMirror internal.
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("alpha\n**beta**\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("alpha\n**beta**\n");
     });
   });
 
@@ -140,12 +143,12 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
     fireEvent.click(screen.getByRole("button", { name: "Bold" }));
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("alpha\n**beta**\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("alpha\n**beta**\n");
     });
     fireEvent.click(screen.getByRole("button", { name: "Bold" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(OPENED);
+      expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     });
   });
 
@@ -187,7 +190,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(screen.getByRole("button", { name: "Italic" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("alpha\n*beta*\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("alpha\n*beta*\n");
     });
     expect(selected(view)).toBe("beta");
     expect(view.hasFocus).toBe(true);
@@ -201,7 +204,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(screen.getByRole("button", { name: "Quote" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("> alpha\n> beta\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("> alpha\n> beta\n");
     });
   });
 
@@ -228,12 +231,12 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
         fireEvent.click(screen.getByRole("button", { name: button.name }));
         await waitFor(() => {
-          expect(notesEditorStore.getState().text).toBe(`alpha\n${button.wrapped}\n`);
+          expect(readNoteDocument("v1", "n1").text).toBe(`alpha\n${button.wrapped}\n`);
         });
 
         fireEvent.click(screen.getByRole("button", { name: button.name }));
         await waitFor(() => {
-          expect(notesEditorStore.getState().text).toBe(OPENED);
+          expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
         });
       });
     }
@@ -244,12 +247,12 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
       fireEvent.click(screen.getByRole("button", { name: "Task list" }));
       await waitFor(() => {
-        expect(notesEditorStore.getState().text).toBe("- [ ] alpha\n- [ ] beta\n");
+        expect(readNoteDocument("v1", "n1").text).toBe("- [ ] alpha\n- [ ] beta\n");
       });
 
       fireEvent.click(screen.getByRole("button", { name: "Task list" }));
       await waitFor(() => {
-        expect(notesEditorStore.getState().text).toBe(OPENED);
+        expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
       });
     });
 
@@ -259,18 +262,18 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
       fireEvent.click(screen.getByRole("button", { name: "Code block" }));
       await waitFor(() => {
-        expect(notesEditorStore.getState().text).toBe("alpha\n```\nbeta\n```\n");
+        expect(readNoteDocument("v1", "n1").text).toBe("alpha\n```\nbeta\n```\n");
       });
 
       fireEvent.click(screen.getByRole("button", { name: "Code block" }));
       await waitFor(() => {
-        expect(notesEditorStore.getState().text).toBe(OPENED);
+        expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
       });
 
       select(view, "beta");
       fireEvent.click(screen.getByRole("button", { name: "Inline code" }));
       await waitFor(() => {
-        expect(notesEditorStore.getState().text).toBe("alpha\n`beta`\n");
+        expect(readNoteDocument("v1", "n1").text).toBe("alpha\n`beta`\n");
       });
     });
   });
@@ -282,7 +285,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(screen.getByRole("button", { name: "Numbered list" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("1. alpha\n2. beta\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("1. alpha\n2. beta\n");
     });
   });
 
@@ -294,7 +297,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(await screen.findByRole("button", { name: "Heading 3" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("### alpha\nbeta\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("### alpha\nbeta\n");
     });
     // The panel closes on use: a menu that stays open over the text it just
     // changed is a menu covering the answer.
@@ -312,7 +315,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(screen.getByRole("button", { name: "Insert" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(
+      expect(readNoteDocument("v1", "n1").text).toBe(
         [
           "alpha",
           "beta",
@@ -337,7 +340,7 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     fireEvent.click(screen.getByRole("button", { name: "Insert" }));
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(
+      expect(readNoteDocument("v1", "n1").text).toBe(
         [
           "alpha",
           "beta",
@@ -361,13 +364,13 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     select(view, "beta");
     fireEvent.click(screen.getByRole("button", { name: "Strikethrough" }));
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe("alpha\n~~beta~~\n");
+      expect(readNoteDocument("v1", "n1").text).toBe("alpha\n~~beta~~\n");
     });
 
     undo(view);
 
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(OPENED);
+      expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     });
   });
 });

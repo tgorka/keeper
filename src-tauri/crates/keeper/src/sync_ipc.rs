@@ -13,15 +13,15 @@
 use std::sync::Arc;
 
 use keeper_core::vm::{
-    ExportReceiptVm, FilesDeletePlanVm, FilesDeleteReceiptVm, FilesDeleteRefusalVm,
-    FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm,
-    FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
+    ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
+    FilesDeleteRefusalVm, FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState,
+    FilesListingVm, FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
 };
 use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::export::{self, ExportRefusal};
-use keeper_sync::files_write::{self, WriteRefusal, WriteScope};
+use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SETTLE_MS,
@@ -1573,8 +1573,20 @@ fn files_listing_vm(
                 .into_iter()
                 .map(|entry| {
                     let sync = sync_mark(&entry.sync, engine_failure);
-                    let write =
-                        FilesWriteVm::from_verdict(&scope.file(&entry.relative_path, entry.is_dir));
+                    // AD-102: three answers, not two. `owner` is the lexical
+                    // half of the same classifier `sync_write_entry` routes
+                    // through, so the flag a row renders and the writer the
+                    // command picks cannot come apart — and it is lexical
+                    // precisely so a thousand rows do not cost a thousand
+                    // `canonicalize` calls to re-learn the `is_dir` the dirent
+                    // just supplied.
+                    let write = match scope.owner(&entry.relative_path, entry.is_dir) {
+                        Ok(files_write::WriteOwner::Vault) => FilesWriteVm::allowed(),
+                        Ok(files_write::WriteOwner::Unmanaged) => {
+                            FilesWriteVm::unmanaged(scope.unmanaged_caveat(&entry.name))
+                        }
+                        Err(refusal) => FilesWriteVm::refused(refusal.to_string()),
+                    };
                     FilesEntryVm::new(FilesEntryFacts {
                         name: entry.name,
                         relative_path: entry.relative_path,
@@ -2004,11 +2016,13 @@ fn write_refused(refusal: &WriteRefusal) -> IpcError {
     }
 }
 
-/// The profile, its live vault and its write scope, or the refusal that ends
-/// the call.
+/// The profile and its live vault, or the refusal that ends the call.
 ///
-/// Every write command starts this way, and factoring it means the four cannot
-/// come to disagree about which vault they are writing into.
+/// **The CREATE path's opener, and after Story 46.14 only that.** Creating is
+/// still vault-only (AD-102 widened editing and deleting, not creating), so
+/// this is the one command that may still decline a whole profile for holding
+/// no vault. Everything that changes an existing file starts at
+/// [`routable_profile`] instead.
 fn writable_profile(
     state: &tauri::State<'_, AppState>,
     id: &str,
@@ -2027,35 +2041,65 @@ fn writable_profile(
     Ok((profile, vault))
 }
 
-/// Save one file inside a synced folder's notes vault (Story 45.3, FR-175,
-/// AD-89, AD-65).
+/// The profile a command may change a file in, whether or not it holds a vault
+/// (Story 46.14, AD-102).
 ///
-/// **The one writer.** `write_vault_file` is the same temp-and-rename
-/// `write_note` uses, under the `.keeper.<ulid>.tmp` name that is already a
-/// tier-0 sync exclusion, so a `kill -9` between write and rename leaves no
-/// torn file in the vault. `mark_dirty` is the announcement `import_attachment`
-/// already makes: the commit cadence runs and the change is committed and
-/// synced.
+/// **The vault question no longer ends the call, and that is the whole
+/// shell-side change.** [`writable_profile`] refused a whole profile for
+/// holding no reachable vault before `WriteScope` was ever consulted, which is
+/// what made the owner's `AGENTS.md` unreachable: it is inside a sync profile,
+/// outside the vault. Editing and deleting now start here and let
+/// [`WriteScope::route`] decide the fork, in `keeper-sync`, where it is
+/// asserted on every machine.
 ///
-/// **`touch` is included here, where Story 44.16 deliberately left it out.**
-/// 44.16's target is an embedded `.csv`, which the notes walk never collects,
-/// so telling the reconciler about it would ask for an index entry that cannot
-/// exist. This surface can save a `.md` *inside the vault*, which is a note —
-/// so the index has to be told, and `apply_batch` skips anything that is not
-/// `.md` at no cost. Omitting it would leave a note edited from Files invisible
-/// to search until an unrelated event moved the reconciler.
+/// Deliberately does NOT return a vault. The vault a command writes through
+/// must be the same one its scope was built from, and the only way to make
+/// that structural is for both to come out of [`vault_and_scope`]'s single
+/// registry lookup — a second lookup here is exactly the "writable by config,
+/// refused by the registry" divergence that function exists to prevent.
+fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<SyncProfile, IpcError> {
+    let engine = engine_of(state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    Ok(find_profile(&profiles, id)?.clone())
+}
+
+/// Save one file inside a synced folder (Story 45.3, FR-175, AD-89, AD-65;
+/// Story 46.14, AD-102).
 ///
-/// **A path that is not on disk is refused rather than created.** Saving is not
-/// creating: `sync_create_entry` is, and it is the one with the collision rule.
-/// A stale editor whose file was deleted elsewhere must not put it back.
+/// **Two writers, and `WriteScope::route` picks.** Which one is not decided
+/// here — it is decided in `keeper-sync`, where it is asserted on Linux, and it
+/// arrives as a `WriteRoute` whose vault arm already carries the vault. This
+/// command's job is to spend the verdict, not to reach it.
+///
+/// *In the vault:* `write_vault_file` is the same temp-and-rename `write_note`
+/// uses, under the `.keeper.<ulid>.tmp` name that is already a tier-0 sync
+/// exclusion, so a `kill -9` between write and rename leaves no torn file.
+/// `mark_dirty` is the announcement `import_attachment` already makes: the
+/// commit cadence runs and the change is committed and synced. `touch` is
+/// included, where Story 44.16 deliberately left it out — 44.16's target is an
+/// embedded `.csv` the notes walk never collects, whereas this surface can save
+/// a `.md` *inside the vault*, which is a note, so the index has to be told.
+///
+/// *Outside every vault:* `write_unmanaged`, a plain atomic write with no
+/// `mark_dirty` and no `touch` — because there is no vault to mark and no index
+/// this file belongs in. Neither call is reachable from that arm: the route
+/// hands over no vault, and `write_unmanaged`'s signature has nowhere to put
+/// one. The surface said so before the first keystroke
+/// (`FilesWriteVm::caveat`); an edit that quietly does less than the vault path
+/// does would be strictly worse than the refusal it replaces.
+///
+/// **A path that is not on disk is refused rather than created**, by either
+/// writer. Saving is not creating: `sync_create_entry` is, it is still
+/// vault-only, and it is the one with the collision rule. A stale editor whose
+/// file was deleted elsewhere must not put it back.
 ///
 /// Content is written as exact bytes — no trailing-newline normalisation, no
 /// re-encoding — for the reason 44.16's parser records spans instead of
 /// re-serialising: a file the user did not change must not change.
 ///
-/// Rejects with: `unsupported`, `internal` (no such profile, no vault, a path
-/// outside the vault, a folder, a path that escapes, a path that is gone, a
-/// disk failure).
+/// Rejects with: `unsupported`, `internal` (no such profile, a folder, a path
+/// that escapes the profile root, a path that is gone, a vault that is
+/// configured but not yet live, a disk failure).
 #[tauri::command]
 pub async fn sync_write_entry(
     state: tauri::State<'_, AppState>,
@@ -2063,33 +2107,65 @@ pub async fn sync_write_entry(
     subpath: String,
     content: String,
 ) -> Result<(), IpcError> {
-    let (profile, vault) = writable_profile(&state, &id)?;
-    let (_, scope) = vault_and_scope(&profile);
-    let resolved = files_write::resolve_existing(&profile.local_path, &subpath)
-        .map_err(|refusal| write_refused(&refusal))?;
-    let rel = scope
-        .file(&subpath, resolved.is_dir())
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    let route = scope
+        .route(vault, &profile.local_path, &subpath)
         .map_err(|refusal| write_refused(&refusal))?;
 
-    // On the blocking pool for the same reason the listing is: a vault on a
+    // On the blocking pool for the same reason the listing is: a folder on a
     // pendrive or a network share can take hundreds of milliseconds to write,
     // and stalling the async runtime would freeze every other profile's poll
     // behind one save.
     let written = {
-        let vault = vault.clone();
-        let rel = rel.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::notes_vault::write_vault_file(&vault, &rel, &content)
+        let route = route.clone();
+        // `subpath` is not captured by the blocking closure — the route
+        // already holds every path either writer needs — so it is still here
+        // to name the file if the task itself panics.
+        tokio::task::spawn_blocking(move || match &route {
+            WriteRoute::Vault { vault, path } => {
+                crate::notes_vault::write_vault_file(vault, path.as_str(), &content)
+                    .map_err(WriteOutcome::Vault)
+            }
+            WriteRoute::Unmanaged(target) => {
+                files_write::write_unmanaged(target, &content).map_err(WriteOutcome::Plain)
+            }
         })
         .await
         .map_err(|err| open_failure(format!("could not save {subpath}: {err}")))?
     };
-    written.map_err(notes_write_error)?;
+    written.map_err(|outcome| match outcome {
+        WriteOutcome::Vault(error) => notes_write_error(error),
+        WriteOutcome::Plain(refusal) => write_refused(&refusal),
+    })?;
 
-    crate::notes_vault::touch(&vault.id, vec![rel.clone()]);
-    crate::notes_vault::mark_dirty(&vault.id);
-    tracing::info!(%rel, "files: wrote a vault file from the Files surface");
+    match route {
+        WriteRoute::Vault { vault, path } => {
+            crate::notes_vault::touch(&vault.id, vec![path.as_str().to_owned()]);
+            crate::notes_vault::mark_dirty(&vault.id);
+            tracing::info!(rel = %path.as_str(), "files: wrote a vault file from the Files surface");
+        }
+        // Logged at `info!` and not `debug!` for DW-162's reason, and worth a
+        // line of its own: "keeper wrote this and told nothing about it" is
+        // exactly what a person asks about later.
+        WriteRoute::Unmanaged(target) => tracing::info!(
+            rel = %target.profile_relative(),
+            "files: wrote a file no vault manages — no mark_dirty, no touch (AD-102)"
+        ),
+    }
     Ok(())
+}
+
+/// Which writer failed, so the sentence a person reads comes from the right
+/// vocabulary.
+///
+/// The two errors are genuinely different types — `NotesError` names a
+/// vault-relative path and `WriteRefusal` names the one the surface shows —
+/// and flattening them to a `String` inside the blocking task would throw away
+/// the `warn!` each of them already logs on the way out.
+enum WriteOutcome {
+    Vault(keeper_core::notes::NotesError),
+    Plain(WriteRefusal),
 }
 
 /// Word what deleting this selection would do, before it is done (Story 45.3,
@@ -2103,18 +2179,20 @@ pub async fn sync_write_entry(
 ///
 /// The sentences are composed by [`FilesDeletePlanVm::compose`], in
 /// `keeper-core`, which is pure and therefore asserted on every machine. This
-/// command's whole job is gathering the two facts it needs per path: may keeper
-/// delete it, and does it sync.
+/// command's whole job is gathering the facts it needs per path: may keeper
+/// delete it, does it sync, and — since Story 46.14 — which trash it is bound
+/// for. That third fact is per file rather than per call because one drag over
+/// a vault and the folder beside it selects both.
 ///
-/// Rejects with: `unsupported`, `internal` (no such profile, no vault).
+/// Rejects with: `unsupported`, `internal` (no such profile).
 #[tauri::command]
 pub async fn sync_delete_plan(
     state: tauri::State<'_, AppState>,
     id: String,
     subpaths: Vec<String>,
 ) -> Result<FilesDeletePlanVm, IpcError> {
-    let (profile, _vault) = writable_profile(&state, &id)?;
-    let (_, scope) = vault_and_scope(&profile);
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
     let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
     let engine = engine_of(&state)?;
     // Once for the whole selection, exactly as the listing asks once for a
@@ -2127,16 +2205,19 @@ pub async fn sync_delete_plan(
     let mut files = Vec::new();
     let mut refusals = Vec::new();
     for subpath in subpaths {
-        match deletable(&profile, &scope, &subpath) {
-            Ok(target) => {
-                let status = browse::status_of(
-                    &profile.local_path,
-                    &subpath,
-                    target.is_dir,
-                    &excludes,
-                    &pending,
-                );
-                files.push((subpath, sync_mark(&status, unavailable.as_deref()).status));
+        match scope.route(vault.clone(), &profile.local_path, &subpath) {
+            Ok(route) => {
+                // `false` and not a re-`stat`: `route` refuses every directory,
+                // so anything that got this far is a file. The old
+                // `DeleteTarget.is_dir` could only ever be `false` here too —
+                // it was a fact carried past the check that made it constant.
+                let status =
+                    browse::status_of(&profile.local_path, &subpath, false, &excludes, &pending);
+                files.push((
+                    subpath,
+                    sync_mark(&status, unavailable.as_deref()).status,
+                    destination_of(&route),
+                ));
             }
             Err(refusal) => refusals.push(FilesDeleteRefusalVm {
                 relative_path: subpath,
@@ -2147,61 +2228,106 @@ pub async fn sync_delete_plan(
     Ok(FilesDeletePlanVm::compose(&profile.name, files, refusals))
 }
 
-/// Move a selection of files into the vault's trash (Story 45.3, FR-175,
-/// AD-89, NFR-30).
+/// Where one routed path's bytes are about to go, for the confirmation's
+/// recovery sentence (Story 46.14, AD-102).
 ///
-/// **`trash_note` is the removal path the reconciler already understands, and
-/// finding that rather than inventing one is the story's instruction.** It
-/// renames the file into `<vault>/.keeper/trash/<ulid>/<rel>` — `.keeper` is a
-/// tier-0 sync exclusion, so git sees a deletion — then `touch`es the path so
-/// the index drops the note, and `mark_dirty`s the vault so the commit cadence
-/// carries the removal. Never an `unlink`: the bytes stay recoverable locally
-/// *and* from history, and the commit that deletes the file is preceded by one
-/// that still holds it.
+/// A projection of the route rather than a second reading of the scope: the
+/// dialog and the command have to name the same trash, and the only way to
+/// guarantee that is for both to read the same verdict.
+fn destination_of<V>(route: &WriteRoute<V>) -> FilesDeleteDestinationVm {
+    match route {
+        WriteRoute::Vault { .. } => FilesDeleteDestinationVm::VaultTrash,
+        WriteRoute::Unmanaged(_) => FilesDeleteDestinationVm::SystemTrash,
+    }
+}
+
+/// Move a selection of files into a trash — the vault's or the operating
+/// system's (Story 45.3, FR-175, AD-89, NFR-30; Story 46.14, AD-102).
+///
+/// **Never an `unlink`, whichever trash it is**, and that is the promise AD-102
+/// relocated rather than weakened.
+///
+/// *In the vault:* `trash_note` is the removal path the reconciler already
+/// understands. It renames the file into `<vault>/.keeper/trash/<ulid>/<rel>` —
+/// `.keeper` is a tier-0 sync exclusion, so git sees a deletion — then
+/// `touch`es the path so the index drops the note, and `mark_dirty`s the vault
+/// so the commit cadence carries the removal. The bytes stay recoverable
+/// locally *and* from history, and the commit that deletes the file is preceded
+/// by one that still holds it.
+///
+/// *Outside every vault:* `trash_unmanaged`, which is `NSFileManager
+/// trashItem` on macOS and the freedesktop.org home trash elsewhere. There is
+/// no vault trash to reach and no note history to record in, and the
+/// confirmation said exactly that before the click
+/// (`FilesDeletePlanVm::recovery`).
 ///
 /// **Every path is re-checked here, not trusted from the plan.** The plan is
 /// advice a person read; this is the authority. A path that became a folder, a
-/// path that left the vault, a path that was already deleted — each answers for
-/// itself, and the receipt reports the split rather than failing the batch.
-/// Failing the whole call would leave four files trashed and an error on screen
-/// saying nothing happened.
+/// path that moved into or out of the vault, a path that was already deleted —
+/// each answers for itself, and the receipt reports the split rather than
+/// failing the batch. Failing the whole call would leave four files trashed and
+/// an error on screen saying nothing happened.
 ///
-/// Rejects with: `unsupported`, `internal` (no such profile, no vault).
+/// Rejects with: `unsupported`, `internal` (no such profile).
 #[tauri::command]
 pub async fn sync_delete_entries(
     state: tauri::State<'_, AppState>,
     id: String,
     subpaths: Vec<String>,
 ) -> Result<FilesDeleteReceiptVm, IpcError> {
-    let (profile, vault) = writable_profile(&state, &id)?;
+    let profile = routable_profile(&state, &id)?;
 
-    let outcome = {
+    let (outcome, dirty) = {
         let profile = profile.clone();
-        let vault = vault.clone();
         tokio::task::spawn_blocking(move || {
-            let (_, scope) = vault_and_scope(&profile);
+            // One registry lookup for the vault AND the scope, so the vault a
+            // path is trashed into and the vault the scope measured it against
+            // cannot be two different vaults.
+            let (vault, scope) = vault_and_scope(&profile);
+            // Resolved once for the batch and never per file: `os_trash` reads
+            // the environment, and on a machine with no home directory it is
+            // the same refusal every time.
+            let trash = files_write::os_trash();
+            let stamp = files_write::local_now_ms();
             let mut deleted = Vec::new();
             let mut refusals = Vec::new();
+            let mut dirty: Option<String> = None;
             for subpath in subpaths {
-                let outcome = deletable(&profile, &scope, &subpath).and_then(|target| {
-                    crate::notes_vault::trash_note(&vault, &target.vault_relative).map_err(
-                        |error| WriteRefusal::DeleteFailed {
-                            // The path the SURFACE shows, not the vault-relative
-                            // one: the sentence lands beside the row the person
-                            // selected, and naming it differently there would
-                            // read as a different file.
-                            relative_path: subpath.clone(),
-                            reason: error.to_string(),
+                let outcome = scope
+                    .route(vault.clone(), &profile.local_path, &subpath)
+                    .and_then(|route| match route {
+                        WriteRoute::Vault { vault, path } => {
+                            crate::notes_vault::trash_note(&vault, path.as_str())
+                                .map(|grave| (grave, Some(vault.id.clone())))
+                                .map_err(|error| WriteRefusal::DeleteFailed {
+                                    // The path the SURFACE shows, not the
+                                    // vault-relative one: the sentence lands
+                                    // beside the row the person selected, and
+                                    // naming it differently there would read as
+                                    // a different file.
+                                    relative_path: subpath.clone(),
+                                    reason: error.to_string(),
+                                })
+                        }
+                        WriteRoute::Unmanaged(target) => match &trash {
+                            // No vault to mark: there is none to reach, and
+                            // marking one anyway would ask a reconciler to
+                            // reconcile a path it has never indexed.
+                            Ok(trash) => files_write::trash_unmanaged(&target, trash, stamp)
+                                .map(|grave| (grave, None)),
+                            // A machine with no trash keeps its file. The
+                            // alternative is the `unlink` NFR-30 forbids.
+                            Err(refusal) => Err(refusal.clone()),
                         },
-                    )
-                });
+                    });
                 match outcome {
-                    Ok(grave) => {
+                    Ok((grave, marked)) => {
                         tracing::info!(
                             %subpath,
                             grave = %grave.display(),
-                            "files: moved a vault file to the trash"
+                            "files: moved a file to the trash"
                         );
+                        dirty = dirty.or(marked);
                         deleted.push(subpath);
                     }
                     Err(refusal) => {
@@ -2213,15 +2339,17 @@ pub async fn sync_delete_entries(
                     }
                 }
             }
-            FilesDeleteReceiptVm { deleted, refusals }
+            (FilesDeleteReceiptVm { deleted, refusals }, dirty)
         })
         .await
         .map_err(|err| open_failure(format!("could not delete: {err}")))?
     };
 
-    if !outcome.deleted.is_empty() {
-        crate::notes_vault::mark_dirty(&vault.id);
-    } else {
+    // Only a removal that actually happened, and only a vault one, moves a
+    // vault's cadence.
+    if let Some(vault_id) = dirty {
+        crate::notes_vault::mark_dirty(&vault_id);
+    } else if outcome.deleted.is_empty() {
         // DW-162: a path that declines to act says so where a person can find
         // it later, and `debug!` never reaches the packaged app's log.
         tracing::info!(profile = %profile.name, "files: delete removed nothing");
@@ -2296,41 +2424,6 @@ pub async fn sync_create_entry(
         "files: created a file from the Files surface"
     );
     Ok(target.profile_relative)
-}
-
-/// Whether one profile-relative path is one keeper will delete, and whether it
-/// is a directory.
-///
-/// The disk question and the scope question in the order that produces the
-/// useful sentence: a path that is gone is reported as gone rather than as
-/// "outside the vault", because the two have different next steps and only one
-/// of them is the user's mistake.
-fn deletable(
-    profile: &SyncProfile,
-    scope: &WriteScope<'_>,
-    subpath: &str,
-) -> Result<DeleteTarget, WriteRefusal> {
-    let resolved = files_write::resolve_existing(&profile.local_path, subpath)?;
-    let is_dir = resolved.is_dir();
-    let vault_relative = scope.file(subpath, is_dir)?;
-    Ok(DeleteTarget {
-        vault_relative,
-        is_dir,
-    })
-}
-
-/// One path the delete path has already resolved and allowed.
-///
-/// Both facts, because both callers need one each and neither may re-derive
-/// the other's: the plan asks the engine about `is_dir`, and the command hands
-/// `vault_relative` to `trash_note`. Resolving twice would be two `stat`s and
-/// one more chance for the two answers to disagree about a path that changed
-/// underneath.
-struct DeleteTarget {
-    /// The argument `notes_vault::trash_note` takes.
-    vault_relative: String,
-    /// From the dirent, for the sync question.
-    is_dir: bool,
 }
 
 /// A `NotesError` from the one writer, as the frontend receives it.

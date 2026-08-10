@@ -36,7 +36,7 @@
  * one creation path, in Rust, with 44.6's `notices` channel attached to it.
  */
 import { useCallback, useEffect, useState } from "react";
-import { saveOpenNote } from "@/hooks/use-notes-body";
+import { saveNote } from "@/hooks/use-notes-body";
 import {
   type IpcError,
   listenNotesCaptureShown,
@@ -149,12 +149,13 @@ export function useCaptureDraft(captureKey: string): UseCaptureDraft {
       stop?.();
     };
   }, [resolve]);
+  const held = draft?.note ?? null;
   const dismiss = useCallback(() => {
     void (async () => {
       // Awaited, and first: Rust reads the file to decide whether this page was
       // written on, so the last 1.5 s of typing has to be in it (AD-62).
       //
-      // **And the answer is read, not assumed.** `saveOpenNote` catches its own
+      // **And the answer is read, not assumed.** `saveNote` catches its own
       // failure — it has to, because the editor's caption is fed from the same
       // store — so awaiting it is not a success check. Hiding on a refused
       // write would take the panel away with the reason legible only inside the
@@ -164,7 +165,12 @@ export function useCaptureDraft(captureKey: string): UseCaptureDraft {
       // would be told nothing. UX-DR35's error branch is that a failed write
       // leaves the text where it is and the panel open, and it survived the
       // move from a buffer to a note.
-      if (!(await saveOpenNote())) {
+      //
+      // Story 46.12: it names the page this window is holding. This webview is
+      // its own JS realm and therefore its own store, so there is only ever one
+      // note in it — but "the only one" and "the one I mean" are different
+      // claims, and after 46.12 only the second is expressible.
+      if (held !== null && !(await saveNote(held.vaultId, held.id))) {
         return;
       }
       setWindowError(null);
@@ -180,7 +186,7 @@ export function useCaptureDraft(captureKey: string): UseCaptureDraft {
       // live note with no round trip in front of the first keystroke.
       await resolve();
     })();
-  }, [resolve]);
+  }, [held, resolve]);
 
   return {
     note: draft?.note ?? null,

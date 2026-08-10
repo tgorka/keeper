@@ -62,6 +62,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     absolutePath: "/Volumes/merope/papers/report.pdf",
     sizeLabel: "2.4 MB",
     openWith: null,
+    writeCaveat: null,
     ...overrides,
   };
 }

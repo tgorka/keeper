@@ -2938,3 +2938,204 @@ reason: these compile and their handler registration is now pinned by
   findable from one place rather than five, and so it is not mistaken for covered because the
   Rust compiles.
 status: open
+
+### DW-193: The `.gitattributes` lines already broken by the unquoted writer are left exactly as they are, and every one of them is a rule covering nothing.
+
+origin: story 46.1, 2026-08-10 — carved out by the epic spine before the story was written, and
+  confirmed against the owner's file during it
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs` (`ensure_attributes`), against any
+  `.gitattributes` written by keeper before 46.1
+reason: 46.1 stops keeper EMITTING an unquoted pattern; it does not repair the ones already on
+  disk. The owner's file holds fifty-nine of them. Each is inert in the same two ways: git reads
+  `/2021 holiday/clip filter=lfs diff=lfs merge=lfs -text` as the pattern `/2021` with
+  `holiday/clip` as an attribute NAME, so the intended path is not routed through LFS at all —
+  and `is_false_modification` asks `routed_through_lfs`, so those paths also lose the
+  racily-clean dismissal that keeps a multi-gigabyte file from being re-hashed on every scan.
+  After 46.1 they stop multiplying, because the correctly quoted line keeper now writes is
+  recognised on the next run; the stale ones simply sit there.
+  The mechanism to fix them exists and is one function: `ensure_attributes` already reads the
+  whole file, rebuilds it in memory and writes it back, so re-emitting the managed block through
+  `quote_pattern` and dropping lines it can prove it wrote is a contained change. What makes it a
+  separate decision is that `.gitattributes` is a versioned file the user is invited to edit, and
+  keeper cannot distinguish "a broken line I wrote" from "a line the user adjusted afterwards"
+  by content alone — the managed marker says where keeper's block STARTS, not that every line
+  below it is still keeper's. Bundling a data migration into a bug fix also means the fix cannot
+  be reverted without reverting the migration, which is the reason the epic spine states for the
+  carve-out.
+  Whoever picks this up should decide it as a product question first: repair silently, repair
+  with a one-line notice, or leave them and let the correctly spelled rule be added alongside.
+status: open
+
+### DW-194: An exact-path `.gitattributes` pattern leaves glob metacharacters live, so a real filename containing `[` gets a rule that matches everything except that file.
+
+origin: story 46.1, 2026-08-10 — flagged by ScoutGitattr while diagnosing the quoting defect and
+  deliberately kept out of the fix
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `pattern_for`'s exact-path branch
+  (`format!("/{}", …)`)
+reason: the exact-path branch spells a filename as a gitattributes PATTERN, and a pattern is
+  wildmatch — `*`, `?`, `[`, and `\` are operators there. C-style quoting does not help, and this
+  is the part worth writing down: unquoting runs FIRST and produces the pattern, then wildmatch
+  interprets it. The two layers compose rather than cancel, so 46.1's fix carries the bug through
+  intact.
+  Measured against git 2.53.0, with the pattern quoted exactly as keeper now writes it:
+
+  ```
+  .gitattributes:  "/notes/draft[final]" filter=lfs
+  notes/draft[final]  ->  filter: unspecified      <- the actual file, NOT routed
+  notes/draftf        ->  filter: lfs              <- a file that is not the one
+  ```
+
+  `[final]` is a character class, so the rule covers `draftf`, `drafti`, `draftn`, `drafta` and
+  `draftl`, and misses the file it was written for. The `*` case fails the other way and is
+  quieter: `"/budget*2026"` does route `budget*2026`, and also routes `budget-q3-2026`, so an
+  unrelated file is silently converted to an LFS pointer.
+  Consequence is the same class as DW-193 — a large file that was meant to be routed becomes an
+  ordinary git blob, which is the outcome `lfs::stage` exists to prevent — but the cause is
+  different and so is the fix: escape the four wildmatch operators inside the pattern (`\[`,
+  `\*`, `\?`, `\\`) at the point the exact path is built, INSIDE the quotes, since the escape is
+  consumed by wildmatch after unquoting rather than by the quoting. That is a change to what a
+  pattern MEANS, it needs its own round-trip evidence against `git check-attr`, and it interacts
+  with DW-193 (patterns already on disk would need the same treatment), which is why it is not
+  folded into a story about blanks.
+  Note the extension branch is not affected: `pattern_for_extension` emits `*.<ext>` where the
+  `*` is intended, and `engine.rs:1802` already refuses an extension holding `/` or whitespace.
+status: open
+
+### DW-195: The tray's notes section still hand-types its labels, so a registry retitle that now reaches four surfaces still misses the three notes verbs in the menu bar.
+
+origin: story 46.16, 2026-08-10 — the recording half of exactly this defect was the story; the
+  notes half was found while writing the projection and deliberately left
+location: `src-tauri/crates/keeper/src/tray.rs` — `build_notes_items`'s initial labels plus
+  `new_note_label`, `capture_label`, `journal_label`
+reason: 46.16 made the tray project `keeper_core::palette` for the recording verbs
+  (`tray_recording_verbs`), so their words and order are the registry's and a rename reaches the
+  menu bar. The notes section was left hand-built, and the words are duplicated: `palette.rs`
+  ships `notes-new` → "New Note", `notes-capture` → "Quick Capture",
+  `notes-journal-today` → "Today's Journal", and `tray.rs` spells all three again. UX-DR42 says
+  the palette, the cheat sheet, the native menu and the tray carry the same titles; nothing
+  enforces it for notes, so the next retitle drifts here exactly as "Start Recording" did.
+  It was not folded in because the notes labels are COMPOSED, not projected: `new_note_label`
+  returns the honest "no vault yet" wording instead of the verb, `capture_label` carries the
+  global-shortcut registration failure (UX-DR43), and the slots/unread line carry model data. The
+  shape of the fix is therefore "registry title as the BASE word, composition unchanged": add a
+  notes id list beside `tray_verb_ids`, gate it on the notes capability, take the base from the
+  projection and keep `paint_notes` composing the suffix.
+  One thing that widening must NOT inherit from the recording projection: order. Recording verbs
+  take the registry's order because they are rebuilt per menu, but the notes items are built once
+  and only mutated (AD-61 — a Linux tray menu cannot be swapped after it is set), so their slot
+  order has to stay the tray's own or a registry reshuffle would move labels onto the wrong
+  handles. `notes-open` / `notes-search` are registered and deliberately absent from the tray,
+  which is the other reason the id list stays explicit rather than "the whole Notes section".
+status: open
+
+### DW-196: `DestinationProfileRow` now carries the recordings root and the head it was joined from as two independent `Option`s, so a row that says one without the other is representable.
+
+origin: story 46.10, 2026-08-10 — created by the story, named by it, and deliberately not
+  collapsed inside it
+location: `src-tauri/crates/keeper/src/ipc.rs` — `DestinationProfileRow.recordings_root` /
+  `.recordings_subfolder`, filled together in `destination_profile_row` and consumed together in
+  `destination_profile_vms`
+reason: 46.10 needed the profile-relative subfolder on the destination picker's rows, because the
+  card now edits it and the exact stored string is what must be echoed back to
+  `sync_profile_save` — a head recovered from the resolved root by `strip_prefix` would come back
+  component-normalised, and `20-media//sessions` and `20-media/sessions` are one root but two
+  different stored values. The honest shape is one field, `Option<(PathBuf, String)>` or a small
+  `RecordingsPlace { root, subfolder }`, so "a root with no head" cannot be written down. What
+  shipped is two `Option`s that agree by construction: `destination_profile_row` is the only
+  place either is built and builds both from the same `profile.recordings` block, and
+  `destination_profile_vms` `?`s on both, so a disagreement drops the row rather than inventing
+  half of one.
+  Nothing is wrong today. Six test fixtures set `unflagged.recordings_root = None` and leave the
+  now-stale `recordings_subfolder` behind, and it changes no verdict because `recordings_root` is
+  checked first at every one of the six read sites. The cost is the next reader's, and the next
+  field: a seventh site that consults the head first would read a head for a folder that holds no
+  recordings.
+  It was not collapsed in 46.10 for one reason only, and it is not a design reason: the `keeper`
+  shell crate does not build on Linux, the story was implemented there, and the collapse is
+  thirteen edit sites in a file no local gate can compile. Two were provable by inspection;
+  thirteen were not. The fix belongs in the next story that is already running the macOS gate on
+  `ipc.rs`, and it is mechanical: introduce the struct, add a `recordings_root()` accessor so the
+  five existing readers keep their one-line shape, and rewrite the six fixture mutations to
+  `row.recordings = None`.
+status: open
+
+### DW-197: `WriteScope::file` survived AD-102 with no production caller left, and it is the pre-fork mental model sitting in the module as a trap.
+
+origin: story 46.14, 2026-08-10 — created by the story, named by it, and deliberately not
+  removed inside it
+location: `src-tauri/crates/keeper-sync/src/files_write.rs` — `WriteScope::file`, plus the six
+  tests that still exercise it (`a_profile_with_no_vault_refuses_every_path_and_names_itself`,
+  `a_folder_whose_name_extends_the_vaults_is_not_inside_the_vault`,
+  `a_nested_vault_subfolder_is_matched_one_component_at_a_time`,
+  `the_configured_subfolder_is_normalised_however_it_was_typed`,
+  `traversal_is_refused_wherever_it_is_aimed`, `the_vault_directory_itself_cannot_be_deleted`,
+  `a_directory_is_refused_as_a_folder_whatever_it_is_named`)
+reason: AD-102 replaced `file` with `WriteScope::route` / `owner` / `classify`. Its two former
+  callers are gone — `files_listing_vm` now asks `owner`, and `deletable` was deleted outright —
+  so as of this story `file` is reached only from its own tests. That is worse than dead code:
+  `file` answers `Err(OutsideVault)` for exactly the paths AD-102 now routes to the second
+  writer, so it IS the pre-fork mental model, still public, still plausible-looking, and a
+  future reader reaching for it would bypass the fork this story exists to make unbypassable.
+  Not removed here because the deletion is not the mechanical part — six existing tests assert
+  refusals through it that AD-102 has turned into routing decisions, so each one needs its
+  intent re-expressed against `directory` (the create path, still live) or `owner` rather than
+  mechanically repointed, and doing that at the end of a wave in a file three other agents were
+  reading is how a green suite stops meaning anything.
+fix: delete `WriteScope::file`; migrate each test above to `directory` where it is asserting the
+  component-by-component vault match or the create refusal, and to `owner` where it is asserting
+  the escape / vault-root / is-a-directory refusals. `vault_relative` stays — it is the shared
+  core of `directory` and `classify`. No production line changes.
+status: open
+
+### DW-198: the hotkey path re-centres the draft capture window on every press, and story 46.15 made that asymmetry visible.
+
+origin: story 46.15, 2026-08-10 — found while wiring the size through, named here rather than
+  fixed because the fix costs NFR-27 something and the trade needs to be chosen, not slipped in
+location: `src-tauri/crates/keeper/src/notes_window.rs` — `show` (the no-argument entry point)
+  passes `None` to `reveal`, which falls through to `position(window)`; its two callers are
+  `hotkey::install_capture`'s press handler and the tray's Quick Capture item
+reason: `show` deliberately has no settings read in front of it — the hotkey path is
+  `set_position` → `show` → `set_focus` and NFR-27 gives it 300 ms. The consequence, which
+  predates this story, is that the prewarmed window's REMEMBERED POSITION is honoured only when
+  it is raised through `notes_capture_open`, and is re-centred on the pointer's monitor every
+  time the hotkey or the tray raises it. A person who unlocks the draft window and drags it
+  somewhere finds it back in the middle on the next hotkey press.
+  Story 46.15 did not cause this and did not widen it — `reveal(None)` now touches the position
+  and nothing else, where before it would also have re-asserted a default size and lock. But it
+  DID make the asymmetry legible: the size survives a hotkey press and a restart (adopted once
+  at boot, off the hot path), and the position does not. "It remembers how big I made it but not
+  where I put it" is a report waiting to be filed.
+fix: adopt the position the same way the size is adopted — once, at boot, in `lib.rs`'s setup,
+  alongside the existing `notes_window::adopt_placement` call, so the hot path stays three
+  synchronous calls. That is not free: `position` is `apply_placement`'s fallback precisely
+  because a hidden window's monitor is "where it was last placed", so honouring a stored
+  position means the panel stops following the pointer between monitors. Which of those two a
+  person wants is exactly what the lock already says — locked follows the pointer, unlocked
+  stays put — so the shape is: at boot, if the stored placement is unlocked and carries a
+  position, apply it; on every `show`, do what `reveal(None)` does today. Needs the macOS gate.
+status: open
+
+### DW-199: on GTK, an unlocked capture window's own 5 px resize border sits over the chrome buttons.
+
+origin: story 46.15, 2026-08-10 — a platform fact confirmed from tao's source during the story,
+  recorded rather than designed around because it needs a look at the real window to size
+location: `src/components/capture/capture-window.tsx` — `CaptureWindowChrome`'s strip
+  (`h-8 … px-1`, buttons flush to the right edge); the behaviour itself is tao 0.35's
+  `src/platform_impl/linux/window.rs` motion/button handlers
+reason: tao gives an undecorated resizable window its edge hit-testing INSIDE the surface — a
+  5 px × scale strip along each edge — and the webview never sees clicks that land in it. On
+  macOS and Windows the resize border is outside the client area, so this is Linux-only. The
+  capture chrome's close button is flush against the top-right corner, which is where two of
+  those strips overlap, so on GTK an UNLOCKED window plausibly turns the top and right few
+  pixels of that button into a resize handle. Two related tao facts from the same reading: the
+  cursor stays the default arrow during an edge drag (tao's own FIXME), and edge dragging is off
+  while the window is maximized.
+  Not addressed here because the fix is a number — how much inset the chrome needs — and this
+  story could not run a GTK window to measure it. Guessing a padding that is wrong in either
+  direction is worse than recording the hazard: too little fixes nothing, too much moves a
+  control on every platform to solve a problem on one.
+fix: on a Linux desktop, unlock a capture window and click the top-right two pixels of the close
+  button. If it resizes instead of closing, give the strip a right/top inset of one resize border
+  when unlocked (the same conditional the drag region already uses), sized from what is measured
+  rather than from tao's constant. No Rust change; no capability change.
+status: open

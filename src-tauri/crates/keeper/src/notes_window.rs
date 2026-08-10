@@ -30,10 +30,12 @@
 //!
 //! # Rust owns geometry, the webview owns chrome
 //!
-//! Show, hide, create, destroy, position and focus are all here. The capture
-//! webview asks for exactly three window things — hide, close and, when it is
-//! unlocked, start-dragging — and its capability file grants those and nothing
-//! more.
+//! Show, hide, create, destroy, position, size and focus are all here. The
+//! capture webview asks for exactly three window things — hide, close and, when
+//! it is unlocked, start-dragging — and its capability file grants those and
+//! nothing more. **Resizing adds no fourth**: it is a native edge drag against
+//! a window attribute this module sets, not a plugin command the webview
+//! invokes, so `quick-capture.json` is unchanged by Story 46.15.
 //!
 //! Positioning is monitor-aware and **best-effort by design**: an undecorated
 //! always-on-top window cannot place itself on Wayland, so keeper asks and
@@ -43,26 +45,35 @@
 //! **Story 45.15's lock is inside that rule, not an exception to it**, and the
 //! distinction is worth keeping straight because it is the one this module's
 //! predecessor stated and a lock icon could very easily have broken. What the
-//! lock promises is **movability**: unlocked, the strip becomes a
-//! `data-tauri-drag-region` and the *compositor* moves the window, which works
-//! everywhere including Wayland. What it does not promise is the restore —
-//! putting the window back there next time is a `set_position`, which is
-//! exactly the call UX-DR43 says may be refused. So the controls are worded for
-//! what they can deliver ("so it can be moved", "where it is") and never
-//! "remembers", and a compositor that declines leaves a window the person can
-//! still put wherever they like, every time, rather than a promise that quietly
-//! fails.
+//! lock promises is **movability**, and since Story 46.15 **resizability**:
+//! unlocked, the strip becomes a `data-tauri-drag-region` and the *compositor*
+//! moves the window, and the window becomes `set_resizable(true)` so its edges
+//! answer a drag. Both work everywhere including Wayland, and for the same
+//! reason — neither is a request to put a surface at a coordinate. What is
+//! still not promised is the restore: putting the window back *there* next time
+//! is a `set_position`, which is exactly the call UX-DR43 says may be refused.
+//! So the controls are worded for what they can deliver ("so it can be moved
+//! and resized", "where it is") and never "remembers", and a compositor that
+//! declines leaves a window the person can still put wherever they like, every
+//! time, rather than a promise that quietly fails.
+//!
+//! The **size**, unlike the position, does survive a restart, and that is not a
+//! contradiction: it is stored under the same key and restored with the same
+//! best-effort `set_size`, but a compositor that honours a size request is the
+//! ordinary case rather than the exception a position request is. When it
+//! declines, the person has a window at keeper's size and can resize it again —
+//! the same recovery, one gesture long.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 
 use keeper_core::capture::{
     capture_label, is_capture_label, CaptureTargetVm, CaptureWindowVm, Placement,
-    DRAFT_CAPTURE_KEY, DRAFT_CAPTURE_LABEL,
+    CAPTURE_DEFAULT_SIZE, CAPTURE_MIN_SIZE, DRAFT_CAPTURE_KEY, DRAFT_CAPTURE_LABEL,
 };
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Runtime, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
 };
 
 /// Emitted to **one** capture window after it is shown, so that window's entry
@@ -85,10 +96,20 @@ pub const CAPTURE_WINDOWS_EVENT: &str = "keeper://notes-capture-windows";
 /// is byte-for-byte what `tauri.conf.json` declares.
 const CAPTURE_DOCUMENT: &str = "capture.html";
 
-/// Width and height of a capture window, in logical pixels — the same numbers
-/// `tauri.conf.json` gives the draft window, so the second window is the same
-/// window and not a differently sized cousin.
-const CAPTURE_SIZE: (f64, f64) = (560.0, 340.0);
+/// A capture window's two sizes — keeper's own [`CAPTURE_DEFAULT_SIZE`] and the
+/// floor [`CAPTURE_MIN_SIZE`] a user may resize one to — live in
+/// `keeper_core::capture`, not here, and they are the same numbers
+/// `tauri.conf.json` gives the prewarmed window, so the second window is the
+/// same window and not a differently sized cousin. They are over there because
+/// [`Placement::window_size`] has to answer with them, and that answer is the
+/// one part of a capture window's geometry that can be tested on a machine
+/// where this crate does not compile (AD-55/AD-56).
+///
+/// This is the only thing left on this side: they are stored as plain integers
+/// of logical pixels, and every Tauri sizing call wants a typed `f64` pair.
+fn logical(size: (u32, u32)) -> LogicalSize<f64> {
+    LogicalSize::new(f64::from(size.0), f64::from(size.1))
+}
 
 /// How far down the focused monitor's work area an *unplaced* panel sits, as a
 /// fraction of the monitor height.
@@ -199,11 +220,19 @@ pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
             );
             let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
                 .title("keeper — quick note")
-                .inner_size(CAPTURE_SIZE.0, CAPTURE_SIZE.1)
+                .inner_size(CAPTURE_DEFAULT_SIZE.0.into(), CAPTURE_DEFAULT_SIZE.1.into())
+                // The floor, set on the window itself rather than only in the
+                // clamp: a `min_inner_size` is refused by the compositor
+                // mid-drag, so the user never gets to a size keeper would then
+                // have to argue with on the next open.
+                .min_inner_size(CAPTURE_MIN_SIZE.0.into(), CAPTURE_MIN_SIZE.1.into())
                 .decorations(false)
                 .always_on_top(true)
                 .skip_taskbar(true)
-                .resizable(false)
+                // Story 46.15: resizability follows the lock, from the first
+                // frame. Built `false` and flipped below would give an unlocked
+                // window one frame in which its edges do not answer.
+                .resizable(!placement.locked)
                 .visible(false)
                 .build();
             match built {
@@ -216,9 +245,12 @@ pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
             }
         }
     };
-    // Belt and braces on a window that already existed: a compositor may have
-    // resized it, and every capture window is the same window.
-    let _ = window.set_size(LogicalSize::new(CAPTURE_SIZE.0, CAPTURE_SIZE.1));
+    // The size is NOT re-asserted unconditionally here any more (Story 46.15).
+    // A locked window is still normalised — a compositor may have resized it,
+    // and every locked capture window is the same window — but an unlocked one
+    // is left at the size the user gave it, which is the whole of the feature.
+    // Which of those two this is, is `Placement::window_size`'s decision, made
+    // in `keeper_core` where it is tested.
     reveal(app, &window, &key, Some(placement));
     announce(app);
 }
@@ -230,15 +262,15 @@ pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
 /// closing the last visible window raises the main one so the app is never
 /// running with nothing on screen and no taskbar entry.
 ///
-/// Returns the window's last position so the caller can persist it. Read
+/// Returns the window's last geometry so the caller can persist it — its
+/// position and, since Story 46.15, the size the user resized it to. Read
 /// *before* the window goes away, because a destroyed window has no geometry to
 /// ask for and a hidden one may report the origin.
-pub fn close(app: &AppHandle, key: &str) -> Option<(i32, i32)> {
-    let window = window(app, key)?;
-    let position = window
-        .outer_position()
-        .ok()
-        .map(|position| (position.x, position.y));
+pub fn close(app: &AppHandle, key: &str) -> Geometry {
+    let Some(window) = window(app, key) else {
+        return Geometry::default();
+    };
+    let geometry = geometry(&window);
     let plan = keeper_core::capture::plan_close(key, other_windows_visible(app, key));
     if plan.destroy {
         forget_target(&capture_label(key));
@@ -252,20 +284,54 @@ pub fn close(app: &AppHandle, key: &str) -> Option<(i32, i32)> {
         crate::tray::show_main_window(app);
     }
     announce(app);
-    position
+    geometry
 }
 
-/// Where the capture window for `key` is right now, or `None` when it is not
-/// open or the platform will not say.
+/// What a capture window's geometry is worth remembering, in the units each
+/// half is remembered in (see [`Placement`]): the position physical, the size
+/// logical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Geometry {
+    /// The top-left in physical pixels, or `None` when the platform will not
+    /// say.
+    pub position: Option<(i32, i32)>,
+    /// The inner size in logical pixels, or `None` when the platform will not
+    /// say.
+    pub size: Option<(u32, u32)>,
+}
+
+/// Where the capture window for `key` is and how big it is right now, or an
+/// empty [`Geometry`] when it is not open or the platform will not say.
 ///
-/// Read at dismissal rather than on every `Moved` event: a drag emits one event
-/// per compositor frame and a settings write per frame would put a sqlite
-/// transaction inside a gesture.
-pub fn position_of(app: &AppHandle, key: &str) -> Option<(i32, i32)> {
-    window(app, key)?
-        .outer_position()
-        .ok()
-        .map(|position| (position.x, position.y))
+/// Read at dismissal and on blur rather than on every `Moved`/`Resized` event:
+/// a drag emits one event per compositor frame and a settings write per frame
+/// would put a sqlite transaction inside a gesture.
+pub fn geometry_of(app: &AppHandle, key: &str) -> Geometry {
+    let Some(window) = window(app, key) else {
+        return Geometry::default();
+    };
+    geometry(&window)
+}
+
+/// [`geometry_of`] against a window already in hand.
+fn geometry<R: Runtime>(window: &WebviewWindow<R>) -> Geometry {
+    Geometry {
+        position: window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y)),
+        // `inner_size`, not `outer_size`: `set_size` sets the inner size, so
+        // reading the outer one would grow the window by whatever frame the
+        // platform draws on every save-and-restore cycle. On an undecorated
+        // window the two are usually equal — "usually" is not a contract.
+        size: window.scale_factor().ok().and_then(|scale| {
+            window
+                .inner_size()
+                .ok()
+                .map(|size| size.to_logical::<u32>(scale))
+                .map(|size| (size.width, size.height))
+        }),
+    }
 }
 
 /// Every capture window that exists right now (FR-191).
@@ -348,14 +414,25 @@ fn other_windows_visible(app: &AppHandle, key: &str) -> bool {
         .any(|(label, window)| label != closing && window.is_visible().unwrap_or(false))
 }
 
-/// Place, show and focus a window, then tell it so.
+/// Place, size, show and focus a window, then tell it so.
+///
+/// `placement` is `None` for the hotkey and tray path, which has no settings
+/// read in front of it (NFR-27) and therefore knows nothing about this window's
+/// remembered geometry. That is not the same as "the default placement": a
+/// caller with nothing to say must **change nothing but the position**, because
+/// resizability and size were already set — at boot by [`adopt_placement`], and
+/// on every toggle by the lock command — and re-asserting a default over them
+/// would silently relock and shrink a window the user unlocked and resized.
 fn reveal<R: Runtime>(
     app: &AppHandle<R>,
     window: &WebviewWindow<R>,
     key: &str,
     placement: Option<Placement>,
 ) {
-    apply_placement(window, placement.unwrap_or_default());
+    match placement {
+        Some(placement) => apply_placement(window, placement),
+        None => position(window),
+    }
     if let Err(error) = window.show() {
         tracing::warn!(%error, %key, "notes: could not show the capture panel");
         return;
@@ -370,12 +447,38 @@ fn reveal<R: Runtime>(
     }
 }
 
-/// Put a window where its placement says, or where keeper would put it.
+/// Give the capture window for `key` the resizability and size its stored
+/// placement asks for, without showing it or moving it.
+///
+/// Two callers, one act. **At boot**, for the prewarmed window: it is declared
+/// `resizable: false` in `tauri.conf.json` and created before anything has read
+/// the settings, so without this a person who unlocked it yesterday finds it
+/// unlocked-looking and unresizable today — the lock reduced to a label, which
+/// is the exact failure Story 46.15 exists to fix. Done here, once, rather than
+/// in [`show`]: the hotkey path is three synchronous calls and a settings read
+/// does not belong in front of it (NFR-27).
+///
+/// **On the lock toggle**, against the live window, so unlocking takes effect
+/// without a reopen.
+pub fn adopt_placement<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Placement) {
+    let Some(window) = window(app, key) else {
+        return;
+    };
+    apply_resizability(&window, placement);
+    apply_size(&window, placement);
+}
+
+/// Put a window where its placement says — or where keeper would put it — at
+/// the size its placement says, and let the user move and resize it or not.
+///
+/// Order is load-bearing. Resizability first, because a platform may refuse a
+/// size outside a non-resizable window's constraints. Size before position,
+/// because [`position`] centres the window against its own measured width: swap
+/// the two and a window that was just resized is centred as the size it used to
+/// be.
 fn apply_placement<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
-    // A locked window is not movable by the user, so it is `resizable(false)`
-    // plus no drag region in the webview; there is no platform flag to set
-    // here. What the lock changes on this side is only whether keeper is
-    // allowed to move the window out from under a position the user chose.
+    apply_resizability(window, placement);
+    apply_size(window, placement);
     match placement.position {
         Some((x, y)) => {
             if let Err(error) = window.set_position(PhysicalPosition::new(x, y)) {
@@ -386,14 +489,66 @@ fn apply_placement<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) 
     }
 }
 
-/// Place the panel horizontally centred on the focused monitor, a fifth of the
-/// way down its work area.
+/// The lock's second verb (Story 46.15). Unlocked means movable **and**
+/// resizable; locked means neither.
+///
+/// This one is not inside UX-DR43's best-effort rule, and the distinction is
+/// worth keeping straight because the module doc spends a paragraph on the
+/// other half. What Wayland refuses is `set_position` — a request to put a
+/// surface at a coordinate, which a compositor owns. Resizability is a window
+/// *attribute*: it is `gtk_window_set_resizable` on GTK, a style mask on macOS
+/// and a window style on Windows, and the edge-drag hit-testing every backend
+/// does for an undecorated window re-reads that attribute per event rather than
+/// capturing it at creation. So the lock can promise this one everywhere.
+fn apply_resizability<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
+    if let Err(error) = window.set_resizable(!placement.locked) {
+        tracing::warn!(
+            %error,
+            locked = placement.locked,
+            "notes: could not set the capture panel's resizability"
+        );
+    }
+}
+
+/// Size a window from its placement, or leave it exactly as it is.
+///
+/// Every part of that decision — normalise a locked window, restore an unlocked
+/// one, touch neither when nothing is remembered, and never restore a size the
+/// screen cannot show — belongs to [`Placement::window_size`], which lives in
+/// `keeper_core` and is tested there. This function converts units and calls it.
+fn apply_size<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
+    let Some(size) = placement.window_size(logical_work_area(window)) else {
+        return;
+    };
+    if let Err(error) = window.set_size(logical(size)) {
+        tracing::debug!(%error, "notes: the compositor sized the capture panel itself");
+    }
+}
+
+/// The usable area of the monitor this panel belongs on, in **logical** pixels,
+/// or `None` when the platform will not name a monitor.
+///
+/// Logical because that is the unit a remembered size is stored in, and mixing
+/// the two here is the bug this function exists to make impossible: clamping a
+/// logical 900 against a physical 2880 on a 2× display would silently allow a
+/// window twice as wide as the screen.
+fn logical_work_area<R: Runtime>(window: &WebviewWindow<R>) -> Option<(u32, u32)> {
+    let monitor = focused_monitor(window)?;
+    let area = monitor
+        .work_area()
+        .size
+        .to_logical::<u32>(monitor.scale_factor());
+    Some((area.width, area.height))
+}
+
+/// The monitor a capture panel belongs on: the one under the pointer, else the
+/// one the window is already on, else the primary one.
 ///
 /// The **focused** monitor, not the primary one: on a two-screen desk the panel
 /// has to appear where the user is looking. `current_monitor` reports the
 /// monitor the window is on, which for a hidden window is where it was last
 /// placed, so the cursor's monitor is preferred when the platform can name it.
-fn position<R: Runtime>(window: &WebviewWindow<R>) {
+fn focused_monitor<R: Runtime>(window: &WebviewWindow<R>) -> Option<Monitor> {
     let monitor = match window.cursor_position() {
         Ok(cursor) => window
             .monitor_from_point(cursor.x, cursor.y)
@@ -402,7 +557,13 @@ fn position<R: Runtime>(window: &WebviewWindow<R>) {
             .or_else(|| window.current_monitor().ok().flatten()),
         Err(_) => window.current_monitor().ok().flatten(),
     };
-    let Some(monitor) = monitor.or_else(|| window.primary_monitor().ok().flatten()) else {
+    monitor.or_else(|| window.primary_monitor().ok().flatten())
+}
+
+/// Place the panel horizontally centred on the focused monitor, a fifth of the
+/// way down its work area.
+fn position<R: Runtime>(window: &WebviewWindow<R>) {
+    let Some(monitor) = focused_monitor(window) else {
         // No monitor information at all (a headless session, or a compositor that
         // does not answer). `center: true` in the static config is the fallback,
         // and it is a perfectly good answer.
@@ -414,7 +575,8 @@ fn position<R: Runtime>(window: &WebviewWindow<R>) {
     };
     // The work area, not the raw resolution: it excludes the macOS menu bar and
     // a Linux panel, so the offset below is measured against the space a window
-    // may actually occupy.
+    // may actually occupy. Physical throughout, matching `outer_size` and the
+    // physical coordinate `set_position` takes.
     let area = monitor.work_area();
     let x = area.position.x + centred(area.size.width, size.width);
     let y = area.position.y + offset_from_top(area.size.height, size.height);

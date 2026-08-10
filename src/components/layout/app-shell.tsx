@@ -45,6 +45,7 @@ import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
+import { hydrateFilesTree } from "@/lib/stores/files-tree";
 import { hydratePanels } from "@/lib/stores/panels";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { hydrateSidebarFold, sidebarFoldStore, useSidebarFold } from "@/lib/stores/sidebar-fold";
@@ -126,6 +127,13 @@ export function AppShell() {
   // silently not happen. Idempotent, like `hydratePanels`.
   useEffect(() => {
     hydrateSidebarFold(document.cookie);
+  }, []);
+  // Restore which folders the Files tree had open (Story 46.3), for the third
+  // time and the same reason: `FilesPane` is unmounted by every surface switch,
+  // which is exactly the defect — the tree forgot itself whenever you looked at
+  // something else. Idempotent, like the two above.
+  useEffect(() => {
+    hydrateFilesTree(document.cookie);
   }, []);
   // The user's fold, and how it composes with the viewport's.
   //

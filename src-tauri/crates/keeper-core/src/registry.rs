@@ -187,7 +187,28 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
 ///
 /// Non-secret key/value store in `keeper.db` (Story 2.6). Never holds secret
 /// material.
+///
+/// # The layer stack is consulted first (Story 46.6, AD-98)
+///
+/// A `keeper.toml` layer resolves **here**, ahead of the table, which is the
+/// whole of AD-98: the file keeps winning on every read instead of winning once
+/// at boot and being erased by the next UI toggle. Every one of the ~40 typed
+/// getters below is built on this function, so they all inherit layering — and
+/// they all keep their own parsing and clamping, because what the overlay
+/// returns is a string in exactly the convention the table stores.
+///
+/// The overlay is checked **before** [`open`]. It has to be: `open` is a fresh
+/// connection, a WAL pragma and eight `CREATE TABLE IF NOT EXISTS` statements,
+/// and a layered read must not pay for a database it is not going to use.
+///
+/// [`set_setting`] still writes the table under a shadowed key rather than
+/// refusing. A refused write would have to be handled by every caller; a write
+/// that lands and is reported as shadowed is handled in one place, the settings
+/// pane, which reads [`crate::config::overrides`] to say so.
 pub fn get_setting(data_dir: &Path, key: &str) -> Result<Option<String>, CoreError> {
+    if let Some(resolved) = crate::config::setting_override(key) {
+        return Ok(Some(resolved.value));
+    }
     let conn = open(data_dir)?;
     let value = conn
         .query_row(
@@ -696,14 +717,44 @@ pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreE
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
-/// Import `config.json` from the data dir over the settings table (Story 22.6,
-/// FR-80) — the file wins, enabling hand-edited / version-controlled setups.
+/// A scalar JSON value in the registry's on-disk string convention, or `None`
+/// when the value is not a scalar.
 ///
-/// Format: one flat JSON object; string, number, and boolean values only.
-/// Booleans map to the registry's `"1"`/`"0"` convention, numbers to their
-/// decimal text; every key is imported verbatim into the k/v table, and the
-/// existing typed getters keep clamping/normalizing on read, so an out-of-range
-/// hand-edit degrades to the documented default rather than misbehaving.
+/// **The one definition of that convention.** Booleans become `"1"`/`"0"`,
+/// numbers their decimal text, strings themselves. [`import_config_file`] and
+/// the TOML layer stack ([`crate::config`]) both go through here, so a
+/// `config.json` and a `keeper.toml` carrying the same value cannot put
+/// different text in the table — which they would if each formatted its own,
+/// since `format!("{}", 3.0f64)` is `"3"` and `serde_json`'s is `"3.0"`.
+pub fn scalar_setting_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Bool(flag) => Some((if *flag { "1" } else { "0" }).to_owned()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Import `config.json` from the data dir into the settings table (Story 22.6,
+/// FR-80) — the hand-edited / version-controlled setup that predates the layer
+/// stack.
+///
+/// # Precedence: this is the bottom (Story 46.6, AD-98)
+///
+/// Superseded by `keeper.toml`, and deliberately kept. This writes *rows*; the
+/// layer stack resolves *above* the rows in [`get_setting`], so **every TOML
+/// layer outranks this file** and a `config.json` only decides keys no layer
+/// mentions. It is still imported because someone may be running one, and
+/// deleting it would silently revert their machine to defaults at the next
+/// update. It also keeps the flaw that motivated AD-98: the values it writes
+/// are rows like any other, so the next UI toggle erases them. A person who
+/// wants a setting that *stays* wants `~/.keeper/keeper.toml`.
+///
+/// Format: one flat JSON object; string, number, and boolean values only,
+/// mapped by [`scalar_setting_text`]. Every key is imported verbatim into the
+/// k/v table, and the existing typed getters keep clamping/normalizing on read,
+/// so an out-of-range hand-edit degrades to the documented default rather than
+/// misbehaving.
 ///
 /// Returns the imported keys (empty when the file is absent — the normal
 /// case). A malformed file or a non-scalar value is an `Err` — the caller
@@ -730,16 +781,11 @@ pub fn import_config_file(data_dir: &Path) -> Result<Vec<String>, CoreError> {
     })?;
     let mut imported = Vec::with_capacity(object.len());
     for (key, value) in object {
-        let text = match value {
-            serde_json::Value::String(text) => text.clone(),
-            serde_json::Value::Bool(flag) => (if *flag { "1" } else { "0" }).to_owned(),
-            serde_json::Value::Number(number) => number.to_string(),
-            _ => {
-                return Err(CoreError::Internal(format!(
-                    "malformed {}: key {key:?} must be a string, number, or boolean",
-                    path.display()
-                )));
-            }
+        let Some(text) = scalar_setting_text(value) else {
+            return Err(CoreError::Internal(format!(
+                "malformed {}: key {key:?} must be a string, number, or boolean",
+                path.display()
+            )));
         };
         set_setting(data_dir, key, &text)?;
         imported.push(key.clone());
@@ -2802,10 +2848,15 @@ mod tests {
         let dragged = Placement {
             locked: false,
             position: Some((1_200, 40)),
+            // Dragged *and* resized: the two travel under one key, so a store
+            // that round-trips the position and drops the size would look
+            // correct here without one of these fields.
+            size: Some((900, 600)),
         };
         let pinned = Placement {
             locked: true,
             position: Some((-15, 900)),
+            size: None,
         };
         set_capture_placement(&dir, "draft", &dragged).expect("place draft");
         assert_eq!(
@@ -2851,6 +2902,26 @@ mod tests {
         assert_eq!(
             salvaged.position, None,
             "a fabricated axis is worse than none"
+        );
+
+        // The same for the size: unreadable costs the size and nothing else.
+        // Asserted through the store rather than only in `capture.rs`, because
+        // the settings row is where a hand edit actually lands.
+        set_setting(
+            &dir,
+            "notes.capture_placement.draft",
+            "free 12 34 size 0 600",
+        )
+        .expect("zero-width placement");
+        let salvaged = get_capture_placement(&dir, "draft").expect("read zero-width");
+        assert_eq!(
+            salvaged.position,
+            Some((12, 34)),
+            "the readable half is kept"
+        );
+        assert_eq!(
+            salvaged.size, None,
+            "a window with no width cannot be seen, focused or closed"
         );
 
         // A row that says nothing keeper understands is keeper's own placement,
@@ -3706,6 +3777,208 @@ mod tests {
         assert!(get_menu_bar_presence(&dir).expect("read back on"));
         set_menu_bar_presence(&dir, false).expect("disable");
         assert!(!get_menu_bar_presence(&dir).expect("read back off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // The layer stack in front of the table (Story 46.6, AD-98)
+    // -----------------------------------------------------------------
+
+    use crate::config::{self, LayerTier};
+
+    /// AD-98 in one assertion: the file keeps winning on every read. Before this
+    /// story `config.json` won once at boot and the next `set_setting` erased
+    /// it — so the write here, AFTER the layer is in place, must not change what
+    /// the reader sees, and must still be there when the layer goes away.
+    #[test]
+    fn a_layer_beats_the_table_and_the_table_is_still_written() {
+        let dir = temp_dir();
+        set_setting(&dir, RECORDING_CODEC_KEY, "h264").expect("seed the table");
+        {
+            let _layers = config::install_for_test(config::layers_from(&[(
+                RECORDING_CODEC_KEY,
+                "hevc",
+                LayerTier::UserGlobal,
+            )]));
+            assert_eq!(
+                get_setting(&dir, RECORDING_CODEC_KEY).expect("read"),
+                Some("hevc".to_owned())
+            );
+            // A shadowed write lands rather than being refused; the settings
+            // pane reports it instead.
+            set_setting(&dir, RECORDING_CODEC_KEY, "prores").expect("shadowed write");
+            assert_eq!(
+                get_setting(&dir, RECORDING_CODEC_KEY).expect("still the file"),
+                Some("hevc".to_owned())
+            );
+        }
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("the table underneath"),
+            Some("prores".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordering claim, proved rather than asserted: with a `data_dir` that
+    /// cannot be opened at all, a layered read still succeeds. It can only do
+    /// that if the overlay is consulted BEFORE [`open`] — which is the point,
+    /// since `open` is a connection, a WAL pragma and eight `CREATE TABLE IF NOT
+    /// EXISTS` statements that a layered read must not pay for.
+    ///
+    /// Move the overlay check below `open` and this fails with the
+    /// `DirUnavailable` the unlayered read below already proves is waiting.
+    #[test]
+    fn the_overlay_is_consulted_before_the_database_is_opened() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        // A FILE where the data dir should be: `create_dir_all` cannot succeed.
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"x").expect("write the blocker");
+        // Proof the probe is real: an unlayered read of the same path fails.
+        assert!(
+            get_setting(&blocked, RECORDING_CODEC_KEY).is_err(),
+            "the probe must be a path the database layer genuinely cannot use"
+        );
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_CODEC_KEY,
+            "hevc",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&blocked, RECORDING_CODEC_KEY).expect("resolved without a database"),
+            Some("hevc".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Layering lands in `get_setting`, so all ~40 typed getters inherit it —
+    /// **with their clamping intact**, because what the overlay hands back is a
+    /// string in exactly the convention the table stores and the getter parses.
+    ///
+    /// Three of them here, each with a different shape of guard: a two-sided
+    /// `clamp`, a one-sided `min`, and a normalize-to-a-legal-set. An
+    /// out-of-range hand-edit degrades to the documented default rather than
+    /// reaching the sidecar.
+    #[test]
+    fn a_layer_value_out_of_range_still_clamps_in_the_typed_getter() {
+        let dir = temp_dir();
+        let _layers = config::install_for_test(config::layers_from(&[
+            // clamp(100, 5000)
+            (RECORDING_SEGMENT_MB_KEY, "99999", LayerTier::UserGlobal),
+            // clamp(1, 600)
+            (
+                RECORDING_DURATION_CAP_MINUTES_KEY,
+                "0",
+                LayerTier::UserGlobal,
+            ),
+            // min(60)
+            (UNDO_SEND_WINDOW_KEY, "99", LayerTier::UserGlobal),
+            // not a number at all ⇒ the documented default
+            (RECORDING_FPS_KEY, "banana", LayerTier::MainMachine),
+        ]));
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("segment"),
+            RECORDING_SEGMENT_MB_MAX
+        );
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("cap"),
+            RECORDING_DURATION_CAP_MINUTES_MIN
+        );
+        assert_eq!(
+            get_undo_send_window(&dir).expect("undo"),
+            UNDO_SEND_WINDOW_MAX
+        );
+        assert_eq!(get_recording_fps(&dir).expect("fps"), RECORDING_FPS_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An in-range layer value passes through the same getters unchanged — the
+    /// clamp test above would also pass if layering did nothing at all.
+    #[test]
+    fn a_layer_value_in_range_reaches_the_typed_getter_unchanged() {
+        let dir = temp_dir();
+        let _layers = config::install_for_test(config::layers_from(&[
+            (RECORDING_SEGMENT_MB_KEY, "800", LayerTier::UserGlobal),
+            (UNDO_SEND_WINDOW_KEY, "3", LayerTier::UserGlobal),
+            (RECORDING_FPS_KEY, "30", LayerTier::UserGlobal),
+        ]));
+        assert_eq!(get_recording_segment_mb(&dir).expect("segment"), 800);
+        assert_eq!(get_undo_send_window(&dir).expect("undo"), 3);
+        assert_eq!(get_recording_fps(&dir).expect("fps"), 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The un-namespaced keys that predate the `recording.*` / `notify.*`
+    /// namespaces resolve through the overlay like any other — nothing in the
+    /// lookup is keyed on a dot.
+    #[test]
+    fn the_legacy_un_namespaced_keys_resolve_through_a_layer() {
+        let dir = temp_dir();
+        set_setting(&dir, "honor_remote_deletions", "off").expect("seed");
+        // The spellings a layer FILE actually produces (`Shape::coerce`), not
+        // the `"1"`/`"0"` a convention-blind mapping would have written: these
+        // two keys predate that convention and their readers compare against
+        // `"on"` and `"true"`. Asserted through the real getter, because
+        // "resolves to a string" is not the promise — "the setting is on" is.
+        let _layers = config::install_for_test(config::layers_from(&[
+            ("honor_remote_deletions", "on", LayerTier::UserGlobal),
+            ("favorites_collapsed", "true", LayerTier::MainShared),
+        ]));
+        assert!(
+            crate::archive::get_honor_remote_deletions(&dir).expect("policy"),
+            "a layer saying on must read as on"
+        );
+        assert_eq!(
+            get_setting(&dir, "favorites_collapsed").expect("read"),
+            Some("true".to_owned()),
+            "the shell's getter compares against \"true\""
+        );
+    }
+
+    /// A key no layer mentions still comes from the table, and an unset key is
+    /// still `None`. The overlay adds a lookup; it does not replace one.
+    #[test]
+    fn an_unlayered_key_still_comes_from_the_table() {
+        let dir = temp_dir();
+        set_setting(&dir, RECORDING_CODEC_KEY, "h264").expect("seed");
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_FPS_KEY,
+            "60",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("table"),
+            Some("h264".to_owned())
+        );
+        assert_eq!(get_setting(&dir, "nothing.sets.this").expect("unset"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `config.json` is the bottom of the stack: it writes rows, and any TOML
+    /// layer outranks the rows. Both stores name the same key here, and the file
+    /// layer wins.
+    #[test]
+    fn a_toml_layer_outranks_an_imported_config_json() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create the data dir");
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            br#"{"recording.codec": "h264", "recording.fps": 15}"#,
+        )
+        .expect("write config.json");
+        let imported = import_config_file(&dir).expect("import");
+        assert_eq!(imported.len(), 2);
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_CODEC_KEY,
+            "hevc",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("layer wins"),
+            Some("hevc".to_owned())
+        );
+        // A key config.json sets and no layer mentions still decides.
+        assert_eq!(get_recording_fps(&dir).expect("fps from json"), 15);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

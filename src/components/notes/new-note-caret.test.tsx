@@ -47,8 +47,9 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { EditorView } from "@codemirror/view";
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { withRangeRects } from "@/test/layout";
+import { NOTE_ACTIONS_TEXT } from "./note-actions";
 import { NoteEditor } from "./note-editor";
 
 // jsdom does no layout, so CodeMirror's measure pass — which runs on ANY
@@ -122,14 +123,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null, cursor: null });
+  resetNotesEditorStoreForTest();
 });
 
 describe("a note that was just created", () => {
   it("opens focused, with the caret in an empty body and no block in the buffer", async () => {
     openOn("", null);
     render(<NoteEditor vaultId="v1" noteId="new-1" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const editor = await view("");
 
     // Focus, because the promise of New Note is that the next thing typed is
@@ -154,7 +155,7 @@ describe("a note that was just created", () => {
     const scaffolded = "# Standup\n\n## Agenda\n";
     openOn(scaffolded, null);
     render(<NoteEditor vaultId="v1" noteId="new-2" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const editor = await view(scaffolded);
 
     await waitFor(() => {
@@ -170,7 +171,7 @@ describe("a note that was just created", () => {
     const scaffolded = "# Standup\n\n## Agenda\n";
     openOn(scaffolded, 10);
     render(<NoteEditor vaultId="v1" noteId="new-3" />);
-    await screen.findByText("Properties");
+    await screen.findByText(NOTE_ACTIONS_TEXT);
     const editor = await view(scaffolded);
 
     await waitFor(() => {

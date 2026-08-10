@@ -62,6 +62,7 @@ export function NoteList({
   total,
   selectedId,
   onSelect,
+  onSelectBeside,
   onToggleTag,
   onVerb,
   onGrow,
@@ -71,6 +72,14 @@ export function NoteList({
   total: number;
   selectedId: string | null;
   onSelect: (row: NoteRowVm) => void;
+  /**
+   * Double click: open this note beside what is already open (Story 46.12,
+   * AD-90). The Files tree's pair, unchanged — and, like the Files tree, it is
+   * a pointer gesture only. `Enter` still means `onSelect`, because a keyboard
+   * twin is a binding neither surface has, and inventing one here would put a
+   * gesture in the notes list that the file list does not answer to.
+   */
+  onSelectBeside: (row: NoteRowVm) => void;
   onToggleTag: (tag: string) => void;
   /**
    * The single-key verbs, `⌘⇧R` and `Delete`, dispatched on the row under the
@@ -216,6 +225,7 @@ export function NoteList({
                 selected={row.id === selectedId}
                 tabIndex={tabStop === item.index ? 0 : -1}
                 onSelect={onSelect}
+                onSelectBeside={onSelectBeside}
                 onToggleTag={onToggleTag}
               />
             </li>

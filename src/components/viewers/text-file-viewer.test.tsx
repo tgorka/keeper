@@ -50,6 +50,7 @@ import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/not
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { type ViewerFile, viewerComponentFor } from "@/lib/viewers";
+import { TEXT_FILE_CAVEAT_TESTID } from "./text-file-frame";
 import { TEXT_FILE_NOTICE_SLOT, TextFileViewer } from "./text-file-viewer";
 
 /**
@@ -156,6 +157,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     absolutePath: "/Volumes/merope/inbox/config.json",
     sizeLabel: "412 bytes",
     openWith: null,
+    writeCaveat: null,
     ...overrides,
   };
 }
@@ -412,6 +414,39 @@ describe("saving goes through Story 45.3's one write path", () => {
     await editorHost();
 
     expect(screen.getByRole("status")).toHaveTextContent("keeper does not write Locked files");
+  });
+
+  it("shows AD-102's caveat before the first keystroke, and only when there is one", async () => {
+    // Story 46.14. A file no vault holds is now writable — keeper saves it
+    // through a second, plain writer — and the whole of what makes that
+    // honest is that the reader is told what is missing BEFORE editing, not
+    // after saving. Rust composes the sentence; this surface owes only that
+    // it is on screen with the editor, not instead of it.
+    const caveat =
+      "AGENTS.md is not one of keeper's notes — it is outside tgdrive's notes vault " +
+      "(10-notes). keeper saves it straight to the file and sends a delete to this " +
+      "computer's trash: no note history, no search index and no conflict copy. Nothing " +
+      "about how tgdrive syncs this folder changes.";
+    syncReadText.mockResolvedValue(vm({ text: "hello\n" }));
+
+    openThroughTheRegistry(
+      target({ name: "AGENTS.md", relativePath: "AGENTS.md", writeCaveat: caveat }),
+    );
+    const editor = await editorHost();
+
+    // Verbatim, never paraphrased — the same rule `reason` and `detail` follow.
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(caveat);
+    // And the editor is there: this is a caveat, not a refusal.
+    expect(editor).toBeInTheDocument();
+  });
+
+  it("says nothing standing about a file keeper does manage", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "hello\n" }));
+
+    openThroughTheRegistry(target({ relativePath: "10-notes/config.json" }));
+    await editorHost();
+
+    expect(screen.queryByTestId(TEXT_FILE_CAVEAT_TESTID)).toBeNull();
   });
 });
 

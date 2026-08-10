@@ -34,7 +34,14 @@ import {
   EXPORT_UNSUPPORTED_SENTENCE,
   exportTarget,
 } from "@/lib/export/export-target";
-import { notesEditorStore, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import {
+  adoptBodySubscription,
+  applyBodyBatch,
+  editBuffer,
+  openNoteDocument,
+  readNoteDocument,
+  resetNotesEditorStoreForTest,
+} from "@/lib/stores/notes-editor";
 
 /** A receipt shaped like the one Rust composes. Two written entries, always:
  *  a caller that reported only the first would pass a one-entry fixture. */
@@ -54,16 +61,24 @@ const FILE_RECEIPT = {
   summary: "Exported report.pdf to /Users/alice/Desktop.",
 };
 
-/** The store as it is for a note nobody has edited since it opened. */
+/**
+ * The store as it is for a note nobody has edited since it opened.
+ *
+ * The same three calls `useNotesBody` makes on mount, rather than a hand-built
+ * document: a document written straight into the store would have no reference
+ * count and no generation, and every reducer treats that as "nobody has this
+ * open" and ignores it.
+ */
 function openClean(vaultId = "v1", noteId = "n1"): void {
-  notesEditorStore.setState({
-    vaultId,
-    noteId,
-    subscriptionId: "sub-1",
-    base: "body",
-    text: "body",
+  openNoteDocument(vaultId, noteId);
+  adoptBodySubscription(vaultId, noteId, readNoteDocument(vaultId, noteId).generation, "sub-1");
+  applyBodyBatch(vaultId, noteId, {
+    kind: "reset",
     rev: "r1",
-    dirty: false,
+    path: "notes/Meeting.md",
+    frontmatter: "",
+    text: "body",
+    cursor: null,
   });
 }
 
@@ -111,7 +126,7 @@ describe("exporting a note", () => {
       return RECEIPT;
     });
     openClean();
-    notesEditorStore.setState({ text: "body and a new paragraph", dirty: true });
+    editBuffer("v1", "n1", "body and a new paragraph");
 
     const outcome = await exportTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
 
@@ -127,7 +142,7 @@ describe("exporting a note", () => {
       throw { code: "internal", message: "the disk is full" };
     });
     openClean();
-    notesEditorStore.setState({ text: "unsaved words", dirty: true });
+    editBuffer("v1", "n1", "unsaved words");
 
     const outcome = await exportTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
 
@@ -141,7 +156,7 @@ describe("exporting a note", () => {
     // Another note is open and dirty. Exporting a closed note must not save
     // that one's buffer, and must not be refused because of it.
     openClean("v1", "someone-else");
-    notesEditorStore.setState({ text: "their unsaved words", dirty: true });
+    editBuffer("v1", "someone-else", "their unsaved words");
 
     const outcome = await exportTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
 

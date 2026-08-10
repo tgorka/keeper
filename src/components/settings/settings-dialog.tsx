@@ -10,6 +10,7 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
+import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
 import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
@@ -228,6 +229,14 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
               (Story 34.14, DW-122). It renders itself away on a build with no
               folder sync at all. */}
       <SyncGitRow open={open} />
+      {/* Ungated, on every platform, and rendered even when nothing is
+          overridden (Story 46.7, AD-98). The layer stack is read by
+          `keeper_core::config`, which has no capability gate, and a section
+          that appeared only once a `keeper.toml` already existed would be
+          invisible to everyone who has not yet discovered that one is
+          possible. It is also where the faults land: a settings file that did
+          not parse sets nothing and looks exactly like one that works. */}
+      <ConfigSourceSection open={open} />
       <EncryptionSection />
       <SetupSection onOpenChange={onOpenChange} />
       <AboutSection open={open} />
@@ -291,12 +300,15 @@ function HonorRemoteDeletionsRow() {
     <div className="mt-1 flex flex-col gap-1.5 border-border border-t pt-3">
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor="honor-remote-deletions">Honor remote deletions locally</Label>
-        <Switch
-          id="honor-remote-deletions"
-          checked={enabled ?? false}
-          disabled={enabled === undefined}
-          onCheckedChange={onCheckedChange}
-        />
+        <div className="flex shrink-0 items-center gap-2">
+          <FileControlled settingKey="honor_remote_deletions" />
+          <Switch
+            id="honor-remote-deletions"
+            checked={enabled ?? false}
+            disabled={enabled === undefined}
+            onCheckedChange={onCheckedChange}
+          />
+        </div>
       </div>
       <p className="text-muted-foreground">{HONOR_REMOTE_DELETIONS_SENTENCE}</p>
     </div>
@@ -445,18 +457,24 @@ function NotificationsSection({ open }: { open: boolean }) {
       <p className="font-medium">Notifications</p>
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor="notify-previews">Show message previews</Label>
-        <Switch
-          id="notify-previews"
-          checked={enabled ?? false}
-          disabled={enabled === undefined}
-          onCheckedChange={onCheckedChange}
-        />
+        <div className="flex shrink-0 items-center gap-2">
+          <FileControlled settingKey="notify.previews_enabled" />
+          <Switch
+            id="notify-previews"
+            checked={enabled ?? false}
+            disabled={enabled === undefined}
+            onCheckedChange={onCheckedChange}
+          />
+        </div>
       </div>
       <p className="text-muted-foreground">{NOTIFY_PREVIEWS_SENTENCE}</p>
       {reducedPlatform && (
         <>
           <div className="mt-1 flex flex-col gap-2">
-            <Label>App icon badge</Label>
+            <div className="flex items-center gap-2">
+              <Label>App icon badge</Label>
+              <FileControlled settingKey="notify.dock_badge_mode" />
+            </div>
             <RadioGroup
               value={badgeMode ?? ""}
               onValueChange={onBadgeModeChange}
@@ -633,7 +651,10 @@ function BackgroundSection({ open }: { open: boolean }) {
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">Background &amp; dock</p>
       <div className="flex flex-col gap-2">
-        <Label>Dock badge</Label>
+        <div className="flex items-center gap-2">
+          <Label>Dock badge</Label>
+          <FileControlled settingKey="notify.dock_badge_mode" />
+        </div>
         <RadioGroup
           value={mode ?? ""}
           onValueChange={onModeChange}
@@ -668,12 +689,15 @@ function BackgroundSection({ open }: { open: boolean }) {
       {trayIcon && (
         <div className="flex items-center justify-between gap-2">
           <Label htmlFor="menu-bar-presence">Keep in menu bar</Label>
-          <Switch
-            id="menu-bar-presence"
-            checked={menuBar ?? false}
-            disabled={menuBar === undefined}
-            onCheckedChange={onMenuBarChange}
-          />
+          <div className="flex shrink-0 items-center gap-2">
+            <FileControlled settingKey="system.menu_bar_presence" />
+            <Switch
+              id="menu-bar-presence"
+              checked={menuBar ?? false}
+              disabled={menuBar === undefined}
+              onCheckedChange={onMenuBarChange}
+            />
+          </div>
         </div>
       )}
       <p className="text-muted-foreground">{BACKGROUND_QUIT_SENTENCE}</p>
@@ -792,26 +816,32 @@ function PrivacySection({ open }: { open: boolean }) {
       <p className="font-medium">Privacy</p>
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor="incognito-global">Incognito by default</Label>
-        <Switch
-          id="incognito-global"
-          checked={enabled ?? false}
-          disabled={enabled === undefined}
-          onCheckedChange={onCheckedChange}
-        />
+        <div className="flex shrink-0 items-center gap-2">
+          <FileControlled settingKey="incognito.global" />
+          <Switch
+            id="incognito-global"
+            checked={enabled ?? false}
+            disabled={enabled === undefined}
+            onCheckedChange={onCheckedChange}
+          />
+        </div>
       </div>
       <p className="text-muted-foreground">{INCOGNITO_GLOBAL_SENTENCE}</p>
       <div className="mt-1 flex items-center justify-between gap-2">
         <Label htmlFor="undo-send-window">Undo-Send window (seconds)</Label>
-        <Input
-          id="undo-send-window"
-          type="number"
-          min={0}
-          max={UNDO_SEND_WINDOW_MAX}
-          className="w-20"
-          value={undoWindow ?? ""}
-          disabled={undoWindow === undefined}
-          onChange={(e) => onWindowChange(e.target.value)}
-        />
+        <div className="flex shrink-0 items-center gap-2">
+          <FileControlled settingKey="undo_send.window" />
+          <Input
+            id="undo-send-window"
+            type="number"
+            min={0}
+            max={UNDO_SEND_WINDOW_MAX}
+            className="w-20"
+            value={undoWindow ?? ""}
+            disabled={undoWindow === undefined}
+            onChange={(e) => onWindowChange(e.target.value)}
+          />
+        </div>
       </div>
       <p className="text-muted-foreground">{UNDO_SEND_SENTENCE}</p>
     </div>
@@ -976,6 +1006,7 @@ function ShortcutsSection({ open }: { open: boolean }) {
       <div className="flex items-center justify-between gap-2">
         <Label>Summon keeper</Label>
         <div className="flex items-center gap-2">
+          <FileControlled settingKey="hotkey.global" />
           {capturing ? (
             <button
               type="button"
@@ -1137,6 +1168,7 @@ function RecordingShortcutRow({ open }: { open: boolean }) {
       <div className="flex items-center justify-between gap-2">
         <Label>Start / stop recording</Label>
         <div className="flex items-center gap-2">
+          <FileControlled settingKey="hotkey.recording" />
           {capturing ? (
             <button
               type="button"

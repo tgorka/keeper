@@ -49,7 +49,10 @@ import {
   FILES_NEW_FILE_LABEL,
   FILES_NEW_FILE_NAME_LABEL,
   FILES_NO_PROFILES_SENTENCE,
+  FILES_OPEN_BESIDE_LABEL,
+  FILES_OPEN_HERE_LABEL,
   FILES_OPEN_LABEL,
+  FILES_OPEN_SHORT_LABEL,
   FILES_PANE_TITLE,
   FILES_REFRESH_LABEL,
   FILES_REVEAL_LABEL,
@@ -72,6 +75,15 @@ import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/ov
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { formatFileSize } from "@/lib/file-size";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  FILES_TREE_COOKIE,
+  filesTreeCookie,
+  filesTreeStore,
+  hydrateFilesTree,
+  nodeKey,
+  readFilesTree,
+  resetFilesTreeForTest,
+} from "@/lib/stores/files-tree";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { type ListGeometry, withListGeometry, withTextLayout } from "@/test/layout";
@@ -171,7 +183,7 @@ function entry(
     // fixtures in this file — a file inside a vault keeper may write — because
     // most tests are not about writing and would otherwise all have to opt in.
     // The tests that ARE about it use `readOnly` below.
-    write: { writable: true, reason: null },
+    write: { writable: true, reason: null, caveat: null },
     ...extra,
   } as FilesEntryVm;
 }
@@ -204,7 +216,7 @@ function readOnly(name: string, reason = OUTSIDE_VAULT): FilesEntryVm {
     name,
     { status: "synced", detail: null },
     {
-      write: { writable: false, reason },
+      write: { writable: false, reason, caveat: null },
     },
   );
 }
@@ -214,7 +226,7 @@ function listed(
   subpath: string,
   entries: FilesEntryVm[],
   detail: string | null = null,
-  write: FilesListingVm["write"] = { writable: true, reason: null },
+  write: FilesListingVm["write"] = { writable: true, reason: null, caveat: null },
 ): FilesListingVm {
   return {
     profileId,
@@ -240,7 +252,7 @@ function notListed(
     detail,
     truncated: false,
     // A folder keeper could not read is not a folder keeper will write into.
-    write: { writable: false, reason: detail },
+    write: { writable: false, reason: detail, caveat: null },
   };
 }
 
@@ -270,6 +282,12 @@ beforeEach(() => {
     sync: true,
     revealInFileManager: true,
   });
+  // The expansion is a module-level store now (Story 46.3), so it outlives a
+  // `render` exactly as it outlives a mount in the app. Every test below that
+  // does not arrange it starts from nothing open.
+  resetFilesTreeForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: the store persists through the document, so clearing it is part of resetting this suite
+  document.cookie = `${FILES_TREE_COOKIE}=; path=/; max-age=0`;
 });
 
 afterEach(() => {
@@ -485,6 +503,7 @@ describe("FilesPane", () => {
       listed("01VAULT", "", [readOnly("outside.txt")], null, {
         writable: false,
         reason: OUTSIDE_VAULT,
+        caveat: null,
       }),
     );
     render(<FilesPane />);
@@ -1588,6 +1607,201 @@ describe("FilesPane — a row opens a panel", () => {
 });
 
 /**
+ * Story 46.13, FR-215 — a file row has a menu, and the three "open"s are named.
+ *
+ * The pane had three verbs and one label. A single click replaced what the active
+ * panel showed, a double click opened a second panel, and the row's own button
+ * handed the file to the operating system — and that last one, the only one with
+ * a name, was called `Open`. Two of the three were undiscoverable and the third
+ * did not say which it was.
+ *
+ * These tests are about the wording as much as the wiring: each item must do its
+ * own distinct thing, and no two of them may be confusable with each other.
+ */
+describe("FilesPane — the row's context menu", () => {
+  async function fileRow(): Promise<HTMLElement> {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [entry("readme.md", "file"), entry("notes.md", "file")]),
+    );
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(within(root).getByRole("button", { name: "Vault" }));
+    return await screen.findByRole("treeitem", { name: "readme.md" });
+  }
+
+  /** Right-click a row and let Radix mount the menu. */
+  async function openMenu(row: HTMLElement): Promise<HTMLElement> {
+    await act(async () => {
+      fireEvent.contextMenu(row);
+      await Promise.resolve();
+    });
+    return await screen.findByRole("menu");
+  }
+
+  beforeEach(() => {
+    resetPanelsStoreForTest();
+  });
+
+  it("names all three ways to open a file, and words them apart", async () => {
+    const menu = await openMenu(await fileRow());
+
+    const items = within(menu)
+      .getAllByRole("menuitem")
+      .map((item) => item.textContent);
+    expect(items).toEqual([FILES_OPEN_HERE_LABEL, FILES_OPEN_BESIDE_LABEL, FILES_OPEN_LABEL]);
+    // Worded apart is the deliverable, so it is asserted rather than assumed:
+    // three distinct strings, none of which is a prefix of another. A reader who
+    // has to guess which `Open` they pressed has not been told anything.
+    expect(new Set(items).size).toBe(3);
+    for (const one of items) {
+      for (const other of items) {
+        if (one !== other) {
+          expect(one?.startsWith(`${other} `)).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("replaces the active panel from the first item, without growing the list", async () => {
+    const row = await fileRow();
+    // Something ELSE already open first, and this is load-bearing rather than
+    // scene-setting: `openPanel` on an empty active panel fills it instead of
+    // appending, so against a fresh keeper the two verbs are indistinguishable
+    // and a test that started there would pass for either of them.
+    await click(screen.getByRole("treeitem", { name: "notes.md" }));
+    expect(panelsStore.getState().panels).toHaveLength(1);
+
+    const menu = await openMenu(row);
+    await click(within(menu).getByRole("menuitem", { name: FILES_OPEN_HERE_LABEL }));
+
+    // One panel, and what it holds was REPLACED. That is the whole difference
+    // between this item and the one below it.
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+      { kind: "file", profileId: "01VAULT", relativePath: "readme.md" },
+    ]);
+    expect(syncOpenEntry).not.toHaveBeenCalled();
+  });
+
+  it("opens a second panel from the second item, keeping what was open", async () => {
+    const row = await fileRow();
+    // Something already open, so "a new panel" has something to be new beside.
+    await click(screen.getByRole("treeitem", { name: "notes.md" }));
+
+    const menu = await openMenu(row);
+    await click(within(menu).getByRole("menuitem", { name: FILES_OPEN_BESIDE_LABEL }));
+
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+      { kind: "file", profileId: "01VAULT", relativePath: "notes.md" },
+      { kind: "file", profileId: "01VAULT", relativePath: "readme.md" },
+    ]);
+    expect(syncOpenEntry).not.toHaveBeenCalled();
+  });
+
+  it("leaves keeper entirely from the third item, and opens no panel at all", async () => {
+    const menu = await openMenu(await fileRow());
+
+    await click(within(menu).getByRole("menuitem", { name: FILES_OPEN_LABEL }));
+
+    // The one verb that is not about panels. Rust gets the profile id and the
+    // profile-relative subpath, never an absolute path (AD-65, FR-145).
+    expect(syncOpenEntry).toHaveBeenCalledWith("01VAULT", "readme.md");
+    expect(activePanel(panelsStore.getState()).target).toBeNull();
+  });
+
+  it("says the short word and answers to the long one on the row's own button", async () => {
+    const row = await fileRow();
+
+    // The row carries three text buttons and a name that has to truncate before
+    // they do, so the button shows `Open` — but a reader driving keeper by voice
+    // or by screen reader gets the whole verb, and the accessible name contains
+    // the visible label, which is what makes that safe (WCAG 2.5.3).
+    const button = within(row).getByRole("button", { name: FILES_OPEN_LABEL });
+    expect(button).toHaveTextContent(FILES_OPEN_SHORT_LABEL);
+    expect(button).toHaveAttribute("title", FILES_OPEN_LABEL);
+  });
+
+  it("offers no menu on a folder, whose gesture is expand and collapse", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("Notes", "folder")]));
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(expander(root));
+    const folder = await screen.findByRole("treeitem", { name: "Notes" });
+
+    await act(async () => {
+      fireEvent.contextMenu(folder);
+      await Promise.resolve();
+    });
+
+    // All three items are ways to open a FILE. A folder is not a panel target,
+    // so its menu would hold none of them — and an empty menu offered on a
+    // right-click is worse than the native one it suppressed.
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("offers no menu on a profile root either", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("readme.md", "file")]));
+    render(<FilesPane />);
+    const root = await screen.findByRole("treeitem", { name: "Vault" });
+
+    await act(async () => {
+      fireEvent.contextMenu(root);
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("opens the same menu on a phone-tier long press, not a second one", async () => {
+    // The house pattern's other half. `useLongPress` dispatches a synthetic
+    // `contextmenu` at the press point after 500ms stationary, which is the event
+    // the Radix trigger already listens for — so there is one menu and one visual
+    // language, and this test exists to prove the bridge is actually wired to the
+    // row rather than merely imported.
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: query.includes("prefers-reduced-motion") ? false : 390 <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+    try {
+      const row = await fileRow();
+
+      // Fake timers only around the hold: the queries above and below poll on
+      // real ones, which is why the pins-strip suite switches back before it
+      // asserts rather than mocking the clock for the whole test.
+      vi.useFakeTimers();
+      fireEvent.pointerDown(row, { pointerId: 1, clientX: 30, clientY: 30 });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      vi.useRealTimers();
+
+      const menu = await screen.findByRole("menu");
+      expect(
+        within(menu)
+          .getAllByRole("menuitem")
+          .map((item) => item.textContent),
+      ).toEqual([FILES_OPEN_HERE_LABEL, FILES_OPEN_BESIDE_LABEL, FILES_OPEN_LABEL]);
+    } finally {
+      vi.useRealTimers();
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+});
+
+/**
  * Story 45.3 — the files surface can write.
  *
  * AD-75 said it never could. AD-89 retired that, deliberately and by the owner,
@@ -1825,6 +2039,7 @@ describe("FilesPane — the write path", () => {
       listed("01FIELD", "", [readOnly("clip.mov")], null, {
         writable: false,
         reason: "Field holds no notes vault, so keeper will not change files in it.",
+        caveat: null,
       }),
     );
     render(<FilesPane />);
@@ -1963,7 +2178,7 @@ describe("FilesPane — attaching a selection to a note", () => {
     syncBrowse.mockResolvedValue(
       listed("01VAULT", "", [
         entry("report.pdf", "file", undefined, undefined, {
-          write: { writable: false, reason: OUTSIDE_VAULT },
+          write: { writable: false, reason: OUTSIDE_VAULT, caveat: null },
         }),
       ]),
     );
@@ -2064,5 +2279,189 @@ describe("FilesPane — attaching a selection to a note", () => {
         "/Users/alice/Vault/b.md",
       ]);
     });
+  });
+});
+
+/**
+ * Story 46.3 — the tree stays where you left it.
+ *
+ * The reported defect was that leaving the Files surface and coming back found
+ * every folder shut. `AppShell` renders this pane conditionally on the primary
+ * view, so looking at anything else unmounts it, and the expansion was
+ * `useState`. Every test here is about what survives that and what deliberately
+ * does not.
+ */
+describe("FilesPane — the tree stays where you left it", () => {
+  /** What the last run left behind: a real cookie, hydrated the way `AppShell`
+   *  does it, so these tests exercise the restore rather than the store. */
+  function remembered(keys: readonly string[]): void {
+    // biome-ignore lint/suspicious/noDocumentCookie: standing in for the write the last run made
+    document.cookie = filesTreeCookie(new Set(keys));
+    hydrateFilesTree(document.cookie);
+  }
+
+  /** One profile with a folder and a file in it, and a subfolder under that. */
+  function vaultTree(): void {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockImplementation((_id: string, subpath: string) =>
+      Promise.resolve(
+        subpath === ""
+          ? listed("01VAULT", "", [entry("Notes", "folder"), entry("readme.md", "file")])
+          : listed("01VAULT", subpath, [entry("2026", "folder", `${subpath}/2026`)]),
+      ),
+    );
+  }
+
+  it("comes back open after the surface unmounts it", async () => {
+    // The bug, exactly as reported: expand, leave Files, come back.
+    vaultTree();
+    const files = render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+
+    // Looking at Notes, or Sync, or anything else. There is no "hide" here —
+    // the shell genuinely unmounts the pane.
+    files.unmount();
+    render(<FilesPane />);
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+  });
+
+  it("re-reads the folder rather than restoring what it held", async () => {
+    // The listings are a cache of a disk keeper has not looked at since. They
+    // stay component state on purpose, so the second mount asks again.
+    vaultTree();
+    const files = render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await screen.findByRole("treeitem", { name: "Notes" });
+
+    files.unmount();
+    syncBrowse.mockClear();
+    render(<FilesPane />);
+
+    await waitFor(() => expect(syncBrowse).toHaveBeenCalledWith("01VAULT", ""));
+  });
+
+  it("opens the folders the last run left open", async () => {
+    vaultTree();
+    remembered([nodeKey("01VAULT", ""), nodeKey("01VAULT", "Notes")]);
+    render(<FilesPane />);
+
+    // Two levels deep, from a cookie, without a click.
+    expect(await screen.findByRole("treeitem", { name: "2026" })).toBeInTheDocument();
+    expect(syncBrowse).toHaveBeenCalledWith("01VAULT", "");
+    expect(syncBrowse).toHaveBeenCalledWith("01VAULT", "Notes");
+  });
+
+  it("drops a remembered folder whose profile is gone, and says nothing about it", async () => {
+    vaultTree();
+    remembered([nodeKey("01VAULT", ""), nodeKey("01GONE", ""), nodeKey("01GONE", "a")]);
+    render(<FilesPane />);
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+    // Nothing was asked of a folder keeper has forgotten...
+    await waitFor(() => expect(syncBrowse).toHaveBeenCalledTimes(1));
+    expect(syncBrowse).toHaveBeenCalledWith("01VAULT", "");
+    // ...nothing on screen mentions it — there is nothing the reader could do
+    // about a profile that no longer exists...
+    expect(screen.queryByText(/01GONE/)).toBeNull();
+    // ...and it is out of the cookie, or it would be a key nothing can clear.
+    expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")]));
+  });
+
+  it("asks only for the remembered folders that will be on screen", async () => {
+    // `Notes` is shut, so `Notes/2026` renders nowhere. Keeping it costs
+    // nothing; browsing for it would be an IPC call for a row with no home.
+    vaultTree();
+    remembered([nodeKey("01VAULT", ""), nodeKey("01VAULT", "Notes/2026")]);
+    render(<FilesPane />);
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+    await waitFor(() => expect(syncBrowse).toHaveBeenCalledTimes(1));
+    expect(syncBrowse).toHaveBeenCalledWith("01VAULT", "");
+  });
+
+  it("does not browse a paused folder, and does not forget it either", async () => {
+    syncProfiles.mockResolvedValue([
+      profile({ id: "01VAULT", name: "Vault" }),
+      profile({ id: "01OLD", name: "Old Archive", enabled: false }),
+    ]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("Notes", "folder")]));
+    remembered([nodeKey("01VAULT", ""), nodeKey("01OLD", "")]);
+    render(<FilesPane />);
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+    // A paused folder is one keeper is not watching; this pane does not list it.
+    await waitFor(() => expect(syncBrowse).toHaveBeenCalledTimes(1));
+    expect(syncBrowse).not.toHaveBeenCalledWith("01OLD", "");
+    // But pausing is not deleting, so its expansion is still remembered.
+    expect(readFilesTree(document.cookie).has(nodeKey("01OLD", ""))).toBe(true);
+  });
+
+  it("forgets a folder that was shut before the surface was left", async () => {
+    vaultTree();
+    const files = render(<FilesPane />);
+    const vault = await screen.findByRole("treeitem", { name: "Vault" });
+    await click(expander(vault));
+    await screen.findByRole("treeitem", { name: "Notes" });
+    await click(expander(screen.getByRole("treeitem", { name: "Vault" })));
+
+    files.unmount();
+    render(<FilesPane />);
+
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await waitFor(() => expect(screen.queryByRole("treeitem", { name: "Notes" })).toBeNull());
+  });
+
+  it("does not forget the tree because the profile list could not be read", async () => {
+    // A folder keeper could not ask about has not been deleted. The pane
+    // renders the same empty surface either way, so the expansion is the one
+    // place the difference can do damage — and forgetting it over a sync engine
+    // that was briefly unreachable would be worse than the bug being fixed.
+    syncProfiles.mockRejectedValue(new Error("the sync engine is not running"));
+    remembered([nodeKey("01VAULT", ""), nodeKey("01VAULT", "Notes")]);
+    render(<FilesPane />);
+
+    expect(await screen.findByText(FILES_NO_PROFILES_SENTENCE)).toBeInTheDocument();
+    const kept = new Set([nodeKey("01VAULT", ""), nodeKey("01VAULT", "Notes")]);
+    expect(filesTreeStore.getState().expanded).toEqual(kept);
+    expect(readFilesTree(document.cookie)).toEqual(kept);
+  });
+
+  it("restores on the first list it really gets, even when the first call failed", async () => {
+    vaultTree();
+    // The first call fails; the Refresh behind it succeeds.
+    syncProfiles.mockRejectedValueOnce(new Error("the sync engine is not running"));
+    remembered([nodeKey("01VAULT", "")]);
+    render(<FilesPane />);
+    await screen.findByText(FILES_NO_PROFILES_SENTENCE);
+
+    // Refresh is the way back from a surface that could not load, so the
+    // restore has to still be waiting when it works.
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+  });
+
+  it("waits for a real list before deciding a profile is gone", async () => {
+    // The other half of the same flag, and the half `refresh` hides: its own
+    // loop re-reads every open folder whatever happens, so the *loads* coming
+    // back proves nothing about whether the list was believed. The stale-drop
+    // is the only observable that does.
+    vaultTree();
+    syncProfiles.mockRejectedValueOnce(new Error("the sync engine is not running"));
+    remembered([nodeKey("01VAULT", ""), nodeKey("01GONE", "")]);
+    render(<FilesPane />);
+    await screen.findByText(FILES_NO_PROFILES_SENTENCE);
+
+    // Nothing learned, so nothing forgotten — not even the profile that really
+    // has gone. A failed call is not evidence.
+    expect(readFilesTree(document.cookie).has(nodeKey("01GONE", ""))).toBe(true);
+
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    await waitFor(() =>
+      expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")])),
+    );
   });
 });

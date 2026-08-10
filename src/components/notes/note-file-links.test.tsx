@@ -15,7 +15,7 @@
  * branch reachable only from the second host cannot be reached by tests that
  * all route through the first.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteRefVm, NoteVaultVm } from "@/lib/ipc/client";
 
@@ -55,11 +55,14 @@ vi.mock("@/lib/ipc/client", () => ({
   notesVaultSetActive: vi.fn(async () => {}),
 }));
 
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
+import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { SHOW_IN_FILES_LABEL } from "@/lib/vault-link";
 import { withRangeRects } from "@/test/layout";
+import { NOTE_ACTIONS_LABEL } from "./note-actions";
 import { LINK_NOTICE_SLOT, NoteEditor } from "./note-editor";
 
 /**
@@ -184,6 +187,53 @@ function noticeText(): string | null {
   return document.querySelector(`[data-slot="${LINK_NOTICE_SLOT}"]`)?.textContent ?? null;
 }
 
+/**
+ * Open the note's Actions menu and hand back its content.
+ *
+ * Story 46.5 moved `Show in Files` in here, which changes what an absence
+ * means: an item missing from a menu nobody opened is missing for a reason
+ * that has nothing to do with `filePathForNote`. Every read of this control —
+ * present or absent — goes through this helper, so the three absence tests
+ * below are asserting the predicate and not Radix's mounting.
+ *
+ * `pointerDown`/`pointerUp` rather than `click`: that is the pair Radix's
+ * trigger listens for, and the same two lines `note-actions.test.tsx:107` and
+ * `export-controls.test.tsx:149` press.
+ */
+async function openNoteActions(): Promise<HTMLElement> {
+  const trigger = await screen.findByRole("button", {
+    name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
+  });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.pointerUp(trigger, { button: 0 });
+  return await screen.findByRole("menu");
+}
+
+/**
+ * Press `Show in Files` from the menu.
+ *
+ * `getByRole("menuitem", …)` and not a bare name query: `SHOW_IN_FILES_LABEL`
+ * is a word that could plausibly name a region as well as a verb, and a name
+ * query that resolved to the wrong role would fail as "item missing" when the
+ * item was fine.
+ */
+async function pressShowInFiles(): Promise<void> {
+  const menu = await openNoteActions();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: SHOW_IN_FILES_LABEL }));
+}
+
+/**
+ * Assert `Show in Files` is not offered, from an OPEN menu — and prove the menu
+ * is open by finding a sibling that is unconditional. Without the sibling this
+ * reads `null` whether the predicate refused or the menu never mounted, which
+ * is an assertion that cannot fail.
+ */
+async function showInFilesIsNotOffered(): Promise<void> {
+  const menu = await openNoteActions();
+  expect(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+  expect(within(menu).queryByRole("menuitem", { name: SHOW_IN_FILES_LABEL })).toBeNull();
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resetPanelsStoreForTest();
@@ -192,7 +242,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null, cursor: null, path: null });
+  resetNotesEditorStoreForTest();
 });
 
 describe("a note knows its file", () => {
@@ -201,8 +251,8 @@ describe("a note knows its file", () => {
     openOn("# Meeting\n", "inbox/meeting.md");
     render(<NoteEditor vaultId="v1" noteId="n1" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Show in Files" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Show in Files" }));
+    await pressShowInFiles();
+    await pressShowInFiles();
 
     // The VALUE, not merely that something opened. The profile is the vault's,
     // and the path is the vault's subfolder joined with the note's own path —
@@ -228,7 +278,7 @@ describe("a note knows its file", () => {
     panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
     render(<NoteEditor vaultId="v1" noteId="n1" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Show in Files" }));
+    await pressShowInFiles();
 
     const targets = panelsStore.getState().panels.map((panel) => panel.target);
     expect(targets).toContainEqual({ kind: "note", vaultId: "v1", noteId: "n1" });
@@ -250,9 +300,7 @@ describe("a note knows its file", () => {
     // control here would compose a path against a vault nobody confirmed.
     openOn("# Meeting\n", "inbox/meeting.md");
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
-
-    expect(screen.queryByRole("button", { name: "Show in Files" })).toBeNull();
+    await showInFilesIsNotOffered();
   });
 
   it("offers nothing for a note whose profile carries no vault subfolder", async () => {
@@ -274,9 +322,7 @@ describe("a note knows its file", () => {
     ]);
     openOn("# Meeting\n", "inbox/meeting.md");
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
-
-    expect(screen.queryByRole("button", { name: "Show in Files" })).toBeNull();
+    await showInFilesIsNotOffered();
   });
 
   it("offers nothing before the note's own path has arrived", async () => {
@@ -288,10 +334,8 @@ describe("a note knows its file", () => {
     seedVaults();
     notesOpen.mockImplementation(async () => "sub-1");
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText("Properties");
-
-    expect(notesEditorStore.getState().path).toBeNull();
-    expect(screen.queryByRole("button", { name: "Show in Files" })).toBeNull();
+    await showInFilesIsNotOffered();
+    expect(readNoteDocument("v1", "n1").path).toBeNull();
   });
 });
 

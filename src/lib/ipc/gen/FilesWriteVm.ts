@@ -16,9 +16,16 @@
  * follows, for the same reason: a second copy of these words is a second copy
  * that will be edited once.
  *
- * `Some` exactly when `writable` is false. A refusal with no reason would be
- * a control that vanished with no explanation, which is the failure this whole
- * field exists to prevent.
+ * `reason` is `Some` exactly when `writable` is false. A refusal with no
+ * reason would be a control that vanished with no explanation, which is the
+ * failure this whole field exists to prevent.
+ *
+ * `caveat` is the third state Story 46.14 introduced, and it is not a second
+ * refusal: AD-102 gave keeper a second writer for files no vault holds, so a
+ * location can now be writable *and* unmanaged. The caveat is what the surface
+ * shows standing, BEFORE the first keystroke — an edit that quietly does less
+ * than the vault path does is strictly worse than the refusal it replaces.
+ * `Some` only when `writable`; the two are never both set.
  */
 export type FilesWriteVm = { 
 /**
@@ -28,4 +35,10 @@ writable: boolean,
 /**
  * Why not, as a whole sentence. `None` exactly when `writable`.
  */
-reason: string | null, };
+reason: string | null, 
+/**
+ * What keeper will not do for this file even though it will write it, as
+ * a whole sentence. `None` when keeper manages the file, and always
+ * `None` when `writable` is false.
+ */
+caveat: string | null, };

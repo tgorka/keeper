@@ -75,6 +75,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     absolutePath: "/Volumes/merope/2026/08/screen-0000.mov",
     sizeLabel: "4.3 MB",
     openWith: null,
+    writeCaveat: null,
     ...overrides,
   };
 }

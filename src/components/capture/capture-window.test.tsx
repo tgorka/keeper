@@ -30,9 +30,14 @@ vi.mock("@/lib/ipc/client", () => ({
   listenNotesCaptureWindows: (onChanged: () => void) => listenNotesCaptureWindows(onChanged),
 }));
 
-const saveOpenNote = vi.fn<() => Promise<boolean>>();
+/**
+ * Story 46.12: the save is addressed to a note. The spy takes the pair, so this
+ * file can assert that the window closing is the one whose note was written —
+ * which is the prop boundary it exists to guard, one level down.
+ */
+const saveNote = vi.fn<(vaultId: string, noteId: string) => Promise<boolean>>();
 vi.mock("@/hooks/use-notes-body", () => ({
-  saveOpenNote: () => saveOpenNote(),
+  saveNote: (vaultId: string, noteId: string) => saveNote(vaultId, noteId),
 }));
 
 /**
@@ -79,7 +84,7 @@ beforeEach(() => {
   notesCaptureWindows.mockResolvedValue([FIRST, SECOND]);
   notesCaptureClose.mockResolvedValue(undefined);
   notesCaptureSetLocked.mockResolvedValue(undefined);
-  saveOpenNote.mockResolvedValue(true);
+  saveNote.mockResolvedValue(true);
   listenNotesCaptureWindows.mockResolvedValue(() => {});
 });
 
@@ -205,7 +210,7 @@ describe("CaptureNoteWindow", () => {
 
   it("waits for the save to LAND before it closes", async () => {
     // Invocation order is not the contract and asserting it was a hole: `void
-    // saveOpenNote()` starts the save first and still lets the close fire while
+    // saveNote()` starts the save first and still lets the close fire while
     // the write is in flight, which passed an order assertion and survived a
     // mutation. This window is DESTROYED rather than hidden, so a write still
     // travelling when the webview goes away is the last 1.5 s of typing lost
@@ -214,7 +219,7 @@ describe("CaptureNoteWindow", () => {
     // initialised to `null` to `null` at the call site below, because the
     // assignment happens inside a callback it cannot order.
     const landed: { resolve: ((ok: boolean) => void) | null } = { resolve: null };
-    saveOpenNote.mockImplementation(
+    saveNote.mockImplementation(
       () =>
         new Promise<boolean>((resolve) => {
           landed.resolve = resolve;
@@ -223,7 +228,8 @@ describe("CaptureNoteWindow", () => {
     render(<CaptureNoteWindow vaultId="v1" noteId="n2" />);
     fireEvent.click(screen.getByRole("button", { name: CAPTURE_CLOSE_LABEL }));
     await waitFor(() => {
-      expect(saveOpenNote).toHaveBeenCalledTimes(1);
+      // Story 46.12: the write that gates this close is THIS window's note.
+      expect(saveNote).toHaveBeenCalledExactlyOnceWith("v1", "n2");
     });
     expect(notesCaptureClose).not.toHaveBeenCalled();
     landed.resolve?.(true);
@@ -239,11 +245,11 @@ describe("CaptureNoteWindow", () => {
     // over a write Rust refused takes the webview, the buffer and the unsaved
     // text with it, and says nothing — because the only surface that could have
     // said anything is the one that just vanished.
-    saveOpenNote.mockResolvedValue(false);
+    saveNote.mockResolvedValue(false);
     render(<CaptureNoteWindow vaultId="v1" noteId="n2" />);
     fireEvent.click(screen.getByRole("button", { name: CAPTURE_CLOSE_LABEL }));
     await waitFor(() => {
-      expect(saveOpenNote).toHaveBeenCalledTimes(1);
+      expect(saveNote).toHaveBeenCalledTimes(1);
     });
     expect(notesCaptureClose).not.toHaveBeenCalled();
     // Still on screen, with the words still in it. The reason is already
@@ -252,7 +258,7 @@ describe("CaptureNoteWindow", () => {
     // And Escape does not get a second bite at throwing them away either.
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => {
-      expect(saveOpenNote).toHaveBeenCalledTimes(2);
+      expect(saveNote).toHaveBeenCalledTimes(2);
     });
     expect(notesCaptureClose).not.toHaveBeenCalled();
   });

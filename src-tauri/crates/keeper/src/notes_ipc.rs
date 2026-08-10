@@ -3614,8 +3614,24 @@ pub async fn notes_body_write(
 /// keeper looked for. The candidate list and the sentence come from the same
 /// module so the words cannot describe a search this loop did not run.
 fn embed_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError> {
-    let candidates = embed::candidates(target, ATTACHMENTS_DIR);
-    for rel in &candidates {
+    match embed_path_opt(vault, target) {
+        Some(found) => Ok(found),
+        None => Err(notes_error(NotesError::NotFound(embed::not_found_notice(
+            target,
+            &embed::candidates(target, ATTACHMENTS_DIR),
+        )))),
+    }
+}
+
+/// The same resolution, answering `None` rather than a sentence.
+///
+/// Split out for [`notes_embed_paths`] (Story 46.11), which asks about a list of
+/// targets and wants one answer per target rather than the first refusal. There
+/// is no second resolver: a panel that decided for itself which file an embed
+/// names would list one file where the viewer opens another and the export
+/// carries a third.
+fn embed_path_opt(vault: &Vault, target: &str) -> Option<(String, PathBuf)> {
+    for rel in embed::candidates(target, ATTACHMENTS_DIR) {
         // `contained_read` is the whole containment check and it is stricter
         // than "inside the vault": it refuses `..`, canonicalises so a symlink
         // out of the vault cannot escape, and — because it stats with
@@ -3629,16 +3645,12 @@ fn embed_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError
         // The `is_file` filter is therefore belt-and-braces, and deliberately
         // kept: it makes this function's precondition true on its own terms
         // rather than by depending on which `stat` another module chose.
-        if let Some(path) =
-            crate::note_protocol::contained_read(vault, rel).filter(|candidate| candidate.is_file())
-        {
-            return Ok((rel.clone(), path));
+        let found = crate::note_protocol::contained_read(vault, &rel);
+        if let Some(path) = found.filter(|candidate| candidate.is_file()) {
+            return Some((rel, path));
         }
     }
-    Err(notes_error(NotesError::NotFound(embed::not_found_notice(
-        target,
-        &candidates,
-    ))))
+    None
 }
 
 /// Read a CSV attachment as text, or refuse in a sentence.
@@ -3786,6 +3798,53 @@ pub async fn notes_embed_read(vault_id: String, target: String) -> Result<NoteEm
         notes_error(NotesError::NotFound(format!("{rel}: {error}")))
     })?;
     Ok(embed::describe(rel, file))
+}
+
+/// Which of these embed targets this vault actually holds (Story 46.11).
+///
+/// **The panel named Attachments needed a containment check and had none.**
+/// Story 46.2 gave it a purely syntactic reader — an embed under `attachments/`
+/// is an attachment — because the webview holds the *unsaved* buffer and has no
+/// disk, and because the only attach path at the time copied every file into
+/// that folder. Story 46.11 makes an in-vault attach point at the file where it
+/// already lives, so the prefix stopped being the test: what makes a row is that
+/// the note embeds a file and the vault holds it, wherever it lives (epic 46's
+/// spine). "The vault holds it" is a `stat`, and this is the `stat`.
+///
+/// **One resolver, not a second one.** [`embed_path_opt`] is the same function
+/// [`notes_embed_read`], [`notes_csv_read`] and the `keeper-note://` protocol
+/// resolve through, and it is `embed::candidates` order — so the panel lists the
+/// file the viewer opens and `export::plan` carries. A reader that re-derived
+/// the candidates in the webview would be the second answer to one question that
+/// AD-103 and this story both exist to remove.
+///
+/// One answer per target, in the order asked, `None` for a target the vault does
+/// not hold. Never a rejection for a missing file: "this note embeds something
+/// that is not here" is a fact the surface must render, and a rejected promise
+/// gives it nothing to render — and one moved photograph must not blank the rest
+/// of the list.
+///
+/// No sentence comes back, unlike [`embed_path`]'s refusal. The caller is
+/// looking at a list of rows rather than at one broken embed, and Story 45.12
+/// already says which paths keeper tried, at the embed, where the person is
+/// pointing.
+#[tauri::command]
+pub async fn notes_embed_paths(
+    vault_id: String,
+    targets: Vec<String>,
+) -> Result<Vec<Option<String>>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    // Blocking: `contained_read` canonicalises, which stats every component, and
+    // a note may embed a dozen files. On the async runtime that would stall
+    // every other command on this thread for as long as the slowest volume takes.
+    tokio::task::spawn_blocking(move || {
+        targets
+            .iter()
+            .map(|target| embed_path_opt(&vault, target).map(|(rel, _)| rel))
+            .collect()
+    })
+    .await
+    .map_err(|error| notes_error(NotesError::Name(format!("embed paths: {error}"))))
 }
 
 /// Write an embedded file's raw bytes back (Story 45.12, FR-187).
@@ -4438,8 +4497,9 @@ pub async fn notes_capture_open(
 /// else is left on screen — is
 /// [`keeper_core::capture::plan_close`]'s decision, not this command's.
 ///
-/// The window's position is written down on the way out. This is the moment a
-/// placement is persisted, rather than on every `Moved` event, because a drag
+/// The window's geometry is written down on the way out — where it was, and
+/// since Story 46.15 how big the user made it. This is the moment a placement
+/// is persisted, rather than on every `Moved`/`Resized` event, because a drag
 /// emits one event per compositor frame and a settings write per frame would
 /// put a sqlite transaction inside a gesture.
 #[cfg(desktop)]
@@ -4449,22 +4509,32 @@ pub async fn notes_capture_close(
     state: State<'_, AppState>,
     key: String,
 ) -> Result<(), IpcError> {
-    let position = crate::notes_window::close(&app, &key);
-    remember_placement(state.platform.as_ref(), &key, position);
+    let geometry = crate::notes_window::close(&app, &key);
+    remember_placement(state.platform.as_ref(), &key, geometry);
     // Dismissing a capture is how a captured thought most often ends, so the
     // vault's commit cadence is forced here rather than waited for (AD-62).
     notes_vault::flush();
     Ok(())
 }
 
-/// Lock or unlock the capture window `key` (Story 45.15, FR-192, UX-DR77).
+/// Lock or unlock the capture window `key` (Story 45.15, FR-192, UX-DR77;
+/// Story 46.15).
 ///
-/// Locked is keeper's placement and an immovable window; unlocked is the user's
-/// and a draggable one. The current position is snapshotted on **either**
-/// transition rather than only on a drag, because a person who unlocks a window
-/// and never moves it has still said "this is where it goes", and a person who
-/// locks one after moving it has said "keep it *there*" — locking is not a
-/// discard button.
+/// Locked is keeper's geometry and a window the user can neither move nor
+/// resize; unlocked is the user's, and a window they can do both to. The
+/// current position and size are snapshotted on **either** transition rather
+/// than only on a gesture, because a person who unlocks a window and never
+/// touches it has still said "this is where it goes", and a person who locks
+/// one after moving and resizing it has said "keep it *there*" — locking is not
+/// a discard button.
+///
+/// The live window is updated after the write, so the toggle takes effect
+/// without a reopen. That is visible on lock: the window snaps back to keeper's
+/// own 560×340 while keeping its position, which is deliberate. A locked window
+/// IS keeper's size, and the alternative is a window that looks one size now
+/// and jumps to another the next time it opens — the same surprise, delivered
+/// later and unattached to the click that caused it. The remembered size is
+/// kept, so unlocking restores it.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn notes_capture_set_locked(
@@ -4476,12 +4546,15 @@ pub async fn notes_capture_set_locked(
     let data_dir = capture_data_dir(state.platform.as_ref())?;
     let stored = keeper_core::registry::get_capture_placement(&data_dir, &key)
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    let live = crate::notes_window::geometry_of(&app, &key);
     let placement = keeper_core::capture::Placement {
         locked,
-        position: crate::notes_window::position_of(&app, &key).or(stored.position),
+        position: live.position.or(stored.position),
+        size: live.size.or(stored.size),
     };
     keeper_core::registry::set_capture_placement(&data_dir, &key, &placement)
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    crate::notes_window::adopt_placement(&app, &key, placement);
     crate::notes_window::announce(&app);
     Ok(())
 }
@@ -4507,31 +4580,38 @@ pub async fn notes_capture_windows(
     }))
 }
 
-/// Write down where a capture window is, keeping whatever the lock says.
+/// Write down where a capture window is and how big it is, keeping whatever the
+/// lock says.
 ///
-/// Called on the way out of a window and on blur, so a position survives a
-/// quit that nobody asked politely for. Never fails a caller: a placement that
-/// could not be stored costs the user a remembered position, and refusing to
+/// Called on the way out of a window and on blur, so a geometry survives a quit
+/// that nobody asked politely for. Never fails a caller: a placement that could
+/// not be stored costs the user a remembered position and size, and refusing to
 /// close a window over it would cost them the window.
+///
+/// A half-answer is written: a platform that reports a size but not a position
+/// still gets its size remembered, because the two are independent facts and
+/// discarding the readable one would make an unrelated platform quirk look like
+/// a bug in the resize. Neither known is nothing to write.
 #[cfg(desktop)]
 pub(crate) fn remember_placement(
     platform: &dyn keeper_core::platform::Platform,
     key: &str,
-    position: Option<(i32, i32)>,
+    geometry: crate::notes_window::Geometry,
 ) {
-    let Some(position) = position else {
+    if geometry.position.is_none() && geometry.size.is_none() {
         return;
-    };
+    }
     let Ok(data_dir) = platform.data_dir() else {
         return;
     };
     let stored = keeper_core::registry::get_capture_placement(&data_dir, key).unwrap_or_default();
     let placement = keeper_core::capture::Placement {
         locked: stored.locked,
-        position: Some(position),
+        position: geometry.position.or(stored.position),
+        size: geometry.size.or(stored.size),
     };
     if let Err(error) = keeper_core::registry::set_capture_placement(&data_dir, key, &placement) {
-        tracing::warn!(%error, %key, "notes: could not remember the capture window's position");
+        tracing::warn!(%error, %key, "notes: could not remember the capture window's geometry");
     }
 }
 

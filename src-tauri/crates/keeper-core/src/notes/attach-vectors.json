@@ -1,5 +1,5 @@
 {
-  "_": "The contract between keeper_core::notes::attach::embedded_attachment_names and its TypeScript mirror src/lib/notes/attach.ts (Story 45.13, FR-188, FR-189). Both test suites load this file. `embedded` is the sorted, lower-cased set of file names the body already EMBEDS. Adding a vector is how you widen the rule; changing one is a product decision about when keeper refuses to attach a file twice.",
+  "_": "The contract between keeper_core and its TypeScript mirror src/lib/notes/attach.ts. Both test suites load this file. `vectors` pins notes::attach::embedded_attachment_names (Story 45.13, FR-188, FR-189): `embedded` is the sorted, lower-cased set of file names the body already EMBEDS. `noteTargets` pins notes::export::names_a_note (Story 46.11): `isNote` is whether an embed target names a NOTE rather than a file to attach — the rule that decides both what the Attachments panel lists and what the in-vault chooser offers, and the rule export::plan uses to decide what an export carries. Adding a vector is how you widen a rule; changing one is a product decision.",
   "vectors": [
     {
       "body": "",
@@ -116,5 +116,43 @@
       "embedded": ["a.png", "b.png"],
       "why": "two embeds with nothing between them are two embeds"
     }
+  ],
+  "noteTargets": [
+    { "target": "photo.png", "isNote": false, "why": "an extension that is not md is a file" },
+    { "target": "attachments/photo.png", "isNote": false, "why": "the folder is not the test" },
+    {
+      "target": "photos/holiday.png",
+      "isNote": false,
+      "why": "nor is any other folder — Story 46.11 attaches a file where it already lives"
+    },
+    { "target": "daily.md", "isNote": true, "why": "an explicit note" },
+    { "target": "notes/2026/daily.MD", "isNote": true, "why": "the extension is folded" },
+    {
+      "target": "Other Note",
+      "isNote": true,
+      "why": "a wikilink with no extension names a note by its title, so it is a note by construction"
+    },
+    {
+      "target": "notes/2026/daily",
+      "isNote": true,
+      "why": "still title-shaped with folders in front of it"
+    },
+    {
+      "target": "photo.png/index",
+      "isNote": true,
+      "why": "the test is on the LAST segment: a folder called photo.png must not make its contents look like an image"
+    },
+    { "target": "notes.d/photo.png", "isNote": false, "why": "the same rule the other way round" },
+    {
+      "target": ".gitignore",
+      "isNote": false,
+      "why": "a dotfile needs no special case: the extension is gitignore, which is not md"
+    },
+    {
+      "target": ".hidden.md",
+      "isNote": true,
+      "why": "a hidden markdown file is a note by every other rule in this codebase"
+    },
+    { "target": "report.PDF", "isNote": false, "why": "any other extension, folded, is a file" }
   ]
 }

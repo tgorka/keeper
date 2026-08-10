@@ -52,7 +52,9 @@ const SHELL_LIB = readFileSync(
  * the first assertion below is what keeps that true.
  */
 const invoked = [
-  ...new Set([...CLIENT.matchAll(/invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"/g)].map(([, name]) => name)),
+  ...new Set(
+    [...CLIENT.matchAll(/invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"/g)].map(([, name]) => name),
+  ),
 ].sort();
 
 /**

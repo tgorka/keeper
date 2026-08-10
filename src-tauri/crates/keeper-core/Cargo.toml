@@ -59,3 +59,10 @@ globset = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
 flate2 = { workspace = true }
+# The layer stack's on-disk format (Story 46.6, AD-98/AD-99). Already resolved
+# in Cargo.lock as `keeper-syncd`'s profile-config parser, so this adds no new
+# package to the tree, and it is the same parser the daemon's `[[profile]]`
+# tables go through — one TOML dialect across the product, not two. MIT OR
+# Apache-2.0, and it drags in neither tauri nor gix, so `check:core-tauri-free`
+# and `check:core-sync-free` stay green.
+toml = { workspace = true }

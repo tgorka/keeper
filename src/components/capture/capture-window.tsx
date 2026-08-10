@@ -35,7 +35,7 @@ import { Lock, LockOpen, X } from "lucide-react";
 import { useCallback, useEffect } from "react";
 import { CaptureDocument } from "@/components/capture/capture-document";
 import { Button } from "@/components/ui/button";
-import { saveOpenNote } from "@/hooks/use-notes-body";
+import { saveNote } from "@/hooks/use-notes-body";
 import { captureKey } from "@/lib/capture-target";
 import { type CaptureTargetVm, listenNotesCaptureWindows } from "@/lib/ipc/client";
 import {
@@ -49,10 +49,27 @@ import {
 /** The accessible name of the way out. */
 export const CAPTURE_CLOSE_LABEL = "Close this capture window";
 
-/** The accessible name of the lock, when the window is keeper-placed. */
-export const CAPTURE_UNLOCK_LABEL = "Unlock this window so it can be moved";
+/**
+ * The accessible name of the lock, when the window is keeper-placed.
+ *
+ * Both verbs, since Story 46.15. The wording is still the module's rule —
+ * promise only what the platform can deliver — and this control now delivers
+ * two things: the drag region below, and `set_resizable` on the Rust side.
+ * Naming only the move would leave the resize undiscoverable, which is how it
+ * came to be asked for in the first place. What is still NOT promised is the
+ * restore: `set_position` is the call a Wayland compositor may refuse
+ * (UX-DR43), so the label says nothing about remembering.
+ */
+export const CAPTURE_UNLOCK_LABEL = "Unlock this window so it can be moved and resized";
 
-/** The accessible name of the lock, when the window is where the user put it. */
+/**
+ * The accessible name of the lock, when the window is where the user put it.
+ *
+ * "Where it is" and not "as it is": locking keeps the position and returns the
+ * window to keeper's own size, which is what `Placement::window_size` does with
+ * a locked placement. The size is remembered, not discarded — unlocking brings
+ * it back — but the label must not imply the current size survives the click.
+ */
 export const CAPTURE_LOCK_LABEL = "Lock this window where it is";
 
 export interface CaptureWindowChromeProps {
@@ -192,7 +209,7 @@ export function useCaptureDismissKeys(onDismiss: () => void): void {
  * Dismissal **saves first, is awaited, and is CHECKED**, and the check is the
  * part that took a second pair of eyes (W3Capture, 45.14, from W3NoteFile's
  * shape): `await` is not a success test when the callee catches its own
- * failure. `saveOpenNote` catches — the editor's caption is fed from the same
+ * failure. `saveNote` catches — the editor's caption is fed from the same
  * store — so awaiting it proves only that it finished, not that the bytes
  * landed.
  *
@@ -214,12 +231,15 @@ export function CaptureNoteWindow({ vaultId, noteId }: { vaultId: string; noteId
   const key = captureKey(target);
   const dismiss = useCallback(() => {
     void (async () => {
-      if (!(await saveOpenNote())) {
+      // Story 46.12: named, not "the open note". This window's editor is over
+      // exactly this note, and the save that gates the close has to be that
+      // note's save rather than whichever one a module singleton was holding.
+      if (!(await saveNote(vaultId, noteId))) {
         return;
       }
       await closeCaptureWindow(key);
     })();
-  }, [key]);
+  }, [key, vaultId, noteId]);
   useCaptureDismissKeys(dismiss);
 
   return (

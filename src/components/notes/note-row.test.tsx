@@ -46,6 +46,7 @@ function renderRow(order: NoteOrder) {
       selected={false}
       tabIndex={0}
       onSelect={vi.fn()}
+      onSelectBeside={vi.fn()}
       onToggleTag={vi.fn()}
     />,
   );

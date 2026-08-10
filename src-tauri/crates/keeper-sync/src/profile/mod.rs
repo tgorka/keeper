@@ -9,7 +9,18 @@
 //! into the app's `config.json` override namespace, and into `keeper-syncd`'s
 //! TOML config (Story 30.2). The same table must mean the same thing in all
 //! three, so defaults live here and nowhere else.
+//!
+//! # There is one profile↔TOML mapping, and it is here
+//!
+//! [`accepted_profile_keys`], [`canonical_key`] and [`canonical_profile_fields`]
+//! were `keeper-syncd`'s until Story 46.8 gave a folder its own
+//! `.keeper/keeper.toml` (AD-99). Two readers of one shape is how a key comes
+//! to mean two things, so the daemon's `[[profile]]` table and a folder's
+//! `[folder]` table are canonicalized by the same three functions, against a
+//! key set *derived from [`SyncProfile`]* rather than listed. See
+//! [`folder`] for what a folder file may and may not carry.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +28,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{Result, SyncError},
     provenance,
+};
+
+pub mod folder;
+
+pub use folder::{
+    as_stored, folder_faults, folder_field_rule, in_force, install_folder_tier,
+    installed_folder_tier, FolderFault, FolderFieldRule, FolderOutcome, FolderTier,
+    FOLDER_CONFIG_DIR,
 };
 
 /// Which way changes are allowed to flow.
@@ -895,6 +914,86 @@ impl SyncProfile {
     }
 }
 
+/// Every key a profile table may carry, derived from [`SyncProfile`].
+///
+/// Derived, not listed. A hand-maintained list is a list that goes stale the
+/// first time the engine gains a field, and the failure mode is the worst one
+/// available: the daemon rejects a profile the app just wrote.
+///
+/// Shared by `keeper-syncd`'s `[[profile]]` tables and by a folder's own
+/// `[folder]` table. What a *folder* may set is a strictly narrower question,
+/// answered by [`folder_field_rule`] against this same set.
+pub fn accepted_profile_keys() -> Result<BTreeSet<String>> {
+    let probe = SyncProfile::new("id", "name", "/", "remote");
+    let value = serde_json::to_value(&probe).map_err(|err| {
+        SyncError::Config(format!("cannot enumerate the accepted profile keys: {err}"))
+    })?;
+    match value {
+        serde_json::Value::Object(map) => Ok(map.into_iter().map(|(key, _)| key).collect()),
+        _ => Err(SyncError::Config(
+            "cannot enumerate the accepted profile keys: a profile is not an object".to_owned(),
+        )),
+    }
+}
+
+/// Fold a snake_case key onto the camelCase spelling [`SyncProfile`] uses.
+///
+/// TOML convention is snake_case and the profile schema is camelCase (it is the
+/// app's JSON schema). Accepting both keeps the 1:1 copy-a-table promise while
+/// not making anyone write `localPath` in a `.toml` file.
+pub fn canonical_key(key: &str) -> String {
+    if !key.contains('_') {
+        return key.to_owned();
+    }
+    let mut out = String::with_capacity(key.len());
+    for (index, part) in key.split('_').filter(|part| !part.is_empty()).enumerate() {
+        let mut chars = part.chars();
+        match chars.next() {
+            None => {}
+            Some(first) if index == 0 => {
+                out.push(first);
+                out.push_str(chars.as_str());
+            }
+            Some(first) => {
+                out.extend(first.to_uppercase());
+                out.push_str(chars.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Fold a table of profile fields onto the canonical spellings, refusing a key
+/// [`SyncProfile`] does not have and a key given twice under two spellings.
+///
+/// Errors carry **no positional prefix**: the daemon names the `[[profile]]`
+/// table and its index, the folder tier names the file, and neither wants the
+/// other's sentence. Both wrap the message they get here.
+pub fn canonical_profile_fields(
+    fields: serde_json::Map<String, serde_json::Value>,
+    accepted: &BTreeSet<String>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut canonical = serde_json::Map::with_capacity(fields.len());
+    for (key, field) in fields {
+        let name = canonical_key(&key);
+        if !accepted.contains(&name) {
+            return Err(SyncError::Config(format!(
+                "unknown key `{key}`; accepted keys are {}",
+                accepted.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        if canonical.insert(name.clone(), field).is_some() {
+            // `local_path` and `localPath` in one table: the survivor would
+            // depend on map ordering, so refuse rather than pick.
+            return Err(SyncError::Config(format!(
+                "key `{name}` is given twice \
+                 (camelCase and snake_case spellings are the same key)"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +1005,54 @@ mod tests {
             "/home/u/tgdrive",
             "https://git.example/u/tgdrive.git",
         )
+    }
+
+    /// Moved here from `keeper-syncd` when the folder tier became the second
+    /// caller (Story 46.8). TOML convention is snake_case and the profile
+    /// schema is the app's camelCase JSON one; both spellings are one key, in
+    /// a `[[profile]]` table and in a `[folder]` table alike.
+    #[test]
+    fn canonical_key_folds_snake_case_onto_the_profile_schema() {
+        assert_eq!(canonical_key("lfs_threshold_bytes"), "lfsThresholdBytes");
+        assert_eq!(canonical_key("localPath"), "localPath");
+        assert_eq!(canonical_key("id"), "id");
+        assert_eq!(canonical_key("subpaths"), "subpaths");
+    }
+
+    /// The accepted set is derived from the type, so it cannot go stale when a
+    /// field is added — which is the whole reason it is not a list.
+    #[test]
+    fn the_accepted_key_set_is_every_serialized_profile_field() {
+        let keys = accepted_profile_keys().expect("keys");
+        let serialized = serde_json::to_value(profile()).expect("serialize");
+        let expected: BTreeSet<String> = serialized
+            .as_object()
+            .expect("a profile is an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys, expected);
+        assert!(keys.contains("localPath") && keys.contains("lfsThresholdBytes"));
+    }
+
+    /// One key under two spellings has no defensible winner: the survivor would
+    /// depend on map ordering, so both callers refuse rather than pick.
+    #[test]
+    fn one_key_under_two_spellings_is_refused_rather_than_resolved() {
+        let accepted = accepted_profile_keys().expect("keys");
+        let mut fields = serde_json::Map::new();
+        fields.insert("local_path".to_owned(), serde_json::json!("/a"));
+        fields.insert("localPath".to_owned(), serde_json::json!("/b"));
+        let err = canonical_profile_fields(fields, &accepted).expect_err("refused");
+        assert!(err.to_string().contains("given twice"), "{err}");
+
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("remoteUrll".to_owned(), serde_json::json!("/a"));
+        let err = canonical_profile_fields(unknown, &accepted).expect_err("refused");
+        assert!(
+            err.to_string().contains("unknown key `remoteUrll`"),
+            "{err}"
+        );
     }
 
     #[test]

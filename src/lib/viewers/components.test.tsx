@@ -48,6 +48,7 @@ function file(overrides: Partial<ViewerFile> = {}): ViewerFile {
     absolutePath: "/Volumes/merope/inbox/board.sketchpad",
     sizeLabel: "1.2 MB",
     openWith: null,
+    writeCaveat: null,
     ...overrides,
   };
 }

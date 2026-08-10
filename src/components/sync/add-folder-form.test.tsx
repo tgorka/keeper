@@ -39,7 +39,6 @@ import {
   SYNC_PATH_FIXED_NOTE,
   SYNC_POLL_LABEL,
   SYNC_RECORDINGS_LABEL,
-  SYNC_RECORDINGS_SUBFOLDER_LABEL,
   SYNC_RECORDINGS_SUBFOLDER_NOTE,
   SYNC_REMOTE_URL_LABEL,
   SYNC_REMOVABLE_LABEL,
@@ -70,7 +69,7 @@ import {
   syncSetCredential,
   syncStatuses,
 } from "@/lib/ipc/client";
-import { resetSyncStoreForTest } from "@/lib/stores/sync";
+import { resetSyncStoreForTest, SYNC_RECORDINGS_SUBFOLDER_LABEL } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest, syncDetailStore } from "@/lib/stores/sync-detail";
 
 const mockSave = vi.mocked(syncProfileSave);

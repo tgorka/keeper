@@ -24,9 +24,11 @@ vi.mock("@/lib/ipc/client", () => ({
 import {
   PANEL_CLOSE_LABEL,
   PANEL_EMPTY_SENTENCE,
+  PANEL_FOLD_LABEL,
   PANEL_REASON_TESTID,
   PANEL_STRIP_LABEL,
   PANEL_TESTID,
+  PANEL_UNFOLD_LABEL,
   PANEL_UNSUPPORTED_SENTENCE,
   PanelStrip,
   panelFileGoneSentence,
@@ -51,6 +53,10 @@ function entry(name: string, relativePath = name): FilesEntryVm {
     absolutePath: `/Users/alice/Vault/${relativePath}`,
     kind: "file",
     sync: { status: "synced", detail: null },
+    // Rust sends a write verdict on every row, so a fixture without one is a
+    // fixture no listing could produce — and `FilePanelBody` reads it to tell the
+    // viewer whether keeper manages this file (Story 46.14).
+    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
   } as FilesEntryVm;
 }
 
@@ -61,7 +67,7 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
     // 45.3's create-in-here verdict. These fixtures are panel-rendering
     // fixtures, so the location deliberately refuses: a panel must render a
     // listing identically whether or not the folder happens to be writable.
-    write: { writable: false, reason: "This folder is outside a notes vault." },
+    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
     state: "listed",
     entries,
     detail: null,
@@ -225,7 +231,7 @@ describe("the panel strip", () => {
     syncBrowse.mockResolvedValue({
       profileId: "p1",
       subpath: "docs",
-      write: { writable: false, reason: "This folder is outside a notes vault." },
+      write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
       state: "mediaAbsent",
       entries: null,
       detail: DRIVE_IS_OUT,
@@ -384,5 +390,127 @@ describe("the panel strip's close control", () => {
       profileId: "p1",
       relativePath: "c.md",
     });
+  });
+});
+
+describe("the panel strip's fold control", () => {
+  /** Open two file panels and return their ids, left to right. */
+  async function twoPanels(): Promise<[string, string]> {
+    syncBrowse.mockResolvedValue(listed("", [entry("a.md"), entry("b.md")]));
+    const state = panelsStore.getState();
+    state.setActiveTarget({ kind: "file", profileId: "p1", relativePath: "a.md" });
+    state.openPanel({ kind: "file", profileId: "p1", relativePath: "b.md" });
+    await mount();
+    const [first, second] = panelsStore.getState().panels;
+    if (first === undefined || second === undefined) {
+      throw new Error("expected two panels");
+    }
+    return [first.id, second.id];
+  }
+
+  it("folds a panel away, and the body goes with it", async () => {
+    const [firstId] = await twoPanels();
+    const frame = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
+    // The body really was there first, so its absence below is the fold's doing
+    // and not a panel that never resolved.
+    expect(frame.children).toHaveLength(2);
+
+    await act(async () => {
+      fireEvent.click(within(frame).getByRole("button", { name: PANEL_FOLD_LABEL }));
+      await Promise.resolve();
+    });
+
+    const folded = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
+    // The body is UNMOUNTED, not hidden. A body kept alive behind `hidden` would
+    // keep its listing, its subscription and its editor buffer — the cost the
+    // reader was reclaiming — and for a note panel it would hold a document
+    // mirror open over a note nobody can see. Asserted as the section's shape
+    // rather than by looking for the file's name: a viewer that happened to draw
+    // nothing would satisfy the second and not the first.
+    expect(folded.children).toHaveLength(1);
+    expect(folded.firstElementChild?.tagName).toBe("HEADER");
+    // And it stops taking a share of the strip's width, which is the visible
+    // point of folding: the neighbours get it.
+    expect(folded).not.toHaveClass("flex-1");
+    expect(folded).toHaveAttribute("data-folded", "true");
+    // The panel is still named, so a reader moving between panels can still tell
+    // which one this is with nothing on screen but a button.
+    expect(folded).toHaveAttribute("aria-label", "a.md");
+  });
+
+  it("offers the way back in, and takes it", async () => {
+    const [firstId] = await twoPanels();
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByTestId(`${PANEL_TESTID}-${firstId}`)).getByRole("button", {
+          name: PANEL_FOLD_LABEL,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    const folded = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
+    const unfold = within(folded).getByRole("button", { name: PANEL_UNFOLD_LABEL });
+    // The name says which way the control goes; `aria-expanded` says where it is.
+    expect(unfold).toHaveAttribute("aria-expanded", "false");
+    // Nothing else is on screen for this panel — no Close, no Export, no name.
+    expect(within(folded).getAllByRole("button")).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.click(unfold);
+      await Promise.resolve();
+    });
+
+    const open = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
+    expect(open).not.toHaveAttribute("data-folded");
+    expect(within(open).getByRole("button", { name: PANEL_FOLD_LABEL })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(within(open).getByText("a.md")).toBeInTheDocument();
+  });
+
+  it("offers to fold the last panel, which it refuses to close", async () => {
+    syncBrowse.mockResolvedValue(listed("", [entry("a.md")]));
+    panelsStore.getState().setActiveTarget({ kind: "file", profileId: "p1", relativePath: "a.md" });
+
+    await mount();
+
+    // The asymmetry, on screen: a control that refuses on activation is worse
+    // than no control, so Close is absent — and Fold is not, because the control
+    // that undoes it sits exactly where the panel was.
+    expect(screen.queryByRole("button", { name: PANEL_CLOSE_LABEL })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("shows a folded panel what it is given, rather than loading it out of sight", async () => {
+    const [firstId] = await twoPanels();
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByTestId(`${PANEL_TESTID}-${firstId}`)).getByRole("button", {
+          name: PANEL_FOLD_LABEL,
+        }),
+      );
+      await Promise.resolve();
+    });
+    // Focus it the way a pointer would, so the next single click in a browser
+    // lands here — folded.
+    await act(async () => {
+      fireEvent.mouseDown(screen.getByTestId(`${PANEL_TESTID}-${firstId}`));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      panelsStore
+        .getState()
+        .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "b.md" });
+      await Promise.resolve();
+    });
+
+    // The epic's own defect, refused: keeper read the file, put it in this panel,
+    // and the reader would have seen nothing at all.
+    const frame = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
+    expect(frame).not.toHaveAttribute("data-folded");
+    expect(within(frame).getByText("b.md")).toBeInTheDocument();
   });
 });

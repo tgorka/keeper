@@ -269,6 +269,22 @@ export interface ViewerFile extends ViewerSubject {
    * on a platform with no file manager, applied to the same shape of fact.
    */
   readonly openWith: (() => Promise<void>) | null;
+  /**
+   * The standing sentence to show before this file is edited, or `null` when
+   * keeper manages it (Story 46.14, AD-102).
+   *
+   * `FilesWriteVm.caveat`, composed in Rust and rendered verbatim — never
+   * paraphrased here, the same rule `FilesEntrySyncVm.detail` follows. AD-102
+   * gave keeper a second writer for files no vault holds, so a file can now be
+   * writable *and* unmanaged: keeper saves it, and gives it no note history, no
+   * search index and no conflict copy. A reader has to know that BEFORE the
+   * first keystroke, because an edit that quietly does less than the vault path
+   * does is worse than the refusal it replaced.
+   *
+   * `null` for every surface that has no such verdict to carry — a recording,
+   * a note embed, a file outside every profile.
+   */
+  readonly writeCaveat: string | null;
 }
 
 /**

@@ -123,16 +123,20 @@ describe("the panel list", () => {
     expect(shown()).toEqual([A]);
   });
 
-  it("retargets the one note panel instead of opening a second", () => {
-    // Not a policy about tidiness: the note document mirror is a module
-    // singleton (AD-58), so a second mounted editor would take the store and the
-    // first would show the second's text under the first's title.
+  it("opens a second note beside the first, like any other target", () => {
+    // Story 46.12 inverted this. It used to retarget the one note panel, and
+    // that was not a policy about tidiness: the note document mirror was a
+    // module singleton (AD-58), so a second mounted editor would have taken the
+    // store and the first would have shown the second's text under the first's
+    // title. The mirror is keyed by note now — one document per note, reference
+    // counted — so there is nothing left to protect and a note is an ordinary
+    // target.
     store().setActiveTarget(A);
     store().openPanel(NOTE_ONE);
     store().openPanel(NOTE_TWO);
 
-    expect(shown()).toEqual([A, NOTE_TWO]);
-    expect(store().panels.filter((panel) => panel.target?.kind === "note")).toHaveLength(1);
+    expect(shown()).toEqual([A, NOTE_ONE, NOTE_TWO]);
+    expect(store().panels.filter((panel) => panel.target?.kind === "note")).toHaveLength(2);
   });
 });
 
@@ -248,7 +252,7 @@ describe("surviving a restart", () => {
     // The drive being out is exactly when the arrangement matters most: the
     // panel has to come back when the drive does, and it cannot come back if the
     // restore quietly filtered it out for being unreachable.
-    const cookie = panelsCookie([{ id: "p", target: A, replaced: null }], "p");
+    const cookie = panelsCookie([{ id: "p", target: A, replaced: null, folded: false }], "p");
     resetPanelsStoreForTest();
     hydratePanels(cookie);
 
@@ -256,7 +260,7 @@ describe("surviving a restart", () => {
   });
 
   it("hydrates once, so a double-invoked effect does not re-restore over a click", () => {
-    const cookie = panelsCookie([{ id: "p", target: A, replaced: null }], "p");
+    const cookie = panelsCookie([{ id: "p", target: A, replaced: null, folded: false }], "p");
     resetPanelsStoreForTest();
     hydratePanels(cookie);
     store().setActiveTarget(B);
@@ -267,11 +271,12 @@ describe("surviving a restart", () => {
   });
 
   it("comes up clean from a corrupt cookie instead of throwing at boot", () => {
-    expect(readPanelTargets(`${PANELS_COOKIE}=not-json`)).toEqual({ targets: [], activeIndex: 0 });
+    const empty = { targets: [], activeIndex: 0, folded: [] };
+    expect(readPanelTargets(`${PANELS_COOKIE}=not-json`)).toEqual(empty);
     expect(
       readPanelTargets(`${PANELS_COOKIE}=${encodeURIComponent('{"v":9,"a":0,"t":[]}')}`),
-    ).toEqual({ targets: [], activeIndex: 0 });
-    expect(readPanelTargets("")).toEqual({ targets: [], activeIndex: 0 });
+    ).toEqual(empty);
+    expect(readPanelTargets("")).toEqual(empty);
   });
 
   it("drops an entry whose kind this build does not know", () => {
@@ -291,7 +296,9 @@ describe("surviving a restart", () => {
   });
 
   it("forgets the arrangement when nothing is open", () => {
-    expect(panelsCookie([{ id: "p", target: null, replaced: null }], "p")).toContain("max-age=0");
+    expect(panelsCookie([{ id: "p", target: null, replaced: null, folded: false }], "p")).toContain(
+      "max-age=0",
+    );
   });
 
   it("remembers what fits and says how many it could not", () => {
@@ -304,6 +311,7 @@ describe("surviving a restart", () => {
       id: `p${index}`,
       target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
       replaced: null,
+      folded: false,
     }));
 
     const cookie = panelsCookie(panels, "p0");
@@ -388,5 +396,237 @@ describe("target identity", () => {
         { kind: "file", profileId: "x", relativePath: "y" },
       ),
     ).toBe(false);
+  });
+});
+
+/** Which panels are folded, left to right — the thing every fold assertion is
+ *  about. Booleans rather than ids, because the interesting claims are all about
+ *  WHICH panel in the arrangement came back folded. */
+function folds(): boolean[] {
+  return store().panels.map((panel) => panel.folded);
+}
+
+/** The value half of a `Set-Cookie`-shaped string, so a test can hand it back to
+ *  the reader without a browser in between. */
+function cookieValue(assignment: string): string {
+  return assignment.slice(assignment.indexOf("=") + 1, assignment.indexOf(";"));
+}
+
+describe("folding a panel", () => {
+  it("folds and unfolds without touching what the panel holds or what has focus", () => {
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    const [first, second] = store().panels;
+    if (first === undefined || second === undefined) {
+      throw new Error("expected two panels");
+    }
+
+    store().toggleFold(first.id);
+
+    expect(folds()).toEqual([true, false]);
+    // A fold hides a panel; it does not empty it and it does not move focus.
+    // Both matter: the target is what makes unfolding worth anything, and focus
+    // is what decides where the next single click in the tree lands.
+    expect(shown()).toEqual([A, B]);
+    expect(store().activeId).toBe(second.id);
+
+    store().toggleFold(first.id);
+    expect(folds()).toEqual([false, false]);
+  });
+
+  it("folds the only panel, which closing it refuses to do", () => {
+    store().setActiveTarget(A);
+    const only = store().panels[0];
+    if (only === undefined) {
+      throw new Error("expected one panel");
+    }
+
+    store().closePanel(only.id);
+    expect(store().panels).toHaveLength(1);
+
+    store().toggleFold(only.id);
+
+    // The asymmetry is the point. Closing the last panel is refused because
+    // there is no way back to having one; folding it is allowed because the
+    // control that undoes it is sitting exactly where the panel was.
+    expect(folds()).toEqual([true]);
+  });
+
+  it("ignores an id that names no panel", () => {
+    store().setActiveTarget(A);
+    store().toggleFold("panel-nope");
+    expect(folds()).toEqual([false]);
+  });
+
+  it("unfolds a panel it is given something to show", () => {
+    // The defect this rule exists to refuse, and the one shape this whole epic
+    // is about: keeper reads the file, loads it into the panel, and shows the
+    // reader nothing at all.
+    store().setActiveTarget(A);
+    const only = store().panels[0];
+    if (only === undefined) {
+      throw new Error("expected one panel");
+    }
+    store().toggleFold(only.id);
+
+    store().setActiveTarget(B);
+
+    expect(shown()).toEqual([B]);
+    expect(folds()).toEqual([false]);
+  });
+
+  it("unfolds a folded panel that already holds the target being opened", () => {
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    const [first] = store().panels;
+    if (first === undefined) {
+      throw new Error("expected two panels");
+    }
+    store().toggleFold(first.id);
+
+    // A double click on A, which is already open in the folded panel: focus it —
+    // and a focus that answered a gesture asking to SEE something has to show it.
+    store().openPanel(A);
+
+    expect(store().activeId).toBe(first.id);
+    expect(folds()).toEqual([false, false]);
+  });
+
+  it("leaves a fold alone when focus moves for its own sake", () => {
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    const [first] = store().panels;
+    if (first === undefined) {
+      throw new Error("expected two panels");
+    }
+    store().toggleFold(first.id);
+
+    store().focusPanel(first.id);
+
+    // Clicking a folded panel's header focuses it. That is not a request to see
+    // anything — the reader is about to press Unfold, or to close it — so the
+    // fold stands. Only a target ARRIVING unfolds a panel.
+    expect(store().activeId).toBe(first.id);
+    expect(folds()).toEqual([true, false]);
+  });
+});
+
+describe("a fold that survives a restart", () => {
+  it("round-trips which panel was folded, and only that one", () => {
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    store().openPanel(C);
+    const middle = store().panels[1];
+    if (middle === undefined) {
+      throw new Error("expected three panels");
+    }
+    store().toggleFold(middle.id);
+
+    resetPanelsStoreForTest();
+    hydratePanels(document.cookie);
+
+    expect(shown()).toEqual([A, B, C]);
+    expect(folds()).toEqual([false, true, false]);
+  });
+
+  it("counts the fold over the targets that survived the way back in", () => {
+    // The cookie's own array and the restored list are not the same list: an
+    // entry this build cannot read is dropped, and everything after it shifts
+    // left. A fold index that still pointed into the original array would come
+    // back folding the panel next door.
+    const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
+      JSON.stringify({ v: 2, a: 0, t: [{ kind: "hologram", id: "x" }, A, B], f: [2] }),
+    )}`;
+
+    const read = readPanelTargets(cookie);
+
+    expect(read.targets).toEqual([A, B]);
+    expect(read.folded).toEqual([1]);
+  });
+
+  it("restores a cookie written before folding existed, rather than discarding it", () => {
+    // The ruling in `PANELS_VERSION`. The discard rule exists because a target's
+    // MEANING may change between versions; `f` only adds a field whose absence
+    // has one safe reading, so applying the discard rule here would cost every
+    // existing reader their whole workspace on the first launch after an update,
+    // in exchange for nothing.
+    const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
+      JSON.stringify({ v: 1, a: 1, t: [A, B] }),
+    )}`;
+
+    hydratePanels(cookie);
+
+    expect(shown()).toEqual([A, B]);
+    expect(folds()).toEqual([false, false]);
+    expect(activePanel(store()).target).toEqual(B);
+  });
+
+  it("ignores a fold list a hand-edited cookie could produce", () => {
+    // The cookie is a string a person can edit. Anything that is not a whole
+    // number in range folds nothing rather than folding something arbitrary:
+    // `NaN` in the set would look like it folded a panel and fold none.
+    const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
+      JSON.stringify({ v: 2, a: 0, t: [A, B], f: ["1", 1.5, -1, 9, null] }),
+    )}`;
+
+    expect(readPanelTargets(cookie).folded).toEqual([]);
+  });
+
+  it("refuses to read a fold out of a version that had none", () => {
+    // A `v: 1` payload carrying an `f` is not a keeper cookie; it is a cookie
+    // somebody edited. Reading the field anyway would make the version number
+    // decorative.
+    const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
+      JSON.stringify({ v: 1, a: 0, t: [A, B], f: [0] }),
+    )}`;
+
+    expect(readPanelTargets(cookie).folded).toEqual([]);
+  });
+
+  it("drops a fold with the panel it belonged to when the budget bites", () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const long = "x".repeat(400);
+    // Every panel folded, so whichever ones survive the trim must all come back
+    // folded and none of the indices may point past the end of the list.
+    const panels = Array.from({ length: 20 }, (_, index) => ({
+      id: `p${index}`,
+      target: { kind: "file", profileId: "p1", relativePath: `${long}/${index}.md` } as const,
+      replaced: null,
+      folded: true,
+    }));
+
+    const value = cookieValue(panelsCookie(panels, "p0"));
+    const read = readPanelTargets(`${PANELS_COOKIE}=${value}`);
+
+    expect(value.length).toBeLessThanOrEqual(PANELS_COOKIE_BUDGET);
+    expect(read.targets.length).toBeGreaterThan(0);
+    expect(read.folded).toEqual(read.targets.map((_, at) => at));
+    info.mockRestore();
+  });
+
+  it("does not spend a byte on a folded panel that holds nothing", () => {
+    // An empty panel is not persisted at all, so its fold cannot be either — and
+    // the fold indices of the panels that ARE persisted must be counted after it
+    // is gone, not before.
+    //
+    // The middle panel is UNFOLDED on purpose. With every remaining panel folded,
+    // an implementation that counted before the drop would write one index too
+    // many and the reader would clamp it away, so the bug would be invisible.
+    // With a gap, counting too early folds the WRONG document: `A` comes back
+    // folded and `B` does not.
+    const value = cookieValue(
+      panelsCookie(
+        [
+          { id: "p0", target: null, replaced: null, folded: true },
+          { id: "p1", target: A, replaced: null, folded: false },
+          { id: "p2", target: B, replaced: null, folded: true },
+        ],
+        "p1",
+      ),
+    );
+
+    const read = readPanelTargets(`${PANELS_COOKIE}=${value}`);
+    expect(read.targets).toEqual([A, B]);
+    expect(read.folded).toEqual([1]);
   });
 });

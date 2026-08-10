@@ -5438,26 +5438,16 @@ fn minute_of_day(hhmm: &str) -> Option<u16> {
 
 /// UTC `yyyymmdd-hhmmss` for a conflict filename.
 ///
-/// Hand-rolled because `keeper-sync` deliberately has no `chrono`: the engine
-/// is time-agnostic and takes wall-clock milliseconds from the platform port.
-/// Civil-date arithmetic from a Unix timestamp is Howard Hinnant's
-/// `days_from_civil` inverse, which is exact for every date we can represent.
+/// UTC deliberately, unlike the `.trashinfo` `DeletionDate`
+/// [`crate::files_write`] writes: this name has to sort and compare the same
+/// on both machines that produced the conflict, and a local stamp would put
+/// two names an hour apart on one event.
+///
+/// The civil-date arithmetic itself is
+/// [`crate::platform::civil_from_unix_ms`], which is where it lives now that
+/// two modules format an instant into words.
 fn conflict_stamp(now_ms: i64) -> String {
-    let secs = now_ms.div_euclid(1_000);
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
-
-    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = era * 400 + yoe + i64::from(month <= 2);
+    let (year, month, day, hh, mm, ss) = crate::platform::civil_from_unix_ms(now_ms);
     format!("{year:04}{month:02}{day:02}-{hh:02}{mm:02}{ss:02}")
 }
 

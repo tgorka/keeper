@@ -20,14 +20,88 @@
  * **It reads no path and joins nothing.** Every identifier arrives from the
  * caller as Rust produced it (AD-65), and `absolutePath` is never rendered
  * anywhere (FR-145).
+ *
+ * # The Save control lives here, and not on the panel's header
+ *
+ * Saving was `Mod-s` and nothing else (Story 46.13, FR-216). There is no
+ * autosave for a file and that is deliberate — `spec-45-6` — so the only
+ * feedback a reader had that their edit was still in the buffer was that nothing
+ * had happened, which is indistinguishable from a save that worked.
+ *
+ * The button is in this frame's own chrome rather than in `PanelFrame`'s header
+ * because `dirty` and `save` live in the hook that is mounted *below* that
+ * header. A header button would need a registry of per-panel save functions kept
+ * in step with mounts and unmounts, and a registry is a worse thing to own than
+ * a button in the right place. It also means a note embed of a file gets the
+ * control for free, where a panel header would have given it nothing.
+ *
+ * The bar exists exactly when there is a Save to offer — a writable format that
+ * was not truncated on the way in. A header whose only reason to exist is a
+ * control that is not there is chrome for its own sake, and a reserved status
+ * slot that can never say anything is 8px of nothing.
  */
+import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
+import { Button } from "@/components/ui/button";
 import type { ViewerEntry } from "@/lib/viewers";
 import type { MarkdownPreviewOptions } from "./markdown-preview";
 import type { CsvCoordinates } from "./raw-rendered-view";
 import { RawRenderedView } from "./raw-rendered-view";
 import { TextEditorSurface } from "./text-viewer";
 import type { UseTextFileResult } from "./use-text-file";
+
+/**
+ * The one word this bar says about the buffer, and why the informative state is
+ * the opposite of the note editor's.
+ *
+ * A note autosaves, so the fact worth carrying is that the write landed and
+ * when: `Saved · HH:MM`, and silence while you type. A file does not autosave,
+ * so the fact worth carrying is the one the reader can still act on — there is
+ * something here that is not on disk — and silence once it is. Same slot, same
+ * reservation mechanism, opposite polarity, because the two surfaces make
+ * opposite promises.
+ *
+ * Derived by a function rather than written twice so {@link FILE_SAVE_SIZERS}
+ * cannot drift from what the caption actually shows.
+ */
+export function fileSaveWord(dirty: boolean): string {
+  return dirty ? "Unsaved changes" : "";
+}
+
+/**
+ * Every string the status slot can show, for `PaneHeader` to measure.
+ *
+ * One entry: the clean state is deliberately empty, and an empty string reserves
+ * nothing. No clock and no locale here — unlike the note editor's caption — but
+ * the width is still the browser's answer rather than ours, because it is a font
+ * and a translation away from being wrong.
+ */
+export const FILE_SAVE_SIZERS: readonly string[] = [fileSaveWord(true)];
+
+/** The Save control. Named as the verb, not as the state. */
+export const FILE_SAVE_LABEL = "Save";
+
+/**
+ * Why Save is disabled when it is.
+ *
+ * Disabled rather than absent, which is the opposite of what this codebase does
+ * for a control that cannot act — and the difference is that "nothing has
+ * changed" is a state the reader leaves by typing, where "keeper will not write
+ * this format" is not. A control that vanished every time the buffer matched the
+ * disk would be a control nobody could find on purpose. The sentence is on the
+ * button so the disabled state is never a mystery, which is the actual house
+ * rule the absent-not-disabled idiom serves.
+ */
+export const FILE_SAVE_CLEAN_TITLE = "Nothing has changed since this file was last read or saved.";
+/**
+ * Test id for AD-102's standing caveat — the sentence a file keeper writes but
+ * does not manage carries before it is edited.
+ *
+ * A slot rather than a text match, because the sentence itself is composed in
+ * Rust and asserted there; what this surface owes is that it is on screen, and
+ * on screen before the editor.
+ */
+export const TEXT_FILE_CAVEAT_TESTID = "text-file-caveat";
 
 export interface TextFileFrameProps {
   /** The file's own name. Display and aria only; never a path. */
@@ -56,6 +130,18 @@ export interface TextFileFrameProps {
   csv: CsvCoordinates | null;
   /** What a markdown preview resolves embeds against. */
   preview: MarkdownPreviewOptions;
+  /**
+   * The standing sentence for a file keeper will write and does not manage, or
+   * `null` (Story 46.14, AD-102).
+   *
+   * Composed in Rust (`FilesWriteVm.caveat`) and rendered verbatim. Rendered
+   * ABOVE `error` and outside the `savable` gate on purpose: the caveat is a
+   * standing fact about the file and the error is about the last action, and
+   * the standing fact has to be on screen before the first keystroke — an edit
+   * that quietly does less than the vault path does is worse than the refusal
+   * it replaced.
+   */
+  writeCaveat?: string | null;
   /** Test seam for 44.16's backend, handed straight through. */
   csvOptions?: CsvTableOptions;
 }
@@ -64,11 +150,12 @@ export function TextFileFrame({
   fileName,
   entry,
   state,
+  writeCaveat = null,
   csv,
   preview,
   csvOptions,
 }: TextFileFrameProps): React.ReactElement {
-  const { vm, content, setContent, save, reload, error, loading } = state;
+  const { vm, content, setContent, dirty, save, reload, error, loading } = state;
 
   if (loading) {
     return (
@@ -119,8 +206,49 @@ export function TextFileFrame({
     ? null
     : `keeper does not write ${entry.label} files: a lossy round trip through this format is how people lose work`;
 
+  // Story 46.13: the bar exists exactly when a Save could land. `refusal` is the
+  // format's no; `vm.oversize` means only a prefix was read and the loader
+  // declines a save that would truncate the rest — offering a button that
+  // announces its own refusal is the shape 45.2 spent a paragraph rejecting.
+  const savable = refusal === null && !vm.oversize;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {savable ? (
+        <PaneHeader
+          className="border-b px-3 py-1.5"
+          // The file's own name, which nothing inside this frame renders — the
+          // panel's header names it too, and the note embed that mounts this has
+          // no header at all, so this is the one identity both hosts can rely on.
+          identity={<span className="min-w-0 flex-1 truncate font-medium text-xs">{fileName}</span>}
+          status={{ sizers: FILE_SAVE_SIZERS, caption: fileSaveWord(dirty) }}
+          actions={
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-xs"
+              disabled={!dirty}
+              title={dirty ? undefined : FILE_SAVE_CLEAN_TITLE}
+              // The same call `Mod-s` makes, and the only one: the hook holds the
+              // buffer, so there is nothing for this to pass and nothing it could
+              // pass that would differ from what the editor last reported.
+              onClick={() => void save()}
+            >
+              {FILE_SAVE_LABEL}
+            </Button>
+          }
+        />
+      ) : null}
+      {writeCaveat === null ? null : (
+        <p
+          data-testid={TEXT_FILE_CAVEAT_TESTID}
+          className="shrink-0 border-b px-3 py-1.5 text-muted-foreground text-xs"
+          role="status"
+        >
+          {writeCaveat}
+        </p>
+      )}
       {error === null ? null : (
         <p className="shrink-0 border-b px-3 py-1.5 text-destructive text-xs" role="alert">
           {error}

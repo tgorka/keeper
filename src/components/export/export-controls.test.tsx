@@ -61,7 +61,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
-import { notesEditorStore, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import {
+  adoptBodySubscription,
+  editBuffer,
+  openNoteDocument,
+  readNoteDocument,
+  resetNotesEditorStoreForTest,
+} from "@/lib/stores/notes-editor";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 
 /** A note receipt with two written entries and one missing embed — enough that
@@ -100,7 +106,7 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     // whether or not the folder happens to be writable.
     size: { bytes: 4300000, label: "4.3 MB" },
     folderRole: null,
-    write: { writable: false, reason: "This folder is outside a notes vault." },
+    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
   };
 }
 
@@ -108,7 +114,7 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
   return {
     profileId: "p1",
     subpath,
-    write: { writable: false, reason: "This folder is outside a notes vault." },
+    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
     state: "listed",
     entries,
     detail: null,
@@ -290,14 +296,9 @@ describe("both doors", () => {
   });
 
   it("do not flush somebody else's unsaved note when a file is exported", async () => {
-    notesEditorStore.setState({
-      vaultId: "v1",
-      noteId: "n1",
-      subscriptionId: "sub-1",
-      text: "unsaved",
-      base: "",
-      dirty: true,
-    });
+    openNoteDocument("v1", "n1");
+    adoptBodySubscription("v1", "n1", readNoteDocument("v1", "n1").generation, "sub-1");
+    editBuffer("v1", "n1", "unsaved");
     await mountFilePanel();
     fireEvent.click(await screen.findByRole("button", { name: EXPORT_FILE_LABEL }));
 

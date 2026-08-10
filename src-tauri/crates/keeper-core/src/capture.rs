@@ -241,7 +241,47 @@ fn query_encode(value: &str) -> String {
     out
 }
 
-/// Where a capture window sits and who decides (FR-192, UX-DR77).
+/// keeper's own size for a capture window, in **logical** pixels.
+///
+/// The same numbers `tauri.conf.json` gives the prewarmed window and the same
+/// numbers `notes_window::open` builds every other one with, so the second
+/// window is the same window and not a differently sized cousin. It lives here
+/// rather than in the shell because [`Placement::window_size`] has to answer
+/// with it, and that answer is the one thing about a capture window's geometry
+/// that can be tested on a machine where the shell does not compile
+/// (AD-55/AD-56).
+pub const CAPTURE_DEFAULT_SIZE: (u32, u32) = (560, 340);
+
+/// The smallest a capture window may be, in logical pixels.
+///
+/// Not a taste judgement — a floor derived from what the window still has to
+/// hold. The note editor's header is three groups (AD-104): the identity group
+/// collapses to nothing by design, but the status group reserves a measured box
+/// for `Saved · HH:MM` (~100 px in a 12-hour locale) and the actions group
+/// carries an icon button plus a word-labelled menu (~112 px), on top of the
+/// row's padding and gaps (~30 px). Below roughly 250 px the actions start
+/// leaving the right-hand edge, which is exactly the defect story 46.5 fixed.
+/// 320 keeps a usable margin over that and still leaves the title something to
+/// truncate into; 240 keeps the chrome strip, the header and more than one line
+/// of text.
+///
+/// Enforced twice on purpose: here, so a remembered row can never restore a
+/// window smaller than this, and as `minWidth`/`minHeight` on the window itself,
+/// so the compositor refuses the drag before the user gets there.
+pub const CAPTURE_MIN_SIZE: (u32, u32) = (320, 240);
+
+/// The word that introduces a size in a persisted placement.
+///
+/// Tagged rather than positional, because a size has to be storable *without* a
+/// position — a window resized but never moved is an ordinary thing — and three
+/// optional trailing integers with no tag cannot say which pair is which.
+/// It also keeps the old two-token spelling readable verbatim: a row written by
+/// the build before this story is `free 120 -40`, and it still decodes to
+/// exactly the placement it always did, with no size.
+const SIZE_TAG: &str = "size";
+
+/// Where a capture window sits, how big it is, and who decides (FR-192,
+/// UX-DR77).
 ///
 /// # Why `locked` defaults to true
 ///
@@ -257,15 +297,37 @@ fn query_encode(value: &str) -> String {
 /// position away on lock would make the lock a discard button, so the two
 /// fields are independent: `locked` decides who may move it, `position` is the
 /// last place it was put.
+///
+/// # Why the size is here too, and why it is logical pixels
+///
+/// The lock's promise is now *both* verbs: unlocked, a window may be moved
+/// **and** resized. A size that did not survive a restart would make the resize
+/// the only gesture in this app that keeper watches and forgets, so `size`
+/// joins `position` under the same key, with the same "locking is not a discard
+/// button" rule.
+///
+/// `position` is physical pixels and `size` is logical ones, and that asymmetry
+/// is deliberate rather than an oversight. A position is a point on a desktop
+/// that may span monitors of different scale factors, and only the physical
+/// coordinate names one unambiguously. A size is a statement about how much
+/// *content* fits, which is what a logical pixel measures: restore a physical
+/// 1120 on a monitor that has meanwhile gone from 2× to 1× and the person gets
+/// a window twice the size they left. The shell converts once, at the window it
+/// is reading or writing, and both directions use the same quantity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    /// `true` — keeper places the window and the user cannot drag it.
-    /// `false` — the user drags it and keeper remembers where.
+    /// `true` — keeper places and sizes the window and the user can do neither.
+    /// `false` — the user moves and resizes it and keeper remembers both.
     pub locked: bool,
     /// The remembered top-left in physical pixels, or `None` for "keeper's
     /// automatic placement", which is where a window that has never been moved
     /// starts.
     pub position: Option<(i32, i32)>,
+    /// The remembered inner size in logical pixels, or `None` for "the window
+    /// has never been resized", which is not the same as
+    /// [`CAPTURE_DEFAULT_SIZE`]: see [`Placement::window_size`], where the
+    /// difference decides whether a live window is touched at all.
+    pub size: Option<(u32, u32)>,
 }
 
 impl Default for Placement {
@@ -273,49 +335,152 @@ impl Default for Placement {
         Self {
             locked: true,
             position: None,
+            size: None,
         }
     }
 }
 
 impl Placement {
     /// The persisted spelling: `locked` or `free`, optionally followed by two
-    /// integers.
+    /// integers, optionally followed by `size` and two more.
     ///
-    /// A tiny text encoding rather than JSON because the whole value is three
+    /// A tiny text encoding rather than JSON because the whole value is five
     /// scalars and the settings table stores strings: JSON here would buy
     /// nothing and would make the "unreadable row falls back to the default"
     /// path depend on a parser with its own opinions about numbers.
     #[must_use]
     pub fn encode(&self) -> String {
         let state = if self.locked { "locked" } else { "free" };
-        match self.position {
+        let mut encoded = match self.position {
             Some((x, y)) => format!("{state} {x} {y}"),
             None => state.to_owned(),
+        };
+        if let Some((width, height)) = self.size {
+            encoded.push(' ');
+            encoded.push_str(SIZE_TAG);
+            encoded.push_str(&format!(" {width} {height}"));
         }
+        encoded
     }
 
     /// Read a persisted placement. **Total**: every unreadable value is the
     /// default, because a settings row written by an older build, truncated, or
-    /// hand-edited must cost the user their remembered position and never their
+    /// hand-edited must cost the user their remembered geometry and never their
     /// window.
     ///
     /// A half-readable position — one coordinate that parses and one that does
     /// not — is *no* position rather than a position with a fabricated axis. A
     /// window placed at `(120, 0)` because the `y` was garbage is a window that
     /// moved somewhere the user never put it.
+    ///
+    /// The size follows the same rule and adds one of its own: **a zero is not
+    /// a size**. `size 0 340` parses perfectly and describes a window with no
+    /// width — invisible, unfocusable and unclosable, and on some backends not
+    /// creatable at all. It degrades to `None`, which is keeper's own size,
+    /// rather than to a window the person cannot get rid of. A negative or
+    /// out-of-range number never reaches that check, because it fails to parse
+    /// as `u32` first.
     #[must_use]
     pub fn decode(raw: &str) -> Self {
-        let mut parts = raw.split_whitespace();
+        let mut parts = raw.split_whitespace().peekable();
         let locked = !matches!(parts.next(), Some("free"));
-        let position = match (parts.next(), parts.next()) {
-            (Some(x), Some(y)) => match (x.parse::<i32>(), y.parse::<i32>()) {
-                (Ok(x), Ok(y)) => Some((x, y)),
+        // Only look for a position when the next word is not the size tag:
+        // `free size 900 600` is a window resized but never moved, and reading
+        // its first two words as coordinates would consume the tag and lose the
+        // size as well.
+        let position = if parts.peek().is_some_and(|word| *word != SIZE_TAG) {
+            match (parts.next(), parts.next()) {
+                (Some(x), Some(y)) => match (x.parse::<i32>(), y.parse::<i32>()) {
+                    (Ok(x), Ok(y)) => Some((x, y)),
+                    _ => None,
+                },
                 _ => None,
-            },
+            }
+        } else {
+            None
+        };
+        let size = match (parts.next(), parts.next(), parts.next()) {
+            (Some(tag), Some(width), Some(height)) if tag == SIZE_TAG => {
+                match (width.parse::<u32>(), height.parse::<u32>()) {
+                    (Ok(width), Ok(height)) if width > 0 && height > 0 => Some((width, height)),
+                    _ => None,
+                }
+            }
             _ => None,
         };
-        Self { locked, position }
+        Self {
+            locked,
+            position,
+            size,
+        }
     }
+
+    /// The size to give this window right now, in logical pixels, or `None` for
+    /// "leave it exactly as it is".
+    ///
+    /// Three answers, and the third is the one that matters:
+    ///
+    /// - **Locked → keeper's own size, always.** A locked window is keeper's to
+    ///   place and keeper's to size; normalising it on every open is what makes
+    ///   the lock mean something, and it is the escape hatch from a size the
+    ///   person no longer wants.
+    /// - **Unlocked with a remembered size → that size**, clamped.
+    /// - **Unlocked with no remembered size → `None`.** Not the default: the
+    ///   caller must not touch the window. This is the difference between
+    ///   "never resized" and "resized to 560×340", and it is load-bearing — the
+    ///   live window may have been dragged to a new size seconds ago by a user
+    ///   whose blur has not yet written it down, and re-asserting a size on the
+    ///   next open would undo the gesture in front of them.
+    ///
+    /// `work_area` is the usable area of the monitor the window will appear on,
+    /// in logical pixels, or `None` when the platform will not say (a headless
+    /// session, or a compositor that does not answer).
+    #[must_use]
+    pub fn window_size(&self, work_area: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        let wanted = match (self.locked, self.size) {
+            (true, _) => CAPTURE_DEFAULT_SIZE,
+            (false, Some(size)) => size,
+            (false, None) => return None,
+        };
+        Some(clamp_size(wanted, work_area))
+    }
+}
+
+/// Fit a wanted size inside what the screen can actually show.
+///
+/// **The clamp lives here rather than in the shell because it is the part that
+/// can be wrong.** A window restored 3000 px wide on a 1440 px display is not a
+/// cosmetic problem: a capture window is undecorated and `skipTaskbar`, so it is
+/// in no dock and no task switcher, its close button is at the right-hand edge,
+/// and `centred` in the shell puts an oversized window's left edge at zero — so
+/// the controls end up past the far edge of the screen with nothing to click
+/// and no window list to reach them from. The same applies to a monitor that
+/// went away: the remembered size came from a display this machine may no longer
+/// have.
+///
+/// The floor is applied **before** the ceiling, so when the two disagree the
+/// screen wins. That order is the whole decision. A work area smaller than
+/// [`CAPTURE_MIN_SIZE`] is a strange display, and the two candidate answers are
+/// "a window slightly too small to be comfortable" and "a window whose right
+/// edge, where every control is, is off the screen". Reachable beats
+/// comfortable.
+fn clamp_size(size: (u32, u32), work_area: Option<(u32, u32)>) -> (u32, u32) {
+    let (mut width, mut height) = (
+        size.0.max(CAPTURE_MIN_SIZE.0),
+        size.1.max(CAPTURE_MIN_SIZE.1),
+    );
+    if let Some((area_width, area_height)) = work_area {
+        // A zero-sized work area is not information — some backends report one
+        // for a monitor that is being reconfigured — and clamping to it would
+        // produce the invisible window `decode` refuses to build.
+        if area_width > 0 {
+            width = width.min(area_width);
+        }
+        if area_height > 0 {
+            height = height.min(area_height);
+        }
+    }
+    (width, height)
 }
 
 /// What closing a capture window must actually do (FR-191).
@@ -504,6 +669,7 @@ mod tests {
         let default = Placement::default();
         assert!(default.locked);
         assert_eq!(default.position, None);
+        assert_eq!(default.size, None);
         assert_eq!(Placement::decode(""), default);
     }
 
@@ -513,20 +679,43 @@ mod tests {
             Placement {
                 locked: true,
                 position: None,
+                size: None,
             },
             Placement {
                 locked: false,
                 position: None,
+                size: None,
             },
             Placement {
                 locked: false,
                 position: Some((120, -40)),
+                size: None,
             },
             // Unlock, drag, lock again: the position is kept, because locking
             // means "keep it there" and not "forget where I put it".
             Placement {
                 locked: true,
                 position: Some((0, 0)),
+                size: None,
+            },
+            // Resized but never moved — the reason the size is tagged rather
+            // than a third and fourth trailing integer.
+            Placement {
+                locked: false,
+                position: None,
+                size: Some((900, 600)),
+            },
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: Some((900, 600)),
+            },
+            // Resize, then lock: the size is kept for the same reason the
+            // position is. Locking is not a discard button.
+            Placement {
+                locked: true,
+                position: Some((-15, 900)),
+                size: Some((1_280, 800)),
             },
         ] {
             assert_eq!(Placement::decode(&placement.encode()), placement);
@@ -535,11 +724,48 @@ mod tests {
             Placement {
                 locked: false,
                 position: Some((120, -40)),
+                size: None,
             }
             .encode(),
             "free 120 -40"
         );
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: Some((900, 600)),
+            }
+            .encode(),
+            "free 120 -40 size 900 600"
+        );
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: None,
+                size: Some((900, 600)),
+            }
+            .encode(),
+            "free size 900 600"
+        );
         assert_eq!(Placement::default().encode(), "locked");
+    }
+
+    /// The row this story did not write. Every capture window on every machine
+    /// that has ever been unlocked already has a placement in the settings
+    /// table, in the two-token spelling, and it must keep meaning exactly what
+    /// it meant — a size appearing out of nowhere would resize a window nobody
+    /// resized.
+    #[test]
+    fn a_placement_written_before_this_story_still_reads_as_itself() {
+        assert_eq!(
+            Placement::decode("free 120 -40"),
+            Placement {
+                locked: false,
+                position: Some((120, -40)),
+                size: None,
+            }
+        );
+        assert_eq!(Placement::decode("locked"), Placement::default());
     }
 
     /// Every unreadable spelling falls back to keeper's own placement, and a
@@ -564,6 +790,226 @@ mod tests {
         assert!(Placement::decode("Free 1 2").locked);
         assert!(!Placement::decode("free").locked);
         assert!(!Placement::decode("free 1 2").locked);
+    }
+
+    /// The degradation that matters most: an unreadable size must become
+    /// keeper's own size, and never a window with no width, no height, or a
+    /// dimension invented from the half of the pair that happened to parse.
+    #[test]
+    fn an_unreadable_size_costs_the_size_and_never_the_window() {
+        for raw in [
+            // A zero is not a size. It parses; it describes a window that
+            // cannot be seen, focused or closed.
+            "free 1 2 size 0 340",
+            "free 1 2 size 560 0",
+            "free size 0 0",
+            // Half-readable, in each direction.
+            "free 1 2 size 560 tall",
+            "free 1 2 size wide 340",
+            // Truncated.
+            "free 1 2 size 560",
+            "free 1 2 size",
+            // Negative, and larger than a u32.
+            "free 1 2 size -560 -340",
+            "free 1 2 size 99999999999999 340",
+            // A tag nobody writes.
+            "free 1 2 dimensions 560 340",
+            // A row from a build that spelled it some other way.
+            "written by a later build",
+        ] {
+            let decoded = Placement::decode(raw);
+            assert_eq!(decoded.size, None, "{raw} invented a size");
+            // And the fallback is a real window, not a zero-sized one.
+            assert_eq!(
+                decoded.window_size(None),
+                if decoded.locked {
+                    Some(CAPTURE_DEFAULT_SIZE)
+                } else {
+                    None
+                },
+                "{raw} degraded to something other than keeper's own size"
+            );
+        }
+        // The unreadable size costs the size and nothing else: a position in
+        // the same row is still honoured.
+        assert_eq!(
+            Placement::decode("free 1 2 size 0 340").position,
+            Some((1, 2))
+        );
+        // Trailing words nobody wrote are ignored rather than fatal, which is
+        // what the two-token spelling already did with `free 1 2 whatever`. A
+        // readable size followed by junk is a readable size: refusing it would
+        // discard information the row plainly carries.
+        assert_eq!(
+            Placement::decode("free size 560 340 1 2"),
+            Placement {
+                locked: false,
+                position: None,
+                size: Some((560, 340)),
+            }
+        );
+    }
+
+    /// Which of the three answers each state gets, and the one that is `None`.
+    #[test]
+    fn a_locked_window_is_normalised_and_an_unsized_one_is_left_alone() {
+        let screen = Some((1_920u32, 1_080u32));
+
+        // Locked: keeper's own size, whatever the row remembers. This is the
+        // escape hatch from a size the person no longer wants.
+        assert_eq!(
+            Placement::default().window_size(screen),
+            Some(CAPTURE_DEFAULT_SIZE)
+        );
+        assert_eq!(
+            Placement {
+                locked: true,
+                position: None,
+                size: Some((1_400, 900)),
+            }
+            .window_size(screen),
+            Some(CAPTURE_DEFAULT_SIZE)
+        );
+
+        // Unlocked and never resized: do not touch the window. NOT the
+        // default — the live window may hold a size the user chose seconds ago
+        // that no blur has written down yet.
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: Some((10, 10)),
+                size: None,
+            }
+            .window_size(screen),
+            None
+        );
+
+        // Unlocked and resized: the size the person left it at.
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: None,
+                size: Some((900, 600)),
+            }
+            .window_size(screen),
+            Some((900, 600))
+        );
+    }
+
+    /// A window restored wider than the screen has its close button past the
+    /// far edge, and a capture window is in no dock and no task switcher — so
+    /// there is nothing left to click. The clamp is the whole of the answer.
+    #[test]
+    fn a_remembered_size_is_cut_down_to_the_screen_it_is_restored_on() {
+        let remembered = |size| Placement {
+            locked: false,
+            position: None,
+            size: Some(size),
+        };
+
+        // 3000 px wide on a 1440 px display — the story's own example.
+        assert_eq!(
+            remembered((3_000, 2_000)).window_size(Some((1_440, 900))),
+            Some((1_440, 900))
+        );
+        // The monitor it was sized on has gone away and the laptop panel is
+        // what is left.
+        assert_eq!(
+            remembered((2_400, 1_300)).window_size(Some((1_512, 945))),
+            Some((1_512, 945))
+        );
+        // One axis over, one under: only the offending axis is cut.
+        assert_eq!(
+            remembered((3_000, 500)).window_size(Some((1_440, 900))),
+            Some((1_440, 500))
+        );
+        // Exactly the work area is not oversized.
+        assert_eq!(
+            remembered((1_440, 900)).window_size(Some((1_440, 900))),
+            Some((1_440, 900))
+        );
+        // A size that fits is not touched at all.
+        assert_eq!(
+            remembered((800, 500)).window_size(Some((1_920, 1_080))),
+            Some((800, 500))
+        );
+    }
+
+    #[test]
+    fn a_remembered_size_is_never_smaller_than_the_window_can_hold() {
+        let remembered = |size| Placement {
+            locked: false,
+            position: None,
+            size: Some(size),
+        };
+
+        // Below the floor on both axes, and on one.
+        assert_eq!(
+            remembered((1, 1)).window_size(Some((1_920, 1_080))),
+            Some(CAPTURE_MIN_SIZE)
+        );
+        assert_eq!(
+            remembered((200, 700)).window_size(Some((1_920, 1_080))),
+            Some((CAPTURE_MIN_SIZE.0, 700))
+        );
+        // Exactly the floor stays there.
+        assert_eq!(
+            remembered(CAPTURE_MIN_SIZE).window_size(Some((1_920, 1_080))),
+            Some(CAPTURE_MIN_SIZE)
+        );
+        // The floor is below keeper's own size, or normalising a locked window
+        // would enlarge it.
+        assert!(CAPTURE_MIN_SIZE.0 < CAPTURE_DEFAULT_SIZE.0);
+        assert!(CAPTURE_MIN_SIZE.1 < CAPTURE_DEFAULT_SIZE.1);
+    }
+
+    /// When the floor and the screen disagree, the screen wins: a window
+    /// slightly too small to be comfortable beats a window whose right-hand
+    /// edge — where every control is — is off the display.
+    #[test]
+    fn a_display_smaller_than_the_floor_still_gets_a_window_it_can_show() {
+        let remembered = |size| Placement {
+            locked: false,
+            position: None,
+            size: Some(size),
+        };
+        assert_eq!(
+            remembered((900, 600)).window_size(Some((300, 200))),
+            Some((300, 200))
+        );
+        // Including the locked window's normalisation, which asks for 560×340
+        // on a display that cannot show it.
+        assert_eq!(
+            Placement::default().window_size(Some((300, 200))),
+            Some((300, 200))
+        );
+    }
+
+    /// A headless session, or a compositor that will not name a monitor. The
+    /// floor still applies; there is no ceiling to apply.
+    #[test]
+    fn an_unknown_display_clamps_what_it_can_and_invents_nothing() {
+        let remembered = |size| Placement {
+            locked: false,
+            position: None,
+            size: Some(size),
+        };
+        assert_eq!(remembered((1, 1)).window_size(None), Some(CAPTURE_MIN_SIZE));
+        assert_eq!(
+            remembered((4_000, 3_000)).window_size(None),
+            Some((4_000, 3_000))
+        );
+        // A zero-sized work area is a monitor mid-reconfiguration, not a
+        // measurement. Clamping to it would build the invisible window
+        // `decode` refuses to build.
+        assert_eq!(
+            remembered((900, 600)).window_size(Some((0, 0))),
+            Some((900, 600))
+        );
+        assert_eq!(
+            remembered((900, 600)).window_size(Some((800, 0))),
+            Some((800, 600))
+        );
     }
 
     #[test]

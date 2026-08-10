@@ -115,6 +115,33 @@ fn served_as_lfs_filter() -> bool {
     false
 }
 
+/// Whether two paths name the same directory on this machine.
+///
+/// Component equality first, because it is free and answers almost every case
+/// (`Path` already ignores a trailing separator and `.` components). The
+/// `canonicalize` pass behind it exists so a *correct* `mainSyncFolder` is
+/// never reported as wrong: a sync profile's stored `local_path` and the path
+/// the owner typed into `~/.keeper/keeper.toml` routinely differ by a symlink
+/// macOS inserted — `/tmp` is `/private/tmp`, an external volume can be
+/// reached through more than one mount point — and a *false* "your main folder
+/// is not a sync folder" would send someone to fix a file that is already
+/// right. Both sides get the same treatment, and a failure on either side
+/// (a path that vanished between the two calls) falls back to the plain
+/// comparison rather than claiming a match.
+///
+/// Two `stat`-class syscalls at most, on a path already known to exist. Not a
+/// walk: nothing in `setup` may touch a tree before the window is up.
+#[cfg(desktop)]
+fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
 /// Application entry point. Registers the plugin set and the typed IPC command
 /// surface, then runs the Tauri event loop.
 ///
@@ -214,20 +241,82 @@ pub fn run() {
     );
     let builder = builder
         .setup(|app| {
-            // Forward every incoming `keeper://oauth/callback` deep link to the
-            // OAuth-callback registry, which matches it to its in-flight OIDC
-            // flow by the `state` query param (Story 2.2). An unmatched / spurious
-            // callback is ignored inside `resolve`. The registry lives in the
-            // managed `AppState` and is cloned into the `'static` handler.
-            // Boot-time config import + logging init (Stories 22.5/22.6),
-            // first among the setup steps. Order matters: `config.json` is
-            // imported over the settings table BEFORE `debug_log::init` seeds
-            // the debug gate, so a hand-edited `"debug.mode": true` applies to
-            // this very boot; the import outcome is logged AFTER init so the
-            // subscriber exists to carry it (loudly, for the malformed case).
+            // Boot-time settings layers, config import and logging init
+            // (Stories 22.5/22.6, 46.6/46.7) — first among the setup steps, and
+            // for a sharper reason than "it always was".
+            //
+            // **Everything a person edited by hand must be in force before
+            // anything reads a setting**, and the very next call reads one:
+            // `debug_log::init` seeds the on-disk logging gate from
+            // `debug.mode`. A layer installed after it would apply to the NEXT
+            // boot — which is precisely the boot nobody is trying to debug.
+            // Hotkeys (below, ~:290), the tray's `system.menu_bar_presence`
+            // (~:325) and the engine's `sync.git_path` (~:445) are the same
+            // argument one step further out: every one of them is read inside
+            // this `setup`, so every one of them is layered only because the
+            // stack is installed here. Hence, in order:
+            //
+            //   1. `config::load_app_layers` + `config::install` — the TOML
+            //      stack (AD-98/AD-99). `registry::get_setting` consults it
+            //      ahead of the `settings` table, so installing it is what puts
+            //      all ~40 typed getters on layered values at once, each still
+            //      clamping its own value exactly as before.
+            //   2. `install_folder_tier` — AD-101's phase one, not two: the
+            //      folder tier resolves each profile's own `.keeper/*.toml` when
+            //      the profile is READ, so it needs only the host label and
+            //      which folder is main — both known here — and never `sync.db`.
+            //      That is what dissolves the cycle AD-101 predicted.
+            //   3. `import_config_file` — unchanged, and now the LOWEST layer.
+            //      It still writes `config.json`'s keys into the settings rows,
+            //      and a TOML layer setting the same key still wins at read
+            //      time. Ordered after the install only so this reads in
+            //      precedence order; it reads no setting itself.
+            //   4. `debug_log::init` — seeds the gate from the layered view.
+            //
+            // Every outcome is logged AFTER init, so the subscriber exists to
+            // carry it. The faults especially: a settings file that did not
+            // load is invisible by construction, and this is the only record of
+            // it until someone opens Settings.
             if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                let host = keeper_core::config::read_host_label();
+                // No `HOME`, no user-global layer — and therefore no main
+                // folder either, since only `~/.keeper/` may name one. Not
+                // `temp_dir()` as a fallback the way `debug_log::app_log_path`
+                // uses one: a log file in `/tmp` is a lost log, but READING
+                // settings out of a world-writable directory would let any
+                // local process choose this app's hotkeys and sync paths.
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let layers = match home.as_deref() {
+                    Some(home) => keeper_core::config::load_app_layers(home, &host),
+                    None => keeper_core::config::AppLayers::default(),
+                };
+                #[cfg(desktop)]
+                keeper_sync::profile::install_folder_tier(keeper_sync::profile::FolderTier::new(
+                    host,
+                    layers.main_folder.clone(),
+                ));
+                keeper_core::config::install(layers);
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                for fault in keeper_core::config::faults() {
+                    // `Display`, not `summary()`: the log form keeps `toml`'s
+                    // own caret diagram over the offending line, which is the
+                    // only thing that locates a typo. The Settings pane takes
+                    // the one-line form instead.
+                    tracing::error!(fault = %fault, "settings file: this layer was skipped");
+                }
+                let layered: Vec<String> = keeper_core::config::overrides()
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
+                if !layered.is_empty() {
+                    tracing::info!(keys = ?layered, "settings: these are set by a file");
+                }
+                if home.is_none() {
+                    tracing::warn!(
+                        "settings: HOME is unset, so no ~/.keeper/*.toml was read this boot"
+                    );
+                }
                 match imported {
                     Ok(keys) if keys.is_empty() => {}
                     Ok(keys) => {
@@ -239,6 +328,11 @@ pub fn run() {
                 }
             }
 
+            // Forward every incoming `keeper://oauth/callback` deep link to the
+            // OAuth-callback registry, which matches it to its in-flight OIDC
+            // flow by the `state` query param (Story 2.2). An unmatched / spurious
+            // callback is ignored inside `resolve`. The registry lives in the
+            // managed `AppState` and is cloned into the `'static` handler.
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
@@ -287,6 +381,47 @@ pub fn run() {
             // and the in-app ⌘⌥K as the two paths that always work.
             #[cfg(desktop)]
             hotkey::install_capture(app.handle());
+
+            // Give the prewarmed capture window the resizability and size its
+            // remembered placement asks for (Story 46.15, FR-192).
+            //
+            // The window is declared `resizable: false` in `tauri.conf.json`
+            // and created before anything has read a setting, so it boots
+            // locked whatever the person last chose. Without this, someone who
+            // unlocked and resized it yesterday finds it today showing an open
+            // padlock, at the size they left it, with edges that do not answer
+            // — the lock reduced to a label.
+            //
+            // Here rather than inside `notes_window::show`, deliberately: the
+            // hotkey path is `set_position` → `show` → `set_focus` and NFR-27's
+            // 300 ms has no room for a sqlite read in front of it. Done once,
+            // at boot, it costs that path nothing and is correct for every
+            // press afterwards.
+            #[cfg(desktop)]
+            {
+                let placement = app
+                    .state::<ipc::AppState>()
+                    .platform
+                    .data_dir()
+                    .and_then(|dir| {
+                        keeper_core::registry::get_capture_placement(
+                            &dir,
+                            keeper_core::capture::DRAFT_CAPTURE_KEY,
+                        )
+                    })
+                    .unwrap_or_else(|error| {
+                        tracing::debug!(
+                            %error,
+                            "notes: no remembered capture placement; the panel boots locked"
+                        );
+                        keeper_core::capture::Placement::default()
+                    });
+                notes_window::adopt_placement(
+                    app.handle(),
+                    keeper_core::capture::DRAFT_CAPTURE_KEY,
+                    placement,
+                );
+            }
 
             // Store the app handle for the desktop notifier port (Story 10.1) so
             // `Platform::notify` can post native notifications from the sync loop, and
@@ -428,6 +563,68 @@ pub fn run() {
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
             }
 
+            // AD-101's phase two: the one fact about the layer stack that
+            // could not be checked until the engine existed.
+            //
+            // **`mainSyncFolder` is the hinge of the entire shared layer, and
+            // a wrong one fails silently.** Phase one can prove the path
+            // exists and is a directory; it cannot prove it is a SYNC folder,
+            // because that lives in `sync.db`, which the supervisor above has
+            // just opened. So a typo that happens to name a real directory
+            // reads two files that are not there, finds nothing, and disables
+            // `<main>/.keeper/keeper.toml` and `keeper.<host>.toml` whole —
+            // looking, from outside, exactly like a configuration that works.
+            // That is the worst failure mode this story can have, so it is
+            // checked here and said out loud twice: in the log, and in
+            // Settings through `config::push_fault`.
+            //
+            // It names the fault and changes nothing else. The keys that layer
+            // did apply stay applied: unwinding them at this point would mean
+            // re-seeding the debug gate, the three hotkeys and the tray from a
+            // different stack halfway through boot, which is a worse thing
+            // than a folder that is honestly reported as wrong.
+            #[cfg(desktop)]
+            if let Some(main) = keeper_core::config::main_folder() {
+                // No engine means no usable `git`, which the `git` report
+                // already says far more usefully than a fault blaming the
+                // folder for git's absence would. Nothing to check against.
+                if let Some(engine) = sync::engine_if_open() {
+                    match engine.list_profiles() {
+                        // Disabled profiles count. A paused folder is still a
+                        // sync folder whose `.keeper/*.toml` phase one read off
+                        // the disk, so its layer really is in force and calling
+                        // it missing would be a fault about nothing.
+                        Ok(profiles) => {
+                            if !profiles.iter().any(|p| same_folder(&p.local_path, &main)) {
+                                let fault = keeper_core::config::LayerFault::late(
+                                    keeper_core::config::LayerFaultKind::MainFolderNotAProfile,
+                                    main.clone(),
+                                    "mainSyncFolder names a folder keeper does not sync, so the \
+                                     keeper.toml files inside it were not read. Add that folder \
+                                     in Settings > Sync, or point mainSyncFolder at a folder you \
+                                     already sync.",
+                                );
+                                tracing::error!(
+                                    fault = %fault,
+                                    "settings: the shared layer is not in force"
+                                );
+                                keeper_core::config::push_fault(fault);
+                            }
+                        }
+                        Err(error) => {
+                            // An unreadable profile list is the engine's
+                            // problem, not the folder's. Saying "your main
+                            // folder is wrong" here would send someone to edit
+                            // a file that is fine.
+                            tracing::warn!(
+                                %error,
+                                "settings: could not check mainSyncFolder against the sync folders"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Build the vault registry and tap the engine's watcher (Epic 35,
             // AD-54/AD-56). After the supervisor, because the tap is the engine's
             // and there is nothing to subscribe to before it exists; a machine
@@ -465,6 +662,14 @@ pub fn run() {
                 // `invoke` rejection the frontend would have to special-case.
                 ipc::sync_git_status,
                 ipc::sync_git_path_set,
+                // In the shared body rather than spliced in as a desktop
+                // `$extra` (Story 46.7): `~/.keeper/*.toml` is read by
+                // `keeper_core::config`, which has no desktop gate, so the
+                // question "where did this value come from?" has an honest
+                // answer on every platform. A phone answering "Command
+                // config_layers not found" would force the Settings surface to
+                // special-case a call it can always make.
+                ipc::config_layers,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,
@@ -747,6 +952,7 @@ pub fn run() {
         notes_ipc::notes_body_write,
         notes_ipc::notes_csv_read,
         notes_ipc::notes_csv_set_cell,
+        notes_ipc::notes_embed_paths,
         notes_ipc::notes_embed_read,
         notes_ipc::notes_embed_write,
         notes_ipc::notes_capture_draft,
@@ -812,22 +1018,23 @@ pub fn run() {
             }
             return;
         }
-        // A capture window losing focus is when its position is written down
-        // (Story 45.15, FR-192). Blur rather than `Moved`, which fires once per
-        // compositor frame during a drag; blur rather than only the close
-        // button, because a quit, a crash-free force-quit and a click on
-        // another app are all ways a window's last position becomes final
-        // without anybody pressing anything.
+        // A capture window losing focus is when its geometry is written down
+        // (Story 45.15, FR-192; the size since Story 46.15). Blur rather than
+        // `Moved`/`Resized`, which fire once per compositor frame during a
+        // gesture; blur rather than only the close button, because a quit, a
+        // crash-free force-quit and a click on another app are all ways a
+        // window's last position and size become final without anybody pressing
+        // anything.
         if matches!(event, WindowEvent::Focused(false))
             && keeper_core::capture::is_capture_label(window.label())
         {
             let app = window.app_handle();
             if let Some(key) = notes_window::key_for_label(window.label()) {
-                let position = notes_window::position_of(app, &key);
+                let geometry = notes_window::geometry_of(app, &key);
                 notes_ipc::remember_placement(
                     app.state::<ipc::AppState>().platform.as_ref(),
                     &key,
-                    position,
+                    geometry,
                 );
             }
         }

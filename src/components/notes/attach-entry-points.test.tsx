@@ -15,13 +15,14 @@
  * `onInsert` proves nothing about it. The third writes to a note nobody has
  * open, so its result is read off the write command.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteAttachSourceVm,
   NoteAttachTargetVm,
   NoteBodyBatch,
   NoteBodyVm,
+  NoteGalleryVm,
   NoteWriteVm,
   RecordingNoteTargetVm,
 } from "@/lib/ipc/client";
@@ -39,6 +40,12 @@ const notesBodyRead = vi.fn<(v: string, n: string) => Promise<NoteBodyVm>>();
 const notesBodyWrite =
   vi.fn<(v: string, n: string, text: string, rev: string) => Promise<NoteWriteVm>>();
 const pickFiles = vi.fn<() => Promise<string[] | string | null>>();
+/** Story 46.11: the Attachments panel asks which of the note's embeds the vault
+ *  holds, and the in-vault chooser lists a vault folder. Both are reached by
+ *  mounting the panel or opening the chooser, which is why 45.13's mock factory
+ *  had neither. */
+const notesEmbedPaths = vi.fn<(v: string, targets: string[]) => Promise<(string | null)[]>>();
+const notesGallery = vi.fn<(v: string, folder: string) => Promise<NoteGalleryVm>>();
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: () => pickFiles(),
@@ -86,10 +93,24 @@ vi.mock("@/lib/ipc/client", () => ({
     notesBodyWrite(v, n, text, rev),
   notesBufferReport: vi.fn(async () => {}),
   notesBacklinks: vi.fn(async () => []),
+  notesEmbedPaths: (v: string, targets: string[]) => notesEmbedPaths(v, targets),
+  notesGallery: (v: string, folder: string) => notesGallery(v, folder),
 }));
 
-import { notesEditorStore } from "@/lib/stores/notes-editor";
-import { ATTACH_FILE_LABEL } from "./attach-file-button";
+import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
+import {
+  ATTACH_FILE_LABEL,
+  ATTACH_FROM_COMPUTER_HINT,
+  ATTACH_FROM_COMPUTER_LABEL,
+  ATTACH_FROM_VAULT_HINT,
+} from "./attach-file-button";
+import {
+  ATTACH_FROM_VAULT_LABEL,
+  ATTACH_FROM_VAULT_OUTCOME_TESTID,
+  ATTACH_FROM_VAULT_PROMISE,
+  ATTACH_FROM_VAULT_UP_LABEL,
+  VAULT_ROOT_LABEL,
+} from "./attach-from-vault-dialog";
 import {
   ATTACH_ACTION_LABEL,
   ATTACH_HOLDS_PREFIX,
@@ -97,6 +118,8 @@ import {
   ATTACH_SEARCH_LABEL,
   AttachToNoteDialog,
 } from "./attach-to-note-dialog";
+import { ATTACHMENTS_LABEL } from "./attachments-panel";
+import { NOTE_ACTIONS_LABEL } from "./note-actions";
 import { NoteEditor } from "./note-editor";
 
 /**
@@ -125,6 +148,30 @@ const RELATIVE = "recordings/2026/standup/screen-0000.mov";
  * bytes the attachment contributes, not about where a person left their cursor.
  */
 const OPENED = "alpha\nbeta\n";
+
+/**
+ * The vault the in-vault chooser browses, one folder per key (Story 46.11).
+ *
+ * A real walk down to the same file the other three entry points attach, rather
+ * than a root listing that implausibly holds a nested path: the chooser hands
+ * `notes_gallery` the folder it is looking at, and a fixture that skipped the
+ * navigation would not exercise the one thing the dialog does with a folder row.
+ */
+const VAULT: Record<string, NoteGalleryVm["items"]> = {
+  "": [{ name: "recordings", relPath: "recordings", kind: "folder", url: null }],
+  recordings: [{ name: "2026", relPath: "recordings/2026", kind: "folder", url: null }],
+  "recordings/2026": [
+    { name: "standup", relPath: "recordings/2026/standup", kind: "folder", url: null },
+  ],
+  "recordings/2026/standup": [
+    {
+      name: "screen-0000.mov",
+      relPath: "recordings/2026/standup/screen-0000.mov",
+      kind: "video",
+      url: "keeper-note://v1/recordings/2026/standup/screen-0000.mov",
+    },
+  ],
+};
 
 const RECORDING_BLOCK = [
   "---",
@@ -171,6 +218,16 @@ beforeEach(() => {
   notesAttachTargets.mockResolvedValue([NOTE]);
   notesBodyRead.mockResolvedValue({ rev: "r0", text: OPENED });
   pickFiles.mockResolvedValue([ABSOLUTE]);
+  // The vault the chooser walks, and the vault the panel asks about (Story
+  // 46.11). A folder nothing put in `VAULT` is a folder that is not there, and
+  // `notes_gallery` answers that with a sentence rather than a rejection.
+  notesGallery.mockImplementation(async (_vault, folder) => ({
+    folder,
+    items: VAULT[folder] ?? [],
+    truncated: false,
+    problem: folder in VAULT ? null : "this folder is not in the vault",
+  }));
+  notesEmbedPaths.mockImplementation(async (_vault, targets) => targets);
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
       kind: "reset",
@@ -185,7 +242,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null, frontmatter: "" });
+  resetNotesEditorStoreForTest();
 });
 
 /** Mount the real editor and wait for its lazy chunk and its first document. */
@@ -193,33 +250,97 @@ async function mountEditor(): Promise<void> {
   render(<NoteEditor vaultId="v1" noteId="n1" />);
   await waitFor(() => {
     expect(document.querySelector(".cm-content")).not.toBeNull();
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
   });
+}
+
+/** Open the note's Actions menu the way Radix's trigger listens for. */
+async function openNoteActions(): Promise<HTMLElement> {
+  const trigger = await screen.findByRole("button", {
+    name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
+  });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.pointerUp(trigger, { button: 0 });
+  return await screen.findByRole("menu");
 }
 
 /** Entry point one: the attachments panel Story 43.7 built. */
 async function throughThePanel(): Promise<string> {
   await mountEditor();
-  fireEvent.click(screen.getByRole("button", { name: "Attachments" }));
+  // Story 46.5: the panel's own control is a menu item now — the 560px capture
+  // window could not hold six header buttons. `menuitem` and not a bare name
+  // query, because `ATTACHMENTS_LABEL` is also the panel section's accessible
+  // name and a name query would happily resolve to the thing being opened.
+  const menu = await openNoteActions();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACHMENTS_LABEL }));
   const insert = await screen.findByRole("button", { name: `Insert ${RELATIVE}` });
   // A real button takes focus on the way down, off the editor, which fires the
   // blur save — the moment the caret could be lost.
   insert.focus();
   fireEvent.click(insert);
   await waitFor(() => {
-    expect(notesEditorStore.getState().text).toContain("![[");
+    expect(readNoteDocument("v1", "n1").text).toContain("![[");
   });
-  return notesEditorStore.getState().text;
+  return readNoteDocument("v1", "n1").text;
+}
+
+/**
+ * Open the attach control's own menu (Story 46.11).
+ *
+ * "Attach a file" is a dropdown trigger since it acquired a second source. The
+ * trigger keeps its name and the header keeps its two controls (AD-104), so what
+ * changed for a test is one interaction, not a query.
+ */
+async function openAttachMenu(): Promise<HTMLElement> {
+  const trigger = screen.getByRole("button", { name: ATTACH_FILE_LABEL });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.pointerUp(trigger, { button: 0 });
+  return await screen.findByRole("menu");
+}
+
+/** Reach the OS picker, which is one of the menu's two items now. */
+async function pickFromComputer(): Promise<void> {
+  const menu = await openAttachMenu();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_COMPUTER_LABEL }));
 }
 
 /** Entry point two: a file picked off the drive, into the open note. */
 async function throughThePicker(): Promise<string> {
   await mountEditor();
-  fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+  await pickFromComputer();
   await waitFor(() => {
-    expect(notesEditorStore.getState().text).toContain("![[");
+    expect(readNoteDocument("v1", "n1").text).toContain("![[");
   });
-  return notesEditorStore.getState().text;
+  return readNoteDocument("v1", "n1").text;
+}
+
+/**
+ * Entry point four: a file the vault already holds, browsed to from the note
+ * (Story 46.11).
+ *
+ * Walks the fixture vault down to the same file the other three attach, so the
+ * parity assertion covers a door that never calls `notes_attach_sources` at all.
+ */
+async function throughTheVaultChooser(): Promise<string> {
+  await mountEditor();
+  const menu = await openAttachMenu();
+  fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+  for (const folder of ["recordings", "2026", "standup"]) {
+    fireEvent.click(await screen.findByRole("button", { name: `${folder}/` }));
+  }
+  fireEvent.click(await screen.findByRole("button", { name: `Attach ${RELATIVE}` }));
+  await waitFor(() => {
+    expect(readNoteDocument("v1", "n1").text).toContain("![[");
+  });
+  // Closed the way a person closes it, and not left open: this dialog renders in
+  // a portal under `document.body`, and the parity test blanks `innerHTML`
+  // between doors — which tears a live portal's nodes out from under React and
+  // makes the unmount throw `NotFoundError` rather than failing an assertion.
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  await waitFor(() => {
+    expect(screen.queryByText(ATTACH_FROM_VAULT_PROMISE)).toBeNull();
+  });
+  return readNoteDocument("v1", "n1").text;
 }
 
 /** Entry point three: a Files-pane selection, into a note nobody has open. */
@@ -239,23 +360,33 @@ describe("one insertion path", () => {
   /**
    * The story, in one assertion. No expected literal: each result is compared
    * with the others, so a change to the embed spelling can only pass here by
-   * changing all three at once — which is what having one spelling means.
+   * changing all of them at once — which is what having one spelling means.
+   *
+   * Four since Story 46.11, and the fourth is the interesting one: it is the
+   * only door that resolves nothing in Rust, because the path it starts from is
+   * already the path a note names. Same bytes anyway, because all four go
+   * through `planAttachments`.
    */
-  it("puts the same file into the note as the same bytes from all three entry points", async () => {
+  it("puts the same file into the note as the same bytes from all four entry points", async () => {
     const fromPanel = await throughThePanel();
     document.body.innerHTML = "";
-    notesEditorStore.setState({ text: "", base: "", subscriptionId: null, frontmatter: "" });
+    resetNotesEditorStoreForTest();
 
     const fromPicker = await throughThePicker();
     document.body.innerHTML = "";
-    notesEditorStore.setState({ text: "", base: "", subscriptionId: null, frontmatter: "" });
+    resetNotesEditorStoreForTest();
+
+    const fromVault = await throughTheVaultChooser();
+    document.body.innerHTML = "";
+    resetNotesEditorStoreForTest();
 
     const fromChooser = await throughTheChooser();
 
     expect(fromPanel).toBe(fromPicker);
-    expect(fromPicker).toBe(fromChooser);
+    expect(fromPicker).toBe(fromVault);
+    expect(fromVault).toBe(fromChooser);
     // And it is the note plus one embed, not the note plus something that
-    // merely matched between three broken implementations.
+    // merely matched between four broken implementations.
     expect(fromPanel).toBe(`${OPENED}![[${RELATIVE}]]`);
   });
 
@@ -516,13 +647,13 @@ describe("the file picker's answers", () => {
     pickFiles.mockResolvedValue(null);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
     await waitFor(() => {
       expect(pickFiles).toHaveBeenCalled();
     });
 
     // A cancel is not an outcome: no note text, and no banner claiming one.
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     expect(notesAttachSources).not.toHaveBeenCalled();
     expect(screen.queryByRole("status")).toBeNull();
   });
@@ -537,13 +668,13 @@ describe("the file picker's answers", () => {
     pickFiles.mockResolvedValue(ABSOLUTE as unknown as string[]);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     expect(await screen.findByRole("status")).toHaveTextContent(
       "keeper could not read what the file picker returned",
     );
     expect(notesAttachSources).not.toHaveBeenCalled();
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
   });
 });
 describe("what the picker hands Rust", () => {
@@ -571,14 +702,14 @@ describe("what the picker hands Rust", () => {
     ]);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     await waitFor(() => {
       expect(notesAttachSources).toHaveBeenCalledWith("v1", [ABSOLUTE, second]);
     });
     // And the note gets both, in the order picked.
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(
+      expect(readNoteDocument("v1", "n1").text).toBe(
         `${OPENED}![[${RELATIVE}]]\n![[attachments/holiday.png]]`,
       );
     });
@@ -606,20 +737,20 @@ describe("the picker's duplicate rule", () => {
     await mountEditor();
 
     // First press writes it.
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(`${OPENED}![[${RELATIVE}]]`);
+      expect(readNoteDocument("v1", "n1").text).toBe(`${OPENED}![[${RELATIVE}]]`);
     });
 
     // Second press, same file, against the buffer the first one just changed —
     // no save has happened in between, which is the point.
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     expect(await screen.findByRole("status")).toHaveTextContent(
       "screen-0000.mov is already in this note, so keeper left it out.",
     );
     // Written once, not twice.
-    expect(notesEditorStore.getState().text).toBe(`${OPENED}![[${RELATIVE}]]`);
+    expect(readNoteDocument("v1", "n1").text).toBe(`${OPENED}![[${RELATIVE}]]`);
   });
 });
 
@@ -646,14 +777,14 @@ describe("what the picker says", () => {
     ]);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     // A copy is a change to their disk and gets a receipt, not silence.
     expect(await screen.findByRole("status")).toHaveTextContent(
       "outside the vault, so keeper copied it into attachments/",
     );
     await waitFor(() => {
-      expect(notesEditorStore.getState().text).toBe(`${OPENED}![[attachments/holiday.png]]`);
+      expect(readNoteDocument("v1", "n1").text).toBe(`${OPENED}![[attachments/holiday.png]]`);
     });
   });
 
@@ -670,10 +801,10 @@ describe("what the picker says", () => {
     ]);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     expect(await screen.findByRole("status")).toHaveTextContent("Trip is a folder.");
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
   });
 
   /** The same invariant the chooser has: partitioned on "produced no path", so
@@ -685,9 +816,161 @@ describe("what the picker says", () => {
     ]);
     await mountEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await pickFromComputer();
 
     expect(await screen.findByRole("status")).toHaveTextContent("mystery.bin");
-    expect(notesEditorStore.getState().text).toBe(OPENED);
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
+  });
+});
+
+/**
+ * The two doors, and the promise each one makes (Story 46.11).
+ *
+ * The owner's ask was "offer attach from a SYNC FOLDER in the dropdown too, not
+ * only from outside", and the ruling epic 46's spine made for it is that the
+ * in-vault door must **not** copy. So the load-bearing assertions here are about
+ * what does NOT happen: `notes_attach_sources` is the only thing in this app
+ * that copies a file into a vault, and this door never calls it.
+ */
+describe("the two doors on the attach control", () => {
+  it("offers both sources from one control, so the header keeps its two", async () => {
+    await mountEditor();
+    const menu = await openAttachMenu();
+
+    // Two items, the OS picker first because that is what this control has
+    // always done.
+    expect(
+      within(menu)
+        .getAllByRole("menuitem")
+        .map((item) => item.getAttribute("aria-label")),
+    ).toEqual([ATTACH_FROM_COMPUTER_LABEL, ATTACH_FROM_VAULT_LABEL]);
+    // And each says what it will do to the disk BEFORE it is opened, which is
+    // the whole reason they are two items with two hints rather than one verb
+    // with a folder chooser.
+    expect(within(menu).getByText(ATTACH_FROM_COMPUTER_HINT)).toBeInTheDocument();
+    expect(within(menu).getByText(ATTACH_FROM_VAULT_HINT)).toBeInTheDocument();
+  });
+
+  /**
+   * The ruling, asserted as an absence.
+   *
+   * The vault holds the file and the sync engine already carries it, so a copy
+   * would duplicate bytes that are on every machine this vault reaches and leave
+   * two files to drift. The note points at the file where it lives.
+   */
+  it("inserts a reference to the file where it already lives, and copies nothing", async () => {
+    const written = await throughTheVaultChooser();
+
+    expect(written).toBe(`${OPENED}![[${RELATIVE}]]`);
+    // The one copier in this app, never called — not called with a different
+    // argument, not called at all. This door has no absolute path to give it.
+    expect(notesAttachSources).not.toHaveBeenCalled();
+    // Nor did anything write to the vault: the only write is the note itself,
+    // through the editor's own save path.
+    expect(notesBodyWrite).not.toHaveBeenCalled();
+    // And nothing on screen or in the note is an absolute path (FR-145): every
+    // path this door ever held came from `notes_gallery` vault-relative.
+    expect(written).not.toContain("/Users/");
+  });
+
+  it("says which folder it is showing, and never where the vault is", async () => {
+    await mountEditor();
+    const menu = await openAttachMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+
+    // The promise, before anything is chosen.
+    expect(await screen.findByText(ATTACH_FROM_VAULT_PROMISE)).toBeInTheDocument();
+    // A phrase for the root, not a path — the webview is never told where the
+    // vault is (AD-65) and must not put one on screen (FR-145).
+    expect(screen.getByText(VAULT_ROOT_LABEL)).toBeInTheDocument();
+    // No way up from the root, because there is nothing above it in this frame.
+    expect(screen.queryByRole("button", { name: ATTACH_FROM_VAULT_UP_LABEL })).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "recordings/" }));
+
+    expect(await screen.findByText(`${VAULT_ROOT_LABEL} / recordings`)).toBeInTheDocument();
+    expect(notesGallery).toHaveBeenLastCalledWith("v1", "recordings");
+
+    // And back out again, to the folder above and not to the root.
+    fireEvent.click(await screen.findByRole("button", { name: "2026/" }));
+    await screen.findByText(`${VAULT_ROOT_LABEL} / recordings / 2026`);
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FROM_VAULT_UP_LABEL }));
+    expect(await screen.findByText(`${VAULT_ROOT_LABEL} / recordings`)).toBeInTheDocument();
+  });
+
+  /**
+   * A vault folder is mostly notes, so "why can I not attach this" is the first
+   * question this surface would raise if it stayed silent. The reason goes where
+   * the button would have been — the shape the attachments panel and the note
+   * chooser already use for a row they will not offer.
+   */
+  it("declines to offer what an embed cannot name, and says why instead of refusing after the click", async () => {
+    notesGallery.mockResolvedValue({
+      folder: "",
+      items: [
+        { name: "holiday.png", relPath: "holiday.png", kind: "image", url: "keeper-note://x" },
+        { name: "daily.md", relPath: "daily.md", kind: "file", url: null },
+        { name: "why#not.png", relPath: "why#not.png", kind: "image", url: null },
+      ],
+      truncated: false,
+      problem: null,
+    });
+    await mountEditor();
+    const menu = await openAttachMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+
+    // The one that can be attached is the only one with a button.
+    expect(await screen.findByRole("button", { name: "Attach holiday.png" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Attach daily.md" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Attach why#not.png" })).toBeNull();
+    // Each with its own reason, because they are two different facts: one is a
+    // transclusion by `export::names_a_note`, the other is a name no wikilink
+    // can spell.
+    expect(screen.getByText("a note, not a file")).toBeInTheDocument();
+    expect(screen.getByText("keeper cannot name this in a note")).toBeInTheDocument();
+  });
+
+  it("will not attach the same file twice, and says so where the person is looking", async () => {
+    await mountEditor();
+    const menu = await openAttachMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+    for (const folder of ["recordings", "2026", "standup"]) {
+      fireEvent.click(await screen.findByRole("button", { name: `${folder}/` }));
+    }
+
+    fireEvent.click(await screen.findByRole("button", { name: `Attach ${RELATIVE}` }));
+    await waitFor(() => {
+      expect(readNoteDocument("v1", "n1").text).toBe(`${OPENED}![[${RELATIVE}]]`);
+    });
+
+    // The receipt is in the dialog, because the dialog is covering the editor's
+    // banner and the person is looking at the dialog.
+    expect(screen.getByTestId(ATTACH_FROM_VAULT_OUTCOME_TESTID)).toHaveTextContent("no copy");
+    // And there is no second press to make: the row wears the panel's own word
+    // for the fact, so duplication is unavailable rather than guarded against.
+    expect(screen.queryByRole("button", { name: `Attach ${RELATIVE}` })).toBeNull();
+    expect(screen.getByText("In the note")).toBeInTheDocument();
+  });
+
+  it("renders Rust's sentence for a folder it cannot list, rather than calling it empty", async () => {
+    // A missing folder, an unreadable one and a path that escapes the vault all
+    // come back the same way from `notes_gallery`: a normal reply carrying a
+    // finished sentence, because a surface has to show something and a rejected
+    // promise gives it nothing to show. Which of the three it was is Rust's to
+    // know. "This folder is empty" would be a different fact, and untrue.
+    notesGallery.mockResolvedValue({
+      folder: "",
+      items: [],
+      truncated: false,
+      problem: "this folder is not in the vault, so there is nothing to show",
+    });
+    await mountEditor();
+    const menu = await openAttachMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+
+    expect(
+      await screen.findByText(/not in the vault, so there is nothing to show/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("This folder is empty.")).toBeNull();
   });
 });

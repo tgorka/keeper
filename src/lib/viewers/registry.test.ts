@@ -31,6 +31,7 @@ function file(name: string, kind: RecordingNoteTargetKind): ViewerFile {
     absolutePath: `/Volumes/merope/folder/${name}`,
     sizeLabel: "12 kB",
     openWith: null,
+    writeCaveat: null,
   };
 }
 
@@ -160,6 +161,7 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       absolutePath: "/Volumes/merope/finance/budget.csv",
       sizeLabel: "4 kB",
       openWith: null,
+      writeCaveat: null,
     };
     const fromNote: ViewerFile = {
       name: "budget.csv",
@@ -169,6 +171,7 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       absolutePath: null,
       sizeLabel: null,
       openWith: async () => undefined,
+      writeCaveat: null,
     };
     expect(resolveViewer(fromFiles)).toBe(resolveViewer(fromNote));
   });

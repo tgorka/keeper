@@ -295,6 +295,14 @@ export const PROPERTY_KEY_COLUMN = "properties-key";
 /** What the seam between the two columns sizes, for its accessible name. */
 export const PROPERTIES_COLUMN_LABEL = "the property name column";
 
+/**
+ * The panel's accessible name, and the word on the control that opens it —
+ * spelled once, like `ATTACHMENTS_LABEL`, because Story 46.5 moved that control
+ * into the note's Actions menu and a menu item and a `<section>` that disagreed
+ * would be two names for one thing.
+ */
+export const PROPERTIES_LABEL = "Properties";
+
 /** What the key column holds, named for the panel that opens a long key. */
 export const PROPERTY_NAME_LABEL = "Property name";
 
@@ -405,7 +413,7 @@ export function PropertiesPanel({
   if (parsed.unparsed) {
     const preview = truncateGraphemes(frontmatter, UNPARSED_PREVIEW_GRAPHEMES);
     return (
-      <section aria-label="Properties" className="border-b px-3 py-2 text-xs">
+      <section aria-label={PROPERTIES_LABEL} className="border-b px-3 py-2 text-xs">
         <p className="text-muted-foreground">
           This note's properties can't be parsed, so keeper is showing them exactly as they are on
           disk rather than rewriting them.
@@ -421,7 +429,10 @@ export function PropertiesPanel({
   }
 
   return (
-    <section aria-label="Properties" className="flex flex-col gap-1 border-b px-3 py-2 text-xs">
+    <section
+      aria-label={PROPERTIES_LABEL}
+      className="flex flex-col gap-1 border-b px-3 py-2 text-xs"
+    >
       {/* Always rendered, because the tag row is always here (Story 45.17). A
           note with no frontmatter at all is the commonest note there is, and it
           is exactly the one whose tags a person wants to set. */}

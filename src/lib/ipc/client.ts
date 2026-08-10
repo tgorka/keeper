@@ -46,6 +46,10 @@ export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
+export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
+export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
+export type { ConfigTierVm } from "./gen/ConfigTierVm";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 export type { CopyEntryVm } from "./gen/CopyEntryVm";
@@ -253,6 +257,7 @@ import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
@@ -3395,6 +3400,29 @@ export async function syncGitPathSet(path: string): Promise<SyncGitVm> {
 }
 
 /**
+ * Which settings a file decides, and everything wrong with the settings files
+ * (Story 46.7, AD-98).
+ *
+ * Settings resolve from a stack of `keeper.toml` layers -- yours, the main sync
+ * folder's, a folder's own -- and a layer keeps winning at every read rather
+ * than being imported into the database once at boot. That is what makes a
+ * hand-edited file useful; it is also what makes a control that silently loses
+ * to one dishonest. Every key in `overrides` is a key whose control must say
+ * so instead of accepting an edit the next read discards.
+ *
+ * `faults` is the other half and the louder one: a settings file that failed to
+ * parse, a `[settings]` block in a folder that may not carry one, or a
+ * `mainSyncFolder` naming a folder keeper does not sync -- each of which sets
+ * nothing at all and looks exactly like a file that works.
+ *
+ * Answers on every platform. A build with no settings file returns an empty
+ * stack, which is the normal, healthy case and never an error.
+ */
+export async function configLayers(): Promise<ConfigLayersVm> {
+  return await invoke<ConfigLayersVm>("config_layers");
+}
+
+/**
  * Store an access token for a profile in the OS keychain.
  *
  * The token goes straight to the keychain under a key derived from the profile
@@ -4368,6 +4396,31 @@ export async function notesCsvSetCell(
     column,
     value,
   });
+}
+
+/**
+ * Which of these embed targets the vault actually holds (Story 46.11).
+ *
+ * One answer per target, in the order asked: the vault-relative path the target
+ * resolves to, or `null` when the vault holds no such file. Resolved through the
+ * same `embed::candidates` + containment check {@link notesEmbedRead} uses, so a
+ * surface listing a note's files lists the files the viewer would open and the
+ * export would carry. A bare `photo.png` therefore comes back as `photo.png`
+ * when that is what is there and as `attachments/photo.png` when it is not —
+ * which is the whole reason the resolved path is what comes back rather than a
+ * boolean.
+ *
+ * A missing file is a `null`, never a rejection: "this note embeds something
+ * that is not here" is a fact a panel has to render, and one moved photograph
+ * must not blank the rest of the list.
+ *
+ * Rejects with: `notesVaultUnknown`, `unsupported`, `internal`.
+ */
+export async function notesEmbedPaths(
+  vaultId: string,
+  targets: string[],
+): Promise<(string | null)[]> {
+  return await invoke<(string | null)[]>("notes_embed_paths", { vaultId, targets });
 }
 
 /**

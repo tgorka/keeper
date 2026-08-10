@@ -26,6 +26,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
+import { PaneHeader } from "@/components/layout/pane-header";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
 import {
@@ -51,6 +52,20 @@ export const PANEL_EMPTY_SENTENCE = "Nothing is open here yet. Click a file to o
  *  {@link "@/lib/stores/panels"}'s `closePanel`; a control that refuses on
  *  activation is worse than a control that is not there. */
 export const PANEL_CLOSE_LABEL = "Close panel";
+
+/**
+ * The fold control, in both of its states (Story 46.13, FR-217).
+ *
+ * Two labels rather than one toggle word, because the accessible name of a
+ * control should say what pressing it does. The `aria-expanded` on the button
+ * says which state it is in; the name says which way it goes.
+ *
+ * A folded panel keeps its place in the strip and its target, and gives up its
+ * width. That is what makes it a different act from closing: the last panel may
+ * be folded, because the control that undoes it is sitting where the panel was.
+ */
+export const PANEL_FOLD_LABEL = "Fold panel";
+export const PANEL_UNFOLD_LABEL = "Unfold panel";
 
 /** What a panel says while it is finding out whether its target is still there. */
 export const PANEL_RESOLVING_SENTENCE = "Reading…";
@@ -216,6 +231,10 @@ function FilePanelBody({ profileId, relativePath }: { profileId: string; relativ
     absolutePath: entry.absolutePath,
     sizeLabel: entry.size?.label ?? null,
     openWith: openWithForProfileEntry(profileId, entry.relativePath),
+    // AD-102's standing sentence for a file keeper will write and does not
+    // manage. Composed in Rust and carried on the listing row, so the panel
+    // neither words it nor decides when it applies.
+    writeCaveat: entry.write.caveat,
   };
   const { entry: viewerEntry, Component } = viewerComponentFor(file);
   return <Component file={file} entry={viewerEntry} />;
@@ -240,9 +259,15 @@ function NotePanelBody({ vaultId, noteId }: { vaultId: string; noteId: string })
 }
 
 /** What one panel is showing. */
-function PanelBody({ target }: { target: PanelTargetVm | null }) {
+function PanelBody({
+  target,
+  emptySentence,
+}: {
+  target: PanelTargetVm | null;
+  emptySentence: string;
+}) {
   if (target === null) {
-    return <PanelReason reason={PANEL_EMPTY_SENTENCE} />;
+    return <PanelReason reason={emptySentence} />;
   }
   switch (target.kind) {
     case "file":
@@ -270,71 +295,139 @@ function panelName(target: PanelTargetVm | null): string {
   }
 }
 
-/** One panel: a header that names it and can close it, and the target below. */
+/**
+ * One panel: a header that names it, folds it and can close it, and the target
+ * below.
+ *
+ * # Folded is a different frame, not a hidden body
+ *
+ * A folded panel renders **no** {@link PanelBody}, and that is deliberate rather
+ * than incidental. A body kept mounted behind `hidden` would keep its
+ * subscriptions, its `sync_browse` and its editor buffer alive, which is exactly
+ * the cost the reader was trying to reclaim — and for a note panel it would keep
+ * a document mirror open over a note nobody can see. It also drops `flex-1` and
+ * the 280px floor, because the whole visible point of folding is that the
+ * neighbours get the width.
+ *
+ * The header is {@link PaneHeader} (AD-104): identity absorbs the slack, the
+ * actions sit last. A panel has no status element yet, so it passes none — see
+ * that module for why an empty reserved slot is not the same thing as no slot.
+ * Panels are `flex-1` inside a horizontally scrolling strip, so this header gets
+ * NARROWER than the note editor's rather than wider, which is the regime the
+ * shrink rules were written for.
+ */
 function PanelFrame({
   panel,
   active,
   closable,
+  emptySentence,
 }: {
   panel: Panel;
   active: boolean;
   closable: boolean;
+  emptySentence: string;
 }) {
   const name = panelName(panel.target);
+  const fold = (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      // The name says which way the control goes; `aria-expanded` says where it
+      // is now. A folded panel shows nothing else, so the name it carries is the
+      // only thing on screen that identifies it to a pointer.
+      aria-expanded={!panel.folded}
+      title={panel.folded ? name : undefined}
+      className="h-6 shrink-0 px-2 text-xs"
+      onClick={() => panelsStore.getState().toggleFold(panel.id)}
+    >
+      {panel.folded ? PANEL_UNFOLD_LABEL : PANEL_FOLD_LABEL}
+    </Button>
+  );
   return (
     <section
       aria-label={name}
       data-testid={`${PANEL_TESTID}-${panel.id}`}
       data-active={active ? "true" : undefined}
+      data-folded={panel.folded ? "true" : undefined}
       // Clicking anywhere in a panel focuses it, which is what makes the next
       // single click in the browser replace THIS panel rather than the one that
       // happened to be focused before.
       onFocusCapture={() => panelsStore.getState().focusPanel(panel.id)}
       onMouseDown={() => panelsStore.getState().focusPanel(panel.id)}
       className={cn(
-        "flex h-full min-w-[280px] flex-1 flex-col overflow-hidden border-border border-r bg-background last:border-r-0",
+        "flex h-full flex-col overflow-hidden border-border border-r bg-background last:border-r-0",
+        panel.folded ? "w-auto shrink-0 grow-0" : "min-w-[280px] flex-1",
         active && "ring-1 ring-ring ring-inset",
       )}
     >
-      <header className="flex shrink-0 items-center gap-2 border-border border-b px-3 py-2">
-        {/* Deliberately not a heading. The viewer inside draws the document's
-            own heading, and a second `h2` naming the same file would put two
-            entries in a screen reader's heading list for one document. The
-            panel is named by the section's `aria-label`, which is how a reader
-            jumps between panels — a tab strip's job, not an outline's. */}
-        <span className="min-w-0 flex-1 truncate font-medium text-sm">{name}</span>
-        {/* Story 45.21. A file only: a note panel's Export is in the editor's
-            own Actions menu, which is the surface that can flush the buffer
-            before the bytes are read off the disk. Two Export controls over one
-            note, one of which exported the last autosave, is the shape this
-            placement exists to refuse. */}
-        {panel.target?.kind === "file" && (
-          <ExportFileButton
-            profileId={panel.target.profileId}
-            relativePath={panel.target.relativePath}
-          />
-        )}
-        {closable && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-6 shrink-0 px-2 text-xs"
-            onClick={() => panelsStore.getState().closePanel(panel.id)}
-          >
-            {PANEL_CLOSE_LABEL}
-          </Button>
-        )}
-      </header>
-      <div className="min-h-0 flex-1 overflow-auto">
-        <PanelBody target={panel.target} />
-      </div>
+      {panel.folded ? (
+        // Folded: the control that undoes it, and nothing else. The panel is
+        // still named by the section's `aria-label`, so a reader moving between
+        // panels can still tell which one this is.
+        <header className="flex shrink-0 items-center border-border border-b px-1 py-2">
+          {fold}
+        </header>
+      ) : (
+        <PaneHeader
+          className="border-border border-b px-3 py-2"
+          // Deliberately not a heading. The viewer inside draws the document's
+          // own heading, and a second `h2` naming the same file would put two
+          // entries in a screen reader's heading list for one document. The
+          // panel is named by the section's `aria-label`, which is how a reader
+          // jumps between panels — a tab strip's job, not an outline's.
+          identity={<span className="min-w-0 flex-1 truncate font-medium text-sm">{name}</span>}
+          actions={
+            <>
+              {/* Story 45.21. A file only: a note panel's Export is in the
+                  editor's own Actions menu, which is the surface that can flush
+                  the buffer before the bytes are read off the disk. Two Export
+                  controls over one note, one of which exported the last
+                  autosave, is the shape this placement exists to refuse. */}
+              {panel.target?.kind === "file" && (
+                <ExportFileButton
+                  profileId={panel.target.profileId}
+                  relativePath={panel.target.relativePath}
+                />
+              )}
+              {fold}
+              {closable && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 shrink-0 px-2 text-xs"
+                  onClick={() => panelsStore.getState().closePanel(panel.id)}
+                >
+                  {PANEL_CLOSE_LABEL}
+                </Button>
+              )}
+            </>
+          }
+        />
+      )}
+      {panel.folded ? null : (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <PanelBody target={panel.target} emptySentence={emptySentence} />
+        </div>
+      )}
     </section>
   );
 }
 
-/** Every open panel, left to right. */
-export function PanelStrip() {
+/**
+ * Every open panel, left to right.
+ *
+ * `emptySentence` is the one thing the host gets to say, and it exists because
+ * the strip has two hosts since Story 46.12. The default names the gesture that
+ * fills a panel in the Files surface; the Notes surface passes its own, because
+ * "click a file to open it" is the wrong instruction beside a list of notes and
+ * a first-run panel is the very first thing either surface shows. It is a prop
+ * threaded to the frame rather than a module default or a store value, so the
+ * sentence depends on which surface is rendering and not on which one mounted
+ * last.
+ */
+export function PanelStrip({ emptySentence = PANEL_EMPTY_SENTENCE }: { emptySentence?: string }) {
   const panels = usePanelsStore((s) => s.panels);
   const activeId = usePanelsStore((s) => s.activeId);
   return (
@@ -346,6 +439,7 @@ export function PanelStrip() {
           active={panel.id === activeId}
           // The last panel cannot be closed, so it does not offer to be.
           closable={panels.length > 1}
+          emptySentence={emptySentence}
         />
       ))}
     </section>

@@ -37,21 +37,21 @@
  *
  * Rust reads the note off the disk, because an export is a copy of a file and a
  * buffer in the webview is not a file. So the export flushes first, through
- * `saveOpenNote` — the same write the autosave performs, not a second writer —
+ * `saveNote` — the same write the autosave performs, not a second writer —
  * and refuses if the buffer still differs afterwards. Exporting a file that is
  * missing the last paragraph somebody typed, under a cheerful "Exported"
  * toast, is the worst outcome available here: it is wrong, and it looks right.
  */
 
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
-import { saveOpenNote } from "@/hooks/use-notes-body";
+import { saveNote } from "@/hooks/use-notes-body";
 // `PanelTargetVm` from the generated bindings, not from the panel store: the
 // store declares the type locally and does not re-export it, and adding an
 // export there would make it a second source for a type Rust generates.
 // `panel-strip.tsx` takes it from the same place.
 import type { PanelTargetVm } from "@/lib/ipc/client";
 import { type ExportReceiptVm, notesExport, syncExportEntry } from "@/lib/ipc/client";
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { readNoteDocument } from "@/lib/stores/notes-editor";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The folder chooser's title. Names the act, because the OS dialog's own
@@ -85,19 +85,19 @@ export type ExportOutcome =
   | { readonly status: "refused"; readonly reason: string };
 
 /**
- * Flush the editor's buffer when the note being exported is the open one.
+ * Flush this note's buffer before its file is read.
  *
- * The identity check is not defensive tidiness: `saveOpenNote` and `dirty` both
- * read the module-singleton editor store, so exporting a note that is NOT open
- * would otherwise be refused because some *other* note has unsaved edits.
+ * Story 46.12 deleted the identity check that used to guard this. It existed
+ * because `saveOpenNote` and `dirty` both read a module-singleton editor store,
+ * so exporting a note that was NOT open would have been refused because some
+ * *other* note had unsaved edits. The store is keyed by note now: `saveNote`
+ * addresses this note's buffer, resolves `true` when there is nothing to write
+ * — which is what a note nobody has open always answers — and no other note's
+ * dirtiness can reach this function.
  */
 async function flushed(vaultId: string, noteId: string): Promise<boolean> {
-  const open = notesEditorStore.getState();
-  if (open.vaultId !== vaultId || open.noteId !== noteId) {
-    return true;
-  }
-  await saveOpenNote();
-  return !notesEditorStore.getState().dirty;
+  await saveNote(vaultId, noteId);
+  return !readNoteDocument(vaultId, noteId).dirty;
 }
 
 /**

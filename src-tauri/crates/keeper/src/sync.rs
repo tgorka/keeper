@@ -297,22 +297,13 @@ pub fn configured_git_path(platform: &dyn Platform) -> Option<String> {
 }
 
 /// This machine's short name, for provenance trailers and conflict filenames.
-pub(crate) fn read_host_label() -> String {
-    let raw = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
-    // macOS answers with a Bonjour name (`macbookpro.lan`); the leading label
-    // keeps a commit trailer short.
-    let short = raw.split('.').next().unwrap_or_default().trim();
-    if short.is_empty() {
-        "unknown-host".to_owned()
-    } else {
-        short.to_owned()
-    }
-}
+///
+/// Moved into `keeper-core` in Story 46.6 — the layer stack's per-machine files
+/// are `keeper.<host>.toml`, and that name has to be computable from a crate
+/// that builds on every platform, not from the Tauri shell. Re-exported here so
+/// the callers that already say `crate::sync::read_host_label()` are unchanged
+/// and there is still exactly one definition.
+pub(crate) use keeper_core::config::read_host_label;
 
 /// The process-wide engine, built on first use.
 ///
@@ -535,17 +526,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[test]
-    fn a_host_label_is_always_produced_and_is_a_short_name() {
-        // Provenance identifies the machine; an empty or dotted label makes
-        // every commit trailer either useless or noisy.
-        let label = read_host_label();
-        assert!(!label.is_empty());
-        assert!(
-            !label.contains('.'),
-            "expected a short label, got {label:?}"
-        );
-    }
+    // `a_host_label_is_always_produced_and_is_a_short_name` moved to
+    // `keeper_core::config` in Story 46.6, with the function. It is the same
+    // assertion, and it now runs on a host that can build the crate it tests.
 
     /// Story 41.5: a `PushPolicy::Window` is an `HH:MM` a person typed on the
     /// clock on their wall, so the offset the engine converts it with has to be

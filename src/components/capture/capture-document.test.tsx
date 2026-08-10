@@ -26,7 +26,7 @@
  * listener was declared and never mounted" is a defect this project has already
  * shipped twice.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteAttachSourceVm,
@@ -98,9 +98,13 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { EditorView } from "@codemirror/view";
 import { CapturePanel } from "@/capture-main";
-import { ATTACH_FILE_LABEL } from "@/components/notes/attach-file-button";
-import { ADD_NOTE_TAG } from "@/components/notes/properties-panel";
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import {
+  ATTACH_FILE_LABEL,
+  ATTACH_FROM_COMPUTER_LABEL,
+} from "@/components/notes/attach-file-button";
+import { NOTE_ACTIONS_LABEL } from "@/components/notes/note-actions";
+import { ADD_NOTE_TAG, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
+import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { CAPTURE_OPENING_LABEL, CaptureDocument, CaptureDraftDocument } from "./capture-document";
 
 /**
@@ -116,13 +120,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   restoreRects();
-  notesEditorStore.setState({
-    text: "",
-    base: "",
-    subscriptionId: null,
-    cursor: null,
-    dirty: false,
-  });
+  resetNotesEditorStoreForTest();
 });
 
 /** The key `capture-main.tsx` names the prewarmed hotkey window with. */
@@ -179,6 +177,24 @@ async function liveEditor(): Promise<EditorView> {
   );
 }
 
+/**
+ * Open the note's Actions menu (Story 46.5) and hand back its content.
+ *
+ * This window is 560px wide (`notes_window.rs:91`) and is the surface the
+ * defect was filed against: the header used to carry six controls, the row
+ * does not wrap, and the last of them — the one holding Delete — was off the
+ * screen. Four of them live in this menu now, so the two the capture window
+ * presses are reached through it.
+ */
+async function openNoteActions(): Promise<HTMLElement> {
+  const trigger = await screen.findByRole("button", {
+    name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
+  });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.pointerUp(trigger, { button: 0 });
+  return await screen.findByRole("menu");
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   onCaptureShown = null;
@@ -224,7 +240,13 @@ describe("the quick-capture draft window", () => {
     // these are `NoteEditor`'s controls, and nothing in this story renders them.
     expect(screen.getByLabelText("Bold")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: ATTACH_FILE_LABEL })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Properties" })).toBeInTheDocument();
+    // Story 46.5: the note's panel verbs live in its Actions menu now, so the
+    // header carries the menu and the menu carries Properties. Read as a
+    // `menuitem` and not by bare name — `PropertiesPanel`'s own `<section>`
+    // answers to the same word, and a name query that resolved to the region
+    // would fail as "the item is missing" when the item was fine.
+    const menu = await openNoteActions();
+    expect(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL })).toBeInTheDocument();
   });
 
   it("renders every notice the create had to say", async () => {
@@ -310,7 +332,8 @@ describe("the quick-capture draft window", () => {
     render(<CaptureDraftDocument captureKey={DRAFT_KEY} />);
     await liveEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: "Properties" }));
+    const menu = await openNoteActions();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL }));
     fireEvent.click(await screen.findByRole("button", { name: ADD_NOTE_TAG }));
     const field = await screen.findByLabelText(ADD_NOTE_TAG);
     fireEvent.change(field, { target: { value: "errand" } });
@@ -345,7 +368,16 @@ describe("the quick-capture draft window", () => {
     render(<CaptureDraftDocument captureKey={DRAFT_KEY} />);
     const editor = await liveEditor();
 
-    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    // Story 46.11: "Attach a file" is a dropdown trigger now, because the header
+    // gained a second source and AD-104 leaves its action group at two controls.
+    // The quick-capture window mounts the same header, so it gets the same two
+    // doors — including the in-vault one, which is the point of putting them in
+    // the control rather than in the 560px row.
+    const trigger = screen.getByRole("button", { name: ATTACH_FILE_LABEL });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    const attachMenu = await screen.findByRole("menu");
+    fireEvent.click(within(attachMenu).getByRole("menuitem", { name: ATTACH_FROM_COMPUTER_LABEL }));
 
     // The call, because `notesAttachSources` answers the same list whatever it
     // is handed: the vault the capture note lives in, and every picked path.

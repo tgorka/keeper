@@ -43,11 +43,20 @@ vi.mock("@/lib/ipc/client", () => ({
   revealPath: vi.fn(async () => {}),
 }));
 
+import { EXPORT_NOTE_LABEL } from "@/components/export/export-note-item";
+import { PANE_HEADER_ACTIONS_SLOT } from "@/components/layout/pane-header";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
-import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { withRangeRects } from "@/test/layout";
-import { NOTE_ACTIONS_LABEL, NOTE_DELETE_LABEL, NoteActions } from "./note-actions";
+import { ATTACH_FILE_LABEL } from "./attach-file-button";
+import { ATTACHMENTS_LABEL } from "./attachments-panel";
+import {
+  NOTE_ACTIONS_LABEL,
+  NOTE_ACTIONS_TEXT,
+  NOTE_DELETE_LABEL,
+  NoteActions,
+} from "./note-actions";
 import {
   NOTE_DELETE_CANCEL,
   NOTE_DELETE_CONFIRM,
@@ -55,6 +64,8 @@ import {
   NOTE_DELETE_TESTID,
 } from "./note-delete-dialog";
 import { NoteEditor } from "./note-editor";
+import { NOTE_HISTORY_LABEL } from "./note-history-panel";
+import { PROPERTIES_LABEL } from "./properties-panel";
 
 // jsdom does no layout, so CodeMirror's measure pass throws outside every `try`
 // a test can write and takes the run's exit code while the summary still prints
@@ -117,7 +128,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  notesEditorStore.setState({ text: "", base: "", subscriptionId: null, cursor: null });
+  resetNotesEditorStoreForTest();
   resetPanelsStoreForTest();
 });
 
@@ -190,6 +201,87 @@ describe("deleting the open note, from the editor's own header", () => {
         false,
       );
     });
+  });
+});
+
+/**
+ * Story 46.5 — the verb is findable, not merely reachable.
+ *
+ * Every test above passed on the morning the owner wrote "I still see no way
+ * to delete notes", and they passed honestly: the menu was mounted, the item
+ * was in it, and Rust got the right ids. They were blind to the defect because
+ * they find the trigger by `role` and an `aria-label` no eye reads, in a jsdom
+ * that performs no layout — and the defect was in exactly those two gaps. The
+ * trigger was a bare `⋯` among five text buttons, and the row it ends does not
+ * wrap and was wider than the 560px quick-capture window
+ * (`notes_window.rs:91`), so it was off the screen as well as unlabelled.
+ *
+ * Neither pixel fact can be measured here. What these assert is the structure
+ * the measurement follows from — a word on the trigger, and two controls in
+ * the row instead of six. The pixels are gate checks in the spec, because a
+ * test that claimed to measure them would be lying about jsdom.
+ */
+describe("finding the destructive verb", () => {
+  it("puts a word on the trigger, and the word is part of the name it answers to", async () => {
+    openOn("# Standup\n");
+    render(<NoteEditor vaultId="v1" noteId="note-7" />);
+
+    const trigger = await screen.findByRole("button", {
+      name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
+    });
+    // The whole report, in one assertion: an icon among words reads as
+    // decoration. A trigger whose only child is an SVG has no text content at
+    // all, which is what this was.
+    expect(trigger).toHaveTextContent(NOTE_ACTIONS_TEXT);
+    // And the eye and the screen reader are naming the same control (WCAG
+    // 2.5.3): speech input asks for what it can see, so a visible label that
+    // is not part of the accessible name is a control nobody can say.
+    const spoken = trigger.getAttribute("aria-label") ?? "";
+    expect(spoken.startsWith(trigger.textContent ?? "")).toBe(true);
+  });
+
+  it("leaves two controls in the header, so its last one is not the one off the screen", async () => {
+    openOn("# Standup\n");
+    render(<NoteEditor vaultId="v1" noteId="note-7" />);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
+
+    // jsdom lays nothing out, so this cannot assert a width. It asserts what
+    // the width followed from: six controls plus two spans in a non-wrapping
+    // 560px row overflowed, and this menu is the group's LAST child, so it was
+    // the first thing past the edge. The identities are asserted and not just
+    // the count — a collapse that kept two of the wrong two would fit and
+    // still lose the verb.
+    const actions = document.querySelector<HTMLElement>(
+      `[data-slot="${PANE_HEADER_ACTIONS_SLOT}"]`,
+    );
+    expect(actions).not.toBeNull();
+    const labels = Array.from(
+      (actions as HTMLElement).querySelectorAll("button"),
+      (button) => button.textContent,
+    );
+    expect(labels).toEqual([ATTACH_FILE_LABEL, NOTE_ACTIONS_TEXT]);
+  });
+
+  it("still offers every verb the header used to carry, by name, from that one menu", async () => {
+    // The move is only safe if nothing was dropped on the way in — and the
+    // order still has to put the destructive one last, which was 45.17's
+    // contract and is the only guard left once six items share a list.
+    //
+    // `Show in Files` is deliberately not here: this file seeds no vaults, so
+    // 45.18's predicate refuses it. `note-file-links.test.tsx` owns that one,
+    // present AND absent, with the menu open in both directions.
+    openOn("# Standup\n");
+    render(<NoteEditor vaultId="v1" noteId="note-7" />);
+
+    const menu = await openActions(new RegExp(`^${NOTE_ACTIONS_LABEL}`));
+    const items = within(menu).getAllByRole("menuitem");
+    expect(items.map((item) => item.textContent)).toEqual([
+      ATTACHMENTS_LABEL,
+      PROPERTIES_LABEL,
+      NOTE_HISTORY_LABEL,
+      EXPORT_NOTE_LABEL,
+      NOTE_DELETE_LABEL,
+    ]);
   });
 });
 

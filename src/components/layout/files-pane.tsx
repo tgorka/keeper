@@ -49,7 +49,16 @@
  * files on it.** Mounting lists the profiles and nothing else; a folder's
  * children are asked for the first time it is expanded, and never again unless
  * Refresh asks. Collapsing keeps what was loaded, so re-opening a branch is
- * free.
+ * free — within one mount.
+ *
+ * **Across mounts, only the expansion survives, and it survives on purpose
+ * (Story 46.3).** This pane is unmounted whenever another primary view is up,
+ * so everything below was thrown away every time somebody looked at Notes.
+ * Which folders are open now lives in {@link "@/lib/stores/files-tree"} and
+ * comes back; the listings and the failures do not, because a cached listing
+ * restored from the last run is a claim about a disk keeper has not looked at.
+ * The cost is one `sync_browse` per remembered folder when this pane mounts,
+ * which is the honest price of the tree being where you left it.
  *
  * **An absent drive and an empty folder are different facts.** They look
  * identical to the filesystem — an unplugged volume simply has no directory
@@ -104,8 +113,16 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
 import { useWindowedRows } from "@/components/ui/window-list";
+import { useLongPress } from "@/hooks/use-long-press";
 import { countLabel, ITEMS } from "@/lib/count-label";
 import type {
   FilesDeletePlanVm,
@@ -126,6 +143,14 @@ import {
   syncProfiles,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import {
+  filesTreeStore,
+  nodeKey,
+  nodeKeyProfile,
+  nodeKeySubpath,
+  reachableNodeKeys,
+  useFilesTree,
+} from "@/lib/stores/files-tree";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
@@ -175,7 +200,45 @@ export const FILES_ALL_PAUSED_SENTENCE = "Every folder is paused. Resume one in 
 export const FILES_REVEAL_LABEL = "Reveal in Finder";
 export const FILES_COPY_PATH_LABEL = "Copy path";
 export const FILES_COPIED_LABEL = "Copied";
-export const FILES_OPEN_LABEL = "Open";
+
+/**
+ * The three things "open" can mean here, worded so a reader can tell which is
+ * which (Story 46.13, FR-215, UX-DR77).
+ *
+ * Three verbs already existed and only one of them had a name. A single click
+ * replaced what the active panel was showing, a double click opened a second
+ * panel beside it, and the row's own button handed the file to the operating
+ * system — and that last one, the only one with a label, was called `Open`,
+ * which is the word all three of them deserve. A reader who has never seen this
+ * pane cannot discover two of the three, and cannot tell what the third does
+ * without pressing it.
+ *
+ * So the menu names all three, and the button that leaves keeper says the same
+ * thing the menu item says. Naming them is most of this fix; the menu is how a
+ * name becomes reachable.
+ *
+ * "Panel" rather than "tab" — the owner's report said tab, and the product has
+ * never had one. What is beside the tree is a panel, the store is `panels`, and
+ * a menu that invented a second word for it would be teaching the reader a
+ * vocabulary the rest of keeper does not use.
+ */
+export const FILES_OPEN_HERE_LABEL = "Open in this panel";
+export const FILES_OPEN_BESIDE_LABEL = "Open in a new panel";
+export const FILES_OPEN_LABEL = "Open in the default app";
+
+/**
+ * What the row's own hand-it-to-the-system button SAYS, as against what it is
+ * NAMED ({@link FILES_OPEN_LABEL}, its `aria-label` and its `title`).
+ *
+ * The row already carries three text buttons and a name that has to truncate
+ * before they do; spelling the whole verb across it would cost the file name
+ * about a hundred pixels on every row in the tree. So the button shows the short
+ * word and answers to the long one. The accessible name CONTAINS the visible
+ * label, which is the condition that makes this safe rather than a trap for
+ * anyone driving keeper by voice (WCAG 2.5.3), and the menu — where a reader
+ * goes to find out what the row can do — spells all three verbs out in full.
+ */
+export const FILES_OPEN_SHORT_LABEL = "Open";
 
 /** The write controls, and the two sentences the surface uses around them
  * (Story 45.3). Every other word in the confirmation is Rust's. */
@@ -314,19 +377,6 @@ const FOLDER_ROLE_TITLE: Record<FilesFolderRoleVm, string> = {
   notesVault: "Your notes vault",
   recordings: "Where recordings are saved",
 };
-
-/**
- * The key one directory is remembered under: a profile and a subpath.
- *
- * `\u0000` rather than `/` or `:` because both are legal in the strings being
- * joined — a folder called `a/b` cannot exist, but a profile id and a subpath
- * concatenated with `:` can collide with a different pair, and a cache that
- * confuses two directories would show one folder's contents under another
- * folder's name.
- */
-function nodeKey(profileId: string, subpath: string): string {
-  return `${profileId}\u0000${subpath}`;
-}
 
 /** One `treeitem`: a profile root, or one entry inside one. */
 interface TreeNodeRow {
@@ -478,6 +528,33 @@ function RowName({
   );
 }
 
+/**
+ * The panel target a row names, or `null` for every row that is not a file this
+ * pane can open (Story 45.1, AD-90).
+ *
+ * A profile root has no entry, and a folder's own gesture is expand/collapse — a
+ * folder is not a panel target, so opening one must not replace what the panel
+ * beside the tree is showing. This is also the predicate for whether a row gets
+ * a context menu at all: the menu's three items are the three ways to open a
+ * file, and a menu holding none of them would be an empty menu offered on a
+ * right-click, which is worse than the native one it suppressed.
+ *
+ * Narrowed to the `file` variant rather than the whole union: the menu's third
+ * item hands the row's own subpath to the operating system, and a caller that
+ * had to re-narrow a union it just built would be one `default:` away from
+ * handing `syncOpenEntry` a note id.
+ */
+function rowTarget(node: TreeNodeRow): Extract<PanelTargetVm, { kind: "file" }> | null {
+  if (node.isFolder || node.entry === null) {
+    return null;
+  }
+  return {
+    kind: "file",
+    profileId: node.profileId,
+    relativePath: node.entry.relativePath,
+  };
+}
+
 export function FilesPane() {
   // A platform with no user-visible file manager gets no Reveal affordance —
   // the row shows its path as inert text instead, the idiom `SyncFolderPath` and
@@ -486,7 +563,13 @@ export function FilesPane() {
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
 
   const [profiles, setProfiles] = useState<SyncProfileVm[] | null>(null);
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  // Which folders are open outlives this component (Story 46.3): the shell
+  // unmounts the pane on every surface switch, so a `useState` here was a set
+  // the user rebuilt by hand each time they came back.
+  const expanded = useFilesTree((s) => s.expanded);
+  // The listings and the failures below stay component state, deliberately.
+  // They cache what a directory held, and a cache restored from the last run
+  // would be describing a disk keeper has not read since.
   const [listings, setListings] = useState<ReadonlyMap<string, FilesListingVm>>(() => new Map());
   // No `loading` set: a node with no listing yet IS the in-flight state, and
   // the tree already says "Reading…" for it. A second flag tracking the same
@@ -501,6 +584,11 @@ export function FilesPane() {
   // rendered elements are held by key. A ref rather than state: writing one
   // during render must not schedule another.
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  // One instance for every row in the tree (Story 46.13). The hook tracks a
+  // single press at a time and captures the pressed element per press, which is
+  // what its own doc says it is for — a hook per row would be one timer per row
+  // in a virtualised list.
+  const longPress = useLongPress();
 
   /**
    * The selection model the rest of the pane reads (Story 45.3, FR-175).
@@ -555,11 +643,24 @@ export function FilesPane() {
   // synced folder, but a note lives in the open vault and nowhere else.
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
 
+  /**
+   * Whether `profiles` is a list Rust answered with, rather than the empty list
+   * this pane renders when the call failed.
+   *
+   * The two are indistinguishable in `profiles` itself, and Story 46.3 needs
+   * them apart: a profile that is absent from an answer has been deleted, and
+   * its remembered folders should go with it — but a profile absent because the
+   * sync engine could not be reached has not been deleted at all, and dropping
+   * someone's expansion over a call that failed would be a worse defect than
+   * the one the restore exists to fix. Empty-because-broken forgets nothing.
+   */
+  const answered = useRef(false);
   useEffect(() => {
     let live = true;
     syncProfiles()
       .then((list) => {
         if (live) {
+          answered.current = true;
           setProfiles(list);
         }
       })
@@ -615,19 +716,53 @@ export function FilesPane() {
       });
   }, []);
 
+  /**
+   * Re-ask for the folders that were already open before this pane mounted
+   * (Story 46.3).
+   *
+   * This is the cost of remembering the expansion, paid deliberately and in one
+   * place: `sync_browse` once per remembered folder. Only the *reachable* ones —
+   * a node whose parent is shut renders nowhere, so browsing for it would buy
+   * nothing — and only under a profile that is enabled, because a paused folder
+   * is one keeper is not watching and this pane does not list it.
+   *
+   * Keyed on the profile list rather than on mount, and that ordering is
+   * load-bearing: `profiles` is non-null only once `syncProfiles()` has settled,
+   * which is a microtask after every mount effect in the tree — including
+   * `AppShell`'s `hydrateFilesTree`. So the store is already restored by the
+   * time this reads it, without this pane knowing anything about the shell.
+   *
+   * Once per mount, and not until the list is one Rust answered — see
+   * {@link answered}. A profile enabled while this pane is on screen is not a
+   * case: Sync is a different primary view, so reaching it unmounts this. A
+   * list that arrives late, from a Refresh after a failed first call, is: the
+   * effect stays armed until it has a real one.
+   */
+  const restored = useRef(false);
+  useEffect(() => {
+    if (restored.current || profiles === null || !answered.current) {
+      return;
+    }
+    restored.current = true;
+    // A remembered folder under a profile that no longer exists is dropped
+    // here, silently. Nothing on screen names it, so there is nothing for the
+    // reader to act on — and left alone it would be a cookie key nothing can
+    // ever clear and a browse call against a folder keeper has forgotten.
+    filesTreeStore.getState().retainProfiles(profiles.map((p) => p.id));
+    const browsable = new Set(profiles.filter((p) => p.enabled).map((p) => p.id));
+    for (const key of reachableNodeKeys(filesTreeStore.getState().expanded)) {
+      const profileId = nodeKeyProfile(key);
+      if (browsable.has(profileId)) {
+        load(profileId, nodeKeySubpath(key));
+      }
+    }
+  }, [profiles, load]);
+
   const toggle = useCallback(
     (profileId: string, subpath: string) => {
       const key = nodeKey(profileId, subpath);
       const opening = !expanded.has(key);
-      setExpanded((prev) => {
-        const next = new Set(prev);
-        if (opening) {
-          next.add(key);
-        } else {
-          next.delete(key);
-        }
-        return next;
-      });
+      filesTreeStore.getState().setNodeOpen(key, opening);
       // Lazy, and once: the fetch fires on the opening edge only, and only for
       // a directory that has never answered. Collapsing keeps what was loaded,
       // so re-opening a branch costs nothing — and a branch whose last attempt
@@ -644,11 +779,13 @@ export function FilesPane() {
    * that collapsed the tree would lose the place the person was looking at. */
   const refresh = useCallback(() => {
     syncProfiles()
-      .then(setProfiles)
+      .then((list) => {
+        answered.current = true;
+        setProfiles(list);
+      })
       .catch(() => undefined);
     for (const key of expanded) {
-      const separator = key.indexOf("\u0000");
-      load(key.slice(0, separator), key.slice(separator + 1));
+      load(nodeKeyProfile(key), nodeKeySubpath(key));
     }
   }, [expanded, load]);
 
@@ -1202,14 +1339,7 @@ export function FilesPane() {
       if (event.target instanceof Element && event.target.closest("button") !== null) {
         return null;
       }
-      if (node.isFolder || node.entry === null) {
-        return null;
-      }
-      return {
-        kind: "file",
-        profileId: node.profileId,
-        relativePath: node.entry.relativePath,
-      };
+      return rowTarget(node);
     },
     [],
   );
@@ -1308,7 +1438,12 @@ export function FilesPane() {
       ]
         .filter((id) => id !== null)
         .join(" ") || undefined;
-    return (
+    // Story 46.13, FR-215: what this row can be opened as, and therefore whether
+    // it has a menu at all. Derived once — the menu's items and the row's own
+    // click gestures must be about the same target or the two gestures mean
+    // different things on the same row.
+    const target = rowTarget(node);
+    const row = (
       <div
         ref={(element) => {
           if (element === null) {
@@ -1341,6 +1476,13 @@ export function FilesPane() {
         onFocus={() => setRememberedKey(node.key)}
         onClick={(event) => handleRowClick(event, node)}
         onDoubleClick={(event) => handleRowDoubleClick(event, node)}
+        // Story 46.13: the phone tier's way into the very same menu the
+        // right-click opens — a ≥500ms stationary press dispatches the synthetic
+        // `contextmenu` the Radix trigger below is already listening for. Spread
+        // only on a row that HAS a menu, so a long press on a folder is not
+        // quietly swallowed by the click suppressor for a menu that never opens.
+        // Off the phone tier every one of these is a no-op.
+        {...(target === null ? {} : longPress)}
         className={cn(
           "flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring",
           selected.has(node.key) && "bg-accent",
@@ -1466,12 +1608,18 @@ export function FilesPane() {
                 variant="ghost"
                 size="sm"
                 tabIndex={actionTabIndex}
+                // Says `Open`, answers to `Open in the default app` — see
+                // {@link FILES_OPEN_SHORT_LABEL}. The full verb is also the
+                // pointer's tooltip, so the short word is never the only thing a
+                // reader can find out about this control.
+                aria-label={FILES_OPEN_LABEL}
+                title={FILES_OPEN_LABEL}
                 className="h-6 px-2 text-xs"
                 onClick={() => {
                   void syncOpenEntry(node.profileId, entry.relativePath).catch(() => undefined);
                 }}
               >
-                {FILES_OPEN_LABEL}
+                {FILES_OPEN_SHORT_LABEL}
               </Button>
             )}
             {canReveal && (
@@ -1501,6 +1649,46 @@ export function FilesPane() {
           </span>
         )}
       </div>
+    );
+    if (target === null) {
+      return row;
+    }
+    // Story 46.13, FR-215, UX-DR77. The house pattern, verbatim: one Radix
+    // `ContextMenu` whose trigger is the row itself (`asChild`, so the DOM the
+    // tree and the virtualiser see is unchanged), paired with `useLongPress` for
+    // the phone tier — the same construction as `chat-row`, `favorites-section`,
+    // `networks-group` and `pins-strip`. Not a fifth idiom.
+    //
+    // The three items are the three verbs the pane already had and only ever
+    // named one of: a single click replaced the active panel, a double click
+    // opened a second one, and the row's button left keeper. Two of those were
+    // undiscoverable and the third was called `Open`. The menu is where a reader
+    // finds out that this row does three different things, so the wording is the
+    // deliverable and the menu is the surface that carries it.
+    //
+    // The rule sits above the last item because that item is the only one that
+    // leaves keeper — everything above it happens in this window, and the
+    // separator is the sentence "and now something different".
+    return (
+      <ContextMenu>
+        <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onSelect={() => panelsStore.getState().setActiveTarget(target)}>
+            {FILES_OPEN_HERE_LABEL}
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => panelsStore.getState().openPanel(target)}>
+            {FILES_OPEN_BESIDE_LABEL}
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem
+            onSelect={() => {
+              void syncOpenEntry(node.profileId, target.relativePath).catch(() => undefined);
+            }}
+          >
+            {FILES_OPEN_LABEL}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
     );
   };
 

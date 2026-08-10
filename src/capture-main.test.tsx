@@ -52,7 +52,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 vi.mock("@/hooks/use-notes-body", () => ({
-  saveOpenNote: () => Promise.resolve(),
+  saveNote: () => Promise.resolve(true),
 }));
 
 import { CapturePanel } from "@/capture-main";

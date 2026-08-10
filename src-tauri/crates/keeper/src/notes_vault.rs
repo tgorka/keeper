@@ -494,8 +494,14 @@ pub fn set_recording_tags(session_id: &str, tags: &[String]) {
 
 /// Drop the cache and cold-scan (`notes_index_rebuild`).
 ///
-/// Deleting `.keeper/` by hand is the same repair, which is why this is not the
-/// only way to get it.
+/// **Selective, and it has to be.** Until Story 46.8 `.keeper/` held nothing but
+/// a cache and a trash, so deleting the whole directory by hand was the same
+/// repair and was documented as one. AD-100 put the folder's own configuration
+/// in there — `keeper.toml` and `keeper.<host>.toml`, which sync — so the whole
+/// directory is no longer safe to delete and this must never grow into a
+/// `remove_dir_all`. It removes `index.json` and nothing else: the trash is the
+/// user's recoverable deletions (NFR-30) and the `*.toml` files are their
+/// settings, and neither is a cache a rescan can regenerate.
 pub fn rebuild(id: &str) -> Result<(), NotesError> {
     let guard = registry();
     let slot = guard
@@ -1104,10 +1110,15 @@ impl VaultWalk for DiskWalk {
 /// Walk the vault, returning every markdown note with its `lstat`.
 ///
 /// `.obsidian/` is skipped **by name, before descent** — the directory is never
-/// listed, so nothing inside it is opened or stat'd. So are `.keeper/`, which is
-/// keeper's own cache rather than vault content, and `.git/`. Everything else
-/// goes through keeper's own [`ExcludeSet`], so an exclusion rule means the same
-/// thing to notes as it does to sync.
+/// listed, so nothing inside it is opened or stat'd. So are `.keeper/` and
+/// `.git/`. Everything else goes through keeper's own [`ExcludeSet`], so an
+/// exclusion rule means the same thing to notes as it does to sync.
+///
+/// `.keeper/` stays skipped even though AD-100 made the `*.toml` in it sync:
+/// the tier-0 carve-out is about what reaches a *commit*, and a folder's
+/// configuration is no more a note than the index cache beside it is. The
+/// refusal is by name rather than through the [`ExcludeSet`] precisely so this
+/// walk does not have to care which of the two answers tier 0 gives.
 fn walk(fs: &mut dyn VaultWalk, excludes: &ExcludeSet) -> Vec<Seen> {
     let mut out = Vec::new();
     let mut queue = vec![String::new()];
@@ -1197,7 +1208,9 @@ fn load_cache(vault: &Vault) -> Vec<IndexEntry> {
     adopt_cache(&bytes, &vault.id).unwrap_or_else(|| {
         tracing::info!(
             vault = %vault.id,
-            "notes: index cache discarded; rescanning (deleting .keeper/ is a supported repair)"
+            "notes: index cache discarded; rescanning (deleting .keeper/index.json is a \
+             supported repair — never the directory, which now holds the folder's own \
+             keeper.toml as well as the trash)"
         );
         Vec::new()
     })
