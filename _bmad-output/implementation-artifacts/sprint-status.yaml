@@ -470,22 +470,22 @@ development_status:
   45-21-export-and-comments-on-a-pdf: review
   epic-45-retrospective: optional
   epic-46: in-progress
-  46-1-a-path-with-a-space-is-one-pattern: backlog
-  46-2-attachments-lists-what-you-attached: backlog
-  46-3-the-tree-stays-where-you-left-it: backlog
-  46-4-a-save-does-not-move-the-toolbar: backlog
-  46-5-delete-a-note-where-you-look-for-it: backlog
-  46-6-a-settings-value-is-resolved-not-imported: backlog
-  46-7-the-main-sync-folder-holds-the-shared-settings: backlog
-  46-8-a-folder-and-a-machine-can-each-say-something: backlog
-  46-9-every-setting-reaches-the-file: backlog
-  46-10-the-recording-destination-in-one-place: backlog
-  46-11-attach-from-a-folder-you-already-sync: backlog
-  46-12-several-notes-at-once: backlog
-  46-13-a-file-row-has-a-menu-and-a-panel-can-fold: backlog
-  46-14-edit-and-delete-outside-the-vault: backlog
-  46-15-a-capture-window-you-can-resize: backlog
-  46-16-start-a-recording-from-the-tray: backlog
+  46-1-a-path-with-a-space-is-one-pattern: review
+  46-2-attachments-lists-what-you-attached: review
+  46-3-the-tree-stays-where-you-left-it: review
+  46-4-a-save-does-not-move-the-toolbar: review
+  46-5-delete-a-note-where-you-look-for-it: review
+  46-6-a-settings-value-is-resolved-not-imported: review
+  46-7-the-main-sync-folder-holds-the-shared-settings: review
+  46-8-a-folder-and-a-machine-can-each-say-something: review
+  46-9-every-setting-reaches-the-file: review
+  46-10-the-recording-destination-in-one-place: review
+  46-11-attach-from-a-folder-you-already-sync: review
+  46-12-several-notes-at-once: review
+  46-13-a-file-row-has-a-menu-and-a-panel-can-fold: review
+  46-14-edit-and-delete-outside-the-vault: review
+  46-15-a-capture-window-you-can-resize: review
+  46-16-start-a-recording-from-the-tray: review
   epic-46-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
