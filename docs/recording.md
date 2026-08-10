@@ -287,6 +287,14 @@ not parse degrades to the default on read), `recording.echo_cancellation`
   **fails the build** if the result is still ad-hoc. Run it from Terminal.app:
   codesign cannot reach the login keychain over SSH
   (`errSecInternalComponent`).
+- **From a Linux workstation, `bun run install:macos` already does all of that.**
+  It rsyncs the tree to the Mac and then dispatches the signed build into the
+  Mac's GUI login session through Terminal.app — the one route to the login
+  keychain that needs neither root (`launchctl asuser`) nor the account password
+  (`security unlock-keychain`). A Terminal window opens on the Mac, its output
+  streams back to your shell, and it closes when the build succeeds. There is no
+  unsigned install path any more; before this, the script built ad-hoc over ssh
+  and merely printed a warning, which cost the TCC grant on every install.
 
   ### The "infinite Screen Recording prompt" loop
 
