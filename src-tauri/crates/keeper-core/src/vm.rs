@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
 
 /// The resolved Incognito state for a chat, projected to the frontend (Story 8.1).
@@ -3050,6 +3051,53 @@ pub struct RecordingSummaryVm {
     pub title: Option<String>,
 }
 
+/// A finished session's `meta` block, shaped for the "Next session" form
+/// (Story 45.19, FR-197).
+///
+/// The same five fields the form collects, and in the form's own units — which
+/// is the point: this VM is what the editor on the last recording opens with,
+/// and what "record another like this" fills a fresh form from. A surface
+/// receiving it never has to know how the manifest stores anything.
+///
+/// The one shape change from [`crate::recording::SessionMeta`] is [`Self::tags`]:
+/// stored as a list, presented as the single comma-separated line the field
+/// holds, joined by [`crate::recording::SessionMeta::tags_line`] so the join and
+/// the split that undoes it stay one decision.
+///
+/// Every field is a plain `String` rather than an `Option`, because an absent
+/// manifest field and an empty form field are the same fact to a form and
+/// giving them two representations would only invite a `?? ""` at the other end.
+/// "There is no session here at all" is a different fact and is carried by the
+/// command answering `None`.
+///
+/// Not `ts_rs`-exported, for [`RecordingSummaryVm`]'s reason — the frontend
+/// declares the twin in `client.ts`; this fixes the camelCase wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSessionMetaVm {
+    /// The session's human title, `""` when it has none.
+    pub title: String,
+    /// Who the recording is with, `""` when unset.
+    pub participants: String,
+    /// The program/session note, `""` when unset.
+    pub note: String,
+    /// The tags as one comma-separated line, `""` when there are none.
+    pub tags: String,
+    /// The repeatable custom rows, in the order the manifest holds them.
+    pub custom: Vec<RecordingSessionMetaFieldVm>,
+}
+
+/// One custom name/value row of [`RecordingSessionMetaVm`] — the wire twin of
+/// [`crate::recording::SessionMetaField`], which is not itself a VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSessionMetaFieldVm {
+    /// The row's user-chosen name.
+    pub name: String,
+    /// The row's value.
+    pub value: String,
+}
+
 /// The note stub the stop surface presents (Story 42.4, FR-142).
 ///
 /// Composed by [`crate::notes::recording_note::compose`] at finalize and written
@@ -4375,9 +4423,271 @@ pub struct FilesDeleteReceiptVm {
     pub refusals: Vec<FilesDeleteRefusalVm>,
 }
 
+/// The most files an export receipt names before it starts counting.
+///
+/// A receipt is read once, in a toast. Three names tell somebody which files
+/// they are and a fourth line of filenames tells them nothing they will read —
+/// but a bare count tells them nothing at all, which is why this is a cap and
+/// not a switch to counting.
+const NAMED_IN_A_RECEIPT: usize = 3;
+
+/// `a, b and 2 more`, or `""` for nothing.
+fn named_list(items: &[String]) -> String {
+    let shown = items
+        .iter()
+        .take(NAMED_IN_A_RECEIPT)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match items.len().checked_sub(NAMED_IN_A_RECEIPT) {
+        Some(rest) if rest > 0 => format!("{shown} and {rest} more"),
+        _ => shown,
+    }
+}
+
+/// What an export actually put in the folder the user picked (Story 45.21,
+/// FR-199).
+///
+/// **What did not go is as much of the receipt as what did.** A note whose
+/// embed has been moved exports without that file, and an export that reported
+/// only its successes would be one nobody could rely on for the thing an export
+/// is for — handing the document to somebody outside keeper. So the two kinds
+/// of not-carried are separate lists with separate remedies: a file keeper
+/// looked for and could not find, and a note the export deliberately did not
+/// follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ExportReceiptVm {
+    /// Absolute path of the one thing that now exists in the destination: the
+    /// copied file, or the folder a note's export was written into.
+    ///
+    /// The only absolute path here, and it is what Reveal points at. FR-145
+    /// forbids an absolute path in a *synced artefact*; this is a receipt for
+    /// something the user just picked a location for, and naming it is the
+    /// whole point.
+    pub path: String,
+    /// Every file written, relative to the destination folder, in copy order.
+    pub written: Vec<String>,
+    /// Embed targets that named a file and resolved to nothing on disk,
+    /// spelled as the note spells them.
+    pub missing: Vec<String>,
+    /// Embed targets that named another note. Not carried, because following
+    /// one would make an export of a note an export of an unbounded set of
+    /// them.
+    pub notes: Vec<String>,
+    /// The finished sentence the surface shows, worded here so the words are
+    /// asserted rather than assembled in a component.
+    pub summary: String,
+}
+
+impl ExportReceiptVm {
+    /// The receipt for one file copied out as itself.
+    pub fn file(destination: &str, path: String, name: &str) -> Self {
+        Self {
+            path,
+            written: vec![name.to_owned()],
+            missing: Vec::new(),
+            notes: Vec::new(),
+            summary: format!("Exported {name} to {destination}."),
+        }
+    }
+
+    /// The receipt for a note and the files it embeds.
+    ///
+    /// `written` is the engine's own list, note first, so the attachment count
+    /// is derived from what actually landed rather than from what was planned
+    /// — a receipt that counted the plan would say "and 2 attachments" about an
+    /// export that copied one.
+    ///
+    /// **The plan arrives whole rather than as two `Vec<String>`s**, and that is
+    /// a deliberate defence rather than tidiness. This is called from
+    /// `keeper/src/notes_ipc.rs`, which does not compile on Linux, so a call
+    /// site that passed `missing` where `notes` belongs would type-check for
+    /// nobody and be found by a user reading "keeper could not find 1 file this
+    /// note embeds: Other Note". One argument cannot be swapped with itself.
+    pub fn note(path: String, note_name: &str, written: Vec<String>, plan: NoteExportPlan) -> Self {
+        let NoteExportPlan {
+            attachments: _,
+            missing,
+            notes,
+        } = plan;
+        let carried = written.len().saturating_sub(1);
+        let with = match carried {
+            0 => String::new(),
+            1 => " and 1 attachment".to_owned(),
+            many => format!(" and {many} attachments"),
+        };
+        let mut summary = format!("Exported {note_name}{with} to {path}.");
+        if !missing.is_empty() {
+            let names = named_list(&missing);
+            let count = missing.len();
+            summary.push_str(&if count == 1 {
+                format!(" keeper could not find 1 file this note embeds, so it was not carried: {names}.")
+            } else {
+                format!(" keeper could not find {count} files this note embeds, so they were not carried: {names}.")
+            });
+        }
+        if !notes.is_empty() {
+            let names = named_list(&notes);
+            summary.push_str(&if notes.len() == 1 {
+                format!(" One embedded note was not carried — export it separately: {names}.")
+            } else {
+                format!(" Embedded notes were not carried — export them separately: {names}.")
+            });
+        }
+        Self {
+            path,
+            written,
+            missing,
+            notes,
+            summary,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Story 45.21: the file receipt names the file and where it went, and
+    /// carries none of a note's caveats — a file has no embeds keeper reads.
+    #[test]
+    fn a_file_export_receipt_names_the_file_and_the_folder() {
+        let receipt = ExportReceiptVm::file(
+            "/Users/alice/Desktop",
+            "/Users/alice/Desktop/clip.mov".to_owned(),
+            "clip.mov",
+        );
+        assert_eq!(
+            receipt.summary,
+            "Exported clip.mov to /Users/alice/Desktop."
+        );
+        assert_eq!(receipt.written, vec!["clip.mov"]);
+        assert!(receipt.missing.is_empty() && receipt.notes.is_empty());
+    }
+
+    /// A plan carrying only the two not-carried lists — the attachment list is
+    /// the copier's input, never the receipt's.
+    fn caveats(missing: &[&str], notes: &[&str]) -> NoteExportPlan {
+        NoteExportPlan {
+            attachments: Vec::new(),
+            missing: missing.iter().map(|s| (*s).to_owned()).collect(),
+            notes: notes.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// Story 45.21: the attachment count comes off what landed, so a receipt
+    /// cannot claim a file the copier never wrote.
+    #[test]
+    fn a_note_export_receipt_counts_the_files_that_actually_landed() {
+        let receipt = ExportReceiptVm::note(
+            "/out/Meeting".to_owned(),
+            "Meeting.md",
+            vec![
+                "Meeting/Meeting.md".to_owned(),
+                "Meeting/attachments/a.png".to_owned(),
+                "Meeting/data/rows.csv".to_owned(),
+            ],
+            caveats(&[], &[]),
+        );
+        assert_eq!(
+            receipt.summary,
+            "Exported Meeting.md and 2 attachments to /out/Meeting."
+        );
+    }
+
+    #[test]
+    fn a_note_export_receipt_is_singular_about_one_attachment_and_silent_about_none() {
+        let one = ExportReceiptVm::note(
+            "/out/Meeting".to_owned(),
+            "Meeting.md",
+            vec!["Meeting/Meeting.md".to_owned(), "Meeting/a.png".to_owned()],
+            caveats(&[], &[]),
+        );
+        assert_eq!(
+            one.summary,
+            "Exported Meeting.md and 1 attachment to /out/Meeting."
+        );
+        let none = ExportReceiptVm::note(
+            "/out/Meeting".to_owned(),
+            "Meeting.md",
+            vec!["Meeting/Meeting.md".to_owned()],
+            caveats(&[], &[]),
+        );
+        assert_eq!(none.summary, "Exported Meeting.md to /out/Meeting.");
+    }
+
+    /// Story 45.21: what did not go is named, not merely counted — a count
+    /// sends somebody to compare two folders by hand.
+    ///
+    /// The two caveats are asserted TOGETHER and in order, because they are
+    /// two lists of the same type: a call site that passed one where the other
+    /// belongs would produce a grammatical sentence about the wrong files, and
+    /// only their relative order in one string can see that.
+    #[test]
+    fn a_note_export_receipt_names_what_it_could_not_find_and_what_it_would_not_follow() {
+        let receipt = ExportReceiptVm::note(
+            "/out/Meeting".to_owned(),
+            "Meeting.md",
+            vec!["Meeting/Meeting.md".to_owned()],
+            caveats(&["gone.png", "vanished.pdf"], &["Other Note"]),
+        );
+        assert_eq!(
+            receipt.summary,
+            "Exported Meeting.md to /out/Meeting. keeper could not find 2 files this note \
+             embeds, so they were not carried: gone.png, vanished.pdf. One embedded note was \
+             not carried — export it separately: Other Note."
+        );
+        // And the lists reach the wire intact, not only the sentence.
+        assert_eq!(receipt.missing, vec!["gone.png", "vanished.pdf"]);
+        assert_eq!(receipt.notes, vec!["Other Note"]);
+    }
+
+    #[test]
+    fn a_single_missing_file_reads_as_one_rather_than_as_a_list() {
+        let receipt = ExportReceiptVm::note(
+            "/out/M".to_owned(),
+            "M.md",
+            vec!["M/M.md".to_owned()],
+            caveats(&["gone.png"], &["A", "B"]),
+        );
+        assert!(
+            receipt.summary.contains(
+                "keeper could not find 1 file this note embeds, so it was not carried: gone.png."
+            ),
+            "{}",
+            receipt.summary
+        );
+        assert!(
+            receipt
+                .summary
+                .contains("Embedded notes were not carried — export them separately: A, B."),
+            "{}",
+            receipt.summary
+        );
+    }
+
+    /// Story 45.21: a receipt is read once, in a toast, so a long list stops
+    /// naming and starts counting — but it never stops naming entirely.
+    ///
+    /// Four entries as well as five: with three named, four is the smallest
+    /// list that has a remainder, and a cap that only starts counting at two
+    /// left over would pass every five-entry test.
+    #[test]
+    fn a_long_list_names_three_and_counts_the_rest() {
+        let names = |n: usize| -> Vec<String> {
+            ["a", "b", "c", "d", "e"][..n]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect()
+        };
+        assert_eq!(named_list(&names(0)), "");
+        assert_eq!(named_list(&names(1)), "a");
+        assert_eq!(named_list(&names(3)), "a, b, c");
+        assert_eq!(named_list(&names(4)), "a, b, c and 1 more");
+        assert_eq!(named_list(&names(5)), "a, b, c and 2 more");
+    }
 
     /// Story 18.2: `is_live`/`is_terminal` partition every `RecordingUiState`
     /// variant — live = Preflight/Recording/Rotating/Stopping, terminal =

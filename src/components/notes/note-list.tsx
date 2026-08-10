@@ -16,11 +16,21 @@
  *
  * Keyboard is the chat list's grammar over a disjoint scope, which is the point:
  * `j`/`k`/`↑`/`↓` move, `Enter` opens, `e` archives, `u` acknowledges an agent's
- * changes, `p` pins. A chat-list user needs no new muscle memory. `f` and `m`
- * have no notes meaning and stay unbound — binding a familiar key to an
- * unfamiliar verb is worse than leaving it silent. `u` is one-directional here,
- * unlike the chat list's toggle: `notes_mark_read` is the whole read-state
- * surface and there is no mark-unread twin, so a read row absorbs the press.
+ * changes, `p` pins, `Delete`/`⌫` ask to remove. A chat-list user needs no new
+ * muscle memory. `f` and `m` have no notes meaning and stay unbound — binding a
+ * familiar key to an unfamiliar verb is worse than leaving it silent. `u` is
+ * one-directional here, unlike the chat list's toggle: `notes_mark_read` is the
+ * whole read-state surface and there is no mark-unread twin, so a read row
+ * absorbs the press.
+ *
+ * `Delete` joined that list in Story 45.17 and it is the same verb the muscle
+ * memory already carries, which is why it is here rather than left silent: the
+ * chat list binds bare `⌫`/`Delete` on the selected message to a redaction
+ * **dialog**, and the Files pane binds them to a delete **confirmation**. All
+ * three ask and none of them removes anything on the keystroke. Checked against
+ * `conversation-pane.tsx` rather than assumed — a familiar key bound to a
+ * destructive verb that behaved differently here would be the exact failure the
+ * paragraph above refuses, in the one place it costs a note.
  *
  * The roving cursor is keyed by note id rather than index (the chat list's rule,
  * and for the same reason): a streamed re-order or a filter change must move the
@@ -62,8 +72,13 @@ export function NoteList({
   selectedId: string | null;
   onSelect: (row: NoteRowVm) => void;
   onToggleTag: (tag: string) => void;
-  /** The single-key verbs and `⌘⇧R`, dispatched on the row under the cursor. */
-  onVerb: (row: NoteRowVm, verb: "e" | "p" | "u" | "r") => void;
+  /**
+   * The single-key verbs, `⌘⇧R` and `Delete`, dispatched on the row under the
+   * cursor. `d` ASKS — it opens the confirmation and never deletes, which is
+   * the Files pane's rule (Story 45.3) and the reason a stray keystroke in a
+   * list cannot lose a note.
+   */
+  onVerb: (row: NoteRowVm, verb: "e" | "p" | "u" | "r" | "d") => void;
   /** Ask for a wider window; called as the viewport nears the last row. */
   onGrow: () => void;
 }) {
@@ -161,6 +176,14 @@ export function NoteList({
     if (event.key === "e" || event.key === "p" || event.key === "u") {
       event.preventDefault();
       onVerb(focused, event.key);
+    }
+    // Both spellings, because the key that means "remove this" is `Delete` on
+    // a full keyboard and `Backspace` on the laptops this app is used on —
+    // binding one of them leaves half the users without the verb. Neither
+    // deletes: `onVerb` opens the confirmation.
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      onVerb(focused, "d");
     }
   };
 

@@ -66,6 +66,7 @@ export function TagVocabularyInput({
   value,
   onChange,
   placeholder,
+  disabled,
   vaultId,
 }: {
   /** The input's DOM id; the label points at it and the datalist derives from it. */
@@ -75,6 +76,11 @@ export function TagVocabularyInput({
   /** Receives the raw text, unmodified. */
   onChange: (value: string) => void;
   placeholder?: string;
+  /** Freeze the field while its host has a save in flight (Story 45.19) — the
+   *  details editor on a finished session disables every control together, and
+   *  a tag field that stayed live would take edits the in-flight write cannot
+   *  carry. */
+  disabled?: boolean;
   /** Scope the vocabulary to a vault; omitted, Rust resolves the active one —
    *  the recording metadata card has no vault of its own. */
   vaultId?: string;
@@ -106,6 +112,7 @@ export function TagVocabularyInput({
         id={id}
         list={listId}
         value={value}
+        disabled={disabled}
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />

@@ -47,11 +47,15 @@ import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { hydratePanels } from "@/lib/stores/panels";
 import { usePrimaryView } from "@/lib/stores/primary-view";
+import { hydrateSidebarFold, sidebarFoldStore, useSidebarFold } from "@/lib/stores/sidebar-fold";
 import { beginTitleBarDrag } from "@/lib/titlebar-drag";
 import { cn } from "@/lib/utils";
 
 export function AppShell() {
-  const { phone, sidebarCollapsed, detailFloating } = useShellLayout();
+  // `narrow` is the VIEWPORT's answer, not the user's. Kept under its own name
+  // because the two are combined a few lines down and reading one as the other
+  // is how a user's fold would silently win over "there is no room".
+  const { phone, sidebarCollapsed: narrow, detailFloating } = useShellLayout();
   // Stream every account's connectivity into the per-account status store: the
   // switcher glyphs, the shell offline pill, and the "Queued" send caption are
   // all pure projections of that single map.
@@ -116,6 +120,24 @@ export function AppShell() {
   useEffect(() => {
     hydratePanels(document.cookie);
   }, []);
+  // Restore the fold from the last run (Story 45.20, FR-198), in the same place
+  // and for the same reason: the drawer is unmounted on the phone tier and can
+  // be unmounted for a whole session, so a restore that lived inside it would
+  // silently not happen. Idempotent, like `hydratePanels`.
+  useEffect(() => {
+    hydrateSidebarFold(document.cookie);
+  }, []);
+  // The user's fold, and how it composes with the viewport's.
+  //
+  // OR, not "the user wins": below 1080px there is no room for a 260px drawer
+  // and that has been true since long before the fold existed, so the narrow
+  // viewport forces the rail and the toggle is withdrawn rather than offered as
+  // a control that would lie. Above it, the choice is entirely the user's — and
+  // it is remembered, so widening the window later brings back the fold they
+  // chose rather than the one the window imposed.
+  const menuFolded = useSidebarFold((s) => s.menu);
+  const sidebarCollapsed = narrow || menuFolded;
+  const toggleFold = useCallback(() => sidebarFoldStore.getState().toggleMenu(), []);
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
@@ -235,7 +257,12 @@ export function AppShell() {
             <PhoneShell />
           ) : (
             <>
-              <SidebarPane collapsed={sidebarCollapsed} />
+              {/* `onToggleFold` is `null` where the viewport has already made
+                  the decision: below 1080px there is no room to unfold into, so
+                  the control is absent rather than present-and-inert. A
+                  disabled button whose only answer is "your window is too
+                  narrow" is a worse answer than no button. */}
+              <SidebarPane collapsed={sidebarCollapsed} onToggleFold={narrow ? null : toggleFold} />
               {recording && primaryView === "recording" ? (
                 <RecordingPane />
               ) : recording && primaryView === "recordings" ? (

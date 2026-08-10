@@ -5,10 +5,19 @@
  * **`document.cookie`, not `localStorage` and not an IPC command.** A column
  * width is a lens the viewer chose, not a fact Rust has any use for, so it does
  * not earn a settings row and a binding. `localStorage` is refused across this
- * codebase (`iosSyncDisclosureShownGet` says so out loud), and the one durable
- * store the frontend already keeps a view preference in is the cookie
- * `SidebarProvider` writes `sidebar_state` to. This follows that, so there is
- * one answer to "where does a remembered pane preference live" rather than two.
+ * codebase (`iosSyncDisclosureShownGet` says so out loud), so a cookie is where
+ * a remembered pane preference lives. {@link "@/lib/stores/sidebar-fold"}
+ * follows the same shape — one cookie per concern, a `keeper_` name, a year —
+ * so there is one answer to "where does a remembered pane preference live"
+ * rather than two.
+ *
+ * This paragraph used to say the precedent was "the cookie `SidebarProvider`
+ * writes `sidebar_state` to". That was false the day it was written: shadcn's
+ * `SidebarProvider` lived in `src/components/ui/sidebar.tsx` and was imported by
+ * nothing, so no build of keeper has ever written `sidebar_state`. Story 45.20
+ * deleted the dead component and corrected the sentence. If you find
+ * `sidebar_state` in a cookie-jar fixture in this repo, that is what it is: a
+ * foreign cookie, chosen precisely because keeper does not write it.
  *
  * Everything here is pure and takes the cookie string as an argument. The
  * parsing, the clamping and the grid template are then assertable without a

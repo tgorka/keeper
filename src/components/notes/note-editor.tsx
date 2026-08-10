@@ -26,20 +26,33 @@
  * which is a promise a remount could not keep.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ExportNoteItem } from "@/components/export/export-note-item";
 import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
+import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
+import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
+import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import type { FormatAction } from "./editor/format-commands";
 import { FormatToolbar } from "./format-toolbar";
+import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NoteHistoryPanel } from "./note-history-panel";
 import { PropertiesPanel, readFrontmatter, recordingSessionId } from "./properties-panel";
 import { TemplateUpdateOffer } from "./template-update-offer";
+
+/**
+ * Test id for the sentence a link that went nowhere leaves behind (Story
+ * 45.18). A slot rather than `role="status"` alone, because 45.13's attach
+ * receipt is also a status and a test has to read one without matching the
+ * other.
+ */
+export const LINK_NOTICE_SLOT = "note-link-notice";
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
@@ -155,12 +168,9 @@ export interface NoteEditorProps {
   noteId: string | null;
   /** Open another note — a backlink row, or a wikilink that resolved. */
   onOpenNote?: (noteId: string) => void;
-  /** Follow a wikilink by name. Resolution belongs to the surface that owns
-   *  the list and the link graph, never to the decoration layer. */
-  onFollowLink?: (target: string) => void;
 }
 
-export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEditorProps) {
+export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   const base = useNotesEditorStore((state) => state.base);
   const rev = useNotesEditorStore((state) => state.rev);
@@ -170,6 +180,17 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   const savedAtMs = useNotesEditorStore((state) => state.savedAtMs);
   const conflictCopy = useNotesEditorStore((state) => state.conflictCopy);
   const error = useNotesEditorStore((state) => state.error);
+  // Story 45.18: the vault this note is in, for the one question the header
+  // asks that the note itself cannot answer — where its file sits inside the
+  // sync profile. Hydrated here rather than assumed, because this editor is
+  // also mounted by `PanelStrip`, and a session that never opened the Notes tab
+  // has never read the vault list.
+  const vault = useNotesVaultsStore(
+    (state) => state.vaults?.find((each) => each.id === vaultId) ?? null,
+  );
+  useEffect(() => {
+    void ensureNotesVaultsHydrated();
+  }, []);
 
   const hostRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<EditorRuntime | null>(null);
@@ -182,6 +203,11 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   // below, because both are "here is what keeper did to your file after you
   // asked for something else".
   const [attachOutcome, setAttachOutcome] = useState<string | null>(null);
+  // Story 45.18's answer to a link that did not go anywhere: the note nobody
+  // has written, the scheme keeper will not open, the window with no opener
+  // grant. Shown rather than swallowed, because a click that produces silence
+  // is exactly what this story was sent to remove.
+  const [linkNotice, setLinkNotice] = useState<string | null>(null);
 
   const openHistory = useCallback(() => setMode("history"), []);
   const toggleProperties = useCallback(() => setShowProperties((shown) => !shown), []);
@@ -203,8 +229,30 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   latest.current = { onEdit: body.onEdit, save: body.save, openHistory, toggleProperties };
   const pathRef = useRef(path);
   pathRef.current = path;
-  const followRef = useRef(onFollowLink);
-  followRef.current = onFollowLink;
+  // Story 45.18: following, at last. `onFollowLink` used to sit here, a prop no
+  // caller ever passed — so a wikilink click reached a `?.()` on `undefined`
+  // and did nothing, for five stories, under a `cursor: pointer`. Resolution is
+  // the index's own (`notes_resolve_link`), and the note it names is opened
+  // through the same `onOpenNote` a backlink row uses, so a link and a backlink
+  // cannot land in different places.
+  const followers = useRef({ onOpenNote, setLinkNotice });
+  followers.current = { onOpenNote, setLinkNotice };
+  const openWikilink = useCallback(
+    (target: string) => {
+      void resolveWikilink(vaultId, target).then((result) => {
+        followers.current.setLinkNotice(result.reason);
+        if (result.note !== null) {
+          followers.current.onOpenNote?.(result.note.id);
+        }
+      });
+    },
+    [vaultId],
+  );
+  const openExternal = useCallback((url: string) => {
+    void followExternalUrl(url).then((refusal) => {
+      followers.current.setLinkNotice(refusal);
+    });
+  }, []);
   // The recording note's identity (Story 42.4), read from the block the
   // properties panel owns and by the predicate that panel decides with. It
   // reaches the decoration layer as a getter for `pathRef`'s reason: the editor
@@ -276,6 +324,19 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
           },
           extensions: [
             view.EditorView.lineWrapping,
+            // CodeMirror gives its content `role="textbox"` and no accessible
+            // name, so the editable region announced itself as an unlabelled
+            // text box on every surface that mounts this editor.
+            //
+            // Found by Story 45.14, and found only because that story DELETED
+            // something: the quick-capture panel's textarea carried
+            // `aria-label="Quick capture"`, and porting the panel to this
+            // editor dropped a promise that was written down nowhere except as
+            // an attribute on code that no longer exists. Named here rather
+            // than in the capture window, because a capture-only label would
+            // be a second configuration of one editor — the thing AD-93 exists
+            // to prevent — and because the notes pane had the same gap.
+            view.EditorView.contentAttributes.of({ "aria-label": "Note" }),
             commands.history(),
             view.keymap.of([
               ...commands.defaultKeymap,
@@ -333,7 +394,8 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
                   .split("/")
                   .map(encodeURIComponent)
                   .join("/")}`,
-              onOpenLink: (target) => followRef.current?.(target),
+              onOpenLink: openWikilink,
+              onOpenUrl: openExternal,
               recordingSession: () => sessionRef.current,
               // Handed the block's own folder text and nothing else: Rust
               // resolves it against the vault root, so no path is composed
@@ -424,7 +486,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
       runtimeRef.current?.destroy();
       runtimeRef.current = null;
     };
-  }, [vaultId, noteId]);
+    // Both handlers are stable — `openExternal` has no deps and `openWikilink`
+    // has only `vaultId`, which is already here — so naming them costs no extra
+    // teardown of the editor and keeps the effect honest about what it closes over.
+  }, [vaultId, noteId, openExternal, openWikilink]);
 
   // The opening `Reset` usually lands AFTER the editor chunk, so this is the
   // effect that actually gets to honour the caret hint: the document has just
@@ -490,6 +555,43 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         <Button size="sm" variant="ghost" onClick={openHistory}>
           History
         </Button>
+        {/* Story 45.18: from a note, its file (FR-196, UX-DR79).
+
+            Absent rather than disabled when there is nothing to show — the
+            vault list has not arrived, the note has no path yet, or the
+            profile carries no vault subfolder. `filePathForNote` answers "may
+            this be offered" and `showNoteInFiles` answers "do it"; the same
+            pure rule twice, deliberately, because a control whose presence and
+            whose effect came from different rules is a control that can be
+            present and fail.
+
+            Beside History rather than inside 45.17's menu: this is a
+            navigation, and burying a one-press navigation in a dropdown is a
+            regression. */}
+        {vault !== null && path !== null && filePathForNote(vault, path) !== null && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              showNoteInFiles(vault, path);
+            }}
+          >
+            {SHOW_IN_FILES_LABEL}
+          </Button>
+        )}
+        {/* Story 45.17. Last in the header, and a menu rather than a sixth
+            button: everything to its left changes what this pane SHOWS, and
+            these act on the note itself. `noteId` is non-null here — the
+            no-note branch returned above — so this control never renders
+            without something to act on. */}
+        {/* Story 45.21 takes 45.17's child slot: Export is a note-level act, it
+            belongs above the destructive item, and putting it here rather than
+            on the panel frame means a note open in a panel has one Export and
+            not two — the panel's could not flush this buffer before Rust reads
+            the file. */}
+        <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
+          <ExportNoteItem vaultId={vaultId} noteId={noteId} />
+        </NoteActions>
       </header>
 
       <NoteDiffBar
@@ -512,6 +614,21 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
       {attachOutcome === null ? null : (
         <p role="status" className="border-b px-3 py-1 text-[11px] text-muted-foreground">
           {attachOutcome}
+        </p>
+      )}
+
+      {/* Story 45.18's answer when a link went nowhere: the note nobody has
+          written, the scheme keeper will not hand to the OS, the window with no
+          opener grant. A slot as well as `role="status"`, because the receipt
+          above is also a status and a test must be able to read one without
+          matching the other. */}
+      {linkNotice === null ? null : (
+        <p
+          role="status"
+          data-slot={LINK_NOTICE_SLOT}
+          className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+        >
+          {linkNotice}
         </p>
       )}
 

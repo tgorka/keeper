@@ -636,6 +636,8 @@ pub fn run() {
                 ipc::recording_settings_set,
                 ipc::recording_session_summary,
                 ipc::recording_retitle,
+                ipc::recording_session_meta,
+                ipc::recording_meta_update,
                 ipc::recording_note_stub,
                 ipc::recording_note_stub_save,
                 ipc::recording_note_stub_dismiss,
@@ -670,6 +672,10 @@ pub fn run() {
         // The document reader (Story 45.8). Returns a bounded projection of a
         // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
         sync_ipc::sync_read_document,
+        // Export (Story 45.21). Reads inside the profile, writes outside it, so
+        // it is here rather than with the write commands below: it needs no
+        // vault and refuses nothing for being outside one.
+        sync_ipc::sync_export_entry,
         // And the write half (Story 45.3, AD-89, which retired AD-75). Every
         // one of these goes through `notes_vault`'s single writer and refuses
         // anything outside a notes vault; the decisions are in
@@ -697,6 +703,7 @@ pub fn run() {
         notes_ipc::notes_vault_settings_save,
         notes_ipc::notes_vault_active,
         notes_ipc::notes_vault_set_active,
+        notes_ipc::notes_capture_impact,
         notes_ipc::notes_index_rebuild,
         notes_ipc::notes_list,
         notes_ipc::notes_tag_tree,
@@ -719,9 +726,11 @@ pub fn run() {
         notes_ipc::notes_rename,
         notes_ipc::notes_set_flag,
         notes_ipc::notes_set_order,
+        notes_ipc::notes_delete_plan,
         notes_ipc::notes_delete,
         notes_ipc::notes_search,
         notes_ipc::notes_link_targets,
+        notes_ipc::notes_resolve_link,
         notes_ipc::notes_backlinks,
         notes_ipc::notes_history,
         notes_ipc::notes_diff,
@@ -740,18 +749,24 @@ pub fn run() {
         notes_ipc::notes_csv_set_cell,
         notes_ipc::notes_embed_read,
         notes_ipc::notes_embed_write,
-        notes_ipc::notes_capture_buffer,
-        notes_ipc::notes_capture_buffer_save,
-        notes_ipc::notes_capture_commit,
+        notes_ipc::notes_capture_draft,
         notes_ipc::notes_subscribe_changes,
         notes_ipc::notes_unsubscribe_changes,
         notes_ipc::notes_subscribe_index,
         notes_ipc::notes_capture_show,
         notes_ipc::notes_capture_hide,
+        notes_ipc::notes_capture_open,
+        notes_ipc::notes_capture_close,
+        notes_ipc::notes_capture_set_locked,
+        notes_ipc::notes_capture_windows,
         notes_ipc::notes_reveal,
         notes_ipc::notes_open_file,
+        // Export (Story 45.21). Desktop-only with the rest of the Files surface
+        // it shares an engine with; iOS has no folder chooser to pick a
+        // destination from and `CapabilitiesVm.notes` is false there.
+        notes_ipc::notes_export,
     );
-    // The notes surface is desktop-only, but the five commands that touch a window
+    // The notes surface is desktop-only, but the commands that touch a window
     // or a file manager have `Unsupported` twins so the handler list is identical
     // on every target and `cargo check --target aarch64-apple-ios` stays green
     // (AD-27, AD-33). The rest of the notes commands are absent on iOS by
@@ -761,6 +776,10 @@ pub fn run() {
         builder,
         ipc::notes_capture_show,
         ipc::notes_capture_hide,
+        ipc::notes_capture_open,
+        ipc::notes_capture_close,
+        ipc::notes_capture_set_locked,
+        ipc::notes_capture_windows,
         ipc::notes_reveal,
         ipc::notes_open_file,
     );
@@ -790,6 +809,26 @@ pub fn run() {
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
                 _ => {}
+            }
+            return;
+        }
+        // A capture window losing focus is when its position is written down
+        // (Story 45.15, FR-192). Blur rather than `Moved`, which fires once per
+        // compositor frame during a drag; blur rather than only the close
+        // button, because a quit, a crash-free force-quit and a click on
+        // another app are all ways a window's last position becomes final
+        // without anybody pressing anything.
+        if matches!(event, WindowEvent::Focused(false))
+            && keeper_core::capture::is_capture_label(window.label())
+        {
+            let app = window.app_handle();
+            if let Some(key) = notes_window::key_for_label(window.label()) {
+                let position = notes_window::position_of(app, &key);
+                notes_ipc::remember_placement(
+                    app.state::<ipc::AppState>().platform.as_ref(),
+                    &key,
+                    position,
+                );
             }
         }
     });

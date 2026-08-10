@@ -43,6 +43,7 @@
  */
 import { FilePlus } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
@@ -130,6 +131,10 @@ export function NotesPane() {
   // Separate from `actionError` because it is not a failure: the note exists,
   // and rendering it as an error would send someone looking for a broken write.
   const [notices, setNotices] = useState<string[]>([]);
+  // The row a confirmation is open for. The id alone, not the row: the list
+  // re-streams constantly, and a held row object would keep a stale title on
+  // screen while the dialog names what it is about to delete.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     void ensureNotesVaultsHydrated();
@@ -237,7 +242,14 @@ export function NotesPane() {
   );
 
   const runVerb = useCallback(
-    (row: NoteRowVm, verb: "e" | "p" | "u" | "r") => {
+    (row: NoteRowVm, verb: "e" | "p" | "u" | "r" | "d") => {
+      // `d` is the one verb that does not act. It asks, and the confirmation
+      // is what acts — so it is handled here rather than joining the chain of
+      // actions below, where every other entry runs on the keystroke.
+      if (verb === "d") {
+        setDeletingId(row.id);
+        return;
+      }
       const run =
         verb === "e"
           ? actions.archive
@@ -457,6 +469,23 @@ export function NotesPane() {
           />
         )}
       </div>
+
+      {/* The list's `Delete` key, confirmed. The same dialog and the same
+          command the editor's actions menu and the sidebar's space rows use:
+          three doors, one removal (Story 45.17). Keyed on the id so pressing
+          Delete on a second row after cancelling the first asks about the
+          second rather than re-rendering the first's plan. */}
+      {activeVaultId !== null && deletingId !== null && (
+        <NoteDeleteDialog
+          key={deletingId}
+          vaultId={activeVaultId}
+          noteId={deletingId}
+          onClose={() => setDeletingId(null)}
+          // Nothing else to do: `deleteNote` closes any panel showing it, and
+          // the list mirror is driven by the index, which the trash announced.
+          onDeleted={() => setDeletingId(null)}
+        />
+      )}
     </div>
   );
 }

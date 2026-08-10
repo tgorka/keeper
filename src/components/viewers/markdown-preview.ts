@@ -48,8 +48,16 @@ export interface MarkdownPreviewOptions {
   /** A vault-relative asset path as a URL keeper is allowed to load. Absent, an
    *  embedded image renders as its alt text and the path it looked for. */
   assetUrl?: (relPath: string) => string;
-  /** Follow a wikilink. Absent, a click does nothing rather than guessing. */
+  /**
+   * Follow a wikilink. Absent, a click does nothing rather than guessing —
+   * and until Story 45.18 this module turned that absence into `() => {}`
+   * before handing it down, which is a fabricated value standing in for a
+   * missing one and made the decoration layer unable to tell the two apart.
+   */
   onOpenLink?: (target: string) => void;
+  /** Hand an ordinary link's destination to the OS. Absent, the link renders
+   *  without a pressable cursor rather than lying about being pressable. */
+  onOpenUrl?: (url: string) => void;
   /** List a folder for a gallery block. Absent, the block says keeper is not
    *  listing here rather than drawing an empty grid. */
   listFolder?: (folder: string) => Promise<NoteGalleryVm>;
@@ -109,7 +117,8 @@ export async function mountMarkdownPreview(
         // which renders the wikilink with its target, the correct degrade.
         vaultId: options.vaultId ?? "",
         assetUrl: options.assetUrl ?? ((relPath) => relPath),
-        onOpenLink: options.onOpenLink ?? (() => {}),
+        onOpenLink: options.onOpenLink,
+        onOpenUrl: options.onOpenUrl,
         listFolder: options.listFolder,
       }),
     ],

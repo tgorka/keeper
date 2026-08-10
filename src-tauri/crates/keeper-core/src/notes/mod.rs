@@ -14,6 +14,7 @@ pub mod counts;
 pub mod csv;
 pub mod default_spaces;
 pub mod embed;
+pub mod export;
 pub mod frontmatter;
 pub mod index;
 pub mod links;

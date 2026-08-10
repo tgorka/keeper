@@ -2018,4 +2018,51 @@ describe("FilesPane — attaching a selection to a note", () => {
       expect(notesAttachSources).toHaveBeenCalledWith("v1", ["/Users/alice/Vault/a.md"]);
     });
   });
+
+  /**
+   * The multiselection promise, through the pane that makes it.
+   *
+   * Every other test here selects ONE row, and a fixture that cannot tell the
+   * right answer from the mutant is a decoration: dropping all but the first
+   * selected row survived the entire sweep, because nothing ever attached two.
+   * "Select five, attach one, report one" is silent by construction — the
+   * person sees a receipt naming a file that did go in.
+   *
+   * Two files AND a folder in the selection, so the same test pins the folder
+   * rule at the same time: three rows selected, two paths sent.
+   */
+  it("sends every selected file and no folder, in the tree's own order", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [
+        entry("a.md", "file"),
+        entry("Photos", "folder"),
+        entry("b.md", "file"),
+      ]),
+    );
+    notesAttachSources.mockResolvedValue([
+      { name: "a.md", relPath: "a.md", copied: false, refusal: null },
+      { name: "b.md", relPath: "b.md", copied: false, refusal: null },
+    ]);
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await screen.findByRole("treeitem", { name: "a.md" });
+
+    // Shift takes the run, which is how a person selects three adjacent rows.
+    await click(screen.getByRole("treeitem", { name: "a.md" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("treeitem", { name: "b.md" }), { shiftKey: true });
+      await Promise.resolve();
+    });
+
+    await click(screen.getByRole("button", { name: ATTACH_TO_NOTE_LABEL }));
+    await click(await screen.findByRole("button", { name: "Attach to Standup" }));
+
+    await waitFor(() => {
+      expect(notesAttachSources).toHaveBeenCalledWith("v1", [
+        "/Users/alice/Vault/a.md",
+        "/Users/alice/Vault/b.md",
+      ]);
+    });
+  });
 });

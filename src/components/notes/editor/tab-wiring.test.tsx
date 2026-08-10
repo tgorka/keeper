@@ -77,7 +77,7 @@ beforeEach(() => {
       // which line that is depends on a race between the chunk and the reset.
       cursor: 0,
       path: "n.md",
-    } as NoteBodyBatch);
+    });
     return "sub-1";
   });
 });

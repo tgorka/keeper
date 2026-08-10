@@ -46,6 +46,21 @@ noteCount: number,
  */
 unreadCount: number, 
 /**
+ * The template a quick capture starts from, vault-relative, or `None`
+ * (Story 45.16, FR-193). Mirrored back so the settings form shows the
+ * value actually in force rather than the one it last sent (AD-34-8).
+ */
+captureTemplate: string | null, 
+/**
+ * The tag every quick capture carries, in its canonical form, or `None`.
+ *
+ * Canonical rather than as typed, for the same reason: `keeper_core`
+ * folded `#Quick Capture` to `quick-capture` on the way in, and a form
+ * still showing the typed spelling would be describing a tag that is not
+ * in any note.
+ */
+captureTag: string | null, 
+/**
  * The commit/push cadence in force for this vault.
  */
 cadence: NoteCadenceVm, };

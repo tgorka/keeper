@@ -54,7 +54,7 @@ import {
 } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
 import { alignedTable, type TableAlign } from "./format-commands";
-import { spliceBetween } from "./live-preview";
+import { spliceBetween } from "./text-splice";
 
 /** The rendered block. The hook a test finds the table by. */
 export const TABLE_BLOCK_CLASS = "cm-md-table";

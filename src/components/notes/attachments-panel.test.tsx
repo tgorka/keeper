@@ -34,6 +34,13 @@ vi.mock("@/lib/ipc/client", () => ({
   notesBufferReport: vi.fn(async () => {}),
   notesTagTree: vi.fn(async () => ({ nodes: [] })),
   notesBacklinks: vi.fn(async () => []),
+  // Reached, but only on a SLOW run, which is what made it a latent flake
+  // rather than a deterministic red. `NoteEditor` mounts `TemplateUpdateOffer`,
+  // which calls this after `TEMPLATE_OFFER_IDLE_MS` (4 s) of idle. A test that
+  // finishes inside four seconds never gets there; under eight-agent load these
+  // do not, the call fires, and the missing export throws an unhandled
+  // rejection that times the test out 5 s later. Seen once in three repeats.
+  notesTemplateUpdatePreview: vi.fn(async () => null),
   notesResolveConflict: vi.fn(async () => {}),
   notesMarkRead: vi.fn(async () => {}),
   notesDiff: vi.fn(async () => null),
@@ -339,7 +346,7 @@ describe("inserting, through the editor the user types into", () => {
         // when the cursor is somewhere the end of the buffer is not.
         cursor: 5,
         path: "n.md",
-      } as NoteBodyBatch);
+      });
       return "sub-1";
     });
   });
@@ -432,7 +439,7 @@ describe("inserting, through the editor the user types into", () => {
         rev: "r0",
         cursor: 0,
         path: "n.md",
-      } as NoteBodyBatch);
+      });
       return "sub-1";
     });
     await editorWithPanel();

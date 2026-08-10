@@ -25,6 +25,7 @@
  * are two different problems.
  */
 import { useCallback, useEffect, useState } from "react";
+import { ExportFileButton } from "@/components/export/export-file-button";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
 import {
@@ -302,6 +303,17 @@ function PanelFrame({
             panel is named by the section's `aria-label`, which is how a reader
             jumps between panels — a tab strip's job, not an outline's. */}
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{name}</span>
+        {/* Story 45.21. A file only: a note panel's Export is in the editor's
+            own Actions menu, which is the surface that can flush the buffer
+            before the bytes are read off the disk. Two Export controls over one
+            note, one of which exported the last autosave, is the shape this
+            placement exists to refuse. */}
+        {panel.target?.kind === "file" && (
+          <ExportFileButton
+            profileId={panel.target.profileId}
+            relativePath={panel.target.relativePath}
+          />
+        )}
         {closable && (
           <Button
             type="button"

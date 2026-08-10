@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the list never touches Tauri. The editor this
-// list opens reaches for four more commands, so they are stubbed here too.
+// list opens reaches for four more commands, and the delete confirmation for
+// two, so they are stubbed here too.
 vi.mock("@/lib/ipc/client", () => ({
   notesSpaces: vi.fn(),
   notesSpacesRestoreDefaults: vi.fn(),
@@ -11,9 +12,17 @@ vi.mock("@/lib/ipc/client", () => ({
   notesSpaceSave: vi.fn(),
   notesTagTree: vi.fn(),
   notesTemplates: vi.fn(),
+  notesDeletePlan: vi.fn(),
+  notesDelete: vi.fn(),
 }));
 
 import {
+  NOTE_DELETE_CANCEL,
+  NOTE_DELETE_CONFIRM,
+  NOTE_DELETE_TESTID,
+} from "@/components/notes/note-delete-dialog";
+import {
+  DELETE_SPACE,
   RESTORE_DEFAULTS,
   RESTORE_FAILED,
   RESTORE_NOTHING_MISSING,
@@ -21,6 +30,8 @@ import {
   SpaceList,
 } from "@/components/notes/space-list";
 import {
+  notesDelete,
+  notesDeletePlan,
   notesSpaceSave,
   notesSpaces,
   notesSpacesRestoreDefaults,
@@ -36,6 +47,8 @@ const mockTerms = vi.mocked(notesSpaceTerms);
 const mockSave = vi.mocked(notesSpaceSave);
 const mockTagTree = vi.mocked(notesTagTree);
 const mockTemplates = vi.mocked(notesTemplates);
+const mockDeletePlan = vi.mocked(notesDeletePlan);
+const mockDelete = vi.mocked(notesDelete);
 
 function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): NoteSpaceVm {
   return {
@@ -71,6 +84,9 @@ beforeEach(() => {
     origin: null,
     text: null,
   });
+  mockDeletePlan.mockReset();
+  mockDelete.mockReset();
+  mockDelete.mockResolvedValue(undefined);
   resetNotesFiltersStoreForTest();
 });
 
@@ -201,7 +217,14 @@ describe("SpaceList rows", () => {
       screen
         .getAllByRole("button")
         .map((row) => row.getAttribute("aria-label"))
-        .filter((label) => label !== null && !label.startsWith("Edit space "))
+        // The row's own control is the one whose name is the space; every
+        // per-row affordance beside it is filtered out by its verb prefix.
+        .filter(
+          (label) =>
+            label !== null &&
+            !label.startsWith("Edit space ") &&
+            !label.startsWith(`${DELETE_SPACE} `),
+        )
         .filter((label) => label !== RESTORE_DEFAULTS),
     ).toEqual(["Zebra", "Apple", "Mango"]);
   });
@@ -223,16 +246,26 @@ describe("SpaceList icons", () => {
    * The decision this pins: an icon set that shrinks must never leave a row with
    * a hole where every sibling has a glyph, and it must never rewrite the stored
    * name to make that true. The row draws the fallback and the value on disk is
-   * still `sparkles`.
+   * still the name nobody recognises.
+   *
+   * **The fixture was `sparkles`, and Story 45.20 added `sparkles` to the set** —
+   * which made this test's own title false while it stayed green. The assertion
+   * reads `data-space-icon`, which is the STORED name, and that is identical
+   * whether the glyph resolved or fell back: same DOM, different meaning.
+   * `no-such-glyph` cannot become a real icon by accident. The durable form —
+   * owed, not done — is `spaceIcon` taking the catalogue the way 45.2's
+   * `resolveViewerComponent` takes the component table, so the fallback is
+   * exercised against an explicitly empty one forever instead of against a name
+   * somebody will add later.
    */
   it("draws the fallback glyph for an icon name that is not in the set any more, and keeps the name", async () => {
-    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Old", icon: "sparkles" })]);
+    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Old", icon: "no-such-glyph" })]);
     const { container } = render(<SpaceList vaultId="vault-1" />);
 
     await screen.findByRole("button", { name: "Old" });
     const glyph = container.querySelector('[data-slot="space-icon"]');
     expect(glyph).toBeInTheDocument();
-    expect(glyph).toHaveAttribute("data-space-icon", "sparkles");
+    expect(glyph).toHaveAttribute("data-space-icon", "no-such-glyph");
 
     // And the unknown name survives a save that only changed the title.
     fireEvent.click(screen.getByRole("button", { name: "Edit space Old" }));
@@ -241,7 +274,7 @@ describe("SpaceList icons", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
-    expect(mockSave.mock.calls[0]?.[1].icon).toBe("sparkles");
+    expect(mockSave.mock.calls[0]?.[1].icon).toBe("no-such-glyph");
   });
 
   it("draws a glyph for a space with no icon rather than nothing", async () => {
@@ -393,5 +426,153 @@ describe("SpaceList restore", () => {
     expect(control).toBeDisabled();
     fireEvent.click(control);
     expect(mockRestore).not.toHaveBeenCalled();
+  });
+});
+
+describe("SpaceList delete", () => {
+  /**
+   * The plan a space's confirmation shows, with the fields a test asserts on
+   * carrying values a paraphrase would not produce.
+   */
+  function plan(name: string, seeded: boolean) {
+    return {
+      path: `spaces/2026-08-09-${name.toLowerCase()}.md`,
+      question: `Delete the space "${name}"?`,
+      consequence: seeded
+        ? "A space is a saved view, and keeper seeded this one."
+        : "A space is a saved view.",
+      recovery: "keeper moves it into the vault's trash.",
+    };
+  }
+
+  /**
+   * Declining removes nothing — and this asserts the COMMAND was not called
+   * rather than that the dialog closed. A dialog that closed while the delete
+   * was in flight looks identical on screen and is the opposite outcome.
+   */
+  it("asks before deleting, and a decline calls no delete", async () => {
+    mockSpaces.mockResolvedValue([
+      space({ id: "s1", name: "Recordings", defaultKey: "recordings" }),
+      space({ id: "s2", name: "Clients" }),
+    ]);
+    mockDeletePlan.mockResolvedValue(plan("Clients", false));
+    render(<SpaceList vaultId="vault-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: `${DELETE_SPACE} Clients` }));
+
+    // The plan is asked for by id, and by the id of the row that was pressed:
+    // a second space is on the list precisely so "it deleted something" and
+    // "it deleted THAT" cannot be the same assertion.
+    await waitFor(() => expect(mockDeletePlan).toHaveBeenCalledWith("vault-1", "s2"));
+    expect(await screen.findByText(`Delete the space "Clients"?`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: NOTE_DELETE_CANCEL }));
+    await waitFor(() =>
+      expect(screen.queryByText(`Delete the space "Clients"?`)).not.toBeInTheDocument(),
+    );
+    expect(mockDelete).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Confirming deletes the space that was pressed, re-reads the rail, and —
+   * the part a rendered-text assertion would miss — hands Rust the right ids.
+   */
+  it("deletes the space it named and re-reads the rail", async () => {
+    mockSpaces
+      .mockResolvedValueOnce([
+        space({ id: "s1", name: "Recordings", defaultKey: "recordings" }),
+        space({ id: "s2", name: "Clients" }),
+      ])
+      .mockResolvedValue([space({ id: "s2", name: "Clients" })]);
+    mockDeletePlan.mockResolvedValue(plan("Recordings", true));
+    render(<SpaceList vaultId="vault-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: `${DELETE_SPACE} Recordings` }));
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+
+    await waitFor(() => expect(mockDelete).toHaveBeenCalledWith("vault-1", "s1"));
+    // Re-read, so the row goes. Two calls: the mount's and the deletion's.
+    await waitFor(() => expect(mockSpaces).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Recordings" })).not.toBeInTheDocument(),
+    );
+  });
+
+  /**
+   * The confirmation is Rust's, verbatim. A space's whole risk is that a person
+   * thinks deleting the saved view deletes the notes it lists, and the sentence
+   * that says otherwise is composed where the removal is — so this asserts the
+   * words arrive, not that some words arrive.
+   */
+  it("shows Rust's sentences rather than a paraphrase", async () => {
+    mockSpaces.mockResolvedValue([
+      space({ id: "s1", name: "Recordings", defaultKey: "recordings" }),
+    ]);
+    mockDeletePlan.mockResolvedValue(plan("Recordings", true));
+    render(<SpaceList vaultId="vault-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: `${DELETE_SPACE} Recordings` }));
+
+    const body = await screen.findByTestId(NOTE_DELETE_TESTID);
+    expect(body).toHaveTextContent("A space is a saved view, and keeper seeded this one.");
+    expect(body).toHaveTextContent("keeper moves it into the vault's trash.");
+    expect(screen.getByText("spaces/2026-08-09-recordings.md")).toBeInTheDocument();
+  });
+
+  /**
+   * A lens pointed at a space that no longer exists selects nothing and cannot
+   * say why, so deleting the ACTIVE space returns the scope to all notes —
+   * and deleting any other space leaves the scope exactly where it was.
+   */
+  it("clears the scope only when the deleted space was the active one", async () => {
+    mockSpaces.mockResolvedValue([
+      space({ id: "s1", name: "Recordings", defaultKey: "recordings" }),
+      space({ id: "s2", name: "Clients" }),
+    ]);
+    mockDeletePlan.mockResolvedValue(plan("Clients", false));
+    render(<SpaceList vaultId="vault-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Recordings" }));
+    expect(notesFiltersStore.getState().scope).toEqual({
+      kind: "space",
+      id: "s1",
+      name: "Recordings",
+      defaultKey: "recordings",
+    });
+
+    // Deleting the OTHER space leaves the lens alone.
+    fireEvent.click(screen.getByRole("button", { name: `${DELETE_SPACE} Clients` }));
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+    await waitFor(() => expect(mockDelete).toHaveBeenCalledWith("vault-1", "s2"));
+    expect(notesFiltersStore.getState().scope).toMatchObject({ kind: "space", id: "s1" });
+
+    // Deleting the active one puts it back to all notes.
+    mockDeletePlan.mockResolvedValue(plan("Recordings", true));
+    fireEvent.click(await screen.findByRole("button", { name: `${DELETE_SPACE} Recordings` }));
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+    await waitFor(() => expect(notesFiltersStore.getState().scope).toEqual({ kind: "all" }));
+  });
+
+  /**
+   * The delete was refused. The dialog stays, says so, and the rail is not
+   * re-read — a row vanishing beside "keeper couldn't delete that" would be
+   * keeper contradicting itself on screen.
+   */
+  it("keeps the dialog and the row when the delete is refused", async () => {
+    mockSpaces.mockResolvedValue([space({ id: "s1", name: "Clients" })]);
+    mockDeletePlan.mockResolvedValue(plan("Clients", false));
+    mockDelete.mockRejectedValue({ message: "spaces/clients.md is read-only" });
+    render(<SpaceList vaultId="vault-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: `${DELETE_SPACE} Clients` }));
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("spaces/clients.md is read-only");
+    expect(mockSpaces).toHaveBeenCalledTimes(1);
+    // The confirmation is still open, so the rail behind it is `aria-hidden`
+    // by Radix's modal — `hidden: true` is asking about the DOM rather than
+    // about what a screen reader is currently being offered.
+    expect(screen.getByText(`Delete the space "Clients"?`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clients", hidden: true })).toBeInTheDocument();
   });
 });

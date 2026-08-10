@@ -32,8 +32,12 @@ import {
   panelFileGoneSentence,
 } from "@/components/layout/panel-strip";
 import { DOCUMENT_VIEWER_TESTID } from "@/components/viewers/document-viewer";
-import { MEDIA_VIEWER_ELEMENT_TESTID } from "@/components/viewers/media-viewer";
+import {
+  MEDIA_VIEWER_ELEMENT_TESTID,
+  MEDIA_VIEWER_FACTS_TESTID,
+} from "@/components/viewers/media-viewer";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
+import { UNKNOWN_VIEWER_OPEN_LABEL } from "@/lib/viewers";
 
 /** The exact sentence Rust composes for a profile whose drive is out. Verbatim,
  * because the whole point of the state is that it reaches the screen unaltered. */
@@ -146,7 +150,7 @@ describe("the panel strip", () => {
         {
           ...entry("screen-0000.mov", "2026/08/screen-0000.mov"),
           kind: "video",
-        } as FilesEntryVm,
+        },
       ]),
     );
     panelsStore.getState().setActiveTarget({
@@ -160,7 +164,61 @@ describe("the panel strip", () => {
     const player = await waitFor(() => screen.getByTestId(MEDIA_VIEWER_ELEMENT_TESTID));
     expect(player.getAttribute("src")).toBe("keeper-file://p1/2026/08/screen-0000.mov");
     // And the absolute path the listing carries reaches no attribute (FR-145).
+    // Witnessed first: an absence over a literal is hollow unless something
+    // asserts the literal was ever in the input, and `entry()`'s absolute path
+    // is a helper this test does not own (Story 45.20's shape).
+    expect(entry("x", "2026/08/x").absolutePath).toContain("/Users/alice/Vault");
     expect(document.body.innerHTML).not.toContain("/Users/alice/Vault");
+  });
+
+  it("hands the viewer the whole payload it builds, not just a resolvable path", async () => {
+    // **Entry-point distribution, not test count.** Story 45.7 has twenty-five
+    // media tests and every one of them builds its own `ViewerFile`; the test
+    // above was the first to enter through the PANEL, and it pinned only the
+    // path. Probed the rest of what this function composes and three more
+    // mutations survived: dropping `openWith`, dropping `sizeLabel`, and
+    // pointing the opener at `entry.name` instead of the relative path.
+    //
+    // None is cosmetic. Without `openWith` the placeholder for a file this
+    // machine cannot decode says "hand it to the application that owns it" and
+    // offers no way to — the remedy named and withheld. Without `sizeLabel`
+    // Story 45.5's whole sentence is undone at the panel. And an opener aimed
+    // at the name refuses for every file in a subfolder, which is the same
+    // works-at-the-root failure as the path bug and reads as a mystery.
+    // A promise, because the placeholder does `.catch()` on what the opener
+    // returns. The suite's shared `vi.fn()` returns `undefined`, and pressing
+    // the button against it throws an unhandled rejection that vitest reports
+    // while still passing the test — a green run with an error in it.
+    syncOpenEntry.mockResolvedValue(undefined);
+    syncBrowse.mockResolvedValue(
+      listed("2026/08", [
+        {
+          ...entry("camera-0000.mkv", "2026/08/camera-0000.mkv"),
+          kind: "video",
+          size: { bytes: 4300000, label: "4.3 MB" },
+        },
+      ]),
+    );
+    panelsStore.getState().setActiveTarget({
+      kind: "file",
+      profileId: "p1",
+      relativePath: "2026/08/camera-0000.mkv",
+    });
+
+    await mount();
+
+    // The size Rust formatted reaches the viewer's own facts line.
+    const player = await waitFor(() => screen.getByTestId(MEDIA_VIEWER_ELEMENT_TESTID));
+    expect(screen.getByTestId(MEDIA_VIEWER_FACTS_TESTID)).toHaveTextContent("4.3 MB");
+
+    // Then press the button. A decode failure is the state where the opener is
+    // the entire remedy, so it is the state worth pressing it in.
+    Object.defineProperty(player, "error", { configurable: true, value: { code: 3 } });
+    fireEvent(player, new Event("error"));
+    fireEvent.click(await screen.findByRole("button", { name: UNKNOWN_VIEWER_OPEN_LABEL }));
+
+    // The opener is aimed at the path the listing produced, not the file name.
+    expect(syncOpenEntry).toHaveBeenCalledWith("p1", "2026/08/camera-0000.mkv");
   });
 
   it("renders Rust's own reason when the drive is out, and keeps the panel", async () => {

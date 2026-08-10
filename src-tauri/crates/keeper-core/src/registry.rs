@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use crate::capture::Placement;
 use crate::error::{CoreError, PlatformError};
 use crate::vm::DockBadgeMode;
 
@@ -1013,23 +1014,167 @@ pub fn set_active_vault(data_dir: &Path, vault_id: &str) -> Result<(), CoreError
     set_setting(data_dir, NOTES_ACTIVE_VAULT_KEY, vault_id)
 }
 
-/// The `settings` key holding the Quick Capture panel's unsent text (Phase 5,
-/// FR-101). Persisted rather than held in the window, because the panel's whole
-/// promise is that closing it never loses what you typed — including across a
-/// quit, a crash or a relaunch.
-const NOTES_CAPTURE_BUFFER_KEY: &str = "notes.capture_buffer";
+/// The `settings` key prefix recording which note one quick-capture window is
+/// holding (Phase 5, FR-101; Story 45.14): `notes.capture_draft.<key>`.
+///
+/// This replaced `notes.capture_buffer`, and the replacement is the whole of
+/// Story 45.14 in one line. The old key held the panel's unsent **text**,
+/// because the panel was a textarea and the note did not exist until Escape.
+/// Quick capture now mounts the note editor (AD-93), so the durable thing is
+/// the note file itself — strictly more durable than a debounced settings row,
+/// and the only place a tag or an attachment can be written, neither of which
+/// can be applied to a String.
+///
+/// **Keyed, not global.** One slot for "the capture buffer" is an assumption
+/// that exactly one capture window exists; two windows sharing it would clobber
+/// each other. Story 45.15 opens several, so the key is a parameter from the
+/// first commit rather than a retrofit.
+const NOTES_CAPTURE_DRAFT_PREFIX: &str = "notes.capture_draft.";
 
-/// Read the Quick Capture buffer (Phase 5, FR-101). Absent ⇒ the empty string:
-/// a panel opening for the first time and a panel whose text was committed are
-/// the same state, and neither is an error.
-pub fn get_capture_buffer(data_dir: &Path) -> Result<String, CoreError> {
-    Ok(get_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY)?.unwrap_or_default())
+/// The note a capture window is holding, and the body it was created with.
+///
+/// `pristine` exists so "has anybody written in this note?" is answered by
+/// comparing bytes to what creation produced, rather than by trusting the
+/// window to say so or by testing the body for emptiness — a capture template
+/// (Story 45.16) makes a brand-new draft non-empty, so emptiness would tear off
+/// a fresh page on every dismissal and litter the vault with untouched notes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDraft {
+    /// The note's stable id, not its path: a draft the user renames by typing a
+    /// first line must stay the same draft.
+    pub note_id: String,
+    /// The body `create_note` wrote — a template's scaffold, or the empty string.
+    pub pristine: String,
 }
 
-/// Write the Quick Capture buffer (Phase 5, FR-101). The caller debounces; this
-/// stores verbatim, including the empty string that clears it after a commit.
-pub fn set_capture_buffer(data_dir: &Path, text: &str) -> Result<(), CoreError> {
-    set_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY, text)
+impl CaptureDraft {
+    /// Whether nobody has written in this draft since creation.
+    ///
+    /// The question a capture window asks when a thought is finished: an
+    /// untouched page is handed back for the next summon, a written-on one is
+    /// torn off and the next summon gets a fresh note. Getting it wrong in
+    /// either direction is visible — reuse a written note and the next thought
+    /// lands on top of the last one; tear off an untouched one and every idle
+    /// press of the hotkey leaves an empty file in the vault.
+    ///
+    /// Compared with the surrounding whitespace trimmed off both sides,
+    /// because the round trip through the editor and `notes_save` is entitled
+    /// to settle a trailing newline that nobody typed — and a draft that
+    /// differs from its scaffold by one `\n` is not a thought anybody had.
+    /// Interior whitespace is never touched: two blank lines a person put
+    /// between two paragraphs are writing.
+    pub fn is_untouched(&self, body: &str) -> bool {
+        self.pristine.trim() == body.trim()
+    }
+}
+
+/// The `settings` key for one capture window's draft pointer.
+fn capture_draft_key(key: &str) -> String {
+    format!("{NOTES_CAPTURE_DRAFT_PREFIX}{key}")
+}
+
+/// Read which note a capture window is holding (Story 45.14).
+///
+/// Three ways to get `None`, and they are deliberately one answer to the
+/// caller — a window opening for the first time, a window whose page was torn
+/// off, and a pointer keeper cannot read all mean "make a fresh page", and a
+/// capture that refused because a settings row rotted would lose the thought it
+/// exists to catch.
+///
+/// They are **not** one answer to the log. A cleared pointer is the ordinary
+/// end of every capture, so it returns silently; only genuinely unreadable
+/// content warns. Writing the clear as something the reader then calls
+/// malformed would put a warning in the log every time somebody filed a note,
+/// which is how a real warning becomes invisible.
+pub fn get_capture_draft(data_dir: &Path, key: &str) -> Result<Option<CaptureDraft>, CoreError> {
+    let Some(raw) = get_setting(data_dir, &capture_draft_key(key))? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str::<CaptureDraft>(&raw) {
+        Ok(draft) if !draft.note_id.trim().is_empty() => Ok(Some(draft)),
+        Ok(_) => Ok(None),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %key,
+                "notes: capture draft pointer is malformed; the next capture gets a fresh note"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Write, or clear with `None`, which note a capture window is holding
+/// (Story 45.14). Clearing is how a finished thought is torn off the pad.
+///
+/// The empty string is the cleared value, matching [`set_active_vault`] and
+/// [`set_capture_hotkey`], and [`get_capture_draft`] reads it back silently.
+/// The pair has to agree: any other spelling of "cleared" would be read as
+/// corruption and warn on every capture.
+pub fn set_capture_draft(
+    data_dir: &Path,
+    key: &str,
+    draft: Option<&CaptureDraft>,
+) -> Result<(), CoreError> {
+    let value = match draft {
+        Some(draft) => serde_json::to_string(draft).map_err(|error| {
+            CoreError::Internal(format!(
+                "could not serialise the capture draft pointer: {error}"
+            ))
+        })?,
+        None => String::new(),
+    };
+    set_setting(data_dir, &capture_draft_key(key), &value)
+}
+
+/// The `settings` key prefix for one capture window's remembered placement
+/// (Story 45.15, FR-192).
+///
+/// Keyed by the same capture key as the draft pointer above, and for the same
+/// reason: what a person moved is *this note's window*, not "the third window
+/// that happened to open". A key derived from the target survives a restart,
+/// an OS window-id change and a reordering; a label or an index survives none
+/// of them.
+const NOTES_CAPTURE_PLACEMENT_PREFIX: &str = "notes.capture_placement.";
+
+/// The `settings` key for one capture window's placement.
+fn capture_placement_key(key: &str) -> String {
+    format!("{NOTES_CAPTURE_PLACEMENT_PREFIX}{key}")
+}
+
+/// Read where a capture window sits and who decides (Story 45.15, FR-192).
+///
+/// Absent or unreadable ⇒ [`Placement::default`], which is keeper's own
+/// placement — exactly what every capture window did before this story. A
+/// person who has never touched the lock must not be able to tell this feature
+/// was added, so "no row" and "the default" are deliberately the same picture.
+///
+/// Never an error for a bad value: [`Placement::decode`] is total. A settings
+/// row a future build wrote in a spelling this one does not know costs the user
+/// their remembered position for one session and never their window.
+pub fn get_capture_placement(data_dir: &Path, key: &str) -> Result<Placement, CoreError> {
+    Ok(get_setting(data_dir, &capture_placement_key(key))?
+        .map_or_else(Placement::default, |raw| Placement::decode(&raw)))
+}
+
+/// Write where a capture window sits (Story 45.15, FR-192).
+///
+/// Called when a window is dismissed rather than on every `Moved` event: a drag
+/// emits one event per compositor frame, and a settings write per frame would
+/// put a sqlite transaction on the path of a gesture. The cost of the choice is
+/// stated where it lands — a position moved and then lost to `kill -9` is not
+/// remembered — and that is the right trade for a window whose default
+/// placement is already good.
+pub fn set_capture_placement(
+    data_dir: &Path,
+    key: &str,
+    placement: &Placement,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, &capture_placement_key(key), &placement.encode())
 }
 
 /// Build the `settings` key that records the revision of one note this device has
@@ -2502,17 +2647,224 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_buffer_survives_a_round_trip_and_clears_to_empty() {
+    fn a_capture_draft_pointer_is_per_window_and_clears_to_absent() {
         let dir = temp_dir();
-        assert_eq!(get_capture_buffer(&dir).expect("get absent buffer"), "");
-        set_capture_buffer(&dir, "half a thought\nand a second line").expect("set buffer");
+        // Two keys, because one global slot is the Story 45.15 defect this
+        // signature exists to make unrepresentable. Both windows must be able
+        // to hold a DIFFERENT note at the same time.
         assert_eq!(
-            get_capture_buffer(&dir).expect("get set buffer"),
-            "half a thought\nand a second line",
-            "stored verbatim, newlines and all"
+            get_capture_draft(&dir, "draft").expect("get absent draft"),
+            None
         );
-        set_capture_buffer(&dir, "").expect("clear buffer after commit");
-        assert_eq!(get_capture_buffer(&dir).expect("get cleared buffer"), "");
+        let first = CaptureDraft {
+            note_id: "01FIRSTNOTE".to_owned(),
+            pristine: "# Standup\n\n## Agenda\n".to_owned(),
+        };
+        let second = CaptureDraft {
+            note_id: "01SECONDNOTE".to_owned(),
+            pristine: String::new(),
+        };
+        set_capture_draft(&dir, "draft", Some(&first)).expect("set first");
+        set_capture_draft(&dir, "note:v1/n1", Some(&second)).expect("set second");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("get first"),
+            Some(first.clone()),
+            "the scaffold is stored verbatim, newlines and all — it is what an \
+             untouched draft is compared against"
+        );
+        assert_eq!(
+            get_capture_draft(&dir, "note:v1/n1").expect("get second"),
+            Some(second),
+            "a second window holds its own note; writing one must not move the other"
+        );
+
+        // Tearing off a finished thought clears only the window that finished it.
+        set_capture_draft(&dir, "note:v1/n1", None).expect("clear second");
+        assert_eq!(
+            get_capture_draft(&dir, "note:v1/n1").expect("get cleared"),
+            None
+        );
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("get first again"),
+            Some(first),
+            "clearing one window's draft must not tear off another's"
+        );
+        // The stored spelling of "cleared", not just the answer read back
+        // through the same module. The writer and the reader have to agree on
+        // it: any other value — `null`, `{}`, a space — reads back as `None`
+        // just the same, and would ALSO take the malformed branch and log a
+        // warning every single time somebody filed a thought. A warning that
+        // fires on the ordinary path is a warning nobody will ever read.
+        assert_eq!(
+            get_setting(&dir, "notes.capture_draft.note:v1/n1").expect("read the raw row"),
+            Some(String::new()),
+            "a torn-off page is stored as the empty string, the same clear \
+             `set_active_vault` and `set_capture_hotkey` use"
+        );
+
+        // A pointer keeper cannot read costs one fresh note, never a refusal:
+        // capture that returns an error because a settings row rotted is
+        // capture that loses the thought it exists to catch.
+        set_setting(&dir, "notes.capture_draft.draft", "{ not json").expect("corrupt");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("malformed reads as absent"),
+            None
+        );
+        // And so does a pointer that parses but names no note. Built through
+        // `to_string` rather than written as a literal: a hand-typed literal
+        // that does not match the field naming would take the malformed arm
+        // above and pass this assertion for the wrong reason.
+        let blank = serde_json::to_string(&CaptureDraft {
+            note_id: "  ".to_owned(),
+            pristine: "x".to_owned(),
+        })
+        .expect("serialise blank id");
+        set_setting(&dir, "notes.capture_draft.draft", &blank).expect("blank id");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("blank id reads as absent"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_untouched_draft_is_the_scaffold_and_nothing_else() {
+        // A capture template (Story 45.16) makes a brand-new draft non-empty,
+        // so "is this page blank?" is the wrong question and "does it still say
+        // what creation put in it?" is the right one.
+        let scaffolded = CaptureDraft {
+            note_id: "01SCAFFOLD".to_owned(),
+            pristine: "# Standup\n\n## Agenda\n".to_owned(),
+        };
+        assert!(
+            scaffolded.is_untouched("# Standup\n\n## Agenda\n"),
+            "the page the template made is a page nobody has written on"
+        );
+        assert!(
+            !scaffolded.is_untouched("# Standup\n\n## Agenda\n- ring the dentist\n"),
+            "one line under the scaffold is a thought, and the page is torn off"
+        );
+        assert!(
+            !scaffolded.is_untouched(""),
+            "a scaffold somebody deleted is an edit, not a blank page"
+        );
+
+        // The round trip through the editor and `notes_save` is entitled to
+        // settle a trailing newline nobody typed. Without this, a vault with a
+        // capture template would accumulate one untouched note per dismissal.
+        assert!(
+            scaffolded.is_untouched("# Standup\n\n## Agenda"),
+            "a trailing newline that came back different is not writing"
+        );
+        assert!(
+            scaffolded.is_untouched("\n # Standup\n\n## Agenda\n\n\n"),
+            "nor is surrounding whitespace at either end"
+        );
+        // But interior blank lines are: two paragraphs a person separated are
+        // not the same document as one.
+        assert!(
+            !scaffolded.is_untouched("# Standup\n## Agenda\n"),
+            "the blank line between the heading and the section is content"
+        );
+
+        // The template-less case, which is every capture until 45.16 lands.
+        let blank = CaptureDraft {
+            note_id: "01BLANK".to_owned(),
+            pristine: String::new(),
+        };
+        assert!(blank.is_untouched(""), "nothing typed into nothing");
+        assert!(blank.is_untouched("\n\n"), "and neither is a stray newline");
+        assert!(
+            !blank.is_untouched("ring the dentist"),
+            "a thought, however short, is a page of its own"
+        );
+    }
+
+    /// Story 45.15's acceptance, on the value this module owns: **two capture
+    /// windows, two placements, and moving one does not move the other** —
+    /// asserted on both rows after each write, because a store that returns the
+    /// right answer for the row you just wrote and the wrong one for its
+    /// neighbour is precisely the single-global-slot defect wearing a key.
+    #[test]
+    fn two_capture_windows_remember_two_placements_independently() {
+        let dir = temp_dir();
+        // Untouched is keeper's own placement, for every key, including ones
+        // nothing has ever written.
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("get absent draft placement"),
+            Placement::default()
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("get absent note placement"),
+            Placement::default()
+        );
+
+        let dragged = Placement {
+            locked: false,
+            position: Some((1_200, 40)),
+        };
+        let pinned = Placement {
+            locked: true,
+            position: Some((-15, 900)),
+        };
+        set_capture_placement(&dir, "draft", &dragged).expect("place draft");
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("read draft"),
+            dragged
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("read untouched neighbour"),
+            Placement::default(),
+            "moving one window must not place a window nobody has moved"
+        );
+
+        set_capture_placement(&dir, "note:v1/n1", &pinned).expect("place note window");
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("read note window"),
+            pinned
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("read draft again"),
+            dragged,
+            "placing the second window must not move the first"
+        );
+
+        // A negative coordinate is ordinary: a second monitor to the left of
+        // the primary one has negative x, and a row that could not hold one
+        // would send the window back to the main screen on every restart.
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1")
+                .expect("read note window")
+                .position,
+            Some((-15, 900))
+        );
+
+        // A row keeper cannot read costs the position and never the window. A
+        // half-readable one is the interesting case and it is asserted field by
+        // field: the readable half is kept, the unreadable half is *absent*
+        // rather than zero, because a window at (12, 0) is a window that moved
+        // somewhere the user never put it.
+        set_setting(&dir, "notes.capture_placement.draft", "free 12 banana")
+            .expect("half-readable placement");
+        let salvaged = get_capture_placement(&dir, "draft").expect("read half-readable");
+        assert!(!salvaged.locked, "the readable half is still readable");
+        assert_eq!(
+            salvaged.position, None,
+            "a fabricated axis is worse than none"
+        );
+
+        // A row that says nothing keeper understands is keeper's own placement,
+        // whole — not an error, and not a window at the origin.
+        set_setting(
+            &dir,
+            "notes.capture_placement.draft",
+            "written by a later build",
+        )
+        .expect("unreadable placement");
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("unreadable reads as default"),
+            Placement::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

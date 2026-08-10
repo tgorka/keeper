@@ -10,6 +10,14 @@
  * them through {@link useNotesActions}, which is a thin binding to the active
  * vault and nothing more.
  *
+ * **One verb is deliberately not in that binding: delete** (Story 45.17).
+ * {@link deleteNote} is here, and it is still the only place a note is
+ * removed — but it is reached through `NoteDeleteDialog` from each of its
+ * three surfaces rather than through {@link useNotesActions}, because it is
+ * the one act that must be confirmed and a bound verb that trashes a note on
+ * call would be a second path around the confirmation. The rule above still
+ * holds for it: one function, one wording, one behaviour, in every surface.
+ *
  * They **reject to their caller** rather than swallowing, following the rule
  * `sync.ts` documents: a read failure belongs to the mirror, an action failure
  * belongs to the surface that asked for it, because only that surface knows
@@ -31,6 +39,7 @@ import {
   notesSetFlag,
   notesSpaceSave,
 } from "@/lib/ipc/client";
+import { openCaptureWindow } from "@/lib/stores/capture-windows";
 import type { TagChip } from "@/lib/stores/notes-filters";
 import { noteQueryFor, notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesListStore } from "@/lib/stores/notes-list";
@@ -104,6 +113,21 @@ export async function showCapture(): Promise<void> {
   await notesCaptureShow();
 }
 
+/**
+ * Open a note as a capture window (Story 45.15, FR-191).
+ *
+ * The sentence the story exists for: **the small window is a way of looking at
+ * a note, not a special kind of note.** A capture window opened on an existing
+ * note is the same editor over the same file the Notes pane shows — nothing is
+ * copied, nothing is converted, and closing it changes nothing.
+ *
+ * Idempotent by identity in Rust: asking twice raises the window that already
+ * holds this note rather than making a second one.
+ */
+export async function openNoteAsCapture(vaultId: string, noteId: string): Promise<void> {
+  await openCaptureWindow({ kind: "note", vaultId, noteId });
+}
+
 /** Pin or unpin a note (FR-119). Rewrites one frontmatter key and nothing else. */
 export async function togglePin(vaultId: string, row: NoteRowVm): Promise<void> {
   await notesSetFlag(vaultId, row.id, "pinned", !row.pinned);
@@ -138,15 +162,24 @@ export async function markNoteRead(vaultId: string, row: NoteRowVm): Promise<voi
   await notesMarkRead(vaultId, row.id, row.headRev);
 }
 
-/** Move a note to the vault's trash (NFR-30). Never an unlink. */
-export async function deleteNote(vaultId: string, row: NoteRowVm): Promise<void> {
-  await notesDelete(vaultId, row.id);
+/**
+ * Move a note to the vault's trash (NFR-30). Never an unlink.
+ *
+ * **Every delete in the app goes through here**, which is why it takes an id
+ * rather than a row (Story 45.17): the confirmation dialog holds an id, a space
+ * row holds an id, and a `NoteRowVm` parameter would have forced two of the
+ * three callers to either build a fake row or call `notesDelete` directly —
+ * and the one that called directly would be the one that skipped the panel
+ * close below.
+ */
+export async function deleteNote(vaultId: string, noteId: string): Promise<void> {
+  await notesDelete(vaultId, noteId);
   // A panel showing a note the user just deleted stops showing it. This is the
   // one case that is NOT "the target no longer resolves, so say so and keep the
   // place": the note is not missing, it was thrown away on purpose, and a pane
   // explaining its absence would be keeper reporting the user's own action back
   // to them as a fault.
-  panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId: row.id });
+  panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId });
 }
 
 /** Reveal a note's real path in the OS file manager (UX-DR38). */
@@ -248,8 +281,6 @@ export interface NotesActions {
   archive: (row: NoteRowVm) => Promise<void>;
   /** Acknowledge the row's changes; a no-op on a read or uncommitted row. */
   markRead: (row: NoteRowVm) => Promise<void>;
-  /** Trash the row's note. */
-  remove: (row: NoteRowVm) => Promise<void>;
   /** Reveal the row's real path. */
   reveal: (row: NoteRowVm) => Promise<void>;
 }
@@ -284,14 +315,12 @@ export function useNotesActions(vaultId: string | null): NotesActions {
     },
     [vaultId],
   );
-  const remove = useCallback(
-    async (row: NoteRowVm) => {
-      if (vaultId !== null) {
-        await deleteNote(vaultId, row);
-      }
-    },
-    [vaultId],
-  );
+  // No `remove` verb. Deleting is the one act in this file that must be
+  // confirmed (Story 45.17), and a bound verb that trashes a note on call
+  // would be a second path around the confirmation — reachable, destructive
+  // and one keystroke from any surface that took this object. The three real
+  // entry points all mount `NoteDeleteDialog`, which calls `deleteNote` above
+  // after a person has pressed Delete in a dialog naming the note.
   const reveal = useCallback(
     async (row: NoteRowVm) => {
       if (vaultId !== null) {
@@ -300,5 +329,5 @@ export function useNotesActions(vaultId: string | null): NotesActions {
     },
     [vaultId],
   );
-  return { pin, archive, markRead, remove, reveal };
+  return { pin, archive, markRead, reveal };
 }

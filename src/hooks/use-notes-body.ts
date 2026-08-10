@@ -76,6 +76,52 @@ function flushBuffer(): void {
   });
 }
 
+/**
+ * Write the open note's buffer now and adopt the acknowledgement. Resolves
+ * `true` when the buffer is on disk — including when there was nothing to
+ * write — and `false` when the write was refused.
+ *
+ * The same write [`useNotesBody`]'s `save()` performs, lifted out of the hook
+ * so a surface that has no editor of its own can force one. Quick capture is
+ * the caller: dismissing the panel is a force-flush point (AD-62), and it then
+ * asks Rust whether the draft was written in — a question answered from the
+ * bytes on disk, which would read "untouched" for the last 1.5 s of typing if
+ * this were not awaited first.
+ *
+ * **The boolean is the point, and it is why this does not simply throw.** A
+ * function that catches its own failure and records it somewhere turns every
+ * `await` on it into a no-op assertion: the caller cannot tell a write that
+ * landed from one that was refused, and the sequenced step after it runs
+ * anyway. Capture's next step is *hide the window*, so without an answer here
+ * a refused write would take the panel away with the reason legible only
+ * inside the window that just disappeared — the exact swallow UX-DR35 forbids.
+ * It reports rather than throwing because the store still has to learn about
+ * the failure for the editor's own caption, and one write must not produce two
+ * different error channels.
+ *
+ * Unlike {@link flushBuffer} this reports back into the store, so `dirty`
+ * clears and the later unmount flush does not re-send the same text against a
+ * revision the first write has already superseded — which Rust would read as
+ * somebody else's edit and answer with a conflict copy.
+ */
+export async function saveOpenNote(): Promise<boolean> {
+  const state = notesEditorStore.getState();
+  if (state.subscriptionId === null || !state.dirty) {
+    // Nothing to write is not a failure: the bytes the caller cares about are
+    // already the bytes on disk, which is what it is about to ask Rust.
+    return true;
+  }
+  const written = state.text;
+  beginSave();
+  try {
+    markSaved(written, await notesSave(state.subscriptionId, written, state.rev));
+    return true;
+  } catch (error: unknown) {
+    markSaveFailed(isIpcError(error) ? error.message : String(error));
+    return false;
+  }
+}
+
 export interface UseNotesBody {
   /** The buffer: the note's body. */
   text: string;
@@ -113,17 +159,7 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
   const save = useCallback(async () => {
     clearTimeout(saveTimer.current);
     saveTimer.current = undefined;
-    const state = notesEditorStore.getState();
-    if (state.subscriptionId === null || !state.dirty) {
-      return;
-    }
-    const written = state.text;
-    beginSave();
-    try {
-      markSaved(written, await notesSave(state.subscriptionId, written, state.rev));
-    } catch (error: unknown) {
-      markSaveFailed(isIpcError(error) ? error.message : String(error));
-    }
+    await saveOpenNote();
   }, []);
 
   const onEdit = useCallback(

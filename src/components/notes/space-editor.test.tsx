@@ -10,6 +10,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import {
+  SPACE_ICON_NO_MATCH,
   SPACE_NO_NAME,
   SPACE_NO_TEMPLATE,
   SPACE_NO_TERMS,
@@ -271,7 +272,12 @@ describe("the icon", () => {
    * picker sends the stored name straight back.
    */
   it("shows no selection for an icon outside the set and leaves the stored name alone", async () => {
-    open(space({ icon: "sparkles" }));
+    // The fixture used to be `sparkles`, which Story 45.20 added to the set —
+    // so this test kept passing while no longer testing anything: every
+    // assertion below is about a name the picker DOES have. A fixture that
+    // cannot distinguish the right answer from the wrong one is a decoration.
+    // `no-such-glyph` cannot become a real icon by accident.
+    open(space({ icon: "no-such-glyph" }));
 
     await screen.findByRole("button", { name: /Tag client\/acme/ });
     for (const name of ["No icon", "star", "flag", "inbox"]) {
@@ -280,7 +286,7 @@ describe("the icon", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
-    expect(savedRequest().icon).toBe("sparkles");
+    expect(savedRequest().icon).toBe("no-such-glyph");
   });
 
   it("clears the icon when No icon is chosen", async () => {
@@ -302,9 +308,80 @@ describe("the icon", () => {
   it("offers every glyph a seeded default asks for", async () => {
     open();
 
-    for (const name of ["inbox", "calendar-days", "pin", "video"]) {
+    // `layout-template` is Story 45.20's fifth seeded default (Templates). Rust
+    // names these as strings and cannot see this file.
+    for (const name of ["inbox", "calendar-days", "pin", "video", "layout-template"]) {
       expect(await screen.findByRole("button", { name })).toBeInTheDocument();
     }
+  });
+
+  it("finds an icon by name and lets it be chosen and saved", async () => {
+    // The chooser's whole reason to exist, driven end to end: type, see the set
+    // narrow, press the glyph, save, and assert the CALL carries it. Stopping
+    // at "the button is on screen" would leave the act unverified.
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    fireEvent.change(screen.getByLabelText("Search icons"), { target: { value: "template" } });
+
+    expect(screen.getByRole("button", { name: "layout-template" })).toBeInTheDocument();
+    // Narrowed, not merely present: an unfiltered grid would satisfy the line
+    // above and would not be a search.
+    expect(screen.queryByRole("button", { name: "inbox" })).not.toBeInTheDocument();
+    // "No icon" is never filtered away, or taking a glyph off a space would
+    // depend on what happens to be typed in the search box.
+    expect(screen.getByRole("button", { name: "No icon" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "layout-template" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().icon).toBe("layout-template");
+  });
+
+  it("finds a glyph by the word a person types rather than lucide's name", async () => {
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    fireEvent.change(screen.getByLabelText("Search icons"), { target: { value: "money" } });
+
+    expect(screen.getByRole("button", { name: "banknote" })).toBeInTheDocument();
+  });
+
+  it("says so when a search names nothing, and browsing comes back on clear", async () => {
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    const search = screen.getByLabelText("Search icons");
+
+    fireEvent.change(search, { target: { value: "qqzzx" } });
+    expect(screen.getByText(SPACE_ICON_NO_MATCH)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "inbox" })).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.queryByText(SPACE_ICON_NO_MATCH)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "inbox" })).toBeInTheDocument();
+  });
+
+  it("groups the set so it can be browsed without searching", async () => {
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    // Queried BY NAME, not by role alone, and that is the whole assertion.
+    // `aria-labelledby` pointing at nothing renders byte-identically — the
+    // attribute is present, `getAllByRole("group")` still finds every grid, the
+    // glyphs still work — and the section headings simply stop being announced.
+    // A query that resolves the name can only pass if the `<span id>` it points
+    // at exists and says that (W3Recording's shape: does anything check the
+    // thing this names exists?).
+    const keeper = screen.getByRole("group", { name: "keeper" });
+    expect(within(keeper).getByRole("button", { name: "inbox" })).toBeInTheDocument();
+    expect(within(keeper).getByRole("button", { name: "layout-template" })).toBeInTheDocument();
+
+    // More than one labelled group, or it is a flat wrap with a heading on it —
+    // which is the wall this replaced.
+    const marks = screen.getByRole("group", { name: "Marks" });
+    expect(within(marks).getByRole("button", { name: "flag" })).toBeInTheDocument();
+    expect(screen.getAllByRole("group").length).toBeGreaterThan(1);
   });
 });
 

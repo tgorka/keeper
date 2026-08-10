@@ -11,6 +11,13 @@ import {
 } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
+import {
+  readSidebarFold,
+  resetSidebarFoldForTest,
+  SIDEBAR_FOLD_COOKIE,
+  sidebarFoldCookie,
+  unfolded,
+} from "@/lib/stores/sidebar-fold";
 
 const beginTitleBarDrag = vi.fn();
 
@@ -58,6 +65,12 @@ afterEach(() => {
   resetPanelsStoreForTest();
   // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
   document.cookie = `${PANELS_COOKIE}=; path=/; max-age=0`;
+  // The fold is remembered in a cookie too, so one test's fold would otherwise
+  // be the next test's restore — and `hydrateSidebarFold` runs once per module,
+  // so the reset has to clear both halves.
+  resetSidebarFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${SIDEBAR_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("AppShell", () => {
@@ -377,5 +390,83 @@ describe("AppShell", () => {
     // correct behaviour and not what this test is about.
     expect(await screen.findByLabelText("report.pdf")).toBeInTheDocument();
     expect(panelsStore.getState().panels).toHaveLength(1);
+  });
+
+  /**
+   * The fold survives a restart (Story 45.20, FR-198).
+   *
+   * At the SHELL, deliberately, because the shell is the only place that can
+   * fail: `hydrateSidebarFold` is mounted here, and a hook-level test of the
+   * store can never see that `AppShell` does not call it (DW-172). That is the
+   * exact defect epic 44 shipped with three tray listeners.
+   */
+  it("comes back folded when the last run left it folded", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie({ menu: true, groups: { spaces: false, networks: false } });
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The rail, and a control that says how to get out of it. The nav is still
+    // there and still navigable — a fold is not a disappearance.
+    expect(screen.getByRole("button", { name: "Expand menu" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
+  });
+
+  it("comes back unfolded when the last run left it unfolded", async () => {
+    // The inverse, written down, because "folded" is the state a restore that
+    // did nothing could not produce and "unfolded" is the state it could. Both
+    // arms or the test only proves the cookie can say one thing.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie(unfolded());
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: "Collapse menu" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-[260px]");
+  });
+
+  it("folds on the press and writes it out, so the next run reads it back", async () => {
+    // The act, not the offer. This is the whole loop the previous two tests
+    // only read one end of: press, persist, and re-read through the same
+    // parser a restart would use.
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse menu" }));
+
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(readSidebarFold(document.cookie).menu).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand menu" }));
+    expect(readSidebarFold(document.cookie).menu).toBe(false);
+  });
+
+  it("withdraws the fold control below the collapse breakpoint and folds anyway", async () => {
+    // Under 1080px the viewport has already decided; the user's remembered
+    // choice cannot unfold into a width that is not there, and the control is
+    // absent rather than present and inert.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie(unfolded());
+    mockViewportWidth(1000);
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(screen.queryByRole("button", { name: "Expand menu" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse menu" })).not.toBeInTheDocument();
+    // Still navigable, still named.
+    expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
   });
 });

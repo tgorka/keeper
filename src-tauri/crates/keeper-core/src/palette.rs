@@ -470,6 +470,35 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
+        // The Recordings archive (Story 42.3, Story 45.20, FR-198). A SECOND
+        // navigation action beside `open-recording`, not a rename of it: the
+        // capture surface and the browser over what capture produced are two
+        // primary views (`recording` and `recordings`), the sidebar has carried
+        // two entries for them since 42.3, and the menu bar carried one — so
+        // the one surface a person reaches for after recording was the one
+        // surface the menu could not open.
+        //
+        // No shortcut chip: `⌘5` belongs to the capture surface and is bound by
+        // a shipped JS hook. A chip here would either teach a chord that opens
+        // the other view or claim a second one nothing binds, and this registry
+        // is where the cheat sheet learns what to promise.
+        //
+        // `requires_recording`, exactly like `open-recording` and for the same
+        // reason the sidebar gates both on one flag: a browser over recordings
+        // this build cannot make is a puzzle, not a surface.
+        PaletteActionVm {
+            id: "open-recordings".to_owned(),
+            title: "Open Recordings".to_owned(),
+            category: "Navigation".to_owned(),
+            keywords: ["record", "archive", "browse", "sessions", "library"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
         // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
         // `open-recording` — `requires_recording: true` drops them from every
         // surface (palette, cheat sheet, native menu) when recording is off
@@ -1036,9 +1065,16 @@ mod tests {
     }
 
     /// Every `requires_recording` action the registry ships — `open-recording`
-    /// (Story 16.3) plus the three recording verbs (Story 20.4, FR-48/FR-66).
-    const RECORDING_ACTION_IDS: [&str; 4] = [
+    /// (Story 16.3), `open-recordings` (Story 45.20) and the three recording
+    /// verbs (Story 20.4, FR-48/FR-66).
+    ///
+    /// The archive entry is in this list rather than in a test of its own so it
+    /// is gated by the same assertions as its four siblings: a navigation entry
+    /// that survived the capability going off would offer a browser over
+    /// recordings the build cannot make.
+    const RECORDING_ACTION_IDS: [&str; 5] = [
         "open-recording",
+        "open-recordings",
         "recording-start",
         "recording-stop",
         "recording-open-folder",
@@ -1121,6 +1157,47 @@ mod tests {
                 "registry projection omits {id} when recording is off"
             );
         }
+    }
+
+    #[test]
+    fn the_archive_entry_is_a_second_navigation_action_beside_the_capture_one() {
+        // Story 45.20: the reported gap was that the menu bar could open the
+        // capture surface and not the archive. Two DISTINCT ids in Navigation,
+        // with two distinct titles, is what closes it — a test that only asked
+        // "is there a recordings entry" would pass on a renamed `open-recording`
+        // and the menu would still have one item where it needs two.
+        let actions = palette_actions();
+        let nav: Vec<(&str, &str)> = actions
+            .iter()
+            .filter(|a| a.category == "Navigation")
+            .map(|a| (a.id.as_str(), a.title.as_str()))
+            .collect();
+        assert!(
+            nav.contains(&("open-recording", "Open Recording")),
+            "the capture surface keeps its entry: {nav:?}"
+        );
+        assert!(
+            nav.contains(&("open-recordings", "Open Recordings")),
+            "the archive gains one: {nav:?}"
+        );
+
+        let archive = actions
+            .iter()
+            .find(|a| a.id == "open-recordings")
+            .expect("open-recordings is registered");
+        // No chip: ⌘5 is the capture surface's and nothing binds a second chord.
+        // A chip here is a promise the cheat sheet would print and no hook keeps.
+        assert_eq!(archive.shortcut, None, "the archive claims no chord");
+        assert!(archive.requires_recording, "gated like every sibling");
+        assert!(!archive.requires_open_chat);
+        assert_eq!(archive.toggle_group, None);
+
+        // Both entries reachable from one search, because "recordings" is what
+        // a person types when they want either.
+        let index = sample_index();
+        let hits = index.query("recordings", PaletteMode::Action, false, true, false);
+        let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"open-recordings"), "searchable: {ids:?}");
     }
 
     /// The six notes actions the registry ships (Phase 5, build contract §1).

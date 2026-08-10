@@ -47,7 +47,7 @@
  * it, and the `recordings` tag is refused with a sentence because it is what
  * makes the note findable as a recording at all.
  */
-import { Copy, FolderOpen, MoreHorizontal, Play, Plus } from "lucide-react";
+import { Copy, FolderOpen, MoreHorizontal, Play, Plus, Video } from "lucide-react";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { namesTag } from "@/components/tags/tag-match";
@@ -72,10 +72,13 @@ import {
   type RecordingNoteTargetVm,
   recordingNoteTargets,
   recordingOpenPath,
+  recordingSessionMeta,
   revealPath,
   tagsVocabulary,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import { truncateGraphemes } from "@/lib/truncate";
 import { cn } from "@/lib/utils";
 
@@ -342,6 +345,19 @@ export function PropertiesPanel({
   const sessionId = recordingSessionId(parsed);
   const [targets, setTargets] = useState<RecordingNoteTargetVm[] | null>(null);
   const keyColumn = useResizableColumn(PROPERTY_KEY_COLUMN, PROPERTIES_COLUMN_LABEL);
+  // The note's `tags:` row, whatever shape it was written in, or null for a
+  // note that has none — a block list, a flow list, a bare `tags: standup`
+  // scalar, or an empty value. Story 44.14 admitted only the lists and the
+  // empty one, so a note whose single tag had been written inline got the
+  // generic text box: no vocabulary, no chips, and the exact surface the
+  // chooser exists to replace.
+  //
+  // `nested` is refused because an indented map under `tags:` is not a tag
+  // list, and the panel renders those read-only everywhere else too. The FIRST
+  // match wins, and identity is what the grid compares below: a hand-edited
+  // block can carry `tags:` twice, and two rows both claiming to be the tag row
+  // would write to two spans, the second landing on offsets the first moved.
+  const tagsEntry = parsed.entries.find((entry) => entry.key === TAGS_KEY && !entry.nested) ?? null;
 
   // Resolved by session id, once per note: the id is the handle that survives
   // a Story 40.4 retitle, so this answers "where is this recording NOW" while
@@ -406,52 +422,73 @@ export function PropertiesPanel({
 
   return (
     <section aria-label="Properties" className="flex flex-col gap-1 border-b px-3 py-2 text-xs">
-      {parsed.entries.length > 0 && (
-        <div
-          ref={keyColumn.containerRef}
-          className={cn(COLUMN_GRID_CLASS, "items-start gap-y-1")}
-          style={keyColumn.gridStyle(parsed.entries.length)}
-        >
-          {parsed.entries.map((entry) => {
-            // A recording note's own two path keys get actions; a `files:` key in
-            // somebody else's note is somebody else's list, and stays a control.
-            const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
-            const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
-            // `tags:` written as an empty scalar is still the tag row: clearing
-            // the last tag in Obsidian leaves the key with nothing after it, and
-            // falling back to the text box there would put the one surface this
-            // story replaced in front of the one note that has no tags yet.
-            const isTagRow =
-              entry.key === TAGS_KEY &&
-              !entry.nested &&
-              (entry.kind === "list" || entry.text === "");
-            return (
-              <Fragment key={entry.key}>
-                <div className="col-start-1 min-w-0 pr-2 text-muted-foreground">
-                  <OverflowValue name={PROPERTY_NAME_LABEL} value={entry.key} />
-                </div>
-                <div className="col-start-3 flex min-w-0 items-start gap-2 pl-2">
-                  {showsRecordingPaths ? (
-                    <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
-                  ) : isTagRow ? (
-                    <TagsProperty
-                      entry={entry}
-                      sessionId={sessionId}
-                      onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
-                    />
-                  ) : (
-                    <PropertyControl
-                      entry={entry}
-                      onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
-                    />
-                  )}
-                </div>
-              </Fragment>
-            );
-          })}
-          <ColumnResizer {...keyColumn.resizerProps} />
-        </div>
-      )}
+      {/* Always rendered, because the tag row is always here (Story 45.17). A
+          note with no frontmatter at all is the commonest note there is, and it
+          is exactly the one whose tags a person wants to set. */}
+      <div
+        ref={keyColumn.containerRef}
+        className={cn(COLUMN_GRID_CLASS, "items-start gap-y-1")}
+        style={keyColumn.gridStyle(parsed.entries.length + (tagsEntry === null ? 1 : 0))}
+      >
+        {parsed.entries.map((entry) => {
+          // A recording note's own two path keys get actions; a `files:` key in
+          // somebody else's note is somebody else's list, and stays a control.
+          const isRecordingPathKey = entry.key === RECORDING_KEY || entry.key === FILES_KEY;
+          const showsRecordingPaths = sessionId !== null && isRecordingPathKey && !entry.nested;
+          return (
+            <Fragment key={entry.key}>
+              <div className="col-start-1 min-w-0 pr-2 text-muted-foreground">
+                <OverflowValue name={PROPERTY_NAME_LABEL} value={entry.key} />
+              </div>
+              <div className="col-start-3 flex min-w-0 items-start gap-2 pl-2">
+                {showsRecordingPaths ? (
+                  <RecordingPaths entry={entry} targets={targets} canReveal={canReveal} />
+                ) : entry === tagsEntry ? (
+                  <TagsProperty
+                    entry={entry}
+                    sessionId={sessionId}
+                    onChange={(tags) =>
+                      write(spliceProperty(frontmatter, entry, serialiseTags(tags, entry)))
+                    }
+                  />
+                ) : (
+                  <PropertyControl
+                    entry={entry}
+                    onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
+                  />
+                )}
+              </div>
+            </Fragment>
+          );
+        })}
+        {/* The note has no `tags:` key. The row is offered anyway, and writes
+            the key on the first tag — a person editing tags should not have to
+            know that "tags" is the name of a frontmatter field, type it into
+            the generic Add-a-property box and only then get the chooser. */}
+        {tagsEntry === null && (
+          <Fragment key={TAGS_KEY}>
+            <div className="col-start-1 min-w-0 pr-2 text-muted-foreground">
+              <OverflowValue name={PROPERTY_NAME_LABEL} value={TAGS_KEY} />
+            </div>
+            <div className="col-start-3 flex min-w-0 items-start gap-2 pl-2">
+              <TagsProperty
+                entry={null}
+                sessionId={sessionId}
+                onChange={(tags) =>
+                  write(addProperty(frontmatter, TAGS_KEY, serialiseList(tags, NEW_TAGS_STYLE)))
+                }
+              />
+            </div>
+          </Fragment>
+        )}
+        <ColumnResizer {...keyColumn.resizerProps} />
+      </div>
+      {/* "Record another like this" (Story 45.19, FR-197) — a note-level
+          action, not a property row: it is about the whole session, and the
+          block has no key it belongs under. Present only for a recording note
+          whose folder resolved, so it can never offer to open a form over a
+          session that is not on this machine. */}
+      {sessionId !== null && <RecordAnotherLikeThis targets={targets} />}
       <div className="flex items-center gap-2 pt-1">
         <Input
           value={newKey}
@@ -596,6 +633,61 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
 const TAGS_KEY = "tags";
 
 /**
+ * The style a `tags:` key keeper writes for the first time is written in.
+ *
+ * A block list, because that is what Obsidian's own tag control writes and what
+ * the overwhelming majority of vault notes already carry — a note keeper gave a
+ * flow list to would be the odd one out in its own folder. It applies only to a
+ * key that did not exist: an existing `tags:` keeps whatever style the file
+ * already used, which is [`serialiseTags`]'s whole job.
+ */
+const NEW_TAGS_STYLE: PropertyStyle = "block";
+
+/**
+ * The tags an entry holds, whatever shape the file wrote them in.
+ *
+ * A scalar is ONE tag, not zero: `tags: standup` means the note is tagged
+ * `standup`, and reading it as an empty list would have shown a person their
+ * own tag missing from the row that claims to list their tags — and then
+ * silently dropped it on the next edit.
+ */
+export function tagsOf(entry: PropertyEntry): string[] {
+  if (entry.kind === "list") {
+    return entry.items;
+  }
+  const only = entry.text.trim();
+  return only === "" ? [] : [only];
+}
+
+/**
+ * Render a tag list back into the value span, keeping the file's own style.
+ *
+ * The one case the style cannot survive is a scalar that has to hold two tags,
+ * and it becomes a FLOW list rather than a block one: the value was written on
+ * the key's own line, and a flow list is still on the key's own line. Promoting
+ * `tags: standup` to three lines because somebody added a second tag is a
+ * bigger edit to their file than the edit they asked for.
+ *
+ * Going the other way it stays a list. Removing the second of two tags leaves
+ * `[standup]` rather than reverting to `standup`, because a value that changes
+ * shape in both directions makes every removal a structural rewrite, and the
+ * note is the user's.
+ */
+export function serialiseTags(tags: string[], entry: PropertyEntry): string {
+  if (entry.kind === "list") {
+    return serialiseList(tags, entry.style);
+  }
+  // A scalar holds at most one tag, so from here the count is 0 — the last tag
+  // came off — or two or more, because one was added. It is never 1: nothing
+  // can rewrite a one-tag scalar into a different one-tag scalar. So there is
+  // no "still exactly one" arm and no `tags[0] ?? ""`; both were a branch and a
+  // fabricated value for a case no input reaches, and a mutation to the
+  // boundary between them survived the whole suite because nothing could tell
+  // the two apart.
+  return tags.length === 0 ? serialiseScalar("", entry.quoted) : serialiseList(tags, "flow");
+}
+
+/**
  * keeper's classification tag (Story 43.2, FR-147): what a *person* browsing
  * the tag tree sees to know this note is a recording, since [`SESSION_KEY`] is
  * a machine predicate and invisible there.
@@ -629,11 +721,22 @@ export function recordingsTagRefusal(tag: string): string {
 }
 
 interface TagsPropertyProps {
-  entry: PropertyEntry;
+  /**
+   * The note's `tags:` entry, or **null for a note that has none yet** — which
+   * is most notes, and the case Story 44.14 could not serve at all.
+   */
+  entry: PropertyEntry | null;
   /** The note's session id, or null when it is not a recording note. */
   sessionId: string | null;
-  /** Receives the serialised list, ready to splice after `tags:`. */
-  onChange: (value: string) => void;
+  /**
+   * Receives the note's whole tag list, in order.
+   *
+   * The LIST and not the serialised text, because the two callers write it
+   * differently — one splices an existing span keeping the file's style, the
+   * other creates the key — and a component that had to know which was which
+   * would be a component that knows about frontmatter offsets.
+   */
+  onChange: (tags: string[]) => void;
 }
 
 /**
@@ -655,6 +758,9 @@ interface TagsPropertyProps {
  * wrote into the stub, comes off with one press.
  */
 function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
+  // Read once per render, because every use below has to agree: the chips, the
+  // removal, what the chooser already has, and what an addition appends to.
+  const items = entry === null ? [] : tagsOf(entry);
   const [adding, setAdding] = useState(false);
   const [vocabulary, setVocabulary] = useState<readonly string[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -705,23 +811,18 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
       return;
     }
     setRefusal(null);
-    onChange(
-      serialiseList(
-        entry.items.filter((candidate) => candidate !== item),
-        entry.style,
-      ),
-    );
+    onChange(items.filter((candidate) => candidate !== item));
   }
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-1">
       <div className="flex flex-wrap items-center gap-1">
-        {entry.items.map((item) => (
+        {items.map((item) => (
           <button
             key={item}
             type="button"
             className="rounded bg-muted px-1.5 py-0.5"
-            aria-label={`Remove ${item} from ${entry.key}`}
+            aria-label={`Remove ${item} from ${TAGS_KEY}`}
             onClick={() => remove(item)}
           >
             {item} ×
@@ -745,7 +846,7 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
           label={ADD_NOTE_TAG}
           placeholder="Type or browse"
           vocabulary={vocabulary}
-          chosen={entry.items}
+          chosen={items}
           // A note may carry a tag no other note carries yet — that is what a
           // first note about a new client is — so this surface creates, and
           // the text goes out exactly as typed. What a tag MEANS is settled in
@@ -755,7 +856,7 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
           inputRef={focusChooser}
           onChoose={(tag) => {
             setRefusal(null);
-            onChange(serialiseList([...entry.items, tag], entry.style));
+            onChange([...items, tag]);
           }}
           onDismiss={closeChooser}
         />
@@ -859,6 +960,92 @@ function targetFor(
   const name = fileName(relativePath);
   return targets.find(
     (target) => target.kind !== "folder" && fileName(target.relativePath) === name,
+  );
+}
+
+/** The duplicate-session affordance's label (Story 45.19, FR-197). */
+export const RECORD_ANOTHER_LABEL = "Record another like this";
+
+/**
+ * What it says when the session's manifest will not load.
+ *
+ * The alternative would be opening the Recording pane with a blank form, which
+ * says "this session had no details" about a session keeper simply could not
+ * read. Nothing is filled and nothing is navigated to, because a surface that
+ * moved the user somewhere useless would make them work out what happened.
+ */
+export const RECORD_ANOTHER_UNREADABLE =
+  "keeper can't read that session's details, so there is nothing to copy.";
+
+/** Test id for the duplicate-session affordance. */
+export const RECORD_ANOTHER_TESTID = "record-another-like-this";
+
+/** Test id for the unreadable-session line beside it. */
+export const RECORD_ANOTHER_FAULT_TESTID = "record-another-fault";
+
+/**
+ * "Record another like this" (Story 45.19, FR-197).
+ *
+ * Fills the Recording pane's "Next session" form from THIS session's stored
+ * metadata and shows that pane. **It stops there.** The recorder is not
+ * touched: no `recording_start`, no capture selection changed, nothing armed.
+ * A recorder that begins without a deliberate press is a recorder people stop
+ * trusting, and the person who pressed a button in a note was asking to set a
+ * session up, not to be recorded.
+ *
+ * The session is located by the folder target Rust resolved — the same list the
+ * paths above act on — so this composes no path of its own (AD-65) and follows
+ * a Story 40.4 retitle for free. No folder target means the session is not on
+ * this machine, and the button is absent rather than present and failing.
+ */
+function RecordAnotherLikeThis({ targets }: { targets: RecordingNoteTargetVm[] | null }) {
+  const [fault, setFault] = useState<string | null>(null);
+  const folder = targetFor(targets, "", "folder");
+  if (folder === undefined) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-1 pt-1">
+      <Button
+        size="sm"
+        variant="ghost"
+        className="w-fit gap-1"
+        data-testid={RECORD_ANOTHER_TESTID}
+        onClick={() => {
+          setFault(null);
+          void recordingSessionMeta(folder.absolutePath)
+            .then((meta) => {
+              if (meta === null) {
+                setFault(RECORD_ANOTHER_UNREADABLE);
+                return;
+              }
+              // The whole form at once, replacing whatever was in it: this is
+              // "like THIS session", so a field this session left empty must
+              // come across empty rather than keep a leftover from the last
+              // thing the user typed into the pane.
+              recordingMetaStore.getState().setFields({
+                title: meta.title,
+                participants: meta.participants,
+                note: meta.note,
+                tags: meta.tags,
+                custom: meta.custom.map((row) => ({ name: row.name, value: row.value })),
+              });
+              primaryViewStore.getState().setView("recording");
+            })
+            .catch(() => {
+              setFault(RECORD_ANOTHER_UNREADABLE);
+            });
+        }}
+      >
+        <Video aria-hidden="true" className="size-3" />
+        {RECORD_ANOTHER_LABEL}
+      </Button>
+      {fault !== null && (
+        <p role="alert" className="text-destructive" data-testid={RECORD_ANOTHER_FAULT_TESTID}>
+          {fault}
+        </p>
+      )}
+    </div>
   );
 }
 

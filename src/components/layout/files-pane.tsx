@@ -535,8 +535,21 @@ export function FilesPane() {
   const [creatingIn, setCreatingIn] = useState<string | null>(null);
   const [createName, setCreateName] = useState("");
   // Whether Story 45.13's chooser is open. A boolean rather than a captured
-  // selection: the dialog reads the live selection, so a row that disappears
-  // on a refresh while the dialog is open cannot be attached from a snapshot.
+  // selection, so `sources` is derived live from `selection` on every render
+  // rather than frozen at open time.
+  //
+  // **That matters for exactly one case, and it is not the obvious one.** The
+  // chooser is a modal: Radix marks everything outside it `aria-hidden`, so
+  // while it is open the tree is inert and the selection cannot be changed by
+  // clicking — a test that tries finds no `treeitem` at all. What CAN change it
+  // underneath is a background listing refresh, which drops a vanished row out
+  // of `selection` (it filters on `entry !== null`) and therefore out of
+  // `sources`. A snapshot taken at open time would still be offering that row.
+  //
+  // Verified by reading rather than by a test, because the modal makes the
+  // click path unreachable and the refresh path is not drivable with the dialog
+  // mounted. The write-time plan is authoritative regardless, so the worst this
+  // can cost is an offer that Rust then refuses with a sentence.
   const [attaching, setAttaching] = useState(false);
   // Which vault a note would be attached to. The Files pane browses every
   // synced folder, but a note lives in the open vault and nowhere else.

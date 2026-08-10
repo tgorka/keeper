@@ -62,6 +62,17 @@ pub struct NoteVaultVm {
     /// Notes changed by an agent or another device since this device last
     /// acknowledged them (FR-113).
     pub unread_count: u32,
+    /// The template a quick capture starts from, vault-relative, or `None`
+    /// (Story 45.16, FR-193). Mirrored back so the settings form shows the
+    /// value actually in force rather than the one it last sent (AD-34-8).
+    pub capture_template: Option<String>,
+    /// The tag every quick capture carries, in its canonical form, or `None`.
+    ///
+    /// Canonical rather than as typed, for the same reason: `keeper_core`
+    /// folded `#Quick Capture` to `quick-capture` on the way in, and a form
+    /// still showing the typed spelling would be describing a tag that is not
+    /// in any note.
+    pub capture_tag: Option<String>,
     /// The commit/push cadence in force for this vault.
     pub cadence: NoteCadenceVm,
 }
@@ -320,6 +331,99 @@ pub struct NoteSpaceVm {
     pub error: Option<String>,
 }
 
+/// What a deletion is about to remove, in the words the confirmation shows
+/// (Story 45.17, FR-195, UX-DR78).
+///
+/// **Composed in Rust for `FilesDeletePlanVm`'s reason** (Story 45.3): the
+/// sentence has to be built by code that knows what the delete will actually
+/// do, or the dialog promises one thing and the command does another. A
+/// confirmation assembled in TypeScript from a name and a boolean is a second
+/// reading of the removal rule, in the one place a wrong reading costs a file.
+///
+/// One struct for a note and for a space, because a space **is** a note and
+/// [`crate::notes::default_spaces`] is the only thing that makes one special.
+/// Two structs would be two dialogs, and the second one would be the one that
+/// forgot to say where the bytes went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteDeletePlanVm {
+    /// The vault-relative path of the file that moves. Shown under the
+    /// question, because two notes may carry one title and the path is the
+    /// only thing on screen that tells them apart.
+    pub path: String,
+    /// Names the thing. Never a count and never "this item": the whole point
+    /// of a confirmation is that it says what goes.
+    pub question: String,
+    /// What goes, and — for a space — what conspicuously does not.
+    pub consequence: String,
+    /// Where the bytes end up. Never absent: a delete nobody said was
+    /// recoverable is a delete people do not press.
+    pub recovery: String,
+}
+
+/// Where a deleted note's bytes go, said once.
+///
+/// Worded to match `FilesDeletePlanVm`'s own recovery clause, because it is the
+/// same `notes_vault::trash_note` under both and a person who deletes a file in
+/// the Files pane and a note in the Notes pane must not be told two different
+/// stories about whether keeper kept a copy (NFR-30).
+const TRASH_RECOVERY: &str = "keeper moves it into the vault's trash rather than erasing it, and \
+the removal is recorded in this vault's history.";
+
+impl NoteDeletePlanVm {
+    /// The plan for an ordinary note.
+    ///
+    /// The link clause is unconditional and is the honest half of the sentence:
+    /// links resolve through the note's ULID (FR-97), so a wiki-link to a
+    /// deleted note stops resolving whether or not anything currently points at
+    /// it. Counting the backlinks here would mean running the link index inside
+    /// a confirmation, and a count that is right only while nothing else is
+    /// writing is worse than a rule that is always true.
+    pub fn for_note(title: &str, path: &str) -> Self {
+        Self {
+            question: format!("Delete \"{title}\"?"),
+            consequence: format!(
+                "keeper removes {path} from this vault. Links to this note stop resolving."
+            ),
+            recovery: TRASH_RECOVERY.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    /// The plan for a space.
+    ///
+    /// **The sentence exists to answer the question that stops people deleting
+    /// a saved view: does this take the notes with it.** It does not, and a
+    /// confirmation that leaves that unsaid is why unused spaces accumulate.
+    ///
+    /// `default_key` is the field that DRIVES the second clause, not the
+    /// space's name: a seeded Recordings space renamed to "Sessions" is still
+    /// keeper's, and a space of the user's own called "Recordings" is not.
+    /// Partitioning on the name would get both of those backwards.
+    pub fn for_space(name: &str, path: &str, default_key: Option<&str>) -> Self {
+        let mut consequence = format!(
+            "A space is a saved view. Deleting it removes {path} and nothing else — every note \
+             it lists stays where it is."
+        );
+        if default_key.is_some() {
+            // Named because the alternative is a person deleting a default,
+            // seeing it survive a restart, and concluding the delete failed —
+            // and because the way back is a control they can see (FR-156).
+            consequence.push_str(
+                " keeper seeded this space, and will not add it back on its own; \
+                 \"Restore default spaces\" brings it back.",
+            );
+        }
+        Self {
+            question: format!("Delete the space \"{name}\"?"),
+            consequence,
+            recovery: TRASH_RECOVERY.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+}
+
 /// One tag term of a space's query, in the shape the three-state chip holds
 /// (Story 43.3's `TagChip`, field for field).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -419,6 +523,15 @@ pub enum NoteBodyBatch {
     Reset {
         /// The revision these bytes are.
         rev: String,
+        /// The note's vault-relative path.
+        ///
+        /// **Added by Story 45.18, and the absence it replaces was load-bearing.**
+        /// `path` reached the editor only through `Renamed` or a completed save,
+        /// so a note that was merely OPENED had none until its first autosave —
+        /// which left the header's path caption blank on open, and would have
+        /// left 45.18's "Show in Files" absent for exactly the case it exists
+        /// for. The value is in hand here anyway; not sending it was the gap.
+        path: String,
         /// The `---` block verbatim — fences and trailing newline included — or
         /// empty when the note has none.
         frontmatter: String,
@@ -985,6 +1098,13 @@ pub struct NoteVaultSettingsReq {
     pub subfolder: Option<String>,
     pub journal_template: Option<String>,
     pub default_template: Option<String>,
+    /// The template a quick capture starts from. An empty string clears it —
+    /// "the user chose no template" and "the user never touched the field" are
+    /// different requests, and only the first may unset what is stored.
+    pub capture_template: Option<String>,
+    /// The tag every quick capture carries, as typed. keeper folds it to the
+    /// canonical form before storing it, and an empty string clears it.
+    pub capture_tag: Option<String>,
     pub cadence: Option<NoteCadenceVm>,
 }
 
@@ -1056,6 +1176,7 @@ mod tests {
         // enums the frontend already applies (RoomListOp/TimelineOp/InboxOp).
         let reset = NoteBodyBatch::Reset {
             rev: "r1".to_owned(),
+            path: "inbox/note.md".to_owned(),
             frontmatter: "---\nid: 01AAA\n---\n".to_owned(),
             text: "hello".to_owned(),
             cursor: Some(3),
@@ -1116,5 +1237,84 @@ mod tests {
         let json = serde_json::to_string(&check).expect("serialize check");
         assert!(json.contains("\"tokenIndex\":1"), "json: {json}");
         assert!(json.contains("\"span\":[6,16]"), "json: {json}");
+    }
+
+    /// Story 45.17: a confirmation NAMES what goes, and says where it went.
+    ///
+    /// Both halves matter and they fail differently. A confirmation that does
+    /// not name the note is one people cancel out of; one that does not say the
+    /// bytes are recoverable is one they never press at all.
+    #[test]
+    fn a_note_deletion_names_the_note_and_where_its_bytes_go() {
+        let plan = NoteDeletePlanVm::for_note("Standup", "meetings/2026-08-09-standup.md");
+
+        assert!(plan.question.contains("Standup"), "{}", plan.question);
+        assert!(
+            plan.consequence.contains("meetings/2026-08-09-standup.md"),
+            "{}",
+            plan.consequence
+        );
+        assert!(plan.recovery.contains("trash"), "{}", plan.recovery);
+        assert_eq!(plan.path, "meetings/2026-08-09-standup.md");
+    }
+
+    /// A space's confirmation answers the question that stops people deleting a
+    /// saved view: does this take the notes with it. It does not, and the
+    /// sentence has to say so.
+    #[test]
+    fn a_space_deletion_says_the_notes_it_lists_stay() {
+        let plan = NoteDeletePlanVm::for_space("Clients", "spaces/clients.md", None);
+
+        assert!(plan.question.contains("Clients"), "{}", plan.question);
+        assert!(plan.question.contains("space"), "{}", plan.question);
+        assert!(
+            plan.consequence
+                .contains("every note it lists stays where it is"),
+            "{}",
+            plan.consequence
+        );
+        assert!(plan.recovery.contains("trash"), "{}", plan.recovery);
+    }
+
+    /// **The clause is driven by the marker, not by the name.**
+    ///
+    /// A seeded Recordings space renamed to "Sessions" is still keeper's, and a
+    /// space of the user's own called "Recordings" is not — so both are checked
+    /// here, and a composer partitioning on the name would get both backwards.
+    /// The promise it carries is specific: keeper will not add it back, and
+    /// Restore is how you get it.
+    #[test]
+    fn only_a_seeded_space_promises_to_stay_deleted() {
+        // One path in both, so the ONLY difference between the two sentences is
+        // the clause the marker adds. Two paths would have made the comparison
+        // below trivially false, and the test would have been asserting that
+        // two paths differ, which nobody doubts.
+        let path = "spaces/2026-08-09-recordings.md";
+        let renamed = NoteDeletePlanVm::for_space("Sessions", path, Some("recordings"));
+        assert!(
+            renamed.consequence.contains("will not add it back"),
+            "{}",
+            renamed.consequence
+        );
+        assert!(
+            renamed.consequence.contains("Restore default spaces"),
+            "{}",
+            renamed.consequence
+        );
+
+        // A space of the user's own that happens to be called Recordings is
+        // not keeper's, and keeper promises nothing about it.
+        let theirs = NoteDeletePlanVm::for_space("Recordings", path, None);
+        assert!(
+            !theirs.consequence.contains("will not add it back"),
+            "keeper must not promise anything about a space it did not seed: {}",
+            theirs.consequence
+        );
+        assert!(
+            renamed.consequence.starts_with(&theirs.consequence),
+            "the two must differ by exactly the added clause\nseeded: {}\nnot seeded: {}",
+            renamed.consequence,
+            theirs.consequence
+        );
     }
 }

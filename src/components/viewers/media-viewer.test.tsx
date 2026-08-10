@@ -18,18 +18,41 @@
  * jsdom's to prove, and the 988 lit pixels were WebKit's. Which of these is
  * proved on which engine is spelled out in the spec's last section.
  */
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/ipc/client", () => ({
-  revealPath: vi.fn(async () => undefined),
-  syncOpenEntry: vi.fn(async () => undefined),
-}));
+// **There is deliberately no `vi.mock("@/lib/ipc/client")` here, and its
+// absence is an assertion.**
+//
+// This file originally carried one, added defensively when it was written.
+// Story 45.13's rule — you need a mock exactly when the boot path reaches the
+// name, so adding one "to be safe" is a lie about what the boot path does —
+// says to check rather than assume, and checking removed it: all tests pass
+// without it.
+//
+// **What the absence enforces, stated no wider than it is.** `MediaViewer`
+// composes its URL synchronously from two values it was handed and reaches no
+// IPC command on any path this file drives. That is the whole of it.
+//
+// It is NOT proof that this viewer works in the quick-capture webview, though
+// it is the load-bearing half of that argument. The rest is two things read
+// rather than run: that the four URI schemes are registered on the Tauri
+// Builder app-wide with no window scoping (`keeper/src/lib.rs`), and that
+// `capabilities/*.json` gates plugin permissions rather than `#[tauri::command]`
+// functions (`sync_ipc.rs`'s own comment). Nothing has ever been executed in a
+// second webview. Story 45.13's rule, taken on this file: a comment claiming a
+// guarantee wider than its test is worse than no comment, because the next
+// reader budgets for the wider one.
+//
+// If you add a test that clicks Reveal, you WILL reach the real `revealPath`
+// and it will fail loudly in jsdom. That is the correct outcome: mock it in
+// that test, not for the whole file, or the property above stops being tested.
 
 import { FRAME_PRIME_SECONDS } from "@/components/notes/editor/recording-transport";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import {
   resolveViewer,
+  UNKNOWN_VIEWER_OPEN_LABEL,
   UNKNOWN_VIEWER_SIZE_SLOT,
   UNKNOWN_VIEWER_TESTID,
   type ViewerFile,
@@ -104,7 +127,17 @@ describe("the registry's three media ids really mount this viewer", () => {
     // FR-145 and AD-65 in one assertion: the URL is composed from the two
     // halves Rust supplied, and `absolutePath` — which this file carries —
     // appears nowhere.
-    openThroughTheRegistry(target());
+    //
+    // Story 45.20's shape: an absence over a literal is hollow unless
+    // something asserts the literal was ever in the input. Without the witness
+    // below, a fixture that stopped carrying an absolute path — or carried a
+    // different one — would satisfy the `not.toContain` for the wrong reason
+    // and this test would go on passing while FR-145 stopped being tested.
+    const file = target();
+    expect(file.absolutePath).toContain("/Volumes/merope");
+
+    openThroughTheRegistry(file);
+
     const source = element().getAttribute("src");
     expect(source).toBe("keeper-file://01PROFILE/2026/08/screen-0000.mov");
     expect(document.body.innerHTML).not.toContain("/Volumes/merope");
@@ -255,6 +288,40 @@ describe("a file keeper cannot decode says so, with its name and its size", () =
     expect(screen.queryByTestId(MEDIA_VIEWER_ELEMENT_TESTID)).toBeNull();
   });
 
+  it("keeps the failure when a measurement lands in the same tick after it", () => {
+    // **Story 45.14's shape: two producers that run one after the other cannot
+    // share one state slot.** Not a race — a sequence, where the later one
+    // succeeds and erases the earlier one's failure sentence before a frame is
+    // painted, which is indistinguishable from never having said anything.
+    //
+    // `failure` and `intrinsic` are two producers over one `reported` object.
+    // They are safe because each writes its own field through a functional
+    // update that carries the other — but nothing pinned that, and a plain
+    // `setReported({ ... })` in either handler reads like perfectly ordinary
+    // React. Probed and it SURVIVED the whole suite; this is the test that
+    // fails it.
+    //
+    // Reachable rather than theoretical: both listeners live on the same
+    // element, so a volume unplugged mid-load raises `error` and can raise
+    // `loadedmetadata` in the same task. Whichever handler ran last would win,
+    // and the reader would get a player that cannot play instead of the
+    // sentence naming why.
+    openThroughTheRegistry(target({ name: "clip.mkv" }));
+    const player = element() as HTMLVideoElement;
+    reports(player, { error: { code: 2 }, videoWidth: 1440, videoHeight: 900 });
+
+    // One batch: both handlers run before React re-renders.
+    act(() => {
+      player.dispatchEvent(new Event("error"));
+      player.dispatchEvent(new Event("loadedmetadata"));
+    });
+
+    expect(screen.getByTestId(UNKNOWN_VIEWER_TESTID)).toHaveTextContent(
+      "keeper could not read clip.mkv",
+    );
+    expect(screen.queryByTestId(MEDIA_VIEWER_ELEMENT_TESTID)).toBeNull();
+  });
+
   it("names each of the platform's four reasons, and never as the unknown one", () => {
     const seen = new Set<string>();
     for (const code of [1, 2, 3, 4]) {
@@ -293,6 +360,39 @@ describe("a file keeper cannot decode says so, with its name and its size", () =
     openThroughTheRegistry(target({ profileId: null }));
     expect(screen.queryByTestId(MEDIA_VIEWER_ELEMENT_TESTID)).toBeNull();
     expect(screen.getByTestId(UNKNOWN_VIEWER_TESTID)).toHaveTextContent(MEDIA_NO_PROFILE_SENTENCE);
+  });
+
+  /**
+   * **The payload, not the prose.** The two tests above assert what the
+   * placeholder SAYS; nothing asserted what it was HANDED. Story 45.13's
+   * finding — a green suite that exercises a payload's shape while never
+   * checking its value reads exactly like one that does both — probed here and
+   * confirmed: passing `{ ...file, openWith: null }` to either fallback
+   * survived every test in this file.
+   *
+   * It matters most in exactly these two states. Both sentences end "hand it to
+   * the application that owns it", and for a file this machine cannot decode,
+   * or one outside every profile, that button IS the remedy. A placeholder that
+   * says so and does not offer it is worse than one that says nothing.
+   *
+   * Two tests rather than one, so a regression names which fallback broke.
+   */
+  it("hands the undecodable file's own actions to the placeholder, not a stripped copy", () => {
+    const openWith = vi.fn(async () => undefined);
+    openThroughTheRegistry(target({ name: "clip.mkv", openWith }));
+    reports(element(), { error: { code: 3 } });
+    fireEvent(element(), new Event("error"));
+
+    fireEvent.click(screen.getByRole("button", { name: UNKNOWN_VIEWER_OPEN_LABEL }));
+    expect(openWith).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands the out-of-profile file's own actions to the placeholder", () => {
+    const openWith = vi.fn(async () => undefined);
+    openThroughTheRegistry(target({ profileId: null, openWith }));
+
+    fireEvent.click(screen.getByRole("button", { name: UNKNOWN_VIEWER_OPEN_LABEL }));
+    expect(openWith).toHaveBeenCalledTimes(1);
   });
 
   it("says so when a non-media row is routed here, rather than drawing a silent audio bar", () => {

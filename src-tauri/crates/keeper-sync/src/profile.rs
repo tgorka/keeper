@@ -220,6 +220,31 @@ pub struct NotesConfig {
     /// Vault-relative path of the template a new note starts from, if any.
     #[serde(default)]
     pub default_template: Option<String>,
+    /// Vault-relative path of the template a **quick capture** starts from, if
+    /// any (Story 45.16, FR-193).
+    ///
+    /// Its own setting rather than a reuse of `default_template`, because the
+    /// two answer different questions: a capture is two seconds of typing into
+    /// a small window and wants a scaffold shaped for that, while the vault
+    /// default shapes every note the app creates. Absent means the capture path
+    /// falls through to `default_template`, which is exactly what every vault
+    /// did before this field existed.
+    #[serde(default)]
+    pub capture_template: Option<String>,
+    /// The tag every quick capture carries, if any (Story 45.16, FR-193).
+    ///
+    /// Stored in the canonical form `keeper_core::notes::seed::capture_tag`
+    /// produces, so the settings form and the note's frontmatter cannot show
+    /// two spellings of one tag.
+    ///
+    /// **`None` by default, and that default is load-bearing.** Story 44.3
+    /// seeds Inbox as `is:untagged`, so any capture tag files every captured
+    /// thought straight out of the one space designed to receive it — the same
+    /// hazard 44.7 refused when it shipped its templates untagged. Defaulting
+    /// this to a value would change what an existing vault does on upgrade,
+    /// with nobody having asked for it.
+    #[serde(default)]
+    pub capture_tag: Option<String>,
     #[serde(default)]
     pub cadence: NotesCadence,
 }
@@ -230,6 +255,8 @@ impl Default for NotesConfig {
             subfolder: DEFAULT_NOTES_SUBFOLDER.to_owned(),
             journal_template: DEFAULT_JOURNAL_TEMPLATE.to_owned(),
             default_template: None,
+            capture_template: None,
+            capture_tag: None,
             cadence: NotesCadence::default(),
         }
     }
@@ -1140,6 +1167,11 @@ mod tests {
         assert_eq!(sparse.subfolder, DEFAULT_NOTES_SUBFOLDER);
         assert_eq!(sparse.journal_template, DEFAULT_JOURNAL_TEMPLATE);
         assert_eq!(sparse.default_template, None);
+        // Story 45.16. `None` here is not laziness: Inbox is `is:untagged`, so
+        // a shipped capture tag would file every captured thought out of the
+        // space 44.3 seeds to receive them, in a vault the user never edited.
+        assert_eq!(sparse.capture_template, None);
+        assert_eq!(sparse.capture_tag, None);
         assert_eq!(sparse.cadence.commit_idle_ms, DEFAULT_COMMIT_IDLE_MS);
         assert_eq!(sparse.cadence.push_interval_ms, DEFAULT_PUSH_INTERVAL_MS);
         assert!(sparse.cadence.push_on_blur);

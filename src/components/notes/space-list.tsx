@@ -26,12 +26,18 @@
  * therefore knows nothing about the DSL — the row hands up a space and the pane
  * hands up an id.
  */
-import { FilePlus, Pencil, RotateCcw } from "lucide-react";
+import { FilePlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { SpaceEditor, spaceIcon } from "@/components/notes/space-editor";
+import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
+import { SpaceEditor } from "@/components/notes/space-editor";
+import { spaceIcon } from "@/components/notes/space-icons";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
-import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
+import {
+  ALL_NOTES_SCOPE,
+  notesFiltersStore,
+  useNotesFiltersStore,
+} from "@/lib/stores/notes-filters";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -66,6 +72,14 @@ export const RESTORE_NOTHING_MISSING = "Nothing was missing.";
 /** What restore says when keeper could not write. */
 export const RESTORE_FAILED = "keeper couldn't restore the default spaces.";
 
+/**
+ * The delete control's accessible name, suffixed with the space. Named because
+ * a column of eight rows would otherwise offer eight controls all called
+ * "Delete", and because the confirmation that follows is the only other place
+ * the space is named.
+ */
+export const DELETE_SPACE = "Delete space";
+
 export function SpaceList({
   vaultId,
   onNewNote,
@@ -80,6 +94,7 @@ export function SpaceList({
 }) {
   const [spaces, setSpaces] = useState<NoteSpaceVm[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const [restoring, setRestoring] = useState(false);
   const [restoreResult, setRestoreResult] = useState<string | null>(null);
   const activeSpaceId = useNotesFiltersStore((s) => (s.scope.kind === "space" ? s.scope.id : null));
@@ -277,6 +292,21 @@ export function SpaceList({
               >
                 <Pencil aria-hidden="true" className="size-3.5" />
               </button>
+              {/* Same reveal rule as the pencil, and after it: the destructive
+                  control is last, so a hand travelling along the row reaches
+                  edit before delete. */}
+              <button
+                type="button"
+                aria-label={`${DELETE_SPACE} ${space.name}`}
+                onClick={() => setDeleting(space.id)}
+                className={cn(
+                  "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                  "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                )}
+              >
+                <Trash2 aria-hidden="true" className="size-3.5" />
+              </button>
             </li>
           );
         })}
@@ -291,6 +321,28 @@ export function SpaceList({
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
+            reload();
+          }}
+        />
+      )}
+      {/* A space is a note, so this is the note dialog and the note command —
+          `notes_delete` records a seeded default as offered, which is what
+          stops the next refresh putting it back (Story 45.17, FR-195). A
+          second removal path for spaces would be the one that forgot. */}
+      {vaultId !== null && deleting !== null && (
+        <NoteDeleteDialog
+          key={deleting}
+          vaultId={vaultId}
+          noteId={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={() => {
+            // The rail must stop showing it, and a lens pointed at a space
+            // that no longer exists selects nothing and cannot say why — so
+            // the scope goes back to all notes when the deleted space was the
+            // active one, and is left alone when it was not.
+            if (deleting === activeSpaceId) {
+              notesFiltersStore.getState().setScope(ALL_NOTES_SCOPE);
+            }
             reload();
           }}
         />

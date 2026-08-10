@@ -59,11 +59,11 @@ use keeper_core::vm::{
     PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
     RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm, RecordingNoteTargetVm,
     RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSearchVm,
-    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
-    RecordingTargetVm, RecordingUiState, RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm,
+    RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RecordingVolumeState,
+    RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess,
+    SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch,
+    TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -1499,13 +1499,52 @@ pub fn notes_capture_show() -> Result<(), IpcError> {
 /// Mobile twin of `notes_capture_hide`.
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn notes_capture_hide(
-    commit: bool,
-) -> Result<Option<keeper_core::notes::vm::NoteRefVm>, IpcError> {
-    let _ = commit;
+pub fn notes_capture_hide() -> Result<(), IpcError> {
     Err(to_ipc_error(CoreError::Unsupported(
         "the quick-capture panel is desktop-only".to_owned(),
     )))
+}
+
+/// Mobile twin of `notes_capture_open` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_open(target: keeper_core::capture::CaptureTargetVm) -> Result<(), IpcError> {
+    let _ = target;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_close` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_close(key: String) -> Result<(), IpcError> {
+    let _ = key;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_set_locked` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_set_locked(key: String, locked: bool) -> Result<(), IpcError> {
+    let _ = (key, locked);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_windows` (Story 45.15).
+///
+/// An empty list rather than a refusal, and that is the one twin here that is
+/// not an error: "which capture windows are open?" has a true answer on a
+/// phone — none — and a surface that asks in order to decide whether to offer
+/// something should get it rather than an exception to swallow.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_windows() -> Result<Vec<keeper_core::capture::CaptureWindowVm>, IpcError> {
+    Ok(Vec::new())
 }
 
 /// Mobile twin of `notes_reveal`.
@@ -6441,48 +6480,38 @@ pub async fn recording_start(
     // builds (AD-65): a second `Local::now()` below this line could name a folder
     // in the next minute and make the card's promise false by a hair.
     let now = Local::now();
-    let title = meta_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned);
+    // The folder-name title is the SAME trimmed value the manifest records, read
+    // back off the block below rather than re-derived: a folder named from one
+    // trim rule and a manifest written from another is a session whose name and
+    // whose title disagree, and nothing on screen would show it.
     // Story 21.5 + 22.3: the optional user metadata, trimmed, with blank entries
     // dropped (a custom row needs a NAME; a blank value is legal) — plus the
     // session's immutable identity, which is why the block is now ALWAYS written.
     // It used to be omitted when the user typed nothing, and an omitted block
     // would mean a session with no id at all.
+    //
+    // Story 45.19: those rules moved into `SessionMeta::from_input`, whole and
+    // unchanged, because the editor on the FINISHED session applies the same
+    // form and had nowhere to read them from. Two copies of "is this field
+    // blank" and "where does one tag end" is how a field starts round-tripping
+    // differently depending on which surface last saved it.
     let session_id = mint_session_id(&data_dir)?;
-    let session_meta = {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        // Story 42.5: one tokenisation, in the tag module, for the one field
-        // whose separator is a comma. What lands in `manifest.json` is still the
-        // user's own text — the canonical form is applied later, by
-        // `RecordingRow::from_manifest`, on the way into the index. The manifest
-        // says what they typed; the row says what it means.
-        let tags = meta_tags
-            .as_deref()
-            .map(keeper_core::notes::tags::split_list)
-            .filter(|list| !list.is_empty());
-        let custom = meta_custom
-            .map(|list| {
-                list.into_iter()
-                    .filter(|f| !f.name.trim().is_empty())
-                    .map(|f| keeper_core::recording::SessionMetaField {
-                        name: f.name.trim().to_owned(),
-                        value: f.value.trim().to_owned(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty());
-        keeper_core::recording::SessionMeta {
-            session_id: Some(session_id.clone()),
-            title: clean(meta_title.clone()),
-            participants: clean(meta_participants),
-            note: clean(meta_note),
-            tags,
-            custom,
-        }
-    };
+    let session_meta = keeper_core::recording::SessionMeta::from_input(
+        Some(session_id.clone()),
+        &keeper_core::recording::SessionMetaInput {
+            title: meta_title.as_deref(),
+            participants: meta_participants.as_deref(),
+            note: meta_note.as_deref(),
+            // Story 42.5: one tokenisation, in the tag module, for the one field
+            // whose separator is a comma. What lands in `manifest.json` is still
+            // the user's own text — the canonical form is applied later, by
+            // `RecordingRow::from_manifest`, on the way into the index. The
+            // manifest says what they typed; the row says what it means.
+            tags: meta_tags.as_deref(),
+            custom: meta_custom.as_deref().unwrap_or(&[]),
+        },
+    );
+    let title = session_meta.title.clone();
     let devices = SessionDevices {
         system_audio,
         // Story 19.3: the mic leg is live — the manifest records whether this
@@ -8590,6 +8619,138 @@ pub async fn recording_retitle(
     let moved = destination.clone();
     tauri::async_runtime::spawn(async move { sync_retitled_session(platform, moved).await });
     Ok(manifest_summary(&destination, &manifest))
+}
+
+/// A finished session's `meta` block, for the two surfaces that open a form on
+/// it (Story 45.19, FR-197): the editor on the last recording, and "record
+/// another like this" on a recording's note.
+///
+/// `Ok(None)` — never an error — for a folder with no loadable `manifest.json`.
+/// A session whose manifest is missing or unparseable is one keeper can say
+/// nothing about, and the two callers want the same thing from that: the editor
+/// stays shut and the duplicate action is absent, rather than either of them
+/// offering a form that would save into nothing. A load failure is not
+/// actionable by the person reading the card — the recording itself is fine —
+/// so it is logged and not raised.
+///
+/// `async` per AD-34-5: the manifest may be on a slow removable volume.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    off_async_runtime(move || -> Option<RecordingSessionMetaVm> {
+        let path = PathBuf::from(folder);
+        match SessionManifest::load(&path) {
+            Ok(manifest) => Some(manifest.meta.unwrap_or_default().to_form_vm()),
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    "recording meta: no loadable manifest, so the session's details cannot be shown"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Rewrite a finished session's metadata from the "Next session" form (Story
+/// 45.19, FR-197) — every field of it EXCEPT the title.
+///
+/// **The title is [`recording_retitle`]'s and stays there.** Setting one MOVES
+/// the session: Story 40.4 re-renders the path template against the session's
+/// own start instant, renames the folder, repoints the kept status snapshot and
+/// the archive row, and refuses a live session by name. Absolutely none of that
+/// is true of participants, note, tags or custom rows, which are a rewrite of
+/// four keys in a file. One editor collects both and sends each field to the one
+/// command that owns it, so neither becomes a second answer to the other.
+///
+/// Refused for a live session ([`recording_session_live_error`]) by the same
+/// compare-and-set claim the retitle uses, and for the same reason: the driver
+/// and the sidecar hold this manifest open, and a rewrite under them would be
+/// overwritten at the next reconcile at best. A folder with no loadable manifest
+/// is refused too — there is nothing to edit, and creating one here would invent
+/// a session out of a directory.
+///
+/// **The archive row is deliberately not rewritten**, exactly as a retitle does
+/// not rewrite it: Story 42.1's row carries a codec and a frame rate that exist
+/// in no manifest, so rebuilding one from what this edit knows would write nulls
+/// over them, and the row is keyed on the identity this edit never touches. The
+/// consequence is honest and bounded — the recordings browser keeps searching
+/// the tags the session was STARTED with until the index is rebuilt from disk
+/// ([`keeper_core::archive::recordings::rebuild_from_disk`]), which reads the
+/// manifests.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_meta_update(
+    state: State<'_, AppState>,
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    // The whole edit goes to the blocking pool as one unit (AD-34-5): a manifest
+    // load and an atomic rewrite, either of which can be on a slow volume.
+    off_async_runtime(move || -> Result<RecordingSessionMetaVm, IpcError> {
+        let path = PathBuf::from(folder);
+        // The claim IS the live check, as in `retitle_session_folder`: `reserve`
+        // reports whether THIS guard inserted the entry, so a folder a live (or
+        // starting) session holds is refused as one indivisible compare-and-set
+        // rather than a `contains` a start could win the instant after it read
+        // `false`. Held across the load and the write, so the orphan-recovery
+        // pass cannot reconcile and rewrite this manifest from under the edit.
+        let claim = LiveFolderReservation::reserve(&reserved, path.clone());
+        if !claim.owned {
+            return Err(recording_session_live_error());
+        }
+        let mut manifest = SessionManifest::load(&path).map_err(|err| to_ipc_error(err.into()))?;
+        manifest.edit_details(&keeper_core::recording::SessionMetaInput {
+            // Not sent, and not defaulted from the form either: `edit_details`
+            // carries the manifest's own title through untouched.
+            title: None,
+            participants: participants.as_deref(),
+            note: note.as_deref(),
+            tags: tags.as_deref(),
+            custom: custom.as_deref().unwrap_or(&[]),
+        });
+        manifest.write().map_err(|err| to_ipc_error(err.into()))?;
+        // Answered from the manifest that was just written, not echoed back from
+        // the request: the editor repaints from this, and the two differ wherever
+        // a rule applied (a trimmed field, a dropped nameless row, a tag line
+        // re-joined from its tokens). Echoing the request would show the user
+        // their own typing and hide what was actually stored.
+        Ok(manifest.meta.unwrap_or_default().to_form_vm())
+    })
+    .await?
+}
+
+/// Mobile stubs for the Story 45.19 commands: recording is a desktop-only
+/// surface, so there is never a session manifest to read or rewrite.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    let _ = folder;
+    Ok(None)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_meta_update(
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let _ = (folder, participants, note, tags, custom);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recording metadata is desktop-only".to_owned(),
+    )))
 }
 
 /// How deep below a retitled session folder the prime walk descends.

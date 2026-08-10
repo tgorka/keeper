@@ -17,24 +17,135 @@
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { TextFileVm } from "@/lib/ipc/client";
+import type { NoteCsvVm, NoteFolderVm, NoteRefVm, NoteRowVm, TextFileVm } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
 
 const syncReadText = vi.fn<(profileId: string, subpath: string) => Promise<TextFileVm>>();
 const syncWriteEntry = vi.fn<(profileId: string, subpath: string, text: string) => Promise<void>>();
+const notesCsvRead = vi.fn<(vaultId: string, target: string) => Promise<NoteCsvVm>>();
+const notesTree = vi.fn<(vaultId: string, relDir: string) => Promise<NoteFolderVm>>();
+const notesResolveLink = vi.fn<(vaultId: string, target: string) => Promise<NoteRefVm | null>>();
+const notesVaultSetActive = vi.fn<(vaultId: string) => Promise<void>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   syncReadText: (profileId: string, subpath: string) => syncReadText(profileId, subpath),
   syncWriteEntry: (profileId: string, subpath: string, text: string) =>
     syncWriteEntry(profileId, subpath, text),
-  notesCsvRead: vi.fn(),
+  notesCsvRead: (vaultId: string, target: string) => notesCsvRead(vaultId, target),
   notesCsvSetCell: vi.fn(),
+  notesTree: (vaultId: string, relDir: string) => notesTree(vaultId, relDir),
+  notesResolveLink: (vaultId: string, target: string) => notesResolveLink(vaultId, target),
+  notesVaultSetActive: (vaultId: string) => notesVaultSetActive(vaultId),
+  // The mirror hydrates itself from this surface now (Story 45.18); a vault
+  // list it cannot read leaves the mirror unhydrated, which is the state every
+  // test below that does NOT seed one is asserting against.
+  notesVaults: vi.fn(async () => []),
+  notesVaultActive: vi.fn(async () => null),
   revealPath: vi.fn(async () => undefined),
   syncOpenEntry: vi.fn(async () => undefined),
 }));
 
+import type { NoteVaultVm } from "@/lib/ipc/client";
+import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
+import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { type ViewerFile, viewerComponentFor } from "@/lib/viewers";
-import { TextFileViewer } from "./text-file-viewer";
+import { TEXT_FILE_NOTICE_SLOT, TextFileViewer } from "./text-file-viewer";
+
+/**
+ * The configured world for a test that needs one (Story 45.18).
+ *
+ * **Two vaults, on two profiles, always.** A one-vault fixture cannot tell a
+ * per-profile filter from an unconditional match — `notePathForFile` would
+ * resolve `profile-2`'s file into `profile-1`'s vault and every assertion here
+ * would still pass.
+ */
+function seedVaults(): void {
+  const vault = (id: string, profileId: string, subfolder: string): NoteVaultVm =>
+    ({
+      id,
+      profileId,
+      name: id,
+      subfolder,
+      root: `/Volumes/${profileId}/${subfolder}`,
+      indexed: true,
+      noteCount: 2,
+      unreadCount: 0,
+      cadence: { commitIdleMs: 1000, pushIntervalMs: 5000, pushOnBlur: true },
+    }) as NoteVaultVm;
+  notesVaultsStore
+    .getState()
+    .setVaults([vault("vault-1", "profile-1", "inbox"), vault("vault-2", "profile-2", "inbox")]);
+  notesVaultsStore.getState().setActiveVaultId("vault-2");
+}
+
+/** A folder listing with more than one note in it, so a mutation that keeps
+ *  only the first — or matches the wrong one — has something to fail against. */
+function folderWith(...notes: Array<{ id: string; path: string }>): NoteFolderVm {
+  return {
+    relDir: "",
+    dirs: [],
+    notes: notes.map(
+      ({ id, path }) =>
+        ({
+          id,
+          path,
+          title: path,
+          snippet: "",
+          tags: [],
+          updatedMs: 0,
+          pinned: false,
+          archived: false,
+          unread: false,
+          conflict: false,
+        }) as unknown as NoteRowVm,
+    ),
+  };
+}
+
+/**
+ * Press the rendered wikilink, retrying until the outcome is observable.
+ *
+ * The retry is not politeness about timing, it is required: the preview is
+ * mounted by an async `import()` and is torn down and rebuilt when the loaded
+ * text arrives, so a node captured from the first mount is detached by the
+ * second and a `mouseDown` on it reaches no handler at all — silently, because
+ * a detached node still accepts events. Re-querying inside the retry is what
+ * makes the press land on the view that is actually on screen.
+ */
+async function pressWikilink(outcome: () => void): Promise<void> {
+  await waitFor(() => {
+    const link = document.querySelector<HTMLElement>("[data-keeper-wikilink]");
+    expect(link, "the preview drew no wikilink").not.toBeNull();
+    fireEvent.mouseDown(link as HTMLElement);
+    outcome();
+  });
+}
+
+/** The notice this surface leaves behind. A `data-slot`, like every other
+ *  named region in this app, so it is read with a selector rather than
+ *  `getByTestId` — which looks for `data-testid` and finds nothing. */
+function noticeText(): string | null {
+  return document.querySelector(`[data-slot="${TEXT_FILE_NOTICE_SLOT}"]`)?.textContent ?? null;
+}
+
+/**
+ * Why 20 s and not `waitFor`'s 5 s default.
+ *
+ * What is being waited for is the editor's lazily imported CodeMirror chunk,
+ * not logic — and under eight concurrent suites that import has been measured
+ * past five seconds, so the default turns a red into a measurement of the box.
+ * Raised deliberately and named: a failure here should mean the press did
+ * nothing, never that the machine was busy.
+ */
+const CHUNK_TIMEOUT_MS = 20_000;
+
+// Applied at FILE scope rather than as a third argument per test. The
+// per-test form was added by a script and it silently missed one, which then
+// failed alone under load and looked like a defect in the code it was testing
+// — the same class of mistake as a file sliced out of another file. A budget
+// that cannot be missed is worth more than one that is precise.
+vi.setConfig({ testTimeout: CHUNK_TIMEOUT_MS });
 
 function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
   return {
@@ -99,6 +210,14 @@ afterAll(() => {
 beforeEach(() => {
   syncReadText.mockReset();
   syncWriteEntry.mockReset();
+  notesCsvRead.mockReset();
+  notesTree.mockReset();
+  notesResolveLink.mockReset();
+  notesVaultSetActive.mockReset();
+  notesVaultSetActive.mockResolvedValue(undefined);
+  resetNotesVaultsStoreForTest();
+  resetPanelsStoreForTest();
+  primaryViewStore.getState().setView("files");
   // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
   document.cookie = "keeper_viewer_modes=; path=/; max-age=0";
 });
@@ -296,17 +415,261 @@ describe("saving goes through Story 45.3's one write path", () => {
   });
 });
 
-describe("the CSV table cannot be reached from a panel yet, and says so", () => {
-  it("opens a CSV as its source and names what is missing", async () => {
-    syncReadText.mockResolvedValue(vm({ text: "name,qty\nwidget,3\n" }));
+describe("the CSV table, now that a panel can resolve its vault (Story 45.18)", () => {
+  it("tables a CSV inside the notes vault, addressed by the vault it resolved to", async () => {
+    // THE INHERITED ASSERTION, CHANGED. Until 45.18 this test pinned the
+    // opposite — a CSV opened from a panel showed its source and a sentence
+    // saying keeper could only table one inside a notes vault — because a panel
+    // held a sync profile id and 44.16's commands want a notes vault id. That
+    // resolution now exists in Rust and is mirrored here, so the same bytes
+    // draw the same table in a panel and in a note.
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "name,qty\nwidget,3\nsprocket,5\n" }));
+    notesCsvRead.mockResolvedValue({
+      relPath: "rows.csv",
+      rev: "rev-1",
+      columns: 2,
+      totalRows: 3,
+      rows: [
+        { index: 0, line: 1, cells: ["name", "qty"], ragged: false },
+        { index: 1, line: 2, cells: ["widget", "3"], ragged: false },
+        { index: 2, line: 3, cells: ["sprocket", "5"], ragged: false },
+      ],
+      notices: [],
+    });
     openThroughTheRegistry(target({ name: "rows.csv", relativePath: "inbox/rows.csv" }));
+    await settle();
+
+    expect(screen.getByRole("tab", { name: "Table" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("alert")).toBeNull();
+    // The CALL, not only the result. A mock that ignores its arguments would
+    // draw this table for `vault-2` and for the whole profile path, and the
+    // rendering would be identical: the file would be read from the wrong
+    // vault, or not found at all, only on a real machine.
+    expect(notesCsvRead).toHaveBeenCalledWith("vault-1", "rows.csv");
+  });
+
+  it("still opens a CSV outside every vault as its source, and says why", async () => {
+    // The other half of the same rule, and the reason the assertion above is
+    // not simply "the table always draws now": a profile that is not a vault,
+    // and a file beside the vault in one that is, both still have no vault
+    // coordinates and must say so rather than draw an empty table.
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "name,qty\nwidget,3\n" }));
+    openThroughTheRegistry(target({ name: "rows.csv", relativePath: "archive/rows.csv" }));
     const editor = await editorHost();
 
-    // Pinned deliberately. A panel holds a sync profile id; 44.16's commands
-    // want a notes vault id; deriving one from the other in the webview is the
-    // path arithmetic AD-65 forbids, and Story 45.18 owns the resolution. When
-    // it lands, this assertion is the one that should change.
     expect(screen.getByRole("alert")).toHaveTextContent("inside a notes vault");
     expect(editor.textContent).toContain("widget");
+    expect(notesCsvRead).not.toHaveBeenCalled();
+  });
+
+  it("does not claim a vault before the vault list has been read", async () => {
+    // `null` is "keeper has not looked", never "you have none". Guessing a
+    // vault here would address 44.16's commands with an id nobody confirmed.
+    syncReadText.mockResolvedValue(vm({ text: "name,qty\nwidget,3\n" }));
+    openThroughTheRegistry(target({ name: "rows.csv", relativePath: "inbox/rows.csv" }));
+    await editorHost();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("inside a notes vault");
+    expect(notesCsvRead).not.toHaveBeenCalled();
+  });
+});
+
+describe("a file knows its note (Story 45.18, FR-196)", () => {
+  it("offers Open in Notes for a markdown file in the vault, and opens the note it names", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# Meeting\n" }));
+    // Two notes in the listing, so a match on the wrong row — or one that keeps
+    // only the first — has something to fail against.
+    notesTree.mockResolvedValue(
+      folderWith(
+        { id: "note-other", path: "daily/other.md" },
+        { id: "note-1", path: "meeting.md" },
+      ),
+    );
+    openThroughTheRegistry(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    // The CALL: the vault it resolved to, and the file's own directory INSIDE
+    // that vault — not the profile-relative one. Passing `inbox/` here would
+    // list a folder that does not exist in the vault and find no note.
+    expect(notesTree).toHaveBeenCalledWith("vault-1", "");
+    // The vault is made active before the target is set, or the notes pane
+    // shows nothing: it only renders the open note while its vault is active.
+    expect(notesVaultSetActive).toHaveBeenCalledWith("vault-1");
+    // And the state: the note is open, BESIDE the file rather than replacing
+    // it, and the Notes tab is showing.
+    const targets = panelsStore.getState().panels.map((panel) => panel.target);
+    expect(targets).toContainEqual({ kind: "note", vaultId: "vault-1", noteId: "note-1" });
+    expect(primaryViewStore.getState().view).toBe("notes");
+  });
+
+  it("offers nothing for a markdown file outside the vault", async () => {
+    // The story's own sentence: absent rather than present-and-failing. A
+    // disabled button, or one that reported "no note" on click, would be the
+    // shape this is written to prevent.
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# Loose\n" }));
+    openThroughTheRegistry(target({ name: "loose.md", relativePath: "archive/loose.md" }));
+    await settle();
+
+    expect(screen.queryByRole("button", { name: "Open in Notes" })).toBeNull();
+  });
+
+  it("offers nothing for a file in the vault that is not markdown", async () => {
+    // An attachment in the vault is not a note, and the registry's own format
+    // is what says so — never the extension (AD-87).
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "a,b\n1,2\n" }));
+    notesCsvRead.mockResolvedValue({
+      relPath: "rows.csv",
+      rev: "r",
+      columns: 2,
+      totalRows: 1,
+      rows: [{ index: 0, line: 1, cells: ["a", "b"], ragged: false }],
+      notices: [],
+    });
+    openThroughTheRegistry(target({ name: "rows.csv", relativePath: "inbox/rows.csv" }));
+    await settle();
+
+    expect(screen.queryByRole("button", { name: "Open in Notes" })).toBeNull();
+  });
+
+  it("says the index has not caught up rather than opening nothing", async () => {
+    // The file is on screen and the vault holds it, so "not found" without a
+    // reason reads as a fault in keeper. It usually is a cold scan in flight.
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# New\n" }));
+    notesTree.mockResolvedValue(folderWith({ id: "note-other", path: "somethingelse.md" }));
+    openThroughTheRegistry(target({ name: "fresh.md", relativePath: "inbox/fresh.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    expect(noticeText()).toContain("fresh.md");
+    expect(primaryViewStore.getState().view).toBe("files");
+  });
+
+  it("refuses to navigate when the vault switch was refused, and says why", async () => {
+    // W2Media's shape: two producers that run one after the other cannot share
+    // one view of the world. `setActiveVault` swallows a rejected
+    // `notes_vault_set_active` into the mirror's error slot and returns
+    // normally, so the later producer — this action reporting success — used to
+    // win. The reader arrived in Notes with no note open, because the pane only
+    // shows one while its vault is active, and with nothing saying why.
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# Meeting\n" }));
+    notesTree.mockResolvedValue(
+      folderWith(
+        { id: "note-other", path: "daily/other.md" },
+        { id: "note-1", path: "meeting.md" },
+      ),
+    );
+    notesVaultSetActive.mockImplementation(async () => {
+      throw { message: "that vault is not open on this device" };
+    });
+    openThroughTheRegistry(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    expect(noticeText()).toContain("that vault is not open on this device");
+    // And nothing moved: being left where you are with a reason beats being
+    // moved somewhere empty.
+    expect(primaryViewStore.getState().view).toBe("files");
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).not.toContainEqual({
+      kind: "note",
+      vaultId: "vault-1",
+      noteId: "note-1",
+    });
+  });
+
+  it("shows Rust's own words when the vault listing is refused", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# New\n" }));
+    notesTree.mockRejectedValue({ message: "that vault is not open" });
+    openThroughTheRegistry(target({ name: "fresh.md", relativePath: "inbox/fresh.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    expect(noticeText()).toContain("that vault is not open");
+  });
+
+  /**
+   * The SECOND host of the decoration layer, which is the whole reason these
+   * tests are here and not only in the note editor's suite.
+   *
+   * A `.md` file opened from Files renders through the same `livePreview` the
+   * editor mounts, so every link in it had the same `cursor: pointer` over the
+   * same dead text — and a branch reachable only from the second host cannot be
+   * reached by tests that all route through the first.
+   */
+  it("follows a wikilink written in a vault file, opening the note beside it", async () => {
+    seedVaults();
+    // Line 2, not line 1: the caret sits at offset 0 and `livePreview` gives
+    // the caret's own line its source back, so a wikilink on the first line
+    // renders as `[[Meeting]]` text with no decoration and no attribute.
+    syncReadText.mockResolvedValue(
+      vm({
+        text: "# Index\n\nsee [[Meeting]] for the rest\n\n\nand a last line the caret can sit on, so the link above is\nnever the caret's own line.\n",
+      }),
+    );
+    notesResolveLink.mockResolvedValue({
+      vaultId: "vault-1",
+      id: "note-7",
+      path: "meeting.md",
+      title: "Meeting",
+    });
+    // The panel the real host would already be holding. Without it the store
+    // has one empty panel, `openPanel` fills it rather than appending, and the
+    // test would prove the opposite of "beside".
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "profile-1", relativePath: "inbox/index.md" });
+    openThroughTheRegistry(target({ name: "index.md", relativePath: "inbox/index.md" }));
+    await settle();
+
+    // The CALL: the vault this FILE resolved to, and the link's raw text. A
+    // resolver handed the empty vault id would answer for no vault at all, and
+    // the rendering would be identical.
+    await pressWikilink(() => {
+      expect(notesResolveLink).toHaveBeenCalledWith("vault-1", "Meeting");
+    });
+    await settle();
+    const targets = panelsStore.getState().panels.map((panel) => panel.target);
+    expect(targets).toContainEqual({ kind: "note", vaultId: "vault-1", noteId: "note-7" });
+    // Beside, not instead: the file panel is still open behind it.
+    expect(targets).toContainEqual({
+      kind: "file",
+      profileId: "profile-1",
+      relativePath: "inbox/index.md",
+    });
+  });
+
+  it("says a wikilink in a file outside every vault cannot be looked up", async () => {
+    // Not silence, and not a lookup against an empty vault id: the file has no
+    // vault, and that is the fact the reader needs.
+    seedVaults();
+    syncReadText.mockResolvedValue(
+      vm({
+        text: "# Loose\n\nsee [[Meeting]] for the rest\n\n\nand a last line the caret can sit on, so the link above is\nnever the caret's own line.\n",
+      }),
+    );
+    openThroughTheRegistry(target({ name: "loose.md", relativePath: "archive/loose.md" }));
+    await settle();
+
+    await pressWikilink(() => {
+      expect(noticeText()).toContain("not inside a notes vault");
+    });
+
+    expect(notesResolveLink).not.toHaveBeenCalled();
   });
 });

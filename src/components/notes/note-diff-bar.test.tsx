@@ -26,6 +26,7 @@ function openClean(): void {
   applyBodyBatch({
     kind: "reset",
     rev: "rev-1",
+    path: "notes/opened.md",
     frontmatter: BLOCK,
     text: OPENED,
     cursor: null,

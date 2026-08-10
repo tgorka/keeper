@@ -1,36 +1,24 @@
 /**
  * The "Next session" metadata card (Story 21.5, FR-71/AD-33).
  *
- * Three optional free-text fields — Title, Participants, Note — describing the
- * NEXT Recording Session only: Start consumes them into the session manifest
- * (`meta` + a title-prefixed folder name) and clears the form; "Use previous"
- * re-fills the just-consumed values for the back-to-back-meetings case.
- * Everything stays local (manifest only — zero egress); leaving the card empty
- * changes nothing about the classic session naming.
+ * The five optional fields — Title, Participants, Note, Tags, custom rows —
+ * describing the NEXT Recording Session only: Start consumes them into the
+ * session manifest (`meta` + a title-prefixed folder name) and clears the form;
+ * "Use previous" re-fills the just-consumed values for the back-to-back-meetings
+ * case. Everything stays local (manifest only — zero egress); leaving the card
+ * empty changes nothing about the classic session naming.
+ *
+ * The fields themselves live in {@link RecordingMetaFieldSet} since Story 45.19,
+ * because the editor on the FINISHED session collects the same five and a
+ * second rendering of them would drift from this one field by field.
  */
-import { Plus, X } from "lucide-react";
-import { TagVocabularyInput } from "@/components/tags/tag-vocabulary-input";
+import { RecordingMetaFieldSet } from "@/components/recording/recording-meta-fields";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { useRecordingMeta } from "@/lib/stores/recording-meta";
 
 /** The card's heading (recording voice: sentence case). */
 export const META_CARD_TITLE = "Next session";
-
-/** Field labels (recording voice). */
-export const META_TITLE_LABEL = "Title";
-export const META_PARTICIPANTS_LABEL = "Participants";
-export const META_NOTE_LABEL = "Program / session note";
-
-/** The tags field label (Story 22.3). The user types comma-separated text;
- *  Story 42.5 moved the decision about what that text MEANS into Rust, and
- *  gave the field completion over the shared tag vocabulary. */
-export const META_TAGS_LABEL = "Tags";
-
-/** The add-custom-field affordance's label (Story 22.3). */
-export const META_ADD_FIELD_LABEL = "Add field";
 
 /** The one-click re-fill affordance's label. */
 export const META_REFILL_LABEL = "Use previous";
@@ -38,6 +26,10 @@ export const META_REFILL_LABEL = "Use previous";
 /** Honest scope note: local manifest only, describes only the next session. */
 export const META_LOCAL_NOTE =
   "Saved into the recording's local manifest only. Applies to the next Recording Session.";
+
+/** The id prefix this host mints its fields under. Unchanged from Story 21.5
+ *  so the pre-Start form's element ids are the ones they have always been. */
+const META_FIELD_PREFIX = "recording-meta";
 
 export function RecordingMetaCard() {
   const fields = useRecordingMeta((s) => s.fields);
@@ -58,111 +50,7 @@ export function RecordingMetaCard() {
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="recording-meta-title">{META_TITLE_LABEL}</Label>
-          <Input
-            id="recording-meta-title"
-            value={fields.title}
-            placeholder="e.g. Weekly sync"
-            onChange={(event) => setFields({ title: event.target.value })}
-          />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="recording-meta-participants">{META_PARTICIPANTS_LABEL}</Label>
-          <Input
-            id="recording-meta-participants"
-            value={fields.participants}
-            placeholder="e.g. Ala, Tomek"
-            onChange={(event) => setFields({ participants: event.target.value })}
-          />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="recording-meta-note">{META_NOTE_LABEL}</Label>
-          <Input
-            id="recording-meta-note"
-            value={fields.note}
-            placeholder="e.g. Zoom demo session"
-            onChange={(event) => setFields({ note: event.target.value })}
-          />
-        </div>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="recording-meta-tags">{META_TAGS_LABEL}</Label>
-          {/* Story 42.5: completion over the ONE tag vocabulary — the same
-              paths the notes tag tree is built from, so a tag that exists only
-              on notes is offered here. The field still takes comma-separated
-              text, but it no longer decides what a tag is: the raw string goes
-              to Rust, which splits and normalises it in the one place that
-              rule lives. */}
-          <TagVocabularyInput
-            id="recording-meta-tags"
-            value={fields.tags}
-            placeholder="e.g. standup, q3, demo (comma-separated)"
-            onChange={(tags) => setFields({ tags })}
-          />
-        </div>
-        {/* Story 22.3: repeatable custom name/value rows. Rows with a blank
-            name are dropped on Start; the X removes a row immediately. */}
-        {fields.custom.map((row, index) => (
-          <div
-            // Index keying is safe: rows are positional edit slots, never
-            // reordered.
-            // biome-ignore lint/suspicious/noArrayIndexKey: positional slots
-            key={index}
-            className="flex items-end gap-2"
-          >
-            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-              <Label htmlFor={`recording-meta-custom-name-${index}`}>Name</Label>
-              <Input
-                id={`recording-meta-custom-name-${index}`}
-                value={row.name}
-                placeholder="e.g. Ticket"
-                onChange={(event) => {
-                  const custom = fields.custom.map((r, i) =>
-                    i === index ? { ...r, name: event.target.value } : r,
-                  );
-                  setFields({ custom });
-                }}
-              />
-            </div>
-            <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-              <Label htmlFor={`recording-meta-custom-value-${index}`}>Value</Label>
-              <Input
-                id={`recording-meta-custom-value-${index}`}
-                value={row.value}
-                placeholder="e.g. KPR-123"
-                onChange={(event) => {
-                  const custom = fields.custom.map((r, i) =>
-                    i === index ? { ...r, value: event.target.value } : r,
-                  );
-                  setFields({ custom });
-                }}
-              />
-            </div>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              aria-label={`Remove field ${index + 1}`}
-              onClick={() => {
-                setFields({ custom: fields.custom.filter((_, i) => i !== index) });
-              }}
-            >
-              <X className="size-4" aria-hidden="true" />
-            </Button>
-          </div>
-        ))}
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="w-fit gap-1"
-          onClick={() => {
-            setFields({ custom: [...fields.custom, { name: "", value: "" }] });
-          }}
-        >
-          <Plus className="size-4" aria-hidden="true" />
-          {META_ADD_FIELD_LABEL}
-        </Button>
+        <RecordingMetaFieldSet fields={fields} onChange={setFields} idPrefix={META_FIELD_PREFIX} />
         <p className="text-muted-foreground text-xs">{META_LOCAL_NOTE}</p>
       </CardContent>
     </Card>

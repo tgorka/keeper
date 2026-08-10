@@ -13,6 +13,7 @@ import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
+import type { ExportReceiptVm } from "./gen/ExportReceiptVm";
 import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
@@ -42,6 +43,8 @@ export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
 export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
+export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
+export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
@@ -63,6 +66,7 @@ export type { EncryptionStatus } from "./gen/EncryptionStatus";
 export type { EncryptionStatusBatch } from "./gen/EncryptionStatusBatch";
 export type { ExportPhase } from "./gen/ExportPhase";
 export type { ExportProgressVm } from "./gen/ExportProgressVm";
+export type { ExportReceiptVm } from "./gen/ExportReceiptVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
 export type { FileSizeVm } from "./gen/FileSizeVm";
@@ -109,6 +113,7 @@ export type { NoteCreateReq } from "./gen/NoteCreateReq";
 export type { NoteCreateVm } from "./gen/NoteCreateVm";
 export type { NoteCsvRowVm } from "./gen/NoteCsvRowVm";
 export type { NoteCsvVm } from "./gen/NoteCsvVm";
+export type { NoteDeletePlanVm } from "./gen/NoteDeletePlanVm";
 export type { NoteDiffVm } from "./gen/NoteDiffVm";
 export type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 export type { NoteFlag } from "./gen/NoteFlag";
@@ -246,6 +251,8 @@ import type { BridgeLoginInput } from "./gen/BridgeLoginInput";
 import type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
+import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
+import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
 import type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
@@ -271,6 +278,7 @@ import type { NoteConflictVm } from "./gen/NoteConflictVm";
 import type { NoteCreateReq } from "./gen/NoteCreateReq";
 import type { NoteCreateVm } from "./gen/NoteCreateVm";
 import type { NoteCsvVm } from "./gen/NoteCsvVm";
+import type { NoteDeletePlanVm } from "./gen/NoteDeletePlanVm";
 import type { NoteDiffVm } from "./gen/NoteDiffVm";
 import type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 import type { NoteFlag } from "./gen/NoteFlag";
@@ -2272,6 +2280,95 @@ export async function recordingRetitle(
 }
 
 /**
+ * One custom name/value row of a session's metadata (Story 22.3) — the twin of
+ * the Rust `keeper_core::vm::RecordingSessionMetaFieldVm`.
+ */
+export interface RecordingSessionMetaFieldVm {
+  /** The row's user-chosen name. A row with a blank name is dropped on save. */
+  name: string;
+  /** The row's value. Blank is legal — a named row being filled in. */
+  value: string;
+}
+
+/**
+ * A finished session's metadata as the "Next session" form holds it (Story
+ * 45.19, FR-197) — the twin of the Rust
+ * `keeper_core::vm::RecordingSessionMetaVm`.
+ *
+ * Every field is a plain string, `""` where the manifest has nothing: a form
+ * field has one empty state, and Rust collapses "absent" into it once so no
+ * surface has to. `tags` is the single comma-separated line the field holds,
+ * joined in Rust by the inverse of the split that produced it, so opening the
+ * editor and saving it unchanged is a fixed point.
+ */
+export interface RecordingSessionMetaVm {
+  /** The session's title, `""` when it has none. */
+  title: string;
+  /** Who the recording is with, `""` when unset. */
+  participants: string;
+  /** The program/session note, `""` when unset. */
+  note: string;
+  /** The tags as one comma-separated line, `""` when there are none. */
+  tags: string;
+  /** The repeatable custom rows, in the order the manifest holds them. */
+  custom: RecordingSessionMetaFieldVm[];
+}
+
+/**
+ * Read a finished session's metadata (Story 45.19, FR-197) — what the editor on
+ * the last recording opens with, and what "record another like this" fills a
+ * fresh Next-session form from.
+ *
+ * `folder` is the session folder as it stands NOW (a Story 40.4 retitle moves
+ * it). Resolves `null` — never rejects — for a folder with no loadable
+ * `manifest.json`: a session keeper cannot read is one it can say nothing
+ * about, and both callers answer that by offering nothing rather than by
+ * opening a form that would save into a file that is not there.
+ */
+export async function recordingSessionMeta(folder: string): Promise<RecordingSessionMetaVm | null> {
+  return await invoke<RecordingSessionMetaVm | null>("recording_session_meta", { folder });
+}
+
+/**
+ * Write a finished session's metadata back to its manifest (Story 45.19,
+ * FR-197) — every field of the "Next session" form EXCEPT the title.
+ *
+ * **The title is {@link recordingRetitle}'s.** Setting one MOVES the session on
+ * disk; participants, note, tags and custom rows move nothing. An editor
+ * collecting both sends each field to the one command that owns it, which is
+ * why this one does not take a title at all rather than taking one and ignoring
+ * it.
+ *
+ * `tags` is the field's text exactly as typed — one comma-separated line, not a
+ * list. Rust splits it in the one place that decides what a tag is (Story 42.5),
+ * so no caller here may pre-split it.
+ *
+ * Resolves the metadata as it was ACTUALLY STORED, which differs from what was
+ * sent wherever a rule applied — a trimmed field, a dropped nameless custom row,
+ * a tag line re-joined from its tokens. Repaint from the answer, never from the
+ * request.
+ *
+ * Rejects with the {@link IpcError} envelope: a session that is still recording
+ * is refused with code `recordingSessionLive` ("stop the recording first" is the
+ * only way out of it), and so is a folder with no loadable manifest.
+ */
+export async function recordingMetaUpdate(
+  folder: string,
+  participants: string,
+  note: string,
+  tags: string,
+  custom: RecordingSessionMetaFieldVm[],
+): Promise<RecordingSessionMetaVm> {
+  return await invoke<RecordingSessionMetaVm>("recording_meta_update", {
+    folder,
+    participants,
+    note,
+    tags,
+    custom,
+  });
+}
+
+/**
  * List the crash-recovered sessions still needing a one-time notice (Story 20.3,
  * FR-73). The Rust core walks the effective recordings destination (Story 40.3 —
  * the path template may nest sessions under it) for a loadable `manifest.json`
@@ -3084,6 +3181,33 @@ export async function syncReadDocument(id: string, subpath: string): Promise<Doc
 }
 
 /**
+ * Copy one file out of a synced folder to a folder the user picked (FR-199,
+ * AD-65, Story 45.21).
+ *
+ * **The destination is the one absolute path this client ever sends**, and it
+ * is the one AD-65 permits: it comes from the OS folder chooser, keeper did not
+ * compose it, and nothing under it is read. The source is still an id plus the
+ * profile-relative `subpath` the listing produced, which Rust re-resolves.
+ *
+ * One file, exactly its bytes. A folder is refused; keeper does not walk a
+ * tree it did not list. A note with its attachments is `notesExport`, not this
+ * — the Files surface addresses a file as a file.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a file that is gone, a folder, a destination that is
+ * missing / is a file / is inside the profile / already holds that name, or a
+ * copy the disk refused). Every message is Rust's own sentence and is shown
+ * verbatim.
+ */
+export async function syncExportEntry(
+  id: string,
+  subpath: string,
+  destination: string,
+): Promise<ExportReceiptVm> {
+  return await invoke<ExportReceiptVm>("sync_export_entry", { id, subpath, destination });
+}
+
+/**
  * Save one file inside a synced folder's notes vault (FR-175, AD-89, AD-65,
  * Story 45.3).
  *
@@ -3493,9 +3617,14 @@ export async function notesVaultFlag(
 }
 
 /**
- * Save one vault's four knobs — subfolder, journal template, default template
- * and sync cadence (FR-120). Cadence values below the engine's floors are
- * clamped in Rust, so the returned VM is what is actually in force.
+ * Save one vault's knobs — subfolder, journal template, default template,
+ * quick-capture template, quick-capture tag and sync cadence (FR-120, FR-193).
+ * Cadence values below the engine's floors are clamped in Rust and the capture
+ * tag is folded to its canonical form there, so the returned VM is what is
+ * actually in force rather than what was sent.
+ *
+ * An absent field means "not expressed" and leaves the stored value alone; an
+ * empty string clears one.
  *
  * Rejects with: `invalidInput`, `unsupported`, `internal`.
  */
@@ -3504,6 +3633,27 @@ export async function notesVaultSettingsSave(
   settings: NoteVaultSettingsReq,
 ): Promise<NoteVaultVm> {
   return await invoke<NoteVaultVm>("notes_vault_settings_save", { vaultId, settings });
+}
+
+/**
+ * What setting `tag` as the quick-capture tag would cost this vault: one
+ * finished sentence per space that lists captures today and would stop
+ * (FR-193). An empty array means nothing is displaced.
+ *
+ * A preview — it takes the tag the form is holding, not the one on disk, so the
+ * answer arrives before Save. Pass `null` to ask about no tag at all, which is
+ * always an empty answer and is what makes the control's "off" state honest.
+ *
+ * The sentences are composed in Rust by running each space's own stored query
+ * over the note a capture would write. Nothing here parses a query, and no
+ * surface hardcodes a claim about Inbox: a vault whose Inbox has been edited,
+ * or one whose spaces are all hand-written, gets the truth about itself
+ * (AD-55, AD-58).
+ *
+ * Rejects with: `notesVaultUnknown`, `internal`.
+ */
+export async function notesCaptureImpact(vaultId: string, tag: string | null): Promise<string[]> {
+  return await invoke<string[]>("notes_capture_impact", { vaultId, tag });
 }
 
 /**
@@ -3857,6 +4007,23 @@ export async function notesSetOrder(
 }
 
 /**
+ * What deleting this note or space would remove, in Rust's own words (Story
+ * 45.17, FR-195).
+ *
+ * A separate call from {@link notesDelete} for the same reason the Files pane
+ * plans separately from deleting: the sentences are composed by code that knows
+ * what the removal does, so a confirmation cannot promise something the command
+ * will not do. Nothing is deleted by asking.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal` — including when the
+ * note cannot be read, because a confirmation keeper cannot compose honestly is
+ * one it must not show.
+ */
+export async function notesDeletePlan(vaultId: string, noteId: string): Promise<NoteDeletePlanVm> {
+  return await invoke<NoteDeletePlanVm>("notes_delete_plan", { vaultId, noteId });
+}
+
+/**
  * Move a note to `.keeper/trash/` and stage the removal (NFR-30). Never an
  * unlink — a delete keeper cannot undo is a delete keeper should not offer.
  *
@@ -3894,6 +4061,27 @@ export async function notesLinkTargets(
   prefix: string,
 ): Promise<NoteLinkTargetVm[]> {
   return await invoke<NoteLinkTargetVm[]>("notes_link_targets", { vaultId, prefix });
+}
+
+/**
+ * The note one wikilink target names, or `null` when nothing answers to it
+ * (Story 45.18, FR-196, FR-108).
+ *
+ * Not {@link notesLinkTargets} filtered down to an exact match. That command is
+ * a substring search built for a completion popup; this one is the index's own
+ * resolver, which answers to a note's id, its vault-relative path, that path
+ * without the `.md`, its filename stem and its title, and breaks a tie by path
+ * order. It is the same resolver the backlink map is built from, which is the
+ * point: a follower that disagreed with it would open one note and leave the
+ * link showing in another's backlinks.
+ *
+ * `null` is an ordinary answer, not a failure: a link to a note nobody has
+ * written yet is a normal thing to find in a vault.
+ *
+ * Rejects with: `unsupported`, `internal` (no such vault).
+ */
+export async function notesResolveLink(vaultId: string, target: string): Promise<NoteRefVm | null> {
+  return await invoke<NoteRefVm | null>("notes_resolve_link", { vaultId, target });
 }
 
 /**
@@ -4224,36 +4412,37 @@ export async function notesEmbedWrite(
 }
 
 /**
- * The persisted quick-capture buffer (FR-101). Durable registry storage, not the
- * vault and not the index — a capture buffer is the one thing in this phase that
- * is not disposable, so it survives dismissal, a crash and a reboot.
+ * The note this quick-capture window is holding, creating it when there is none
+ * (FR-101, FR-190, AD-93; Story 45.14).
  *
- * Rejects with: `unsupported`, `internal`.
- */
-export async function notesCaptureBuffer(): Promise<string> {
-  return await invoke<string>("notes_capture_buffer");
-}
-
-/**
- * Persist the capture buffer. Debounced by the caller; cleared by exactly one
- * event, a write acknowledgement.
+ * Quick capture mounts the real note editor, so the thing it edits has to be a
+ * real note before the first keystroke: a tag is frontmatter on a note and an
+ * attachment is a file copied relative to a note's path, and neither can be
+ * applied to a string in a settings table. This replaced the three
+ * `notes_capture_buffer*` commands and the durable text they mirrored — the
+ * note file is now the durable thing, which is strictly more durable than a
+ * debounced settings row.
  *
- * Rejects with: `unsupported`, `internal`.
- */
-export async function notesCaptureBufferSave(text: string): Promise<void> {
-  await invoke<void>("notes_capture_buffer_save", { text });
-}
-
-/**
- * Write the captured text into the active vault as an ordinary note and clear
- * the buffer (FR-101).
+ * Idempotent by design and called off the critical path. Rust hands back the
+ * SAME note for as long as nobody has written in it, so summoning the panel and
+ * dismissing it without typing never leaves a note behind; the first thought
+ * typed into a page tears it off, and the next call creates a fresh one.
  *
- * Rejects with: `invalidInput` (no vault flagged), `unsupported`, `internal` —
- * and a rejection is what keeps the panel open with the text intact, because the
- * one thing capture may never do is swallow words.
+ * `key` names the window (Story 45.15) — never a global slot, because two
+ * capture windows sharing one draft pointer would each hold the other's note.
+ * Build it with `captureKey`; never by hand.
+ *
+ * `notices` is 44.6's channel and is rendered by the capture window: a capture
+ * whose configured template could not be read is still a capture, and the
+ * sentence saying so used to be discarded because the old commit path had
+ * nowhere to show it.
+ *
+ * Rejects with: `invalidInput` (no vault flagged — there is nowhere to put a
+ * thought and the window says so instead of taking keystrokes it cannot keep),
+ * `unsupported`, `internal`.
  */
-export async function notesCaptureCommit(text: string): Promise<NoteRefVm> {
-  return await invoke<NoteRefVm>("notes_capture_commit", { text });
+export async function notesCaptureDraft(key: string): Promise<NoteCreateVm> {
+  return await invoke<NoteCreateVm>("notes_capture_draft", { key });
 }
 
 /**
@@ -4311,19 +4500,77 @@ export async function notesCaptureShow(): Promise<void> {
 }
 
 /**
- * Hide the quick-capture panel. `commit` true is the Escape contract — write the
- * buffer, clear it, hide, and answer with the note written; `commit` false hides
- * and leaves the buffer intact.
+ * Hide the quick-capture panel (FR-101, AD-60). Desktop only.
  *
- * Resolves with `null` when nothing was written: an empty buffer (keeper never
- * creates an empty note) or no vault flagged (the text stays durable in the
- * buffer, per FR-101). Neither is an error. A write that FAILS rejects, and the
- * panel must then stay open with the text untouched.
+ * Hide, and nothing else. It used to take `commit: boolean` and write a note
+ * out of the panel's text buffer; since Story 45.14 the panel holds a real note
+ * that autosaves as it is typed, so by the time anything asks for a hide the
+ * words are already on disk and there is nothing left for a flag to mean. The
+ * caller flushes the editor's pending save first — dismissal is a force-flush
+ * point (AD-62) — and then asks for this.
  *
  * Rejects with: `unsupported` (non-desktop), `internal`.
  */
-export async function notesCaptureHide(commit: boolean): Promise<NoteRefVm | null> {
-  return await invoke<NoteRefVm | null>("notes_capture_hide", { commit });
+export async function notesCaptureHide(): Promise<void> {
+  await invoke<void>("notes_capture_hide");
+}
+
+/**
+ * Open — or raise — the capture window holding `target` (Story 45.15, FR-191).
+ * Desktop only.
+ *
+ * The command behind "any note opens as a capture window". Idempotent by
+ * identity: asking twice for the same note raises the window that is already
+ * there, because Rust derives the window's label from the target rather than
+ * handing one out from a counter.
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureOpen(target: CaptureTargetVm): Promise<void> {
+  await invoke<void>("notes_capture_open", { target });
+}
+
+/**
+ * Close the capture window `key` (Story 45.15, FR-191). Desktop only.
+ *
+ * What "close" means is Rust's decision and deliberately not this call's: the
+ * prewarmed window is hidden so the next hotkey press is still instant
+ * (NFR-27), any other window is destroyed, and the main window is raised if
+ * nothing else is left on screen. The window's position is written down on the
+ * way out.
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureClose(key: string): Promise<void> {
+  await invoke<void>("notes_capture_close", { key });
+}
+
+/**
+ * Lock or unlock the capture window `key` (Story 45.15, FR-192). Desktop only.
+ *
+ * Locked is keeper's placement and a window the user cannot move; unlocked is
+ * the user's and a window they can drag. Either transition snapshots where the
+ * window is right now, so unlocking and never dragging still remembers, and
+ * locking after a drag keeps the place rather than discarding it.
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureSetLocked(key: string, locked: boolean): Promise<void> {
+  await invoke<void>("notes_capture_set_locked", { key, locked });
+}
+
+/**
+ * Every capture window open right now (Story 45.15, FR-191).
+ *
+ * One command for two readers: the main window renders the list, and a capture
+ * window finds its own row in it by key. Resolves with an empty list rather
+ * than rejecting where capture cannot exist — "which windows are open?" has a
+ * true answer on a phone, and it is "none".
+ *
+ * Rejects with: `internal`.
+ */
+export async function notesCaptureWindows(): Promise<CaptureWindowVm[]> {
+  return await invoke<CaptureWindowVm[]>("notes_capture_windows");
 }
 
 /**
@@ -4337,6 +4584,36 @@ export async function notesCaptureHide(commit: boolean): Promise<NoteRefVm | nul
  */
 export async function notesReveal(vaultId: string, noteId: string): Promise<void> {
   await invoke<void>("notes_reveal", { vaultId, noteId });
+}
+
+/**
+ * Copy a note, and every file it shows, to a folder the user picked (FR-199,
+ * Story 45.21). Desktop only.
+ *
+ * **The note's bytes are copied unchanged.** Its embedded files are copied to
+ * the same vault-relative paths beneath a new folder named after the note, so
+ * `![[attachments/photo.png]]` still resolves without a byte of the note being
+ * rewritten. The exported markdown can be diffed against the vault's copy and
+ * comes out identical, which an export with rewritten links could not.
+ *
+ * **This reads the note from disk, not from the editor's buffer** — Rust cannot
+ * see a buffer that has not been saved. The Export control flushes first; a
+ * caller that does not is exporting whatever the last autosave wrote.
+ *
+ * The receipt names what did NOT go as well as what did: an embed whose file
+ * has moved, and an embedded note, which is deliberately not followed. Neither
+ * is a rejection — the export happens and the sentence says what is missing.
+ *
+ * Rejects with: `unsupported`, `internal` (no such vault, no such note, an
+ * unreadable note, a destination that is missing / is a file / is inside the
+ * vault / already holds that name, or a copy the disk refused).
+ */
+export async function notesExport(
+  vaultId: string,
+  noteId: string,
+  destination: string,
+): Promise<ExportReceiptVm> {
+  return await invoke<ExportReceiptVm>("notes_export", { vaultId, noteId, destination });
 }
 
 /**
@@ -4371,6 +4648,16 @@ export const NOTES_SHOW_UNREAD_EVENT = "keeper://notes-show-unread";
 export const NOTES_CAPTURE_SHOWN_EVENT = "keeper://notes-capture-shown";
 
 /**
+ * The Tauri event the shell emits whenever the set of capture windows changes
+ * (Story 45.15, FR-191) — one opened, one closed, one locked or unlocked.
+ *
+ * Payload-free by convention: a list sent with the event would be a list that
+ * was true when it was sent, and a listener that trusted it would render a
+ * window somebody had just closed. The listener asks.
+ */
+export const NOTES_CAPTURE_WINDOWS_EVENT = "keeper://notes-capture-windows";
+
+/**
  * Subscribe to the tray's open-a-note event. Resolves with an unlisten function;
  * registering is best-effort and graceful outside a Tauri webview (jsdom in
  * tests), so a failure leaves the bridge inert rather than crashing the shell.
@@ -4394,5 +4681,12 @@ export async function listenNotesShowUnread(
 export async function listenNotesCaptureShown(onShown: () => void): Promise<() => void> {
   return await listen<null>(NOTES_CAPTURE_SHOWN_EVENT, () => {
     onShown();
+  });
+}
+
+/** Subscribe to the capture-windows-changed event (payload-free). */
+export async function listenNotesCaptureWindows(onChanged: () => void): Promise<() => void> {
+  return await listen<null>(NOTES_CAPTURE_WINDOWS_EVENT, () => {
+    onChanged();
   });
 }

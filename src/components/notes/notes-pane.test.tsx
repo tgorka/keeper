@@ -36,6 +36,10 @@ const VAULT_A: NoteVaultVm = {
   indexed: true,
   noteCount: 3,
   unreadCount: 1,
+  // Story 45.16 added both to `NoteVaultVm`. `null` is the shipped default and
+  // the one this suite means: no capture template, no capture tag.
+  captureTemplate: null,
+  captureTag: null,
   cadence: { commitIdleMs: 2000, pushIntervalMs: 30000, pushOnBlur: true },
 };
 
@@ -291,6 +295,12 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     notesMarkRead: vi.fn(async () => undefined),
     notesReveal: vi.fn(async () => undefined),
     notesDelete: vi.fn(async () => undefined),
+    notesDeletePlan: vi.fn(async (_vaultId: string, noteId: string) => ({
+      path: `${noteId}.md`,
+      question: `Delete "${noteId}"?`,
+      consequence: `keeper removes ${noteId}.md from this vault.`,
+      recovery: "keeper moves it into the vault's trash.",
+    })),
     notesSpaceSave: vi.fn(async () => ({
       vaultId: "vault-a",
       id: "space-1",
@@ -300,6 +310,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
+import { NOTE_DELETE_CANCEL, NOTE_DELETE_CONFIRM } from "@/components/notes/note-delete-dialog";
 import {
   NEW_NOTE_LABEL,
   NOTES_COUNT_SLOT,
@@ -308,7 +319,7 @@ import {
 } from "@/components/notes/notes-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WINDOW_ROW_ATTR } from "@/components/ui/window-list";
-import { notesCreate } from "@/lib/ipc/client";
+import { notesCreate, notesDelete, notesDeletePlan } from "@/lib/ipc/client";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
@@ -816,5 +827,57 @@ describe("NotesPane — new note", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeDisabled();
     });
+  });
+});
+
+/**
+ * Story 45.17's third door.
+ *
+ * The editor's menu and the sidebar's space rows are the other two, and both
+ * are tested where they live. This one is the list's `Delete` key, and it needs
+ * its own tests for the reason the whole wave has been re-learning: a rule with
+ * many tests that all enter through one door is untested at every other door.
+ */
+describe("NotesPane — deleting from the list", () => {
+  it("asks about the row under the cursor, and deletes nothing until it is told to", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Standup");
+
+    // Cursor onto the SECOND row, so "it deleted something" and "it deleted
+    // the note you were looking at" cannot be the same assertion.
+    const list = screen.getByRole("button", { name: /Note, Pricing/ });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "Delete" });
+
+    await waitFor(() => expect(notesDeletePlan).toHaveBeenCalledWith("vault-a", "a2"));
+    expect(await screen.findByText('Delete "a2"?')).toBeInTheDocument();
+    expect(notesDelete).not.toHaveBeenCalled();
+  });
+
+  it("declines without calling the delete, and the row is still listed", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Standup");
+
+    const list = screen.getByRole("button", { name: /Note, Pricing/ });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "Delete" });
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CANCEL }));
+
+    await waitFor(() => expect(screen.queryByText('Delete "a1"?')).not.toBeInTheDocument());
+    expect(notesDelete).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
+  });
+
+  it("deletes the note it named when the confirmation is taken", async () => {
+    renderPane();
+    await waitForRows("Pricing", "Standup");
+
+    const list = screen.getByRole("button", { name: /Note, Pricing/ });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "Delete" });
+    fireEvent.click(await screen.findByRole("button", { name: NOTE_DELETE_CONFIRM }));
+
+    await waitFor(() => expect(notesDelete).toHaveBeenCalledWith("vault-a", "a1"));
   });
 });

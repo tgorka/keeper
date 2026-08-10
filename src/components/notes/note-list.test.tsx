@@ -136,6 +136,42 @@ describe("NoteList affordances", () => {
     expect(onVerb).toHaveBeenNthCalledWith(3, PLAIN, "u");
   });
 
+  /**
+   * Story 45.17: `Delete` and `Backspace` both ASK, on the row under the
+   * cursor and never on the first row.
+   *
+   * Two rows, and the cursor moved to the SECOND, because "it dispatched a
+   * delete" and "it dispatched a delete for the note you were looking at" are
+   * different claims and a one-row list cannot tell them apart. Both spellings
+   * are bound: `Delete` on a full keyboard, `Backspace` on the laptops this
+   * app is used on.
+   */
+  it("asks to delete the row under the cursor, on both spellings of the key", () => {
+    const onVerb = renderList([PLAIN, PINNED]);
+    const list = screen.getByRole("button", { name: /Note, Plain/ });
+
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    fireEvent.keyDown(list, { key: "Delete" });
+    fireEvent.keyDown(list, { key: "Backspace" });
+
+    expect(onVerb).toHaveBeenNthCalledWith(1, PINNED, "d");
+    expect(onVerb).toHaveBeenNthCalledWith(2, PINNED, "d");
+  });
+
+  /**
+   * And with no cursor there is no row to ask about, so the key does nothing —
+   * rather than falling back to the first row, which is how a list deletes a
+   * note nobody was looking at.
+   */
+  it("does nothing on Delete before the cursor has been placed", () => {
+    const onVerb = renderList([PLAIN, PINNED]);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: /Note, Plain/ }), { key: "Delete" });
+
+    expect(onVerb).not.toHaveBeenCalled();
+  });
+
   it("moves the cursor without opening the note; Enter is what opens", () => {
     const onSelect = vi.fn();
     render(

@@ -7,7 +7,8 @@ vi.mock("@/lib/ipc/client", () => ({
   tagsVocabulary: vi.fn(),
 }));
 
-import { META_TAGS_LABEL, RecordingMetaCard } from "@/components/recording/recording-meta-card";
+import { RecordingMetaCard } from "@/components/recording/recording-meta-card";
+import { META_TAGS_LABEL } from "@/components/recording/recording-meta-fields";
 import { tagVocabularyListId } from "@/components/tags/tag-vocabulary-input";
 import { tagsVocabulary } from "@/lib/ipc/client";
 import type { RecordingMetaWire } from "@/lib/stores/recording-meta";

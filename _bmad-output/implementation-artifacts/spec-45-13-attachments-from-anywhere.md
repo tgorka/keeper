@@ -84,10 +84,25 @@ than a promise in a comment, and it is what the byte-for-byte test asserts.
 | A Files-pane multiselection | `AttachToNoteDialog`, opened from the Files header | 45.3's `selection`, filtered to files | `notesBodyWrite` on the chosen note |
 | The attachment panel | `AttachmentsPanel` (43.7) | The note's own `files:` key | `insertAtCursor` |
 
-Into a note or into a quick capture with the same result: the first and third
-write through `NoteEditor.insertAtCursor`, which 45.14 makes quick capture's
-editor too — there is nothing capture-specific to add, which is the point of
-routing them through the same call rather than through a capture-aware branch.
+**"Into a note or into a quick capture, with the same result" — what is actually
+established.** The epic asks for this and it is an acceptance criterion, so it
+is worth being exact rather than triumphant about it.
+
+*Established here:* the picker and the panel both deliver through
+`NoteEditor.insertAtCursor`, and neither they nor `@/lib/notes/attach` contain a
+branch on which window they are in. There is no capture-aware code path to get
+wrong, because there is no capture-aware code path.
+
+*Depends on someone else:* that quick capture mounts the real `NoteEditor` at
+all, which is 45.14's story and was in flight while this was written.
+
+*Never run:* **nothing in 45.13 has ever executed in the quick-capture
+webview.** Every test here mounts the editor in the main window's realm. So
+"the same result" is an argument from the absence of a branch, not a
+measurement — the load-bearing half of the claim, and not the whole of it.
+W3Capture established the fact that makes the argument work (the capture window
+is a separate webview with its own JS realm, so a module singleton is per-realm
+and constrains nothing here); I read that finding rather than reproducing it.
 
 ### A file outside the vault: **copy it in**
 
@@ -341,10 +356,43 @@ offering, exact about writing.
 
 ## Tests, and the mutation table
 
-**Scope, judged by exit code and not the summary line:**
+**The command the acceptance names, first, because that is what a reviewer
+checks:** `bun run test src/components/notes/ src/components/layout/files-pane.test.tsx`.
 
-- `bun run test src/lib/notes/ src/components/notes/attach-entry-points.test.tsx src/components/notes/attachments-panel.test.tsx src/components/layout/files-pane.test.tsx` → **EXIT=0, 118/118**, three consecutive runs.
+Best observed: **EXIT=0, 761/761, zero unhandled errors.** But three consecutive
+repeats gave red / green / red, so it is **not reliably green while the wave is
+live**, and the honest form of that is to name the reds rather than quote the
+one green:
+
+| Red | Owner | Nature |
+| --- | --- | --- |
+| `editor/file-embed.test.tsx` | W2Embeds | known load-dependent `waitFor`, ~1 in 3 |
+| `notes/note-file-links.test.tsx` | W3NoteFile | mid-mutation-sweep on that exact file |
+
+**Zero of this story's symbols appear in any failure across all three runs.**
+Neither red is 45.13's, and neither is a defect — one is load, one is a sibling's
+sweep window. A reviewer running this after the wave settles should see 761/761;
+a reviewer running it during a sweep should not conclude anything from a red
+without grepping for the failing file's owner first.
+
+**What is claimed, at a scope that survived three consecutive repeats and that
+nobody else is editing:**
+
+- `bun run test src/lib/notes/ src/components/notes/attach-entry-points.test.tsx src/components/notes/attachments-panel.test.tsx src/components/layout/files-pane.test.tsx` → **EXIT=0, 124/124**, zero unhandled, zero `export is defined`.
 - `cargo test -p keeper-core --lib notes::attach` → **EXIT=0, 6/6**.
+- `cargo test -p keeper-core --lib` (the WHOLE crate, because this story deletes
+  a field from a shared VM and "my six pass" says nothing about the 1680 that
+  also compile against it) → **EXIT=0, 1686/1686**.
+- Direct consumers — every suite that mounts the real `NoteEditor` whose header
+  gained a button, plus `panel-strip` and `properties-panel` → **EXIT=0,
+  174/174**, three repeats, zero unhandled. Re-confirmed after Main's
+  `withRangeRects` change, which `attachments-panel.test.tsx` consumes.
+
+**And what is deliberately NOT claimed.** A wide run over `src/components/notes/`
++ `src/components/layout/` + `src/lib/` is not a measurement while the wave is
+live: three repeats returned 1806, 1806 and 1815 tests, because siblings landed
+test files between them. *Four runs over three different trees is four
+measurements of nothing* (W2Media). Repeats do not rescue a moving target.
 
 The central test has no expected literal in it: it runs all three entry points
 and compares their results against **each other**, byte for byte. A change to the
@@ -355,8 +403,10 @@ one spelling means.
 for shapes peers hit after their own sweeps were clean (three against the
 class-level test, two against the vector table's opacity, one against the
 silent-drop fix, two against the picker's named cases, three against the
-`flatMap` refactor). **35 in total; one survived its first probe and is the
-subject of its own section below.**
+`flatMap` refactor, three against the picker's payload, four against the
+`sources` and `body` props, three against what the picker SAYS, and two against
+the picker's named answers). **44 in total; ten survived their first probe,
+every one at a seam no sweep line was pointed at.**
 
 The last three probes matter more than the sweep's, and W2Media said why: **a
 mutation list is a list of lines you already thought about.** It cannot reach a
@@ -519,10 +569,154 @@ Attach rather than stopping at the offer, and the mutation is caught by it and
 only it. AD-65 in the direction that matters: the webview hands over the path
 the shell gave it and composes nothing.
 
-Worth stating plainly: this was the **only mutation of the 35 that survived its
-first probe**, and it was found not by the sweep but by re-probing a line a
+Worth stating plainly: this was the **first mutation of 44 to survive its first
+probe**, and it was found not by the sweep but by re-probing a line a
 refactor had touched. A sweep certifies the lines it was pointed at, on the day
 it was run.
+
+### A seam the mocks hid, and the wider rule behind it
+
+W2Media's finding, applied here: their media tests all built a `ViewerFile` by
+hand and asked the registry, so nothing exercised the function that turns a
+listing *into* one — and putting `entry.name` where `relativePath` belonged
+survived their whole sweep.
+
+The same shape lives in a mock's indifference to its arguments.
+`notesAttachSources.mockResolvedValue(…)` returns the same value whatever it is
+called with, so every test above asserts the **result** and none asserts the
+**call**. Three mutations proved it, all survivors on the first probe:
+
+| Mutation | What would ship |
+| --- | --- |
+| `notesAttachSources(vaultId, [])` | the picker resolves nothing and inserts nothing — **silently**, at the entry point in this story's own title |
+| `notesAttachSources("other-vault", paths)` | the file is copied into a different vault; the note embeds a path it cannot resolve, so it renders "not found" on a file keeper just accepted |
+| `notesAttachSources(vaultId, paths.slice(0, 1))` | a five-file selection attaches one, and says it attached one, so nothing reads as wrong |
+
+Closed by `sends the vault and every picked path, not a subset`, which asserts
+the call and then the resulting note text. Two paths in the fixture rather than
+one, deliberately: a mutation keeping only the first would pass on a
+single-file selection.
+
+**The generalisation, and it is the sharpest of the day:** a mock that ignores
+its arguments converts every assertion downstream of it into an assertion about
+the mock. The tests are not wrong, they are testing a different thing than they
+appear to — and the appearance is the problem, because a green suite that
+exercises the payload's *shape* while never checking the payload's *value* reads
+exactly like one that does both.
+
+**W2Media then widened it past mocks, and the wider form is the one that
+matters:** *assert what you handed on, not only what came back.* "Handed on"
+includes a **prop**, a constructor argument, and any struct you build for
+someone else. A mock is the most common instance, not the shape.
+
+Applied to the props this story introduces, four more survivors:
+
+| Mutation | What would ship |
+| --- | --- |
+| `attachablePaths.slice(0, 1)` in the pane | select five, attach one, report one — nothing reads as wrong |
+| `[...sources].slice(0, 1)` in the chooser | the same, one level down |
+| `body=""` handed to the picker | **the duplicate check is blinded**, so the picker writes a second embed of a file the note already shows — the thing this story's title says it refuses, at one of its three entry points |
+| `body={base}` handed to the picker | `base` is what Rust last acknowledged, so a file attached and attached again before the autosave fires slips through — precisely what that prop's doc comment claims to prevent |
+
+Every duplicate test in this story drove the **chooser**, which reads the body
+from disk. The picker reads the live buffer through a prop, and nothing checked
+that the prop carried it. Closed by
+`refuses a file the note already holds, and says so`, which presses the picker
+twice with no save in between; both `body` mutations fail it and only it. The
+two `slice` mutations are closed by multi-item fixtures — see below.
+
+**Main's companion rule, applied to every collection fixture here:** *put at
+least two items in any collection fixture, because a mutation that keeps only
+the first passes every single-item test.* Audited all of them. The shared vector
+table has 23 entries and asserts its own minimum length. The picker's payload
+test picks two paths. The Files-pane test now selects **two files and a folder**,
+so one fixture pins the multiselection promise and the folder rule together. The
+chooser's multiselection tests now assert the call as well as the result.
+
+A fixture that cannot distinguish the right answer from the mutant is a
+decoration, not a test.
+
+### Counting tests per entry point, which is where the last three came from
+
+The shape that tells you *where* to look rather than what to look for: **when
+one behaviour has many tests and they all enter through the same door, the other
+doors are untested no matter how many tests there are.**
+
+This story has three doors and it was written as though that were obvious. The
+count says otherwise. Tabulated after everything above was already fixed:
+
+| Behaviour | Panel | Picker | Chooser |
+| --- | --- | --- | --- |
+| the one embed spelling | ✓ | ✓ | ✓ (the parity test drives all three) |
+| duplicate refused, with a sentence | ✓ (43.7) | **0 → ✓** | ✓ ×3 |
+| multiselection, in order | n/a | ✓ | ✓ ×2 |
+| a copy was made, and said so | n/a | **0 → ✓** | ✓ |
+| Rust's refusal reaches the person | n/a | **0 → ✓** | ✓ |
+| neither path nor reason | n/a | **0 → ✓** | ✓ |
+| no absolute path in the note | n/a | ✓ | ✓ |
+
+Four zeros, all in the picker, all found by counting rather than by mutating.
+Each was then confirmed by a probe that survived, and the blast radius of all
+four is the same sentence: **the picker says nothing.** A file copied onto the
+user's disk with no receipt; a folder refused in silence; a source dropped
+without a word; a duplicate written twice. At the entry point named in this
+story's title.
+
+The picker composes its own clauses from its own code — it does not share the
+chooser's — and every test of an outcome sentence had gone through the chooser.
+The suite looked thorough for those behaviours *because it was, once*.
+
+### Every claim this story makes about another module, checked
+
+W3Chrome's shape, and it is the cheapest audit of the lot: **a doc comment that
+names another module's behaviour is an assertion nobody runs.** Theirs —
+`column-widths.ts` saying it followed the cookie `SidebarProvider` writes — had
+been false since the day it was written, because `SidebarProvider` has never
+been rendered.
+
+This story makes four such claims, three of them load-bearing for the design
+rather than decorative. Checked rather than reasoned about:
+
+| Claim | Where | Verdict |
+| --- | --- | --- |
+| "`recording-embed.ts` resolves by name too, so 'already there' and 'this is that file' cannot come apart" | `attach.rs` module doc | **True** — `recording-embed.ts:158` is `fileName(target.relativePath) === name`. Inherited from 43.7's comment and never previously checked by me; it is the whole justification for the duplicate key being a name rather than a path, so a false one would have invalidated the design and not just the sentence. |
+| "Folded, like `index::link_key` and for its reason" | `attach.rs` | **True** — `link_key` ends `key.trim().to_lowercase()`. |
+| "the same mechanism `keeper_core::size` and `src/lib/file-size.ts` already use" | `attach.ts` | **True** — both load a checked-in vector table; the Rust side by `include_str!`, the TypeScript side by `readFileSync` from the Rust tree. |
+| "`plugin-dialog` … already used by five other surfaces" | `attach-file-button.tsx` | **True, and exactly** — six non-test files import it, one of which is this one. |
+
+`notes_body_write`'s claim to make "the same promises `notes_save` makes, through
+the same three functions" is not in this table because it is not a claim about
+someone else's code: it calls `save_document`, `write_conflict_copy` and
+`write_note` directly, which is checkable by reading the function itself.
+
+### One claim of my own that did not survive being tested
+
+W3Chrome's shape applied to a comment I wrote, with the outcome that is easy to
+skip: not a defect found, a **claim corrected**.
+
+`attaching`'s comment said it is a boolean rather than a captured selection so
+that "a row that disappears on a refresh while the dialog is open cannot be
+attached from a snapshot". True as far as it went, and it implied something
+false: that the selection can change under the open chooser at all.
+
+Tried to test it by selecting a different row with the dialog open. The test
+cannot be written: the chooser is a Radix modal, everything outside it is
+`aria-hidden`, and Testing Library's role query returns **no roles whatsoever**
+while it is mounted. The tree is inert; the click path is structurally
+impossible, not merely untested.
+
+So the live derivation matters for exactly one case — a **background listing
+refresh**, which drops a vanished row out of `selection` (it filters on
+`entry !== null`) and therefore out of `sources`, where a snapshot would still
+be offering it. That case is real and is not drivable with the dialog mounted
+either.
+
+The undrivable test was deleted and the comment now says which case it covers,
+that it was verified by reading rather than by a test, and why no test is
+available. **A comment that overclaims is worse than a missing test**, because
+the next reader budgets for a guarantee that is narrower than advertised — and
+the write-time plan is authoritative regardless, so the worst this can cost is
+an offer Rust then refuses with a sentence.
 
 ### A restore failure worth recording
 

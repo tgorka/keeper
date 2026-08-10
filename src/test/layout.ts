@@ -139,9 +139,29 @@ export function withRangeRects(): () => void {
 
   proto.getClientRects = () => list;
   proto.getBoundingClientRect = () => rect;
+  // The undo restores the PREVIOUS implementation when there was one, and
+  // otherwise leaves this one in place rather than deleting the property.
+  //
+  // Deleting it is what a symmetric teardown would do, and it is wrong here.
+  // CodeMirror measures in an animation frame; a frame still in flight when
+  // `afterAll` runs finds `undefined` and throws out of
+  // `DocView.measureTextSize`, where no `try` in the test can catch it — so it
+  // takes the run's exit code while the summary still prints passes. Whether a
+  // frame is in flight is decided by how busy the box is, which is why it
+  // presented as a suite that was green until eight agents ran at once.
+  //
+  // Leaving the stub costs nothing: vitest isolates per test file (measured
+  // twice with a two-file probe, one of them inverted to confirm the probe was
+  // sensitive), so `Range.prototype` is clean at every file's start and nothing
+  // can inherit this. The undo exists for a file that had a real implementation
+  // to put back, which is the only case where leaving ours would be a lie.
   return () => {
-    proto.getClientRects = hadRects;
-    proto.getBoundingClientRect = hadBox;
+    if (hadRects !== undefined) {
+      proto.getClientRects = hadRects;
+    }
+    if (hadBox !== undefined) {
+      proto.getBoundingClientRect = hadBox;
+    }
   };
 }
 

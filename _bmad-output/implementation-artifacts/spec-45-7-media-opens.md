@@ -181,9 +181,9 @@ the platform will not decode.
       for one track, per 43.6.
 - [x] Reused AD-91's placeholder for the undecodable case, with a named reason per `MediaError` code.
 - [x] Released the element on unmount and on retarget.
-- [x] 33 mutations applied, run and watched to fail (26 in the sweep; 7 more from auditing this
-      code for four shapes peers were bitten by AFTER their own sweeps were clean). Two survived:
-      one a real hole in a test, one a genuinely uncovered seam. Both closed and re-probed.
+- [x] 47 mutations applied, run and watched to fail (26 in the sweep; 21 more from auditing this
+      code for twelve shapes peers were bitten by AFTER their own sweeps were clean). Eight
+      survived, every one at a seam no sweep line pointed at. All closed and re-probed.
 - [x] No new dependency in `package.json` or `Cargo.lock`.
 
 **Acceptance Criteria:**
@@ -191,10 +191,60 @@ the platform will not decode.
   src/components/layout/panel-strip.test.tsx src/components/notes/editor/recording-embed.test.ts
   src/components/notes/editor/recording-transport.test.ts
   src/components/notes/editor/gallery-block.test.ts src/test/no-user-agent-gating.test.ts` —
-  **EXIT=0**, 233 tests over three consecutive repeats, including 44.1's 46 and 43.6's 39 unchanged.
+  **EXIT=0**, 241 tests over three consecutive repeats, with zero unhandled errors, including 44.1's 46 and 43.6's 39 unchanged.
 - `cargo test -p keeper-core --lib file_asset` — **EXIT=0**, 14 tests.
-- `cargo test -p keeper-sync --lib file_serve` — **EXIT=0**, 12 tests.
-- `bunx tsc --noEmit` clean over every file this story touches.
+
+  For a while this was not re-runnable: a sibling story's `keeper-core/src/notes/export.rs` did not
+  compile (`E0106`), and a lib-test build is one unit, so the crate's tests were red for every
+  agent. Rather than restate the old number, the claim was narrowed to what could still be shown —
+  that `file_asset.rs` and its vector table were byte-identical to the committed tree by
+  `git status` — and marked as pending re-run. The crate now builds and **it has been re-run: EXIT=0,
+  14/14.** Recorded because the intermediate state is the interesting one: a green you cannot
+  reproduce is a claim about the past, and saying so costs nothing next to being wrong about the
+  present.
+- `cargo test -p keeper-sync --lib file_serve` — **EXIT=0**, 12 tests, re-verified after the
+  breakage above. It is unaffected *because of* AD-40: `keeper-sync` is deliberately
+  `keeper-core`-free, so a compile error over there cannot reach the crate holding this story's
+  containment rule. An architectural decision taken for dependency hygiene turned out to buy
+  verification independence under concurrent development, which is not why it was made.
+- `bunx tsc --noEmit` clean over every file this story touches; `bunx biome check` clean.
+
+**One acceptance criterion is only partly satisfiable here, and saying so belongs in this section
+rather than only in the proof section at the end.** The story asks that a video "produces a real
+frame rather than transparent black, asserted the way 44.1 asserted it (painted pixels or
+`readyState`, not merely that the element exists)". What is asserted here is **neither** — it is
+`currentTime`, which is the mechanism that *causes* `readyState` to advance.
+
+That is not a shortcut, and it is also not the thing that was asked for. jsdom never fires
+`loadedmetadata`, never raises `readyState` above 0 and decodes nothing, so both named signals are
+values this suite would have to stub before reading — asserting a number the test itself wrote is
+circular and would be worse than asserting nothing. 44.1 hit the same wall and split the same way:
+the prime's POLICY in jsdom, `readyState` 1→2 and 988 lit pixels in a real WKWebView. This story
+inherits the second half rather than reproducing it, and the measurement it inherits was taken on a
+note embed, not a panel.
+
+So the criterion is met in the only place it can be met on this machine, and the half that cannot be
+is a macOS-gate item with a named first check — not a gap discovered later. Story 45.13's rule
+applied to an acceptance criterion: **a boundary stated in conversation does not travel into the
+artifact unless it is written there, and the artifact is what survives.**
+
+**The consumer set, not the filter.** Three of the modules this story edits are SHARED —
+`unknown-viewer.tsx`, `recording-transport.ts` and `components.tsx` — and "my eleven files pass"
+says nothing about the modules that compile against them. Story 45.13's framing: a green filter over
+a shared type is the same shape as a suite with only one door. So every consumer was run:
+
+| Scope | Result |
+|---|---|
+| `src/components/viewers` | EXIT=0, 210 |
+| `src/lib/viewers` | EXIT=0, 80 |
+| `src/components/notes/editor` (the transport's other two consumers) | EXIT=0, 364 |
+| `src/components/layout/panel-strip` + `files-pane` | EXIT=0, 84 |
+| `cargo test -p keeper-core --lib` (whole crate) | EXIT=0, 1686 |
+| `cargo test -p keeper-sync --lib` (whole crate) | EXIT=0, 612 |
+
+Whole crates rather than `--lib file_asset` for the same reason: this story adds a module and a
+`lib.rs` line to each, and a filtered Rust run proves nothing about the 1670 tests that also build
+against them.
 
 ## Design Notes
 
@@ -469,7 +519,196 @@ story were found after it was clean — one absence assertion with no mutation b
 silent-audio-bar fallthrough, two branches of a type that lied, and this seam — and every one came
 from auditing for a SHAPE a peer had just been bitten by, not from extending the sweep.
 
-Story total: **33 mutations, 33 caught** — 26 sweep, 7 audit.
+Running total at this point: 33 mutations, 33 caught. One shape left.
+
+### The payload, not the prose
+
+Story 45.13's last handback, which Main added to the wave's brief: *a mock that ignores its
+arguments converts every assertion downstream of it into an assertion about the mock — a suite that
+checks a payload's SHAPE while never checking its VALUE reads exactly like one that checks both.*
+
+This story mocks almost no IPC, because a media URL is composed synchronously and no command is
+called — which removes the usual form of this hazard rather than earning immunity from it. The same
+shape appeared one layer over: **the two fallbacks assert what the placeholder SAYS and nothing
+asserted what it was HANDED.** Probed: passing `{ ...file, openWith: null }` to either fallback
+survived every test in the file.
+
+That matters most in exactly these two states. Both sentences end "hand it to the application that
+owns it", and for a file this machine cannot decode, or one outside every profile, that button IS
+the remedy — the placeholder would have said so while not offering it, which is worse than saying
+nothing. Two tests now supply a real `openWith` thunk, click the button and assert the CALL rather
+than the rendering. Each fails alone.
+
+Main's companion rule — *put at least two items in any collection fixture, because a mutation that
+keeps only the first passes every single-item test* — was probed against this story's three
+collections. The shared vector table carries twelve entries and asserts its own minimum length; the
+profile list has a two-profile test, which is what makes the `find` → `first` mutation fail; and the
+facts line was probed directly with a `.slice(0, 1)`, caught by three tests. No single-item fixture
+is load-bearing here.
+
+Running total at this point: 35 mutations, 35 caught. One shape left, and it is the one that
+tells you where to look.
+
+### Count the doors, not the tests
+
+Story 45.13's last handback, and the only shape of the seven that names a PLACE rather than a
+pattern: *when one behaviour has many tests and they all enter through the same door, the other
+doors are untested no matter how many tests there are.* A suite's count says nothing about its
+coverage of surfaces.
+
+Counted here. `MediaViewer` has three doors: the registry (`viewerComponentFor`, 24 tests), a direct
+mount (1 test, the non-media guard, which the registry cannot reach), and **the panel**, which is
+the only door a real user comes through — and which had 1 test, added an hour earlier, pinning one
+field of the payload.
+
+So the rest of that payload was probed, and **three more mutations survived**:
+
+| Mutation in `FilePanelBody` | What the user gets |
+|---|---|
+| `openWith: null` | Every viewer loses "Open in default app". The undecodable-media placeholder says "hand it to the application that owns it" and offers no way to — the remedy named and withheld. |
+| `sizeLabel: null` | Story 45.5's whole sentence undone at the panel; the facts line and the placeholder both go quiet about size. |
+| `openWith` aimed at `entry.name` | Open With refuses for every file in a subfolder. Same works-at-the-root failure as the path bug, and reads as a mystery for the same reason. |
+
+Closed by one test that reads the size off the rendered facts line, then drives the element to a
+decode failure and PRESSES the button, asserting `sync_open_entry` was called with the profile id
+and the path the listing produced. All four panel-payload mutations now fail it or its sibling.
+
+It also surfaced a smaller thing worth keeping: the suite's shared `syncOpenEntry` stub returns
+`undefined`, and the placeholder does `.catch()` on what the opener returns — so pressing the button
+raised an unhandled rejection that vitest reported *while still passing the test*. A green run with
+an error in it, which is Main's "judge by exit code, not the summary" from the other direction. The
+stub now resolves.
+
+### A mock removed, and what its absence now asserts
+
+Story 45.13's last sharpening: *you need a mock exactly when the boot path reaches the name, so
+adding one "to be safe" is a lie about what the boot path does.* This file carried a defensive
+`vi.mock("@/lib/ipc/client")`, written when it was created and never questioned. Checked: every test
+passes without it.
+
+It is now gone, and its absence is an assertion. **`MediaViewer` composes its URL synchronously from
+two values it was handed and calls no command at all** — the bytes arrive over a protocol handler,
+not over IPC. That is precisely why it works unchanged in the quick-capture webview, whose
+capability file grants no opener and no dialog, and it was a claim made to another story on the
+strength of reading the registration site. It is now a property this suite enforces. A future test
+that clicks Reveal will reach the real `revealPath` and fail loudly, which is the correct outcome:
+mock it in that test, not for the file, or the property stops being tested.
+
+Running total at this point: 39 mutations, 39 caught. Two shapes left.
+
+### The scheme name exists three times, and all three are pinned
+
+Story 45.19's shape: *if both of your assertions read the same representation, you have one
+assertion* — a struct checked structurally and its bytes checked textually are one witness and one
+thing that will agree with anything. `keeper-file` is a literal in Rust (`file_asset::SCHEME`), in
+TypeScript (`FILE_ASSET_SCHEME`) and in every `url` of the shared vector table. Probed both
+independently: renaming the Rust constant alone fails the Rust suite; renaming the TypeScript
+constant alone fails the TypeScript suite. The vector table is what makes each rename loud, and
+`file_protocol.rs` re-exports the Rust constant rather than spelling a fourth literal, so the
+registration and the grammar cannot disagree. Verified rather than reasoned.
+
+### Two producers, one state slot — the last survivor of the day
+
+Story 45.14's shape, and the sharpest of the seven: **two producers that run one after the other
+cannot share one state slot.** Not a race — a sequence, where the later one succeeds and erases the
+earlier one's failure sentence before a frame is painted, which is indistinguishable from never
+having said anything.
+
+`MediaViewer` has exactly that: `failure` and `intrinsic` are two producers over one `reported`
+object. The code is correct — each writes its own field through a functional update that carries the
+other — but **nothing pinned it, and the probe SURVIVED the whole suite.** A plain
+`setReported({ … })` in either handler reads like perfectly ordinary React and would have erased the
+other producer's work.
+
+Reachable rather than theoretical: both listeners live on the same element, so a volume unplugged
+mid-load raises `error` and can raise `loadedmetadata` in the same task. Whichever handler ran last
+would win, and the reader would get a player that cannot play instead of the sentence naming why —
+which is this story's own headline requirement, defeated by a state update.
+
+Closed with a test that dispatches both events inside one `act` so both handlers run before React
+re-renders. The mutation now fails it and only it.
+
+### Two hollow absences, witnessed — and the seam I did NOT build
+
+Story 45.20's shape: *an absence over a literal is hollow unless something asserts the literal was
+ever in the input.* Two here, both defending FR-145: `expect(document.body.innerHTML).not
+.toContain("/Volumes/merope")` in the viewer, and the same over `/Users/alice/Vault` in the panel.
+**Neither had anything asserting the fixture carried an absolute path at all.** Hollow the fixture to
+`absolutePath: null` and both pass while FR-145 stops being tested. Each now witnesses the literal
+first, and both mutations are caught, each by its own test.
+
+The witness is over the INPUT object and the absence over the OUTPUT DOM, which is the pairing that
+means something: the value was supplied AND did not reach the screen. Two representations here is
+correct rather than the defect Story 45.19 names — theirs were a struct and its own bytes, one
+witness wearing two hats; these are two ends of a journey.
+
+**And the part worth writing down: I did not build the seam, and a test helper would not have been
+one.** Four stories this wave arrived at "owed, not done" against W1Registry's
+`resolveViewerComponent(entry, components)` — a parameter on PRODUCTION code that makes the test's
+honest form the only available one. A shared `expectNoAbsolutePathRendered(file)` helper would look
+like that and would not be: a helper can simply not be called, so it is a convention with a better
+name, which is exactly what Stories 45.17 and 45.20 corrected themselves for claiming.
+
+The real seam for FR-145 is production-side and is not this story's to build: `ViewerFile
+.absolutePath` typed so it cannot reach a render — a branded string only action call sites can
+unwrap, which would make "an absolute path in the DOM" a compile error rather than a test everyone
+must remember to write. That is 45.2's field and a larger change than a media viewer. Recorded as
+owed, with its shape named, rather than discharged with something that resembles it.
+
+### The scheme was named and nothing checked it was wired
+
+Story 45.19's shape, which is the one that reaches furthest: *does this thing NAME something, and
+does anything check the thing it names exists? A reference and a dangling reference are the same
+bytes.*
+
+`file-asset-url.ts` composes `keeper-file://…` and hands it to a `<video src>`. **That names a
+protocol handler, and nothing checked the handler was wired.** Delete the
+`register_asynchronous_uri_scheme_protocol` block from `keeper/src/lib.rs` and the frontend composes
+the same URLs, every TypeScript test passes, `cargo check` is clean — and every image, video, audio
+file and PDF in the Files pane silently fails to load, surfacing as this story's own most honest
+sentence, "keeper could not open …, and the platform did not say why", about a defect that is
+entirely keeper's.
+
+It cannot be caught where it belongs. The shell crate does not build on Linux, so a Rust assertion is
+prose on the machine this was written on. Closed with `src/test/file-scheme-registration.test.ts` —
+Story 45.15's `capture-capability.test.ts` pattern taken verbatim because it is the right one: a
+TypeScript test that reads the Rust source and pins the literals, **covering exactly the half the
+shell owns and this box cannot compile.** Four probes, four caught, each by its own assertion: the
+registration removed, the `mod` declaration dropped, the shell spelling a second scheme literal
+instead of re-exporting the core one, and the core constant drifting from the TypeScript one.
+
+What it does not prove is that Tauri serves a byte — only a running app does that, and that is the
+gate check this spec already names. It proves the declaration exists and that all three spellings of
+the scheme agree.
+
+Measured against Story 45.20's closing standard — *when the checking form and the convenient form
+are the same form, nobody has to remember* — this is the forgettable kind, and honestly so: nothing
+about writing a fourth protocol handler would naturally produce this test. It is in the class where
+the extra assertion is the only witness available, which 45.20 correctly separates from laziness.
+
+Story total: **47 mutations, 47 caught** — 26 sweep, 21 audit, eight survivors found and closed.
+
+### Negative anchors, and one that fired on its own explanation
+
+Story 45.13's closing addition: verify what a story REMOVED as well as what it added, because a
+merge or a sibling's edit restoring a deleted line is silent. Nine negative anchors here — no
+`primeFirstFrame` or `FRAME_PRIME_SECONDS` left in `recording-embed.ts` (two definitions would be
+two policies), no inline `removeAttribute("src")` there (the release must go through the shared
+primitive), no `absolutePath`, `keeper-recording`, `recordingAssetUrl` or `RECORDING_ASSET_SCHEME`
+reachable from the media viewer (FR-145 and AD-74), and no `await` in the URL composer, which is
+total and synchronous and would have started asking someone if one appeared.
+
+Plus the architectural claim this story's own doc comment makes about another module —
+Story 45.20's shape pointed inward: **`recording-transport.ts` imports nothing.** That is the entire
+reason it is a safe home for two facts a React viewer needs, and it is a property a sibling could
+break in one line without any test noticing. Asserted mechanically: zero `import` statements.
+
+**The first run of that check reported a violation, and the violation was this spec's own argument.**
+`keeper-recording` appears in `media-viewer.tsx` — in the module doc, explaining why that scheme is
+NOT used. The query was answered by prose. That is the same failure the whole audit thread has been
+about, in its last available direction: an absence query that fires on a comment explaining the
+absence is exactly as wrong as one that misses the real usage. Both were still wrong about the code.
+The check now strips comments before asking, and all nine pass.
 
 ## What is proved on which machine, and what is not proved anywhere
 
@@ -518,6 +757,15 @@ Linux):
 - **The `Content-Type` a real WKWebView accepts for each extension.** `mime_for`'s table is shared
   with two shipped schemes and is not new here, but `avif`, `flac` and `oga` have never been served
   to a real webview by any of them as far as this story could establish.
+
+  What IS now settled, and was not when this section was first written: that `mime_for` has a
+  Content-Type for **every** extension this scheme serves. That claim lives in a doc comment here
+  and in a `file_protocol.rs` test that only runs on macOS — which is Story 45.20's shape exactly,
+  *a doc comment naming another module's behaviour is an assertion nobody runs*. So it was run by
+  hand on Linux, parsing `VIDEO_EXTENSIONS` / `IMAGE_EXTENSIONS` / `AUDIO_EXTENSIONS` out of
+  `recordings_fts.rs` plus `pdf`, and the match arms out of `note_protocol::mime_for`: nineteen
+  extensions served, nineteen known, **no gap**. Mechanical rather than read, because reading two
+  tables and believing they agree is how they stop agreeing.
 - **What the prime costs on a slow volume**, unchanged from 44.1: still reasoning, not measurement.
   A panel pays it once per open rather than once per note, which is cheaper than the note case, and
   is the same drive touch.

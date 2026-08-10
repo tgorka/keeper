@@ -11,6 +11,7 @@ const recordingNoteTargets =
 const revealPath = vi.fn();
 const recordingOpenPath = vi.fn();
 const tagsVocabulary = vi.fn<() => Promise<{ entries: { path: string; count: number }[] }>>();
+const recordingSessionMeta = vi.fn();
 
 vi.mock("@/lib/ipc/client", () => ({
   notesSave: (id: string, text: string, rev: string, frontmatter: string | null) =>
@@ -18,6 +19,7 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingNoteTargets: (sessionId: string) => recordingNoteTargets(sessionId),
   revealPath: (path: string) => revealPath(path),
   recordingOpenPath: (path: string) => recordingOpenPath(path),
+  recordingSessionMeta: (folder: string) => recordingSessionMeta(folder),
   tagsVocabulary: () => tagsVocabulary(),
 }));
 
@@ -30,6 +32,8 @@ import {
 } from "@/components/ui/resizable-columns";
 import { COLUMN_WIDTH_COOKIE, MIN_COLUMN_WIDTH, readColumnWidths } from "@/lib/column-widths";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import { ELLIPSIS } from "@/lib/truncate";
 import { withRect, withTextLayout } from "@/test/layout";
 import {
@@ -37,6 +41,9 @@ import {
   PROPERTIES_COLUMN_LABEL,
   PROPERTY_KEY_COLUMN,
   PropertiesPanel,
+  RECORD_ANOTHER_FAULT_TESTID,
+  RECORD_ANOTHER_TESTID,
+  RECORD_ANOTHER_UNREADABLE,
   readFrontmatter,
   recordingsTagRefusal,
   UNPARSED_BLOCK_LABEL,
@@ -724,5 +731,281 @@ describe("PropertiesPanel — a recording note's tags", () => {
 
     await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
     expect((notesSave.mock.calls[0][3] ?? "").replace("  - offline\n", "")).toBe(TAGGED);
+  });
+});
+
+/**
+ * Story 45.17: the tag row is the tag row on ANY note, not only on one whose
+ * `tags:` key is already a list.
+ *
+ * 44.14 admitted three shapes — a block list, a flow list, and an empty value
+ * — which between them leave out the two commonest notes there are: one whose
+ * single tag was written inline, and one with no `tags:` key at all. Both got
+ * the generic text box, which has no vocabulary, so a second casing of a tag
+ * the vault already had silently became a second tag. That is the exact defect
+ * 44.13's chooser exists to prevent, still live on most of the vault.
+ */
+describe("PropertiesPanel — any note's tags", () => {
+  const VOCABULARY = ["work", "client/acme", "standup"];
+
+  /** A note with a `tags:` key written inline, holding one tag. */
+  const SCALAR = ["---", "title: Monday", "tags: standup", "---", ""].join("\n");
+
+  /** A note with frontmatter and no `tags:` key, which is most notes. */
+  const UNTAGGED = ["---", "title: Monday", "pinned: false", "---", ""].join("\n");
+
+  async function openChooser(): Promise<HTMLElement> {
+    fireEvent.click(screen.getByRole("button", { name: ADD_NOTE_TAG }));
+    await waitFor(() => expect(tagsVocabulary).toHaveBeenCalled());
+    return await screen.findByRole("combobox", { name: ADD_NOTE_TAG });
+  }
+
+  beforeEach(() => {
+    tagsVocabulary.mockResolvedValue({
+      entries: VOCABULARY.map((path) => ({ path, count: 1 })),
+    });
+  });
+
+  it("reads an inline tag as a tag, and renders it as a chip", () => {
+    renderPanel(SCALAR);
+
+    // A chip with a remove control, not a text box. Before this story the
+    // scalar fell through to the generic control and the tag was a string in
+    // an input — editable, but with no vocabulary behind it.
+    expect(screen.getByRole("button", { name: "Remove standup from tags" })).toBeInTheDocument();
+    // The witness, in the same fixture and the same representation: `title` is
+    // an ordinary scalar and DOES get the generic text box, named after its
+    // key. Without it the line below is an absence with nothing to compare to —
+    // change `PropertyControl`'s `aria-label={entry.key}` convention and the
+    // "not a text box" claim, which is the whole point of this story's scalar
+    // handling, would pass while testing nothing.
+    expect(screen.getByRole("textbox", { name: "title" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "tags" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * The chooser is HANDED the note's tags, and this asks the chooser rather
+   * than the panel. Passing `chosen={[]}` would render identically — same
+   * chips, same field — and would offer to add a tag the note already has.
+   */
+  it("tells the chooser what an inline tag already put on the note", async () => {
+    renderPanel(SCALAR);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "standup" } });
+    expect(await screen.findByText(tagComboboxAlreadyChosen("standup"))).toBeInTheDocument();
+  });
+
+  /**
+   * One tag on the key's own line cannot hold two, so it becomes a flow list —
+   * still on the key's own line. Promoting it to three lines would be a bigger
+   * edit to the file than the edit that was asked for.
+   */
+  it("promotes an inline tag to a flow list rather than to three lines", async () => {
+    renderPanel(SCALAR);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "work" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][0]).toBe("sub-1");
+    expect(notesSave.mock.calls[0][1]).toBe(BODY);
+    expect(notesSave.mock.calls[0][2]).toBe("rev-1");
+    expect(notesSave.mock.calls[0][3]).toBe(
+      ["---", "title: Monday", "tags: [standup, work]", "---", ""].join("\n"),
+    );
+  });
+
+  /**
+   * Two in the fixture on purpose: a removal that dropped the whole list, or
+   * kept only the first item, is invisible against a one-tag note.
+   */
+  it("removes one tag of a flow list and leaves the other where it was", async () => {
+    const flow = ["---", "title: Monday", "tags: [standup, work]", "---", ""].join("\n");
+    renderPanel(flow);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove standup from tags" }));
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][3]).toBe(
+      ["---", "title: Monday", "tags: [work]", "---", ""].join("\n"),
+    );
+  });
+
+  /**
+   * The headline case. A note with no `tags:` key gets the row anyway, and the
+   * first tag writes the key — so tagging a note never requires knowing that
+   * "tags" is the name of a frontmatter field.
+   */
+  it("offers a chooser with no tags key, and writes the key on the first tag", async () => {
+    renderPanel(UNTAGGED);
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "client/acme" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][1]).toBe(BODY);
+    expect(notesSave.mock.calls[0][3]).toBe(
+      ["---", "title: Monday", "pinned: false", "tags:", "  - client/acme", "---", ""].join("\n"),
+    );
+  });
+
+  /** And on a note with no frontmatter at all, the block is created for it. */
+  it("creates the block for a note that has none", async () => {
+    renderPanel("");
+    const field = await openChooser();
+
+    fireEvent.change(field, { target: { value: "work" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][3]).toBe("---\ntags:\n  - work\n---\n");
+  });
+
+  /**
+   * An indented map under `tags:` is not a tag list. The panel renders nested
+   * values read-only everywhere else, and a chooser writing a flat list over
+   * somebody's nested map would destroy it.
+   */
+  it("leaves a nested tags key alone and writes a new key beside it", async () => {
+    const nested = ["---", "tags:", "  work: true", "---", ""].join("\n");
+    renderPanel(nested);
+
+    // One chooser, and no chip made out of the map's own key.
+    expect(screen.getAllByRole("button", { name: ADD_NOTE_TAG })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Remove work from tags" })).not.toBeInTheDocument();
+
+    // Neither of those two says WHICH row it is: a chooser handed the nested
+    // entry renders no chips either, because a map's value is not a list. Only
+    // the write tells them apart — and the difference is a user's map surviving
+    // or being spliced over by a flat list. A mutation dropping the `nested`
+    // guard survived both assertions above and is killed by this one.
+    const field = await openChooser();
+    fireEvent.change(field, { target: { value: "standup" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][3]).toContain("  work: true");
+    expect(notesSave.mock.calls[0][3]).toContain("tags:\n  - standup");
+  });
+
+  /**
+   * A hand-edited block can carry `tags:` twice. Exactly one row may be the tag
+   * row — two would write to two spans, and the second write would land on
+   * offsets the first had already moved.
+   */
+  it("makes the first tags key the tag row and no other", () => {
+    const twice = ["---", "tags: standup", "title: Monday", "tags: work", "---", ""].join("\n");
+    renderPanel(twice);
+
+    expect(screen.getAllByRole("button", { name: ADD_NOTE_TAG })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Remove standup from tags" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove work from tags" })).not.toBeInTheDocument();
+  });
+
+  /**
+   * Taking the last tag off an inline key empties the value rather than
+   * deleting the key. The panel is a lens over the block and does not own its
+   * keys — and `tags:` with nothing after it is what Obsidian leaves too.
+   */
+  it("empties an inline tags key rather than removing it", async () => {
+    renderPanel(SCALAR);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove standup from tags" }));
+
+    await waitFor(() => expect(notesSave).toHaveBeenCalledTimes(1));
+    expect(notesSave.mock.calls[0][3]).toBe(
+      ["---", "title: Monday", 'tags: ""', "---", ""].join("\n"),
+    );
+  });
+});
+
+describe("PropertiesPanel — record another like this (Story 45.19, FR-197)", () => {
+  /** What that session's manifest holds. Two tags and TWO custom rows: a copy
+   *  that kept only the first element of either would pass a one-item fixture
+   *  and lose half the setup the person asked to reuse. */
+  const STORED = {
+    title: "Standup",
+    participants: "Ada, Grace",
+    note: "weekly",
+    tags: "standup, q3",
+    custom: [
+      { name: "Ticket", value: "KPR-1" },
+      { name: "Room", value: "Blue" },
+    ],
+  };
+
+  beforeEach(() => {
+    recordingSessionMeta.mockReset();
+    recordingSessionMeta.mockResolvedValue(STORED);
+    recordingMetaStore.setState({
+      fields: { title: "", participants: "", note: "", tags: "", custom: [] },
+      last: null,
+    });
+    primaryViewStore.getState().setView("notes");
+  });
+
+  it("fills every field of the next-session form and shows the Recording pane", async () => {
+    recordingNoteTargets.mockResolvedValue(TARGETS);
+    renderPanel(RECORDING_BLOCK);
+
+    fireEvent.click(await screen.findByTestId(RECORD_ANOTHER_TESTID));
+
+    // Asserted on the CALL: the folder Rust resolved, which follows a Story
+    // 40.4 rename — reading the note's own (older) `recording:` text would copy
+    // a session that is no longer there.
+    await waitFor(() =>
+      expect(recordingSessionMeta).toHaveBeenCalledWith(TARGETS[0]?.absolutePath),
+    );
+    await waitFor(() =>
+      expect(recordingMetaStore.getState().fields).toEqual({
+        title: "Standup",
+        participants: "Ada, Grace",
+        note: "weekly",
+        tags: "standup, q3",
+        custom: [
+          { name: "Ticket", value: "KPR-1" },
+          { name: "Room", value: "Blue" },
+        ],
+      }),
+    );
+    expect(primaryViewStore.getState().view).toBe("recording");
+  });
+
+  it("is absent on a note that is not about a recording", async () => {
+    renderPanel();
+    // No `session:` key at all, so the panel never even asks where the
+    // recording is — the predicate is the note's own frontmatter.
+    await waitFor(() => expect(screen.getByLabelText("New property name")).toBeInTheDocument());
+    expect(recordingNoteTargets).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(RECORD_ANOTHER_TESTID)).toBeNull();
+  });
+
+  it("is absent when the session is not on this machine", async () => {
+    // No archive row, no folder on disk, or no archive at all — all `null`, and
+    // an action that opens a form over a session keeper cannot find is worse
+    // than an absent one.
+    recordingNoteTargets.mockResolvedValue(null);
+    renderPanel(RECORDING_BLOCK);
+    await waitFor(() => expect(recordingNoteTargets).toHaveBeenCalled());
+    expect(screen.queryByTestId(RECORD_ANOTHER_TESTID)).toBeNull();
+  });
+
+  it("says so, fills nothing and navigates nowhere when the manifest will not load", async () => {
+    recordingNoteTargets.mockResolvedValue(TARGETS);
+    recordingSessionMeta.mockResolvedValue(null);
+    renderPanel(RECORDING_BLOCK);
+
+    fireEvent.click(await screen.findByTestId(RECORD_ANOTHER_TESTID));
+
+    expect(await screen.findByTestId(RECORD_ANOTHER_FAULT_TESTID)).toHaveTextContent(
+      RECORD_ANOTHER_UNREADABLE,
+    );
+    expect(recordingMetaStore.getState().fields.title).toBe("");
+    // Still in Notes: moving the user to an empty recorder would make them work
+    // out for themselves that nothing was copied.
+    expect(primaryViewStore.getState().view).toBe("notes");
   });
 });

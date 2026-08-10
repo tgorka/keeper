@@ -149,6 +149,12 @@ export function applyBodyBatch(batch: NoteBodyBatch): void {
           text: batch.text,
           frontmatter: batch.frontmatter,
           rev: batch.rev,
+          // `?? null` and not a bare read: `path` is a NEW required field on an
+          // existing variant, so a batch built before Story 45.18 — a fixture,
+          // or an older build's channel — type-checks and delivers `undefined`,
+          // which is neither a path nor `null` and would pass every
+          // `path !== null` gate while composing "undefined/note.md".
+          path: batch.path ?? null,
           dirty: false,
           cursor: batch.cursor,
           pending: null,

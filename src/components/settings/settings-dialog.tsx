@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { CaptureSettingsSection } from "@/components/notes/capture-settings";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
 import { AboutSection } from "@/components/settings/about-section";
@@ -202,6 +203,12 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
       {!reducedPlatform && <BackgroundSection open={open} />}
       <PrivacySection open={open} />
       {globalHotkey && <ShortcutsSection open={open} />}
+      {/* Beside Shortcuts rather than gated with it: the summon chord is a
+          desktop capability, but the template a capture starts from and the tag
+          its notes carry are vault settings that mean the same thing on every
+          platform that has a vault. The section renders itself away when there
+          is no vault to configure (Story 45.16, FR-193). */}
+      <CaptureSettingsSection open={open} />
       {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
       {recording && <RecordingSection open={open} />}

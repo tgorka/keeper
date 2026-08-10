@@ -6,6 +6,8 @@ import {
   Inbox,
   MessageSquare,
   NotebookPen,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radio,
   Settings,
   Video,
@@ -90,6 +92,15 @@ const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
 
 interface SidebarPaneProps {
   collapsed: boolean;
+  /**
+   * Fold or unfold the whole menu, or `null` where the viewport has already
+   * decided.
+   *
+   * A nullable callback rather than a `foldable` boolean beside a handler: two
+   * fields that must agree is a state where "foldable and no handler" compiles,
+   * and the symptom is a button that does nothing.
+   */
+  onToggleFold: (() => void) | null;
 }
 
 /** Exact offline-pill copy (UX-DR18) — kept verbatim. Exported so the phone
@@ -103,7 +114,15 @@ export const OFFLINE_PILL_TEXT =
  * AD-34-3 exists to prevent. */
 export const SIDEBAR_WIDTH_CLASS = { collapsed: "w-12", expanded: "w-[260px]" } as const;
 
-export function SidebarPane({ collapsed }: SidebarPaneProps) {
+/** The id the fold control's `aria-controls` points at.
+ *
+ * A module constant rather than `useId`: the value has to be identical in the
+ * button's attribute and on the list, and only one element of each ever exists
+ * in a document (the drawer is unmounted on the phone tier). A generated id
+ * would be correct and would also make the relationship untestable by name. */
+const VIEWS_LIST_ID = "sidebar-views";
+
+export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
   // button opens it.
@@ -150,12 +169,44 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
         collapsed ? SIDEBAR_WIDTH_CLASS.collapsed : SIDEBAR_WIDTH_CLASS.expanded,
       )}
     >
+      {/* The fold control, above the views it folds (Story 45.20, UX-DR81).
+
+          A real `<button>` in the tab order with an accessible name that says
+          which way it goes, plus `aria-expanded` on the region it controls, so
+          the folded rail is navigable by keyboard and announced rather than
+          being a strip of glyphs. Absent — not disabled — where the viewport
+          has already folded the drawer, because there is nothing it could
+          honestly do at that width. */}
+      {onToggleFold !== null && (
+        <div className={cn("flex p-2 pb-0", collapsed ? "justify-center" : "justify-end")}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={collapsed ? "Expand menu" : "Collapse menu"}
+            aria-expanded={!collapsed}
+            aria-controls={VIEWS_LIST_ID}
+            data-slot="sidebar-fold"
+            className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            onClick={onToggleFold}
+          >
+            {collapsed ? (
+              <PanelLeftOpen aria-hidden="true" />
+            ) : (
+              <PanelLeftClose aria-hidden="true" />
+            )}
+          </Button>
+        </div>
+      )}
       <ScrollArea className="min-h-0 flex-1">
         {/* The primary views and both data-driven groups scroll as one, so the
             footer below stays reachable however many Spaces or Networks the user
             belongs to (AD-34-4). */}
         <div className="flex flex-col">
-          <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
+          <ul
+            id={VIEWS_LIST_ID}
+            className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}
+          >
             {views.map((view) => {
               const Icon = view.icon;
               // Every entry switches the primary view — Settings included, since
@@ -258,16 +309,24 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
               );
             })}
           </ul>
-          {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces the
-              user belongs to, filtering the Unified Inbox. Rendered after the primary
-              views, before the footer. Hidden entirely when there are no Spaces, and
-              suppressed on the collapsed rail (it needs labels + names). */}
-          {!collapsed && <SpacesGroup />}
-          {/* NETWORKS group (Story 4.6): a single-select list of the distinct bridged
-              Networks connected across all accounts, filtering the Unified Inbox.
-              Rendered immediately after SPACES. Hidden entirely when there are no
-              bridged rooms, and suppressed on the collapsed rail (needs labels). */}
-          {!collapsed && <NetworksGroup />}
+          {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces
+              the user belongs to, filtering the Unified Inbox. Rendered after
+              the primary views, before the footer. Hidden entirely when there
+              are no Spaces.
+
+              **It renders folded now** (Story 45.20). It used to be suppressed
+              on the rail "because it needs labels + names", which is exactly
+              the outcome UX-DR81 refuses: folding the menu silently removed a
+              whole navigation surface rather than shrinking it, so a person who
+              folded the drawer lost their Spaces until they unfolded it again.
+              An avatar with an accessible name is a name; a missing row is not. */}
+          <SpacesGroup collapsed={collapsed} />
+          {/* NETWORKS group (Story 4.6): a single-select list of the distinct
+              bridged Networks connected across all accounts, filtering the
+              Unified Inbox. Rendered immediately after SPACES. Hidden entirely
+              when there are no bridged rooms, and folded rather than dropped on
+              the rail, for the reason above. */}
+          <NetworksGroup collapsed={collapsed} />
         </div>
       </ScrollArea>
       {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):

@@ -99,7 +99,7 @@ function openOn(body: string, cursor: number | null): void {
       rev: "r0",
       cursor,
       path: "2026-08-09-untitled.md",
-    } as NoteBodyBatch);
+    });
     return "sub-1";
   });
 }

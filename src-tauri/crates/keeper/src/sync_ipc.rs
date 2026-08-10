@@ -13,13 +13,14 @@
 use std::sync::Arc;
 
 use keeper_core::vm::{
-    FilesDeletePlanVm, FilesDeleteReceiptVm, FilesDeleteRefusalVm, FilesEntryFacts,
-    FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm, FilesSyncStatusVm,
-    FilesWriteVm, IpcError, IpcErrorCode,
+    ExportReceiptVm, FilesDeletePlanVm, FilesDeleteReceiptVm, FilesDeleteRefusalVm,
+    FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm,
+    FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
 };
 use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
+use keeper_sync::export::{self, ExportRefusal};
 use keeper_sync::files_write::{self, WriteRefusal, WriteScope};
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
@@ -1868,6 +1869,84 @@ pub async fn sync_read_document(
         .await
         .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
         .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Export (Story 45.21, FR-199)
+// ---------------------------------------------------------------------------
+
+/// An export refusal, as the frontend receives it and as the log records it.
+///
+/// One function for both export commands — `notes_ipc::notes_export` calls this
+/// one rather than wording its own, because a refusal the user reads must not
+/// depend on which surface they pressed the button from.
+///
+/// `warn!` rather than `info!`, on the same reasoning as [`write_refused`]:
+/// `GatedMakeWriter` only writes `INFO` to the file when debug mode is on, and
+/// a refusal is exactly the thing somebody asks about an hour later (DW-162).
+pub(crate) fn export_refused(refusal: &ExportRefusal) -> IpcError {
+    tracing::warn!(%refusal, "export: refused");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: refusal.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Copy one file out of a synced folder to a location the user picked
+/// (Story 45.21, FR-199, AD-65).
+///
+/// **Not a write command, and deliberately not beside the four below.** Export
+/// reads inside the profile and writes outside it, so it needs no vault and
+/// refuses nothing for being outside one: a PDF in a synced folder that keeper
+/// will not edit is still a PDF the owner can take a copy of. `writable_profile`
+/// is not used here for exactly that reason.
+///
+/// **The destination is the one path the webview supplies**, and it is the one
+/// path AD-65 permits it to: the user picked it from the OS folder chooser, it
+/// is not composed from anything keeper holds, and nothing under it is read.
+/// The source is still an id plus a relative path, re-resolved through
+/// `browse::resolve` like every other reader on this surface.
+///
+/// Every decision — is the destination there, is the name taken, does a partial
+/// copy get cleaned up — is [`keeper_sync::export`], which compiles and is
+/// tested on any machine. This crate does not build on Linux (AD-55, AD-56).
+///
+/// Runs on the blocking pool: copying a 2 GB video off a pendrive is not
+/// something to do on the async runtime.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is gone, a folder, a destination that is
+/// missing / is a file / is inside the profile / already holds the name, or a
+/// copy the disk refused).
+#[tauri::command]
+pub async fn sync_export_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    destination: String,
+) -> Result<ExportReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    // The root is cloned out immediately: nothing about the profile is needed
+    // after this point, and a borrow held across the await below would be a
+    // borrow of a local `Vec` in a future that has to be `Send`.
+    let root = find_profile(&profiles, &id)?.local_path.clone();
+    let named = subpath.clone();
+    let target = std::path::PathBuf::from(&destination);
+
+    let done = tokio::task::spawn_blocking(move || export::export_entry(&root, &subpath, &target))
+        .await
+        .map_err(|err| open_failure(format!("could not export {named}: {err}")))?
+        .map_err(|refusal| export_refused(&refusal))?;
+
+    tracing::info!(rel = %named, "files: exported a file out of keeper");
+    Ok(ExportReceiptVm::file(
+        &destination,
+        done.path.display().to_string(),
+        export::file_name_of(&named),
+    ))
 }
 
 // ---------------------------------------------------------------------------

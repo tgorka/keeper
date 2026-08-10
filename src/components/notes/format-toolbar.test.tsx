@@ -77,7 +77,7 @@ beforeEach(() => {
       rev: "r0",
       cursor: 0,
       path: "n.md",
-    } as NoteBodyBatch);
+    });
     return "sub-1";
   });
 });

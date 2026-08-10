@@ -1,8 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "quick-capture",
-  "description": "Least-privilege capability for the quick-capture panel (AD-60, FR-101). Every capability file in this app is window-scoped, so a second window with no file of its own can invoke NOTHING — the panel would render and sit inert, which looks like a frontend bug and is not. It gets exactly three grants: `core:default` for channel/event delivery and the app's own invoke path, `core:window:allow-hide` so Escape can hide the panel, and `core:window:allow-set-focus` for the Linux compositor race the `keeper://notes-capture-shown` event exists to recover from. No opener, no dialog, no deep-link, no global-shortcut, no process, and no `core:window:allow-close` — the window is created once at startup and never destroyed, which is how NFR-27's 300 ms is met. The honest limit, stated so nobody plans around a fence that is not there: Tauri's ACL gates core and plugin commands, not the app's own `#[tauri::command]`s, so this file cannot by itself stop the capture webview from invoking `notes_delete`. The real containment is threefold — the panel loads a separate entry point that imports four IPC wrappers and nothing else, every notes command re-validates its arguments against the vault registry in Rust regardless of caller, and the panel's only privileged operation writes to a destination it does not choose.",
-  "windows": ["quick-capture"],
+  "description": "Least-privilege capability for the quick-capture windows (AD-60, FR-101, FR-191, FR-192). Every capability file in this app is window-scoped, so a window with no file of its own can invoke NO plugin permission — it renders and sits inert, which looks like a frontend bug and is not. Story 45.15 made capture windows several and dynamic, so the list carries the prewarmed window's exact label AND the `quick-capture-*` glob every created one matches; `keeper_core::capture::capture_label` derives those labels and its tests pin them to this glob, because a window that matches nothing here fails silently. The grants: `core:default` for channel/event delivery and the app's own invoke path; `core:window:allow-hide` so Escape can dismiss the prewarmed window; `core:window:allow-set-focus` for the Linux compositor race the `keeper://notes-capture-shown` event exists to recover from; `core:window:allow-close` for the close button, which Story 45.15 added because Escape being the only way out is a way out nobody discovers; `core:window:allow-start-dragging` so an UNLOCKED window can be moved — an undecorated window has no title bar to drag, so this is the whole of the lock icon's mechanism; `dialog:allow-open` because capture now mounts the real NoteEditor and Attach a File arrives with it; and `opener:default` so a link in a capture window opens where the same link in the main window opens — a link that silently rejects on one surface and works on the identical control in another is worse than a link that works nowhere. The opener plugin's default scope is `http`, `https`, `mailto` and `tel` and nothing else, so `javascript:` and `file:` are refused by Tauri rather than by a guard of ours. Still NOT granted: deep-link, global-shortcut, process, fs, and any window permission that would let the webview place or resize itself — a window that can place itself is a window that can place itself off screen.",
+  "windows": ["quick-capture", "quick-capture-*"],
   "platforms": ["macOS", "windows", "linux"],
-  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-set-focus"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "dialog:allow-open",
+    "opener:default"
+  ]
 }

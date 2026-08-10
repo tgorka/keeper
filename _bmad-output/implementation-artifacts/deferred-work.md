@@ -2854,3 +2854,48 @@ the testing lesson, which is the reusable part: a hook suite that does `renderHo
   `App.tsx` fails it. `use-notify-navigate.test.ts` has the same hook-only shape and is the reason
   nobody noticed the notes trio; worth the same treatment when someone is next in that file.
 status: open
+
+### DW-190: Comments anchored to parts of a PDF need a PDF renderer keeper does not have.
+
+origin: story 45.21, 2026-08-10 — the speculative half of the story, decided before building
+location: `src/components/viewers/document-viewer.tsx` (`PdfBody`), against
+  `src-tauri/crates/keeper/src/file_protocol.rs`'s `keeper-file://`
+reason: 45.8 renders a PDF as `<embed type="application/pdf">` routed to the platform's own
+  renderer (PDFKit under WKWebView), which is why a 400-page document costs one element and no
+  marshalling. **That choice also puts the document permanently out of JavaScript's reach**, and
+  this was measured rather than assumed. WebKit's own
+  `Source/WebCore/html/HTMLEmbedElement.idl` exposes exactly `align`, `height`, `name`, `src`,
+  `type`, `width` and `getSVGDocument()` — there is **no `contentDocument` and no
+  `contentWindow`**, unlike `<iframe>` and `<object>`, which have both (confirmed independently
+  against a spec-conformant DOM: `"contentDocument" in element` is `false` for `embed` and `true`
+  for the other two). `getSVGDocument()` is same-origin-guarded and answers only for SVG; a PDF is
+  not SVG, and `keeper-file://` is a different origin from the app document anyway.
+  So: no document, therefore no selection (a `Selection` belongs to a document), therefore no
+  coordinates and no page events. An overlay `<div>` can capture a drag, but keeper cannot read the
+  embed's scroll offset or current page, so a rectangle drawn on it is pinned to viewport
+  coordinates of a document whose position keeper cannot observe — it drifts the moment the reader
+  scrolls, and drifts silently.
+  The epic's own fallback, "anchor to a page and a rectangle", is therefore half impossible: the
+  rectangle cannot be drawn meaningfully and the page number could only ever be one the reader
+  TYPES. What would be left — a comment list with a typed page number — was deliberately not built,
+  because a paragraph of prose about a document anchored by a number a person typed **is a note**,
+  keeper already has notes, and a second prose store beside the file would be a second write path
+  for prose with its own sidecar format, its own conflict semantics and an anchor keeper cannot
+  verify. That is what AD-88 and AD-89 exist to refuse.
+what it would take, in order:
+  1. a PDF renderer that runs in JavaScript (pdf.js or equivalent) — a new dependency of
+     substantial size, a re-opened zero-egress review, and a canvas plus a text layer per visible
+     page with a virtualiser to bound it, replacing an `<embed>` that costs one element;
+  2. an anchor format that survives the document being replaced — a page and a rectangle does not,
+     because re-exporting re-paginates; the state of the art is a text-quote anchor
+     (prefix/exact/suffix, à la W3C Web Annotation) with a page+rect fallback, which needs the text
+     layer from (1);
+  3. a store with sync semantics — where comments live, what a conflict does, what a rename does;
+  4. only then the overlay, the gutter and the show/hide toggle.
+severity: none today — nothing is half-built, no control is offered and no comment can be lost.
+  The hazard is a future story adding a comment button to `DocumentViewer` without reading this:
+  it would anchor to a scroll position nothing can observe, and the drift would be silent.
+the reusable part: the export half of 45.21 shipped and this half did not, and the difference was
+  measuring the platform before designing against it. Ten minutes reading WebKit's IDL replaced an
+  epic's worth of speculation about what an overlay could anchor to.
+status: open

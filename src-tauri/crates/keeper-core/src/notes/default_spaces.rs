@@ -1,10 +1,12 @@
-//! The four spaces keeper seeds into a vault, and the rule for when it may
-//! (Story 44.3, FR-156, AD-79, AD-80).
+//! The spaces keeper seeds into a vault, and the rule for when it may
+//! (Story 44.3, Story 45.20, FR-156, FR-198, AD-79, AD-80).
 //!
 //! Inbox, Journal, Pinned and Recordings used to be hard-coded rows above the
 //! Spaces group — saved filters that nobody could edit, reorder, rename or give
 //! an icon. They are spaces now, and the only thing that makes them special is
 //! that keeper writes them once, into a vault that has never seen them.
+//! Templates joined them in 45.20 and is the one that was never a row: 44.7 made
+//! a template a note with a tag, and left the set of them with nowhere to stand.
 //!
 //! Everything in this module is a decision over values, deliberately, because
 //! the effect it drives is the worst kind keeper has: **writing notes into
@@ -19,10 +21,12 @@
 //! `is:untagged` — the honest home of the unfiled is the note no tag has
 //! claimed, and `untagged` is what the index computes — Journal is `is:journal`,
 //! which the index sets from `journal/` (`notes_vault::note_flags`), Pinned is
-//! `is:pinned` and Recordings is `is:recording`. Every one of them is already in
-//! [`crate::notes::query`]'s closed `is:` set. Inventing an `is:inbox` alias for
-//! `untagged` would have been a second name for one predicate, which is the one
-//! thing epic 44 says it adds none of.
+//! `is:pinned`, Recordings is `is:recording` and Templates is `is:template`.
+//! Every one of them is already in [`crate::notes::query`]'s closed `is:` set.
+//! Inventing an `is:inbox` alias for `untagged` would have been a second name
+//! for one predicate, which is the one thing epic 44 says it adds none of — and
+//! the same rule is why Templates reuses the predicate 44.7 already widened
+//! rather than spelling itself `tag:template`.
 //!
 //! **Today is not here.** It never filtered anything (AD-80): it opened or
 //! created today's journal entry, which is an action on one note and still lives
@@ -81,13 +85,33 @@ pub struct DefaultSpace {
     pub icon: &'static str,
 }
 
-/// The four, in the order the rail used to fix.
+/// The five, in the order the rail used to fix.
 ///
 /// The order is also alphabetical by name, which is what `notes_spaces` sorts
 /// by today — so a freshly seeded vault renders the rail the deleted rows
 /// rendered, glyph for glyph, before Story 44.4 gives a space an explicit
 /// `order`.
-pub const DEFAULT_SPACES: [DefaultSpace; 4] = [
+///
+/// **Templates is the fifth, and it is not one of the deleted rows** (Story
+/// 45.20). 44.7 made a template an ordinary note carrying an ordinary tag
+/// (AD-82), which bought templates the tag tree, search and sync for free — and
+/// cost them the one thing a folder gave them, a place to stand. `notes_templates`
+/// can list them and the picker can offer them, and until now nothing in the
+/// rail could show you the set. It reuses [`crate::notes::templates::TEMPLATE_TAG`]
+/// through the `is:template` predicate rather than inventing anything: creating
+/// a note in it makes a template, because `seed::seed_flag` already answers
+/// `is:template` with that tag.
+///
+/// **`is:template` and not `tag:template`, deliberately, and the difference is
+/// grandfathering.** 44.7 changed the predicate to
+/// `templates::is_template(&fm) || rel.starts_with("templates/")` — the tag OR
+/// the legacy folder — so that vaults seeded by builds before 44.7 keep seeing
+/// their own templates. `tag:template` is strictly narrower and would omit every
+/// grandfathered one, leaving this space showing fewer templates than the
+/// template picker lists: two surfaces disagreeing about what a template is.
+/// Whoever eventually retires the `templates/` clause changes what this space
+/// selects, and should expect to.
+pub const DEFAULT_SPACES: [DefaultSpace; 5] = [
     DefaultSpace {
         key: "inbox",
         name: "Inbox",
@@ -111,6 +135,12 @@ pub const DEFAULT_SPACES: [DefaultSpace; 4] = [
         name: "Recordings",
         query: "is:recording",
         icon: "video",
+    },
+    DefaultSpace {
+        key: "templates",
+        name: "Templates",
+        query: "is:template",
+        icon: "layout-template",
     },
 ];
 
@@ -387,6 +417,99 @@ pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
 fn keys_recorded(vault: &mut dyn SeedVault, keys: &BTreeSet<String>) {
     let text = render_ledger(keys);
     let _ = vault.write(LEDGER_REL, &text);
+}
+
+/// What deleting a space left in the ledger, and — when it left nothing — why.
+///
+/// Same shape and same rule as [`SeedOutcome`]: no silent arm. A deletion that
+/// failed to tombstone a default is a space that comes back on the next
+/// refresh, and the person watching it reappear needs a line in the log saying
+/// which file keeper could not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteRecord {
+    /// The key is in the ledger now; the seeder will not offer it again.
+    Recorded(String),
+    /// The ledger already named it, which is the ordinary case: keeper seeded
+    /// the space, so it recorded the key when it wrote the note.
+    AlreadyRecorded(String),
+    /// The note was not a default space. The ledger has nothing to say about a
+    /// space a person wrote, and nothing would re-create it.
+    NotADefault,
+    /// Recorded nothing, deliberately. The string is the sentence for the log.
+    Blocked(String),
+}
+
+impl DeleteRecord {
+    /// The level and the sentence this outcome deserves in the log, for
+    /// [`REPORT_FLOOR`]'s reason: a decision the app made about somebody's
+    /// vault that only shows up as a space reappearing days later.
+    pub fn report(&self) -> (tracing::Level, String) {
+        match self {
+            Self::Recorded(key) => (
+                REPORT_FLOOR,
+                format!("recorded the deleted default space {key} in {LEDGER_REL}; it will not be seeded again"),
+            ),
+            Self::AlreadyRecorded(key) => (
+                REPORT_FLOOR,
+                format!("{LEDGER_REL} already records the default space {key}; it will not be seeded again"),
+            ),
+            Self::NotADefault => (
+                REPORT_FLOOR,
+                "deleted a space keeper did not seed; nothing to record".to_owned(),
+            ),
+            Self::Blocked(why) => (
+                tracing::Level::WARN,
+                format!("deleted the space, but did not record it as deleted, so a later refresh may offer it again. {why}"),
+            ),
+        }
+    }
+}
+
+/// Record that a default space was deleted on purpose, so [`seed`] will not put
+/// it back (Story 45.17, FR-195).
+///
+/// **This invents no tombstone, because the ledger already is one.** `offered`
+/// is the set of keys this vault has been given, and [`plan`] skips every key
+/// in it on a `FirstRun`. So "deleted on purpose" and "already offered" are the
+/// same fact from the seeder's side, and the deletion's whole job is to make
+/// sure the key is in that set. A second file saying "and this one is deleted"
+/// would be a second answer to one question, and the two would disagree the
+/// first time somebody restored a vault from a backup that had one and not the
+/// other.
+///
+/// It is not a no-op, and the case that makes it load-bearing is the one that
+/// looks impossible: `seed` records only the keys it WROTE. A default it stood
+/// down because a space of the user's own already carried that name never
+/// reaches the ledger — so deleting *that* space, without this, hands the next
+/// refresh a vault with no `inbox` key, no space named Inbox and no space
+/// carrying the marker, and keeper writes one. That is the AD-79 failure with
+/// extra steps.
+///
+/// `source` is the note's text, read before the bytes move. An unreadable
+/// ledger blocks rather than being overwritten, exactly as it does in [`seed`]:
+/// a file that is there and is not a ledger keeper wrote may be a newer build's,
+/// and replacing it would re-offer that build's defaults.
+pub fn record_deleted(vault: &mut dyn SeedVault, source: &str) -> DeleteRecord {
+    let Some(key) = default_key_of(source) else {
+        return DeleteRecord::NotADefault;
+    };
+    let mut keys = match read_ledger(vault) {
+        Ok(Some(keys)) => keys,
+        // [`read_ledger`] documents this as unreachable — an absent ledger is
+        // an empty set, which is a fact rather than an absence of one. Read as
+        // the empty set rather than unwrapped, because the bytes have already
+        // moved by the time this runs and a panic here would take the command
+        // down after the deletion succeeded.
+        Ok(None) => BTreeSet::new(),
+        Err(reason) => return DeleteRecord::Blocked(reason),
+    };
+    if !keys.insert(key.clone()) {
+        return DeleteRecord::AlreadyRecorded(key);
+    }
+    match vault.write(LEDGER_REL, &render_ledger(&keys)) {
+        Ok(()) => DeleteRecord::Recorded(key),
+        Err(error) => DeleteRecord::Blocked(format!("{LEDGER_REL}: {error}")),
+    }
 }
 
 /// The keys this vault has already been offered, or the sentence explaining why
@@ -674,10 +797,10 @@ mod tests {
         of.iter().map(|key| (*key).to_owned()).collect()
     }
 
-    /// The whole reason the four could become spaces: every query they run is
-    /// already in the closed `is:` set. If one of them were not, seeding would
-    /// write a space that refuses to parse into a fresh vault — a rail of four
-    /// rows, all broken, on first run.
+    /// The whole reason the defaults could become spaces: every query they run
+    /// is already in the closed `is:` set. If one of them were not, seeding
+    /// would write a space that refuses to parse into a fresh vault — a rail of
+    /// broken rows on first run.
     #[test]
     fn every_default_query_parses_against_the_closed_flag_set() {
         for space in &DEFAULT_SPACES {
@@ -693,6 +816,13 @@ mod tests {
     /// The queries are the rows', not new ones. Pinned all over again as
     /// `tag:pinned` would list a different set of notes from the row it
     /// replaced, and nobody would notice until the vault had a `pinned` tag.
+    ///
+    /// Templates never was a row, and it is pinned here for the sharper version
+    /// of the same reason: `tag:template` and `is:template` look interchangeable
+    /// and are not. 44.7 widened the predicate to the frontmatter tag OR the
+    /// legacy `templates/` prefix, so the tag spelling would silently omit every
+    /// template a pre-44.7 vault still keeps in that folder. Writing the exact
+    /// string down is what makes that a failing test rather than a shrug.
     #[test]
     fn the_defaults_run_the_queries_the_deleted_rows_ran() {
         let queries: Vec<(&str, &str)> = DEFAULT_SPACES
@@ -706,16 +836,48 @@ mod tests {
                 ("journal", "is:journal"),
                 ("pinned", "is:pinned"),
                 ("recordings", "is:recording"),
+                ("templates", "is:template"),
             ]
         );
     }
 
+    /// Every default's icon is one the picker can actually draw.
+    ///
+    /// The seeded set and the icon set live in two languages and two crates, and
+    /// the only thing joining them is a string in frontmatter. A default whose
+    /// glyph name is not in `SPACE_ICONS` renders the unknown-icon fallback on
+    /// first run — a rail of default rows that all look broken, which is exactly
+    /// what 44.3's own doc comment says the first four exist to prevent. The
+    /// TypeScript half of this pair is `every seeded default names an icon the
+    /// picker has` in `space-editor.test.tsx`; neither half can see the other,
+    /// so both are written down.
     #[test]
-    fn a_fresh_vault_is_offered_all_four() {
+    fn every_default_names_an_icon_and_no_two_defaults_share_a_key() {
+        let mut keys: Vec<&str> = DEFAULT_SPACES.iter().map(|space| space.key).collect();
+        keys.sort_unstable();
+        let unique = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), unique, "two defaults share a key: {keys:?}");
+        for space in &DEFAULT_SPACES {
+            assert!(!space.icon.is_empty(), "{} names no icon", space.key);
+            assert!(
+                space
+                    .icon
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{} names {:?}, which is not a lucide key",
+                space.key,
+                space.icon
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_vault_is_offered_every_default() {
         let plan = plan(SeedMode::FirstRun, &[], Some(&BTreeSet::new()));
         assert_eq!(
             keys(&plan),
-            vec!["inbox", "journal", "pinned", "recordings"]
+            vec!["inbox", "journal", "pinned", "recordings", "templates"]
         );
     }
 
@@ -723,7 +885,7 @@ mod tests {
     /// back. The ledger remembers the offer, not the note.
     #[test]
     fn a_default_the_ledger_already_offered_is_never_written_again() {
-        let all = ledger(&["inbox", "journal", "pinned", "recordings"]);
+        let all = ledger(&["inbox", "journal", "pinned", "recordings", "templates"]);
         // Every one deleted off disk, every one already offered.
         assert!(plan(SeedMode::FirstRun, &[], Some(&all)).is_empty());
         // And the ordinary case: three still there, one thrown away.
@@ -745,20 +907,20 @@ mod tests {
         ];
         // The ledger was written last, so it never landed: nothing recorded.
         let plan = plan(SeedMode::FirstRun, &half, Some(&BTreeSet::new()));
-        assert_eq!(keys(&plan), vec!["pinned", "recordings"]);
+        assert_eq!(keys(&plan), vec!["pinned", "recordings", "templates"]);
     }
 
     /// Restore is the user asking, so the ledger does not veto it — but it still
     /// only fills holes.
     #[test]
     fn restore_writes_the_missing_and_leaves_the_present_alone() {
-        let all = ledger(&["inbox", "journal", "pinned", "recordings"]);
+        let all = ledger(&["inbox", "journal", "pinned", "recordings", "templates"]);
         let present = [
             existing("Inbox", Some("inbox")),
             existing("Recordings", Some("recordings")),
         ];
         let plan = plan(SeedMode::Restore, &present, Some(&all));
-        assert_eq!(keys(&plan), vec!["journal", "pinned"]);
+        assert_eq!(keys(&plan), vec!["journal", "pinned", "templates"]);
 
         // Nothing missing, nothing written — pressing it twice is a no-op.
         let full: Vec<ExistingSpace> = DEFAULT_SPACES
@@ -785,15 +947,21 @@ mod tests {
         ];
         assert_eq!(
             keys(&plan(SeedMode::FirstRun, &renamed, Some(&BTreeSet::new()))),
-            vec!["journal", "pinned"]
+            vec!["journal", "pinned", "templates"]
         );
         assert_eq!(
             keys(&plan(
                 SeedMode::Restore,
                 &renamed,
-                Some(&ledger(&["inbox", "journal", "pinned", "recordings"]))
+                Some(&ledger(&[
+                    "inbox",
+                    "journal",
+                    "pinned",
+                    "recordings",
+                    "templates"
+                ]))
             )),
-            vec!["journal", "pinned"]
+            vec!["journal", "pinned", "templates"]
         );
     }
 
@@ -805,7 +973,7 @@ mod tests {
         let mine = [existing("My unfiled things", None)];
         assert_eq!(
             keys(&plan(SeedMode::FirstRun, &mine, Some(&BTreeSet::new()))),
-            vec!["inbox", "journal", "pinned", "recordings"]
+            vec!["inbox", "journal", "pinned", "recordings", "templates"]
         );
     }
 
@@ -820,7 +988,7 @@ mod tests {
         let plan = plan(SeedMode::FirstRun, &mine, Some(&BTreeSet::new()));
         assert_eq!(
             keys(&plan),
-            vec!["inbox", "journal", "pinned", "recordings"]
+            vec!["inbox", "journal", "pinned", "recordings", "templates"]
         );
     }
 
@@ -836,7 +1004,10 @@ mod tests {
                 !keys(&plan).contains(&"inbox"),
                 "{spelling} folds to the Inbox name and must stand it down"
             );
-            assert_eq!(keys(&plan), vec!["journal", "pinned", "recordings"]);
+            assert_eq!(
+                keys(&plan),
+                vec!["journal", "pinned", "recordings", "templates"]
+            );
         }
         // A name that folds to something else is a different space and blocks
         // nothing — the fold is the filename rule, so `In box` is `in-box` and
@@ -845,21 +1016,22 @@ mod tests {
             let mine = [existing(other, None)];
             assert_eq!(
                 keys(&plan(SeedMode::FirstRun, &mine, Some(&BTreeSet::new()))),
-                vec!["inbox", "journal", "pinned", "recordings"],
+                vec!["inbox", "journal", "pinned", "recordings", "templates"],
                 "{other} is not Inbox"
             );
         }
     }
 
     /// A ledger keeper cannot read is not "this vault was never seeded". Reading
-    /// it that way would put four notes back into a vault whose owner may have
-    /// deleted all four, which is the one outcome worth being timid about.
+    /// it that way would put every default back into a vault whose owner may
+    /// have deleted all of them, which is the one outcome worth being timid
+    /// about.
     #[test]
     fn an_unreadable_ledger_stops_the_automatic_seed_and_not_the_manual_one() {
         assert!(plan(SeedMode::FirstRun, &[], None).is_empty());
         assert_eq!(
             keys(&plan(SeedMode::Restore, &[], None)),
-            vec!["inbox", "journal", "pinned", "recordings"]
+            vec!["inbox", "journal", "pinned", "recordings", "templates"]
         );
     }
 
@@ -872,7 +1044,7 @@ mod tests {
         assert!(read.contains("someday"));
         assert_eq!(
             keys(&plan(SeedMode::FirstRun, &[], Some(&read))),
-            vec!["journal", "pinned", "recordings"]
+            vec!["journal", "pinned", "recordings", "templates"]
         );
     }
 
@@ -953,7 +1125,10 @@ mod tests {
     #[test]
     fn a_seeded_note_is_the_same_shape_a_saved_space_is() {
         let note = render_note(
-            &DEFAULT_SPACES[3],
+            // By key, not by index: the array grew from four to five in Story
+            // 45.20 and an index would have silently re-pointed this assertion
+            // at a different space's bytes.
+            by_key("recordings").expect("the Recordings default exists"),
             "01J8ZQ4M7T5R9V3XK2B6C0DFGH",
             "2026-08-09T10:00:00+02:00",
         );
@@ -994,7 +1169,7 @@ mod tests {
     /// declines silently, because `AlreadySatisfied` and `Blocked` are different
     /// values and neither is `Wrote`.
     #[test]
-    fn the_owners_vault_gets_its_four_defaults_beside_the_four_spaces_it_already_had() {
+    fn the_owners_vault_gets_its_defaults_beside_the_four_spaces_it_already_had() {
         let mut vault = temp_vault();
         for (n, filename) in [
             "2026-08-08-recordings-first-recording.md",
@@ -1022,14 +1197,20 @@ mod tests {
                 "spaces/2026-08-09-journal.md".to_owned(),
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ])
         );
-        // Their four are still there, untouched, beside keeper's four. Sorted,
+        // Their four are still there, untouched, beside keeper's five. Sorted,
         // so keeper's bare "Recordings" comes before their "Recordings · …".
         let names = names_on_disk(&vault);
-        assert_eq!(names.len(), 8, "{names:?}");
-        assert_eq!(&names[..4], ["Inbox", "Journal", "Pinned", "Recordings"]);
-        for theirs in &names[4..] {
+        assert_eq!(names.len(), 9, "{names:?}");
+        assert_eq!(
+            &names[..4],
+            ["Inbox", "Journal", "Pinned", "Recordings"],
+            "{names:?}"
+        );
+        assert_eq!(names[8], "Templates", "{names:?}");
+        for theirs in &names[4..8] {
             assert!(
                 theirs.starts_with("Recordings · first-recording"),
                 "{theirs}"
@@ -1044,12 +1225,12 @@ mod tests {
         let mut vault = temp_vault();
         let outcome = seed(&mut vault, SeedMode::FirstRun);
         assert!(
-            matches!(&outcome, SeedOutcome::Wrote(w) if w.len() == 4),
+            matches!(&outcome, SeedOutcome::Wrote(w) if w.len() == DEFAULT_SPACES.len()),
             "{outcome:?}"
         );
         assert_eq!(
             names_on_disk(&vault),
-            ["Inbox", "Journal", "Pinned", "Recordings"]
+            ["Inbox", "Journal", "Pinned", "Recordings", "Templates"]
         );
     }
 
@@ -1066,7 +1247,11 @@ mod tests {
             seed(&mut vault, SeedMode::FirstRun),
             SeedOutcome::AlreadySatisfied
         );
-        assert_eq!(names_on_disk(&vault).len(), 4, "nothing doubled");
+        assert_eq!(
+            names_on_disk(&vault).len(),
+            DEFAULT_SPACES.len(),
+            "nothing doubled"
+        );
     }
 
     /// The story's own acceptance, now against files: delete one and reopen.
@@ -1083,7 +1268,10 @@ mod tests {
             seed(&mut vault, SeedMode::FirstRun),
             SeedOutcome::AlreadySatisfied
         );
-        assert_eq!(names_on_disk(&vault), ["Inbox", "Journal", "Recordings"]);
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox", "Journal", "Recordings", "Templates"]
+        );
 
         // And restore brings back exactly the one that is gone.
         assert_eq!(
@@ -1092,7 +1280,68 @@ mod tests {
         );
         assert_eq!(
             names_on_disk(&vault),
-            ["Inbox", "Journal", "Pinned", "Recordings"]
+            ["Inbox", "Journal", "Pinned", "Recordings", "Templates"]
+        );
+    }
+
+    /// Story 45.20's own acceptance for the fifth default, end to end against a
+    /// real directory: seeded, ledgered, and gone for good once deleted.
+    ///
+    /// Its own test rather than a line added to the four above, because the
+    /// three facts it asserts are three different failures and each has already
+    /// happened to a sibling: a default that is planned and never written, a
+    /// default written and never recorded (so the next launch writes it again),
+    /// and a default the automatic run resurrects after the user threw it away.
+    /// It also reads the note's own bytes rather than only the outcome list —
+    /// the outcome names a path, and a path is not a query.
+    #[test]
+    fn the_templates_space_is_seeded_ledgered_and_stays_deleted() {
+        let mut vault = temp_vault();
+        let rel = "spaces/2026-08-09-templates.md";
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        assert!(
+            matches!(&outcome, SeedOutcome::Wrote(written) if written.iter().any(|w| w == rel)),
+            "the first run writes it: {outcome:?}"
+        );
+
+        // Seeded: the note on disk is a space note carrying the predicate 44.7
+        // widened, the glyph the picker draws, and the marker that survives a
+        // rename. Read off the file, not off the constant.
+        let note = std::fs::read_to_string(vault.root.join(rel)).expect("the note is there");
+        assert!(note.contains("space: is:template"), "{note}");
+        assert!(note.contains("icon: layout-template"), "{note}");
+        assert_eq!(
+            default_key_of(&note).as_deref(),
+            Some("templates"),
+            "{note}"
+        );
+        assert!(note.ends_with("# Templates\n"), "{note}");
+
+        // Ledgered: recorded beside its four siblings, so the record is what
+        // stops the next run rather than the file merely existing.
+        let recorded = parse_ledger(
+            &std::fs::read_to_string(vault.root.join(LEDGER_REL)).expect("a ledger was written"),
+        )
+        .expect("it is a ledger keeper wrote");
+        assert!(recorded.contains("templates"), "{recorded:?}");
+
+        // Deleted: it stays deleted, and the run says which silence it is.
+        std::fs::remove_file(vault.root.join(rel)).expect("delete");
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(
+            names_on_disk(&vault),
+            ["Inbox", "Journal", "Pinned", "Recordings"],
+            "keeper does not put back a space the user threw away"
+        );
+
+        // …until the user asks, which is the whole point of the two modes.
+        assert_eq!(
+            seed(&mut vault, SeedMode::Restore),
+            SeedOutcome::Wrote(vec![rel.to_owned()])
         );
     }
 
@@ -1117,11 +1366,12 @@ mod tests {
             SeedOutcome::Wrote(vec![
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ])
         );
         assert_eq!(
             names_on_disk(&vault),
-            ["Inbox", "Journal", "Pinned", "Recordings"]
+            ["Inbox", "Journal", "Pinned", "Recordings", "Templates"]
         );
     }
 
@@ -1144,13 +1394,13 @@ mod tests {
         // The user pressing Restore is not blocked by it, and repairs it.
         let repaired = seed(&mut vault, SeedMode::Restore);
         assert!(
-            matches!(&repaired, SeedOutcome::Wrote(w) if w.len() == 4),
+            matches!(&repaired, SeedOutcome::Wrote(w) if w.len() == DEFAULT_SPACES.len()),
             "{repaired:?}"
         );
         assert_eq!(
             parse_ledger(&std::fs::read_to_string(vault.root.join(LEDGER_REL)).expect("read")),
             Some(
-                ["inbox", "journal", "pinned", "recordings"]
+                ["inbox", "journal", "pinned", "recordings", "templates"]
                     .iter()
                     .map(|k| (*k).to_owned())
                     .collect()
@@ -1204,8 +1454,9 @@ mod tests {
                 "spaces/2026-08-09-journal.md".to_owned(),
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ]),
-            "Inbox was already offered; the other three were not"
+            "Inbox was already offered; the others were not"
         );
     }
 
@@ -1245,9 +1496,10 @@ mod tests {
             SeedOutcome::Wrote(vec![
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ])
         );
-        assert_eq!(names_on_disk(&vault), ["Pinned", "Recordings"]);
+        assert_eq!(names_on_disk(&vault), ["Pinned", "Recordings", "Templates"]);
     }
 
     /// The bug the first version had in the other direction. A `spaces/` that is
@@ -1304,6 +1556,7 @@ mod tests {
                 "spaces/2026-08-09-journal.md".to_owned(),
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ])
         );
         assert!(
@@ -1315,7 +1568,7 @@ mod tests {
     }
 
     /// A user space really called Inbox, on disk, with no marker. keeper stands
-    /// down and writes the other three.
+    /// down for that one key and writes the rest.
     #[test]
     fn a_user_space_named_inbox_on_disk_stands_keepers_inbox_down() {
         let mut vault = temp_vault();
@@ -1329,6 +1582,7 @@ mod tests {
                 "spaces/2026-08-09-journal.md".to_owned(),
                 "spaces/2026-08-09-pinned.md".to_owned(),
                 "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
             ])
         );
         // Theirs is byte-identical: keeper never edits a space it did not write.
@@ -1341,7 +1595,7 @@ mod tests {
     /// The seeded notes are readable as spaces by the code that reads spaces —
     /// which is what makes the rail render them at all.
     #[test]
-    fn what_the_seed_wrote_reads_back_as_four_marked_defaults() {
+    fn what_the_seed_wrote_reads_back_as_marked_defaults() {
         let mut vault = temp_vault();
         assert!(matches!(
             seed(&mut vault, SeedMode::FirstRun),
@@ -1361,6 +1615,7 @@ mod tests {
                 ("journal".to_owned(), "Journal".to_owned()),
                 ("pinned".to_owned(), "Pinned".to_owned()),
                 ("recordings".to_owned(), "Recordings".to_owned()),
+                ("templates".to_owned(), "Templates".to_owned()),
             ]
         );
         for space in &DEFAULT_SPACES {
@@ -1431,6 +1686,188 @@ mod tests {
         .report();
         assert_eq!(level, tracing::Level::WARN);
         assert!(message.contains(".keeper-spaces.json"), "{message}");
+        assert!(message.contains("permission denied"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Deleting a space (Story 45.17, FR-195)
+    // -----------------------------------------------------------------------
+
+    /// The ledger the vault currently holds, as a sorted list, read the way
+    /// [`seed`] reads it. The independent side of every assertion below.
+    fn recorded(vault: &DiskVault) -> Vec<String> {
+        parse_ledger(&vault.read(LEDGER_REL).unwrap_or_default())
+            .map(|keys| keys.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Delete a space the way the shell does: read its bytes, remove it, then
+    /// record. The order is the production order and it matters — the marker is
+    /// in the file, and after the removal there is nothing to read it from.
+    fn delete_space(vault: &mut DiskVault, rel: &str) -> DeleteRecord {
+        let source = vault.read(rel).expect("read the space before deleting it");
+        std::fs::remove_file(vault.root.join(rel)).expect("delete the space");
+        record_deleted(vault, &source)
+    }
+
+    /// The ordinary case, end to end: seed, delete one of keeper's own, run the
+    /// automatic seed again, and the space stays gone.
+    ///
+    /// The ledger already named it — `seed` recorded the key when it wrote the
+    /// note — so the deletion has nothing to add, and saying `AlreadyRecorded`
+    /// rather than writing is the assertion that the tombstone is the ledger
+    /// and not something this story invented.
+    #[test]
+    fn deleting_a_seeded_default_leaves_it_deleted_across_a_reseed() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        let before = recorded(&vault);
+        assert!(before.contains(&"recordings".to_owned()), "{before:?}");
+
+        assert_eq!(
+            delete_space(&mut vault, "spaces/2026-08-09-recordings.md"),
+            DeleteRecord::AlreadyRecorded("recordings".to_owned()),
+        );
+        assert_eq!(recorded(&vault), before, "the ledger did not need changing");
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied,
+            "the automatic run must not put back a space the user threw away"
+        );
+        let names = names_on_disk(&vault);
+        assert!(!names.contains(&"Recordings".to_owned()), "{names:?}");
+    }
+
+    /// **The case the ledger could not already answer, and the reason
+    /// [`record_deleted`] exists.**
+    ///
+    /// [`keys_recorded`] is best effort — `let _ = vault.write(...)` — so a
+    /// vault whose ledger write failed has its seeded spaces and no ledger at
+    /// all. Deleting one of them then has to record it, because there is
+    /// nothing there to have recorded it already, and the next automatic run
+    /// would otherwise write it straight back.
+    ///
+    /// Reached the way it happens in the field rather than by hand-removing the
+    /// file: the seed runs with the ledger path refused, which is what a full
+    /// disk or a read-only `.keeper-spaces.json` does to it.
+    #[test]
+    fn deleting_a_default_the_ledger_never_recorded_still_tombstones_it() {
+        let mut vault = temp_vault();
+        vault.refuse = Some(LEDGER_REL.to_owned());
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        vault.refuse = None;
+        assert!(
+            recorded(&vault).is_empty(),
+            "the premise: spaces on disk and nothing recorded"
+        );
+        let before = names_on_disk(&vault);
+
+        assert_eq!(
+            delete_space(&mut vault, "spaces/2026-08-09-pinned.md"),
+            DeleteRecord::Recorded("pinned".to_owned()),
+        );
+        assert_eq!(recorded(&vault), vec!["pinned".to_owned()]);
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied,
+            "every other default is present and the deleted one is recorded"
+        );
+        let after = names_on_disk(&vault);
+        assert!(!after.contains(&"Pinned".to_owned()), "{after:?}");
+        assert_eq!(
+            after.len(),
+            before.len() - 1,
+            "exactly the deleted one is gone and nothing else moved: {before:?} -> {after:?}"
+        );
+    }
+
+    /// A space a person wrote is not keeper's, and the ledger has nothing to
+    /// say about it. The bytes are compared rather than the parse, because the
+    /// failure this guards against is a delete rewriting a file it had no
+    /// reason to touch.
+    #[test]
+    fn deleting_a_space_keeper_did_not_seed_leaves_the_ledger_byte_identical() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        put_space(&vault, "2026-08-09-clients.md", "Clients", "tag:clients");
+        let before = vault.read(LEDGER_REL).expect("ledger");
+
+        assert_eq!(
+            delete_space(&mut vault, "spaces/2026-08-09-clients.md"),
+            DeleteRecord::NotADefault,
+        );
+        assert_eq!(
+            vault.read(LEDGER_REL).expect("ledger"),
+            before,
+            "not one byte of the ledger changed"
+        );
+    }
+
+    /// A ledger keeper cannot parse is not overwritten, for [`seed`]'s reason:
+    /// it may be a newer build's, and replacing it would re-offer that build's
+    /// defaults. The deletion still happened; what is refused is the record.
+    #[test]
+    fn an_unreadable_ledger_blocks_the_record_and_is_left_alone() {
+        let mut vault = temp_vault();
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+        let theirs = "{\"version\":99,\"written-by\":\"a keeper from the future\"}\n";
+        vault.write(LEDGER_REL, theirs).expect("plant the ledger");
+
+        match delete_space(&mut vault, "spaces/2026-08-09-journal.md") {
+            DeleteRecord::Blocked(why) => assert!(why.contains(LEDGER_REL), "{why}"),
+            other => panic!("expected a spoken refusal, got {other:?}"),
+        }
+        assert_eq!(
+            vault.read(LEDGER_REL).expect("ledger"),
+            theirs,
+            "keeper must not replace a ledger it could not read"
+        );
+    }
+
+    /// No outcome of a deletion is invisible in the app's own log, for
+    /// [`REPORT_FLOOR`]'s reason — and every arm that knows a key names it,
+    /// because "the space came back" is otherwise the only symptom anyone gets.
+    #[test]
+    fn no_delete_record_reports_below_the_level_the_app_can_print() {
+        let every = [
+            DeleteRecord::Recorded("pinned".to_owned()),
+            DeleteRecord::AlreadyRecorded("pinned".to_owned()),
+            DeleteRecord::NotADefault,
+            DeleteRecord::Blocked(format!("{LEDGER_REL}: permission denied")),
+        ];
+        for outcome in &every {
+            let (level, message) = outcome.report();
+            assert!(
+                level <= REPORT_FLOOR,
+                "{outcome:?} reports at {level}, which the app's own filter drops"
+            );
+            assert!(!message.is_empty(), "{outcome:?} says nothing");
+        }
+        for outcome in [
+            DeleteRecord::Recorded("pinned".to_owned()),
+            DeleteRecord::AlreadyRecorded("pinned".to_owned()),
+        ] {
+            let (_, message) = outcome.report();
+            assert!(message.contains("pinned"), "{outcome:?} does not name it");
+        }
+        let (level, message) =
+            DeleteRecord::Blocked(format!("{LEDGER_REL}: permission denied")).report();
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(message.contains(LEDGER_REL), "{message}");
         assert!(message.contains("permission denied"), "{message}");
     }
 }

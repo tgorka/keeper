@@ -524,6 +524,8 @@ pub fn vault_vm(vault: &Vault, unread: u32) -> NoteVaultVm {
             u32::try_from(snapshot.len()).unwrap_or(u32::MAX)
         }),
         unread_count: unread,
+        capture_template: vault.config.capture_template.clone(),
+        capture_tag: vault.config.capture_tag.clone(),
         cadence: cadence_vm(&vault.config.cadence),
     }
 }

@@ -36,7 +36,7 @@ import { tableLayer } from "./markdown-table";
 import { mermaidLayer } from "./mermaid-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
 import { transportFor } from "./recording-transport";
-import { WIKILINK, WIKILINK_ATTR } from "./wikilink";
+import { LINK_ATTR, WIKILINK, WIKILINK_ATTR } from "./wikilink";
 
 /** How long an externally applied change stays highlighted. */
 export const EXTERNAL_FLASH_MS = 1_200;
@@ -114,8 +114,27 @@ export interface LivePreviewOptions {
   vaultId: string;
   /** Turn a vault-relative asset path into its `keeper-note://` URL (AD-59). */
   assetUrl: (relPath: string) => string;
-  /** Follow a wikilink. Called with the raw target, never a filesystem path. */
-  onOpenLink: (target: string) => void;
+  /**
+   * Follow a wikilink. Called with the raw target, never a filesystem path.
+   *
+   * Optional, because a host that cannot resolve a note name has none to give
+   * — and until Story 45.18 `markdown-preview.ts` supplied `() => {}` for
+   * exactly that case, which is a fabricated value standing in for a missing
+   * one. Absent, a click falls through rather than being swallowed by a
+   * function that does nothing.
+   */
+  onOpenLink?: (target: string) => void;
+  /**
+   * Follow an ordinary markdown link's destination (Story 45.18).
+   *
+   * Optional, and its absence is a real configuration rather than an oversight:
+   * a host with no way to hand a URL to the OS must render a link that does
+   * NOT look pressable, so the class is withheld and the decoration falls back
+   * to a plain `title`. Between 37.6 and this story every host was in that
+   * position and none of them said so — `.cm-lp-link` was `cursor: pointer`
+   * over text that did nothing at all.
+   */
+  onOpenUrl?: (url: string) => void;
   /**
    * The open note's `session:` frontmatter, or null when it has none.
    *
@@ -243,6 +262,11 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
   const { doc } = view.state;
   const revealed = revealedLines(view);
   const decorations: Range<Decoration>[] = [];
+  // A link that can be followed says so with the cursor; one that cannot must
+  // not (Story 45.18). Between 37.6 and this story `.cm-lp-link` was
+  // `cursor: pointer` in every host and no host had a follower, so the whole
+  // affordance was a pointer over dead text.
+  const urlClass = options.onOpenUrl === undefined ? "cm-lp-link" : "cm-lp-link cm-lp-followable";
 
   /** Whether any line the range spans is showing its source. */
   const isRevealed = (from: number, to: number): boolean => {
@@ -315,9 +339,12 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
         }
 
         // A link keeps its text, gains the link class, and carries its
-        // destination in a `title` — because the destination is about to be
-        // hidden and hovering has to be able to answer "where does this go?"
-        // without moving the caret into the line to read the source.
+        // destination twice: in a `title`, because the destination is about to
+        // be hidden and hovering has to answer "where does this go?" without
+        // moving the caret into the line; and in `LINK_ATTR`, which is what the
+        // click handler follows (Story 45.18). Two attributes rather than one
+        // because a title is a user-visible string and following a link must
+        // not depend on how it is worded.
         if (node.name === "Link" || node.name === "Autolink") {
           let destination: string | null = null;
           for (let child = node.node.firstChild; child !== null; child = child.nextSibling) {
@@ -328,8 +355,9 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           }
           decorations.push(
             Decoration.mark({
-              class: "cm-lp-link",
-              attributes: destination === null ? {} : { title: destination },
+              class: urlClass,
+              attributes:
+                destination === null ? {} : { title: destination, [LINK_ATTR]: destination },
             }).range(node.from, node.to),
           );
           return undefined;
@@ -365,8 +393,11 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
             // A bare GFM autolink: no wrapping node, so it gets the class here.
             decorations.push(
               Decoration.mark({
-                class: "cm-lp-link",
-                attributes: { title: doc.sliceString(node.from, node.to) },
+                class: urlClass,
+                attributes: {
+                  title: doc.sliceString(node.from, node.to),
+                  [LINK_ATTR]: doc.sliceString(node.from, node.to),
+                },
               }).range(node.from, node.to),
             );
           }
@@ -536,42 +567,12 @@ const externalFlashField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
-export interface TextSplice {
-  /** Start of the replaced span in the old text. */
-  from: number;
-  /** End of the replaced span in the old text. */
-  to: number;
-  /** What replaces it. */
-  insert: string;
-}
-
-/**
- * The single minimal replacement that turns `before` into `after`, or null when
- * they are identical.
- *
- * Minimal matters twice over: CodeMirror maps the caret and the selection
- * through the change, so replacing only what actually moved is what keeps the
- * caret still when an agent appends a section somewhere else in the file; and
- * the same span is what gets the fading highlight, so the user sees where the
- * change landed rather than a whole-document flash.
- */
-export function spliceBetween(before: string, after: string): TextSplice | null {
-  if (before === after) {
-    return null;
-  }
-  const shortest = Math.min(before.length, after.length);
-  let start = 0;
-  while (start < shortest && before[start] === after[start]) {
-    start += 1;
-  }
-  let endBefore = before.length;
-  let endAfter = after.length;
-  while (endBefore > start && endAfter > start && before[endBefore - 1] === after[endAfter - 1]) {
-    endBefore -= 1;
-    endAfter -= 1;
-  }
-  return { from: start, to: endBefore, insert: after.slice(start, endAfter) };
-}
+// Re-exported rather than moved out of sight: `note-editor.tsx` reaches it as
+// `preview.spliceBetween` and this module is still the natural place to look
+// for it. The implementation lives in `text-splice.ts` so that
+// `markdown-table.ts` can import it without importing this module back — see
+// that file for the cycle it broke.
+export { spliceBetween, type TextSplice } from "./text-splice";
 
 /** Paint the fading highlight over a range, then let it go. */
 export function flashExternal(view: EditorView, from: number, to: number): void {
@@ -597,7 +598,13 @@ const livePreviewTheme = EditorView.baseTheme({
     borderRadius: "3px",
     padding: "0 3px",
   },
-  ".cm-lp-link, .cm-lp-wikilink": { color: "var(--primary)", cursor: "pointer" },
+  // Colour says "this is a link"; the cursor says "this one goes somewhere when
+  // you press it". They were one rule until Story 45.18, which is why an
+  // external URL looked pressable for four stories while nothing followed it.
+  // A wikilink always keeps the pointer: every host that mounts this layer can
+  // resolve a note name, and the embed widgets' degrade anchors reuse the class.
+  ".cm-lp-link, .cm-lp-wikilink": { color: "var(--primary)" },
+  ".cm-lp-wikilink, .cm-lp-followable": { cursor: "pointer" },
   ".cm-lp-h1": { fontSize: "1.5em", fontWeight: "600" },
   ".cm-lp-h2": { fontSize: "1.3em", fontWeight: "600" },
   ".cm-lp-h3": { fontSize: "1.15em", fontWeight: "600" },
@@ -887,13 +894,25 @@ export function livePreview(options: LivePreviewOptions): Extension {
           if (!(target instanceof HTMLElement)) {
             return false;
           }
-          const link = target.closest(`[${WIKILINK_ATTR}]`);
-          const name = link?.getAttribute(WIKILINK_ATTR);
-          if (name === null || name === undefined) {
+          const wiki = target.closest(`[${WIKILINK_ATTR}]`)?.getAttribute(WIKILINK_ATTR);
+          const openNote = options.onOpenLink;
+          if (wiki !== null && wiki !== undefined && openNote !== undefined) {
+            event.preventDefault();
+            openNote(wiki);
+            return true;
+          }
+          // A host with no URL follower withholds the pressable class as well,
+          // so this branch is not reachable by pointing at one — the guard is
+          // here because an attribute outlives the re-render that dropped the
+          // option, and because a keyboard or synthetic event does not consult
+          // a cursor.
+          const url = target.closest(`[${LINK_ATTR}]`)?.getAttribute(LINK_ATTR);
+          const follow = options.onOpenUrl;
+          if (url === null || url === undefined || follow === undefined) {
             return false;
           }
           event.preventDefault();
-          options.onOpenLink(name);
+          follow(url);
           return true;
         },
       },

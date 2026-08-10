@@ -44,17 +44,18 @@ use keeper_core::notes::template_update::{
 use keeper_core::notes::vm::{
     NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
     NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm, NoteCreateReq, NoteCreateVm, NoteCsvVm,
-    NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm, NoteGalleryVm, NoteIndexProgressVm,
-    NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq, NoteRefVm,
-    NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq,
-    NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm,
+    NoteDeletePlanVm, NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm, NoteGalleryVm,
+    NoteIndexProgressVm, NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq,
+    NoteRefVm, NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm, NoteSearchReq,
+    NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm,
     NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{
     attach, counts, csv, naming, query, search, seed, sort, tags, templates, NotesError,
 };
 use keeper_core::vm::{
-    IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm, TagVocabularyVm,
+    ExportReceiptVm, IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm,
+    TagVocabularyVm,
 };
 use keeper_sync::browse;
 use keeper_sync::profile::{NotesCadence, NotesConfig};
@@ -889,6 +890,55 @@ pub async fn notes_vault_settings_save(
     Ok(notes_vault::vault_vm(&vault, unread))
 }
 
+/// What configuring `tag` as the capture tag would do to this vault's spaces
+/// (Story 45.16, FR-193).
+///
+/// One finished sentence per space that would **stop** listing captured notes,
+/// composed by [`seed::capture_tag_cost`] over that space's real stored query.
+/// An empty list means nothing is displaced.
+///
+/// **Asked, not reasoned about.** 44.7 wrote down why its shipped templates
+/// carry no tags of their own: Inbox is `is:untagged`, so a tag files its notes
+/// out of the space that offered them. A capture tag is that hazard aimed at
+/// every thought the user captures, and the honest way to show the cost is to
+/// run the one evaluator over the note a capture would write — not to hardcode
+/// a sentence about Inbox in the webview, which would be wrong the moment
+/// somebody edits Inbox's query and silent for the space they wrote themselves
+/// (AD-55, AD-58).
+///
+/// A *preview*: it takes the tag the form is holding rather than the one on
+/// disk, so the answer arrives before Save rather than after it.
+#[tauri::command]
+pub async fn notes_capture_impact(
+    vault_id: String,
+    tag: Option<String>,
+) -> Result<Vec<String>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id)))?;
+    // The canonical tag, through the same rule the save applies, so the preview
+    // answers about the tag that would actually be stored — `#Quick Capture`
+    // and `quick-capture` must not preview differently from each other.
+    let tag = tag.as_deref().and_then(seed::capture_tag);
+    let stamp = now_local();
+    let now_ms = notes_vault::local_now_ms();
+    Ok(snapshot
+        .entries()
+        .iter()
+        .filter(|entry| has_flag(entry, "space"))
+        .filter_map(|entry| {
+            let source = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
+            let def = space_def(entry, &source);
+            // Which spaces are worth naming is `keeper-core`'s decision, not
+            // this command's: it is the difference between a surface that names
+            // the one space you are about to lose and one that lists your whole
+            // rail. This function reads the spaces and iterates; it decides
+            // nothing (AD-55, AD-56).
+            seed::capture_tag_cost(&def.name, &def.query, tag.as_deref(), &stamp, now_ms)
+        })
+        .collect())
+}
+
 /// Apply a settings request onto an existing config.
 ///
 /// Every field is optional and `None` means **the caller did not express this**,
@@ -916,6 +966,18 @@ fn apply_settings(mut config: NotesConfig, req: &NoteVaultSettingsReq) -> NotesC
     if let Some(template) = req.default_template.as_ref() {
         let trimmed = template.trim();
         config.default_template = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    if let Some(template) = req.capture_template.as_ref() {
+        let trimmed = template.trim();
+        config.capture_template = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    // Folded on the way in, never on the way out, so the stored value IS the
+    // tag the note will carry and the form cannot show a second spelling of it
+    // (AD-34-8). `capture_tag` also refuses the `template` marker, which is why
+    // this is a call rather than a trim: a capture tagged `template` would make
+    // every captured thought a scaffold (AD-82).
+    if let Some(tag) = req.capture_tag.as_ref() {
+        config.capture_tag = seed::capture_tag(tag);
     }
     if let Some(cadence) = req.cadence.as_ref() {
         config.cadence = NotesCadence {
@@ -1673,6 +1735,43 @@ pub async fn notes_link_targets(
     Ok(hits)
 }
 
+/// Resolve one wikilink target to the note it names (Story 45.18, FR-196,
+/// FR-108).
+///
+/// **The resolver already existed and nothing could reach it.**
+/// `NoteIndexSnapshot::resolve_link` has answered this question since epic 37 —
+/// it is what the backlink map is built from — and no command exposed it, so
+/// clicking a rendered wikilink has done nothing since 37.6 while the text has
+/// been `cursor: pointer` the whole time. This is the missing wire, not a new
+/// rule.
+///
+/// Deliberately NOT [`notes_link_targets`] with an exact-match filter in the
+/// webview. That command is a substring search for a completion popup; the
+/// resolver folds through `link_key` and answers to a note's id, its
+/// vault-relative path, that path without the `.md`, its filename stem AND its
+/// title, then breaks ties by path order. `index.rs` says in as many words that
+/// two definitions of "what names this note" is a bug waiting to happen: the
+/// day the follower and the backlink map disagree, a link opens one note and
+/// appears in another note's backlinks, and nothing in the UI can explain why.
+///
+/// `None` rather than an error for a target nothing answers to: a link to a
+/// note that has not been written yet is an ordinary thing to have in a vault,
+/// and the surface says so where the link is.
+#[tauri::command]
+pub async fn notes_resolve_link(
+    vault_id: String,
+    target: String,
+) -> Result<Option<NoteRefVm>, IpcError> {
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    Ok(snapshot.resolve_link(&target).map(|entry| NoteRefVm {
+        vault_id,
+        id: entry.id.clone(),
+        path: entry.path.clone(),
+        title: entry.title.clone(),
+    }))
+}
+
 /// Every note that links to this one (FR-108).
 #[tauri::command]
 pub async fn notes_backlinks(
@@ -1864,7 +1963,7 @@ fn create_note(
     // into the expanded BODY, which is exactly the space the body channel speaks
     // in — one `\n` away, because the document keeper writes puts a blank line
     // between the block and the body.
-    let choice = template_source(vault, req, space_template);
+    let choice = template_source(vault, req, space_template, seed.capture);
     let (applied, provenance) = match &choice {
         TemplateChoice::Found { rel, source } => {
             let applied = templates::expand(
@@ -2034,28 +2133,43 @@ enum TemplateChoice {
 
 /// The template a create should apply, if any.
 ///
-/// **Three rungs, most specific first** (FR-161, FR-162): the template the
-/// caller named, else the template the space hands out, else the vault's
-/// configured default. A caller naming one is answering a question the space
-/// only implied, and a space naming one is answering a question the vault only
-/// implied.
+/// **Four rungs, most specific first** (FR-161, FR-162, FR-193): the template
+/// the caller named, else the template the space hands out, else — for a quick
+/// capture only — the vault's capture template, else the vault's configured
+/// default. A caller naming one is answering a question the space only implied,
+/// a space naming one is answering a question the vault only implied, and the
+/// capture template sits between them because it is chosen for a surface.
 ///
 /// A template path that names nothing is **not** a failure: the note is created
 /// plain, because losing a thought over a missing scaffold is the wrong trade.
 /// It is also not silent — see [`TemplateChoice::Missing`], whose sentence is
 /// composed in `keeper-core` and reaches both the log and the caller.
+///
+/// The rungs and their order live in `keeper-core` ([`templates::rung`]) rather
+/// than in this `or_else` chain, because this crate does not compile on the
+/// host the decision is proved on (AD-56) — and because the chain used to trim
+/// one rung and not the next, so a blank in the caller's slot fell through and
+/// a blank in the space's slot swallowed the vault default.
 fn template_source(
     vault: &Vault,
     req: &NoteCreateReq,
     space_template: Option<&str>,
+    capture: bool,
 ) -> TemplateChoice {
-    let named = req
-        .template
-        .clone()
-        .filter(|path| !path.trim().is_empty())
-        .or_else(|| space_template.map(str::to_owned))
-        .or_else(|| vault.config.default_template.clone());
-    let Some(named) = named.filter(|path| !path.trim().is_empty()) else {
+    // The capture rung applies exactly when this create IS a capture. Derived
+    // from the seed's own mark rather than passed as a second parameter, so a
+    // future caller cannot acquire a capture's scaffold by forgetting to say
+    // it is not one.
+    let capture_template = capture
+        .then(|| vault.config.capture_template.as_deref())
+        .flatten();
+    let Some(named) = templates::rung(templates::TemplateRungs {
+        named: req.template.as_deref(),
+        space: space_template,
+        capture: capture_template,
+        vault_default: vault.config.default_template.as_deref(),
+    })
+    .map(str::to_owned) else {
         return TemplateChoice::None;
     };
     // A bare name is a file in the template directory; anything with a slash is
@@ -2123,12 +2237,25 @@ pub async fn notes_journal_today(vault_id: String) -> Result<NoteRefVm, IpcError
         .unwrap_or(&rel)
         .trim_end_matches(".md")
         .to_owned();
+    // Which template today's entry starts from (Story 45.20, FR-198).
+    //
+    // This used to be `vault.config.default_template` and nothing else, which
+    // is `None` in every vault whose owner never set one — so 44.7's shipped
+    // `Journal entry` template was seeded into every vault and reached by
+    // nothing. `journal_template` names it when the vault still has it, and
+    // names nothing when the user deleted it, which is what lets the ladder
+    // below fall through to their configured default instead of stopping on a
+    // rung that is not there. The existence check is the shell's one
+    // contribution; the decision is `keeper-core`'s and is asserted there.
+    let present =
+        |candidate: &str| notes_vault::contained(&vault, candidate).is_ok_and(|path| path.exists());
     // No `dest`: the journal path is fixed by the configured template, so the
     // collision counter must not be allowed to move it.
     let req = NoteCreateReq {
         title: Some(title),
         body: None,
-        template: vault.config.default_template.clone(),
+        template: templates::journal_template(&present)
+            .or_else(|| vault.config.default_template.clone()),
         dest: None,
         tags: Vec::new(),
         // Today's journal is reached by `⌘⌥J`, the tray and the palette, never
@@ -2147,60 +2274,30 @@ fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteR
     let id = crate::sync_ipc::new_ulid();
     let title = req.title.clone().unwrap_or_else(today);
     // The journal's template comes from `req.template`, which the caller filled
-    // from the vault's configured default. No space rung: today's entry is
-    // opened by a shortcut, a tray item and the palette, none of which is inside
-    // a space.
-    let (applied, provenance) = match template_source(vault, req, None) {
-        TemplateChoice::Found { rel, source } => {
-            let applied = templates::expand(
-                &source,
-                &templates::TemplateCtx {
-                    title: title.clone(),
-                    id: id.clone(),
-                    now_local: now_local(),
-                },
-            );
-            let provenance = templates::provenance_pairs(&rel, applied.source_id.as_deref());
-            (Some(applied), provenance)
-        }
+    // with the shipped journal scaffold or the vault's configured default. No
+    // space rung: today's entry is opened by a shortcut, a tray item and the
+    // palette, none of which is inside a space.
+    let found = match template_source(vault, req, None) {
+        TemplateChoice::Found { rel, source } => Some((rel, source)),
         // A journal entry is created either way — the whole point of `⌘⌥J` is
         // that today's page is always there. `template_source` has already said
         // so at `INFO`; there is no surface here to carry a notice to.
-        TemplateChoice::Missing { .. } | TemplateChoice::None => (None, Vec::new()),
+        TemplateChoice::Missing { .. } | TemplateChoice::None => None,
     };
-    let (body, caret) = match &applied {
-        Some(applied) => (applied.body.clone(), applied.caret),
-        None => (format!("# {title}\n"), None),
-    };
-    let mut pairs = vec![
-        ("id".to_owned(), FieldValue::Str(id.clone())),
-        ("created".to_owned(), FieldValue::Str(now_local())),
-        ("updated".to_owned(), FieldValue::Str(now_local())),
-    ];
-    // The journal template's tags and properties reach the entry too. Without
-    // this the one note keeper creates on a schedule would be the one note a
-    // template could not shape.
-    if let Some(applied) = &applied {
-        if !applied.tags.is_empty() {
-            pairs.push((
-                "tags".to_owned(),
-                FieldValue::List(
-                    applied
-                        .tags
-                        .iter()
-                        .map(|tag| FieldValue::Str(tag.clone()))
-                        .collect(),
-                ),
-            ));
-        }
-        pairs.extend(applied.properties.iter().cloned());
-    }
-    if !provenance.is_empty() {
-        pairs.push(("keeper".to_owned(), FieldValue::Map(provenance)));
-    }
-    let front = Frontmatter::serialise_new(&pairs);
-    notes_vault::write_note(vault, rel, &format!("{front}\n{body}")).map_err(notes_error)?;
-    if let Some(at) = caret {
+    // The bytes are composed in `keeper-core` (Story 45.20). What used to be
+    // thirty lines of frontmatter assembly here was the only part of "today's
+    // journal applies its template" that no test on a Linux host could reach,
+    // which is exactly why the template never arriving went unnoticed.
+    let note = templates::render_journal_note(
+        found
+            .as_ref()
+            .map(|(rel, source)| (rel.as_str(), source.as_str())),
+        &title,
+        &id,
+        &now_local(),
+    );
+    notes_vault::write_note(vault, rel, &note.text).map_err(notes_error)?;
+    if let Some(at) = note.caret {
         remember_caret(&id, at + 1);
     }
     Ok(NoteRefVm {
@@ -2295,14 +2392,79 @@ pub async fn notes_set_order(
     notes_vault::write_note(&vault, &entry.path, &updated).map_err(notes_error)
 }
 
+/// What deleting this note would remove, in the words the confirmation shows
+/// (Story 45.17, FR-195, UX-DR78).
+///
+/// A separate call from the delete, for `sync_delete_plan`'s reason (Story
+/// 45.3): the sentences are composed by code that knows what the removal does,
+/// so the dialog cannot promise something the command will not do.
+///
+/// **A read failure fails the call rather than describing the note anyway.**
+/// The alternative is a plan built from an empty source, which would silently
+/// drop the clause that says a seeded space stays deleted — a confirmation
+/// missing the one sentence it exists to carry. A note keeper cannot read is
+/// also a note `trash_note` is about to fail on, so nothing is lost by saying
+/// so here.
+#[tauri::command]
+pub async fn notes_delete_plan(
+    vault_id: String,
+    note_id: String,
+) -> Result<NoteDeletePlanVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    // The index says what it is; the file says whose it is. Both are needed and
+    // neither substitutes: `space` is a flag the index computes, and
+    // `keeper.default` is a marker only the seeder writes.
+    Ok(if has_flag(&entry, "space") {
+        NoteDeletePlanVm::for_space(
+            &entry.title,
+            &entry.path,
+            default_spaces::default_key_of(&source).as_deref(),
+        )
+    } else {
+        NoteDeletePlanVm::for_note(&entry.title, &entry.path)
+    })
+}
+
 /// Move a note to the trash and stage its removal (NFR-30). Never an `unlink`.
+///
+/// **This is also how a space is deleted** (Story 45.17, FR-195). A space is a
+/// note, so a second command for it would be a second removal path — and the
+/// one that eventually forgot the ledger. Deleting a seeded default records its
+/// key as offered, which is what stops the next `refresh` seeding it back:
+/// [`default_spaces::record_deleted`] explains why that is the ledger's
+/// existing concept rather than a tombstone this story invented.
 #[tauri::command]
 pub async fn notes_delete(vault_id: String, note_id: String) -> Result<(), IpcError> {
     let vault = vault_of(&vault_id)?;
     let entry = entry_of(&vault_id, &note_id)?;
+    // Read BEFORE the bytes move. `keeper.default` lives in the file, and after
+    // `trash_note` there is nothing at `entry.path` to read it from.
+    let source = notes_vault::read_note(&vault, &entry.path);
     notes_vault::trash_note(&vault, &entry.path)
         .map(drop)
-        .map_err(notes_error)
+        .map_err(notes_error)?;
+    // Unlike the plan above, an unreadable note does NOT fail this: the person
+    // asked for the deletion and it has happened. What it must not do is read
+    // as "not a default" — that is a wrong answer wearing an absent one's
+    // clothes — so the failure becomes the outcome that says keeper could not
+    // tell, at WARN, naming the file.
+    let record = match &source {
+        Ok(text) => default_spaces::record_deleted(&mut VaultSeedFiles { vault: &vault }, text),
+        Err(error) => default_spaces::DeleteRecord::Blocked(format!(
+            "could not read {} before deleting it, so keeper cannot tell whether it was a \
+             default space: {error}",
+            entry.path
+        )),
+    };
+    let (level, message) = record.report();
+    if level <= tracing::Level::WARN {
+        tracing::warn!(vault = %vault.id, "notes: {message}");
+    } else {
+        tracing::info!(vault = %vault.id, "notes: {message}");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2341,6 +2503,10 @@ pub async fn notes_open(
     channel
         .send(NoteBodyBatch::Reset {
             rev: rev.clone(),
+            // The path the subscription was opened on. Already resolved two
+            // lines above; withholding it is what left the editor's own header
+            // caption blank until the first autosave (Story 45.18).
+            path: entry.path.clone(),
             frontmatter: frontmatter.to_owned(),
             text: body.to_owned(),
             // A template's `{{cursor}}`, once, and nothing else: without a hint the
@@ -3667,63 +3833,54 @@ pub async fn notes_embed_write(
 // Capture
 // ---------------------------------------------------------------------------
 
-/// The persisted capture buffer (FR-101).
+/// The note one quick-capture window is holding, creating it when there is
+/// none (FR-101, FR-190, AD-93; Story 45.14).
+///
+/// **This replaced the three `notes_capture_buffer*` commands and
+/// `commit_buffer`.** Those existed because quick capture was a textarea whose
+/// text had nowhere to live until Escape assembled a note out of it. Quick
+/// capture now mounts the real note editor, and a tag is frontmatter on a note
+/// while an attachment is a file copied relative to a note's path — neither can
+/// be applied to a `String` in the settings table. So the note exists before
+/// the first keystroke and the editor's own autosave is the durability, which
+/// is strictly stronger than the 300 ms debounce it replaced.
+///
+/// **Idempotent, and that is the whole design.** A page nobody has written on
+/// is handed back unchanged, so summoning the panel and dismissing it without
+/// typing leaves nothing behind; the first thought written on a page tears it
+/// off, and the next call makes a fresh one. The decision is taken here, from
+/// the bytes on disk, rather than from a claim the window makes about itself —
+/// a caller that says "I did not type anything" is a caller that can be wrong,
+/// and being wrong in one direction litters the vault while being wrong in the
+/// other buries one thought under the next.
+///
+/// `key` names the window (Story 45.15). One global slot would be two capture
+/// windows holding each other's note.
+///
+/// The create goes through [`create_note`] — the one path `notes_create` uses,
+/// with 44.6's `notices` out-parameter attached rather than discarded, which is
+/// how a capture whose configured template could not be read now says so. The
+/// old commit path passed `&mut Vec::new()` because it had no surface to show a
+/// sentence on. It has one now.
 #[tauri::command]
-pub async fn notes_capture_buffer(state: State<'_, AppState>) -> Result<String, IpcError> {
-    read_buffer(state.platform.as_ref())
+pub async fn notes_capture_draft(
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<NoteCreateVm, IpcError> {
+    resolve_capture_draft(state.platform.as_ref(), &key)
 }
 
-/// Read the buffer through the platform port, so the command and the Escape path
-/// share one implementation.
-fn read_buffer(platform: &dyn keeper_core::platform::Platform) -> Result<String, IpcError> {
+/// Hand back this window's untouched page, or make it a new one.
+fn resolve_capture_draft(
+    platform: &dyn keeper_core::platform::Platform,
+    key: &str,
+) -> Result<NoteCreateVm, IpcError> {
     let data_dir = platform
         .data_dir()
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
-    keeper_core::registry::get_capture_buffer(&data_dir)
-        .map_err(|error| notes_error(NotesError::Name(error.to_string())))
-}
-
-/// Persist the capture buffer (FR-101).
-///
-/// Debounced 300 ms by the caller and never on the critical path. It is in
-/// `keeper.db` rather than the webview, so the text survives both dismissal and
-/// `kill -9`.
-#[tauri::command]
-pub async fn notes_capture_buffer_save(
-    state: State<'_, AppState>,
-    text: String,
-) -> Result<(), IpcError> {
-    let data_dir = state
-        .platform
-        .data_dir()
-        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
-    keeper_core::registry::set_capture_buffer(&data_dir, &text)
-        .map_err(|error| notes_error(NotesError::Name(error.to_string())))
-}
-
-/// Write the capture buffer into the active vault and clear it (FR-101).
-///
-/// The buffer is cleared **only after** the write returns, so a failure on a
-/// read-only volume leaves the text exactly where it was.
-#[tauri::command]
-pub async fn notes_capture_commit(
-    state: State<'_, AppState>,
-    text: String,
-) -> Result<NoteRefVm, IpcError> {
-    commit_buffer(state.platform.as_ref(), text)
-}
-
-/// Write `text` into the active vault as a capture note and clear the buffer.
-fn commit_buffer(
-    platform: &dyn keeper_core::platform::Platform,
-    text: String,
-) -> Result<NoteRefVm, IpcError> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err(notes_error(NotesError::Name(
-            "nothing to capture".to_owned(),
-        )));
-    }
+    // Refused up front rather than after the window has taken keystrokes:
+    // there is nowhere to put a thought, and a panel that accepts words it
+    // cannot keep is the failure capture exists to prevent.
     let vault_id = notes_vault::active_vault(platform).ok_or_else(|| IpcError {
         code: IpcErrorCode::Unsupported,
         message: "no notes vault yet — flag a folder you already sync and it becomes one"
@@ -3732,37 +3889,119 @@ fn commit_buffer(
         retriable: false,
     })?;
     let vault = vault_of(&vault_id)?;
-    let reference = create_note(
+
+    let held = keeper_core::registry::get_capture_draft(&data_dir, key)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    if let Some(held) = held {
+        if let Some(note) = untouched_draft(&vault, &held) {
+            return Ok(NoteCreateVm {
+                note,
+                notices: Vec::new(),
+            });
+        }
+    }
+
+    let mut notices = Vec::new();
+    let note = create_note(
         &vault,
+        // Spelled out rather than through `blank_note()`, which is
+        // `#[cfg(desktop)]`: nothing about resolving a page is desktop-only,
+        // and a helper that makes this function unbuildable on another target
+        // is a coupling with no reason behind it.
         &NoteCreateReq {
             title: None,
-            body: Some(text),
+            body: None,
             template: None,
             dest: None,
             tags: Vec::new(),
             space: None,
         },
-        // Capture's one mark, spelled as the seed it always was: the note is
-        // written with `keeper.capture` so the Inbox lens can find an unfiled
-        // thought.
-        &seed::Seed {
-            capture: true,
-            ..seed::Seed::default()
-        },
-        // Capture has no space, so no space template. The vault's configured
-        // default still applies, inside `template_source`.
+        // Everything a capture carries, from the one producer (Story 45.16):
+        // the reserved `keeper.capture` mark the Inbox lens has always read,
+        // plus the vault's configured capture tag when there is one. Both in
+        // `keeper-core` because "what is a capture" must have one answer, and
+        // because the tag interacts with every space's query — which is a
+        // decision this crate cannot prove on the build host (AD-56).
+        &seed::capture(vault.config.capture_tag.as_deref()),
+        // Capture has no space, so no space template. The vault's capture
+        // template — and, failing that, its default — applies inside
+        // `template_source`, which takes the capture rung from this seed's own
+        // mark.
         None,
-        // Nowhere to show a notice from: capture is the path with no dialog and
-        // no return surface (UX-DR35). A missing template is still logged at
-        // `INFO` by `template_source`, which is the only channel this path has.
-        &mut Vec::new(),
+        &mut notices,
     )?;
-    if let Ok(data_dir) = platform.data_dir() {
-        if let Err(error) = keeper_core::registry::set_capture_buffer(&data_dir, "") {
-            tracing::warn!(%error, "notes: captured the note but could not clear the buffer");
-        }
+
+    // What creation put on the page, read back from the file rather than
+    // assembled here: `create_note` expands a template, and a pristine snapshot
+    // that disagreed with the bytes by one placeholder would make every page
+    // look written-on and tear off a fresh note per dismissal.
+    //
+    // `else` rather than `unwrap_or_default()`. A note keeper wrote and then
+    // could not read back is rare — a volume that went away between the two —
+    // but defaulting to the empty string would record a scaffolded page as
+    // having been created blank, and every later comparison would then read it
+    // as written-on. That is the tear-off-every-time failure this snapshot
+    // exists to prevent, arrived at from the other side. No pointer at all is
+    // honest: the next summon makes one fresh note and says why in the log.
+    let Some(pristine) = draft_body(&vault, &note.path) else {
+        tracing::info!(
+            %key,
+            note = %note.path,
+            "notes: captured a page but could not read it back; not remembering it, so the next summon makes a fresh one"
+        );
+        return Ok(NoteCreateVm { note, notices });
+    };
+    let pointer = keeper_core::registry::CaptureDraft {
+        note_id: note.id.clone(),
+        pristine,
+    };
+    if let Err(error) = keeper_core::registry::set_capture_draft(&data_dir, key, Some(&pointer)) {
+        // The note exists and is returned. Losing the pointer costs one extra
+        // untouched note on the next summon, never the thought — said at `INFO`
+        // because a decision only the return value carries is one nobody can
+        // debug from a log (DW-162).
+        tracing::info!(
+            %error,
+            %key,
+            note = %note.path,
+            "notes: captured a page but could not remember it; the next summon makes a fresh one"
+        );
     }
-    Ok(reference)
+    Ok(NoteCreateVm { note, notices })
+}
+
+/// This window's held page, when the note is still there and still says exactly
+/// what creation put on it.
+///
+/// `None` for every other case — the note was deleted, the vault has not
+/// finished indexing, the file cannot be read, somebody wrote in it — and every
+/// one of those means the same thing to the caller: make a fresh page. They are
+/// not distinguished because the answer does not differ, and a note that cannot
+/// be re-read is not a note capture should hand back.
+fn untouched_draft(vault: &Vault, held: &keeper_core::registry::CaptureDraft) -> Option<NoteRefVm> {
+    let snapshot = notes_vault::snapshot(&vault.id)?;
+    let entry = snapshot.by_id(&held.note_id)?;
+    let body = draft_body(vault, &entry.path)?;
+    if !held.is_untouched(&body) {
+        return None;
+    }
+    Some(NoteRefVm {
+        vault_id: vault.id.clone(),
+        id: entry.id.clone(),
+        path: entry.path.clone(),
+        title: entry.title.clone(),
+    })
+}
+
+/// One note's body — the file with its frontmatter block taken off.
+///
+/// The body and not the file, because `updated` is stamped into the block on
+/// every write: comparing whole files would call a page written-on the moment
+/// anything touched it, including keeper itself.
+fn draft_body(vault: &Vault, rel: &str) -> Option<String> {
+    let source = notes_vault::read_note(vault, rel).ok()?;
+    let (_, body_at) = Frontmatter::parse(&source);
+    Some(source.get(body_at..).unwrap_or_default().to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -4143,38 +4382,163 @@ pub async fn notes_capture_show(app: AppHandle) -> Result<(), IpcError> {
     Ok(())
 }
 
-/// Hide the quick-capture panel; `commit: true` is Escape, which saves first.
+/// Hide the quick-capture panel (NFR-27, AD-60).
 ///
-/// Returns the note it wrote, or `None` when there was nothing to write — an
-/// empty Escape is not an error, and with no vault flagged the text stays in the
-/// durable buffer (FR-101).
+/// Hide, and nothing else. It used to take `commit: bool` and assemble a note
+/// out of the panel's text buffer, because until Story 45.14 there was no note
+/// to assemble one from. The panel now holds a real note that has been
+/// autosaving since before the first keystroke, and the caller force-flushes it
+/// (AD-62) before asking for this — so there is nothing left for a flag to
+/// mean, and a `commit: false` that hid without writing would be a way to lose
+/// words that no longer exists.
 #[cfg(desktop)]
 #[tauri::command]
-pub async fn notes_capture_hide(
+pub async fn notes_capture_hide(app: AppHandle) -> Result<(), IpcError> {
+    crate::notes_window::hide(&app);
+    // Dismissing the panel is how a captured thought most often ends, so the
+    // vault's commit cadence is forced here rather than waited for (AD-62).
+    notes_vault::flush();
+    Ok(())
+}
+
+/// Open — or raise — the capture window holding `target` (Story 45.15, FR-191).
+///
+/// The entry point behind "any note opens as a capture window", and the reason
+/// the small window stops being a special kind of note: a capture window is a
+/// *view* of a note, addressed the same way a panel addresses one.
+///
+/// Idempotent by identity. Asking twice for the same note raises the window
+/// that is already there, because the label is derived from the target rather
+/// than handed out by a counter.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_capture_open(
     app: AppHandle,
     state: State<'_, AppState>,
-    commit: bool,
-) -> Result<Option<NoteRefVm>, IpcError> {
-    let mut written = None;
-    if commit {
-        let platform = state.platform.as_ref();
-        let buffer = read_buffer(platform)?;
-        if !buffer.trim().is_empty() {
-            match commit_buffer(platform, buffer) {
-                Ok(reference) => written = Some(reference),
-                Err(error) => {
-                    // The panel still hides and the buffer stays intact: a failed
-                    // flush must not also lose the thought (NFR-30).
-                    tracing::warn!(message = %error.message, "notes: capture flush failed");
-                }
-            }
-        }
-    }
-    crate::notes_window::hide(&app);
-    // Hiding the panel after a capture is the most common way a captured thought
-    // ends, so it is a force-flush point (AD-62).
+    target: keeper_core::capture::CaptureTargetVm,
+) -> Result<(), IpcError> {
+    let data_dir = capture_data_dir(state.platform.as_ref())?;
+    let key = keeper_core::capture::capture_key(&target);
+    let placement = keeper_core::registry::get_capture_placement(&data_dir, &key)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    crate::notes_window::open(&app, &target, placement);
+    Ok(())
+}
+
+/// Close the capture window `key` (Story 45.15, FR-191).
+///
+/// The close button's command, and Escape's. Where it goes — hidden for the
+/// prewarmed window, destroyed for any other, main window raised when nothing
+/// else is left on screen — is
+/// [`keeper_core::capture::plan_close`]'s decision, not this command's.
+///
+/// The window's position is written down on the way out. This is the moment a
+/// placement is persisted, rather than on every `Moved` event, because a drag
+/// emits one event per compositor frame and a settings write per frame would
+/// put a sqlite transaction inside a gesture.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_capture_close(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<(), IpcError> {
+    let position = crate::notes_window::close(&app, &key);
+    remember_placement(state.platform.as_ref(), &key, position);
+    // Dismissing a capture is how a captured thought most often ends, so the
+    // vault's commit cadence is forced here rather than waited for (AD-62).
     notes_vault::flush();
-    Ok(written)
+    Ok(())
+}
+
+/// Lock or unlock the capture window `key` (Story 45.15, FR-192, UX-DR77).
+///
+/// Locked is keeper's placement and an immovable window; unlocked is the user's
+/// and a draggable one. The current position is snapshotted on **either**
+/// transition rather than only on a drag, because a person who unlocks a window
+/// and never moves it has still said "this is where it goes", and a person who
+/// locks one after moving it has said "keep it *there*" — locking is not a
+/// discard button.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_capture_set_locked(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+    locked: bool,
+) -> Result<(), IpcError> {
+    let data_dir = capture_data_dir(state.platform.as_ref())?;
+    let stored = keeper_core::registry::get_capture_placement(&data_dir, &key)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    let placement = keeper_core::capture::Placement {
+        locked,
+        position: crate::notes_window::position_of(&app, &key).or(stored.position),
+    };
+    keeper_core::registry::set_capture_placement(&data_dir, &key, &placement)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    crate::notes_window::announce(&app);
+    Ok(())
+}
+
+/// Every capture window open right now, with what it holds and whether it is
+/// locked (Story 45.15, FR-191).
+///
+/// One command for two readers: the main window renders the list, and a capture
+/// window finds its own row in it by key. A second "what am I?" command would
+/// be a second answer to one question, and the two would disagree the first
+/// time a window was closed while another was reading.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_capture_windows(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<keeper_core::capture::CaptureWindowVm>, IpcError> {
+    let data_dir = capture_data_dir(state.platform.as_ref())?;
+    Ok(crate::notes_window::list(&app, &|key| {
+        keeper_core::registry::get_capture_placement(&data_dir, key)
+            .unwrap_or_default()
+            .locked
+    }))
+}
+
+/// Write down where a capture window is, keeping whatever the lock says.
+///
+/// Called on the way out of a window and on blur, so a position survives a
+/// quit that nobody asked politely for. Never fails a caller: a placement that
+/// could not be stored costs the user a remembered position, and refusing to
+/// close a window over it would cost them the window.
+#[cfg(desktop)]
+pub(crate) fn remember_placement(
+    platform: &dyn keeper_core::platform::Platform,
+    key: &str,
+    position: Option<(i32, i32)>,
+) {
+    let Some(position) = position else {
+        return;
+    };
+    let Ok(data_dir) = platform.data_dir() else {
+        return;
+    };
+    let stored = keeper_core::registry::get_capture_placement(&data_dir, key).unwrap_or_default();
+    let placement = keeper_core::capture::Placement {
+        locked: stored.locked,
+        position: Some(position),
+    };
+    if let Err(error) = keeper_core::registry::set_capture_placement(&data_dir, key, &placement) {
+        tracing::warn!(%error, %key, "notes: could not remember the capture window's position");
+    }
+}
+
+/// The data directory, or a notes-shaped error. Shared by the capture window
+/// commands so the three of them cannot disagree about how a missing data
+/// directory reads.
+#[cfg(desktop)]
+fn capture_data_dir(
+    platform: &dyn keeper_core::platform::Platform,
+) -> Result<std::path::PathBuf, IpcError> {
+    platform
+        .data_dir()
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))
 }
 
 /// Reveal a note's real path in the OS file manager (UX-DR38).
@@ -4229,6 +4593,84 @@ fn contained_in_profile(vault: &Vault, rel_path: &str) -> Result<PathBuf, IpcErr
         ))));
     }
     Ok(canonical)
+}
+
+/// Copy a note, and every file it shows, to a location the user picked
+/// (Story 45.21, FR-199).
+///
+/// **What "export a note" means, and why.** The note's bytes are copied
+/// unchanged and its embedded files are copied to the *same vault-relative
+/// paths* beneath a new folder named after the note. Not the markdown alone,
+/// which lands somewhere its `![[attachments/photo.png]]` means nothing; and
+/// not the markdown with its links rewritten, which would mean the exported
+/// file is no longer the note and cannot be diffed against the vault's copy.
+/// The neighbourhood is reproduced instead of the links being edited. The full
+/// argument is in `keeper_core::notes::export`'s module doc.
+///
+/// **Three crates, one decision each.** Which files the note needs is
+/// `keeper_core::notes::export::plan` — pure, and asked through the same
+/// candidate order the embed viewer resolves in, so an export carries the file
+/// the note *renders*. Whether and where they may be copied is
+/// `keeper_sync::export`. This function is the adapter that holds a vault: it
+/// supplies the on-disk probe, which is `note_protocol::contained_read` — the
+/// same containment check the embed viewer uses, so a symlink out of the vault
+/// cannot be exported by naming it in an embed.
+///
+/// **The buffer is not consulted, and the surface flushes first.** This reads
+/// what is on disk, because an export is a copy of a file. The editor saves
+/// continuously and the Export control saves before calling, so what lands is
+/// what the person can see — a detail that belongs to the surface, because
+/// this command must stay usable for a note nobody has open.
+///
+/// Runs on the blocking pool: a note with forty photographs is forty copies.
+///
+/// Rejects with: `internal` (no such vault, no such note, an unreadable note, a
+/// destination that is missing / is a file / is inside the vault / already
+/// holds the name, or a copy the disk refused). A note whose embed has been
+/// moved is NOT a rejection — it exports, and the receipt names what did not
+/// go.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_export(
+    vault_id: String,
+    note_id: String,
+    destination: String,
+) -> Result<ExportReceiptVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    let body = split_note(&source).1.to_owned();
+    let rel = entry.path.clone();
+    let target = PathBuf::from(&destination);
+
+    let named = rel.clone();
+    let (plan, done) = tokio::task::spawn_blocking(move || {
+        let plan = keeper_core::notes::export::plan(&body, ATTACHMENTS_DIR, &|candidate: &str| {
+            crate::note_protocol::contained_read(&vault, candidate).is_some()
+        });
+        keeper_sync::export::export_note(&vault.root, &rel, &plan.attachments, &target)
+            .map(|done| (plan, done))
+    })
+    .await
+    .map_err(|error| {
+        notes_error(NotesError::Name(format!(
+            "could not export {named}: {error}"
+        )))
+    })?
+    .map_err(|refusal| crate::sync_ipc::export_refused(&refusal))?;
+
+    tracing::info!(
+        rel = %named,
+        carried = plan.attachments.len(),
+        missing = plan.missing.len(),
+        "notes: exported a note out of keeper"
+    );
+    Ok(ExportReceiptVm::note(
+        done.path.display().to_string(),
+        keeper_sync::export::file_name_of(&named),
+        done.written,
+        plan,
+    ))
 }
 
 #[cfg(test)]

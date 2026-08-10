@@ -75,7 +75,7 @@ beforeEach(() => {
       // the end of whatever the store held when its lazy chunk landed.
       cursor: 0,
       path: "n.md",
-    } as NoteBodyBatch);
+    });
     return "sub-1";
   });
 });

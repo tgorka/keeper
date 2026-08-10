@@ -65,11 +65,29 @@ if (!globalThis.ResizeObserver) {
 //
 // The shim answers with one screen — and ONLY when the real answer is all
 // zeros, so any test that arranges a real geometry still sees its own numbers.
+//
+// It also stops at the edge of a CodeMirror editor, and that exclusion is
+// load-bearing rather than tidy. CodeMirror measures LINE heights with the same
+// call, so an unscoped shim tells it every line is 768px tall; it then decides a
+// seven-line note is taller than the screen and virtualises the middle away into
+// a `<div class="cm-gap" style="height: 3840px">`. The lines are not slow to
+// arrive, they are never rendered at all — so no timeout saves it, and the
+// failure reads as "the link decoration was never built".
+//
+// It was intermittent because the measurement runs on an animation frame: a test
+// that finished its assertions before that frame saw the whole document, and one
+// that lost the race to a busy box saw the gap. Measured at roughly one run in
+// six of `src/components/notes/` under a full-suite load; zero in eighteen after.
+// jsdom's honest zeros are what CodeMirror wants — with no height to exceed, it
+// renders the whole document, which is the behaviour every editor test assumes.
 const VIEWPORT = { width: 1024, height: 768 };
 const measure = Element.prototype.getBoundingClientRect;
 Element.prototype.getBoundingClientRect = function shimmedRect(this: Element): DOMRect {
   const real = measure.call(this);
   if (real.width !== 0 || real.height !== 0 || real.x !== 0 || real.y !== 0) {
+    return real;
+  }
+  if (this.closest(".cm-editor") !== null) {
     return real;
   }
   return {

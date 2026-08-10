@@ -28,7 +28,11 @@
 //! `is:` means. The frontend sends "which space", and Rust answers with a note
 //! and, when it must, one finished sentence (AD-55, AD-58).
 
+use std::collections::BTreeMap;
+
 use crate::notes::index::IndexEntry;
+use crate::notes::naming;
+use crate::notes::order::NoteOrder;
 use crate::notes::query::{self, Term};
 use crate::notes::tags;
 use crate::notes::templates;
@@ -42,6 +46,12 @@ use crate::notes::templates;
 /// vault whose template points elsewhere would otherwise get a note that says
 /// it is in the Journal space and is not.
 pub const JOURNAL_DIR: &str = "journal";
+
+/// The folder prefix that makes the index flag a note `space`.
+///
+/// Inverts `keeper::notes_vault::parse_note`'s `rel.starts_with("spaces/")`,
+/// with the separator baked in so a folder called `spaces-archive` is not one.
+pub const SPACES_DIR: &str = "spaces/";
 
 /// Characters that make a path segment a pattern rather than a folder name.
 const GLOB_META: [char; 6] = ['*', '?', '[', ']', '{', '}'];
@@ -293,80 +303,224 @@ fn join_terms(terms: &[String]) -> String {
     }
 }
 
+/// The tag a configured capture-tag setting actually yields, or `None`
+/// (Story 45.16, FR-193).
+///
+/// **One rule, read by both ends.** The settings save stores what this returns
+/// so the form shows the value actually in force (AD-34-8), and [`capture`]
+/// applies it. Storing what the user typed and folding it later would put two
+/// spellings of one tag in front of them — the field saying `#Quick Capture`
+/// and the note saying `quick-capture`.
+///
+/// Two refusals, both of which produce "no tag" rather than a bad one:
+///
+/// - **A tag that is not a tag.** `tags::normalise` already rejects `"   "`, a
+///   bare `#` and `---`. Cleared and unusable are one state; inventing a
+///   literal `---` tag out of the second is how a vault acquires a tag nobody
+///   can type again.
+/// - **The `template` marker itself.** AD-82 makes `template` mean "this note
+///   is a scaffold", so a capture tag spelled `template` would make every
+///   thought the user captures a template of itself — the exact failure 44.7's
+///   marker-stripping exists to prevent, arriving through the front door
+///   instead. A nested `template/inbox` is somebody's own filing under a word
+///   keeper reserves at the root and is left alone, which is 44.7's ruling for
+///   the copy path spelled the same way here.
+pub fn capture_tag(configured: &str) -> Option<String> {
+    let tag = tags::normalise(configured)?;
+    (tag != templates::TEMPLATE_TAG).then_some(tag)
+}
+
+/// The seed a quick capture creates with (Story 45.16, FR-193).
+///
+/// One producer for both things a captured note carries, because there were
+/// about to be two: the reserved `keeper.capture` mark lived in the shell's
+/// commit path and the configured tag would have landed beside it. Two
+/// producers of "what a capture carries" drift the moment one of them gains a
+/// rule, and the symptom is a note that is a capture to one surface and not to
+/// another.
+pub fn capture(tag: Option<&str>) -> Seed {
+    Seed {
+        capture: true,
+        tags: tag.and_then(capture_tag).into_iter().collect(),
+        ..Seed::default()
+    }
+}
+
+/// Whether `query` selects the note a quick capture *would* write, and what to
+/// say when it does not.
+///
+/// This exists because 44.7 refused to tag its shipped templates and wrote down
+/// why: Inbox is `is:untagged`, so a template that tags its copies files every
+/// one of them straight out of the space that offered it. A capture tag is the
+/// same hazard with a wider blast radius — it is not one template's notes, it
+/// is every thought the user captures — and the honest way to know is to run
+/// the space's real query through [`verdict`] rather than to reason about
+/// `is:untagged` in a comment.
+///
+/// **Two facts about a capture are unknowable in advance**, and both are passed
+/// as empty rather than invented: its title (the first line of text not yet
+/// typed) and its body. So a space selecting on `text:` or on a title reports
+/// that a capture will not appear, which is the honest answer to *will captures
+/// appear here* and not a claim about any particular one.
+pub fn capture_verdict(
+    space_name: &str,
+    query: &str,
+    tag: Option<&str>,
+    stamp: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let entry = projected(&capture(tag), "", "", stamp, now_ms);
+    verdict(space_name, query, &entry, "", now_ms)
+}
+
+/// What configuring `tag` would COST this space, or `None` when it costs it
+/// nothing (Story 45.16, FR-193).
+///
+/// `Some` only when the space lists a capture today and would stop. The
+/// filtering is the decision, and it lives here rather than in the shell's
+/// command because it is the difference between a surface that names the one
+/// space you are about to lose and one that lists your whole rail with a
+/// warning beside every row nobody could act on.
+///
+/// The three cases that are deliberately silent:
+///
+/// - **A space that never listed captures.** Not a cost of turning the tag on;
+///   it was already not listing them and the tag changed nothing.
+/// - **A space that lists them either way.** Nothing to say.
+/// - **A space the tag would ADD captures to** — the `tag:` space this setting
+///   exists to make possible. A gain is not a cost, and a surface that
+///   announced gains would be promising that a space the user has not written
+///   yet will fill up.
+pub fn capture_tag_cost(
+    space_name: &str,
+    query: &str,
+    tag: Option<&str>,
+    stamp: &str,
+    now_ms: i64,
+) -> Option<String> {
+    if capture_verdict(space_name, query, None, stamp, now_ms).is_some() {
+        return None;
+    }
+    capture_verdict(space_name, query, tag, stamp, now_ms)
+}
+
+/// The index entry a note created with `seed` would produce.
+///
+/// It mirrors `keeper::notes_vault::parse_note` for exactly the facts a [`Seed`]
+/// can set — the two boolean flags, the journal folder, the capture mark, the
+/// template tag and the tag list — and **nothing else**: a fact a seed cannot
+/// set is absent here rather than guessed, so a query that reads one gets the
+/// same answer it would get for a note that has not acquired it yet.
+///
+/// It is a model of the shell's parser, and that is a real risk worth naming:
+/// the shell is where the bytes are actually read, and this crate cannot
+/// compile it (AD-56). What keeps the two honest is that the *rules* mirrored
+/// here are each one line over there and each already lives in this crate —
+/// `templates::is_template` decides the template flag, [`JOURNAL_DIR`] inverts
+/// the journal one — so the model can only drift by someone adding a rule to
+/// the parser, which is the moment to add it here.
+///
+/// `stamp` is the local timestamp keeper writes into `created:` and `updated:`;
+/// its first ten characters are the date [`naming::note_filename`] prefixes, so
+/// the filename this projects is the filename a create would pick in an empty
+/// folder. `now_ms` must mean the same instant as `stamp`, because the date
+/// predicates compare against it.
+pub fn projected(seed: &Seed, title: &str, body: &str, stamp: &str, now_ms: i64) -> IndexEntry {
+    let dir = seed.dest.clone().unwrap_or_default();
+    let date = stamp.get(..DATE_LEN).unwrap_or_default();
+    let filename = naming::note_filename(title, date, &[]);
+    let path = if dir.is_empty() {
+        filename
+    } else {
+        format!("{dir}/{filename}")
+    };
+    let mut flags = Vec::new();
+    if seed.pinned {
+        flags.push("pinned".to_owned());
+    }
+    if seed.archived {
+        flags.push("archived".to_owned());
+    }
+    if path.starts_with(&format!("{JOURNAL_DIR}/")) {
+        flags.push("journal".to_owned());
+    }
+    if seed.capture {
+        flags.push("capture".to_owned());
+    }
+    // The one folder whose PREFIX decides a file's kind. `is:space` declines to
+    // seed a destination for exactly that reason, but `path:spaces/**` does
+    // not — so a seed really can land here, and a projection that missed it
+    // would tell a spaces space its new note will not appear when it will.
+    if path.starts_with(SPACES_DIR) {
+        flags.push("space".to_owned());
+    }
+    // 44.7's rule, mirrored whole: a template is a note TAGGED `template`
+    // (AD-82), **or** one under the grandfathered `templates/` prefix.
+    // `notes_vault::parse_note` is `is_template(&fm) || rel.starts_with(…)` and
+    // both halves are reachable from a seed — the tag through `is:template`,
+    // the prefix through `path:templates/**`.
+    if seed.tags.iter().any(|tag| tag == templates::TEMPLATE_TAG)
+        || path.starts_with(&format!("{}/", templates::TEMPLATES_DIR))
+    {
+        flags.push("template".to_owned());
+    }
+    let mut fields = BTreeMap::new();
+    fields.insert("created".to_owned(), stamp.to_owned());
+    fields.insert("updated".to_owned(), stamp.to_owned());
+    let mut tags = seed.tags.clone();
+    tags.sort();
+    IndexEntry {
+        id: PROJECTED_ID.to_owned(),
+        path,
+        title: title.to_owned(),
+        size: 0,
+        mtime_ns: i128::from(now_ms) * 1_000_000,
+        ino: 1,
+        created_ms: now_ms,
+        updated_ms: now_ms,
+        tags,
+        fields,
+        links: Vec::new(),
+        flags,
+        snippet: body.to_owned(),
+        order: NoteOrder::default(),
+    }
+}
+
+/// `YYYY-MM-DD` — the leading characters of the stamp keeper writes, which is
+/// the date a note's filename is prefixed with.
+const DATE_LEN: usize = 10;
+
+/// The id [`projected`] gives a note that does not exist yet.
+///
+/// A note keeper is about to write has no ULID until the create path mints one,
+/// and no query predicate reads an id — `link:` and `backlink:` read the links
+/// list, which a new note has none of. A recognisable constant rather than an
+/// empty string, so anything that does surface it says where it came from.
+const PROJECTED_ID: &str = "01PROJECTEDNOTE";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::notes::default_spaces::DEFAULT_SPACES;
-    use crate::notes::order::NoteOrder;
-    use std::collections::BTreeMap;
 
     /// Ten in the morning on 2026-08-09, UTC, in ms. Every date assertion below
     /// is relative to it, so none of them changes meaning tomorrow.
     const NOW_MS: i64 = 1_786_600_000_000;
 
-    /// The index entry the shell's parser would produce for a note created with
-    /// `seed`.
-    ///
-    /// This mirrors `keeper::notes_vault::parse_note` for exactly the facts a
-    /// seed can set, and nothing else — it is a test double for the *shell*, so
-    /// that these tests can assert the round trip (a seed derived from a query
-    /// really does produce a note that query selects) on a host that cannot
-    /// build the Tauri crate (AD-56). Production never calls it: the shell
-    /// hands `verdict` an entry from the real parser.
-    fn as_created(seed: &Seed, title: &str, body: &str) -> IndexEntry {
-        let dir = seed.dest.clone().unwrap_or_default();
-        let path = if dir.is_empty() {
-            "2026-08-09-note.md".to_owned()
-        } else {
-            format!("{dir}/2026-08-09-note.md")
-        };
-        let mut flags = Vec::new();
-        if seed.pinned {
-            flags.push("pinned".to_owned());
-        }
-        if seed.archived {
-            flags.push("archived".to_owned());
-        }
-        if path.starts_with(&format!("{JOURNAL_DIR}/")) {
-            flags.push("journal".to_owned());
-        }
-        if seed.capture {
-            flags.push("capture".to_owned());
-        }
-        // 44.7's rule, mirrored: a template is a note TAGGED `template`, not a
-        // note in a folder keeper owns (AD-82). `notes_vault::parse_note` reads
-        // it through `templates::is_template`, off the same frontmatter tag
-        // list the seed writes.
-        if seed.tags.iter().any(|tag| tag == templates::TEMPLATE_TAG) {
-            flags.push("template".to_owned());
-        }
-        let mut fields = BTreeMap::new();
-        fields.insert("created".to_owned(), "2026-08-09T10:00:00+00:00".to_owned());
-        fields.insert("updated".to_owned(), "2026-08-09T10:00:00+00:00".to_owned());
-        let mut tags = seed.tags.clone();
-        tags.sort();
-        IndexEntry {
-            id: "01SEEDNOTE".to_owned(),
-            path,
-            title: title.to_owned(),
-            size: 0,
-            mtime_ns: i128::from(NOW_MS) * 1_000_000,
-            ino: 1,
-            created_ms: NOW_MS,
-            updated_ms: NOW_MS,
-            tags,
-            fields,
-            links: Vec::new(),
-            flags,
-            snippet: body.to_owned(),
-            order: NoteOrder::default(),
-        }
-    }
+    /// The same instant as [`NOW_MS`], spelled the way keeper writes it into
+    /// `created:` — the two have to agree or the date predicates and the
+    /// filename would be describing different days.
+    const STAMP: &str = "2026-08-09T10:00:00+00:00";
 
     /// Create into `query` and report what the user would be told.
+    ///
+    /// Goes through [`projected`], which is production code since 45.16 — the
+    /// test double it replaced was a second model of the same parser, and two
+    /// models of one thing is the defect this whole module exists to refuse.
     fn create_into(name: &str, query: &str) -> (Seed, Option<String>) {
         let seed = inherit(query);
-        let entry = as_created(&seed, "Note", "");
+        let entry = projected(&seed, "Note", "", STAMP, NOW_MS);
         let told = verdict(name, query, &entry, "", NOW_MS);
         (seed, told)
     }
@@ -591,7 +745,7 @@ mod tests {
     #[test]
     fn a_text_term_is_answered_from_the_body_the_note_will_actually_have() {
         let seed = inherit("text:agenda");
-        let entry = as_created(&seed, "Note", "");
+        let entry = projected(&seed, "Note", "", STAMP, NOW_MS);
         assert!(verdict("Agenda", "text:agenda", &entry, "", NOW_MS).is_some());
         assert_eq!(
             verdict("Agenda", "text:agenda", &entry, "## Agenda\n", NOW_MS),
@@ -653,5 +807,325 @@ mod tests {
         let (seed, told) = create_into("Impossible", "tag:work is:untagged");
         assert_eq!(seed.tags, ["work"]);
         assert!(told.is_some_and(|sentence| sentence.contains("is:untagged")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 45.16 — what a quick capture carries, and where it lands
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_capture_carries_the_mark_and_the_configured_tag() {
+        let seed = capture(Some("#Quick Capture"));
+        assert!(seed.capture, "a capture is still a capture");
+        assert_eq!(
+            seed.tags,
+            ["quick-capture"],
+            "the stored tag is the canonical one, not what was typed"
+        );
+        assert_eq!(
+            seed.dest, None,
+            "a capture is filed by tag, never by folder"
+        );
+    }
+
+    /// The default every existing vault keeps: no capture tag configured, so a
+    /// capture is exactly the note it has always been.
+    #[test]
+    fn a_capture_with_no_tag_configured_is_untagged_and_still_a_capture() {
+        let seed = capture(None);
+        assert!(seed.capture);
+        assert!(seed.tags.is_empty());
+    }
+
+    /// Cleared and unusable are one state, at both ends of the setting.
+    #[test]
+    fn a_configured_value_that_is_not_a_tag_yields_no_tag_at_all() {
+        for typed in ["", "   ", "#", "###", "---", "/", "//"] {
+            assert_eq!(capture_tag(typed), None, "{typed:?} was accepted");
+            let seed = capture(Some(typed));
+            assert!(seed.tags.is_empty(), "{typed:?} became {:?}", seed.tags);
+            assert!(seed.capture, "{typed:?} stopped being a capture");
+        }
+    }
+
+    /// AD-82's marker is not available as a capture tag: it would make every
+    /// thought the user captures a template of itself, which is the failure
+    /// 44.7 strips the marker on copy to prevent.
+    #[test]
+    fn the_template_marker_is_refused_as_a_capture_tag_however_it_is_spelled() {
+        for typed in ["template", "#Template", "  TEMPLATE  "] {
+            assert_eq!(capture_tag(typed), None, "{typed:?} was accepted");
+            assert!(capture(Some(typed)).tags.is_empty(), "{typed:?}");
+        }
+        assert!(
+            !projected(&capture(Some("template")), "", "", STAMP, NOW_MS)
+                .has_flag(templates::TEMPLATE_TAG),
+            "a capture must never be indexed as a template"
+        );
+    }
+
+    /// Somebody's own filing under a word keeper reserves at the root. 44.7
+    /// leaves `template/daily` on a copied note for the same reason.
+    #[test]
+    fn a_tag_merely_filed_under_template_is_a_usable_capture_tag() {
+        assert_eq!(
+            capture_tag("Template/Inbox").as_deref(),
+            Some("template/inbox")
+        );
+        assert!(
+            !projected(&capture(Some("template/inbox")), "", "", STAMP, NOW_MS)
+                .has_flag(templates::TEMPLATE_TAG)
+        );
+    }
+
+    /// **The finding this story had to answer, asked rather than reasoned
+    /// about.** 44.7 shipped its templates untagged because Inbox is
+    /// `is:untagged`; a capture tag is the same hazard aimed at every captured
+    /// thought instead of one template's copies. The answer comes from Inbox's
+    /// own stored query, run by the one evaluator.
+    #[test]
+    fn a_capture_tag_files_every_capture_out_of_the_inbox() {
+        let inbox = DEFAULT_SPACES
+            .iter()
+            .find(|space| space.key == "inbox")
+            .expect("a vault has an Inbox");
+        assert_eq!(
+            inbox.query, "is:untagged",
+            "this test is only meaningful while Inbox selects the unfiled"
+        );
+        assert_eq!(
+            capture_verdict(inbox.name, inbox.query, None, STAMP, NOW_MS),
+            None,
+            "an untagged capture is what the Inbox is for"
+        );
+        let told = capture_verdict(inbox.name, inbox.query, Some("capture"), STAMP, NOW_MS)
+            .expect("a tagged capture is not untagged, and the user has to be told");
+        assert!(
+            told.contains("is:untagged") && told.contains("Inbox"),
+            "the sentence must name the term and the space: {told}"
+        );
+    }
+
+    /// The other half of the trade: the tag buys a space of its own, and that
+    /// space is a `tag:` query rather than a folder (FR-193).
+    #[test]
+    fn a_space_selecting_the_capture_tag_lists_a_capture_and_only_a_tagged_one() {
+        assert_eq!(
+            capture_verdict("Captures", "tag:capture", Some("capture"), STAMP, NOW_MS),
+            None
+        );
+        assert!(
+            capture_verdict("Captures", "tag:capture", None, STAMP, NOW_MS).is_some(),
+            "with no tag configured there is nothing for a tag space to select"
+        );
+        // A subtree term is satisfied by the tag underneath it, so a user who
+        // files captures at `inbox/capture` still gets a `tag:inbox` space.
+        assert_eq!(
+            capture_verdict("Unfiled", "tag:inbox", Some("inbox/capture"), STAMP, NOW_MS),
+            None
+        );
+    }
+
+    /// Every space a fresh vault has, both ways, in one table — because the
+    /// question "what does this setting cost me" has exactly as many answers as
+    /// 44.3 seeds and no fewer.
+    ///
+    /// The length assertion is deliberate: a new default space is a new answer
+    /// to "does a captured thought land here", and a silently unconsidered one
+    /// is how a shipped surface stops showing captures without anybody deciding
+    /// it should.
+    #[test]
+    fn what_a_capture_tag_does_to_every_space_a_fresh_vault_is_seeded_with() {
+        // key, lists an untagged capture, lists a capture tagged `capture`
+        let expected = [
+            ("inbox", true, false),
+            ("journal", false, false),
+            ("pinned", false, false),
+            ("recordings", false, false),
+            // 45.20's Templates space. A capture is never a template, whichever
+            // way the setting is left — `capture_tag` refuses the marker, so
+            // there is no configuration that files captured thoughts in among
+            // the scaffolds.
+            ("templates", false, false),
+        ];
+        assert_eq!(
+            expected.len(),
+            DEFAULT_SPACES.len(),
+            "a default space was added or removed without saying what a capture tag does to it — \
+             add its key here with the two answers this test measures"
+        );
+        for (key, untagged, tagged) in expected {
+            let space = DEFAULT_SPACES
+                .iter()
+                .find(|space| space.key == key)
+                .unwrap_or_else(|| panic!("no default named {key}"));
+            assert_eq!(
+                capture_verdict(space.name, space.query, None, STAMP, NOW_MS).is_none(),
+                untagged,
+                "{key} ({}) with no capture tag",
+                space.query
+            );
+            assert_eq!(
+                capture_verdict(space.name, space.query, Some("capture"), STAMP, NOW_MS).is_none(),
+                tagged,
+                "{key} ({}) with the capture tag",
+                space.query
+            );
+        }
+    }
+
+    /// `is:capture` was already in the vocabulary before this story and stays
+    /// the tag-free way to find captures — a vault that wants them out of the
+    /// Inbox has the tag, and a vault that wants them in it still has this.
+    #[test]
+    fn the_reserved_capture_mark_selects_a_capture_with_or_without_a_tag() {
+        for tag in [None, Some("capture")] {
+            assert_eq!(
+                capture_verdict("Unfiled", "is:capture", tag, STAMP, NOW_MS),
+                None,
+                "{tag:?}"
+            );
+        }
+    }
+
+    /// A space seeded from `tag:<capture tag>` is the space the setting is for,
+    /// and creating into it by hand must produce the same note capture does.
+    #[test]
+    fn creating_by_hand_into_a_capture_space_seeds_the_same_tag_capture_writes() {
+        let (seeded, told) = create_into("Captures", "tag:capture");
+        assert_eq!(seeded.tags, capture(Some("capture")).tags);
+        assert_eq!(told, None);
+    }
+
+    /// [`projected`] answers about the note a create would write, so the two
+    /// facts a capture cannot know in advance must be absent rather than
+    /// invented — an invented body would make a `text:` space claim a capture
+    /// will appear in it.
+    #[test]
+    fn a_capture_verdict_never_pretends_to_know_what_has_not_been_typed() {
+        assert!(
+            capture_verdict("Agenda", "text:agenda", Some("capture"), STAMP, NOW_MS).is_some(),
+            "keeper cannot promise a space that reads the body"
+        );
+        let entry = projected(&capture(None), "", "", STAMP, NOW_MS);
+        assert!(entry.snippet.is_empty());
+        assert!(entry.title.is_empty());
+    }
+
+    /// The filename comes from the real namer and the stamp's own date, so the
+    /// path a `path:` space is asked about is the path a create would pick.
+    #[test]
+    fn a_projected_note_is_named_the_way_the_create_path_names_one() {
+        assert_eq!(
+            projected(&Seed::default(), "Standup notes", "", STAMP, NOW_MS).path,
+            "2026-08-09-standup-notes.md"
+        );
+        assert_eq!(
+            projected(&capture(None), "", "", STAMP, NOW_MS).path,
+            "2026-08-09-untitled.md"
+        );
+        // A stamp too short to carry a date leaves the name undated rather than
+        // panicking on a slice: `note_filename` already treats "" as no date.
+        assert_eq!(
+            projected(&Seed::default(), "Note", "", "2026", NOW_MS).path,
+            "note.md"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shape audit (see the story spec) — probes from shapes peers were bitten
+    // by, after the sweep was already green.
+    // -----------------------------------------------------------------------
+
+    /// A5. [`projected`]'s doc comment claims to mirror
+    /// `notes_vault::parse_note` "for exactly the facts a Seed can set". It did
+    /// not: the parser flags `space` from a `spaces/` prefix and `template`
+    /// from a `templates/` prefix, and a seed reaches BOTH through `path:` —
+    /// `is:space` declines to seed a destination, but `path:spaces/**` does
+    /// not. So a `path:templates/**` space was told its new note would not
+    /// appear when it would.
+    #[test]
+    fn a_projected_note_carries_the_flags_its_folder_gives_it_and_not_only_its_tags() {
+        let into_spaces = inherit("path:spaces/**");
+        assert_eq!(into_spaces.dest.as_deref(), Some("spaces"), "reachable");
+        assert!(projected(&into_spaces, "Note", "", STAMP, NOW_MS).has_flag("space"));
+        assert_eq!(
+            verdict(
+                "Saved views",
+                "path:spaces/** is:space",
+                &projected(&into_spaces, "Note", "", STAMP, NOW_MS),
+                "",
+                NOW_MS
+            ),
+            None
+        );
+
+        let into_templates = inherit("path:templates/**");
+        assert_eq!(
+            into_templates.dest.as_deref(),
+            Some("templates"),
+            "reachable"
+        );
+        assert!(
+            projected(&into_templates, "Note", "", STAMP, NOW_MS).has_flag(templates::TEMPLATE_TAG),
+            "44.7 grandfathers the folder, and the projection has to grandfather it too"
+        );
+        // A folder that merely BEGINS with the word is not the folder.
+        let elsewhere = Seed {
+            dest: Some("spaces-archive".to_owned()),
+            ..Seed::default()
+        };
+        assert!(!projected(&elsewhere, "Note", "", STAMP, NOW_MS).has_flag("space"));
+    }
+
+    /// A9. The positive witness for every `!has_flag(TEMPLATE_TAG)` assertion
+    /// above. Without one, a renamed or broken `has_flag` would make each of
+    /// them pass for the wrong reason and nothing in the file could tell.
+    #[test]
+    fn the_template_flag_is_really_set_when_the_seed_really_asks_for_it() {
+        let seed = inherit("is:template");
+        assert_eq!(seed.tags, [templates::TEMPLATE_TAG]);
+        assert!(projected(&seed, "Note", "", STAMP, NOW_MS).has_flag(templates::TEMPLATE_TAG));
+    }
+
+    /// A6. The filter the Settings surface renders, which was a decision living
+    /// in an uncompilable shell command until this probe. All four quadrants,
+    /// because three of them are silent and a function that returned a sentence
+    /// for any of those three would bury the one row that matters.
+    #[test]
+    fn the_cost_of_a_capture_tag_is_only_what_the_tag_takes_away() {
+        // Lists an untagged capture, not a tagged one — the only cost there is.
+        let told = capture_tag_cost("Inbox", "is:untagged", Some("capture"), STAMP, NOW_MS)
+            .expect("the Inbox stops listing captures and that is the whole point");
+        assert!(
+            told.contains("is:untagged") && told.contains("Inbox"),
+            "{told}"
+        );
+        // Lists them either way.
+        assert_eq!(
+            capture_tag_cost("Unfiled", "is:capture", Some("capture"), STAMP, NOW_MS),
+            None
+        );
+        // Never listed them: not a cost of turning the tag on.
+        assert_eq!(
+            capture_tag_cost("Pinned", "is:pinned", Some("capture"), STAMP, NOW_MS),
+            None
+        );
+        // A GAIN — the space this setting exists to make possible. Silent,
+        // because a surface that announced it would be promising a space fills.
+        assert_eq!(
+            capture_tag_cost("Captures", "tag:capture", Some("capture"), STAMP, NOW_MS),
+            None
+        );
+        // And no tag costs nothing anywhere, which is what makes the control's
+        // off state honest rather than merely quiet.
+        for space in DEFAULT_SPACES {
+            assert_eq!(
+                capture_tag_cost(space.name, space.query, None, STAMP, NOW_MS),
+                None,
+                "{}",
+                space.key
+            );
+        }
     }
 }

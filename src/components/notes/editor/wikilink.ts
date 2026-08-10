@@ -44,6 +44,18 @@ export const WIKILINK = /!?\[\[([^[\]|]+)(?:\|([^[\]]+))?]]/g;
 /** The attribute a click handler reads the link target back out of. */
 export const WIKILINK_ATTR = "data-keeper-wikilink";
 
+/**
+ * The attribute a click handler reads an ORDINARY markdown link's destination
+ * out of (Story 45.18).
+ *
+ * Beside {@link WIKILINK_ATTR} because the two are read by one handler and
+ * differ only in what they carry — a note's name, or a URL. Separate from the
+ * `title` the same decoration already sets: `title` is what a hover shows and a
+ * user-visible string is not a data channel, so a future story that shortens a
+ * long destination for display would silently break following it.
+ */
+export const LINK_ATTR = "data-keeper-link";
+
 /** Replace the typed name with `name]]`, swallowing brackets already closed
  *  for us, and park the caret after the link. */
 function insertLink(view: EditorView, from: number, to: number, name: string): void {

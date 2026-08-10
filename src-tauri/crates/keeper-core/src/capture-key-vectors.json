@@ -1,0 +1,90 @@
+[
+  {
+    "target": {
+      "kind": "draft"
+    },
+    "key": "draft",
+    "search": ""
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "vault-a",
+      "noteId": "note-1"
+    },
+    "key": "note:vault-a/note-1",
+    "search": "?vault=vault-a&note=note-1"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "a",
+      "noteId": "b/c"
+    },
+    "key": "note:a/b%2Fc",
+    "search": "?vault=a&note=b%2Fc"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "a/b",
+      "noteId": "c"
+    },
+    "key": "note:a%2Fb/c",
+    "search": "?vault=a%2Fb&note=c"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "vault one",
+      "noteId": "note two.md"
+    },
+    "key": "note:vault%20one/note%20two.md",
+    "search": "?vault=vault%20one&note=note%20two.md"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "café",
+      "noteId": "résumé"
+    },
+    "key": "note:caf%C3%A9/r%C3%A9sum%C3%A9",
+    "search": "?vault=caf%C3%A9&note=r%C3%A9sum%C3%A9"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "a~b!c*d'e(f)g",
+      "noteId": "-_."
+    },
+    "key": "note:a~b!c*d'e(f)g/-_.",
+    "search": "?vault=a~b%21c%2Ad%27e%28f%29g&note=-_."
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "a+b",
+      "noteId": "c&d=e"
+    },
+    "key": "note:a%2Bb/c%26d%3De",
+    "search": "?vault=a%2Bb&note=c%26d%3De"
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "",
+      "noteId": ""
+    },
+    "key": "note:/",
+    "search": "?vault=&note="
+  },
+  {
+    "target": {
+      "kind": "note",
+      "vaultId": "emoji 🗒",
+      "noteId": "x"
+    },
+    "key": "note:emoji%20%F0%9F%97%92/x",
+    "search": "?vault=emoji%20%F0%9F%97%92&note=x"
+  }
+]

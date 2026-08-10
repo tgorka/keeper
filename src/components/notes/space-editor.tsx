@@ -6,6 +6,13 @@
  * This is the surface that ends that — a name, an icon from a fixed set, and the
  * space's terms as Story 43.3's three-state chips.
  *
+ * **The icon set is a chooser now, not a wall** (Story 45.20, UX-DR82). 44.4 took
+ * ten glyphs to twenty-four and drew them as one flat wrap, which is about the
+ * largest a flat wrap gets before picking one means reading every glyph. The set
+ * is much larger, {@link "@/components/notes/space-icons"} groups it, and a
+ * search field over the names is what makes the size an asset. Still fixed, for
+ * 44.4's reason unchanged.
+ *
  * **The chips are the ones from the filter bar, told what to do.** Not a copy:
  * {@link TagFilterChip} carries three redundant carriers of a chip's state and
  * the accessible name is the one nobody would notice rotting, so it has exactly
@@ -31,37 +38,10 @@
  * — a saved view that silently widens to the whole vault is how a bulk action
  * becomes a data-loss story.
  */
-import {
-  Archive,
-  Bell,
-  Bookmark,
-  Briefcase,
-  CalendarDays,
-  Clock,
-  Code,
-  FileText,
-  Flag,
-  Folder,
-  Globe,
-  Hash,
-  Heart,
-  Inbox,
-  Layers,
-  Lightbulb,
-  type LucideIcon,
-  Mic,
-  Pin,
-  Search,
-  Star,
-  Tag,
-  Target,
-  Users,
-  Video,
-  Zap,
-} from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { tagPaths } from "@/components/notes/editor/tag-complete";
 import { TagFilterChip } from "@/components/notes/note-filter-bar";
+import { matchSpaceIcons, type SpaceIconGroup, spaceIcon } from "@/components/notes/space-icons";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import {
@@ -85,66 +65,21 @@ import {
 } from "@/lib/stores/notes-filters";
 import { cn } from "@/lib/utils";
 
-/**
- * The icons a space may carry, keyed by the name stored in its frontmatter.
+/** How many icons the chooser shows before it needs its own scroll region.
  *
- * Fixed, and now twenty-four rather than ten (Story 44.4). Still fixed, because
- * an open picker is a decision the user makes every time and a value keeper then
- * validates forever; wider, because ten shapes cannot tell a rail of saved views
- * apart once the four defaults have taken four of them. The keys are lucide's own
- * names, so the value in the file is a thing a human hand-editing frontmatter can
- * guess, and a name that is not in this map draws {@link SpaceIconFallback}
- * without keeper rewriting what is on disk.
- *
- * The first four are load-bearing rather than decorative: `inbox`,
- * `calendar-days`, `pin` and `video` are what the seeded defaults ask for
- * (Story 44.3), so the set covering them is what makes the rail render as the
- * fixed rows it replaced.
- */
-export const SPACE_ICONS: Readonly<Record<string, LucideIcon>> = {
-  inbox: Inbox,
-  "calendar-days": CalendarDays,
-  pin: Pin,
-  video: Video,
-  archive: Archive,
-  bell: Bell,
-  bookmark: Bookmark,
-  briefcase: Briefcase,
-  clock: Clock,
-  code: Code,
-  "file-text": FileText,
-  flag: Flag,
-  folder: Folder,
-  globe: Globe,
-  hash: Hash,
-  heart: Heart,
-  lightbulb: Lightbulb,
-  mic: Mic,
-  search: Search,
-  star: Star,
-  tag: Tag,
-  target: Target,
-  users: Users,
-  zap: Zap,
-};
+ * A cap rather than none: 188 glyphs is a wall, and the fieldset sits above a
+ * form whose Save button must stay reachable without scrolling past the
+ * alphabet. */
+const ICON_GRID_MAX_HEIGHT = "max-h-56";
 
-/**
- * What a space draws when it has no icon — and what it draws when its stored
- * icon is not in {@link SPACE_ICONS} any more.
+/** What the chooser says when a search names nothing.
  *
- * The unknown case renders this rather than nothing, because a row with a hole
- * where every sibling has a glyph reads as a broken space rather than as an
- * unfamiliar icon name. The *stored value* is untouched: the picker simply shows
- * nothing selected, and saving without choosing sends the name straight back. An
- * icon set shrinking must not silently rewrite what is in someone's vault, for
- * the same reason a query term keeper cannot parse is not rewritten either.
- */
-export const SpaceIconFallback: LucideIcon = Layers;
-
-/** The glyph a space's stored icon name draws. */
-export function spaceIcon(name: string | null): LucideIcon {
-  return (name !== null ? SPACE_ICONS[name] : undefined) ?? SpaceIconFallback;
-}
+ * It names the search rather than saying "no results", because the failure a
+ * person makes here is typing a concept the set spells differently — and the
+ * only useful next move is to clear the box and browse, which the sentence
+ * says. */
+export const SPACE_ICON_NO_MATCH =
+  "No icon by that name. Clear the search to browse the whole set.";
 
 /** The sentence over the terms of a space the chips will not touch. */
 export const SPACE_TERMS_READONLY =
@@ -291,6 +226,16 @@ export function SpaceEditor({
   const templateId = useId();
   const [name, setName] = useState(space.name);
   const [icon, setIcon] = useState<string | null>(space.icon);
+  // The icon search, held here rather than inside the chooser: clearing it on
+  // Cancel is free, and a query that outlived the dialog would re-open it
+  // filtered to whatever somebody typed last week.
+  const [iconQuery, setIconQuery] = useState("");
+  // Memoised because it rebuilds six groups and up to 188 entries, and the
+  // dialog re-renders on every keystroke in the NAME field too.
+  const iconGroups: readonly SpaceIconGroup[] = useMemo(
+    () => matchSpaceIcons(iconQuery),
+    [iconQuery],
+  );
   // Seeded from `sortEffective`, never from `sort`: the raw value may be empty
   // or a word keeper does not know, and working out what either resolves to is
   // a rule that exists once, in Rust. The form shows what the list is actually
@@ -494,24 +439,78 @@ export function SpaceEditor({
             />
           </div>
 
+          {/* The icon chooser (Story 45.20, UX-DR82).
+
+              A search field over the names, then one labelled grid per group.
+              The search is what makes 188 glyphs usable and the groups are what
+              make it browsable without one; either alone is the wall 44.4's flat
+              wrap of twenty-four became.
+
+              "No icon" stays outside the search, always, and that is deliberate:
+              it is not an icon and no query names it, so filtering it away would
+              make "take the glyph off this space" a thing you can only do by
+              clearing the box first. */}
           <fieldset className="flex flex-col gap-1.5">
             <legend className="font-medium text-sm">Icon</legend>
-            <div className="flex flex-wrap gap-1">
-              <IconChoice
-                name={null}
-                selected={icon === null}
-                onSelect={() => setIcon(null)}
-                label="No icon"
-              />
-              {Object.keys(SPACE_ICONS).map((key) => (
+            <Input
+              type="search"
+              value={iconQuery}
+              onChange={(event) => setIconQuery(event.target.value)}
+              // A label rather than a placeholder: a placeholder disappears the
+              // moment somebody types, taking the only description of the field
+              // with it, and it is not an accessible name at all in some
+              // screen readers.
+              aria-label="Search icons"
+              placeholder="Search icons"
+              autoComplete="off"
+              className="h-8"
+            />
+            <div className={cn("flex flex-col gap-2 overflow-y-auto", ICON_GRID_MAX_HEIGHT)}>
+              <div className="flex flex-wrap gap-1">
                 <IconChoice
-                  key={key}
-                  name={key}
-                  selected={icon === key}
-                  onSelect={() => setIcon(key)}
-                  label={key}
+                  name={null}
+                  selected={icon === null}
+                  onSelect={() => setIcon(null)}
+                  label="No icon"
                 />
+              </div>
+              {iconGroups.map((group) => (
+                <div key={group.label} className="flex flex-col gap-1">
+                  <span
+                    id={`space-icon-group-${group.label}`}
+                    className="font-medium text-muted-foreground text-xs uppercase tracking-wide"
+                  >
+                    {group.label}
+                  </span>
+                  {/* `group` + `aria-labelledby`, so a screen reader reading the
+                      chooser hears which section each glyph is in rather than a
+                      run of a hundred and eighty unrelated buttons. */}
+                  {/* biome-ignore lint/a11y/useSemanticElements: `<fieldset>` is the
+                      semantic form-grouping element and this is a button grid inside
+                      a dialog that already owns the form; a legend cannot be the
+                      styled heading span the section labels share. */}
+                  <div
+                    role="group"
+                    aria-labelledby={`space-icon-group-${group.label}`}
+                    className="flex flex-wrap gap-1"
+                  >
+                    {Object.keys(group.icons).map((key) => (
+                      <IconChoice
+                        key={key}
+                        name={key}
+                        selected={icon === key}
+                        onSelect={() => setIcon(key)}
+                        label={key}
+                      />
+                    ))}
+                  </div>
+                </div>
               ))}
+              {iconGroups.length === 0 && (
+                <p data-slot="icon-search-empty" className="text-muted-foreground text-sm">
+                  {SPACE_ICON_NO_MATCH}
+                </p>
+              )}
             </div>
           </fieldset>
 

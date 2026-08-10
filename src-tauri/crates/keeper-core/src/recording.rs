@@ -1352,6 +1352,124 @@ pub struct SessionMetaField {
     pub value: String,
 }
 
+/// The "Next session" form as it crosses the wire, from either surface that
+/// collects it (Story 21.5's pre-Start card, Story 45.19's editor on the
+/// finished session).
+///
+/// Every field is the raw text the user typed. Nothing here has been trimmed,
+/// split or dropped yet: that is [`SessionMeta::from_input`]'s job, and the
+/// whole reason this type exists is so the two surfaces cannot answer "is this
+/// field empty" or "where does one tag end" differently. Before Story 45.19 the
+/// answer lived inline in `recording_start`, which meant an edit path had
+/// nowhere to get it from except a second copy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionMetaInput<'a> {
+    /// The human title, as typed.
+    pub title: Option<&'a str>,
+    /// Who the recording is with, as typed.
+    pub participants: Option<&'a str>,
+    /// The program/session note, as typed.
+    pub note: Option<&'a str>,
+    /// The tag field as ONE comma-separated line, exactly as typed (Story
+    /// 42.5). Not a list: [`crate::notes::tags::split_list`] is the single
+    /// tokenisation, and a caller that split it first would be a second one.
+    pub tags: Option<&'a str>,
+    /// The repeatable custom rows, as typed.
+    pub custom: &'a [SessionMetaField],
+}
+
+/// Trim, and treat all-whitespace as absent.
+///
+/// The emptiness rule for every free-text meta field, in one place: "the user
+/// left this blank" has exactly one representation in a manifest — the absent
+/// key — so a field of spaces can never serialize as `""` and make an untouched
+/// field look answered.
+fn clean_field(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+impl SessionMeta {
+    /// Build the metadata block one form submission means (Story 21.5, 22.3,
+    /// 42.5; extracted here by Story 45.19).
+    ///
+    /// `session_id` is threaded rather than derived because this module is
+    /// clock-free and a ULID reads the clock: the shell mints it at start and
+    /// carries the SAME one through every later edit. Passing `None` on an edit
+    /// would silently orphan the session from Story 42's archive rows, which are
+    /// keyed on it — so the edit path reads the existing id back out of the
+    /// manifest and hands it here.
+    ///
+    /// The rules, all of which used to live inline in `recording_start`:
+    /// free text is trimmed and blank means absent ([`clean_field`]); the tag
+    /// line is tokenised once by [`crate::notes::tags::split_list`], which keeps
+    /// the tokens verbatim so the manifest still says what the user typed; a
+    /// custom row needs a NAME (a blank value is legal — "Ticket:" with nothing
+    /// after it is a row the user is still filling in, a nameless row is one
+    /// nobody can read); and an empty list is absent rather than `[]`.
+    pub fn from_input(session_id: Option<String>, input: &SessionMetaInput<'_>) -> Self {
+        let tags = input
+            .tags
+            .map(crate::notes::tags::split_list)
+            .filter(|list| !list.is_empty());
+        let custom: Vec<SessionMetaField> = input
+            .custom
+            .iter()
+            .filter(|field| !field.name.trim().is_empty())
+            .map(|field| SessionMetaField {
+                name: field.name.trim().to_owned(),
+                value: field.value.trim().to_owned(),
+            })
+            .collect();
+        Self {
+            session_id,
+            title: clean_field(input.title),
+            participants: clean_field(input.participants),
+            note: clean_field(input.note),
+            tags,
+            custom: (!custom.is_empty()).then_some(custom),
+        }
+    }
+
+    /// The tag list rendered back into the ONE comma-separated line the form
+    /// field holds (Story 45.19).
+    ///
+    /// The inverse of the [`crate::notes::tags::split_list`] this block was
+    /// built with, and it lives here for the same reason that split does: the
+    /// separator is one decision, and a frontend that joined with `","` while
+    /// Rust split on `", "` would grow a leading space on every tag each time
+    /// the editor was opened and saved.
+    pub fn tags_line(&self) -> String {
+        self.tags.as_deref().unwrap_or_default().join(", ")
+    }
+
+    /// This block as the "Next session" form holds it (Story 45.19).
+    ///
+    /// Absent becomes `""` HERE, once, rather than at each of the surfaces that
+    /// render the form: a form field has one empty state, and two of them —
+    /// `null` and `""` — is how a `?? ""` ends up sprinkled through a component
+    /// tree and how one of them ends up missing.
+    pub fn to_form_vm(&self) -> crate::vm::RecordingSessionMetaVm {
+        crate::vm::RecordingSessionMetaVm {
+            title: self.title.clone().unwrap_or_default(),
+            participants: self.participants.clone().unwrap_or_default(),
+            note: self.note.clone().unwrap_or_default(),
+            tags: self.tags_line(),
+            custom: self
+                .custom
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|field| crate::vm::RecordingSessionMetaFieldVm {
+                    name: field.name.clone(),
+                    value: field.value.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Build a secret-free [`RecordingError::ManifestIo`]: the failing operation name
 /// plus the `io::Error` display only — never a filesystem path.
 fn manifest_io(operation: &str, error: &std::io::Error) -> RecordingError {
@@ -1457,6 +1575,43 @@ impl SessionManifest {
                 title,
                 ..SessionMeta::default()
             });
+        }
+    }
+
+    /// Rewrite everything the "Next session" form holds EXCEPT the title, on a
+    /// session that has already finished (Story 45.19) — the caller then
+    /// [`Self::write`]s.
+    ///
+    /// **The title is not here on purpose.** Setting a title MOVES the session
+    /// on disk (Story 40.4 re-renders the path template and renames the
+    /// folder), which is a filesystem decision this clock-free, root-free
+    /// module cannot make; [`Self::retitle`] is its seam and the shell drives
+    /// the move around it. Participants, note, tags and custom rows move
+    /// nothing, so they are a plain rewrite of the block.
+    ///
+    /// **The identity is carried, never re-minted.** `meta.session_id` is what
+    /// Story 42's archive rows, the note stub's `session:` line and the
+    /// recovery latch are all keyed on, so an edit that dropped it would
+    /// detach the session from every one of them at once — silently, because
+    /// each of those looks up by id and simply finds nothing. It is read out of
+    /// the block being replaced and put straight back.
+    ///
+    /// A pre-40.3 manifest carries no `meta` block at all. One is minted only
+    /// when the edit actually says something, so clearing every field on a
+    /// session that never had metadata still serializes no empty `meta` object
+    /// — the same rule [`Self::retitle`] follows, for the same reason.
+    pub fn edit_details(&mut self, input: &SessionMetaInput<'_>) {
+        // The title comes from the block, not from `input`: this method is not
+        // allowed to change it, and reading it back is what keeps a details
+        // edit from clearing a title the folder name is derived from.
+        let title = self.meta.as_ref().and_then(|meta| meta.title.clone());
+        let session_id = self.meta.as_ref().and_then(|meta| meta.session_id.clone());
+        let edited = SessionMeta {
+            title,
+            ..SessionMeta::from_input(session_id, input)
+        };
+        if self.meta.is_some() || edited != SessionMeta::default() {
+            self.meta = Some(edited);
         }
     }
 
@@ -4692,6 +4847,232 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn edit_details_reaches_every_field_of_the_manifest_on_disk() {
+        let folder = fresh_temp_dir("edit-details-all");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM44444444444444444444".to_owned();
+        let mut manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                title: Some("Retro".to_owned()),
+                participants: Some("Ada".to_owned()),
+                note: Some("first pass".to_owned()),
+                tags: Some(vec!["old".to_owned()]),
+                custom: Some(vec![SessionMetaField {
+                    name: "Ticket".to_owned(),
+                    value: "KPR-1".to_owned(),
+                }]),
+            }),
+            None,
+        )
+        .expect("create session folder + initial manifest");
+
+        // Two custom rows and two tags, deliberately: a mutant that keeps only
+        // the first element of either collection passes every single-item
+        // fixture, and there is nothing in the shape of such a manifest that
+        // says anything went missing.
+        manifest.edit_details(&SessionMetaInput {
+            title: Some("ignored — the title moves the folder, retitle owns it"),
+            participants: Some("  Ada, Grace  "),
+            note: Some("  second pass  "),
+            tags: Some(" Client/Acme , acme ,, "),
+            custom: &[
+                SessionMetaField {
+                    name: "  Ticket ".to_owned(),
+                    value: " KPR-123 ".to_owned(),
+                },
+                SessionMetaField {
+                    name: "Room".to_owned(),
+                    value: String::new(),
+                },
+                SessionMetaField {
+                    name: "   ".to_owned(),
+                    value: "nameless".to_owned(),
+                },
+            ],
+        });
+        manifest.write().expect("rewrite the edited manifest");
+
+        // Asserted on the FILE, re-read from disk, not on the struct that was
+        // mutated in memory: the story's promise is that an edit lands in
+        // `manifest.json`, and a `write` that never happened is invisible to an
+        // assertion on `manifest`.
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+        assert_eq!(
+            loaded.meta,
+            Some(SessionMeta {
+                session_id: Some(session_id),
+                // Carried, not taken from the input: a details edit is not
+                // allowed to change the name the folder is derived from.
+                title: Some("Retro".to_owned()),
+                participants: Some("Ada, Grace".to_owned()),
+                note: Some("second pass".to_owned()),
+                // Verbatim tokens (Story 42.5): the manifest says what the user
+                // typed, and `Client/Acme` keeps its case here.
+                tags: Some(vec!["Client/Acme".to_owned(), "acme".to_owned()]),
+                custom: Some(vec![
+                    SessionMetaField {
+                        name: "Ticket".to_owned(),
+                        value: "KPR-123".to_owned(),
+                    },
+                    SessionMetaField {
+                        name: "Room".to_owned(),
+                        value: String::new(),
+                    },
+                ]),
+            }),
+            "every edited field lands, a nameless custom row is dropped, and a \
+             blank custom VALUE is kept"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn edit_details_clears_a_field_the_user_emptied() {
+        let folder = fresh_temp_dir("edit-details-clear");
+        let session_id = "01KYDKP6SN2HR4SJBJ9JTBVC2Z-01KYDM55555555555555555555".to_owned();
+        let mut manifest = SessionManifest::create_with_meta(
+            folder.clone(),
+            CaptureTarget::display(None),
+            test_devices(),
+            Some(SessionMeta {
+                session_id: Some(session_id.clone()),
+                participants: Some("Ada".to_owned()),
+                note: Some("keep me?".to_owned()),
+                tags: Some(vec!["one".to_owned(), "two".to_owned()]),
+                custom: Some(vec![SessionMetaField {
+                    name: "Ticket".to_owned(),
+                    value: "KPR-1".to_owned(),
+                }]),
+                ..SessionMeta::default()
+            }),
+            None,
+        )
+        .expect("create session folder + initial manifest");
+
+        // The fixture is asserted OPAQUE before it is asserted read away: these
+        // four keys are matched as literal JSON below, so the day serde renames
+        // one, the absence check would pass for the wrong reason and the struct
+        // equality beside it would not notice — it compares fields, not text.
+        // Reading them out first is the seam that makes the hollow version of
+        // this test impossible to write rather than merely discouraged.
+        let before = std::fs::read_to_string(folder.join("manifest.json")).expect("on disk");
+        for key in ["participants", "note", "tags", "custom"] {
+            assert!(
+                before.contains(&format!("\"{key}\"")),
+                "the fixture must actually carry {key} for its removal to mean anything, got: {before}"
+            );
+        }
+
+        // An emptied field is an edit, and it must be able to say "there is
+        // nothing here" — otherwise a participant list typed by mistake can
+        // never be taken back off a recording.
+        manifest.edit_details(&SessionMetaInput {
+            participants: Some("   "),
+            note: Some(""),
+            tags: Some(" , , "),
+            custom: &[],
+            ..SessionMetaInput::default()
+        });
+        manifest.write().expect("rewrite the cleared manifest");
+
+        let loaded = SessionManifest::load(&folder).expect("load round-trip");
+        assert_eq!(
+            loaded.meta,
+            Some(SessionMeta {
+                session_id: Some(session_id),
+                ..SessionMeta::default()
+            }),
+            "clearing every detail leaves the identity and nothing else"
+        );
+        let raw = std::fs::read_to_string(folder.join("manifest.json")).expect("on disk");
+        for key in ["participants", "note", "tags", "custom"] {
+            assert!(
+                !raw.contains(&format!("\"{key}\"")),
+                "a cleared {key} is omitted from the wire, got: {raw}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn edit_details_mints_a_block_only_when_the_edit_says_something() {
+        // A pre-40.3 manifest has no `meta` at all. An edit that fills a field
+        // must mint one; an edit that fills nothing must not, or every legacy
+        // session that someone merely opened the editor on would start
+        // serializing an empty object.
+        let filled = fresh_temp_dir("edit-details-mint");
+        let mut manifest = test_manifest(filled.clone());
+        assert!(
+            manifest.meta.is_none(),
+            "the fixture must be a pre-40.3 manifest with no meta block at all"
+        );
+        manifest.edit_details(&SessionMetaInput {
+            participants: Some("Ada, Grace"),
+            ..SessionMetaInput::default()
+        });
+        manifest.write().expect("rewrite the edited manifest");
+        assert_eq!(
+            SessionManifest::load(&filled)
+                .expect("load round-trip")
+                .meta,
+            Some(SessionMeta {
+                participants: Some("Ada, Grace".to_owned()),
+                ..SessionMeta::default()
+            })
+        );
+        let _ = std::fs::remove_dir_all(&filled);
+
+        let empty = fresh_temp_dir("edit-details-no-mint");
+        let mut manifest = test_manifest(empty.clone());
+        manifest.edit_details(&SessionMetaInput::default());
+        manifest.write().expect("rewrite the untouched manifest");
+        assert_eq!(
+            SessionManifest::load(&empty).expect("load round-trip").meta,
+            None,
+            "an edit that says nothing mints no block"
+        );
+        let raw = std::fs::read_to_string(empty.join("manifest.json")).expect("on disk");
+        assert!(
+            !raw.contains("\"meta\""),
+            "no empty meta object reaches the wire, got: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn the_tag_line_round_trips_through_split_and_join() {
+        // The editor opens on `tags_line`, the user saves, and `from_input`
+        // splits it again. If the two disagree about the separator, every
+        // open-and-save grows or eats whitespace — so the fixed point is the
+        // property worth pinning, with more than one tag so a join that drops
+        // the separator entirely cannot pass.
+        let meta = SessionMeta::from_input(
+            None,
+            &SessionMetaInput {
+                tags: Some("Client/Acme, acme, q3"),
+                ..SessionMetaInput::default()
+            },
+        );
+        assert_eq!(meta.tags_line(), "Client/Acme, acme, q3");
+        let again = SessionMeta::from_input(
+            None,
+            &SessionMetaInput {
+                tags: Some(&meta.tags_line()),
+                ..SessionMetaInput::default()
+            },
+        );
+        assert_eq!(again.tags, meta.tags, "open, save, open is a fixed point");
+        assert_eq!(
+            SessionMeta::default().tags_line(),
+            "",
+            "a session with no tags opens the field empty, never on a literal 'None'"
+        );
     }
 
     #[test]

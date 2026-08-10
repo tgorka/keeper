@@ -44,6 +44,36 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: () => pickFiles(),
 }));
 
+/**
+ * The mock factory is the minimum the boot path actually reaches, and the
+ * NAMES THAT ARE ABSENT ARE PART OF THE ASSERTION.
+ *
+ * A `vi.mock` factory replaces the whole module, and vitest throws
+ * `No "x" export is defined on the mock` on ACCESS — not on import. So a name
+ * listed here is a claim that mounting this surface reaches it, and a name
+ * left out is a claim that it does not. Twenty were listed when this file was
+ * written, copied from `attachments-panel.test.tsx` and never questioned. **Ten
+ * of them were never reached:** `notesTagTree`, `notesGallery`,
+ * `notesLinkTargets`, `notesResolveConflict`, `notesMarkRead`, `notesDiff`,
+ * `notesHistory`, `notesCreate`, `recordingOpenPath`, `revealPath`. Removed one
+ * group at a time, re-running between, and the suite is still green — so each
+ * was quietly telling the next reader something false about what `NoteEditor`
+ * does on mount.
+ *
+ * `notesBacklinks` is the one that failed that experiment and came back:
+ * `BacklinksPanel` mounts in edit mode and asks for them. That is the shape of
+ * evidence this comment rests on — every name here was kept because removing it
+ * broke something, not because it looked plausible.
+ *
+ * `notesAttachSources` earns its place for the opposite reason, and it is worth
+ * stating: the picker calls it only inside a click handler, so the two suites
+ * that merely MOUNT the editor (`emoji-wiring`, `new-note-caret`) need no stub
+ * for it and correctly have none. It is here because this file clicks.
+ *
+ * A future test that drives a path needing one of the removed names fails
+ * loudly with the name in the message. That is the intended behaviour: add it
+ * back then, knowing something reaches it.
+ */
 vi.mock("@/lib/ipc/client", () => ({
   recordingNoteTargets: (sessionId: string) => recordingNoteTargets(sessionId),
   notesOpen: (v: string, n: string, on: (b: NoteBodyBatch) => void) => notesOpen(v, n, on),
@@ -55,17 +85,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesBodyWrite: (v: string, n: string, text: string, rev: string) =>
     notesBodyWrite(v, n, text, rev),
   notesBufferReport: vi.fn(async () => {}),
-  notesTagTree: vi.fn(async () => ({ nodes: [] })),
-  notesGallery: vi.fn(async () => ({ folder: "", items: [], notice: null })),
   notesBacklinks: vi.fn(async () => []),
-  notesResolveConflict: vi.fn(async () => {}),
-  notesMarkRead: vi.fn(async () => {}),
-  notesDiff: vi.fn(async () => null),
-  notesHistory: vi.fn(async () => []),
-  notesCreate: vi.fn(async () => ""),
-  notesLinkTargets: vi.fn(async () => []),
-  recordingOpenPath: vi.fn(async () => {}),
-  revealPath: vi.fn(async () => {}),
 }));
 
 import { notesEditorStore } from "@/lib/stores/notes-editor";
@@ -159,7 +179,7 @@ beforeEach(() => {
       rev: "r0",
       cursor: OPENED.length,
       path: "notes/standup.md",
-    } as NoteBodyBatch);
+    });
     return "sub-1";
   });
 });
@@ -344,7 +364,15 @@ describe("a multiselection", () => {
   const SECOND = "/Users/alice/Movies/keeper/recordings/2026/standup/camera-0000.mov";
   const SECOND_REL = "recordings/2026/standup/camera-0000.mov";
 
-  /** The stated order is the order offered, one embed per line. */
+  /**
+   * The stated order is the order offered, one embed per line.
+   *
+   * Asserts the CALL as well as the result. `notesAttachSources` is mocked with
+   * `mockResolvedValue`, which answers the same list whatever it is handed — so
+   * without the first expectation, sending Rust only the first of the two
+   * sources would still produce both embeds and this test would still pass. It
+   * did: that mutation survived until this line existed.
+   */
   it("writes every file, in the order the selection offered them", async () => {
     notesAttachSources.mockResolvedValue([
       { name: "screen-0000.mov", relPath: RELATIVE, copied: false, refusal: null },
@@ -353,6 +381,7 @@ describe("a multiselection", () => {
 
     const written = await throughTheChooser([ABSOLUTE, SECOND]);
 
+    expect(notesAttachSources).toHaveBeenCalledWith("v1", [ABSOLUTE, SECOND]);
     expect(written).toBe(`${OPENED}![[${RELATIVE}]]\n![[${SECOND_REL}]]`);
   });
 
@@ -553,5 +582,112 @@ describe("what the picker hands Rust", () => {
         `${OPENED}![[${RELATIVE}]]\n![[attachments/holiday.png]]`,
       );
     });
+  });
+});
+
+/**
+ * The duplicate rule, at the entry point that had no test for it.
+ *
+ * Every duplicate test in this file drives the CHOOSER, which reads the note's
+ * body from disk. The picker reads the live buffer instead, through a `body`
+ * prop `NoteEditor` hands it — and a prop is a boundary like any other. Two
+ * mutations proved nothing was checking it: `body=""` and `body={base}` both
+ * survived the entire suite.
+ *
+ * Neither is cosmetic. `body=""` blinds the duplicate check completely, so the
+ * picker writes a second embed of a file the note already shows — the exact
+ * thing this story's title says it refuses, at one of its three entry points.
+ * `body={base}` is the subtler one and it is what the prop's own doc comment
+ * claims to prevent: `base` is what Rust last acknowledged, so a file attached
+ * and attached again before the autosave fires would slip through.
+ */
+describe("the picker's duplicate rule", () => {
+  it("refuses a file the note already holds, and says so", async () => {
+    await mountEditor();
+
+    // First press writes it.
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+    await waitFor(() => {
+      expect(notesEditorStore.getState().text).toBe(`${OPENED}![[${RELATIVE}]]`);
+    });
+
+    // Second press, same file, against the buffer the first one just changed —
+    // no save has happened in between, which is the point.
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "screen-0000.mov is already in this note, so keeper left it out.",
+    );
+    // Written once, not twice.
+    expect(notesEditorStore.getState().text).toBe(`${OPENED}![[${RELATIVE}]]`);
+  });
+});
+
+/**
+ * What the picker SAYS, which nothing tested.
+ *
+ * Found by Main's count-your-tests-per-entry-point shape rather than by any
+ * mutation of a line: this story has three doors, and every test of the
+ * outcome sentence went through the chooser. The picker composes its own
+ * clauses from its own code, and all three of these mutations survived —
+ * never saying a file was copied, dropping a source with neither path nor
+ * reason, and never passing on Rust's refusal at all.
+ *
+ * All three are the same failure wearing three hats: **the picker says
+ * nothing**, at the entry point in this story's title, about something that
+ * happened to the person's disk.
+ */
+describe("what the picker says", () => {
+  it("says a file from outside the vault was copied in", async () => {
+    const outside = "/Users/alice/Desktop/holiday.png";
+    pickFiles.mockResolvedValue([outside]);
+    notesAttachSources.mockResolvedValue([
+      { name: "holiday.png", relPath: "attachments/holiday.png", copied: true, refusal: null },
+    ]);
+    await mountEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+
+    // A copy is a change to their disk and gets a receipt, not silence.
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "outside the vault, so keeper copied it into attachments/",
+    );
+    await waitFor(() => {
+      expect(notesEditorStore.getState().text).toBe(`${OPENED}![[attachments/holiday.png]]`);
+    });
+  });
+
+  it("passes on Rust's refusal rather than swallowing it", async () => {
+    pickFiles.mockResolvedValue(["/Users/alice/Pictures/Trip"]);
+    notesAttachSources.mockResolvedValue([
+      {
+        name: "Trip",
+        relPath: null,
+        copied: false,
+        refusal:
+          "Trip is a folder. A note can embed a file, but there is nothing to show for a directory.",
+      },
+    ]);
+    await mountEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Trip is a folder.");
+    expect(notesEditorStore.getState().text).toBe(OPENED);
+  });
+
+  /** The same invariant the chooser has: partitioned on "produced no path", so
+   *  a source with neither cannot be dropped in silence. */
+  it("says something about a source that came back with neither a path nor a reason", async () => {
+    pickFiles.mockResolvedValue(["/Users/alice/mystery.bin"]);
+    notesAttachSources.mockResolvedValue([
+      { name: "mystery.bin", relPath: null, copied: false, refusal: null },
+    ]);
+    await mountEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FILE_LABEL }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("mystery.bin");
+    expect(notesEditorStore.getState().text).toBe(OPENED);
   });
 });
