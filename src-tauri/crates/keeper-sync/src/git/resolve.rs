@@ -382,6 +382,9 @@ mod tests {
     /// A fake `git` in its own directory, so a candidate list is a list of
     /// directories exactly as `PATH` is. Follows `keeper-syncd`'s
     /// `find_executable` fixtures: a script, a mode, a temp dir.
+    ///
+    /// Writing a program and then running it is racy in a multithreaded
+    /// process, so see [`settled`] for what the tests do about it.
     fn fake_git(root: &Path, dir: &str, body: &str, mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let bin = root.join(dir);
@@ -391,6 +394,44 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
             .expect("fixture mode");
         program
+    }
+
+    /// Resolve, retrying while the answer is "Text file busy".
+    ///
+    /// `cargo test` runs these tests in parallel. While one thread holds a
+    /// write handle to a fixture it has just created, another thread's `fork`
+    /// duplicates that descriptor into its child; `O_CLOEXEC` only closes it at
+    /// the child's own `execve`, so for the width of that window executing the
+    /// fixture fails with `ETXTBSY`. It showed up as roughly one failure in
+    /// three across the whole crate, always in a different test and never
+    /// single-threaded — the signature of a race rather than a bug in whichever
+    /// assertion happened to lose.
+    ///
+    /// Retried here rather than warmed up in [`fake_git`], because warming up
+    /// means *running* the fixture, and
+    /// `probing_stops_at_the_first_git_that_clears_the_floor` proves a later
+    /// candidate is never spawned by asserting a script never ran. A helper
+    /// that executes every fixture it creates would defeat the one test that
+    /// checks we do not.
+    ///
+    /// And retried here rather than inside `resolve()`, because a real `git` is
+    /// never written moments before it is run: production would be paying for a
+    /// hazard only this fixture creates.
+    fn settled(request: GitRequest) -> GitResolution {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let resolution = request.clone().resolve();
+            if !resolution.refusal().contains("Text file busy")
+                && !format!("{:?}", resolution.chosen()).contains("Text file busy")
+            {
+                return resolution;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a fixture stayed ETXTBSY for five seconds, which is no longer a race"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// A git that answers `--version` with `version`, like a real one.
@@ -420,7 +461,10 @@ mod tests {
         let broken = fake_git(root.path(), "usr-local-bin", BROKEN_CONFIG_STDERR, 0o755);
         let good = good_git(root.path(), "opt-homebrew-bin", "2.52.0");
 
-        let resolution = GitRequest::search(vec![broken.clone(), good.clone()], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(
+            vec![broken.clone(), good.clone()],
+            ADVICE,
+        ));
 
         assert_eq!(
             resolution.chosen().map(|c| c.program.clone()),
@@ -439,7 +483,7 @@ mod tests {
         let old = good_git(root.path(), "old", "2.23.0");
         let new = good_git(root.path(), "new", "2.42.0");
 
-        let resolution = GitRequest::search(vec![old.clone(), new.clone()], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(vec![old.clone(), new.clone()], ADVICE));
 
         assert_eq!(resolution.chosen().map(|c| c.program.clone()), Some(new));
         assert_eq!(
@@ -495,8 +539,10 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let good = good_git(root.path(), "bin", "2.50.1");
 
-        let resolution =
-            GitRequest::search(vec![root.path().join("empty").join("git"), good], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(
+            vec![root.path().join("empty").join("git"), good],
+            ADVICE,
+        ));
 
         assert!(resolution.rejected().is_empty());
         assert!(resolution.chosen().is_some());
@@ -511,7 +557,7 @@ mod tests {
         let old = good_git(root.path(), "old", "2.23.0");
         good_git(root.path(), "new", "2.52.0");
 
-        let resolution = GitRequest::explicit(old.clone(), ADVICE).resolve();
+        let resolution = settled(GitRequest::explicit(old.clone(), ADVICE));
 
         assert!(resolution.chosen().is_none(), "no fallback, ever");
         assert!(resolution.is_explicit());
@@ -534,7 +580,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let missing = root.path().join("nowhere").join("git");
 
-        let resolution = GitRequest::explicit(missing.clone(), ADVICE).resolve();
+        let resolution = settled(GitRequest::explicit(missing.clone(), ADVICE));
 
         assert_eq!(resolution.rejected().len(), 1);
         assert_eq!(resolution.rejected()[0].cause, GitReject::Absent);
@@ -545,7 +591,7 @@ mod tests {
 
     #[test]
     fn an_empty_search_says_there_is_no_git_and_how_to_get_one() {
-        let resolution = GitRequest::search(Vec::new(), ADVICE).resolve();
+        let resolution = settled(GitRequest::search(Vec::new(), ADVICE));
 
         let refusal = resolution.refusal();
         assert!(refusal.contains("no `git` on PATH"), "{refusal}");
@@ -563,7 +609,10 @@ mod tests {
         let old = good_git(root.path(), "old", "2.23.0");
         let broken = fake_git(root.path(), "broken", BROKEN_CONFIG_STDERR, 0o755);
 
-        let resolution = GitRequest::search(vec![old.clone(), broken.clone()], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(
+            vec![old.clone(), broken.clone()],
+            ADVICE,
+        ));
 
         let refusal = resolution.refusal();
         assert!(refusal.contains("no usable `git` on PATH"), "{refusal}");
@@ -581,7 +630,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         let good = good_git(root.path(), "bin", "2.52.0");
 
-        let resolution = GitRequest::search(vec![good.clone()], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(vec![good.clone()], ADVICE));
 
         let summary = resolution.summary().expect("a chosen git has a summary");
         assert!(summary.contains("git 2.52"), "{summary}");
@@ -601,7 +650,7 @@ mod tests {
         let windows = good_git(root.path(), "windows", "2.45.1.windows.1");
 
         for (program, expected) in [(apple, (2, 50)), (windows, (2, 45))] {
-            let resolution = GitRequest::search(vec![program], ADVICE).resolve();
+            let resolution = settled(GitRequest::search(vec![program], ADVICE));
 
             assert_eq!(
                 resolution
@@ -629,7 +678,10 @@ mod tests {
         );
         let real = good_git(root.path(), "real", "2.52.0");
 
-        let resolution = GitRequest::search(vec![impostor.clone(), real.clone()], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(
+            vec![impostor.clone(), real.clone()],
+            ADVICE,
+        ));
 
         assert_eq!(
             resolution.chosen().map(|c| c.program.clone()),
@@ -671,7 +723,7 @@ mod tests {
             .to_owned();
         assert!(relative.is_relative(), "the fixture name must be relative");
 
-        let resolution = GitRequest::explicit(relative, ADVICE).resolve();
+        let resolution = settled(GitRequest::explicit(relative, ADVICE));
 
         let summary = resolution
             .summary()
@@ -706,7 +758,7 @@ mod tests {
             0o755,
         );
 
-        let resolution = GitRequest::search(vec![good.clone(), after], ADVICE).resolve();
+        let resolution = settled(GitRequest::search(vec![good.clone(), after], ADVICE));
 
         assert_eq!(resolution.chosen().map(|c| c.program.clone()), Some(good));
         assert!(!witness.exists(), "a later candidate must not be spawned");

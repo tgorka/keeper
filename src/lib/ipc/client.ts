@@ -12,12 +12,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
+import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
+import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
+import type { TextFileVm } from "./gen/TextFileVm";
 
 export type { AccountVm } from "./gen/AccountVm";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
@@ -59,8 +62,13 @@ export type { ExportPhase } from "./gen/ExportPhase";
 export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
+export type { FileSizeVm } from "./gen/FileSizeVm";
+export type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
+export type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
+export type { FilesDeleteRefusalVm } from "./gen/FilesDeleteRefusalVm";
 export type { FilesEntrySyncVm } from "./gen/FilesEntrySyncVm";
 export type { FilesEntryVm } from "./gen/FilesEntryVm";
+export type { FilesFolderRoleVm } from "./gen/FilesFolderRoleVm";
 export type { FilesListingState } from "./gen/FilesListingState";
 export type { FilesListingVm } from "./gen/FilesListingVm";
 export type { FilesSyncStatusVm } from "./gen/FilesSyncStatusVm";
@@ -135,6 +143,7 @@ export type { PaletteActionVm } from "./gen/PaletteActionVm";
 export type { PaletteChatVm } from "./gen/PaletteChatVm";
 export type { PaletteMode } from "./gen/PaletteMode";
 export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+export type { PanelTargetVm } from "./gen/PanelTargetVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
@@ -196,6 +205,7 @@ export type { TemplateUpdateNoteVm } from "./gen/TemplateUpdateNoteVm";
 export type { TemplateUpdateOfferVm } from "./gen/TemplateUpdateOfferVm";
 export type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 export type { TemplateUpdateSelectionVm } from "./gen/TemplateUpdateSelectionVm";
+export type { TextFileVm } from "./gen/TextFileVm";
 export type { TimelineBatch } from "./gen/TimelineBatch";
 export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
@@ -2977,6 +2987,140 @@ export async function syncBrowse(id: string, subpath: string): Promise<FilesList
  */
 export async function syncOpenEntry(id: string, subpath: string): Promise<void> {
   await invoke<void>("sync_open_entry", { id, subpath });
+}
+
+/**
+ * Read one file inside a synced folder as editable text (FR-179, AD-65, Story
+ * 45.6).
+ *
+ * Takes the profile id and a profile-relative `subpath` this surface was handed
+ * by {@link syncBrowse}, never a path — Rust re-resolves it through the same
+ * containment rule the listing uses, so this cannot be pointed at an arbitrary
+ * location on disk. In particular it is NOT given `FilesEntryVm.absolutePath`:
+ * that field is an action argument for the system opener, and reading through
+ * it would go around the containment check.
+ *
+ * Three outcomes, all of them resolutions rather than rejections, because all
+ * three are things about the file rather than failures to ask:
+ * - ordinary text: `text` is the file's exact bytes, `binary` and `oversize`
+ *   both false, `detail` null;
+ * - not text: `text` is null, `binary` true, `detail` says so. Never a lossy
+ *   conversion — replacement characters would be written back on the next save;
+ * - too large to edit: `text` is the first megabyte only, `oversize` true, and
+ *   `detail` names the file's real size. The surface must open read-only,
+ *   because the buffer is a prefix and saving it would truncate the file.
+ *
+ * `sizeLabel` is formatted in Rust by `keeper_core::size::format_file_size`, so
+ * the sentence an editor shows and the size the Files pane shows for the same
+ * file cannot disagree.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a file no longer on disk, an unreadable file). The message
+ * is written to be shown verbatim.
+ */
+export async function syncReadText(id: string, subpath: string): Promise<TextFileVm> {
+  return await invoke<TextFileVm>("sync_read_text", { id, subpath });
+}
+
+/**
+ * Save one file inside a synced folder's notes vault (FR-175, AD-89, AD-65,
+ * Story 45.3).
+ *
+ * **AD-75 said the files surface never writes; AD-89 retired it.** What
+ * replaced the rule is narrower rather than absent: keeper writes only inside
+ * a notes vault, only through `notes_vault::write_vault_file`, and every
+ * refusal is a sentence rather than a silent failure. See
+ * `keeper_sync::files_write`'s module doc for why.
+ *
+ * Takes the profile id and the profile-relative `subpath` the listing handed
+ * you -- never a path, never one composed here (AD-65). `content` is written as
+ * exact bytes: no trailing-newline normalisation, no re-encoding, so a file the
+ * user did not change does not change.
+ *
+ * **Ask `entry.write.writable` before calling.** That field is on every listed
+ * entry precisely so a surface never offers a save that will fail, and
+ * `entry.write.reason` is the sentence to show where the control would have
+ * been. A rejection from this command therefore means a real fault -- the drive
+ * went out mid-edit, permissions changed -- not a policy the caller could have
+ * checked.
+ *
+ * A path that is not on disk is refused rather than created: saving is not
+ * creating, {@link syncCreateEntry} is, and a stale editor must not resurrect a
+ * file that was deleted elsewhere.
+ *
+ * Rejects with: `unsupported`, `internal`. The message is written to be shown
+ * verbatim.
+ */
+export async function syncWriteEntry(id: string, subpath: string, content: string): Promise<void> {
+  await invoke<void>("sync_write_entry", { id, subpath, content });
+}
+
+/**
+ * Word what deleting this selection would do, before it is done (FR-175,
+ * UX-DR66, Story 45.3).
+ *
+ * Every sentence in the returned plan is composed in Rust and rendered
+ * verbatim: `question` names the one file or counts the many, `consequence`
+ * says whether they sync, `recovery` says where the bytes go, and `refusals`
+ * names anything in the selection keeper will not delete. A confirmation
+ * assembled in TypeScript from a count and a glyph would be a second reading of
+ * the engine's answer, in the one place a wrong reading costs a file.
+ *
+ * A separate call from {@link syncDeleteEntries} on purpose: the plan is built
+ * by the same code the delete runs, so the dialog cannot promise something the
+ * command then refuses.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, no vault).
+ */
+export async function syncDeletePlan(id: string, subpaths: string[]): Promise<FilesDeletePlanVm> {
+  return await invoke<FilesDeletePlanVm>("sync_delete_plan", { id, subpaths });
+}
+
+/**
+ * Move a selection of files into the vault's trash (FR-175, AD-89, NFR-30,
+ * Story 45.3).
+ *
+ * Never an `unlink`: each file is renamed into `<vault>/.keeper/trash/<ulid>/`,
+ * which is a tier-0 sync exclusion, so git sees a deletion and the commit that
+ * removes the file is preceded by one that still holds it. The reconciler is
+ * told and the commit cadence runs, so the removal is announced rather than
+ * discovered on the next scan.
+ *
+ * **The receipt reports a split rather than failing the batch.** A file can
+ * vanish between the confirmation and the command; failing the whole call would
+ * leave the other four deleted and an error on screen saying nothing happened.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, no vault).
+ */
+export async function syncDeleteEntries(
+  id: string,
+  subpaths: string[],
+): Promise<FilesDeleteReceiptVm> {
+  return await invoke<FilesDeleteReceiptVm>("sync_delete_entries", { id, subpaths });
+}
+
+/**
+ * Create an empty text file inside a synced folder's notes vault (FR-176,
+ * AD-89, AD-65, Story 45.3).
+ *
+ * `subpath` is the directory -- a profile-relative path the listing produced --
+ * and `name` is its own argument. Rust joins them; nothing here composes a path
+ * (AD-65).
+ *
+ * A name that collides is refused rather than overwriting, case-insensitively,
+ * because the filesystem keeper ships to is. Returns the new file's
+ * profile-relative path, so the caller can re-read the folder and put the
+ * cursor on the row it just made.
+ *
+ * Ask the LISTING's `write.writable` before offering this: that is the
+ * directory's own answer, and it is a different question from any entry's.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, no vault, a
+ * directory outside the vault, a name that is not a name, a name already
+ * taken). The message is written to be shown verbatim.
+ */
+export async function syncCreateEntry(id: string, subpath: string, name: string): Promise<string> {
+  return await invoke<string>("sync_create_entry", { id, subpath, name });
 }
 
 /**

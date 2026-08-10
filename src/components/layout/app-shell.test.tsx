@@ -3,6 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { detailStore } from "@/lib/stores/detail-ui";
+import {
+  PANELS_COOKIE,
+  panelsCookie,
+  panelsStore,
+  resetPanelsStoreForTest,
+} from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -47,6 +53,11 @@ afterEach(() => {
   primaryViewStore.getState().setView("inbox");
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   beginTitleBarDrag.mockClear();
+  // The panel list is remembered in a cookie, so one test's arrangement would
+  // otherwise be the next test's restore.
+  resetPanelsStoreForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
+  document.cookie = `${PANELS_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("AppShell", () => {
@@ -327,5 +338,44 @@ describe("AppShell", () => {
     } finally {
       document.removeEventListener("mousedown", shim);
     }
+  });
+
+  /**
+   * Story 45.1, and DW-172's lesson made into an assertion.
+   *
+   * Three tray listeners shipped in epic 44 declared and never mounted, because
+   * `renderHook` mounts the hook itself and can therefore never see that `App`
+   * does not. The panel restore is the same shape of thing: a `useEffect` that
+   * is correct in isolation and worthless if the shell does not call it. So it
+   * is asserted HERE, against the real shell, by writing a cookie the way the
+   * last run would have and looking for the panel on screen.
+   */
+  it("restores the panels the last run left open", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
+    document.cookie = panelsCookie(
+      [
+        {
+          id: "p",
+          target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
+          replaced: null,
+        },
+      ],
+      "p",
+    );
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The panel is named after the file it holds, so finding the frame proves
+    // the cookie was read, the store was hydrated and the strip was mounted.
+    // What it RESOLVES to is the strip's own suite: with no Tauri host the
+    // listing call fails and the panel renders that reason, which is the
+    // correct behaviour and not what this test is about.
+    expect(await screen.findByLabelText("report.pdf")).toBeInTheDocument();
+    expect(panelsStore.getState().panels).toHaveLength(1);
   });
 });

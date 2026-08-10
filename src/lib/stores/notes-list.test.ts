@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { NoteChangeBatch, NoteRowVm } from "@/lib/ipc/client";
 import { notesListStore, resetNotesListStoreForTest } from "@/lib/stores/notes-list";
+import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 
 function row(id: string, title = id): NoteRowVm {
   return {
@@ -39,6 +40,7 @@ function batch(
 
 beforeEach(() => {
   resetNotesListStoreForTest();
+  resetPanelsStoreForTest();
 });
 
 describe("notesListStore.applyBatch", () => {
@@ -123,26 +125,37 @@ describe("notesListStore.applyBatch", () => {
     expect(notesListStore.getState().total).toBe(1);
   });
 
-  it("keeps the cursor when the row it names leaves the window", () => {
+  it("leaves the open note alone when the row it names leaves the window", () => {
+    // The contract did not go away with the cursor (Story 45.1) — it moved to
+    // the panel list, and it is asserted here because THIS store is the one
+    // that could break it.
     const state = notesListStore.getState();
     state.applyBatch(batch({ total: 2 }, { op: "reset", rows: [row("a"), row("b")] }));
-    state.select("vault-a", "a");
+    panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "vault-a", noteId: "a" });
     state.applyBatch(batch({ total: 1 }, { op: "remove", id: "a" }));
 
     // The note stays open in the editor and the row is simply no longer listed
-    // (UX-DR41). A cursor that cleared itself would move the user's place on
+    // (UX-DR41). A list that closed the note would move the user's place on
     // every agent write.
-    expect(notesListStore.getState().selected).toEqual({ vaultId: "vault-a", noteId: "a" });
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "note",
+      vaultId: "vault-a",
+      noteId: "a",
+    });
   });
 
-  it("remembers which vault the open note belongs to", () => {
+  it("keeps the open note across a vault switch, which only empties the window", () => {
     const state = notesListStore.getState();
-    state.select("vault-a", "a");
+    panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "vault-a", noteId: "a" });
     state.clear();
 
-    // `clear` empties the window on a vault switch; the open note is not part of
-    // the window, so it survives and comes back when its vault does.
+    // `clear` empties the window on a vault switch; the open note is a panel,
+    // not part of the window, so it survives and comes back when its vault does.
     expect(notesListStore.getState().rows).toEqual([]);
-    expect(notesListStore.getState().selected).toEqual({ vaultId: "vault-a", noteId: "a" });
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "note",
+      vaultId: "vault-a",
+      noteId: "a",
+    });
   });
 });

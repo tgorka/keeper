@@ -33,8 +33,9 @@ vi.mock("@/lib/stores/notes-vaults", async (importOriginal) => {
 
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { NOTES_OPEN_NOTE_EVENT } from "@/lib/ipc/client";
-import { notesListStore, resetNotesListStoreForTest } from "@/lib/stores/notes-list";
+import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
+import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const REF: NoteRefVm = {
@@ -60,12 +61,14 @@ beforeEach(() => {
   };
   resetNotesListStoreForTest();
   resetNotesVaultsStoreForTest();
+  resetPanelsStoreForTest();
   primaryViewStore.setState({ view: "inbox" });
 });
 
 afterEach(() => {
   resetNotesListStoreForTest();
   resetNotesVaultsStoreForTest();
+  resetPanelsStoreForTest();
   primaryViewStore.setState({ view: "inbox" });
 });
 
@@ -87,7 +90,8 @@ describe("useNotesOpenNote", () => {
     fire();
 
     expect(primaryViewStore.getState().view).toBe("notes");
-    expect(notesListStore.getState().selected).toEqual({
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "note",
       vaultId: "vault-a",
       noteId: "new-1",
     });
@@ -108,9 +112,10 @@ describe("useNotesOpenNote", () => {
     fire();
 
     expect(setActiveVault).toHaveBeenCalledWith("vault-a");
-    // Selected with its vault regardless, because selection is stored per
+    // Targeted with its vault regardless, because a panel target carries the
     // vault: pane 3 shows the note the moment its vault becomes active.
-    expect(notesListStore.getState().selected).toEqual({
+    expect(activePanel(panelsStore.getState()).target).toEqual({
+      kind: "note",
       vaultId: "vault-a",
       noteId: "new-1",
     });

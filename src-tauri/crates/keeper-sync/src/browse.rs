@@ -1,5 +1,14 @@
 //! Read-only browsing of a synced folder, one directory at a time (Story 43.8,
-//! FR-153, AD-74, AD-75).
+//! FR-153, AD-74).
+//!
+//! **AD-75 — "the files surface never writes" — was retired by AD-89 (Story
+//! 45.3), and this module is still read-only.** The reversal did not relax
+//! anything here: browsing still takes a `&SyncProfile` and still cannot spend
+//! an engine verdict. What it added is a *separate* module,
+//! [`crate::files_write`], which decides where the Files surface may write and
+//! refuses everywhere else. Read that module's doc for why the decision was
+//! reversed and what replaced it; the argument below is about looking, and it
+//! still holds.
 //!
 //! # Why this lives here and not in the shell
 //!
@@ -48,6 +57,7 @@
 //! reach the engine is a browser that will eventually spend something.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 
@@ -94,6 +104,20 @@ pub struct BrowseEntry {
     /// folder expands like the folder it points at, and [`resolve`] refuses it
     /// on the next call if it points outside the root.
     pub is_dir: bool,
+    /// The entry's length in bytes for a regular file, `None` for a directory
+    /// and for anything whose metadata could not be read (Story 45.5, FR-178).
+    ///
+    /// **Free.** The `stat` behind it is the same one `is_dir` already paid
+    /// for; this field costs the listing nothing beyond a `u64` per row.
+    ///
+    /// **`None` for a directory on purpose.** `metadata().len()` answers for a
+    /// directory on every platform this runs on, and the number it gives is the
+    /// size of the directory's own bookkeeping — not of what is inside it.
+    /// Carrying it would hand a surface a plausible-looking number that means
+    /// nothing, and the only honest total for a folder needs a recursive walk
+    /// this module must never do. A folder's size is not slow here; it is
+    /// absent.
+    pub size_bytes: Option<u64>,
     /// What sync knows about this entry right now (Story 44.17, FR-173).
     pub sync: EntrySyncStatus,
 }
@@ -314,28 +338,7 @@ impl std::fmt::Display for BrowseRefusal {
 /// the caller decides whether that is absent media or a missing folder, because
 /// only the caller knows whether the profile is removable.
 pub fn resolve(root: &Path, subpath: &str) -> Result<Option<PathBuf>, BrowseRefusal> {
-    let escapes = || BrowseRefusal::Escapes {
-        subpath: subpath.to_owned(),
-    };
-    let mut target = root.to_path_buf();
-    for segment in subpath.split('/') {
-        if segment.is_empty() {
-            // A leading, trailing or doubled `/`. Tolerating it would mean
-            // tolerating `""`, `"/"` and `"a//b"` as three spellings of paths
-            // that are not the same request, and the root is spelled `""` —
-            // which never enters this loop because `"".split('/')` yields one
-            // empty segment and we would have to special-case it anyway.
-            if subpath.is_empty() {
-                break;
-            }
-            return Err(escapes());
-        }
-        let mut components = Path::new(segment).components();
-        match (components.next(), components.next()) {
-            (Some(Component::Normal(name)), None) => target.push(name),
-            _ => return Err(escapes()),
-        }
-    }
+    let target = lexical_join(root, subpath)?;
 
     let (Ok(canonical_root), Ok(canonical_target)) = (root.canonicalize(), target.canonicalize())
     else {
@@ -350,6 +353,59 @@ pub fn resolve(root: &Path, subpath: &str) -> Result<Option<PathBuf>, BrowseRefu
         });
     }
     Ok(Some(canonical_target))
+}
+
+/// The lexical half of [`resolve`], on its own.
+///
+/// Split out because [`resolve`] is not the only caller that needs it: a create
+/// names a file that does not exist yet, so it cannot be canonicalized, and
+/// [`crate::files_write`] has to be able to refuse `..` in a path it is about
+/// to write to *before* the disk is consulted. Two copies of this loop would be
+/// two chances for one of them to be wrong, and the one that is wrong would be
+/// the one guarding the write.
+///
+/// Never canonicalizes and never touches the disk, so it is total over strings.
+pub fn lexical_join(root: &Path, subpath: &str) -> Result<PathBuf, BrowseRefusal> {
+    let mut target = root.to_path_buf();
+    for name in plain_segments(subpath)? {
+        target.push(name);
+    }
+    Ok(target)
+}
+
+/// Split a profile-relative subpath into its components, refusing any that is
+/// not a plain name.
+///
+/// Each segment must parse to exactly one `Component::Normal`, which is a single
+/// test that covers every shape an escape takes and covers it *per platform*:
+/// `..` is `ParentDir`, `.` is `CurDir`, a leading `/` is `RootDir`, `C:` is
+/// `Prefix`, and on Windows — where `\` is a separator and on Linux an ordinary
+/// filename character — `a\b` yields two components there and one here, which is
+/// exactly the difference that matters.
+///
+/// The empty subpath is the root and yields no segments. Every other empty
+/// segment — a leading, trailing or doubled `/` — is refused, because tolerating
+/// it would make `"a//b"` and `"a/b"` two spellings of one request and make
+/// `"/"` a second spelling of the root.
+pub fn plain_segments(subpath: &str) -> Result<Vec<&OsStr>, BrowseRefusal> {
+    let escapes = || BrowseRefusal::Escapes {
+        subpath: subpath.to_owned(),
+    };
+    if subpath.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for segment in subpath.split('/') {
+        if segment.is_empty() {
+            return Err(escapes());
+        }
+        let mut components = Path::new(segment).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) => out.push(name),
+            _ => return Err(escapes()),
+        }
+    }
+    Ok(out)
 }
 
 /// List one directory of one profile, lazily and without touching the engine.
@@ -448,14 +504,7 @@ fn list_resolved(
         return Ok(BrowseListing::Missing);
     }
 
-    // One `.exists()` for the whole listing, and deliberately the same
-    // expression `Engine::pending` uses to decide whether git has anything to
-    // say — a `.git` that is a file rather than a directory is a worktree or a
-    // submodule and counts either way. Asking gitoxide to open the repository
-    // would be the more thorough answer and is exactly what this module must
-    // not do: opening is where trust levels, config enforcement and index
-    // refreshes live, and browsing has no business near any of them.
-    let in_repository = root.join(".git").exists();
+    let in_repository = in_repository(root);
     let prefix = subpath.trim_end_matches('/');
     let read = std::fs::read_dir(&dir).map_err(|error| BrowseRefusal::Unreadable {
         reason: error.to_string(),
@@ -484,8 +533,21 @@ fn list_resolved(
         // symlink to a folder should expand like a folder, and `resolve` is what
         // stops it if it points out of the tree. A broken symlink has no
         // metadata and reads as a file, which is what it looks like on disk.
+        //
+        // Bound once and read twice (Story 45.5): the size comes off the same
+        // `stat` `is_dir` already needed, so a thousand-entry listing pays the
+        // same number of syscalls it paid before this field existed. A second
+        // `metadata` call here would have doubled the cost of browsing a
+        // network share to render a column.
         let absolute_path = entry.path();
-        let is_dir = std::fs::metadata(&absolute_path).is_ok_and(|meta| meta.is_dir());
+        let meta = std::fs::metadata(&absolute_path).ok();
+        let is_dir = meta.as_ref().is_some_and(std::fs::Metadata::is_dir);
+        // `is_file` rather than `!is_dir`: a fifo, a socket or a device node has
+        // a length that is not a number of bytes anyone can read out of it.
+        let size_bytes = meta
+            .as_ref()
+            .filter(|meta| meta.is_file())
+            .map(std::fs::Metadata::len);
         let match_path = Path::new(&relative_path);
         let verdict = excludes.verdict(match_path, is_dir);
         if verdict == ExcludeVerdict::BuiltinNoise {
@@ -503,6 +565,7 @@ fn list_resolved(
             relative_path,
             absolute_path,
             is_dir,
+            size_bytes,
             sync,
         });
     }
@@ -523,6 +586,44 @@ fn list_resolved(
         entries,
         truncated,
     }))
+}
+
+/// Whether `root` is a git repository, for the purpose of a sync mark.
+///
+/// Deliberately the same expression [`crate::engine::Engine::pending`] uses —
+/// a `.git` that is a file rather than a directory is a worktree or a submodule
+/// and counts either way. Asking gitoxide to open the repository would be the
+/// more thorough answer and is exactly what this module must not do: opening is
+/// where trust levels, config enforcement and index refreshes live, and
+/// browsing has no business near any of them.
+///
+/// One function rather than the expression written twice, because
+/// [`list_resolved`] pays it once for a whole directory and [`status_of`] pays
+/// it once per asked-about path, and a second spelling is a second chance for
+/// one of them to answer differently about the same folder.
+fn in_repository(root: &Path) -> bool {
+    root.join(".git").exists()
+}
+
+/// What sync says about one entry the caller already knows about, without
+/// re-reading its directory.
+///
+/// [`list_resolved`] answers this for every entry of a listing; this answers it
+/// for a handful of paths a caller is about to *act* on — Story 45.3's delete
+/// confirmation, which has to say whether the files it names sync. Both go
+/// through [`classify`], so the confirmation and the row it was opened from
+/// cannot come to word one file's state differently.
+///
+/// `is_dir` comes from the caller's own `stat`, never from the name.
+pub fn status_of(
+    root: &Path,
+    relative_path: &str,
+    is_dir: bool,
+    excludes: &ExcludeSet,
+    pending: &PendingView,
+) -> EntrySyncStatus {
+    let verdict = excludes.verdict(Path::new(relative_path), is_dir);
+    classify(relative_path, is_dir, verdict, pending, in_repository(root))
 }
 
 /// Decide one entry's mark from state that already existed before the call.
@@ -598,6 +699,56 @@ mod tests {
             BrowseListing::Listed(dir) => dir.entries.iter().map(|e| e.name.clone()).collect(),
             other => panic!("expected a listing, got {other:?}"),
         }
+    }
+
+    /// Story 45.3: the delete confirmation asks about a handful of paths
+    /// rather than a directory, and it must get the SAME answer the row it was
+    /// opened from shows. Asserted by listing a folder and then asking about
+    /// each of its entries one at a time.
+    #[test]
+    fn asking_about_one_path_agrees_with_the_listing_it_came_from() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join(".git")).expect("repo");
+        std::fs::write(root.path().join("kept.md"), b"x").expect("kept");
+        std::fs::write(root.path().join("scratch.tmp"), b"x").expect("tmp");
+        std::fs::create_dir(root.path().join("daily")).expect("daily");
+        std::fs::write(root.path().join("daily/new.md"), b"x").expect("new");
+
+        let excludes = ExcludeSet::new(&["*.tmp".to_owned()]).expect("patterns");
+        let pending = PendingView::Known(BTreeMap::from([(
+            "daily/new.md".to_owned(),
+            PendingReason::Untracked,
+        )]));
+        let listing = browse(&profile(root.path()), "", &excludes, &pending).expect("listing");
+        let BrowseListing::Listed(dir) = &listing else {
+            panic!("expected a listing");
+        };
+        assert!(!dir.entries.is_empty());
+        for entry in &dir.entries {
+            assert_eq!(
+                status_of(
+                    root.path(),
+                    &entry.relative_path,
+                    entry.is_dir,
+                    &excludes,
+                    &pending
+                ),
+                entry.sync,
+                "{}",
+                entry.relative_path
+            );
+        }
+        // And the three answers are genuinely different, so the agreement above
+        // is not an agreement that everything is `Synced`.
+        let kinds: Vec<_> = dir.entries.iter().map(|e| e.sync.clone()).collect();
+        assert!(kinds.contains(&EntrySyncStatus::Synced), "{kinds:?}");
+        assert!(kinds.contains(&EntrySyncStatus::Excluded), "{kinds:?}");
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, EntrySyncStatus::Waiting { .. })),
+            "{kinds:?}"
+        );
     }
 
     // --- The escape rule ---------------------------------------------------
@@ -924,6 +1075,51 @@ mod tests {
         assert_eq!(dir.entries.len(), 1);
         assert_eq!(dir.entries[0].name, "deep");
         assert!(dir.entries[0].is_dir);
+    }
+
+    /// A file's size comes off the dirent; a folder has none (Story 45.5,
+    /// FR-178).
+    ///
+    /// The directory half is the one worth a test. `std::fs::metadata().len()`
+    /// answers for a directory on Linux and macOS alike — it is nonzero and it
+    /// describes the folder's own bookkeeping, not its contents — so the
+    /// obvious `(!is_dir).then(...)`-free implementation ships a plausible
+    /// number that means nothing. The empty file is here because zero is a real
+    /// size and must survive the `Option`: `Some(0)` and `None` are different
+    /// facts and a `filter(|n| *n > 0)` anywhere would collapse them.
+    #[test]
+    fn a_file_carries_its_byte_count_and_a_folder_carries_none() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join("folder")).expect("dir");
+        // Something inside it, so the folder is not empty and a recursive
+        // implementation would have a number to report.
+        std::fs::write(root.path().join("folder/inside.md"), vec![b'x'; 4_096]).expect("inner");
+        std::fs::write(root.path().join("empty.md"), b"").expect("empty file");
+        std::fs::write(root.path().join("sized.bin"), vec![b'x'; 1_500]).expect("sized file");
+
+        let BrowseListing::Listed(dir) = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal") else {
+            panic!("expected a listing");
+        };
+        let sizes: Vec<(&str, Option<u64>)> = dir
+            .entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.size_bytes))
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![
+                ("folder", None),
+                ("empty.md", Some(0)),
+                ("sized.bin", Some(1_500)),
+            ],
+            "a folder has no size, and an empty file has a size of zero"
+        );
     }
 
     #[test]

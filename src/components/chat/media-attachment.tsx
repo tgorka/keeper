@@ -17,6 +17,7 @@ import { FileIcon, FileVideo, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { formatFileSize } from "@/lib/file-size";
 import type { MediaVm } from "@/lib/ipc/client";
 import { useMediaShed } from "@/lib/stores/lifecycle";
 import { cn } from "@/lib/utils";
@@ -45,21 +46,6 @@ interface MediaAttachmentProps {
    * no-op and the message stays sent.
    */
   onCancel?: (key: string) => void;
-}
-
-/** Format a byte count as a short human-readable size (e.g. `1.2 MB`). */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
 /**
@@ -264,7 +250,7 @@ export function MediaAttachment({
           <span className="truncate font-medium text-sm">{media.filename}</span>
           <span className="text-muted-foreground text-xs">
             {media.mimetype ?? "File"}
-            {media.size != null ? ` · ${formatSize(media.size)}` : ""}
+            {media.size != null ? ` · ${formatFileSize(media.size)}` : ""}
           </span>
         </div>
       </div>

@@ -641,11 +641,20 @@ pub fn run() {
         sync_ipc::sync_verify,
         sync_ipc::sync_rescan,
         sync_ipc::sync_open_path,
-        // The Files tab's listing command and its one action (Story 43.8).
-        // Desktop-only with the rest of sync: a build with no folder sync has
-        // no synced folder to browse. Neither writes.
+        // The Files tab's listing command and its actions (Story 43.8; the text
+        // read added by Story 45.6). Desktop-only with the rest of sync: a build
+        // with no folder sync has no synced folder to browse.
         sync_ipc::sync_browse,
         sync_ipc::sync_open_entry,
+        sync_ipc::sync_read_text,
+        // And the write half (Story 45.3, AD-89, which retired AD-75). Every
+        // one of these goes through `notes_vault`'s single writer and refuses
+        // anything outside a notes vault; the decisions are in
+        // `keeper_sync::files_write`, and these are the call sites.
+        sync_ipc::sync_write_entry,
+        sync_ipc::sync_delete_plan,
+        sync_ipc::sync_delete_entries,
+        sync_ipc::sync_create_entry,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
         sync_ipc::sync_activity,

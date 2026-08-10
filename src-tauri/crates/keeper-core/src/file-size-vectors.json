@@ -1,0 +1,84 @@
+{
+  "why": "Story 45.5, FR-178. The pinning between keeper_core::size::format_file_size and its TypeScript mirror src/lib/file-size.ts. Both are loaded from THIS file by their own test suites, so a change to either implementation fails on the same commit that introduces it. A mirror that is only documented as a mirror drifts; a mirror that shares a vector table cannot drift silently. Bytes are strings because a JSON number cannot hold u64::MAX exactly and this table has to be able to say what the largest possible file renders as.",
+  "base": 1000,
+  "baseWhy": "Decimal. macOS Finder has reported decimal sizes since 10.6 and keeper is macOS-first: the number keeper puts beside a file must be the number the operating system puts beside the same file, or the user concludes one of them is lying.",
+  "vectors": [
+    {
+      "bytes": "0",
+      "label": "0 bytes",
+      "why": "an empty file exists and is worth saying so about; it is a DIRECTORY that must render nothing at all"
+    },
+    { "bytes": "1", "label": "1 byte", "why": "the singular" },
+    {
+      "bytes": "2",
+      "label": "2 bytes",
+      "why": "the plural resumes immediately above the singular"
+    },
+    {
+      "bytes": "999",
+      "label": "999 bytes",
+      "why": "one below the base: still exact, still a word"
+    },
+    {
+      "bytes": "1000",
+      "label": "1.0 kB",
+      "why": "the base itself; lowercase SI k, never KB and never KiB"
+    },
+    {
+      "bytes": "1023",
+      "label": "1.0 kB",
+      "why": "one below the BINARY boundary, which is not a boundary here"
+    },
+    {
+      "bytes": "1024",
+      "label": "1.0 kB",
+      "why": "1024 bytes is 1.024 kB, not 1 KiB. This vector is the whole decimal decision"
+    },
+    { "bytes": "1500", "label": "1.5 kB", "why": "one decimal place below ten" },
+    {
+      "bytes": "1999",
+      "label": "1.9 kB",
+      "why": "truncation, not rounding: 1.999 is 1.9 and never 2.0"
+    },
+    { "bytes": "9999", "label": "9.9 kB", "why": "the last value that still gets a decimal place" },
+    { "bytes": "10000", "label": "10 kB", "why": "at ten the decimal place is dropped" },
+    {
+      "bytes": "999999",
+      "label": "999 kB",
+      "why": "one below the next unit; a rounding implementation prints the impossible 1000.0 kB here"
+    },
+    { "bytes": "1000000", "label": "1.0 MB", "why": "the MB step" },
+    {
+      "bytes": "1048576",
+      "label": "1.0 MB",
+      "why": "one mebibyte. Both chat surfaces printed this as 1.0 MB by dividing by 1024, which was the right string for the wrong reason and the wrong string for 1500000"
+    },
+    {
+      "bytes": "1500000",
+      "label": "1.5 MB",
+      "why": "the value that exposes a binary divisor: a 1024-based formatter calls this 1.4 MB"
+    },
+    { "bytes": "999999999", "label": "999 MB", "why": "one below the GB step" },
+    { "bytes": "1000000000", "label": "1.0 GB", "why": "the GB step" },
+    { "bytes": "2500000000", "label": "2.5 GB", "why": "a file big enough to need GB" },
+    { "bytes": "5000000000", "label": "5.0 GB", "why": "a recording-sized file" },
+    {
+      "bytes": "12300000000",
+      "label": "12 GB",
+      "why": "at and above ten, no decimal, in a unit above kB"
+    },
+    { "bytes": "999999999999", "label": "999 GB", "why": "one below the TB step" },
+    { "bytes": "1000000000000", "label": "1.0 TB", "why": "the TB step" },
+    { "bytes": "1000000000000000", "label": "1.0 PB", "why": "the PB step" },
+    {
+      "bytes": "1000000000000000000",
+      "label": "1.0 EB",
+      "why": "the EB step; the top rung of the ladder"
+    },
+    {
+      "bytes": "18446744073709551615",
+      "label": "18 EB",
+      "why": "u64::MAX. An implementation that multiplies before dividing overflows here, and a ladder that stops at PB prints 18446 PB. In JavaScript this exceeds Number.MAX_SAFE_INTEGER, which is why the mirror takes a bigint and this column is a string"
+    }
+  ]
+}

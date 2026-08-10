@@ -13,12 +13,14 @@
 use std::sync::Arc;
 
 use keeper_core::vm::{
-    FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm, FilesSyncStatusVm, IpcError,
-    IpcErrorCode,
+    FilesDeletePlanVm, FilesDeleteReceiptVm, FilesDeleteRefusalVm, FilesEntryFacts,
+    FilesEntrySyncVm, FilesEntryVm, FilesListingState, FilesListingVm, FilesSyncStatusVm,
+    FilesWriteVm, IpcError, IpcErrorCode,
 };
 use keeper_sync::browse;
 use keeper_sync::engine::{PendingReason, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
+use keeper_sync::files_write::{self, WriteRefusal, WriteScope};
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SETTLE_MS,
@@ -1517,11 +1519,18 @@ pub async fn sync_browse(
     }
     .map_err(|refusal| open_failure(refusal.to_string()))?;
 
+    // Built from the vault keeper can actually REACH, not from the profile's
+    // stored configuration (Story 45.3). A profile whose `notes` block names a
+    // vault the registry has no slot for is a profile whose write commands will
+    // refuse, and a listing that said "writable" from the config would put a
+    // Delete button over exactly that case.
+    let (_vault, scope) = vault_and_scope(&profile);
     Ok(files_listing_vm(
         &profile,
         subpath,
         listing,
         unavailable.as_deref(),
+        &scope,
     ))
 }
 
@@ -1535,12 +1544,27 @@ pub async fn sync_browse(
 /// `engine_failure` is the engine's own words for why it could not produce a
 /// pending list, threaded through so an `unknown` mark carries a reason
 /// instead of a shrug.
+///
+/// The folder roles come off the profile that is already in hand (Story 45.5):
+/// `notes.subfolder` and `recordings.subfolder` are the only evidence that a
+/// folder is the vault or the recordings root, and reading them here — rather
+/// than letting a surface match a name — is why a vault called `Second Brain`
+/// is marked and an ordinary folder called `10-notes` is not. Borrowed for the
+/// whole listing, so a thousand rows resolve against two `&str`.
 fn files_listing_vm(
     profile: &SyncProfile,
     subpath: String,
     listing: browse::BrowseListing,
     engine_failure: Option<&str>,
+    scope: &files_write::WriteScope<'_>,
 ) -> FilesListingVm {
+    let roles = keeper_core::vm::FilesFolderRoles {
+        notes_subfolder: profile.notes.as_ref().map(|notes| notes.subfolder.as_str()),
+        recordings_subfolder: profile
+            .recordings
+            .as_ref()
+            .map(|recordings| recordings.subfolder.as_str()),
+    };
     let (state, entries, detail, truncated) = match listing {
         browse::BrowseListing::Listed(dir) => {
             let entries = dir
@@ -1548,13 +1572,18 @@ fn files_listing_vm(
                 .into_iter()
                 .map(|entry| {
                     let sync = sync_mark(&entry.sync, engine_failure);
-                    FilesEntryVm::new(
-                        entry.name,
-                        entry.relative_path,
-                        entry.absolute_path.to_string_lossy().into_owned(),
-                        entry.is_dir,
-                        sync,
-                    )
+                    let write =
+                        FilesWriteVm::from_verdict(&scope.file(&entry.relative_path, entry.is_dir));
+                    FilesEntryVm::new(FilesEntryFacts {
+                        name: entry.name,
+                        relative_path: entry.relative_path,
+                        absolute_path: entry.absolute_path.to_string_lossy().into_owned(),
+                        is_dir: entry.is_dir,
+                        sync: sync,
+                        size_bytes: entry.size_bytes,
+                        roles: roles,
+                        write: write,
+                    })
                 })
                 .collect::<Vec<_>>();
             let detail = dir.truncated.then(|| {
@@ -1598,6 +1627,18 @@ fn files_listing_vm(
             false,
         ),
     };
+    // The directory's OWN verdict — "can a file be created in here" — which is
+    // a different question from any entry's. Refused outright for every state
+    // that produced no entries: a folder keeper could not read is not a folder
+    // keeper will write into, and offering New file over an unplugged drive is
+    // the "action that will fail" this field exists to remove.
+    let write = if state == FilesListingState::Listed {
+        FilesWriteVm::from_verdict(&scope.directory(&subpath))
+    } else {
+        FilesWriteVm::refused(detail.clone().unwrap_or_else(|| {
+            "keeper could not read this folder, so it will not write in it.".to_owned()
+        }))
+    };
     FilesListingVm {
         profile_id: profile.id.clone(),
         subpath,
@@ -1605,6 +1646,7 @@ fn files_listing_vm(
         entries,
         detail,
         truncated,
+        write,
     }
 }
 
@@ -1723,6 +1765,453 @@ pub async fn sync_open_entry(
             "could not open {subpath} with the system's default application: {error}"
         ))
     })
+}
+
+/// Read one file inside a synced folder as editable text (Story 45.6, FR-179,
+/// AD-65).
+///
+/// **The counterpart of `sync_write_entry`, and deliberately not part of it.**
+/// Story 45.3 reversed AD-75 and gave the Files surface a write path; this is
+/// the read half, and it is a separate command because reading is a separate
+/// capability: a file outside a vault can be listed and viewed but not written
+/// (the epic's own rule), so a single read-write command would have to refuse
+/// half of itself.
+///
+/// **Containment is not restated here.** The subpath is one the listing already
+/// produced, and [`browse::resolve`] is the same function `sync_browse` and
+/// `sync_open_entry` use: it refuses `..` lexically and refuses a symlink out
+/// of the tree after canonicalisation. This command composes no path of its
+/// own, so there is no second rule to keep in step with the first.
+///
+/// **Every decision is in `keeper-core`.** Whether the bytes are text, whether
+/// the file is too large to edit, how big it is in words a person reads — all
+/// of it is [`keeper_core::text_file::open_text_file`], which compiles and is
+/// tested on any machine. This crate does not build on Linux, so a threshold
+/// or a sentence written here would be one nobody could exercise until macOS
+/// (AD-55, AD-56).
+///
+/// Runs on the blocking pool: a file on a pendrive or a network share can take
+/// hundreds of milliseconds to open, and stalling the async runtime would
+/// freeze every other profile's poll behind one click.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an unreadable file).
+#[tauri::command]
+pub async fn sync_read_text(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<keeper_core::text_file::TextFileVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    let named = subpath.clone();
+    tokio::task::spawn_blocking(move || keeper_core::text_file::open_text_file(&resolved))
+        .await
+        .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
+        .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// The Files surface writes (Story 45.3, FR-175, FR-176, AD-89)
+// ---------------------------------------------------------------------------
+//
+// AD-75 said the Files surface never writes. AD-89 retired it, deliberately and
+// by the owner, and the four commands below are the whole of what replaced it.
+// The reasoning lives in `keeper_sync::files_write`'s module doc; what matters
+// at this call site is the shape it imposes:
+//
+//   * every byte goes through `notes_vault::write_vault_file` + `mark_dirty`,
+//     the same path notes and Story 44.16's CSV editor use — never a second
+//     writer, never a reach into the sync engine;
+//   * every removal goes through `notes_vault::trash_note`, which the
+//     reconciler already understands, so a deletion is announced rather than
+//     discovered on the next scan;
+//   * every decision — is this inside a vault, is it a folder, is the name a
+//     name, is it already taken — is made in `keeper_sync::files_write`, which
+//     compiles and is tested on any machine. This crate does not build on Linux
+//     (AD-55, AD-56), so a rule written here would be a rule guarding a write
+//     that nobody could exercise until macOS.
+
+/// The vault this profile holds and the write scope over it.
+///
+/// **From the LIVE vault, never from `profile.notes`.** The listing's
+/// `writable` flag and the write command's answer have to be the same question
+/// asked twice, and a profile configured with a vault the registry has no slot
+/// for — unflagged, root moved, still starting — is exactly where those two
+/// would diverge. A pane told "writable" by configuration and refused by the
+/// registry is a pane offering an action that will fail, which is the one thing
+/// this story's own rule forbids.
+fn vault_and_scope(profile: &SyncProfile) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
+    let vault = crate::notes_vault::vault(&profile.id);
+    let scope = WriteScope::new(
+        &profile.name,
+        vault.as_ref().map(|vault| vault.config.subfolder.as_str()),
+    );
+    (vault, scope)
+}
+
+/// A write refusal, as the frontend receives it — and as the log records it.
+///
+/// `warn!` rather than `info!`, on 44.16's reasoning: `GatedMakeWriter` only
+/// writes `INFO` to the file when debug mode is on and lets `WARN` and above
+/// through always. A refusal is the thing the user asks about later, so it has
+/// to already be on disk (DW-162).
+fn write_refused(refusal: &WriteRefusal) -> IpcError {
+    tracing::warn!(%refusal, "files: write refused");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: refusal.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// The profile, its live vault and its write scope, or the refusal that ends
+/// the call.
+///
+/// Every write command starts this way, and factoring it means the four cannot
+/// come to disagree about which vault they are writing into.
+fn writable_profile(
+    state: &tauri::State<'_, AppState>,
+    id: &str,
+) -> Result<(SyncProfile, crate::notes_vault::Vault), IpcError> {
+    let engine = engine_of(state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, id)?.clone();
+    // The refusal is `WriteRefusal`'s own sentence rather than one worded here,
+    // so the reason a person reads when a command declines is the same reason
+    // the listing already showed them where the control should have been.
+    let Some(vault) = crate::notes_vault::vault(&profile.id) else {
+        return Err(write_refused(&WriteRefusal::NoVault {
+            profile_name: profile.name.clone(),
+        }));
+    };
+    Ok((profile, vault))
+}
+
+/// Save one file inside a synced folder's notes vault (Story 45.3, FR-175,
+/// AD-89, AD-65).
+///
+/// **The one writer.** `write_vault_file` is the same temp-and-rename
+/// `write_note` uses, under the `.keeper.<ulid>.tmp` name that is already a
+/// tier-0 sync exclusion, so a `kill -9` between write and rename leaves no
+/// torn file in the vault. `mark_dirty` is the announcement `import_attachment`
+/// already makes: the commit cadence runs and the change is committed and
+/// synced.
+///
+/// **`touch` is included here, where Story 44.16 deliberately left it out.**
+/// 44.16's target is an embedded `.csv`, which the notes walk never collects,
+/// so telling the reconciler about it would ask for an index entry that cannot
+/// exist. This surface can save a `.md` *inside the vault*, which is a note —
+/// so the index has to be told, and `apply_batch` skips anything that is not
+/// `.md` at no cost. Omitting it would leave a note edited from Files invisible
+/// to search until an unrelated event moved the reconciler.
+///
+/// **A path that is not on disk is refused rather than created.** Saving is not
+/// creating: `sync_create_entry` is, and it is the one with the collision rule.
+/// A stale editor whose file was deleted elsewhere must not put it back.
+///
+/// Content is written as exact bytes — no trailing-newline normalisation, no
+/// re-encoding — for the reason 44.16's parser records spans instead of
+/// re-serialising: a file the user did not change must not change.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, no vault, a path
+/// outside the vault, a folder, a path that escapes, a path that is gone, a
+/// disk failure).
+#[tauri::command]
+pub async fn sync_write_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    content: String,
+) -> Result<(), IpcError> {
+    let (profile, vault) = writable_profile(&state, &id)?;
+    let (_, scope) = vault_and_scope(&profile);
+    let resolved = files_write::resolve_existing(&profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+    let rel = scope
+        .file(&subpath, resolved.is_dir())
+        .map_err(|refusal| write_refused(&refusal))?;
+
+    // On the blocking pool for the same reason the listing is: a vault on a
+    // pendrive or a network share can take hundreds of milliseconds to write,
+    // and stalling the async runtime would freeze every other profile's poll
+    // behind one save.
+    let written = {
+        let vault = vault.clone();
+        let rel = rel.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::notes_vault::write_vault_file(&vault, &rel, &content)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not save {subpath}: {err}")))?
+    };
+    written.map_err(notes_write_error)?;
+
+    crate::notes_vault::touch(&vault.id, vec![rel.clone()]);
+    crate::notes_vault::mark_dirty(&vault.id);
+    tracing::info!(%rel, "files: wrote a vault file from the Files surface");
+    Ok(())
+}
+
+/// Word what deleting this selection would do, before it is done (Story 45.3,
+/// FR-175, UX-DR66).
+///
+/// **A separate call, and that is what makes the confirmation honest.** The
+/// plan is built by the same code the delete runs — the same scope, the same
+/// resolution, the same sync answer — so the dialog cannot promise something
+/// the command will then refuse, and a file that vanished between the click and
+/// the confirmation is named as a refusal rather than silently dropped.
+///
+/// The sentences are composed by [`FilesDeletePlanVm::compose`], in
+/// `keeper-core`, which is pure and therefore asserted on every machine. This
+/// command's whole job is gathering the two facts it needs per path: may keeper
+/// delete it, and does it sync.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, no vault).
+#[tauri::command]
+pub async fn sync_delete_plan(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpaths: Vec<String>,
+) -> Result<FilesDeletePlanVm, IpcError> {
+    let (profile, _vault) = writable_profile(&state, &id)?;
+    let (_, scope) = vault_and_scope(&profile);
+    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+    let engine = engine_of(&state)?;
+    // Once for the whole selection, exactly as the listing asks once for a
+    // whole directory.
+    let (pending, unavailable) = match engine.pending(&id).await {
+        Ok(files) => (browse::PendingView::from_pending(files), None),
+        Err(error) => (browse::PendingView::Unavailable, Some(error.to_string())),
+    };
+
+    let mut files = Vec::new();
+    let mut refusals = Vec::new();
+    for subpath in subpaths {
+        match deletable(&profile, &scope, &subpath) {
+            Ok(target) => {
+                let status = browse::status_of(
+                    &profile.local_path,
+                    &subpath,
+                    target.is_dir,
+                    &excludes,
+                    &pending,
+                );
+                files.push((subpath, sync_mark(&status, unavailable.as_deref()).status));
+            }
+            Err(refusal) => refusals.push(FilesDeleteRefusalVm {
+                relative_path: subpath,
+                reason: refusal.to_string(),
+            }),
+        }
+    }
+    Ok(FilesDeletePlanVm::compose(&profile.name, files, refusals))
+}
+
+/// Move a selection of files into the vault's trash (Story 45.3, FR-175,
+/// AD-89, NFR-30).
+///
+/// **`trash_note` is the removal path the reconciler already understands, and
+/// finding that rather than inventing one is the story's instruction.** It
+/// renames the file into `<vault>/.keeper/trash/<ulid>/<rel>` — `.keeper` is a
+/// tier-0 sync exclusion, so git sees a deletion — then `touch`es the path so
+/// the index drops the note, and `mark_dirty`s the vault so the commit cadence
+/// carries the removal. Never an `unlink`: the bytes stay recoverable locally
+/// *and* from history, and the commit that deletes the file is preceded by one
+/// that still holds it.
+///
+/// **Every path is re-checked here, not trusted from the plan.** The plan is
+/// advice a person read; this is the authority. A path that became a folder, a
+/// path that left the vault, a path that was already deleted — each answers for
+/// itself, and the receipt reports the split rather than failing the batch.
+/// Failing the whole call would leave four files trashed and an error on screen
+/// saying nothing happened.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, no vault).
+#[tauri::command]
+pub async fn sync_delete_entries(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpaths: Vec<String>,
+) -> Result<FilesDeleteReceiptVm, IpcError> {
+    let (profile, vault) = writable_profile(&state, &id)?;
+
+    let outcome = {
+        let profile = profile.clone();
+        let vault = vault.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_, scope) = vault_and_scope(&profile);
+            let mut deleted = Vec::new();
+            let mut refusals = Vec::new();
+            for subpath in subpaths {
+                let outcome = deletable(&profile, &scope, &subpath).and_then(|target| {
+                    crate::notes_vault::trash_note(&vault, &target.vault_relative).map_err(
+                        |error| WriteRefusal::DeleteFailed {
+                            // The path the SURFACE shows, not the vault-relative
+                            // one: the sentence lands beside the row the person
+                            // selected, and naming it differently there would
+                            // read as a different file.
+                            relative_path: subpath.clone(),
+                            reason: error.to_string(),
+                        },
+                    )
+                });
+                match outcome {
+                    Ok(grave) => {
+                        tracing::info!(
+                            %subpath,
+                            grave = %grave.display(),
+                            "files: moved a vault file to the trash"
+                        );
+                        deleted.push(subpath);
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(%subpath, %refusal, "files: delete refused");
+                        refusals.push(FilesDeleteRefusalVm {
+                            relative_path: subpath,
+                            reason: refusal.to_string(),
+                        });
+                    }
+                }
+            }
+            FilesDeleteReceiptVm { deleted, refusals }
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not delete: {err}")))?
+    };
+
+    if !outcome.deleted.is_empty() {
+        crate::notes_vault::mark_dirty(&vault.id);
+    } else {
+        // DW-162: a path that declines to act says so where a person can find
+        // it later, and `debug!` never reaches the packaged app's log.
+        tracing::info!(profile = %profile.name, "files: delete removed nothing");
+    }
+    Ok(outcome)
+}
+
+/// Create an empty text file inside a synced folder's notes vault (Story 45.3,
+/// FR-176, AD-89).
+///
+/// Takes the directory as a profile-relative subpath the listing produced, and
+/// the name as its own argument — never a joined path (AD-65). Rust joins them,
+/// once, in `WriteScope::create`, which is also where the name is checked.
+///
+/// **The collision refusal is the point.** `write_vault_file` renames over its
+/// target, so a create that did not check would replace an existing file with
+/// an empty one. The check is case-insensitive because APFS and NTFS are: an
+/// exact-match check passes on the Linux box this is written on and destroys a
+/// file on the Mac it ships to. A directory that cannot be read is a refusal,
+/// never a cleared check — the shape of the epic-44 defect where `notes_create`
+/// could overwrite a note through an unreadable directory.
+///
+/// Returns the new file's profile-relative path, so the surface can re-read the
+/// folder and put the cursor on the row it just made without composing a path.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, no vault, a
+/// directory outside the vault, a name that is not a name, a name already
+/// taken, an unreadable directory, a disk failure).
+#[tauri::command]
+pub async fn sync_create_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    name: String,
+) -> Result<String, IpcError> {
+    let (profile, vault) = writable_profile(&state, &id)?;
+    let (_, scope) = vault_and_scope(&profile);
+    let target = scope
+        .create(&subpath, &name)
+        .map_err(|refusal| write_refused(&refusal))?;
+
+    let created = {
+        let root = profile.local_path.clone();
+        let vault = vault.clone();
+        let target = target.clone();
+        let wanted = name.clone();
+        tokio::task::spawn_blocking(move || {
+            let directory = files_write::resolve_existing(&root, &subpath)?;
+            if files_write::collides(&directory, &wanted)? {
+                return Err(WriteRefusal::NameTaken { name: wanted });
+            }
+            // Empty, and empty on purpose: a new text file with keeper's
+            // boilerplate in it is a file the user has to delete something out
+            // of before typing.
+            crate::notes_vault::write_vault_file(&vault, &target.vault_relative, "").map_err(
+                |error| WriteRefusal::WriteFailed {
+                    relative_path: target.profile_relative.clone(),
+                    reason: error.to_string(),
+                },
+            )?;
+            Ok(target)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not create {name}: {err}")))?
+    };
+    let target = created.map_err(|refusal| write_refused(&refusal))?;
+
+    crate::notes_vault::touch(&vault.id, vec![target.vault_relative.clone()]);
+    crate::notes_vault::mark_dirty(&vault.id);
+    tracing::info!(
+        rel = %target.profile_relative,
+        "files: created a file from the Files surface"
+    );
+    Ok(target.profile_relative)
+}
+
+/// Whether one profile-relative path is one keeper will delete, and whether it
+/// is a directory.
+///
+/// The disk question and the scope question in the order that produces the
+/// useful sentence: a path that is gone is reported as gone rather than as
+/// "outside the vault", because the two have different next steps and only one
+/// of them is the user's mistake.
+fn deletable(
+    profile: &SyncProfile,
+    scope: &WriteScope<'_>,
+    subpath: &str,
+) -> Result<DeleteTarget, WriteRefusal> {
+    let resolved = files_write::resolve_existing(&profile.local_path, subpath)?;
+    let is_dir = resolved.is_dir();
+    let vault_relative = scope.file(subpath, is_dir)?;
+    Ok(DeleteTarget {
+        vault_relative,
+        is_dir,
+    })
+}
+
+/// One path the delete path has already resolved and allowed.
+///
+/// Both facts, because both callers need one each and neither may re-derive
+/// the other's: the plan asks the engine about `is_dir`, and the command hands
+/// `vault_relative` to `trash_note`. Resolving twice would be two `stat`s and
+/// one more chance for the two answers to disagree about a path that changed
+/// underneath.
+struct DeleteTarget {
+    /// The argument `notes_vault::trash_note` takes.
+    vault_relative: String,
+    /// From the dirent, for the sync question.
+    is_dir: bool,
+}
+
+/// A `NotesError` from the one writer, as the frontend receives it.
+///
+/// Its `Display` already names the vault-relative path and the OS's own words,
+/// which is what a person needs; wrapping it in a second sentence would bury
+/// the only actionable part.
+fn notes_write_error(error: keeper_core::notes::NotesError) -> IpcError {
+    tracing::warn!(%error, "files: a vault write failed");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    }
 }
 
 /// The tray's view of folder sync: one composed state and one line.

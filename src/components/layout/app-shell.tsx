@@ -1,4 +1,4 @@
-import { type MouseEvent, useCallback, useRef } from "react";
+import { type MouseEvent, useCallback, useEffect, useRef } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
@@ -9,6 +9,7 @@ import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { FilesPane } from "@/components/layout/files-pane";
+import { PanelStrip } from "@/components/layout/panel-strip";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
 import { SettingsPane } from "@/components/layout/settings-pane";
@@ -44,6 +45,7 @@ import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
+import { hydratePanels } from "@/lib/stores/panels";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { beginTitleBarDrag } from "@/lib/titlebar-drag";
 import { cn } from "@/lib/utils";
@@ -101,6 +103,19 @@ export function AppShell() {
   // a press toggles capture through the shared recording-control module. The
   // hook self-gates on the `recording` capability (inert everywhere else).
   useRecordingHotkey();
+  // Restore the panel arrangement from the last run (Story 45.1, FR-173).
+  //
+  // Here rather than at the panel store's module load, and here rather than
+  // inside the strip: the notes list can retarget a panel while the Notes
+  // surface is up and the strip has never mounted, and an unhydrated store
+  // would then overwrite the remembered arrangement with one panel. Mounted at
+  // the shell so it runs exactly once per app, whatever surface comes up first
+  // — a restore the shell does not mount is a restore no hook-level test can
+  // ever see it fail to make (DW-172). `hydratePanels` is idempotent, so
+  // React's double-invoked development effects restore once.
+  useEffect(() => {
+    hydratePanels(document.cookie);
+  }, []);
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
@@ -235,7 +250,16 @@ export function AppShell() {
                 // Story 43.8: the browser over what sync holds, gated on the
                 // SAME `sync` capability as sync itself — where no folder can be
                 // synced there is nothing for a file browser to browse.
-                <FilesPane />
+                //
+                // Story 45.1 puts the panel strip beside it: the tree is the
+                // browser and the strip is the document area, which is what
+                // turns "the Files pane lists a PDF it will not open" into a
+                // click. The tree already carried its own right-hand border for
+                // a neighbour it did not have.
+                <>
+                  <FilesPane />
+                  <PanelStrip />
+                </>
               ) : notes && primaryView === "notes" ? (
                 <NotesPane />
               ) : primaryView === "bridges" ? (

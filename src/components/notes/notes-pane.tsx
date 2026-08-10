@@ -69,6 +69,7 @@ import {
   useActiveVault,
   useNotesVaultsStore,
 } from "@/lib/stores/notes-vaults";
+import { activePanel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
@@ -114,7 +115,11 @@ export function NotesPane() {
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
   const loaded = useNotesListStore((s) => s.loaded);
-  const selected = useNotesListStore((s) => s.selected);
+  // The note this pane is showing: the active panel's target, when it is a note.
+  const activeNote = usePanelsStore((s) => {
+    const active = activePanel(s);
+    return active.target?.kind === "note" ? active.target : null;
+  });
   const actions = useNotesActions(activeVaultId);
   const searchRef = useRef<HTMLInputElement | null>(null);
   // A verb's failure belongs to the surface that asked for it, so it is shown
@@ -210,10 +215,22 @@ export function NotesPane() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onSaveAsSpace]);
 
+  /**
+   * A row's own click: the active panel now shows this note (Story 45.1).
+   *
+   * There is no double-click twin here. A second note panel is refused by the
+   * model — the note document mirror is a module singleton, so two mounted
+   * editors would write each other's buffer — and this pane renders exactly the
+   * one note panel the model allows.
+   */
   const openRow = useCallback(
     (row: NoteRowVm) => {
       if (activeVaultId !== null) {
-        notesListStore.getState().select(activeVaultId, row.id);
+        panelsStore.getState().setActiveTarget({
+          kind: "note",
+          vaultId: activeVaultId,
+          noteId: row.id,
+        });
       }
     },
     [activeVaultId],
@@ -245,10 +262,13 @@ export function NotesPane() {
   };
 
   const noVault = vaults !== null && vaults.length === 0;
-  // The open note is shown only while its own vault is the active one. It is not
-  // forgotten in the meantime — that is the whole of "a vault switch is a filter".
+  // The open note is the active panel's target, and it is shown only while its
+  // own vault is the active one. It is not forgotten in the meantime — that is
+  // the whole of "a vault switch is a filter" — and it is the panel list rather
+  // than a cursor of this pane's own, so the Files surface and this one cannot
+  // disagree about what is open (Story 45.1).
   const openNoteId =
-    selected !== null && selected.vaultId === activeVaultId ? selected.noteId : null;
+    activeNote !== null && activeNote.vaultId === activeVaultId ? activeNote.noteId : null;
 
   // A cold scan in progress is why the list can be empty and the vault not be.
   const scanning = activeVault !== null && !activeVault.indexed;
@@ -429,7 +449,11 @@ export function NotesPane() {
           <NoteEditor
             vaultId={activeVaultId}
             noteId={openNoteId}
-            onOpenNote={(noteId) => notesListStore.getState().select(activeVaultId, noteId)}
+            onOpenNote={(noteId) =>
+              panelsStore
+                .getState()
+                .setActiveTarget({ kind: "note", vaultId: activeVaultId, noteId })
+            }
           />
         )}
       </div>

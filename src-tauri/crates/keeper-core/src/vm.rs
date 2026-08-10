@@ -3789,6 +3789,146 @@ impl FilesEntrySyncVm {
     }
 }
 
+/// One entry's size, formatted once in Rust (Story 45.5, FR-178).
+///
+/// **Both halves, and the label is not derivable from the bytes by the
+/// caller.** `bytes` is the exact count, for a tooltip, a sort, or a threshold
+/// a viewer applies. `label` is [`crate::size::format_file_size`]'s answer,
+/// computed here so that the Files pane, 45.2's unknown viewer, 45.3's delete
+/// confirmation and any later surface all show the same string for the same
+/// file. A frontend handed only `bytes` would divide by something, and the six
+/// formatters this product had before this story are what that looks like after
+/// a few years.
+///
+/// This type is only ever reached through an [`Option`]: see
+/// [`FilesEntryVm::size`] for why a directory must not have one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileSizeVm {
+    /// The exact byte count. `u64` on the wire is a JSON number, which loses
+    /// precision above 2^53 — irrelevant for a file (9 PB) and stated here so
+    /// nobody reaches for this field to carry something that is not a size.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// The rendered size, decimal, from [`crate::size::format_file_size`]. The
+    /// only string any surface shows for this file's size.
+    pub label: String,
+}
+
+impl FileSizeVm {
+    /// Wrap a byte count with its one rendering.
+    pub fn new(bytes: u64) -> Self {
+        Self {
+            bytes,
+            label: crate::size::format_file_size(bytes),
+        }
+    }
+}
+
+/// A folder keeper itself put somewhere, so the pane can point at it (Story
+/// 45.5, FR-178).
+///
+/// "Which of these forty folders is my vault" is a question the pane has all
+/// the information to answer and, before this story, did not. The answer is
+/// always **configuration**: the profile's own `notes.subfolder` and
+/// `recordings.subfolder`. It is never a name. A user whose vault is called
+/// `brain` or `Second Brain` or `zk` gets the same icon as one who kept the
+/// default, and a user who names an ordinary folder `10-notes` does not get a
+/// vault icon for it — which is the failure a hardcoded name produces on the
+/// day somebody renames their vault and quietly loses the marker.
+///
+/// Deliberately NOT a member of [`RecordingNoteTargetKind`]. That vocabulary
+/// answers "what is this thing" from the dirent and the file name (AD-73), and
+/// it is the same answer on every machine. A folder's role is an answer about
+/// *this installation's settings*, true of one folder on one profile and false
+/// of a byte-identical copy of it elsewhere. Folding the two together would put
+/// a machine-local fact into the classifier that 45.2's registry keys on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum FilesFolderRoleVm {
+    /// This folder is the profile's notes vault (`notes.subfolder`).
+    NotesVault,
+    /// This folder is where the profile's recordings are written
+    /// (`recordings.subfolder`).
+    Recordings,
+}
+
+/// The configured folder roles of one profile, as [`FilesEntryVm::new`] needs
+/// them (Story 45.5).
+///
+/// Borrowed rather than owned, and passed per listing rather than per entry: a
+/// directory of a thousand rows resolves its roles against two `&str` and
+/// allocates nothing. `None` for either means the profile carries no such
+/// configuration — not a vault, or not a recordings root — and no entry in it
+/// can take that role.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilesFolderRoles<'a> {
+    /// The profile's `notes.subfolder`, profile-relative, exactly as stored.
+    pub notes_subfolder: Option<&'a str>,
+    /// The profile's `recordings.subfolder`, profile-relative, exactly as
+    /// stored.
+    pub recordings_subfolder: Option<&'a str>,
+}
+
+impl FilesFolderRoles<'_> {
+    /// Which role, if any, the folder at `relative_path` plays.
+    ///
+    /// **Only a directory can hold a role**, so a *file* the user happens to
+    /// name `notes` never takes the vault icon.
+    ///
+    /// **Exact match on the whole path, not a prefix.** A folder *inside* the
+    /// vault is an ordinary folder; marking every descendant would make the
+    /// marker useless at exactly the depth a person is scanning.
+    ///
+    /// **Compared case-insensitively, and with separators and edge slashes
+    /// normalised.** The stored subfolder is whatever the user typed into the
+    /// settings form — `Notes/`, `\Notes`, `NOTES` — while `relative_path` is
+    /// what the dirent says, and on APFS and HFS+ those two differ in case for
+    /// the same folder as a matter of course. A case-sensitive compare would
+    /// silently drop the icon for the user who typed a capital, which is the
+    /// same invisible failure as hardcoding the name.
+    ///
+    /// Notes wins a tie. A profile configured with the same subfolder for both
+    /// is a misconfiguration the settings form should refuse, and if one ever
+    /// reaches here it must produce one deterministic answer rather than
+    /// whichever branch was written first.
+    pub fn role_of(&self, relative_path: &str, is_dir: bool) -> Option<FilesFolderRoleVm> {
+        if !is_dir {
+            return None;
+        }
+        let matches = |configured: Option<&str>| {
+            configured.is_some_and(|configured| same_folder_path(configured, relative_path))
+        };
+        if matches(self.notes_subfolder) {
+            Some(FilesFolderRoleVm::NotesVault)
+        } else if matches(self.recordings_subfolder) {
+            Some(FilesFolderRoleVm::Recordings)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether two profile-relative folder paths name the same folder.
+///
+/// Split out so the normalisation rule is one function with one set of tests
+/// rather than a chain of `trim`s inlined at a comparison — the shape that
+/// grows a fifth `trim_matches` nobody notices is missing on the other side.
+/// An empty configured subfolder matches nothing: the profile root is not a
+/// vault, `NotesConfig::validate` refuses an empty subfolder, and returning
+/// `true` for it here would mark every entry of an empty-string listing.
+fn same_folder_path(left: &str, right: &str) -> bool {
+    let normalise = |path: &str| {
+        path.replace('\\', "/")
+            .trim_matches('/')
+            .to_ascii_lowercase()
+    };
+    let left = normalise(left);
+    !left.is_empty() && left == normalise(right)
+}
+
 /// One entry in a browsed synced folder (Story 43.8, FR-153, FR-145, AD-65,
 /// AD-73).
 ///
@@ -3824,6 +3964,69 @@ pub struct FilesEntryVm {
     pub kind: RecordingNoteTargetKind,
     /// Whether sync has this entry, and why not (Story 44.17, FR-173).
     pub sync: FilesEntrySyncVm,
+    /// How big this entry is, rendered once in Rust (Story 45.5, FR-178).
+    ///
+    /// **`None` for a directory, and that is the point of the `Option`.** A
+    /// folder has no size keeper is willing to claim — computing one means
+    /// walking the tree, which a listing must never do — and a folder rendered
+    /// as "0 bytes" says something false about every folder that has anything
+    /// in it. Modelled as an absence rather than a zero so the natural
+    /// refactor, making this field non-optional and defaulting it, has to
+    /// delete a documented contract to happen.
+    ///
+    /// Also `None` when the entry's metadata could not be read at all — a
+    /// broken symlink, a file removed between the `read_dir` and the `stat`.
+    /// An unknown size and an absent size render identically, which is correct:
+    /// in both cases keeper does not know and says nothing rather than
+    /// guessing.
+    pub size: Option<FileSizeVm>,
+    /// Whether keeper itself put something here (Story 45.5, FR-178).
+    ///
+    /// `Some` only for the folder the profile's configuration names as its
+    /// notes vault or its recordings root, and only ever from that
+    /// configuration — never from the folder's name. See
+    /// [`FilesFolderRoleVm`].
+    pub folder_role: Option<FilesFolderRoleVm>,
+    /// Whether the Files surface may change or remove this entry, and why not
+    /// (Story 45.3, FR-175, AD-89).
+    ///
+    /// **This is the LOCATION question and only that.** It answers "is this
+    /// path somewhere keeper writes" — inside a reachable notes vault, not the
+    /// vault directory itself, not a folder. Whether the *format* can be
+    /// written is a separate question the viewer registry answers (Story 45.2),
+    /// and an edit needs both to say yes: a PDF in a writable folder is not
+    /// editable, and a Markdown file outside a vault is not either.
+    ///
+    /// Carried on the entry rather than probed for, because the surface must
+    /// never offer an action that will fail. The pane renders the reason where
+    /// the action would have been.
+    pub write: FilesWriteVm,
+}
+
+/// Everything [`FilesEntryVm::new`] needs, named at the call site.
+///
+/// A struct rather than eight positional parameters, and not only because
+/// clippy counts: three of them are strings in a row (`name`,
+/// `relative_path`, `absolute_path`), so transposing two of them compiles,
+/// passes every type check, and produces a row that renders one file's name
+/// over another file's path. A field name is the cheapest defence there is
+/// against that, and this constructor is called from a loop over a whole
+/// directory where the mistake would be uniform and therefore plausible.
+pub struct FilesEntryFacts<'a> {
+    /// The dirent's own name, which is what the row shows.
+    pub name: String,
+    /// Profile-relative, and the only path that may reach a note (FR-145).
+    pub relative_path: String,
+    /// An action argument for Reveal and Open With; never rendered (AD-65).
+    pub absolute_path: String,
+    pub is_dir: bool,
+    pub sync: FilesEntrySyncVm,
+    /// `None` when the metadata could not be read. A directory's is discarded.
+    pub size_bytes: Option<u64>,
+    /// The profile's configuration, not the folder's name (Story 45.5).
+    pub roles: FilesFolderRoles<'a>,
+    /// The location verdict `keeper_sync::files_write` already reached.
+    pub write: FilesWriteVm,
 }
 
 impl FilesEntryVm {
@@ -3832,14 +4035,34 @@ impl FilesEntryVm {
     /// `is_dir` comes from the dirent rather than from the name, because a
     /// directory called `notes.md` exists and an extension table would call it
     /// a document and offer to open it in a text editor.
-    pub fn new(
-        name: impl Into<String>,
-        relative_path: impl Into<String>,
-        absolute_path: impl Into<String>,
-        is_dir: bool,
-        sync: FilesEntrySyncVm,
-    ) -> Self {
-        let name = name.into();
+    ///
+    /// `size_bytes` is the dirent's own `len()` for a regular file and `None`
+    /// for everything else. A directory's is DISCARDED here rather than
+    /// trusted: `std::fs::metadata` reports a nonzero length for a directory on
+    /// most filesystems (the size of its own dirent block), which is a number
+    /// about the folder's bookkeeping and not about its contents. Showing it
+    /// would be worse than showing nothing, so this constructor drops it
+    /// unconditionally — a caller that passes one for a directory cannot leak
+    /// it (Story 45.5).
+    ///
+    /// `roles` is the profile's configuration, not the folder's name.
+    ///
+    /// `write` is the location verdict `keeper_sync::files_write` already
+    /// reached for this path. Passed in rather than derived: this crate is
+    /// deliberately `keeper-sync`-free (AD-40), so it cannot see a profile's
+    /// vault configuration, and a second opinion about where keeper may write
+    /// is the last thing this projection should hold.
+    pub fn new(facts: FilesEntryFacts<'_>) -> Self {
+        let FilesEntryFacts {
+            name,
+            relative_path,
+            absolute_path,
+            is_dir,
+            sync,
+            size_bytes,
+            roles,
+            write,
+        } = facts;
         let kind = if is_dir {
             RecordingNoteTargetKind::Folder
         } else {
@@ -3847,10 +4070,17 @@ impl FilesEntryVm {
         };
         Self {
             name,
-            relative_path: relative_path.into(),
-            absolute_path: absolute_path.into(),
             kind,
+            absolute_path,
+            size: if is_dir {
+                None
+            } else {
+                size_bytes.map(FileSizeVm::new)
+            },
+            folder_role: roles.role_of(&relative_path, is_dir),
+            relative_path,
             sync,
+            write,
         }
     }
 }
@@ -3890,6 +4120,259 @@ pub struct FilesListingVm {
     /// Whether the listing was cut short at the shell's cap. `false` for every
     /// state that has no entries — there was nothing to cut.
     pub truncated: bool,
+    /// Whether keeper may create a file in the directory that was listed, and
+    /// why not (Story 45.3, FR-176, AD-89).
+    ///
+    /// The directory's own answer, which is a different question from any
+    /// entry's: the vault root can be created in and cannot be deleted, and a
+    /// folder outside the vault can be listed and cannot be created in. Carried
+    /// on the listing so the "New file" control is absent-with-a-reason rather
+    /// than present-and-failing, and so nothing has to ask a second time.
+    ///
+    /// Refused for every state but [`FilesListingState::Listed`]: a folder
+    /// keeper could not read is not a folder keeper will write into.
+    pub write: FilesWriteVm,
+}
+
+/// Whether keeper may write at one place, and the sentence saying why not
+/// (Story 45.3, FR-175, FR-176, AD-89).
+///
+/// **A field on the listing rather than an error from an attempt.** The rule
+/// the story turns on is that a file outside a vault "can be listed and viewed
+/// but not written: the surface says why rather than offering an action that
+/// will fail". That is only expressible if the surface knows before it renders
+/// the control, so the verdict rides with the data.
+///
+/// `reason` is a whole sentence composed by
+/// `keeper_sync::files_write::WriteRefusal`, rendered verbatim and never
+/// paraphrased in TypeScript — the same rule [`FilesEntrySyncVm::detail`]
+/// follows, for the same reason: a second copy of these words is a second copy
+/// that will be edited once.
+///
+/// `Some` exactly when `writable` is false. A refusal with no reason would be
+/// a control that vanished with no explanation, which is the failure this whole
+/// field exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesWriteVm {
+    /// Whether keeper will write here.
+    pub writable: bool,
+    /// Why not, as a whole sentence. `None` exactly when `writable`.
+    pub reason: Option<String>,
+}
+
+impl FilesWriteVm {
+    /// keeper writes here.
+    pub fn allowed() -> Self {
+        Self {
+            writable: true,
+            reason: None,
+        }
+    }
+
+    /// keeper does not write here, and this is why.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            writable: false,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Project a `Result` from the write-scope decision, which is how every
+    /// call site actually holds this fact.
+    pub fn from_verdict<T, E: std::fmt::Display>(verdict: &Result<T, E>) -> Self {
+        match verdict {
+            Ok(_) => Self::allowed(),
+            Err(refusal) => Self::refused(refusal.to_string()),
+        }
+    }
+}
+
+/// One thing in a delete selection that keeper will not delete, and why
+/// (Story 45.3, FR-175).
+///
+/// Named, because a selection that silently shrinks between the click and the
+/// confirmation is a selection that lied about what it was going to do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesDeleteRefusalVm {
+    /// The entry's profile-relative path — what the surface already shows.
+    pub relative_path: String,
+    /// The whole sentence, composed by `keeper_sync::files_write`.
+    pub reason: String,
+}
+
+/// What a delete would do, worded before it is done (Story 45.3, FR-175,
+/// UX-DR66).
+///
+/// **Composed in Rust, and that is the story's requirement rather than a house
+/// habit.** The confirmation has to name the file and say whether it syncs, and
+/// both facts live here: the file list is the one the command will act on, and
+/// the sync consequence is derived from the same [`FilesSyncStatusVm`] the row
+/// already shows. A confirmation assembled in TypeScript from a count and a
+/// glyph would be a second, unverified reading of the engine's answer, and the
+/// one place a wrong reading costs a file.
+///
+/// Built by [`FilesDeletePlanVm::compose`], which is pure — so every sentence
+/// below is asserted on any machine, not only on the one where the Tauri shell
+/// builds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesDeletePlanVm {
+    /// The profile-relative paths that would go, in the order they were asked
+    /// for. Empty means there is nothing to confirm.
+    pub files: Vec<String>,
+    /// The heading: names the one file, counts the many.
+    pub question: String,
+    /// What deleting these means for sync — the story's "says whether it
+    /// syncs", worded for this exact set rather than in general.
+    pub consequence: String,
+    /// Where the bytes go. A destructive confirmation that does not say a copy
+    /// is kept reads as an erasure, and this one is not.
+    pub recovery: String,
+    /// What was asked for and will not go, each named.
+    pub refusals: Vec<FilesDeleteRefusalVm>,
+}
+
+impl FilesDeletePlanVm {
+    /// Word a delete over a set of entries and the reasons the rest were
+    /// dropped.
+    ///
+    /// `files` pairs each deletable profile-relative path with what sync says
+    /// about it right now.
+    ///
+    /// **[`FilesSyncStatusVm::Unknown`] counts as syncing, and says so.** The
+    /// two available guesses are "this deletion stays on this machine" and
+    /// "this deletion travels", and only one of them is safe to be wrong
+    /// about. Silently picking the quiet one would be the same lie
+    /// [`FilesSyncStatusVm::Unknown`] was introduced to refuse.
+    pub fn compose(
+        profile_name: &str,
+        files: Vec<(String, FilesSyncStatusVm)>,
+        refusals: Vec<FilesDeleteRefusalVm>,
+    ) -> Self {
+        let total = files.len();
+        let unclear = files
+            .iter()
+            .filter(|(_, status)| *status == FilesSyncStatusVm::Unknown)
+            .count();
+        let travels = files
+            .iter()
+            .filter(|(_, status)| {
+                matches!(
+                    status,
+                    FilesSyncStatusVm::Synced
+                        | FilesSyncStatusVm::Waiting
+                        | FilesSyncStatusVm::Unknown
+                )
+            })
+            .count();
+        let local = total - travels;
+
+        let question = match files.first() {
+            _ if total == 0 => "There is nothing here keeper can delete.".to_owned(),
+            Some((path, _)) if total == 1 => format!("Delete {path}?"),
+            _ => format!("Delete {total} files?"),
+        };
+
+        let consequence = if total == 0 {
+            String::new()
+        } else if unclear == total {
+            let (subject, claim, object) = if total == 1 {
+                ("this file's", "it syncs", "it")
+            } else {
+                ("these files'", "they sync", "them")
+            };
+            format!(
+                "keeper could not read {subject} sync state, so it has assumed {claim} and \
+                 that deleting removes {object} from every machine that syncs {profile_name}."
+            )
+        } else if local == 0 {
+            let head = if total == 1 {
+                "This file syncs".to_owned()
+            } else {
+                format!("These {total} files sync")
+            };
+            let caveat = unclear_caveat(unclear);
+            format!(
+                "{head}, so deleting {} here removes {} from every machine that syncs \
+                 {profile_name}.{caveat}",
+                if total == 1 { "it" } else { "them" },
+                if total == 1 { "it" } else { "them" },
+            )
+        } else if travels == 0 {
+            if total == 1 {
+                "This file does not sync, so this removes it from this machine only.".to_owned()
+            } else {
+                format!(
+                    "None of these {total} files sync, so this removes them from this \
+                     machine only."
+                )
+            }
+        } else {
+            let caveat = unclear_caveat(unclear);
+            format!(
+                "{travels} of these {total} files sync, so deleting them removes them from \
+                 every machine that syncs {profile_name}; the other {local} do not and go \
+                 from this machine only.{caveat}"
+            )
+        };
+
+        let recovery = if total == 0 {
+            String::new()
+        } else if total == 1 {
+            "keeper moves it into the vault's trash rather than erasing it, and the removal \
+             is recorded in this folder's history."
+                .to_owned()
+        } else {
+            "keeper moves them into the vault's trash rather than erasing them, and the \
+             removals are recorded in this folder's history."
+                .to_owned()
+        };
+
+        Self {
+            files: files.into_iter().map(|(path, _)| path).collect(),
+            question,
+            consequence,
+            recovery,
+            refusals,
+        }
+    }
+}
+
+/// The clause appended when some of the set's sync state could not be read.
+///
+/// Separate because it hangs off three different sentences and a fourth copy of
+/// it would be the one that eventually says something different.
+fn unclear_caveat(unclear: usize) -> String {
+    if unclear == 0 {
+        return String::new();
+    }
+    format!(
+        " keeper could not read the sync state of {unclear} of them, and has counted \
+         {} as syncing because that is the reading that assumes more rather than less.",
+        if unclear == 1 { "it" } else { "them" }
+    )
+}
+
+/// What a delete actually did (Story 45.3, FR-175).
+///
+/// **Partial success is a real outcome and is reported rather than thrown.** A
+/// file can vanish between the confirmation and the command — a sync pull, the
+/// user's own Finder window — and failing the whole call would leave the other
+/// four deleted with an error on screen saying nothing happened. Each path
+/// answers for itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesDeleteReceiptVm {
+    /// The profile-relative paths that are now in the trash.
+    pub deleted: Vec<String>,
+    /// What did not go, each named with the reason.
+    pub refusals: Vec<FilesDeleteRefusalVm>,
 }
 
 #[cfg(test)]
@@ -5693,13 +6176,16 @@ mod tests {
             ("manifest.json", RecordingNoteTargetKind::File),
             ("Makefile", RecordingNoteTargetKind::File),
         ] {
-            let entry = FilesEntryVm::new(
-                name,
-                format!("sub/{name}"),
-                format!("/v/sub/{name}"),
-                false,
-                FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
-            );
+            let entry = FilesEntryVm::new(FilesEntryFacts {
+                name: name.to_owned(),
+                relative_path: format!("sub/{name}"),
+                absolute_path: format!("/v/sub/{name}"),
+                is_dir: false,
+                sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+                size_bytes: Some(7),
+                roles: FilesFolderRoles::default(),
+                write: FilesWriteVm::allowed(),
+            });
             assert_eq!(entry.kind, expected, "{name}");
         }
     }
@@ -5709,13 +6195,16 @@ mod tests {
     /// a text editor.
     #[test]
     fn a_directory_is_a_folder_whatever_it_is_named() {
-        let entry = FilesEntryVm::new(
-            "notes.md",
-            "notes.md",
-            "/v/notes.md",
-            true,
-            FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
-        );
+        let entry = FilesEntryVm::new(FilesEntryFacts {
+            name: "notes.md".to_owned(),
+            relative_path: "notes.md".to_owned(),
+            absolute_path: "/v/notes.md".to_owned(),
+            is_dir: true,
+            sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+            size_bytes: None,
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
         assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
     }
 
@@ -5731,6 +6220,7 @@ mod tests {
             entries: Some(Vec::new()),
             detail: None,
             truncated: false,
+            write: FilesWriteVm::allowed(),
         };
         let json = serde_json::to_string(&empty).expect("serialize empty listing");
         assert!(json.contains("\"state\":\"listed\""), "json was: {json}");
@@ -5752,18 +6242,233 @@ mod tests {
         assert_eq!(back, absent);
     }
 
+    /// Story 45.3: `writable` and `reason` are exact complements, so a control
+    /// can never vanish without a sentence saying why.
+    #[test]
+    fn a_write_verdict_carries_a_reason_exactly_when_it_refuses() {
+        assert_eq!(
+            FilesWriteVm::allowed(),
+            FilesWriteVm {
+                writable: true,
+                reason: None
+            }
+        );
+        let refused = FilesWriteVm::refused("nope, and here is why");
+        assert!(!refused.writable);
+        assert_eq!(refused.reason.as_deref(), Some("nope, and here is why"));
+
+        // The projection every call site actually uses: a `Result` from the
+        // write-scope decision, whose `Err` already holds the whole sentence.
+        let ok: Result<(), String> = Ok(());
+        assert_eq!(FilesWriteVm::from_verdict(&ok), FilesWriteVm::allowed());
+        let err: Result<(), String> = Err("outside the vault".to_owned());
+        assert_eq!(
+            FilesWriteVm::from_verdict(&err),
+            FilesWriteVm::refused("outside the vault")
+        );
+    }
+
+    /// Story 45.3, the confirmation's first requirement: it NAMES one file and
+    /// COUNTS many.
+    #[test]
+    fn a_delete_confirmation_names_one_file_and_counts_several() {
+        let one = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![("10-notes/Report.md".to_owned(), FilesSyncStatusVm::Synced)],
+            Vec::new(),
+        );
+        assert_eq!(one.question, "Delete 10-notes/Report.md?");
+        assert_eq!(one.files, vec!["10-notes/Report.md".to_owned()]);
+
+        let many = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                ("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced),
+                ("10-notes/b.md".to_owned(), FilesSyncStatusVm::Waiting),
+                ("10-notes/c.md".to_owned(), FilesSyncStatusVm::Synced),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(many.question, "Delete 3 files?");
+        // The list is the one the command will act on, in the asked-for order.
+        assert_eq!(
+            many.files,
+            vec![
+                "10-notes/a.md".to_owned(),
+                "10-notes/b.md".to_owned(),
+                "10-notes/c.md".to_owned()
+            ]
+        );
+    }
+
+    /// Story 45.3, the confirmation's second requirement: it says whether the
+    /// files sync, and the three answers are different sentences rather than
+    /// one hedged one.
+    #[test]
+    fn a_delete_confirmation_says_whether_the_files_sync() {
+        let synced = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            Vec::new(),
+        );
+        assert_eq!(
+            synced.consequence,
+            "This file syncs, so deleting it here removes it from every machine that \
+             syncs Vault."
+        );
+
+        // Excluded and not-in-a-repository are both "this stays here", and the
+        // sentence must not promise a remote that has never heard of the file.
+        for status in [
+            FilesSyncStatusVm::Excluded,
+            FilesSyncStatusVm::NotInRepository,
+        ] {
+            let local =
+                FilesDeletePlanVm::compose("Vault", vec![("a.md".to_owned(), status)], Vec::new());
+            assert_eq!(
+                local.consequence,
+                "This file does not sync, so this removes it from this machine only.",
+                "{status:?}"
+            );
+        }
+
+        let none = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                ("a.md".to_owned(), FilesSyncStatusVm::Excluded),
+                ("b.md".to_owned(), FilesSyncStatusVm::NotInRepository),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            none.consequence,
+            "None of these 2 files sync, so this removes them from this machine only."
+        );
+
+        let mixed = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
+                ("b.md".to_owned(), FilesSyncStatusVm::Excluded),
+                ("c.md".to_owned(), FilesSyncStatusVm::Waiting),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            mixed.consequence,
+            "2 of these 3 files sync, so deleting them removes them from every machine \
+             that syncs Vault; the other 1 do not and go from this machine only."
+        );
+    }
+
+    /// An engine that could not answer is counted as syncing and SAYS so.
+    ///
+    /// The two guesses are "this deletion stays here" and "this deletion
+    /// travels", and only one of them is safe to be wrong about. Picking the
+    /// quiet one silently would be exactly the lie `FilesSyncStatusVm::Unknown`
+    /// exists to refuse.
+    #[test]
+    fn an_unreadable_sync_state_is_counted_as_syncing_and_admitted() {
+        let all = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![("a.md".to_owned(), FilesSyncStatusVm::Unknown)],
+            Vec::new(),
+        );
+        assert_eq!(
+            all.consequence,
+            "keeper could not read this file's sync state, so it has assumed it syncs and \
+             that deleting removes it from every machine that syncs Vault."
+        );
+
+        let some = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
+                ("b.md".to_owned(), FilesSyncStatusVm::Unknown),
+            ],
+            Vec::new(),
+        );
+        assert!(
+            some.consequence.starts_with("These 2 files sync"),
+            "{}",
+            some.consequence
+        );
+        assert!(
+            some.consequence.contains(
+                "keeper could not read the sync state of 1 of them, and has counted it as \
+                 syncing"
+            ),
+            "{}",
+            some.consequence
+        );
+    }
+
+    /// A destructive confirmation that does not say a copy is kept reads as an
+    /// erasure, and this one is not one.
+    #[test]
+    fn a_delete_confirmation_says_where_the_bytes_go() {
+        let one = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![("a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            Vec::new(),
+        );
+        assert!(one.recovery.contains("vault's trash"), "{}", one.recovery);
+        assert!(one.recovery.contains("rather than erasing it"));
+
+        let many = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                ("a.md".to_owned(), FilesSyncStatusVm::Synced),
+                ("b.md".to_owned(), FilesSyncStatusVm::Synced),
+            ],
+            Vec::new(),
+        );
+        assert!(many.recovery.contains("rather than erasing them"));
+    }
+
+    /// A selection keeper will only partly act on says so by name, and an
+    /// empty plan is a plan that asks nothing.
+    #[test]
+    fn a_plan_that_can_delete_nothing_asks_no_question() {
+        let refusals = vec![FilesDeleteRefusalVm {
+            relative_path: "10-notes/daily".to_owned(),
+            reason: "daily is a folder.".to_owned(),
+        }];
+        let plan = FilesDeletePlanVm::compose("Vault", Vec::new(), refusals.clone());
+        assert!(plan.files.is_empty());
+        assert_eq!(plan.question, "There is nothing here keeper can delete.");
+        // No consequence and no recovery: there is nothing to word, and a
+        // leftover sentence about syncing would describe a deletion that is
+        // not going to happen.
+        assert_eq!(plan.consequence, "");
+        assert_eq!(plan.recovery, "");
+        assert_eq!(plan.refusals, refusals);
+
+        // A partial selection keeps both halves.
+        let partial = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![("10-notes/a.md".to_owned(), FilesSyncStatusVm::Synced)],
+            refusals.clone(),
+        );
+        assert_eq!(partial.question, "Delete 10-notes/a.md?");
+        assert_eq!(partial.refusals, refusals);
+    }
+
     #[test]
     fn files_entry_camel_cases_both_paths_and_never_leaks_one_into_the_other() {
-        let entry = FilesEntryVm::new(
-            "clip.mov",
-            "2026/clip.mov",
-            "/Volumes/m/2026/clip.mov",
-            false,
-            FilesEntrySyncVm::explained(
+        let entry = FilesEntryVm::new(FilesEntryFacts {
+            name: "clip.mov".to_owned(),
+            relative_path: "2026/clip.mov".to_owned(),
+            absolute_path: "/Volumes/m/2026/clip.mov".to_owned(),
+            is_dir: false,
+            sync: FilesEntrySyncVm::explained(
                 FilesSyncStatusVm::Waiting,
                 "This file has changed and has not been committed yet.",
             ),
-        );
+            size_bytes: Some(1_500_000),
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
         let json = serde_json::to_string(&entry).expect("serialize files entry");
         assert!(
             json.contains("\"relativePath\":\"2026/clip.mov\""),
@@ -5782,6 +6487,193 @@ mod tests {
                  has not been committed yet.\"}"
             ),
             "json was: {json}"
+        );
+        // The size crosses as one nested object carrying both halves, so a
+        // surface reads `entry.size.label` and never divides anything (45.5).
+        assert!(
+            json.contains("\"size\":{\"bytes\":1500000,\"label\":\"1.5 MB\"}"),
+            "json was: {json}"
+        );
+        assert!(json.contains("\"folderRole\":null"), "json was: {json}");
+    }
+
+    /// A directory carries no size, even when the caller offers one (Story
+    /// 45.5, FR-178).
+    ///
+    /// `std::fs::metadata` reports a nonzero length for a directory on every
+    /// platform keeper runs on, so "the caller offers one" is the ordinary
+    /// case rather than a contrived one. The constructor drops it, and the
+    /// wire says `null` — not `0`, which would be a false claim about the
+    /// folder's contents and the exact string this story exists to prevent.
+    #[test]
+    fn a_directory_has_no_size_even_when_one_is_offered() {
+        let entry = FilesEntryVm::new(FilesEntryFacts {
+            name: "Archive".to_owned(),
+            relative_path: "Archive".to_owned(),
+            absolute_path: "/v/Archive".to_owned(),
+            is_dir: true,
+            sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+            size_bytes: Some(4_096),
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
+        assert_eq!(entry.size, None, "a folder's size is absent, never zero");
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(json.contains("\"size\":null"), "json was: {json}");
+        assert!(
+            !json.contains("0 B") && !json.contains("0 bytes"),
+            "a folder must never carry a rendered zero: {json}"
+        );
+    }
+
+    /// An unreadable file has an unknown size, and an empty one has a size of
+    /// zero. They are different facts and must stay so.
+    #[test]
+    fn an_unknown_size_and_an_empty_file_are_different() {
+        let unknown = FilesEntryVm::new(FilesEntryFacts {
+            name: "broken.link".to_owned(),
+            relative_path: "broken.link".to_owned(),
+            absolute_path: "/v/broken.link".to_owned(),
+            is_dir: false,
+            sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Unknown),
+            size_bytes: None,
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
+        assert_eq!(unknown.size, None);
+        let empty = FilesEntryVm::new(FilesEntryFacts {
+            name: "empty.md".to_owned(),
+            relative_path: "empty.md".to_owned(),
+            absolute_path: "/v/empty.md".to_owned(),
+            is_dir: false,
+            sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+            size_bytes: Some(0),
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
+        assert_eq!(
+            empty.size.as_ref().map(|size| size.label.as_str()),
+            Some("0 bytes"),
+            "an empty FILE says so; it is a folder that says nothing"
+        );
+    }
+
+    /// The vault and the recordings folder are found by CONFIGURATION, never by
+    /// name (Story 45.5, FR-178).
+    ///
+    /// The fixture deliberately uses `Second Brain` and `Clips` rather than the
+    /// defaults, and puts a decoy folder literally called `10-notes` beside
+    /// them. An implementation that matches keeper's default subfolder names —
+    /// the shortcut this story explicitly forbids — marks the decoy and misses
+    /// both real ones, so it fails on three assertions at once.
+    #[test]
+    fn the_vault_and_the_recordings_folder_come_from_configuration_not_from_a_name() {
+        let roles = FilesFolderRoles {
+            notes_subfolder: Some("Second Brain"),
+            recordings_subfolder: Some("Clips"),
+        };
+        let role_of = |name: &str, is_dir: bool| {
+            FilesEntryVm::new(FilesEntryFacts {
+                name: name.to_owned(),
+                relative_path: name.to_owned(),
+                absolute_path: format!("/v/{name}"),
+                is_dir,
+                sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+                size_bytes: None,
+                roles,
+                write: FilesWriteVm::allowed(),
+            })
+            .folder_role
+        };
+        assert_eq!(
+            role_of("Second Brain", true),
+            Some(FilesFolderRoleVm::NotesVault)
+        );
+        assert_eq!(role_of("Clips", true), Some(FilesFolderRoleVm::Recordings));
+        assert_eq!(
+            role_of("10-notes", true),
+            None,
+            "keeper's default vault name is not evidence of anything"
+        );
+        assert_eq!(role_of("recordings", true), None);
+        assert_eq!(
+            role_of("Second Brain", false),
+            None,
+            "a FILE named like the vault is not the vault"
+        );
+        // A profile with no vault and no recordings root marks nothing at all.
+        let unconfigured = FilesEntryVm::new(FilesEntryFacts {
+            name: "Second Brain".to_owned(),
+            relative_path: "Second Brain".to_owned(),
+            absolute_path: "/v/Second Brain".to_owned(),
+            is_dir: true,
+            sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+            size_bytes: None,
+            roles: FilesFolderRoles::default(),
+            write: FilesWriteVm::allowed(),
+        });
+        assert_eq!(unconfigured.folder_role, None);
+    }
+
+    /// The role matches the whole path, case-insensitively, however the
+    /// subfolder was typed.
+    ///
+    /// Case-insensitivity is not politeness: APFS and HFS+ are case-insensitive
+    /// by default, so the folder the user created as `Notes` and the subfolder
+    /// they typed as `notes` are the same folder on disk, and a case-sensitive
+    /// compare drops the marker with no way for the user to tell why. The
+    /// nested case matters because a subfolder may be `work/notes`, and the
+    /// descendant case matters because marking everything under the vault makes
+    /// the marker useless.
+    #[test]
+    fn the_role_normalises_the_configured_subfolder_and_matches_only_the_folder_itself() {
+        let role_at = |configured: &str, path: &str| {
+            FilesFolderRoles {
+                notes_subfolder: Some(configured),
+                recordings_subfolder: None,
+            }
+            .role_of(path, true)
+        };
+        for configured in ["notes", "Notes", "NOTES", "/notes", "notes/", "\\notes"] {
+            assert_eq!(
+                role_at(configured, "Notes"),
+                Some(FilesFolderRoleVm::NotesVault),
+                "configured as {configured:?}"
+            );
+        }
+        assert_eq!(
+            role_at("work/notes", "work/notes"),
+            Some(FilesFolderRoleVm::NotesVault),
+            "a nested vault is still the vault"
+        );
+        assert_eq!(
+            role_at("notes", "notes/daily"),
+            None,
+            "a folder INSIDE the vault is an ordinary folder"
+        );
+        assert_eq!(
+            role_at("notes", "archive/notes"),
+            None,
+            "a folder with the vault's NAME elsewhere in the tree is not the vault"
+        );
+        assert_eq!(
+            role_at("", ""),
+            None,
+            "an empty configured subfolder matches nothing: the profile root is not a vault"
+        );
+    }
+
+    /// The role vocabulary crosses the wire camel-cased, so a surface can
+    /// switch on it without a translation table.
+    #[test]
+    fn the_folder_role_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&FilesFolderRoleVm::NotesVault).expect("serialize"),
+            "\"notesVault\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FilesFolderRoleVm::Recordings).expect("serialize"),
+            "\"recordings\""
         );
     }
 }

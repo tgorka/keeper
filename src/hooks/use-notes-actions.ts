@@ -35,6 +35,7 @@ import type { TagChip } from "@/lib/stores/notes-filters";
 import { noteQueryFor, notesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesListStore } from "@/lib/stores/notes-list";
 import { notesVaultsStore } from "@/lib/stores/notes-vaults";
+import { panelsStore } from "@/lib/stores/panels";
 
 /**
  * The vault a verb acts on, or `null` when none is active.
@@ -83,7 +84,7 @@ export async function createNote(spaceId: string | null = null): Promise<NoteCre
     tags: [],
     space: spaceId,
   });
-  notesListStore.getState().select(vaultId, created.note.id);
+  panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: created.note.id });
   return created;
 }
 
@@ -94,7 +95,7 @@ export async function openJournalToday(): Promise<NoteRefVm | null> {
     return null;
   }
   const ref = await notesJournalToday(vaultId);
-  notesListStore.getState().select(vaultId, ref.id);
+  panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: ref.id });
   return ref;
 }
 
@@ -140,9 +141,12 @@ export async function markNoteRead(vaultId: string, row: NoteRowVm): Promise<voi
 /** Move a note to the vault's trash (NFR-30). Never an unlink. */
 export async function deleteNote(vaultId: string, row: NoteRowVm): Promise<void> {
   await notesDelete(vaultId, row.id);
-  if (notesListStore.getState().selected?.noteId === row.id) {
-    notesListStore.getState().clearSelection();
-  }
+  // A panel showing a note the user just deleted stops showing it. This is the
+  // one case that is NOT "the target no longer resolves, so say so and keep the
+  // place": the note is not missing, it was thrown away on purpose, and a pane
+  // explaining its absence would be keeper reporting the user's own action back
+  // to them as a fault.
+  panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId: row.id });
 }
 
 /** Reveal a note's real path in the OS file manager (UX-DR38). */

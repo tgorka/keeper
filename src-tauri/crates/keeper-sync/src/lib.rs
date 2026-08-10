@@ -43,6 +43,7 @@ pub mod db;
 pub mod engine;
 pub mod error;
 pub mod exclude;
+pub mod files_write;
 pub mod git;
 pub mod lfs;
 pub mod platform;

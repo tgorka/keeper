@@ -443,6 +443,33 @@ development_status:
   44-17-sync-status-in-files: review
   epic-44-retrospective: optional
 
+  # Epic 45, opened 2026-08-10 from a third field report after epics 43/44 were
+  # installed and used. Thirty-nine items, one sentence: keeper shows you the
+  # name of a thing where it should show you the thing.
+  epic-45: in-progress
+  45-1-a-panel-shows-a-target: backlog
+  45-2-one-viewer-registry: backlog
+  45-3-the-files-surface-can-write: backlog
+  45-4-raw-and-rendered: backlog
+  45-5-a-file-says-what-it-is-and-how-big: backlog
+  45-6-text-and-code-files-open-and-save: backlog
+  45-7-media-opens: backlog
+  45-8-documents-render: backlog
+  45-9-a-table-you-can-edit: backlog
+  45-10-the-editors-missing-marks: backlog
+  45-11-emoji: backlog
+  45-12-embeds-render-and-edit-in-place: backlog
+  45-13-attachments-from-anywhere: backlog
+  45-14-quick-capture-is-the-note-editor: backlog
+  45-15-quick-capture-is-a-window-you-own: backlog
+  45-16-quick-capture-knows-its-template-and-its-tag: backlog
+  45-17-tags-you-can-edit-spaces-and-notes-you-can-delete: backlog
+  45-18-a-note-knows-its-file-a-file-knows-its-note: backlog
+  45-19-recording-remembers-the-last-session: backlog
+  45-20-chrome-that-makes-room: backlog
+  45-21-export-and-comments-on-a-pdf: backlog
+  epic-45-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

@@ -39,8 +39,8 @@
  */
 import { useEffect } from "react";
 import { listenNotesOpenNote } from "@/lib/ipc/client";
-import { notesListStore } from "@/lib/stores/notes-list";
 import { notesVaultsStore, setActiveVault } from "@/lib/stores/notes-vaults";
+import { panelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 export function useNotesOpenNote(): void {
@@ -57,7 +57,9 @@ export function useNotesOpenNote(): void {
           // render — the note is still on disk and still in the list.
           void setActiveVault(ref.vaultId).catch(() => {});
         }
-        notesListStore.getState().select(ref.vaultId, ref.id);
+        panelsStore
+          .getState()
+          .setActiveTarget({ kind: "note", vaultId: ref.vaultId, noteId: ref.id });
       })
         .then((fn) => {
           if (cancelled) {

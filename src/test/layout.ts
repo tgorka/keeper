@@ -27,6 +27,9 @@ import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-li
 /** Every glyph is this wide. A monospace font, in a world with one font. */
 export const TEST_CHAR_PX = 8;
 
+/** One line's height, in the same world where every glyph is the same width. */
+export const TEST_LINE_PX = 16;
+
 /**
  * Make `truncate` elements report a width derived from their own text and a
  * fixed available width. Returns the undo, which the caller MUST run —
@@ -88,6 +91,58 @@ export function withRect(element: Element, left: number, width = 0): void {
         toJSON: () => ({}),
       }) as DOMRect,
   });
+}
+
+/**
+ * Give `Range` the client rects jsdom does not implement, for a real
+ * `EditorView` (Story 45.4).
+ *
+ * CodeMirror measures its default character width and line height by putting a
+ * `Range` over a probe and calling `getClientRects()`. jsdom has no such method
+ * at all, so the measure pass — which runs on an animation frame, ANY animation
+ * frame that happens to elapse during a test — throws
+ * `textRange(...).getClientRects is not a function`. The throw lands outside
+ * every `try` a test can write, is reported as an unhandled error, and takes
+ * the run's exit code with it whether or not a single assertion failed. Worse,
+ * whether it happens at all depends on how many milliseconds the test spent, so
+ * a suite is green until it is slow.
+ *
+ * The rects are a monospace fiction: one glyph {@link TEST_CHAR_PX} wide and
+ * one line {@link TEST_LINE_PX} tall. What is modelled is the browser, not
+ * keeper — nothing here is asserted on, and no test may claim a pixel it read
+ * back out of this.
+ *
+ * Returns the undo, which the caller MUST run: `Range.prototype` is shared with
+ * every other test in the file.
+ */
+export function withRangeRects(): () => void {
+  const proto = Range.prototype as Range & {
+    getClientRects?: () => DOMRectList;
+    getBoundingClientRect?: () => DOMRect;
+  };
+  const hadRects = proto.getClientRects;
+  const hadBox = proto.getBoundingClientRect;
+  const rect = {
+    x: 0,
+    y: 0,
+    left: 0,
+    top: 0,
+    right: TEST_CHAR_PX,
+    bottom: TEST_LINE_PX,
+    width: TEST_CHAR_PX,
+    height: TEST_LINE_PX,
+    toJSON: () => ({}),
+  } as DOMRect;
+  const list = Object.assign([rect], {
+    item: (index: number) => (index === 0 ? rect : null),
+  }) as unknown as DOMRectList;
+
+  proto.getClientRects = () => list;
+  proto.getBoundingClientRect = () => rect;
+  return () => {
+    proto.getClientRects = hadRects;
+    proto.getBoundingClientRect = hadBox;
+  };
 }
 
 /** The installed scrolling box: a way to scroll it, and the undo the caller

@@ -1,6 +1,6 @@
 /**
  * The Files primary view — a browser over every synced folder (Story 43.8,
- * FR-153, AD-74, AD-75, AD-65).
+ * FR-153, AD-74, AD-65; the write path is Story 45.3, FR-175, FR-176, AD-89).
  *
  * Epic 42 gave keeper an archive of recordings and a note that knows where its
  * files are. Neither could answer the plainest question a person has about a
@@ -8,15 +8,35 @@
  * notes vault lives there, and so does everything else the folder holds — and
  * nothing in the app would show it to you.
  *
- * **Read-only by construction, which is a design decision and not an
- * omission.** keeper's whole promise about a synced folder is that it never
- * moves a file you did not ask it to move, and a browser with a delete key in
- * it is the shortest path to breaking that promise by accident (AD-75). There
- * is no rename, no delete, no move, no drag target and no new-folder control in
- * this file, and {@link FILES_WRITE_CONTROL_LABELS} exists so a test can assert
- * that in one line rather than by inspection. The three things a row can do —
- * reveal it, copy its path, hand it to the system's default application — all
- * leave keeper and touch nothing.
+ * **AD-75 said this pane never writes. AD-89 retired it, deliberately and by
+ * the owner, and the reversal is recorded here because this is where the next
+ * reader will come looking.** The old rule was right while Files was a window
+ * onto the sync engine's world: keeper's promise about a synced folder is that
+ * it never moves a file you did not ask it to move, and a browser with a delete
+ * key in it is the shortest path to breaking that promise by accident. The
+ * owner has now asked it to delete and create, and the honest answer was to
+ * give the surface one write path rather than to leave it read-only and watch a
+ * second one grow beside it. Three narrower promises replaced the one broad
+ * one:
+ *
+ * 1. **Only inside a notes vault.** A file outside one is listed, viewed and
+ *    opened, and the surface *says why* it cannot be changed rather than
+ *    offering an action that will fail. The verdict is
+ *    `entry.write.writable`/`entry.write.reason`, composed in Rust and carried
+ *    on the listing so the control is absent-with-a-reason rather than
+ *    present-and-failing.
+ * 2. **One writer.** Everything goes through `notes_vault::write_vault_file` +
+ *    `mark_dirty`, the path notes and Story 44.16's CSV editor already use, and
+ *    every removal goes through `trash_note`, which the reconciler already
+ *    understands.
+ * 3. **Every destructive act is confirmed, and the confirmation names the
+ *    file.** Its sentences are `sync_delete_plan`'s, composed in Rust from the
+ *    same code the delete runs, so the dialog cannot promise something the
+ *    command then refuses.
+ *
+ * What still does not exist is {@link FILES_UNBUILT_CONTROL_LABELS}, asserted
+ * by name so a half-built Rename cannot arrive quietly. Reveal, copy path and
+ * open-with are unchanged and still leave keeper entirely.
  *
  * **The frontend never composes a path** (AD-65). Every call carries a profile
  * id and a `subpath` that Rust itself produced; the join onto the folder root
@@ -50,25 +70,65 @@ import type { LucideIcon } from "lucide-react";
 import {
   ChevronDown,
   ChevronRight,
-  FileAudio,
-  File as FileIcon,
+  Clapperboard,
+  FileBraces,
+  FileCode,
+  FileHeadphone,
   FileImage,
-  FileVideo,
+  FilePlay,
+  FileQuestionMark,
+  FileSpreadsheet,
+  FileText,
+  FileType,
   Folder,
   FolderOpen,
+  NotebookPen,
 } from "lucide-react";
-import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  ReactNode,
+} from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { countLabel, ITEMS } from "@/lib/count-label";
-import type { FilesEntryVm, FilesListingVm, IpcError, SyncProfileVm } from "@/lib/ipc/client";
-import { revealPath, syncBrowse, syncOpenEntry, syncProfiles } from "@/lib/ipc/client";
+import type {
+  FilesDeletePlanVm,
+  FilesEntryVm,
+  FilesFolderRoleVm,
+  FilesListingVm,
+  IpcError,
+  PanelTargetVm,
+  SyncProfileVm,
+} from "@/lib/ipc/client";
+import {
+  revealPath,
+  syncBrowse,
+  syncCreateEntry,
+  syncDeleteEntries,
+  syncDeletePlan,
+  syncOpenEntry,
+  syncProfiles,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { panelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
+import type { IconName } from "@/lib/viewers";
+import { resolveViewer } from "@/lib/viewers";
 
 /**
  * The height a tree row is assumed to be until it has been mounted once: an
@@ -84,9 +144,9 @@ const FILES_ROW_ESTIMATE = 32;
 /** The pane's heading, and the accessible name of the surface itself. */
 export const FILES_PANE_TITLE = "Files";
 
-/** The one honest sentence under the heading: what this shows, and what it does not do. */
+/** The one honest sentence under the heading: what this shows, and what it can change. */
 export const FILES_PANE_SUBTITLE =
-  "Everything in the folders keeper syncs. Read-only — nothing here moves, renames or deletes a file.";
+  "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here; everything else is read-only.";
 
 /** The accessible name of the tree (distinct from the pane's own name). */
 export const FILES_TREE_LABEL = "Synced folders";
@@ -115,25 +175,45 @@ export const FILES_COPY_PATH_LABEL = "Copy path";
 export const FILES_COPIED_LABEL = "Copied";
 export const FILES_OPEN_LABEL = "Open";
 
+/** The write controls, and the two sentences the surface uses around them
+ * (Story 45.3). Every other word in the confirmation is Rust's. */
+export const FILES_DELETE_LABEL = "Delete";
+export const FILES_NEW_FILE_LABEL = "New file";
+export const FILES_NEW_FILE_NAME_LABEL = "New file name";
+export const FILES_CREATE_LABEL = "Create";
+export const FILES_CANCEL_LABEL = "Cancel";
+
+/** How the header counts what Delete would act on. A count, because the
+ * confirmation is where the files are named. */
+export const FILES_SELECTED_TESTID = "files-selection-count";
+
+/** Test id for the delete confirmation's body, so a test reads Rust's
+ * sentences rather than re-deriving them. */
+export const FILES_CONFIRM_TESTID = "files-delete-confirm";
+
+/** Test id for the sentence a refused write leaves on screen. */
+export const FILES_WRITE_ERROR_TESTID = "files-write-error";
+
 /**
- * Every label this surface must never grow, named so a test can assert their
- * absence rather than a reviewer having to notice their arrival.
+ * The write controls this surface does NOT have, named so a test can assert
+ * their absence rather than a reviewer having to notice their arrival.
  *
- * AD-75 is a promise, and a promise that is only kept by everyone remembering
- * it is a promise with a date on it. The next person to add "just a rename" to
- * this pane will fail a test that says why.
+ * **This list used to include Delete, and that was AD-75.** AD-89 retired the
+ * rule and Story 45.3 built the two controls the owner asked for; what is left
+ * here is the work nobody has done yet, and the assertion is worth keeping for
+ * the reason the AD-75 one was: a control that arrives before its command does
+ * is a control that fails on click. `Save` left the list when Story 45.6 built
+ * it. The next person to add "just a rename" to this pane will fail a test that
+ * says so.
  */
-export const FILES_WRITE_CONTROL_LABELS = [
+export const FILES_UNBUILT_CONTROL_LABELS = [
   "Rename",
-  "Delete",
   "Move",
   "New folder",
-  "Trash",
   "Duplicate",
   "Paste",
   "Cut",
   "Upload",
-  "Save",
 ] as const;
 
 /** Test id for one tree row, suffixed with the row's node key. */
@@ -150,18 +230,87 @@ export const FILES_COUNT_SLOT = "files-entry-count";
  * the empty-folder sentence on purpose: that distinction is the story. */
 export const FILES_STATE_DETAIL_TESTID = "files-state-detail";
 
-/** The glyph for each kind of the one attachment vocabulary (AD-73).
+/** Test id for a row's size cell (Story 45.5). A slot, so a test reads the
+ * rendered figure rather than re-deriving the sentence around it. */
+export const FILES_SIZE_SLOT = "files-entry-size";
+
+/** Test id for the words behind a configured folder's glyph (Story 45.5). The
+ * glyph is the visible form of the same fact; this is the speakable one. */
+export const FILES_ROLE_SLOT = "files-entry-role";
+
+/**
+ * What the size column means, stated where a person can read it (Story 45.5,
+ * FR-178).
  *
- * Keyed on the wire type rather than on `string`, so a kind added to
- * `RecordingNoteTargetKind` fails this file to compile instead of silently
- * rendering nothing. The vocabulary is 43.5's to widen; this is the browser
- * noticing when it does. */
-const KIND_ICON: Record<FilesEntryVm["kind"], LucideIcon> = {
-  video: FileVideo,
-  image: FileImage,
-  audio: FileAudio,
-  file: FileIcon,
+ * The base is a visible choice — a 1 048 576-byte file reads "1.0 MB" here and
+ * would read "1.0 MiB" under the other convention — so the pane says which one
+ * it made rather than leaving the reader to work it out by comparing against
+ * Finder. It is on the column, not on every row, because it is one fact about
+ * the surface and not a fact about any file.
+ */
+export const FILES_SIZE_BASE_NOTE = "Sizes are decimal: 1 kB is 1000 bytes, the same as Finder.";
+
+/**
+ * The glyph for each of the viewer registry's icon names (Story 45.5, FR-178).
+ *
+ * **This replaced a `Record<FilesEntryVm["kind"], LucideIcon>` that lived here
+ * from 43.8 until this story.** That map was keyed on the five-value attachment
+ * vocabulary, so every text file, source file, CSV, JSON and PDF in a synced
+ * folder drew the same blank page — the pane could already tell a video from an
+ * image and could not tell a spreadsheet from an executable. Keying on the
+ * registry's icon names instead is what makes "adding a format is a row"
+ * (AD-87) true of the glyph as well as of the viewer: a new format arrives with
+ * an icon name and this pane renders it without being edited.
+ *
+ * Keyed on {@link IconName} rather than on `string`, which keeps the property
+ * the map it replaced was written for: a name added to the registry's union
+ * fails THIS FILE to compile rather than rendering an empty cell.
+ *
+ * The lucide identifiers are the canonical ones rather than the older aliases
+ * `FileVideo` / `FileAudio` / `FileJson` / `FileQuestion` that 43.8 imported.
+ * Same glyphs — lucide re-exports the old names — but the alias renders a class
+ * that does not match what the import is called (`FileVideo` draws
+ * `lucide-file-play`), which is a thing to discover twice: once when reading
+ * this table and once when a test asks what a row drew.
+ */
+const VIEWER_ICON: Record<IconName, LucideIcon> = {
+  "file-video": FilePlay,
+  "file-image": FileImage,
+  "file-audio": FileHeadphone,
+  "file-text": FileText,
+  "file-code": FileCode,
+  "file-table": FileSpreadsheet,
+  "file-json": FileBraces,
+  "file-document": FileType,
   folder: Folder,
+  "file-question": FileQuestionMark,
+};
+
+/**
+ * The glyph for a folder keeper itself put somewhere (Story 45.5, FR-178).
+ *
+ * An overlay on top of the folder glyph rather than a row in the registry,
+ * because a role is not a format: {@link VIEWER_ICON} answers "what is this
+ * kind of thing", which is the same answer on every machine, and this answers
+ * "what did THIS INSTALLATION configure this folder as". Rust decides it from
+ * the profile's `notes.subfolder` and `recordings.subfolder`; nothing here
+ * looks at a name, so a vault called `Second Brain` is marked and an ordinary
+ * folder called `10-notes` is not.
+ *
+ * A role beats the open/closed chevron pairing on purpose: which folder is the
+ * vault is worth more at a glance than whether it happens to be expanded, and
+ * the chevron beside it already says that.
+ */
+const FOLDER_ROLE_ICON: Record<FilesFolderRoleVm, LucideIcon> = {
+  notesVault: NotebookPen,
+  recordings: Clapperboard,
+};
+
+/** What a role-carrying folder's icon means, for the row's title. Two folders
+ * in a list of forty look identical without it. */
+const FOLDER_ROLE_TITLE: Record<FilesFolderRoleVm, string> = {
+  notesVault: "Your notes vault",
+  recordings: "Where recordings are saved",
 };
 
 /**
@@ -229,7 +378,26 @@ interface TreeNoteRow {
   plain?: boolean;
 }
 
-type TreeRow = TreeNodeRow | TreeNoteRow;
+/**
+ * The inline "name your new file" row (Story 45.3, FR-176).
+ *
+ * A row rather than a modal, and rather than a `window.prompt`: it sits inside
+ * the folder it will write into, so what the name means is visible while it is
+ * being typed. Deliberately not a `treeitem` for the same reason a note row is
+ * not — there is nothing to select or expand — and it holds the only text input
+ * this pane has.
+ */
+interface TreeCreateRow {
+  kind: "create";
+  key: string;
+  level: number;
+  profileId: string;
+  /** The directory the file lands in, profile-relative. Rust joins the name
+   * onto it (AD-65). */
+  subpath: string;
+}
+
+type TreeRow = TreeNodeRow | TreeNoteRow | TreeCreateRow;
 
 /** Structural guard for the IpcError envelope surfaced on a rejection. */
 function isIpcError(value: unknown): value is IpcError {
@@ -331,6 +499,39 @@ export function FilesPane() {
   // rendered elements are held by key. A ref rather than state: writing one
   // during render must not schedule another.
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
+
+  /**
+   * The selection model the rest of the pane reads (Story 45.3, FR-175).
+   *
+   * Node keys, not paths: a path is only unique within a profile, and the tree
+   * shows several profiles at once. Delete acts on this set and the
+   * confirmation counts it, which is the whole reason it exists rather than
+   * being a per-row Delete button — a per-row button cannot answer "and the
+   * other four".
+   *
+   * **One profile at a time.** Every write command is scoped to one profile
+   * id, so a selection spanning two folders is a selection half of which no
+   * command can act on. Selecting into a different profile REPLACES rather
+   * than extends, which is a rule a person can see happen; silently dropping
+   * the other half at delete time is not.
+   */
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  // Where a Shift-range starts. Null once the anchor row is gone.
+  const [anchorKey, setAnchorKey] = useState<string | null>(null);
+  // Rust's own delete plan, plus what the delete will need afterwards. `null`
+  // is the dialog closed; there is no separate `open` boolean, because two
+  // facts about one dialog is how a dialog ends up open with nothing in it.
+  const [pending, setPending] = useState<{
+    profileId: string;
+    /** Node keys of the folders to re-read once the delete lands. */
+    parents: string[];
+    plan: FilesDeletePlanVm;
+  } | null>(null);
+  // The sentence a refused or failed write left behind. Rust's words.
+  const [writeError, setWriteError] = useState<string | null>(null);
+  // Which folder is being created in, by node key, and what has been typed.
+  const [creatingIn, setCreatingIn] = useState<string | null>(null);
+  const [createName, setCreateName] = useState("");
 
   useEffect(() => {
     let live = true;
@@ -493,6 +694,19 @@ export function FilesPane() {
         });
         return;
       }
+      // The name field goes at the TOP of the folder it will write into, and
+      // before the empty-folder branch below: creating the first file in an
+      // empty folder is exactly when this is wanted, and returning early on
+      // "this folder is empty" would have made it the one place it is missing.
+      if (creatingIn === key) {
+        out.push({
+          kind: "create",
+          key: `${key}\u0001create`,
+          level,
+          profileId,
+          subpath,
+        });
+      }
       if (listing.entries.length === 0) {
         out.push({
           kind: "note",
@@ -556,11 +770,178 @@ export function FilesPane() {
       }
     }
     return out;
-  }, [enabled, expanded, listings, failures]);
+  }, [creatingIn, enabled, expanded, listings, failures]);
 
   const nodes = useMemo(
     () => rows.filter((row): row is TreeNodeRow => row.kind === "node"),
     [rows],
+  );
+
+  /**
+   * Replace, extend or toggle the selection from one row (Story 45.3).
+   *
+   * The three gestures a file browser has, and the modifier decides which:
+   * plain replaces, Cmd/Ctrl toggles one, Shift takes the run from the anchor.
+   * The run is over {@link nodes} — the flat visible order — so what a Shift
+   * takes is exactly what a person sees between the two rows, including rows
+   * inside an expanded folder and excluding rows inside a collapsed one.
+   *
+   * Crossing into another profile REPLACES whatever the modifier said, because
+   * every write command is scoped to one profile and half a selection no
+   * command can act on is worse than a selection that visibly reset.
+   */
+  const select = useCallback(
+    (node: TreeNodeRow, mode: "replace" | "toggle" | "extend") => {
+      setSelected((previous) => {
+        const crossesProfile = [...previous].some(
+          (key) => nodes.find((candidate) => candidate.key === key)?.profileId !== node.profileId,
+        );
+        if (mode === "replace" || crossesProfile || previous.size === 0) {
+          return new Set([node.key]);
+        }
+        if (mode === "toggle") {
+          const next = new Set(previous);
+          if (!next.delete(node.key)) {
+            next.add(node.key);
+          }
+          return next;
+        }
+        const from = nodes.findIndex((candidate) => candidate.key === anchorKey);
+        const to = nodes.findIndex((candidate) => candidate.key === node.key);
+        if (from < 0 || to < 0) {
+          return new Set([node.key]);
+        }
+        const [low, high] = from <= to ? [from, to] : [to, from];
+        return new Set(
+          nodes
+            .slice(low, high + 1)
+            .filter((candidate) => candidate.profileId === node.profileId)
+            .map((candidate) => candidate.key),
+        );
+      });
+      // Shift keeps the anchor it is measuring from; the other two move it.
+      if (mode !== "extend") {
+        setAnchorKey(node.key);
+      }
+      // A stale refusal from a previous attempt is not about this selection.
+      setWriteError(null);
+    },
+    [anchorKey, nodes],
+  );
+
+  /** The selected rows, in the tree's own order, and only those a listing still
+   * has an entry for — a row that vanished on a refresh is not silently still
+   * selected. */
+  const selection = useMemo(
+    () => nodes.filter((node) => selected.has(node.key) && node.entry !== null),
+    [nodes, selected],
+  );
+
+  /**
+   * The selected rows keeper will actually delete: the location said yes.
+   *
+   * A read-only file in the selection contributes nothing to the Delete
+   * control and is not silently deleted either — its own row already carries
+   * `write.reason`, which is where the explanation belongs. Both questions have
+   * to say yes before a write control exists, and this is the location half;
+   * the format half is the viewer registry's `entry.writable` (Story 45.2), and
+   * a delete does not consult it because removing a PDF is not editing one.
+   */
+  const deletable = useMemo(
+    () => selection.filter((node) => node.entry?.write.writable === true),
+    [selection],
+  );
+
+  /**
+   * Ask Rust what deleting these rows would do, then show its answer.
+   *
+   * Nothing is deleted here. The plan is a separate call from the delete on
+   * purpose: it is built by the same code the delete runs, so the dialog cannot
+   * name a file the command will then refuse — and a file that vanished since
+   * the listing is named as a refusal rather than dropped in silence.
+   *
+   * **Takes its targets rather than reading the selection**, because the Delete
+   * key can select a row and delete it in one keystroke, and a callback reading
+   * `selection` would read the selection from before that keystroke. The
+   * profile and the folders to re-read afterwards are captured here for the
+   * same reason: by the time the person presses Confirm the tree may have
+   * re-rendered under them.
+   */
+  const requestDelete = useCallback((targets: readonly TreeNodeRow[]) => {
+    const first = targets[0];
+    if (first === undefined) {
+      return;
+    }
+    const profileId = first.profileId;
+    // The parents of everything that is going, so the tree re-reads exactly the
+    // folders whose contents changed rather than the whole open tree.
+    const parents = [...new Set(targets.map((node) => node.parentKey ?? nodeKey(profileId, "")))];
+    setWriteError(null);
+    syncDeletePlan(
+      profileId,
+      targets.map((node) => node.subpath),
+    )
+      .then((plan) => setPending({ profileId, parents, plan }))
+      .catch((error: unknown) => {
+        setWriteError(isIpcError(error) ? error.message : String(error));
+      });
+  }, []);
+
+  /** Carry out the delete the plan described, then re-read what changed. */
+  const confirmDelete = useCallback(() => {
+    if (pending === null) {
+      return;
+    }
+    const { profileId, parents, plan } = pending;
+    setPending(null);
+    syncDeleteEntries(profileId, plan.files)
+      .then((receipt) => {
+        setSelected(new Set());
+        setAnchorKey(null);
+        // A panel holding a file the user just threw away must not survive to
+        // explain that keeper cannot find it (Story 45.1). This is the one
+        // unresolvable target that is NOT "render the reason and keep the
+        // place": the reason is that they deleted it, and they know.
+        for (const relativePath of receipt.deleted) {
+          panelsStore.getState().closeTarget({ kind: "file", profileId, relativePath });
+        }
+        // Named, not swallowed: a selection that only partly went is the case a
+        // person most needs told about, and the receipt already carries Rust's
+        // sentence per path.
+        setWriteError(
+          receipt.refusals.length === 0
+            ? null
+            : receipt.refusals.map((refusal) => refusal.reason).join(" "),
+        );
+        for (const key of parents) {
+          const separator = key.indexOf("\u0000");
+          load(key.slice(0, separator), key.slice(separator + 1));
+        }
+      })
+      .catch((error: unknown) => {
+        setWriteError(isIpcError(error) ? error.message : String(error));
+      });
+  }, [load, pending]);
+
+  /** Create the named file in the folder the inline row belongs to, then
+   * re-read that folder so the new file appears where it was made. */
+  const createFile = useCallback(
+    (profileId: string, subpath: string) => {
+      setWriteError(null);
+      syncCreateEntry(profileId, subpath, createName)
+        .then(() => {
+          setCreatingIn(null);
+          setCreateName("");
+          load(profileId, subpath);
+        })
+        .catch((error: unknown) => {
+          // The row stays open with what was typed still in it: a refused name
+          // is a name to edit, and clearing the field would make the user
+          // retype the part that was fine.
+          setWriteError(isIpcError(error) ? error.message : String(error));
+        });
+    },
+    [createName, load],
   );
 
   /** Where a row key sits in the flat render order — the window works in
@@ -623,7 +1004,7 @@ export function FilesPane() {
   );
 
   /**
-   * The tree's keyboard model (WAI-ARIA APG, Tree View).
+   * The tree's keyboard model (WAI-ARIA APG, Tree View, multi-select).
    *
    * Up/Down step one visible row, Home/End jump to the ends, Right expands a
    * closed folder and then descends into an open one, Left collapses an open
@@ -631,6 +1012,17 @@ export function FilesPane() {
    * descends only into a row that is genuinely this folder's child, so an open
    * folder whose only content is "this folder is empty" does not quietly move
    * focus to the next sibling and look like it worked.
+   *
+   * Story 45.3 added the selection half, APG's own spelling for a multi-select
+   * tree: Shift with Up/Down extends the run while it moves, Space selects the
+   * focused row, Ctrl/Cmd-Space adds it to what is already selected, Delete or
+   * Backspace asks to delete the selection, and Escape clears it. **A pane that
+   * can only be deleted from with a mouse is a pane whose keyboard model was
+   * finished and then not extended** — this tree went to some trouble for the
+   * arrows and it would be strange to stop here.
+   *
+   * Delete opens the confirmation and never deletes: there is no keystroke in
+   * this pane that removes a file without Rust naming it first.
    */
   const onRowKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>, node: TreeNodeRow) => {
@@ -640,6 +1032,9 @@ export function FilesPane() {
         if (next !== undefined) {
           event.preventDefault();
           focusRow(next.key);
+          if (event.shiftKey) {
+            select(next, "extend");
+          }
         }
       };
       switch (event.key) {
@@ -680,18 +1075,134 @@ export function FilesPane() {
           }
           break;
         case "Enter":
-        case " ":
           if (node.isFolder) {
             event.preventDefault();
             setRememberedKey(node.key);
             toggle(node.profileId, node.subpath);
           }
           break;
+        case " ":
+          // Space is the selection key on a multi-select tree. It keeps the
+          // folder toggle it has had since 43.8 only when it carries no
+          // modifier, so the two meanings never collide.
+          event.preventDefault();
+          if (event.metaKey || event.ctrlKey) {
+            select(node, "toggle");
+          } else if (node.isFolder) {
+            setRememberedKey(node.key);
+            toggle(node.profileId, node.subpath);
+          } else {
+            select(node, "replace");
+          }
+          break;
+        case "Delete":
+        case "Backspace": {
+          event.preventDefault();
+          // A row that is not in the selection is what the person means by
+          // pressing Delete on it, so it becomes the selection and the
+          // confirmation is asked about it — one keystroke, one meaning.
+          const targets = selected.has(node.key) ? selection : [node];
+          if (!selected.has(node.key)) {
+            select(node, "replace");
+          }
+          requestDelete(targets);
+          break;
+        }
+        case "Escape":
+          if (selected.size > 0) {
+            event.preventDefault();
+            setSelected(new Set());
+            setAnchorKey(null);
+          }
+          break;
         default:
           break;
       }
     },
-    [focusRow, nodes, toggle],
+    [focusRow, nodes, requestDelete, select, selected, selection, toggle],
+  );
+
+  /**
+   * What a row's own click means (Story 45.1, AD-90).
+   *
+   * `null` for every row that is not a file this pane can open: a profile root
+   * has no entry, and a folder's click is expand/collapse — a folder is not a
+   * panel target, so clicking one must not replace what the panel beside the
+   * tree is showing.
+   *
+   * Two guards, both of them the difference between a gesture and a surprise:
+   *
+   * - A modifier click belongs to the selection model (Story 45.3), never to
+   *   the panel. Somebody assembling a five-file selection to delete does not
+   *   want five panels, and the last Shift-click of a range is not the file
+   *   they were looking at.
+   * - A click that landed on one of the row's own controls — the folder toggle,
+   *   Open, Reveal, Copy path — is that control's click. It bubbles to the row,
+   *   and without this every Copy path would also open a panel.
+   */
+  const clickTarget = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, node: TreeNodeRow): PanelTargetVm | null => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey) {
+        return null;
+      }
+      if (event.target instanceof Element && event.target.closest("button") !== null) {
+        return null;
+      }
+      if (node.isFolder || node.entry === null) {
+        return null;
+      }
+      return {
+        kind: "file",
+        profileId: node.profileId,
+        relativePath: node.entry.relativePath,
+      };
+    },
+    [],
+  );
+
+  /**
+   * Single click: select, and show this file in the panel beside the tree.
+   *
+   * Two things at once because they are one gesture. The selection branch runs
+   * for every click, including the modified ones; the panel branch runs only
+   * for an unmodified click on a file, which is {@link clickTarget}'s rule.
+   * That split is the point: a person building a five-file selection to delete
+   * does not want five panels, and the last Shift-click is not the file they
+   * meant to open.
+   *
+   * A click that landed on one of the row's own buttons changes neither —
+   * Copy path is not a selection gesture.
+   */
+  const handleRowClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, node: TreeNodeRow) => {
+      if (!(event.target instanceof Element && event.target.closest("button") !== null)) {
+        let mode: "replace" | "toggle" | "extend" = "replace";
+        if (event.metaKey || event.ctrlKey) {
+          mode = "toggle";
+        } else if (event.shiftKey) {
+          mode = "extend";
+        }
+        select(node, mode);
+      }
+      const target = clickTarget(event, node);
+      if (target !== null) {
+        panelsStore.getState().setActiveTarget(target);
+      }
+    },
+    [clickTarget, select],
+  );
+
+  /** Double click: open this file BESIDE what is already open. The single click
+   *  that necessarily preceded it is undone by the store, so the file that was
+   *  showing comes back rather than being replaced by a second copy of this one. */
+  const handleRowDoubleClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, node: TreeNodeRow) => {
+      const target = clickTarget(event, node);
+      if (target !== null) {
+        panelsStore.getState().openPanel(target);
+      }
+    },
+    [clickTarget],
   );
 
   const renderNode = (node: TreeNodeRow) => {
@@ -700,10 +1211,26 @@ export function FilesPane() {
     // focused row rather than through every action of every row in the tree.
     const actionTabIndex = active ? 0 : -1;
     const entry = node.entry;
-    // A folder shows open or closed; anything else takes the vocabulary's glyph.
-    let Icon: LucideIcon = node.open ? FolderOpen : Folder;
-    if (!node.isFolder && entry !== null) {
-      Icon = KIND_ICON[entry.kind];
+    // The glyph, from one table and never from an extension (Story 45.5,
+    // FR-178, AD-87).
+    //
+    // A configured role wins over everything: "which of these forty folders is
+    // my vault" is worth more at a glance than whether that folder happens to
+    // be expanded, and the chevron immediately beside it already says the
+    // second thing. Otherwise a folder shows open or closed, and every file
+    // asks the viewer registry — the only thing that knows what renders a
+    // `.csv`, and therefore the only thing that should say what a `.csv` looks
+    // like. Before this story a local table keyed on the five-value attachment
+    // vocabulary drew a blank page for every text file, source file, CSV, JSON
+    // and PDF alike.
+    const role = entry?.folderRole ?? null;
+    let Icon: LucideIcon;
+    if (role !== null) {
+      Icon = FOLDER_ROLE_ICON[role];
+    } else if (node.isFolder || entry === null) {
+      Icon = node.open ? FolderOpen : Folder;
+    } else {
+      Icon = VIEWER_ICON[resolveViewer({ name: entry.name, kind: entry.kind }).icon];
     }
     // Derived from the row's own key, which is already unique per row and
     // stable across a re-render. Percent-encoded because the key joins two
@@ -711,6 +1238,22 @@ export function FilesPane() {
     // space-separated list of ids — a raw path with a space in it would name
     // two ids, neither of which exists.
     const countId = `files-count-${encodeURIComponent(node.key)}`;
+    const sizeId = `files-size-${encodeURIComponent(node.key)}`;
+    const roleId = `files-role-${encodeURIComponent(node.key)}`;
+    // Everything that DESCRIBES the row, in the order a person would say it.
+    // Each of these is visible-but-unspeakable on its own: `aria-label` on the
+    // row replaces its subtree's contribution to the name, so a size or a
+    // vault marker rendered only as a child would be on screen and absent from
+    // the accessibility tree entirely (Story 44.11's finding, applied to two
+    // more facts).
+    const describedBy =
+      [
+        node.count === null ? null : countId,
+        entry?.size == null ? null : sizeId,
+        role === null ? null : roleId,
+      ]
+        .filter((id) => id !== null)
+        .join(" ") || undefined;
     return (
       <div
         ref={(element) => {
@@ -725,19 +1268,29 @@ export function FilesPane() {
         aria-level={node.level}
         aria-expanded={node.isFolder ? node.open : undefined}
         aria-label={node.name}
-        // The count DESCRIBES the row; it is not part of its name (Story
-        // 44.11). A tree row's name is the folder — that is what a person
-        // navigating by first letter is matching against, and folding a number
-        // into it would make "Vault" stop being the row called Vault. The
-        // description is where supplementary facts belong, and `aria-label`
-        // would otherwise swallow the count entirely: it replaces the subtree's
-        // contribution to the name, so a count rendered only as a child would be
-        // visible and unspeakable.
-        aria-describedby={node.count === null ? undefined : countId}
+        // Story 45.3: the selection is a fact about the row, so it is on the
+        // row rather than a class the assistive layer cannot see. Every node
+        // carries it — a tree that marked only the selected rows would leave a
+        // screen reader unable to say "not selected" about the others.
+        aria-selected={selected.has(node.key)}
+        // These facts DESCRIBE the row; none is part of its name (Story 44.11,
+        // Story 45.5). A tree row's name is the folder — that is what a person
+        // navigating by first letter is matching against, and folding a count,
+        // a size and a vault marker into it would make "Vault" stop being the
+        // row called Vault. The description is where supplementary facts
+        // belong, and `aria-label` would otherwise swallow all three: it
+        // replaces the subtree's contribution to the name, so anything rendered
+        // only as a child would be visible and unspeakable.
+        aria-describedby={describedBy}
         data-testid={`${FILES_ROW_TESTID}-${entry === null ? node.profileId : node.subpath}`}
         onKeyDown={(event) => onRowKeyDown(event, node)}
         onFocus={() => setRememberedKey(node.key)}
-        className="flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring"
+        onClick={(event) => handleRowClick(event, node)}
+        onDoubleClick={(event) => handleRowDoubleClick(event, node)}
+        className={cn(
+          "flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring",
+          selected.has(node.key) && "bg-accent",
+        )}
         style={{ paddingInlineStart: `${(node.level - 1) * 16 + 8}px` }}
       >
         <RowName name={node.name} tabIndex={actionTabIndex}>
@@ -777,6 +1330,16 @@ export function FilesPane() {
             )
           }
         </RowName>
+        {/* What a role-carrying folder IS, for anyone who cannot see the glyph
+            (Story 45.5). The icon alone answers "which of these forty folders
+            is my vault" only for a sighted reader; this is the same answer for
+            everyone else, and it is `sr-only` rather than visible because the
+            glyph is already the visible form of it. */}
+        {role !== null && (
+          <span id={roleId} data-slot={FILES_ROLE_SLOT} className="sr-only">
+            {FOLDER_ROLE_TITLE[role]}
+          </span>
+        )}
         {/* How many entries this open folder holds (Story 44.11, FR-166).
             The listing's own count, not the number of rows the window mounted
             under it — the tree is virtualised (Story 44.10), so what is in the
@@ -790,10 +1353,57 @@ export function FilesPane() {
             {node.count}
           </span>
         )}
+        {/* How big this file is (Story 45.5, FR-178).
+            The label is Rust's — `keeper_core::size::format_file_size`, decimal
+            — so this pane, a note embed and the unknown viewer cannot come to
+            print different numbers for the same bytes. Nothing here divides
+            anything.
+
+            A DIRECTORY HAS NO `size` AND SO RENDERS NOTHING. Not "0 B", not a
+            dash: a folder showing a zero is a false claim about every folder
+            that has anything in it, and the absence is carried as a `null` on
+            the wire precisely so this cell cannot accidentally say it. */}
+        {entry?.size != null && (
+          <span
+            id={sizeId}
+            data-slot={FILES_SIZE_SLOT}
+            title={`${entry.size.bytes} bytes. ${FILES_SIZE_BASE_NOTE}`}
+            className="shrink-0 text-muted-foreground text-xs tabular-nums"
+          >
+            {entry.size.label}
+          </span>
+        )}
         {/* Between the name and the actions: what this file's sync state is.
         Never focusable — see {@link SyncStatusMark}. A profile root has no
         entry of its own and takes no mark; its children answer for themselves. */}
         {entry !== null && <SyncStatusMark sync={entry.sync} />}
+        {/* Create a file here (Story 45.3, FR-176, AD-89).
+
+            On an OPEN folder only, because the answer to "may keeper write in
+            here" is the folder's own listing and a closed folder has none — and
+            because a person creating a file in a folder they are not looking
+            into is a person about to be surprised by where it went.
+
+            Absent rather than disabled when the location is not writable: the
+            listing's `write.reason` says why, and a disabled button with no
+            sentence beside it is the failure this whole field exists to
+            prevent. */}
+        {node.open && (listings.get(node.key)?.write.writable ?? false) && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            tabIndex={actionTabIndex}
+            className="h-6 shrink-0 px-2 text-xs"
+            onClick={() => {
+              setWriteError(null);
+              setCreateName("");
+              setCreatingIn(node.key);
+            }}
+          >
+            {FILES_NEW_FILE_LABEL}
+          </Button>
+        )}
         {entry !== null && (
           <span className="flex shrink-0 items-center gap-1">
             {!node.isFolder && (
@@ -840,6 +1450,57 @@ export function FilesPane() {
     );
   };
 
+  /** The inline name field, rendered where the file will land. */
+  const renderCreate = (row: TreeCreateRow) => (
+    <div
+      className="flex items-center gap-2 px-2 py-1"
+      style={{ paddingInlineStart: `${(row.level - 1) * 16 + 8}px` }}
+    >
+      <input
+        // Autofocused because the row exists only in response to pressing New
+        // file: the next thing the person does is type, and a field they have
+        // to click first is a field that reads as decoration.
+        // biome-ignore lint/a11y/noAutofocus: the row is created by the gesture that asks for it
+        autoFocus
+        aria-label={FILES_NEW_FILE_NAME_LABEL}
+        value={createName}
+        onChange={(event) => setCreateName(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            createFile(row.profileId, row.subpath);
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            setCreatingIn(null);
+            setWriteError(null);
+          }
+        }}
+        className="h-6 min-w-0 flex-1 rounded-sm border border-border bg-background px-2 text-sm"
+      />
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-6 px-2 text-xs"
+        onClick={() => createFile(row.profileId, row.subpath)}
+      >
+        {FILES_CREATE_LABEL}
+      </Button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-6 px-2 text-xs"
+        onClick={() => {
+          setCreatingIn(null);
+          setWriteError(null);
+        }}
+      >
+        {FILES_CANCEL_LABEL}
+      </Button>
+    </div>
+  );
+
   return (
     <section
       aria-label={FILES_PANE_TITLE}
@@ -850,10 +1511,47 @@ export function FilesPane() {
           <h1 className="font-heading font-medium text-lg">{FILES_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
         </div>
-        <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={refresh}>
-          {FILES_REFRESH_LABEL}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Delete acts on the SELECTION, which is why the count lives here
+              rather than a Delete button living on every row (Story 45.3).
+              A per-row button cannot answer "and the other four", and the
+              confirmation's whole job is answering exactly that.
+
+              Present only when something is selected that keeper may delete —
+              a selection of read-only files offers no Delete, and each of those
+              rows already carries its own reason. */}
+          {deletable.length > 0 && (
+            <>
+              <span data-testid={FILES_SELECTED_TESTID} className="text-muted-foreground text-xs">
+                {`${countLabel(deletable.length, ITEMS)} selected`}
+              </span>
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                onClick={() => requestDelete(deletable)}
+              >
+                {FILES_DELETE_LABEL}
+              </Button>
+            </>
+          )}
+          <Button type="button" variant="outline" size="sm" onClick={refresh}>
+            {FILES_REFRESH_LABEL}
+          </Button>
+        </div>
       </header>
+
+      {/* Rust's sentence for a write that was refused or only partly done.
+          `role="alert"` because it is the answer to something the person just
+          did, and it appears where they did it rather than in a toast that has
+          gone by the time they look up. */}
+      {writeError !== null && (
+        <Alert variant="destructive" className="mx-4 mt-3 w-auto">
+          <AlertDescription data-testid={FILES_WRITE_ERROR_TESTID} role="alert">
+            {writeError}
+          </AlertDescription>
+        </Alert>
+      )}
 
       <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
         <div className="px-4 py-3">
@@ -864,6 +1562,7 @@ export function FilesPane() {
           ) : (
             <div
               aria-label={FILES_TREE_LABEL}
+              aria-multiselectable="true"
               role="tree"
               className="relative w-full"
               style={{ height: `${list.totalSize}px` }}
@@ -878,9 +1577,9 @@ export function FilesPane() {
                   // directly: the window needs a box to position, and a box
                   // between a tree and its items is a box with no role.
                   <div key={row.key} role="presentation" {...list.rowProps(item)}>
-                    {row.kind === "node" ? (
-                      renderNode(row)
-                    ) : (
+                    {row.kind === "node" && renderNode(row)}
+                    {row.kind === "create" && renderCreate(row)}
+                    {row.kind === "note" && (
                       <p
                         data-testid={row.plain === true ? undefined : FILES_STATE_DETAIL_TESTID}
                         data-state={row.state ?? undefined}
@@ -902,6 +1601,49 @@ export function FilesPane() {
           )}
         </div>
       </div>
+
+      {/* The confirmation, and every word in it is Rust's (Story 45.3,
+          UX-DR66). `question` names the one file or counts the many,
+          `consequence` says whether they sync, `recovery` says a copy is kept,
+          and `refusals` names anything keeper will not touch. Nothing here
+          paraphrases: a confirmation composed in TypeScript from a count and a
+          glyph would be a second reading of the engine's answer, in the one
+          place a wrong reading costs a file. */}
+      <AlertDialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{pending?.plan.question}</AlertDialogTitle>
+            <AlertDialogDescription data-testid={FILES_CONFIRM_TESTID}>
+              {pending?.plan.consequence} {pending?.plan.recovery}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {pending !== null && pending.plan.files.length > 1 && (
+            <ul className="max-h-40 overflow-y-auto text-muted-foreground text-sm">
+              {pending.plan.files.map((file) => (
+                <li key={file}>{file}</li>
+              ))}
+            </ul>
+          )}
+          {pending !== null && pending.plan.refusals.length > 0 && (
+            <ul className="text-destructive text-sm">
+              {pending.plan.refusals.map((refusal) => (
+                <li key={refusal.relativePath}>{refusal.reason}</li>
+              ))}
+            </ul>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>{FILES_CANCEL_LABEL}</AlertDialogCancel>
+            {/* Absent, not disabled, when there is nothing left to delete: the
+                refusals above already say why, and a greyed-out Delete invites
+                a second click at the one thing that will not happen. */}
+            {pending !== null && pending.plan.files.length > 0 && (
+              <AlertDialogAction variant="destructive" onClick={confirmDelete}>
+                {FILES_DELETE_LABEL}
+              </AlertDialogAction>
+            )}
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }

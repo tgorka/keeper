@@ -15,9 +15,14 @@
  *
  * The store holds no note state Rust owns: no read marks, no pin state, no
  * ordering, no filtering. A row is a {@link NoteRowVm} exactly as Rust composed
- * it, and the one thing kept beside the rows — `selectedId` — is a cursor over
- * them, deliberately kept by IDENTITY rather than index so a re-ordering stream
- * moves the row and not the cursor.
+ * it, and that is all this store holds.
+ *
+ * **It no longer keeps a cursor.** Which note is open used to live here as
+ * `selected`, and Story 45.1 moved it to {@link "@/lib/stores/panels"}: a note
+ * on screen is a panel showing a `note` target, exactly as a file on screen is a
+ * panel showing a `file` target. Leaving a second copy of that fact beside the
+ * panel list is how the two would come to disagree about what is open — so this
+ * one was deleted rather than kept in step.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -57,17 +62,6 @@ export interface NotesListState {
   /** Whether a first list read has landed. */
   loaded: boolean;
   /**
-   * The note the editor has open, qualified by the vault it belongs to, or
-   * `null`.
-   *
-   * By IDENTITY and not by index, so a streamed re-order or a filter change
-   * moves the row and never the cursor (UX-DR41). By VAULT as well, because
-   * switching vaults must not *close* a note — the editor stops showing it while
-   * another vault is on screen and shows it again on the way back, which is the
-   * difference between a filter and a navigation.
-   */
-  selected: { readonly vaultId: string; readonly noteId: string } | null;
-  /**
    * How many rows the window currently asks Rust for. It GROWS rather than
    * paging, and the whole window is re-read at the new size: appending pages
    * would leave the streamed ops' indices meaning one thing to Rust and another
@@ -79,10 +73,6 @@ export interface NotesListState {
   reset: (vm: NoteListVm) => void;
   /** Fold one streamed change batch onto the window. */
   applyBatch: (batch: NoteChangeBatch) => void;
-  /** Move the cursor. */
-  select: (vaultId: string, noteId: string) => void;
-  /** Drop the cursor entirely (the note it named is gone). */
-  clearSelection: () => void;
   /** Ask for one more page's worth of rows on the next read. */
   growWindow: () => void;
   /** Clear the mirror (subscription teardown, vault switch). */
@@ -96,7 +86,6 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
   matched: 0,
   offset: 0,
   loaded: false,
-  selected: null,
   limit: NOTES_PAGE_SIZE,
   reset: (vm) =>
     set({
@@ -149,14 +138,12 @@ export const notesListStore = createStore<NotesListState>()((set) => ({
       // scroll that would have corrected it. Rust recounts the whole set for
       // every batch it sends, so this is a copy, not a derivation.
       //
-      // The cursor is NOT cleared when its row leaves the window. The note stays
-      // open in the editor and the row is simply no longer listed (UX-DR41); a
-      // cursor that reset itself would move the user's place on every agent
-      // write.
+      // The open note is NOT closed when its row leaves the window. Which note
+      // is open is the panel list's business now (Story 45.1), not this
+      // mirror's, and the row simply stops being listed (UX-DR41) — a list that
+      // closed the editor would move the user's place on every agent write.
       return { rows, total: batch.total, matched: batch.matched, loaded: true };
     }),
-  select: (vaultId, noteId) => set({ selected: { vaultId, noteId } }),
-  clearSelection: () => set({ selected: null }),
   growWindow: () => set((state) => ({ limit: state.limit + NOTES_PAGE_SIZE })),
   clear: () =>
     set({
@@ -177,7 +164,7 @@ export function useNotesListStore<T>(selector: (state: NotesListState) => T): T 
   return useStore(notesListStore, selector);
 }
 
-/** Test-only reset: empty the window and drop the cursor. */
+/** Test-only reset: empty the window. */
 export function resetNotesListStoreForTest(): void {
   notesListStore.setState({
     rows: [],
@@ -185,7 +172,6 @@ export function resetNotesListStoreForTest(): void {
     matched: 0,
     offset: 0,
     loaded: false,
-    selected: null,
     limit: NOTES_PAGE_SIZE,
   });
 }
