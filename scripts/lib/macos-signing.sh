@@ -180,5 +180,15 @@ RUNNER
 
   code="$(cat "$status")"
   rm -f "$payload" "$runner" "$status"
+
+  # Keep the transcript only when it is worth reading. A successful build's log
+  # is 12 000 lines nobody will open, and one per install accumulates in /tmp
+  # forever; a failed one is the only record of what the Terminal window said
+  # before it closed, so name it rather than delete it.
+  if [ "$code" -eq 0 ]; then
+    rm -f "$log"
+  else
+    echo "error: the GUI build failed; transcript: $log" >&2
+  fi
   return "$code"
 }
