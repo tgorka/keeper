@@ -195,18 +195,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), b"0123456789");
         assert_eq!(
-            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            response
+                .headers()
+                .get(header::ACCEPT_RANGES)
+                .expect("header::ACCEPT_RANGES is the subject of this assertion"),
             "bytes"
         );
         assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("header::CONTENT_TYPE is the subject of this assertion"),
             "video/quicktime"
         );
         assert_eq!(
             response
                 .headers()
                 .get(header::X_CONTENT_TYPE_OPTIONS)
-                .unwrap(),
+                .expect("header::X_CONTENT_TYPE_OPTIONS is the subject of this assertion"),
             "nosniff"
         );
     }
@@ -223,7 +229,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.body(), b"2345");
         assert_eq!(
-            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .expect("header::CONTENT_RANGE is the subject of this assertion"),
             "bytes 2-5/10"
         );
     }
@@ -246,7 +255,10 @@ mod tests {
                 "{header_value}"
             );
             assert_eq!(
-                response.headers().get(header::CONTENT_RANGE).unwrap(),
+                response
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .expect("header::CONTENT_RANGE is the subject of this assertion"),
                 "bytes */10",
                 "{header_value}"
             );
@@ -295,7 +307,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(body_len(&response), EIGHT_MIB);
         assert_eq!(
-            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .expect("header::CONTENT_RANGE is the subject of this assertion"),
             &format!("bytes 0-{}/{}", EIGHT_MIB - 1, EIGHT_MIB + 4096)
         );
         // And with no header at all, which is the other way the same file can be

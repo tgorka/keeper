@@ -234,9 +234,7 @@ pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
 /// *before* the window goes away, because a destroyed window has no geometry to
 /// ask for and a hidden one may report the origin.
 pub fn close(app: &AppHandle, key: &str) -> Option<(i32, i32)> {
-    let Some(window) = window(app, key) else {
-        return None;
-    };
+    let window = window(app, key)?;
     let position = window
         .outer_position()
         .ok()

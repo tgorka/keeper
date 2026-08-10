@@ -857,6 +857,10 @@ pub async fn notes_vault_flag(
             indexed: false,
             note_count: 0,
             unread_count: 0,
+            // A folder keeper is not indexing has no config to read a capture
+            // scaffold or tag out of, so both are absent rather than defaulted.
+            capture_template: None,
+            capture_tag: None,
             cadence: notes_vault::cadence_vm(&NotesCadence::default()),
         });
     };
@@ -2161,7 +2165,7 @@ fn template_source(
     // future caller cannot acquire a capture's scaffold by forgetting to say
     // it is not one.
     let capture_template = capture
-        .then(|| vault.config.capture_template.as_deref())
+        .then_some(vault.config.capture_template.as_deref())
         .flatten();
     let Some(named) = templates::rung(templates::TemplateRungs {
         named: req.template.as_deref(),
@@ -2277,7 +2281,9 @@ fn create_journal(vault: &Vault, rel: &str, req: &NoteCreateReq) -> Result<NoteR
     // with the shipped journal scaffold or the vault's configured default. No
     // space rung: today's entry is opened by a shortcut, a tray item and the
     // palette, none of which is inside a space.
-    let found = match template_source(vault, req, None) {
+    // Not a capture: `⌘⌥J` opens today's page, so the capture rung is skipped
+    // and the journal falls through to the vault default.
+    let found = match template_source(vault, req, None, false) {
         TemplateChoice::Found { rel, source } => Some((rel, source)),
         // A journal entry is created either way — the whole point of `⌘⌥J` is
         // that today's page is always there. `template_source` has already said
@@ -5018,6 +5024,8 @@ mod tests {
                 subfolder: None,
                 journal_template: None,
                 default_template: None,
+                capture_template: None,
+                capture_tag: None,
                 cadence: Some(NoteCadenceVm {
                     commit_idle_ms: 100,
                     push_interval_ms: 1_000,
@@ -5045,6 +5053,8 @@ mod tests {
                 subfolder: None,
                 journal_template: None,
                 default_template: None,
+                capture_template: None,
+                capture_tag: None,
                 cadence: None,
             },
         );
@@ -5060,6 +5070,8 @@ mod tests {
                 subfolder: None,
                 journal_template: None,
                 default_template: Some(String::new()),
+                capture_template: None,
+                capture_tag: None,
                 cadence: None,
             },
         );

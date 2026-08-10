@@ -1580,10 +1580,10 @@ fn files_listing_vm(
                         relative_path: entry.relative_path,
                         absolute_path: entry.absolute_path.to_string_lossy().into_owned(),
                         is_dir: entry.is_dir,
-                        sync: sync,
+                        sync,
                         size_bytes: entry.size_bytes,
-                        roles: roles,
-                        write: write,
+                        roles,
+                        write,
                     })
                 })
                 .collect::<Vec<_>>();

@@ -414,6 +414,15 @@ mod tests {
         fs::write(vault.join("notes/Meeting.md"), AWKWARD_NOTE).expect("note");
         fs::write(vault.join("attachments/photo.png"), BINARY).expect("photo");
         fs::write(vault.join("data/rows.csv"), b"a,b\r\n1,2").expect("csv");
+        // Canonicalised, and this is a macOS fact rather than tidiness: the
+        // system temp dir is `/var/...`, which is a symlink to `/private/var/...`.
+        // Containment is decided by `browse::resolve`, which resolves symlinks,
+        // so every path this module HANDS BACK is the real one. A fixture holding
+        // the symlinked spelling makes `done.path` compare unequal to the folder
+        // it actually wrote — a green suite on Linux and two reds on the only
+        // machine that ships.
+        let vault = fs::canonicalize(&vault).expect("canonical vault");
+        let out = fs::canonicalize(&out).expect("canonical out");
         Fixture {
             _dir: dir,
             vault,
