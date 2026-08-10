@@ -306,13 +306,28 @@ pub fn refresh(app: &AppHandle) {
     // It deliberately does NOT wait for the first scan: seeding asks the
     // directory, not an index that has not been built yet, so a cold vault
     // converges on its first registration instead of on the second.
+    //
+    // **Off this thread, because asking the directory can block forever.**
+    // Measured on the owner's machine: `refresh` sat inside
+    // `default_spaces::seed -> read_dir -> opendir -> __open_nocancel` for the
+    // whole life of the process. A vault on a removable volume can stall an
+    // `open` indefinitely — the drive is asleep, it was pulled mid-call, or
+    // macOS is holding the call while it decides whether this build may read
+    // the volume at all, which a fresh ad-hoc signature makes it do again every
+    // install. `refresh` runs on startup and after every profile write, so a
+    // blocking seed there does not merely delay itself: `start_tap` below never
+    // arms, no later refresh ever retries, and the app comes up with a notes
+    // subsystem that is silent and will not recover. Spawned, the same stall
+    // costs exactly the seeding it was in, and the next refresh tries again.
     for vault in registered {
-        crate::notes_ipc::seed_default_spaces(&vault);
-        // The templates go in beside the spaces, from the same loop and on the
-        // same terms: idempotent by construction, planned against the directory
-        // rather than the index, and never on a vault that has already been
-        // offered them (Story 44.7).
-        crate::notes_ipc::seed_default_templates(&vault);
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::notes_ipc::seed_default_spaces(&vault);
+            // The templates go in beside the spaces, on the same terms:
+            // idempotent by construction, planned against the directory rather
+            // than the index, and never on a vault that has already been
+            // offered them (Story 44.7).
+            crate::notes_ipc::seed_default_templates(&vault);
+        });
     }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
     // means the first profile write after a repair puts notes back too.
