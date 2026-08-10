@@ -2899,3 +2899,42 @@ the reusable part: the export half of 45.21 shipped and this half did not, and t
   measuring the platform before designing against it. Ten minutes reading WebKit's IDL replaced an
   epic's worth of speculation about what an overlay could anchor to.
 status: open
+
+### DW-191: A default space keeper stood down because the user already had that name is never recorded, so deleting the user's space brings keeper's version back.
+
+origin: story 45.17, 2026-08-10 — found by W3TagsDelete while proving the delete/restore path,
+  and deliberately not fixed inside that story
+location: `src-tauri/crates/keeper-core/src/notes/seed.rs` (the seeded-key ledger),
+  against 44.3's five default spaces and 45.17's `notes_spaces_restore_defaults`
+reason: `seed` writes a ledger entry for each default space it CREATES, and 45.17's delete path
+  reads that ledger to decide whether a deleted default stays deleted. A default that was never
+  created — because the vault already contained a space with that name — leaves no entry. The
+  user's own space is therefore not protected by the mechanism that protects keeper's: delete it,
+  and the next seed sees a name that is absent from both the vault and the ledger and creates
+  keeper's version in its place. The user deletes their space and gets a different one back,
+  which is the exact surprise 44.7 refused for templates.
+  One line in `seed` closes it — record the key whether the space was written or stood down —
+  but that CHANGES 44.3's stated semantics, from "the spaces keeper made" to "the names keeper
+  has claimed", and it changes them for vaults that already exist. That is a product call about
+  an upgrade path, not a bug fix inside a story about deleting things, which is why it is here
+  rather than in 45.17.
+status: open
+
+### DW-192: `notes_capture_impact`, the two recording commands and the capture rung are wired but have never been exercised by a running app.
+
+origin: epic 45 wave 3, 2026-08-10 — raised independently by W3CaptureTag, W3Recording and
+  W3CaptureWindow in their stand-down reports
+location: `src-tauri/crates/keeper/src/notes_ipc.rs` (`apply_settings`'s two capture arms,
+  `template_source`'s capture rung, `resolve_capture_draft`'s seed, `notes_capture_impact`),
+  `src-tauri/crates/keeper/src/notes_window.rs`, `keeper/src/ipc.rs`'s recording pair
+reason: these compile and their handler registration is now pinned by
+  `src/test/command-registration.test.ts`, so the "Command not found" class is closed. What is
+  NOT closed is whether they do the right thing: no note has ever been captured through this
+  code, no manifest has ever been written through IPC on any machine, and the
+  `quick-capture-*` capability glob has never been evaluated by a real webview. A capability
+  that did not take renders exactly like a frontend bug — the window appears and its buttons do
+  nothing — and no test on either box can tell the two apart.
+  Each story's spec carries its own ordered gate checks; this entry exists so the set is
+  findable from one place rather than five, and so it is not mistaken for covered because the
+  Rust compiles.
+status: open
