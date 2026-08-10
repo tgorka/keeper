@@ -1,17 +1,18 @@
 /**
- * Markdown's rendered view, against a real `EditorView` (Story 45.4).
+ * Markdown's rendered view, against a real `EditorView` (Story 45.4, 45.10).
  *
- * **This file exists to perform the assembly nothing in this repository has
+ * **This file exists to perform the assembly nothing in this repository had
  * ever performed**: a real `EditorView` carrying BOTH `@codemirror/lang-markdown`
- * and `livePreview`. DW-165 says in as many words why that matters —
+ * and `livePreview`. DW-165 was found by that assembly and nothing else —
  * `mermaid-widget.test.ts` drives the widget directly and never asks the
  * renderer to place one, and `recording-embed.test.ts`, the one suite that does
  * build a real view around `livePreview`, loads it WITHOUT the markdown
- * language, so `syntaxTree` yields no `FencedCode`, the mermaid branch is never
- * entered, and a crash that has shipped since story 37.8 stayed invisible.
+ * language, so `syntaxTree` yielded no `FencedCode`, the mermaid branch was
+ * never entered, and a crash that had shipped since story 37.8 stayed invisible
+ * for eight epics.
  *
  * A suite can be exhaustive about a widget and never once assemble the thing
- * the user assembles.
+ * the user assembles. That is why the assembly is still here after the fix.
  */
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
@@ -50,23 +51,42 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("DW-165 tripwire", () => {
+describe("DW-165, fixed", () => {
   /**
-   * **When this test fails, DW-165 has been fixed — invert it and delete the
-   * guard in `markdown-preview.ts`.** Written as a passing assertion about the
-   * broken behaviour rather than as a failing test, so the wave's gate stays
-   * green while the defect stays pinned; 45.10's `StateField` lift is then
-   * verified by a test whose author had no reason to shape it around the fix.
+   * The inverse of the tripwire 45.4 left here. That test asserted the crash as
+   * a passing fact so the wave's gate stayed green while the defect stayed
+   * pinned, and said in as many words: when this fails, invert it and delete
+   * the guard. Story 45.10 lifted the mermaid block decoration out of the
+   * renderer's `ViewPlugin` into `mermaidLayer`, a `StateField`, so this is now
+   * the same assembly asserting the same thing from the other side.
    */
-  it("still throws when a real EditorView is given the markdown language and a mermaid fence", () => {
+  it("constructs a real EditorView over a mermaid fence instead of throwing", () => {
     const parent = document.createElement("div");
-    expect(() => new EditorView({ parent, state: realState(MERMAID) })).toThrow(
-      /block decorations/i,
-    );
+    const view = new EditorView({ parent, state: realState(MERMAID) });
+
+    expect(view.contentDOM).not.toBeNull();
+    // Not merely "did not throw": the fence is actually replaced by the widget,
+    // which is the half a `try`/`catch` around construction could never prove.
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).not.toBeNull();
+    // And the fence's own three lines are gone from the rendered text, because
+    // a block decoration that renders beside its source is not a replacement.
+    expect(view.contentDOM.textContent).not.toContain("graph TD;");
+    view.destroy();
+  });
+
+  it("gives the fence its source back when the caret is inside it", () => {
+    const parent = document.createElement("div");
+    const view = new EditorView({ parent, state: realState(MERMAID) });
+    // Line 4 is `graph TD;`, inside the fence.
+    view.dispatch({ selection: { anchor: view.state.doc.line(4).from } });
+
+    expect(view.contentDOM.querySelector(".cm-mermaid-block")).toBeNull();
+    expect(view.contentDOM.textContent).toContain("graph TD;");
+    view.destroy();
   });
 
   it("does not throw for the same document without the markdown language", () => {
-    // Exactly why the existing suite is green: no grammar, no `FencedCode`
+    // Exactly why the pre-45.4 suite was green: no grammar, no `FencedCode`
     // node, no mermaid branch, no crash. The extension set is the variable.
     const parent = document.createElement("div");
     const view = new EditorView({
@@ -141,20 +161,13 @@ describe("mountMarkdownPreview", () => {
     preview.destroy();
   });
 
-  it("declines a mermaid document by name and line instead of throwing or blanking", async () => {
-    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+  it("renders a mermaid document instead of declining it (DW-165 is fixed)", async () => {
     const host = document.createElement("div");
 
     const preview = await mountMarkdownPreview(host, MERMAID, { vaultId: "vault-1" });
 
-    expect(preview.failure).toContain("mermaid");
-    expect(preview.failure).toContain("DW-165");
-    expect(preview.failureLine).toBe(3);
-    // Nothing half-drawn is left behind for the raw view to render on top of.
-    expect(host.childNodes).toHaveLength(0);
-    // A path that declines to act says so where the packaged app can see it —
-    // `console.debug` never reaches the on-disk log (DW-162).
-    expect(info).toHaveBeenCalledWith(expect.stringContaining("DW-165"));
+    expect(preview.failure).toBeNull();
+    expect(host.querySelector(".cm-mermaid-block")).not.toBeNull();
     preview.destroy();
   });
 
@@ -171,7 +184,6 @@ describe("mountMarkdownPreview", () => {
     const preview = await mountMarkdownPreview(host, "# plain\n", { vaultId: "vault-1" });
 
     expect(preview.failure).toContain("host is gone");
-    expect(preview.failureLine).toBeNull();
     expect(info).toHaveBeenCalled();
     expect(host.childNodes).toHaveLength(0);
     // Safe to call after a failure — every caller does, and one of them would

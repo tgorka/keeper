@@ -9,9 +9,11 @@
 //! (AD-56). That split is the reason this phase is testable at all: every rule
 //! below is exercised over `&str` inputs, with no vault, no tokio and no Tauri.
 
+pub mod attach;
 pub mod counts;
 pub mod csv;
 pub mod default_spaces;
+pub mod embed;
 pub mod frontmatter;
 pub mod index;
 pub mod links;

@@ -11,43 +11,25 @@
  * them keeper's, and neither of them aware that a tag is a PATH. Typing `ent`
  * in the editor offered `client` — a substring hit in the middle of a segment,
  * which is never what someone reaching for a tag meant.
+ * **The rule itself now lives in `lib/segment-match.ts` (Story 45.11).** It was
+ * always a rule about SEGMENTS rather than about slashes, and Story 45.11
+ * needed the same rule over `_` for emoji shortcodes. It moved rather than
+ * being restated, so `cl/ac` finding `client/acme` and `rai/ha` finding
+ * `raised_hands` can never become two different opinions. This file keeps what
+ * is genuinely about tags: the separator, the ranking, and what counts as
+ * already naming one.
  *
- * **The rule is the tree's own rule: segments, aligned at a boundary.** The
- * vocabulary arrives as full paths (`client`, `client/acme`,
- * `client/acme/renewal`) because that is how `keeper-core`'s tag tree is
- * flattened. A query is split the same way, and it matches when its segments
- * line up against a consecutive run of the tag's segments that BEGINS at a
- * segment boundary: every query segment but the last must equal its segment
- * outright, and the last may be a prefix of its own. So `cl/ac` finds
- * `client/acme`, `acme` finds `client/acme` without knowing about `client`,
- * and `ent` finds nothing, because no tag has a segment that starts with it.
- *
- * **Case is folded here, and that is a search rule, not a tag rule.** What a
- * tag IS — its case, its whitespace, its slashes — is decided exactly once, in
- * `keeper-core/src/notes/tags.rs::normalise`, and nothing here reverses or
- * restates it. Folding case to decide what to OFFER is the same kind of
- * courtesy a `<datalist>` extends; it never rewrites the text the user typed
- * and never invents a canonical form. Every string this module returns came
- * out of the vocabulary or out of the user's own keystrokes.
+ * **Case is folded when deciding what to OFFER, and that is not a tag rule.**
+ * What a tag IS — its case, its whitespace, its slashes — is decided exactly
+ * once, in `keeper-core/src/notes/tags.rs::normalise`, and nothing here
+ * reverses or restates it. Every string this module returns came out of the
+ * vocabulary or out of the user's own keystrokes.
  */
+import { segmentMatchOffset, segmentsOf } from "@/lib/segment-match";
 
-/**
- * A tag path cut into its segments, case-folded, with empty segments dropped.
- *
- * Dropping empties is what makes a half-typed hierarchy behave: `client/` is
- * one segment, so it still matches `client` and everything beneath it rather
- * than matching nothing while the user's finger is still on the slash.
- */
-function segmentsOf(path: string): string[] {
-  const out: string[] = [];
-  for (const segment of path.toLowerCase().split("/")) {
-    const trimmed = segment.trim();
-    if (trimmed !== "") {
-      out.push(trimmed);
-    }
-  }
-  return out;
-}
+/** Tag paths are slash-separated, and that is the only thing about the rule in
+ *  `lib/segment-match.ts` that is specific to a tag. */
+const TAG_SEPARATOR = "/";
 
 /**
  * The index of the tag segment where `query` starts matching, or `-1`.
@@ -59,27 +41,7 @@ function segmentsOf(path: string): string[] {
  * anybody has to tune.
  */
 export function tagMatchOffset(query: string, tag: string): number {
-  const wanted = segmentsOf(query);
-  const have = segmentsOf(tag);
-  if (wanted.length === 0) {
-    return 0;
-  }
-  const last = wanted.length - 1;
-  for (let start = 0; start + wanted.length <= have.length; start += 1) {
-    let hit = true;
-    for (let i = 0; i < wanted.length; i += 1) {
-      const q = wanted[i] as string;
-      const t = have[start + i] as string;
-      if (i === last ? !t.startsWith(q) : t !== q) {
-        hit = false;
-        break;
-      }
-    }
-    if (hit) {
-      return start;
-    }
-  }
-  return -1;
+  return segmentMatchOffset(segmentsOf(query, TAG_SEPARATOR), segmentsOf(tag, TAG_SEPARATOR));
 }
 
 /**
@@ -95,14 +57,14 @@ export function tagMatchOffset(query: string, tag: string): number {
  * same vocabulary can never disagree about which row the arrow keys land on.
  */
 export function matchTags(query: string, vocabulary: readonly string[]): string[] {
-  if (segmentsOf(query).length === 0) {
+  if (segmentsOf(query, TAG_SEPARATOR).length === 0) {
     return [...vocabulary];
   }
   const hits: { tag: string; at: number; depth: number }[] = [];
   for (const tag of vocabulary) {
     const at = tagMatchOffset(query, tag);
     if (at >= 0) {
-      hits.push({ tag, at, depth: segmentsOf(tag).length });
+      hits.push({ tag, at, depth: segmentsOf(tag, TAG_SEPARATOR).length });
     }
   }
   hits.sort(
@@ -125,9 +87,9 @@ export function matchTags(query: string, vocabulary: readonly string[]): string[
  * different road.
  */
 export function namesTag(query: string, tags: readonly string[]): boolean {
-  const wanted = segmentsOf(query).join("/");
+  const wanted = segmentsOf(query, TAG_SEPARATOR).join(TAG_SEPARATOR);
   if (wanted === "") {
     return false;
   }
-  return tags.some((tag) => segmentsOf(tag).join("/") === wanted);
+  return tags.some((tag) => segmentsOf(tag, TAG_SEPARATOR).join(TAG_SEPARATOR) === wanted);
 }

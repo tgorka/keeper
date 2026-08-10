@@ -22,6 +22,8 @@
  * called from a render path, and a line per frame is a line nobody reads.
  */
 
+import { DocumentViewer } from "@/components/viewers/document-viewer";
+import { MediaViewer } from "@/components/viewers/media-viewer";
 import { TextFileViewer } from "@/components/viewers/text-file-viewer";
 import { resolveViewer } from "./registry";
 import type { ViewerComponent, ViewerEntry, ViewerFile, ViewerId } from "./types";
@@ -36,10 +38,22 @@ import { UnknownViewer } from "./unknown-viewer";
  * absent binding is an honest absence and is reported as one.
  */
 export const VIEWER_COMPONENTS: Partial<Record<ViewerId, ViewerComponent>> = Object.freeze({
+  // Story 45.7. Three ids, ONE component: 43.5's shape, where the medium
+  // decides the element rather than the module, so a fourth medium is a case
+  // and not a file. The component branches on `entry.viewer`, never on a name.
+  video: MediaViewer,
+  image: MediaViewer,
+  audio: MediaViewer,
   // Story 45.4. Raw and rendered are ONE component under one id (AD-88), so
   // there is no separate "editor" binding beside this one: `TextFileViewer`
   // loads the bytes and mounts 45.6's editor as its raw half.
   text: TextFileViewer,
+  // Story 45.8. One id for four formats, for the same reason media is three
+  // ids and one component: the format decides the body, not the module.
+  // `DocumentViewer` mounts the webview's own PDF renderer for a PDF and Rust's
+  // bounded projection for DOCX, PPTX and XLSX, and degrades to the unknown
+  // viewer — with the reason Rust worded — for anything it cannot read.
+  document: DocumentViewer,
   unknown: UnknownViewer,
 });
 

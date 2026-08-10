@@ -20,7 +20,9 @@
  *   the file on disk is intact, which is the most alarming lie a notes app can
  *   tell (UX-DR44).
  */
-import { WidgetType } from "@codemirror/view";
+import { syntaxTree } from "@codemirror/language";
+import { type EditorState, type Extension, StateField } from "@codemirror/state";
+import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
 
 /** How long a single diagram may take before it is abandoned. */
 export const MERMAID_RENDER_TIMEOUT_MS = 4_000;
@@ -156,4 +158,108 @@ export class MermaidWidget extends WidgetType {
   ignoreEvent(): boolean {
     return false;
   }
+}
+
+/** One mermaid fence: the lines it owns and the diagram between them. */
+interface MermaidFence {
+  from: number;
+  to: number;
+  source: string;
+}
+
+/**
+ * Every mermaid fence in the document, as the line range it occupies.
+ *
+ * The info string is read from the parse tree rather than from a regex over the
+ * line, because ` ~~~mermaid `, an indented fence and a fence opened inside a
+ * list item are all mermaid fences and none of them start at column zero with
+ * three backticks. `markdown-preview.ts` asks the same question of the same
+ * tree for the same reason.
+ */
+function mermaidFences(state: EditorState): MermaidFence[] {
+  const fences: MermaidFence[] = [];
+  syntaxTree(state).iterate({
+    enter: (node) => {
+      if (node.name !== "FencedCode") {
+        return undefined;
+      }
+      let info = "";
+      for (let child = node.node.firstChild; child !== null; child = child.nextSibling) {
+        if (child.name === "CodeInfo") {
+          info = state.doc.sliceString(child.from, child.to).trim();
+          break;
+        }
+      }
+      if (info !== "mermaid") {
+        return false;
+      }
+      const open = state.doc.lineAt(node.from);
+      const close = state.doc.lineAt(node.to);
+      // The body is what lies between the two fence lines. An unterminated
+      // fence has `close === open`, and slicing then yields "" rather than a
+      // negative range, which is the right diagram for a fence still being
+      // typed: empty, not the fence's own backticks.
+      const source = close.from > open.to ? state.doc.sliceString(open.to + 1, close.from - 1) : "";
+      fences.push({ from: open.from, to: close.to, source });
+      return false;
+    },
+  });
+  return fences;
+}
+
+/**
+ * The mermaid layer, as a `StateField` rather than as part of the renderer's
+ * `ViewPlugin` — the fix for DW-165.
+ *
+ * **This was a crash, not a preference.** A mermaid fence is several lines
+ * replaced by one element, so the decoration needs `block: true`, and
+ * CodeMirror refuses a block decoration supplied by a `ViewPlugin` — it throws
+ * out of `EditorView` construction. The renderer's plugin therefore could never
+ * host this, and from story 37.8 until Story 45.10 any note containing a
+ * ` ```mermaid ` fence made the editor throw on open. `galleryLayer` had
+ * already met the same wall and taken the same way round it; this is that
+ * shape, applied to the block that filed the ledger entry.
+ *
+ * Composed into {@link livePreview}'s extension array beside the plugin, so a
+ * note still has exactly one renderer.
+ *
+ * The reveal rule is the renderer's, applied to a whole block: put the caret
+ * anywhere in the fence and the source comes back, so a diagram stays editable
+ * as the text it is.
+ */
+export function mermaidLayer(): Extension {
+  // Scan and reveal are separated for the reason `galleryLayer` separates
+  // them: moving the caret must not re-walk the parse tree, and only an edit
+  // can change where the fences are.
+  const paint = (fences: readonly MermaidFence[], state: EditorState): DecorationSet =>
+    Decoration.set(
+      fences
+        .filter(
+          (fence) =>
+            !state.selection.ranges.some(
+              (range) => range.from <= fence.to && range.to >= fence.from,
+            ),
+        )
+        .map((fence) =>
+          Decoration.replace({ widget: new MermaidWidget(fence.source), block: true }).range(
+            fence.from,
+            fence.to,
+          ),
+        ),
+      true,
+    );
+  return StateField.define<{ fences: MermaidFence[]; decorations: DecorationSet }>({
+    create(state) {
+      const fences = mermaidFences(state);
+      return { fences, decorations: paint(fences, state) };
+    },
+    update(value, transaction) {
+      if (!transaction.docChanged && transaction.selection === undefined) {
+        return value;
+      }
+      const fences = transaction.docChanged ? mermaidFences(transaction.state) : value.fences;
+      return { fences, decorations: paint(fences, transaction.state) };
+    },
+    provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
+  });
 }

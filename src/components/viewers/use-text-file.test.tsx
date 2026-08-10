@@ -96,7 +96,14 @@ describe("useTextFile, opening", () => {
 
     expect(syncReadText).not.toHaveBeenCalled();
     expect(result.current.loading).toBe(false);
-    expect(result.current.error).toContain("not inside a synced folder");
+    // The WHOLE sentence, not a phrase inside it. `unreachable` short-circuits
+    // before any command exists, and the source's own read is a rejecting stub
+    // whose message also mentions a synced folder — so a `toContain` here
+    // passes with the short-circuit removed, and the reader silently loses the
+    // half that tells them what to do instead.
+    expect(result.current.error).toBe(
+      "This file is not inside a synced folder, so keeper cannot open or save it here. Use Open With to read it.",
+    );
   });
 
   it("surfaces Rust's own sentence when the read is refused", async () => {

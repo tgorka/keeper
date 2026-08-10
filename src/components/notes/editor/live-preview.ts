@@ -13,9 +13,11 @@
  *
  * What is deliberately absent: syntax highlighting inside code fences (not this
  * phase, and colour that implies highlighting would be a lie), any HTML
- * rendering (raw HTML in a note body stays text — there is no HTML sink to
- * inject into), and any fetch of a remote image URL (a note must not be able to
- * become a tracking pixel).
+ * rendering beyond the two literal `<u>` tags underline is spelled with (raw
+ * HTML in a note body stays text — there is no HTML sink to inject into, and
+ * underline adds none: it hides two strings and paints a CSS class), and any
+ * fetch of a remote image URL (a note must not be able to become a tracking
+ * pixel).
  */
 import { syntaxTree } from "@codemirror/language";
 import { type Extension, type Range, StateEffect, StateField } from "@codemirror/state";
@@ -28,9 +30,10 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
-import { CsvTableWidget, isCsvTarget } from "./csv-table";
+import { embedEntryFor, FileEmbedWidget } from "./file-embed";
 import { galleryLayer } from "./gallery-block";
-import { MermaidWidget } from "./mermaid-widget";
+import { tableLayer } from "./markdown-table";
+import { mermaidLayer } from "./mermaid-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
 import { transportFor } from "./recording-transport";
 import { WIKILINK, WIKILINK_ATTR } from "./wikilink";
@@ -38,17 +41,24 @@ import { WIKILINK, WIKILINK_ATTR } from "./wikilink";
 /** How long an externally applied change stays highlighted. */
 export const EXTERNAL_FLASH_MS = 1_200;
 
-/** Syntax markers hidden on every line except the one being edited. */
+/**
+ * Syntax markers hidden on every line except the one being edited.
+ *
+ * Only the marks whose node makes them unambiguous live here. A link's
+ * punctuation does not: the parser reuses `LinkMark`, `URL` and `LinkLabel`
+ * across constructs where they mean opposite things, and hiding them by name
+ * is what made a bare URL disappear from a note. Those three are decided by
+ * their parent, further down.
+ */
 const HIDDEN_MARKS: Record<string, true> = {
   EmphasisMark: true,
   StrongMark: true,
   CodeMark: true,
   HeaderMark: true,
   QuoteMark: true,
-  LinkMark: true,
   StrikethroughMark: true,
-  CodeInfo: true,
-  URL: true,
+  SubscriptMark: true,
+  SuperscriptMark: true,
 };
 
 /** Inline nodes that keep their text and gain a class. */
@@ -57,8 +67,29 @@ const INLINE_CLASSES: Record<string, string> = {
   StrongEmphasis: "cm-lp-strong",
   InlineCode: "cm-lp-code",
   Strikethrough: "cm-lp-strike",
-  Link: "cm-lp-link",
+  Subscript: "cm-lp-sub",
+  Superscript: "cm-lp-sup",
+  // The language a fence declares. Visible, unlike the backticks around it:
+  // hiding it left every code block opening with a blank grey line and threw
+  // away the one piece of information the block carried about itself.
+  CodeInfo: "cm-lp-fence-info",
 };
+
+/**
+ * The nodes whose `LinkMark`, `URL` and `LinkLabel` children are punctuation.
+ *
+ * `Link` and `Image` own a destination the reader does not want to see.
+ * `Autolink` owns two angle brackets around a URL that IS the text. A
+ * `LinkReference` definition line owns neither — it is metadata the writer
+ * typed and must be able to read back, so nothing in it is hidden.
+ */
+const LINK_PUNCTUATION: Record<string, true> = { Link: true, Image: true, Autolink: true };
+
+/** Underline's two delimiters, in the spelling `format-commands.ts` writes.
+ *  Matched as literal strings against `HTMLTag` nodes — nothing here parses or
+ *  renders HTML, so every other tag in a note body stays inert text. */
+const UNDERLINE_OPEN = "<u>";
+const UNDERLINE_CLOSE = "</u>";
 
 /** Block nodes that colour their whole line. */
 const LINE_CLASSES: Record<string, string> = {
@@ -154,21 +185,58 @@ function revealedLines(view: EditorView): Set<number> {
   return revealed;
 }
 
-/** The info string of a fenced block (`mermaid` in ` ```mermaid `), or "". */
-function fenceInfo(view: EditorView, from: number, to: number): string {
-  let info = "";
-  syntaxTree(view.state).iterate({
-    from,
-    to,
-    enter: (node) => {
-      if (node.name === "CodeInfo") {
-        info = view.state.doc.sliceString(node.from, node.to).trim();
-        return false;
+/** The three characters a task marker is spelled with. */
+const TASK_MARKER = /^\[[ xX]]$/;
+
+/**
+ * A task list's checkbox, which is the marker and is clickable.
+ *
+ * **The widget carries no position.** A widget outlives the decoration set that
+ * placed it, so a captured offset goes stale the moment anything above it is
+ * typed and the click would tick a different line. The live position is asked
+ * of the view at click time, and the three characters found there are checked
+ * to still be a marker before anything is written — so the worst a stale click
+ * can do is nothing.
+ *
+ * `mousedown` is cancelled rather than handled: letting it through would move
+ * the caret onto the line, the reveal rule would show the line's source, and
+ * the checkbox would vanish out from under the click that was toggling it.
+ */
+class TaskWidget extends WidgetType {
+  constructor(private readonly checked: boolean) {
+    super();
+  }
+
+  eq(other: TaskWidget): boolean {
+    return other.checked === this.checked;
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "cm-lp-task";
+    box.checked = this.checked;
+    box.setAttribute("aria-label", this.checked ? "Done" : "To do");
+    box.addEventListener("mousedown", (event) => event.preventDefault());
+    box.addEventListener("click", (event) => {
+      event.preventDefault();
+      const from = view.posAtDOM(box);
+      const current = view.state.doc.sliceString(from, from + 3);
+      if (!TASK_MARKER.test(current)) {
+        return;
       }
-      return undefined;
-    },
-  });
-  return info;
+      view.dispatch({
+        changes: { from, to: from + 3, insert: current[1] === " " ? "[x]" : "[ ]" },
+      });
+    });
+    return box;
+  }
+
+  /** The checkbox handles its own clicks; the editor must not also treat one
+   *  as a place to put the caret. */
+  ignoreEvent(): boolean {
+    return true;
+  }
 }
 
 function buildDecorations(view: EditorView, options: LivePreviewOptions): DecorationSet {
@@ -188,17 +256,23 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
     return false;
   };
 
+  // Underline is a pair of literal `HTMLTag` nodes with no node of their own to
+  // hang a class on, so the opening tags wait here until their closer arrives.
+  const openUnderlines: { from: number; to: number }[] = [];
+
   for (const visible of view.visibleRanges) {
     syntaxTree(view.state).iterate({
       from: visible.from,
       to: visible.to,
       enter: (node) => {
-        // A gallery block is decorated by `galleryLayer` below and not here:
-        // it replaces several lines with one element, and CodeMirror refuses
-        // both a block decoration and a line-break-spanning replace from a
-        // `ViewPlugin`. Nothing needs excluding at this point — the field's
-        // replacement covers the whole callout, so the quote's line class and
-        // the pins' wikilink marks fall inside a range nothing paints.
+        // A gallery block is decorated by `galleryLayer` below and not here,
+        // and a mermaid fence by `mermaidLayer`: both replace several lines
+        // with one element, and CodeMirror refuses both a block decoration and
+        // a line-break-spanning replace from a `ViewPlugin`. Nothing needs
+        // excluding at this point — a field's replacement covers the whole
+        // block, so the line classes and marks underneath it fall inside a
+        // range nothing paints. (Supplying one from here anyway is what DW-165
+        // was: it threw out of `EditorView` construction.)
 
         const lineClass = LINE_CLASSES[node.name];
         if (lineClass !== undefined) {
@@ -210,21 +284,6 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
         }
 
         if (node.name === "FencedCode") {
-          const blockFrom = doc.lineAt(node.from).from;
-          const blockTo = doc.lineAt(node.to).to;
-          if (
-            fenceInfo(view, node.from, node.to) === "mermaid" &&
-            !isRevealed(node.from, node.to)
-          ) {
-            const source = doc.sliceString(doc.lineAt(node.from).to + 1, doc.lineAt(node.to).from);
-            decorations.push(
-              Decoration.replace({ widget: new MermaidWidget(source), block: true }).range(
-                blockFrom,
-                blockTo,
-              ),
-            );
-            return false;
-          }
           const first = doc.lineAt(node.from).number;
           const last = doc.lineAt(node.to).number;
           for (let line = first; line <= last; line += 1) {
@@ -233,18 +292,118 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           return undefined;
         }
 
-        if (node.name === "Image" && !isRevealed(node.from, node.to)) {
+        if (node.name === "Image") {
           const raw = doc.sliceString(node.from, node.to);
           const match = /^!\[([^\]]*)]\(([^)\s]+)\)$/.exec(raw);
-          // A remote URL is left as source on purpose: keeper never fetches one,
-          // so a note cannot become a tracking pixel (NFR-11's egress claim).
-          if (match && !/^[a-z][a-z0-9+.-]*:/i.test(match[2])) {
+          // A remote URL is left as source, whole and visible: keeper never
+          // fetches one, so a note cannot become a tracking pixel (NFR-11's
+          // egress claim). Showing the alt text alone — which is what hiding
+          // the destination by node name used to do — made a remote embed look
+          // like a word somebody typed, with no hint that an image was meant.
+          if (match === null || /^[a-z][a-z0-9+.-]*:/i.test(match[2])) {
+            return false;
+          }
+          if (!isRevealed(node.from, node.to)) {
             decorations.push(
               Decoration.replace({
                 widget: new ImageWidget(match[1], match[2], options.assetUrl),
               }).range(node.from, node.to),
             );
             return false;
+          }
+          return undefined;
+        }
+
+        // A link keeps its text, gains the link class, and carries its
+        // destination in a `title` — because the destination is about to be
+        // hidden and hovering has to be able to answer "where does this go?"
+        // without moving the caret into the line to read the source.
+        if (node.name === "Link" || node.name === "Autolink") {
+          let destination: string | null = null;
+          for (let child = node.node.firstChild; child !== null; child = child.nextSibling) {
+            if (child.name === "URL") {
+              destination = doc.sliceString(child.from, child.to);
+              break;
+            }
+          }
+          decorations.push(
+            Decoration.mark({
+              class: "cm-lp-link",
+              attributes: destination === null ? {} : { title: destination },
+            }).range(node.from, node.to),
+          );
+          return undefined;
+        }
+
+        // `URL`, `LinkMark` and `LinkLabel` mean different things under
+        // different parents, and hiding them by name is the defect this story
+        // was sent to fix: `<https://example.com>` and a bare
+        // `https://example.com` are both a `URL` node whose text IS the link,
+        // so blanket-hiding it deleted them from the rendered note entirely.
+        if (node.name === "LinkMark" || node.name === "LinkLabel") {
+          if (LINK_PUNCTUATION[node.node.parent?.name ?? ""] === true) {
+            if (!isRevealed(node.from, node.to)) {
+              decorations.push(Decoration.replace({}).range(node.from, node.to));
+            }
+          }
+          return undefined;
+        }
+
+        if (node.name === "URL") {
+          const parent = node.node.parent?.name ?? "";
+          // A destination — the one URL a reader does not want to see, because
+          // the link's text is right there saying where it goes.
+          if (parent === "Link" || parent === "Image") {
+            if (!isRevealed(node.from, node.to)) {
+              decorations.push(Decoration.replace({}).range(node.from, node.to));
+            }
+            return false;
+          }
+          // Under an `Autolink` the surrounding node already carries the class;
+          // under a `LinkReference` this is a definition line, which is source.
+          if (parent !== "Autolink" && parent !== "LinkReference") {
+            // A bare GFM autolink: no wrapping node, so it gets the class here.
+            decorations.push(
+              Decoration.mark({
+                class: "cm-lp-link",
+                attributes: { title: doc.sliceString(node.from, node.to) },
+              }).range(node.from, node.to),
+            );
+          }
+          return undefined;
+        }
+
+        // The checkbox IS the marker, so a rendered task list is the same
+        // number of characters wide as its source and nothing reflows when the
+        // caret arrives and the source comes back.
+        if (node.name === "TaskMarker" && !isRevealed(node.from, node.to)) {
+          const marker = doc.sliceString(node.from, node.to);
+          decorations.push(
+            Decoration.replace({ widget: new TaskWidget(marker[1] !== " ") }).range(
+              node.from,
+              node.to,
+            ),
+          );
+          return false;
+        }
+
+        if (node.name === "HTMLTag") {
+          const tag = doc.sliceString(node.from, node.to);
+          if (tag === UNDERLINE_OPEN) {
+            openUnderlines.push({ from: node.from, to: node.to });
+          } else if (tag === UNDERLINE_CLOSE) {
+            const open = openUnderlines.pop();
+            // An empty `<u></u>` gets its tags hidden and no mark: CodeMirror
+            // rejects a mark decoration with nothing between its ends.
+            if (open !== undefined && !isRevealed(open.from, node.to)) {
+              if (open.to < node.from) {
+                decorations.push(
+                  Decoration.mark({ class: "cm-lp-underline" }).range(open.to, node.from),
+                );
+              }
+              decorations.push(Decoration.replace({}).range(open.from, open.to));
+              decorations.push(Decoration.replace({}).range(node.from, node.to));
+            }
           }
           return undefined;
         }
@@ -272,22 +431,31 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           const target = match[1];
           const label = match[2] ?? target;
 
-          // `![[….csv]]`: the one embed syntax, rendered as the table Story
-          // 44.16 adds. Checked before the recording branch because a session's
-          // own files are video, audio and images — never a spreadsheet — so a
-          // `.csv` in a recording note is an ordinary attachment like any
-          // other, and a table is what it should be either way.
-          if (match[0].startsWith("!") && isCsvTarget(target)) {
+          // `![[….csv]]`, `![[….json]]`, `![[….jsonl]]`: the one embed syntax,
+          // rendered as the panel Story 45.12 mounts. WHICH targets get one is
+          // 45.2's registry's answer and not a list here — `embedEntryFor`
+          // returns a row or null, and this branch is the whole of what
+          // `live-preview.ts` knows about formats.
+          //
+          // The note's session goes with it rather than sending the target to
+          // the branch below, because in a recording note a data target may be
+          // either the session's own `manifest.json` or a vault attachment
+          // beside the note, and only an answer from the index can tell those
+          // apart. The widget asks the session first and the vault second.
+          if (match[0].startsWith("!") && embedEntryFor(target) !== null) {
             // An INLINE replace with a block-styled host, not `block: true`.
             // These decorations come from a `ViewPlugin`, and CodeMirror refuses
-            // a block decoration from one — the embed is a single line, so the
-            // inline form is available and is the shape `RecordingEmbedWidget`
-            // already uses. (The mermaid fence above asks for `block: true` from
-            // this same plugin and throws for it; that is Story 37.8's to fix,
-            // and the fix is moving this whole set into a `StateField`.)
+            // a block decoration from one (DW-165) — 45.10 moved the mermaid
+            // fence out to `mermaidLayer` rather than changing that rule. The
+            // embed is a single line, so the inline form is available and is the
+            // shape `RecordingEmbedWidget` already uses.
             decorations.push(
               Decoration.replace({
-                widget: new CsvTableWidget(options.vaultId, target),
+                widget: new FileEmbedWidget(
+                  options.vaultId,
+                  target,
+                  options.recordingSession?.() ?? null,
+                ),
               }).range(start, end),
             );
             continue;
@@ -417,6 +585,12 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-strong": { fontWeight: "600" },
   ".cm-lp-em": { fontStyle: "italic" },
   ".cm-lp-strike": { textDecoration: "line-through" },
+  ".cm-lp-underline": { textDecoration: "underline" },
+  // `vertical-align` alone would push the line's height around; the smaller
+  // font is what keeps a paragraph containing `H~2~O` the same height as one
+  // that does not, which is what stops a list of formulae from jittering.
+  ".cm-lp-sub": { verticalAlign: "sub", fontSize: "0.75em" },
+  ".cm-lp-sup": { verticalAlign: "super", fontSize: "0.75em" },
   ".cm-lp-code": {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     backgroundColor: "var(--muted)",
@@ -436,6 +610,20 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-fence": {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     backgroundColor: "var(--muted)",
+  },
+  // The language name, on the opening fence line. Quiet, because it labels the
+  // block rather than being part of it.
+  ".cm-lp-fence-info": {
+    color: "var(--muted-foreground)",
+    fontSize: "0.8em",
+  },
+  // Sized and spaced to occupy the three columns `[ ]` occupied, so ticking a
+  // box does not reflow the paragraph and neither does moving the caret onto
+  // the line and getting the source back.
+  ".cm-lp-task": {
+    verticalAlign: "middle",
+    margin: "0 0.15em",
+    cursor: "pointer",
   },
   ".cm-lp-image img": { maxWidth: "100%", borderRadius: "4px" },
   // The host stays inline so an unresolved embed sits in its sentence like the
@@ -634,7 +822,12 @@ const livePreviewTheme = EditorView.baseTheme({
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     whiteSpace: "pre-wrap",
   },
-  ".cm-csv-block": { display: "block", overflowX: "auto" },
+  // Story 45.12's embed host. `block`, because an inline replace is all a
+  // `ViewPlugin` may supply (DW-165) and a panel wedged into a line of prose is
+  // neither readable nor usable. The height is set on the body element by the
+  // widget, from the same constant its `estimatedHeight` reports.
+  ".cm-embed-block": { display: "block" },
+  ".cm-embed-body": { border: "1px solid var(--border)", borderRadius: "4px" },
   ".cm-csv-table": { borderCollapse: "collapse", fontSize: "0.9em", width: "max-content" },
   ".cm-csv-cell": {
     border: "1px solid var(--border)",
@@ -706,5 +899,12 @@ export function livePreview(options: LivePreviewOptions): Extension {
       },
     },
   );
-  return [plugin, galleryLayer({ list: options.listFolder }), externalFlashField, livePreviewTheme];
+  return [
+    plugin,
+    galleryLayer({ list: options.listFolder }),
+    tableLayer(),
+    mermaidLayer(),
+    externalFlashField,
+    livePreviewTheme,
+  ];
 }

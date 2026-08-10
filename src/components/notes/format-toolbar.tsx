@@ -30,9 +30,14 @@ import {
   Link,
   List,
   ListOrdered,
+  ListTodo,
   Quote,
+  SquareCode,
   Strikethrough,
+  Subscript,
+  Superscript,
   Table,
+  Underline,
 } from "lucide-react";
 import { type MouseEvent, useCallback, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -44,14 +49,23 @@ type Panel = "heading" | "table" | null;
 
 const HEADING_LEVELS = [1, 2, 3, 4, 5, 6] as const;
 
-/** The straight-through buttons, in the order the toolbar shows them. */
+/** The straight-through buttons, in the order the toolbar shows them.
+ *
+ *  Grouped the way markdown groups them — the inline marks, then the block
+ *  ones, then link — so the five Story 45.10 added sit beside their relatives
+ *  rather than at the end where a toolbar goes to accumulate. */
 const DIRECT: readonly { action: FormatAction; label: string; Icon: typeof Bold }[] = [
   { action: { kind: "bold" }, label: "Bold", Icon: Bold },
   { action: { kind: "italic" }, label: "Italic", Icon: Italic },
+  { action: { kind: "underline" }, label: "Underline", Icon: Underline },
   { action: { kind: "strikethrough" }, label: "Strikethrough", Icon: Strikethrough },
+  { action: { kind: "subscript" }, label: "Subscript", Icon: Subscript },
+  { action: { kind: "superscript" }, label: "Superscript", Icon: Superscript },
   { action: { kind: "code" }, label: "Inline code", Icon: Code },
+  { action: { kind: "codeblock" }, label: "Code block", Icon: SquareCode },
   { action: { kind: "bullet" }, label: "Bullet list", Icon: List },
   { action: { kind: "ordered" }, label: "Numbered list", Icon: ListOrdered },
+  { action: { kind: "task" }, label: "Task list", Icon: ListTodo },
   { action: { kind: "quote" }, label: "Quote", Icon: Quote },
   { action: { kind: "link" }, label: "Link", Icon: Link },
 ];

@@ -67,7 +67,8 @@ import {
   windowSlice,
 } from "@/components/ui/window-list";
 import type { NoteGalleryItemVm, NoteGalleryVm } from "@/lib/ipc/client";
-import { primeFirstFrame, releaseRecordingMedia } from "./recording-embed";
+import { releaseRecordingMedia } from "./recording-embed";
+import { primeFirstFrame } from "./recording-transport";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /**

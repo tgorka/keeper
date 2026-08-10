@@ -15,16 +15,31 @@ import {
 } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { withRangeRects } from "@/test/layout";
+import { formatCommand } from "./format-commands";
 import { SLASH_COMMANDS, slashMenuSource } from "./slash-menu";
 
-// jsdom does no layout, so CodeMirror's measure pass would throw out of the
-// test on the first frame. Same shim, same reason, as `recording-embed.test.ts`.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
+// any animation frame that elapses during a test. The hand-rolled shim this
+// replaced installed an EMPTY `DOMRectList`, so a measure that did run read
+// `rects[0]` as undefined and threw anyway. That was a permanent fault that
+// only SHOWED as an occasional red, because whether a frame elapses at all
+// depends on how busy the box is. It was never an ordering problem: vitest
+// isolates per file (measured, not assumed — `isolate` and `pool` are unset in
+// vitest.config.ts and the default is true), so every file starts with a clean
+// prototype and the shim's `if (!…)` guard was always true. `withRangeRects`
+// hands back a real rect; its undo is mandatory — `Range.prototype` is shared.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+  restoreRects = null;
+});
 
 interface Opened {
   view: EditorView;
@@ -231,5 +246,91 @@ describe("the slash menu", () => {
     await stayedShut(view);
 
     view.destroy();
+  });
+});
+
+/**
+ * Story 45.10's rows, and the caret they leave behind.
+ *
+ * A row that inserts a *pair* has to put the caret between the delimiters.
+ * Without that the menu writes `^^` and parks the caret past both, so the user
+ * types their exponent outside its own marks and gets `^^2` — which is the kind
+ * of thing a person does once and then stops using the menu. Every case here
+ * therefore asserts the offset as well as the bytes.
+ */
+describe("the marks Story 45.10 added", () => {
+  const pairs: readonly { typed: string; label: string; inserted: string; caret: number }[] = [
+    { typed: "/subs", label: "Subscript", inserted: "~~", caret: 1 },
+    { typed: "/supe", label: "Superscript", inserted: "^^", caret: 1 },
+    { typed: "/unde", label: "Underline", inserted: "<u></u>", caret: 3 },
+  ];
+
+  for (const pair of pairs) {
+    it(`inserts ${pair.label} and leaves the caret between its delimiters`, async () => {
+      const { view, text, offered } = type("", pair.typed);
+      await opened(view);
+      expect(offered()[0]).toBe(pair.label);
+
+      expect(acceptCompletion(view)).toBe(true);
+
+      expect(text()).toBe(pair.inserted);
+      expect(view.state.selection.main.head).toBe(pair.caret);
+
+      view.destroy();
+    });
+  }
+
+  /**
+   * The row that was already here and had the wrong caret.
+   *
+   * "Code fence" has been in this table since Story 37.6, and it parked the
+   * caret after the closing fence — so the one thing you do next, type code,
+   * happened below the block instead of inside it.
+   */
+  it("puts the caret inside the code fence, not after it", async () => {
+    const { view, text } = type("", "/cod");
+    await opened(view);
+    acceptCompletion(view);
+
+    expect(text()).toBe("```\n\n```\n");
+    // Line two, the empty one between the fences.
+    expect(view.state.doc.lineAt(view.state.selection.main.head).number).toBe(2);
+
+    view.destroy();
+  });
+
+  it("puts the caret in the mermaid diagram's body, under `graph TD`", async () => {
+    const { view, text } = type("", "/mer");
+    await opened(view);
+    acceptCompletion(view);
+
+    expect(text()).toBe("```mermaid\ngraph TD\n\n```\n");
+    expect(view.state.doc.lineAt(view.state.selection.main.head).number).toBe(3);
+
+    view.destroy();
+  });
+
+  /**
+   * The `/` menu and the toolbar must write the SAME bytes for the same mark.
+   * Two doors into one note that disagree about how underline is spelled would
+   * put both spellings in one vault, and only one of them would ever render.
+   */
+  it("spells each mark exactly as the toolbar's command spells it", () => {
+    const spelling = (kind: "subscript" | "superscript" | "underline"): string => {
+      const view = new EditorView({
+        state: EditorState.create({ doc: "", selection: { anchor: 0 } }),
+      });
+      formatCommand({ kind })(view);
+      const out = view.state.doc.toString();
+      view.destroy();
+      return out;
+    };
+
+    const rowFor = (label: string): string =>
+      SLASH_COMMANDS.find((command) => command.label === label)?.text(new Date()) ?? "";
+
+    expect(rowFor("Subscript")).toBe(spelling("subscript"));
+    expect(rowFor("Superscript")).toBe(spelling("superscript"));
+    expect(rowFor("Underline")).toBe(spelling("underline"));
   });
 });

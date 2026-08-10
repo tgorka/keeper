@@ -13,6 +13,12 @@ vi.mock("@/lib/ipc/client", () => ({
   syncBrowse: (id: unknown, subpath: unknown) => syncBrowse(id, subpath),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
+  // Story 45.8 bound the `document` viewer, so a panel resolving a `.pdf`
+  // through the registry now reaches its loader. Held pending: this file
+  // asserts that the strip draws whatever the registry hands it, and a read
+  // that never settles keeps that assertion about the strip rather than about
+  // a document's contents.
+  syncReadDocument: vi.fn(() => new Promise(() => undefined)),
 }));
 
 import {
@@ -25,8 +31,9 @@ import {
   PanelStrip,
   panelFileGoneSentence,
 } from "@/components/layout/panel-strip";
+import { DOCUMENT_VIEWER_TESTID } from "@/components/viewers/document-viewer";
+import { MEDIA_VIEWER_ELEMENT_TESTID } from "@/components/viewers/media-viewer";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
-import { UNKNOWN_VIEWER_TESTID } from "@/lib/viewers";
 
 /** The exact sentence Rust composes for a profile whose drive is out. Verbatim,
  * because the whole point of the state is that it reaches the screen unaltered. */
@@ -104,19 +111,56 @@ describe("the panel strip", () => {
     // the one directory reader and it carries the containment rule.
     expect(syncBrowse).toHaveBeenCalledWith("p1", "docs");
 
-    // A `.pdf` resolves to the `document` viewer, which wave 2 has not bound —
-    // so the registry falls back to the unknown viewer, which is a real
-    // rendering of a real file rather than an empty frame. Asserted INSIDE the
-    // frame, so this cannot pass on a viewer mounted somewhere else.
+    // A `.pdf` resolves to the `document` viewer, which Story 45.8 bound — so
+    // the panel draws a document rather than a placeholder. The read is held
+    // pending by the mock, so what is asserted is that the STRIP mounted what
+    // the registry chose, which is this test's subject; whether the document
+    // then draws pages is 45.8's own suite.
+    //
+    // Before 45.8 this asserted the unknown viewer, and the assertion was
+    // right then for the same reason it is right now: the strip renders
+    // whatever the registry hands back and holds no opinion of its own.
     const only = panelsStore.getState().panels[0];
     if (only === undefined) {
       throw new Error("expected one panel");
     }
-    await waitFor(() => expect(screen.getByTestId(UNKNOWN_VIEWER_TESTID)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId(DOCUMENT_VIEWER_TESTID)).toBeInTheDocument());
     const frame = screen.getByTestId(`${PANEL_TESTID}-${only.id}`);
-    expect(within(frame).getByTestId(UNKNOWN_VIEWER_TESTID)).toBeInTheDocument();
+    expect(within(frame).getByTestId(DOCUMENT_VIEWER_TESTID)).toBeInTheDocument();
     // And the frame names the panel for a reader jumping between them.
     expect(frame).toHaveAttribute("aria-label", "report.pdf");
+  });
+
+  it("hands a media viewer the path the listing produced, not the file's name", async () => {
+    // **The seam nothing pressed.** Every media test in Story 45.7 builds its
+    // own `ViewerFile` and asks the registry directly, so all of them would
+    // still pass if THIS function put `entry.name` where `relativePath`
+    // belongs — measured, not supposed: that mutation survived the whole
+    // sweep. The consequence is not cosmetic. A file in a subfolder would be
+    // addressed as if it sat at the profile root, `browse::resolve` would find
+    // nothing there, and every video, image and audio inside a folder would
+    // 404. So the assertion is over the composed URL, which is the only place
+    // the two spellings differ.
+    syncBrowse.mockResolvedValue(
+      listed("2026/08", [
+        {
+          ...entry("screen-0000.mov", "2026/08/screen-0000.mov"),
+          kind: "video",
+        } as FilesEntryVm,
+      ]),
+    );
+    panelsStore.getState().setActiveTarget({
+      kind: "file",
+      profileId: "p1",
+      relativePath: "2026/08/screen-0000.mov",
+    });
+
+    await mount();
+
+    const player = await waitFor(() => screen.getByTestId(MEDIA_VIEWER_ELEMENT_TESTID));
+    expect(player.getAttribute("src")).toBe("keeper-file://p1/2026/08/screen-0000.mov");
+    // And the absolute path the listing carries reaches no attribute (FR-145).
+    expect(document.body.innerHTML).not.toContain("/Users/alice/Vault");
   });
 
   it("renders Rust's own reason when the drive is out, and keeps the panel", async () => {

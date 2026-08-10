@@ -8,6 +8,11 @@
 #[cfg(desktop)]
 mod copy_ipc;
 mod debug_log;
+// The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
+// reason `note_protocol` is: it serves files out of a synced folder, and the
+// folder sync it is rooted in is desktop-only.
+#[cfg(desktop)]
+mod file_protocol;
 #[cfg(desktop)]
 mod hotkey;
 mod ipc;
@@ -190,6 +195,21 @@ pub fn run() {
         recording_protocol::SCHEME,
         |ctx, request, responder| {
             recording_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
+    // Files inside a synced folder — the image, audio or video a panel opens
+    // (Story 45.7), and the PDF a document viewer draws (Story 45.8) — reach
+    // the webview only over this scheme. A fourth handler rather than a wider
+    // `keeper-recording://`, whose root is the recordings destination and which
+    // AD-74 forbids the Files surface from reaching, and rather than a wider
+    // `keeper-note://`, whose root is the notes SUBFOLDER and therefore narrower
+    // than the tree the Files pane browses. This one is contained to the sync
+    // profile's own root, through the same `browse::resolve` the listing uses.
+    #[cfg(desktop)]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        file_protocol::SCHEME,
+        |ctx, request, responder| {
+            file_protocol::handle(ctx.app_handle().clone(), &request, responder);
         },
     );
     let builder = builder
@@ -647,6 +667,9 @@ pub fn run() {
         sync_ipc::sync_browse,
         sync_ipc::sync_open_entry,
         sync_ipc::sync_read_text,
+        // The document reader (Story 45.8). Returns a bounded projection of a
+        // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
+        sync_ipc::sync_read_document,
         // And the write half (Story 45.3, AD-89, which retired AD-75). Every
         // one of these goes through `notes_vault`'s single writer and refuses
         // anything outside a notes vault; the decisions are in
@@ -709,9 +732,14 @@ pub fn run() {
         notes_ipc::notes_conflicts,
         notes_ipc::notes_resolve_conflict,
         notes_ipc::notes_attachment_paste,
-        notes_ipc::notes_attachment_drop,
+        notes_ipc::notes_attach_sources,
+        notes_ipc::notes_attach_targets,
+        notes_ipc::notes_body_read,
+        notes_ipc::notes_body_write,
         notes_ipc::notes_csv_read,
         notes_ipc::notes_csv_set_cell,
+        notes_ipc::notes_embed_read,
+        notes_ipc::notes_embed_write,
         notes_ipc::notes_capture_buffer,
         notes_ipc::notes_capture_buffer_save,
         notes_ipc::notes_capture_commit,

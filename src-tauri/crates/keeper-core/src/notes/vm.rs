@@ -592,6 +592,18 @@ pub struct NoteConflictVm {
 /// Only the reference crosses IPC. The bytes were read and written entirely in
 /// Rust, and the webview reaches them through the custom protocol at `url`
 /// (AD-58) rather than through a base64 payload.
+///
+/// **There was a `markdown` field here and Story 45.13 deleted it.** It carried
+/// `![name](attachments/name.png)` — CommonMark's embed — while the attachments
+/// panel wrote `![[attachments/name.png]]`, Obsidian's. Two spellings for one
+/// act, and only the second is decorated by `live-preview.ts`, so an attachment
+/// imported through this VM would have rendered as flat text. It was never
+/// noticed because nothing in the webview has read this field since epic 37:
+/// `notes_attachment_drop` and `notes_attachment_paste` have client wrappers
+/// and no callers. A dead field is not a spare part, it is an untested code
+/// path waiting for its first caller — which is how `NoteCreateReq.dest`
+/// turned out to be an armed data-loss path the moment something set it. The
+/// one spelling now lives in `src/lib/notes/attach.ts` and nowhere else.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -600,8 +612,78 @@ pub struct NoteAttachmentVm {
     pub rel_path: String,
     /// `keeper-note://…` URL the webview can render.
     pub url: String,
-    /// The markdown to splice into the body at the caret.
-    pub markdown: String,
+}
+
+/// One file offered for attaching, resolved to something a note can name
+/// (Story 45.13, FR-188, FR-189).
+///
+/// The three entry points hand over three different kinds of path — a picker's
+/// absolute path, a Files-pane row's absolute path, a recording note's own
+/// relative one — and this is what they all become before any note is touched.
+/// The webview never turns one into the other: it does not know where the vault
+/// is (AD-65) and must never hold an absolute path long enough to write it
+/// (FR-145).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteAttachSourceVm {
+    /// The file's own name, so a refusal can say which file it is about even
+    /// when there is no path to show.
+    pub name: String,
+    /// The vault-relative path a note may name, or `None` when keeper refused
+    /// this source. Exactly one of this and `refusal` is `Some`.
+    pub rel_path: Option<String>,
+    /// Whether keeper had to copy the file into the vault to make it nameable.
+    ///
+    /// Reported rather than inferred, because it is a thing that happened to
+    /// the user's disk and the surface says so. `false` means the file was
+    /// already in the vault and the note names it where it lies — no second
+    /// copy, which is what the dead `notes_attachment_drop` would have made.
+    pub copied: bool,
+    /// Why this source produced no path — a directory, an unreadable file, a
+    /// copy that failed. A finished sentence, worded here on this module's
+    /// standing rule that Rust words what Rust decided.
+    pub refusal: Option<String>,
+}
+
+/// One note offered as somewhere to attach files (Story 45.13, FR-189).
+///
+/// A sibling of [`NoteLinkTargetVm`] rather than a field on it: the wikilink
+/// autocomplete asks "which note do you mean", and this asks "which note should
+/// receive these files", which is a different question with a different answer
+/// for the same note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteAttachTargetVm {
+    pub id: String,
+    pub title: String,
+    pub path: String,
+    /// Of the file names the caller asked about, the ones this note's body
+    /// already embeds — folded to lower case, in no particular order.
+    ///
+    /// **The subset, not the note's whole set, and never the body.** A list
+    /// never ships bodies (AD-58), and shipping every embed of every candidate
+    /// would make the payload a function of how much the vault holds rather
+    /// than of what was asked.
+    pub holds: Vec<String>,
+}
+
+/// A note's body as it is on disk right now (Story 45.13).
+///
+/// The read half of the one read-modify-write a surface can do to a note it has
+/// not opened in the editor. `rev` is what the write must be based on, so a
+/// note that changed underneath is conflict-copied rather than clobbered — the
+/// same guarantee `notes_save` gives the editor, through the same code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteBodyVm {
+    /// Content revision of the whole file these bytes came from.
+    pub rev: String,
+    /// The body, with the frontmatter block removed — the same space
+    /// [`NoteBodyBatch`] and `notes_save` speak in.
+    pub text: String,
 }
 
 /// A CSV attachment projected as a table (Story 44.16, FR-172).

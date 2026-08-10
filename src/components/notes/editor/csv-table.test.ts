@@ -1,20 +1,26 @@
-import { EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/**
+ * 44.16's CSV table (Story 44.16, FR-172).
+ *
+ * The widget that used to mount this, its `![[….csv]]` predicate and the
+ * renderer assembly around it moved to Story 45.12's `file-embed.test.tsx`,
+ * where one widget covers every embedded data format. What is asserted here is
+ * what stayed: the table, its ragged rows, its cell editor and its degrade
+ * paths.
+ */
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IpcClient from "@/lib/ipc/client";
 import type { NoteCsvVm } from "@/lib/ipc/client";
+import { withRangeRects } from "@/test/layout";
 import {
   CSV_CELL_LABEL,
   CSV_MISSING_CLASS,
   CSV_RAGGED_CLASS,
-  CsvTableWidget,
-  isCsvTarget,
   renderCsvTableInto,
 } from "./csv-table";
-import { livePreview } from "./live-preview";
 
-/** What the renderer's own widget — the one `live-preview` constructs, with no
- *  seam for a test to inject through — reaches for. */
+/** The defaults `renderCsvTableInto` falls back to when a caller injects
+ *  neither. Mocked so a test that forgets to inject fails loudly here instead
+ *  of reaching for a Tauri host that is not running. */
 const readCsv = vi.fn<typeof IpcClient.notesCsvRead>();
 const writeCell = vi.fn<typeof IpcClient.notesCsvSetCell>();
 
@@ -31,13 +37,28 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   ) => writeCell(vaultId, target, rev, row, column, value),
 }));
 
-// jsdom does no layout, so CodeMirror's measure pass would throw out of the
-// test on the first frame. Same shim, same reason, as `recording-embed.test.ts`.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom has no `Range.getClientRects`, and CodeMirror's measure pass calls it
+// on any animation frame that elapses during a test. `withRangeRects` is the
+// shared model of it, in the file whose whole purpose is modelling the browser
+// jsdom is not.
+//
+// The hand-rolled shim this replaced installed an EMPTY DOMRectList, so a
+// measure that did run read `rects[0]` as undefined and threw anyway — a
+// PERMANENT fault that only ever SHOWED as an occasional red, because whether a
+// frame elapses at all depends on how busy the box is. It was never an ordering
+// problem: vitest isolates per test file (measured with a two-file probe;
+// `isolate` and `pool` are unset in vitest.config.ts and default to isolated),
+// so every file starts with a clean `Range.prototype` and the shim's
+// `if (!…)` guard was always true.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+});
 
 const VAULT = "vault-1";
 const TARGET = "attachments/people.csv";
@@ -97,16 +118,6 @@ async function settled(): Promise<void> {
 beforeEach(() => {
   readCsv.mockReset();
   writeCell.mockReset();
-});
-
-describe("isCsvTarget", () => {
-  it("claims a csv embed whatever case the export used, and nothing else", () => {
-    expect(isCsvTarget("attachments/people.csv")).toBe(true);
-    expect(isCsvTarget("EXPORT.CSV")).toBe(true);
-    expect(isCsvTarget("attachments/clip.mov")).toBe(false);
-    expect(isCsvTarget("notes/csv")).toBe(false);
-    expect(isCsvTarget("csv.md")).toBe(false);
-  });
 });
 
 describe("renderCsvTableInto", () => {
@@ -249,81 +260,5 @@ describe("renderCsvTableInto", () => {
     expect(host.querySelector('[role="alert"]')?.textContent).toContain("changed on disk");
     // The table shows the file, not the edit that did not land.
     expect(cellAt(host, 1, 0).textContent).toBe("Doe, Jane");
-  });
-});
-
-describe("CsvTableWidget", () => {
-  it("renders the ordinary link first, then puts the table in its place", async () => {
-    const widget = new CsvTableWidget(VAULT, TARGET, { read: async () => table() });
-    const dom = widget.toDOM();
-
-    expect(dom.querySelector("a")?.textContent).toBe(TARGET);
-    await settled();
-    expect(grid(dom)[1]).toEqual(["Doe, Jane", "ok"]);
-  });
-
-  it("drops a table that resolved after the widget was destroyed", async () => {
-    let answer: (value: NoteCsvVm) => void = () => {};
-    const widget = new CsvTableWidget(VAULT, TARGET, {
-      read: async () => await new Promise<NoteCsvVm>((resolve) => (answer = resolve)),
-    });
-    const dom = widget.toDOM();
-    widget.destroy();
-    answer(table());
-    await settled();
-
-    // The link stands; nothing is written into DOM CodeMirror has thrown away.
-    expect(dom.querySelector("table")).toBeNull();
-  });
-
-  it("reuses the DOM for the same embed, so the caret moving cannot lose a cell", () => {
-    const one = new CsvTableWidget(VAULT, TARGET);
-    expect(one.eq(new CsvTableWidget(VAULT, TARGET))).toBe(true);
-    expect(one.eq(new CsvTableWidget(VAULT, "attachments/other.csv"))).toBe(false);
-    expect(one.eq(new CsvTableWidget("vault-2", TARGET))).toBe(false);
-  });
-
-  it("claims a cell's events from CodeMirror and gives up the link's", () => {
-    const widget = new CsvTableWidget(VAULT, TARGET);
-    const cell = document.createElement("td");
-    cell.className = "cm-csv-cell";
-    const anchor = document.createElement("a");
-
-    // A claimed event is one CodeMirror runs no handler for. Letting a click on
-    // a cell through would reveal the line, and a revealed line drops its
-    // decorations — so the click would destroy the table instead of editing it.
-    // An untargeted event has `target === null`, which is the "not a cell" case.
-    expect(widget.ignoreEvent(new MouseEvent("click"))).toBe(false);
-    expect(widget.ignoreEvent({ target: cell } as unknown as Event)).toBe(true);
-    expect(widget.ignoreEvent({ target: anchor } as unknown as Event)).toBe(false);
-  });
-});
-
-describe("the renderer", () => {
-  it("turns a csv embed into a table and leaves an ordinary wikilink alone", async () => {
-    readCsv.mockResolvedValue(table());
-    const parent = document.createElement("div");
-    document.body.append(parent);
-    const view = new EditorView({
-      parent,
-      state: EditorState.create({
-        doc: `intro\n\n![[${TARGET}]]\n\n[[people.md]]\n`,
-        extensions: [
-          livePreview({
-            vaultId: VAULT,
-            assetUrl: (rel) => rel,
-            onOpenLink: () => {},
-            recordingSession: () => null,
-          }),
-        ],
-      }),
-    });
-    await settled();
-
-    expect(readCsv).toHaveBeenCalledWith(VAULT, TARGET);
-    expect(view.contentDOM.querySelector(".cm-csv-block")).not.toBeNull();
-    // The plain wikilink on the third line is still a link, not a second table.
-    expect(view.contentDOM.querySelectorAll(".cm-csv-block")).toHaveLength(1);
-    view.destroy();
   });
 });

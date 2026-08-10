@@ -22,6 +22,9 @@ vi.mock("@/lib/ipc/client", () => ({
   // `lib: ES2020` does not declare. Nothing ever settles it, so there are no
   // resolvers to name anyway.
   syncReadText: vi.fn(() => new Promise(() => undefined)),
+  // Story 45.8's `document` viewer loads its own too, and is held pending for
+  // exactly the same reason.
+  syncReadDocument: vi.fn(() => new Promise(() => undefined)),
   syncWriteEntry: vi.fn(async () => undefined),
 }));
 

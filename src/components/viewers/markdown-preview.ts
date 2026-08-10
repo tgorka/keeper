@@ -14,35 +14,20 @@
  * (NFR-27): a reader who opens a CSV must not pay for the markdown grammar, and
  * the quick-capture window must not pay for any of it.
  *
- * ## The guard, and the defect it is standing in front of
+ * ## Why this returns a failure instead of throwing
  *
- * DW-165: `live-preview.ts` supplies `Decoration.replace({ …, block: true })`
- * from a `ViewPlugin`, and CodeMirror refuses a block decoration from a plugin.
- * The first time the decoration set contains a rendered ```mermaid fence the
- * `EditorView` **throws on construction** — so a note or a file with a diagram
- * in it cannot be opened at all. It has been that way since story 37.8 because
- * nothing in the suite ever assembled a real `EditorView` with the markdown
- * language AND the plugin; `markdown-preview.test.ts` now does, and pins it.
+ * A rendered pane that is blank because something threw is the single outcome
+ * this story forbids, and that has to hold for the throw nobody has found yet.
+ * So the construction is wrapped, and a failure comes back as a sentence the
+ * reader can act on with the raw — editable — view underneath it (AD-88).
  *
- * The fix is 45.10's (lift that branch into a `StateField`, as `galleryLayer`
- * in the same extension list already is), not this story's: `live-preview.ts`
- * is the note editor's core and changing it mid-wave is something every other
- * agent in this wave builds against.
- *
- * Until then this module declines to render a document it knows the renderer
- * will throw on, **names the reason and the line**, and hands the reader the
- * raw view — which is editable, which is the point of AD-88. Declining out loud
- * beats a pane that is blank for a reason nobody can see.
- *
- * The detection uses the *same* markdown grammar the renderer uses, over the
- * `EditorState` before any view exists — not a regex over the text. A regex
- * would be a second opinion about what a fence is, and the two would eventually
- * disagree about an indented fence or a tilde one.
- *
- * The `try`/`catch` around the construction stays regardless of DW-165, and is
- * the reason this returns a failure instead of throwing: a rendered pane that
- * is blank because something threw is the single outcome this story forbids,
- * and that has to hold for the throw nobody has found yet.
+ * **DW-165 used to be caught here and no longer is.** Until Story 45.10 the
+ * renderer supplied a block decoration from a `ViewPlugin`, CodeMirror refused
+ * it, and any document containing a ```mermaid fence threw on construction; this
+ * module declined such a document by name rather than letting the pane go
+ * blank. 45.10 lifted that decoration into a `StateField` (`mermaidLayer`), so
+ * a mermaid fence now renders, the pre-flight parse this module used to do is
+ * gone, and diagrams are no longer a special case anywhere in the viewer.
  */
 import type { ensureSyntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
@@ -74,20 +59,16 @@ export interface MarkdownPreviewOptions {
 export interface MarkdownPreview {
   /** Null when the document rendered. A finished sentence when it did not. */
   failure: string | null;
-  /** 1-based line the failure is about, when it is about one. */
-  failureLine: number | null;
   /** Always safe to call, including after a failure. */
   destroy: () => void;
 }
 
 /**
- * How long the grammar gets to parse the whole document before the fence check
- * gives up and mounts guarded instead.
+ * How long the grammar gets to parse the whole document before giving up.
  *
  * CodeMirror parses lazily; asking for a tree over the whole document of a
- * large file can take real time. A timeout here is not a correctness hole — the
- * `try`/`catch` still catches the construction — it just means the reader gets
- * a caught throw rather than a named line on a pathological file.
+ * large file can take real time, so {@link mermaidFenceLine} is bounded rather
+ * than allowed to block a pane.
  */
 const PARSE_BUDGET_MS = 250;
 
@@ -103,10 +84,9 @@ export async function mountMarkdownPreview(
   text: string,
   options: MarkdownPreviewOptions,
 ): Promise<MarkdownPreview> {
-  const [state, view, language, markdown, preview] = await Promise.all([
+  const [state, view, markdown, preview] = await Promise.all([
     import("@codemirror/state"),
     import("@codemirror/view"),
-    import("@codemirror/language"),
     import("@codemirror/lang-markdown"),
     import("@/components/notes/editor/live-preview"),
   ]);
@@ -135,27 +115,9 @@ export async function mountMarkdownPreview(
     ],
   });
 
-  const fence = mermaidFenceLine(editorState, language.ensureSyntaxTree);
-  if (fence !== null) {
-    // INFO, not debug: `tracing::debug!` and `console.debug` never reach the
-    // packaged app's log (DW-162), and a viewer that declined to render is
-    // exactly the thing somebody will be asking about.
-    console.info(
-      `viewers: declining the rendered view of a markdown file — a mermaid fence on line ${fence} ` +
-        "crashes the preview renderer (DW-165); showing the source instead",
-    );
-    return {
-      failure:
-        "keeper cannot draw this document yet: a mermaid diagram here crashes the preview " +
-        "renderer (DW-165). The source below is the file, unchanged",
-      failureLine: fence,
-      destroy: () => {},
-    };
-  }
-
   try {
     const mounted = new view.EditorView({ parent: host, state: editorState });
-    return { failure: null, failureLine: null, destroy: () => mounted.destroy() };
+    return { failure: null, destroy: () => mounted.destroy() };
   } catch (error) {
     console.info(
       `viewers: the markdown preview could not be built, showing the source instead: ${
@@ -169,7 +131,6 @@ export async function mountMarkdownPreview(
       failure:
         "keeper could not draw this document, so the source is below, unchanged: " +
         (error instanceof Error ? error.message : String(error)),
-      failureLine: null,
       destroy: () => {},
     };
   }
@@ -178,8 +139,10 @@ export async function mountMarkdownPreview(
 /**
  * The 1-based line of the first ```mermaid fence, or null when there is none.
  *
- * Exported for the test that pins DW-165. Takes `ensureSyntaxTree` rather than
- * importing it so this module keeps its single lazy import boundary.
+ * Kept, and still exported, because it is how `markdown-preview.test.ts` proves
+ * that this module and the renderer read the SAME grammar — the property that
+ * made DW-165 findable in the first place, and the one a regex over the text
+ * would quietly break for an indented or tilde fence.
  */
 export function mermaidFenceLine(
   editorState: EditorState,

@@ -19,16 +19,31 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxTree } from "@codemirror/language";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { withRangeRects } from "@/test/layout";
 import { type FormatAction, formatCommand, gfmTable } from "./format-commands";
 
-// jsdom does no layout, so CodeMirror's measure pass would throw out of the
-// test on the first frame. Same shim, same reason, as `slash-menu.test.ts`.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
+// any animation frame that elapses during a test. The hand-rolled shim this
+// replaced installed an EMPTY `DOMRectList`, so a measure that did run read
+// `rects[0]` as undefined and threw anyway. That was a permanent fault that
+// only SHOWED as an occasional red, because whether a frame elapses at all
+// depends on how busy the box is. It was never an ordering problem: vitest
+// isolates per file (measured, not assumed — `isolate` and `pool` are unset in
+// vitest.config.ts and the default is true), so every file starts with a clean
+// prototype and the shim's `if (!…)` guard was always true. `withRangeRects`
+// hands back a real rect; its undo is mandatory because `Range.prototype` is
+// shared with every other test in this file's run.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+  restoreRects = null;
+});
 
 interface Opened {
   view: EditorView;
@@ -85,6 +100,13 @@ describe("the inline marks", () => {
     { name: "italic", action: { kind: "italic" }, on: "*word*" },
     { name: "strikethrough", action: { kind: "strikethrough" }, on: "~~word~~" },
     { name: "inline code", action: { kind: "code" }, on: "`word`" },
+    // Story 45.10's three. They join the existing table rather than getting a
+    // suite of their own, because the promise a toolbar makes is the same for
+    // all of them and a mark that only round-trips in a test written for it is
+    // a mark nobody proved.
+    { name: "subscript", action: { kind: "subscript" }, on: "~word~" },
+    { name: "superscript", action: { kind: "superscript" }, on: "^word^" },
+    { name: "underline", action: { kind: "underline" }, on: "<u>word</u>" },
   ];
 
   for (const mark of marks) {
@@ -166,6 +188,77 @@ describe("the inline marks", () => {
 
     editor.view.destroy();
   });
+
+  /**
+   * The spelling choice, asserted as bytes.
+   *
+   * Obsidian reads this vault. `~word~` and `^word^` render there as
+   * themselves — literal, legible, and losslessly round-tripped back into
+   * keeper — while `<u>` is a real underline in Obsidian, on GitHub and in
+   * Pandoc. What is NOT written is the reason this test exists: `__word__` is
+   * bold in CommonMark, so binding underline to it would make the same file
+   * say two different things depending on who opened it, and this editor's own
+   * parser would not be able to tell the two apart either.
+   */
+  it("never writes __ for underline, because __ is bold everywhere else", () => {
+    const editor = open("a word here", "word");
+    editor.apply({ kind: "underline" });
+
+    expect(editor.text()).toBe("a <u>word</u> here");
+    expect(editor.text()).not.toContain("__");
+
+    editor.view.destroy();
+  });
+
+  it("takes underline off a caret sitting inside the run", () => {
+    const editor = open("a <u>word</u> here", "wor");
+    editor.apply({ kind: "underline" });
+
+    expect(editor.text()).toBe("a word here");
+
+    editor.view.destroy();
+  });
+
+  it("removes the innermost underline when two are nested", () => {
+    const editor = open("a <u>big <u>word</u> here</u> now", "word");
+    editor.apply({ kind: "underline" });
+
+    expect(editor.text()).toBe("a <u>big word here</u> now");
+
+    editor.view.destroy();
+  });
+
+  /** An unclosed `<u>` three paragraphs up must not pair with the `</u>` under
+   *  the caret and delete a tag the writer cannot see. */
+  it("does not pair an underline across a paragraph break", () => {
+    const editor = open("a <u>run\n\nplain word here\n", "word");
+    editor.apply({ kind: "underline" });
+
+    expect(editor.text()).toBe("a <u>run\n\nplain <u>word</u> here\n");
+
+    editor.view.destroy();
+  });
+
+  it("writes an empty underline pair and sits between the tags", () => {
+    const editor = open("a ");
+    editor.apply({ kind: "underline" });
+
+    expect(editor.text()).toBe("a <u></u>");
+    expect(editor.view.state.selection.main.head).toBe(5);
+
+    editor.view.destroy();
+  });
+
+  /** A single tilde is subscript and a double one is strikethrough; the parser
+   *  is what tells them apart, so neither toggle may eat the other's marks. */
+  it("does not mistake a strikethrough's tildes for a subscript's", () => {
+    const editor = open("a ~~word~~ here", "word");
+    editor.apply({ kind: "subscript" });
+
+    expect(editor.text()).toBe("a ~~~word~~~ here");
+
+    editor.view.destroy();
+  });
 });
 
 describe("the link action", () => {
@@ -226,6 +319,69 @@ describe("the block actions, over a multi-line selection", () => {
 
     expect(once).toBe("## alpha\n## beta\n## gamma\n");
     expect(twice).toBe(THREE);
+  });
+
+  it("turns every selected line into a task and takes the boxes off together", () => {
+    const { once, twice } = roundTrip(THREE, "alpha\nbeta\ngamma", { kind: "task" });
+
+    // `- [ ] `, which is GFM and is what Obsidian draws as a checkbox. The
+    // spelling is not keeper's to invent: the vault is read by both.
+    expect(once).toBe("- [ ] alpha\n- [ ] beta\n- [ ] gamma\n");
+    expect(twice).toBe(THREE);
+  });
+
+  /**
+   * The trap the prefix regex had to be widened for.
+   *
+   * A task is `- ` plus `[ ] `. If the marker group stopped at the bullet, the
+   * checkbox would be content, "is this already a task?" would be false, and
+   * pressing the button on a task would produce `- [ ] [ ] alpha`.
+   */
+  it("does not add a second checkbox to a line that already has one", () => {
+    const editor = open("- [ ] alpha\n", "alpha");
+    editor.apply({ kind: "task" });
+
+    expect(editor.text()).toBe("alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("adds a box to an existing bullet rather than stacking a second bullet", () => {
+    const editor = open("- alpha\n", "alpha");
+    editor.apply({ kind: "task" });
+
+    expect(editor.text()).toBe("- [ ] alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("turns a task back into a plain bullet when bullet is pressed on it", () => {
+    const editor = open("- [ ] alpha\n", "alpha");
+    editor.apply({ kind: "bullet" });
+
+    expect(editor.text()).toBe("- alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("keeps a ticked box's tick when the marker is left alone", () => {
+    // Heading owns the same prefix group, so it must take the WHOLE marker —
+    // leaving an orphan `[x]` behind would be a heading that reads `# [x] a`.
+    const editor = open("- [x] alpha\n", "alpha");
+    editor.apply({ kind: "heading", level: 1 });
+
+    expect(editor.text()).toBe("# alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("takes a task's box off a quoted line without touching the quote", () => {
+    const editor = open("> - [ ] alpha\n", "alpha");
+    editor.apply({ kind: "task" });
+
+    expect(editor.text()).toBe("> alpha\n");
+
+    editor.view.destroy();
   });
 
   it("changes the level rather than clearing it when a different level is asked for", () => {
@@ -326,6 +482,117 @@ describe("the block actions, over a multi-line selection", () => {
 
     expect(editor.text()).toBe("> alpha beta\n");
     expect(editor.selected()).toBe("beta");
+
+    editor.view.destroy();
+  });
+});
+
+describe("the code block action, which is not the inline code action", () => {
+  /**
+   * The confusion this suite exists to rule out. `code` writes one backtick
+   * either side of a run *within* a line; `codeblock` writes three on lines of
+   * their own. They produce different nodes, they get different decorations,
+   * and the two buttons must never converge — a toolbar whose "code" and "code
+   * block" produced the same bytes is a toolbar with one button on it twice.
+   */
+  it("writes a fence on its own lines, where inline code writes backticks in one", () => {
+    const block = open("alpha\n", "alpha");
+    block.apply({ kind: "codeblock" });
+    expect(block.text()).toBe("```\nalpha\n```\n");
+    block.view.destroy();
+
+    const inline = open("alpha\n", "alpha");
+    inline.apply({ kind: "code" });
+    expect(inline.text()).toBe("`alpha`\n");
+    inline.view.destroy();
+  });
+
+  it("wraps every line the selection touches, whole", () => {
+    const editor = open("intro\nalpha\nbeta\nend\n", "alpha\nbeta");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("intro\n```\nalpha\nbeta\n```\nend\n");
+
+    editor.view.destroy();
+  });
+
+  it("keeps the body selected, so a second press is a true undo", () => {
+    const editor = open("alpha\n", "alpha");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.selected()).toBe("alpha");
+
+    editor.apply({ kind: "codeblock" });
+    expect(editor.text()).toBe("alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("unwraps from a caret inside the fence, keeping the body", () => {
+    const editor = open("intro\n```\nalpha\n```\nend\n", "alpha");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("intro\nalpha\nend\n");
+
+    editor.view.destroy();
+  });
+
+  it("unwraps a fence with a language, dropping the info string with the fence", () => {
+    const editor = open("```ts\nconst a = 1;\n```\n", "const");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("const a = 1;\n");
+
+    editor.view.destroy();
+  });
+
+  it("leaves a caret on the empty middle line when nothing is selected", () => {
+    const editor = open("");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("```\n\n```");
+    // Offset four is past the opening fence and its newline: the next
+    // keystroke is code, not a fourth backtick.
+    expect(editor.view.state.selection.main.head).toBe(4);
+
+    editor.view.destroy();
+  });
+
+  /** An empty fence has no body, and the two "delete the line break too"
+   *  ranges an unwrap would otherwise use overlap on it. */
+  it("unwraps an empty fence without throwing", () => {
+    const editor = open("intro\n```\n```\nend\n", "```\n```");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("intro\n\nend\n");
+
+    editor.view.destroy();
+  });
+
+  /**
+   * A fence the user has opened but not yet closed still toggles off, and the
+   * one fence line is all that goes.
+   *
+   * The weak version of this test — "the result still contains alpha, and is
+   * not exactly `alpha`" — survived a mutation that turned the unwrap loose on
+   * a single `CodeMark` and left a stray blank line behind. Asserted as the
+   * whole document instead, because "did not eat the prose" is only meaningful
+   * as an exact string.
+   */
+  it("unwraps an unterminated fence without eating what follows it", () => {
+    const editor = open("```\nalpha\n", "alpha");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("alpha\n");
+
+    editor.view.destroy();
+  });
+
+  it("does not eat the prose under an unterminated fence when there is some", () => {
+    const editor = open("```\nalpha\n\nplain prose\n", "alpha");
+    editor.apply({ kind: "codeblock" });
+
+    expect(editor.text()).toBe("alpha\n\nplain prose\n");
 
     editor.view.destroy();
   });

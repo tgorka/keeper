@@ -14,7 +14,8 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { withRangeRects } from "@/test/layout";
 import { indentBindings } from "./indent-keymap";
 import { slashMenuSource } from "./slash-menu";
 import { tagCompleteSource } from "./tag-complete";
@@ -24,13 +25,33 @@ const VOCABULARY = ["work", "work/clients"];
 
 // jsdom performs no layout, so a `Range` reports no client rects and
 // CodeMirror's measure pass — which runs in a frame, after the awaits below
-// have started — throws out of the test. Same shim, same reason, as
-// `recording-embed.test.ts`.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// have started — throws out of the test.
+//
+// The hand-rolled shim this replaced returned an EMPTY rect list, so a measure
+// that did run read `rects[0]` as undefined and threw anyway — a permanent
+// latent fault that only surfaced when a box was busy enough for a frame to
+// elapse mid-test, which is what made it look like flake.
+//
+// It also installed itself only `if (!Range.prototype.getClientRects)`, which
+// read like order-dependence and was not: vitest isolates per file, so every
+// file starts with a clean `Range.prototype` and that condition was always
+// true. Measured with a two-file probe, not derived from the config.
+//
+// `withRangeRects` always installs and returns rects with numbers in them. Its
+// undo is mandatory because `Range.prototype` is shared with every other test
+// in the file, and `afterAll` is the hook that can carry it — an `afterEach`
+// undo restores the prototype while a just-destroyed view still has frames
+// pending, which exits non-zero with every test reported as passing.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+  restoreRects = null;
+});
 
 interface Opened {
   view: EditorView;

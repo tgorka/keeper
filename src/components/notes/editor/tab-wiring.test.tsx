@@ -14,8 +14,9 @@
  * surface a user actually types into.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
+import { withRangeRects } from "@/test/layout";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
@@ -39,13 +40,27 @@ vi.mock("@/lib/ipc/client", () => ({
 import { notesEditorStore } from "@/lib/stores/notes-editor";
 import { NoteEditor } from "../note-editor";
 
-// Same shim, same reason, as `recording-embed.test.ts`: jsdom does no layout,
-// so CodeMirror's measure pass would throw out of the test on the first frame.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
+// any animation frame that elapses during a test — and this file mounts the
+// real `NoteEditor`, so frames do elapse. The hand-rolled shim this replaced
+// installed an EMPTY `DOMRectList`, so a measure that did run read `rects[0]`
+// as undefined and threw anyway. That was a permanent fault that only SHOWED
+// as an occasional red, because whether a frame elapses at all depends on how
+// busy the box is. It was never an ordering problem: vitest isolates per file
+// (measured, not assumed — `isolate` and `pool` are unset in vitest.config.ts
+// and the default is true), so every file starts with a clean prototype and
+// the shim's `if (!…)` guard was always true. `withRangeRects` hands back a
+// real rect; its undo is mandatory because `Range.prototype` is shared.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+  restoreRects = null;
+});
 
 const OPENED = "alpha\nbeta\n";
 

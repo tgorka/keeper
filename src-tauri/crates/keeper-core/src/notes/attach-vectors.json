@@ -1,0 +1,120 @@
+{
+  "_": "The contract between keeper_core::notes::attach::embedded_attachment_names and its TypeScript mirror src/lib/notes/attach.ts (Story 45.13, FR-188, FR-189). Both test suites load this file. `embedded` is the sorted, lower-cased set of file names the body already EMBEDS. Adding a vector is how you widen the rule; changing one is a product decision about when keeper refuses to attach a file twice.",
+  "vectors": [
+    {
+      "body": "",
+      "embedded": [],
+      "why": "an empty note holds nothing"
+    },
+    {
+      "body": "just some prose about photographs.\n",
+      "embedded": [],
+      "why": "prose is not a link"
+    },
+    {
+      "body": "![[photo.png]]",
+      "embedded": ["photo.png"],
+      "why": "the spelling keeper writes"
+    },
+    {
+      "body": "![[attachments/photo.png]]",
+      "embedded": ["photo.png"],
+      "why": "matched by name, not by path — Story 40.4 renames the folder around the file"
+    },
+    {
+      "body": "![[old/screen.mov]] and ![[new/screen.mov]]",
+      "embedded": ["screen.mov"],
+      "why": "one file shown twice under two folder names is one name"
+    },
+    {
+      "body": "[[photo.png]]",
+      "embedded": [],
+      "why": "a mention is not an embed; `!` is the whole of the difference"
+    },
+    {
+      "body": "![alt](attachments/photo.png)",
+      "embedded": ["photo.png"],
+      "why": "CommonMark's embed spelling holds the file just as much"
+    },
+    {
+      "body": "[alt](attachments/photo.png)",
+      "embedded": [],
+      "why": "a markdown link without the bang is a link"
+    },
+    {
+      "body": "![alt](https://example.com/photo.png)",
+      "embedded": [],
+      "why": "an external URL is not a file in this vault"
+    },
+    {
+      "body": "![alt](attachments/a%20b.png)",
+      "embedded": ["a b.png"],
+      "why": "Obsidian percent-encodes a markdown destination; the name on disk is decoded"
+    },
+    {
+      "body": "![Photo](<attachments/a b.png>)",
+      "embedded": ["a b.png"],
+      "why": "angle brackets carry a destination with spaces and are not part of it"
+    },
+    {
+      "body": "![alt](attachments/photo.png \"A title\")",
+      "embedded": ["photo.png"],
+      "why": "the optional title is not part of the destination"
+    },
+    {
+      "body": "```\n![[photo.png]]\n```\n",
+      "embedded": [],
+      "why": "a fenced block is documentation about the syntax, not a use of it"
+    },
+    {
+      "body": "inline `![[photo.png]]` code",
+      "embedded": [],
+      "why": "the same, inline"
+    },
+    {
+      "body": "\\![[photo.png]]",
+      "embedded": [],
+      "why": "an escaped bang is not an embed marker"
+    },
+    {
+      "body": "![[photo.png#page=2]]",
+      "embedded": ["photo.png"],
+      "why": "an anchor selects a place inside the target and does not change which file it is"
+    },
+    {
+      "body": "![[photo.png|A photo]]",
+      "embedded": ["photo.png"],
+      "why": "an alias is display text, not the target"
+    },
+    {
+      "body": "![[ photo.png ]]",
+      "embedded": ["photo.png"],
+      "why": "a target is trimmed"
+    },
+    {
+      "body": "![[]] and ![[#heading]]",
+      "embedded": [],
+      "why": "neither names a file"
+    },
+    {
+      "body": "![[FOTO.PNG]]",
+      "embedded": ["foto.png"],
+      "why": "folded: APFS is case-insensitive, so this is the same file as foto.png"
+    },
+    {
+      "body": "![[b.png]]\n![[a.png]]\n![[deep/A.PNG]]\n",
+      "embedded": ["a.png", "b.png"],
+      "why": "sorted and deduplicated after folding, not in document order"
+    },
+    {
+      "body": "see ![[deep/nested/report.pdf]] here",
+      "embedded": ["report.pdf"],
+      "why": "an embed anywhere in a line counts"
+    },
+    {
+      "body": "![[a.png]]![[b.png]]",
+      "embedded": ["a.png", "b.png"],
+      "why": "two embeds with nothing between them are two embeds"
+    }
+  ]
+}

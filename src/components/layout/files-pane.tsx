@@ -91,6 +91,7 @@ import type {
 } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
+import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -125,6 +126,7 @@ import {
   syncProfiles,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
 import type { IconName } from "@/lib/viewers";
@@ -532,6 +534,13 @@ export function FilesPane() {
   // Which folder is being created in, by node key, and what has been typed.
   const [creatingIn, setCreatingIn] = useState<string | null>(null);
   const [createName, setCreateName] = useState("");
+  // Whether Story 45.13's chooser is open. A boolean rather than a captured
+  // selection: the dialog reads the live selection, so a row that disappears
+  // on a refresh while the dialog is open cannot be attached from a snapshot.
+  const [attaching, setAttaching] = useState(false);
+  // Which vault a note would be attached to. The Files pane browses every
+  // synced folder, but a note lives in the open vault and nowhere else.
+  const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
 
   useEffect(() => {
     let live = true;
@@ -849,6 +858,38 @@ export function FilesPane() {
    */
   const deletable = useMemo(
     () => selection.filter((node) => node.entry?.write.writable === true),
+    [selection],
+  );
+
+  /**
+   * The absolute paths of the selected rows a note could hold (Story 45.13,
+   * FR-188).
+   *
+   * A folder is out because there is no element for a directory — the rule
+   * Story 43.5 set and `notes_attach_sources` enforces again on the paths it is
+   * handed. Deciding it here as well is not belt-and-braces for its own sake:
+   * it decides whether the control appears at all, and a control that is always
+   * there and always refuses is worse than one that is only there when it works.
+   *
+   * `write.writable` is deliberately not consulted. That is the LOCATION
+   * question — may keeper change this file — and attaching changes the note,
+   * not the file. A read-only PDF is a perfectly good thing to put in a note.
+   *
+   * **`flatMap` rather than `filter` and then `map`, and that is the whole
+   * reason this holds paths instead of rows.** `Array.prototype.filter` does
+   * not narrow its element type without a type predicate, so a filtered list of
+   * rows still reads as `entry: FilesEntryVm | null` downstream and the
+   * compiler demands `node.entry?.absolutePath ?? ""` at the call site. That
+   * fallback was here, and it was the bad kind: it cannot happen, so no test
+   * can reach it, and if it ever did it would hand Rust an empty path to attach
+   * rather than nothing at all. Narrowing inside the ternary means the
+   * impossible case has no value to fabricate — there is no `??` to get wrong.
+   */
+  const attachablePaths = useMemo(
+    () =>
+      selection.flatMap((node) =>
+        node.entry !== null && node.entry.kind !== "folder" ? [node.entry.absolutePath] : [],
+      ),
     [selection],
   );
 
@@ -1535,6 +1576,21 @@ export function FilesPane() {
               </Button>
             </>
           )}
+          {/* Story 45.13's entry point, on the SAME selection Delete acts on
+              (Story 45.3) — there is one selection model in this pane and this
+              does not add a second. Offered whenever files are selected and a
+              vault is open, and never for a selection of only folders: a note
+              embeds a file, and there is no element for a directory.
+
+              Deliberately not gated on `write.writable`. That flag answers "may
+              keeper change this file", and attaching changes the NOTE, not the
+              file — a read-only PDF on a paused drive is a perfectly good thing
+              to put in a note. */}
+          {attachablePaths.length > 0 && activeVaultId !== null && (
+            <Button type="button" variant="outline" size="sm" onClick={() => setAttaching(true)}>
+              {ATTACH_TO_NOTE_LABEL}
+            </Button>
+          )}
           <Button type="button" variant="outline" size="sm" onClick={refresh}>
             {FILES_REFRESH_LABEL}
           </Button>
@@ -1644,6 +1700,18 @@ export function FilesPane() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Story 45.13. Mounted only while open, like the create row: it holds
+          a search and an outcome that belong to one gesture, and a person who
+          closed it and selected different files must not find the old sentence
+          waiting for them. */}
+      {attaching && activeVaultId !== null && (
+        <AttachToNoteDialog
+          vaultId={activeVaultId}
+          sources={attachablePaths}
+          onClose={() => setAttaching(false)}
+        />
+      )}
     </section>
   );
 }

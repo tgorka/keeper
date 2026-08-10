@@ -1,12 +1,21 @@
 /**
- * The raw/rendered toggle, against a real render (Story 45.4).
+ * The raw/rendered toggle, against a real render (Story 45.4, 45.10).
  *
  * The raw half is a REAL controlled `<textarea>` passed in as the editor,
  * not a mock of 45.6's module. What is being asserted here is that this
  * component holds one buffer and hands the exact characters back — and a mocked
  * module would let that hold for a component that had quietly grown a second
  * copy of the text. The markdown pane mounts a REAL `EditorView` with the real
- * decoration layer, for the reason DW-165 exists.
+ * decoration layer, for the reason DW-165 existed.
+ *
+ * **The one seam.** Two tests here are about the *refusal lifecycle* — a
+ * refusal names itself, and a refusal does not outlive the bytes it was about
+ * — and they need a document the renderer cannot draw. Until Story 45.10 that
+ * document was a ```mermaid fence, because DW-165 made one throw. It draws now,
+ * so those two tests force the failure through `mountMarkdownPreview` instead.
+ * The alternative was to keep asserting the lifecycle over a document that no
+ * longer refuses, which is a test that proves nothing, or to delete the
+ * lifecycle coverage along with the defect that happened to trigger it.
  */
 import "@codemirror/lang-markdown";
 import "@codemirror/language";
@@ -18,9 +27,35 @@ import { useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteCsvVm } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
+import type { MarkdownPreview } from "./markdown-preview";
 import type { RawEditorProps } from "./raw-rendered-view";
 import { RawRenderedView } from "./raw-rendered-view";
 import { VIEW_MODE_COOKIE } from "./view-mode";
+
+/** The sentence the forced failure returns, when one is forced. Null means the
+ *  real renderer runs, which is what every other test in this file gets. */
+let forcedPreviewFailure: string | null = null;
+
+vi.mock("./markdown-preview", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./markdown-preview")>();
+  return {
+    ...actual,
+    mountMarkdownPreview: async (
+      host: HTMLElement,
+      text: string,
+      options: Parameters<typeof actual.mountMarkdownPreview>[2],
+    ): Promise<MarkdownPreview> => {
+      if (forcedPreviewFailure === null) {
+        return actual.mountMarkdownPreview(host, text, options);
+      }
+      // The real module empties the host on failure so the reader never sees a
+      // fragment of a render; the double has to do the same or the assertions
+      // about what is left behind would be about the double.
+      host.replaceChildren();
+      return { failure: forcedPreviewFailure, destroy: () => {} };
+    },
+  };
+});
 
 /**
  * Drain the microtasks the markdown mount rides on, and nothing else.
@@ -137,6 +172,7 @@ afterAll(() => {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  forcedPreviewFailure = null;
 });
 
 describe("the toggle remembers per format, not per file", () => {
@@ -455,10 +491,9 @@ describe("markdown renders through the note editor's own preview", () => {
     expect(container.querySelector(".cm-lp-em")?.textContent).toBe("em");
   });
 
-  it("names a document it cannot draw and hands over an editable source view", async () => {
-    vi.spyOn(console, "info").mockImplementation(() => {});
+  it("draws a mermaid diagram rather than refusing the document (DW-165 is fixed)", async () => {
     const cookie = jar();
-    render(
+    const { container } = render(
       <Host
         format="markdown"
         rendered="markdown"
@@ -470,35 +505,64 @@ describe("markdown renders through the note editor's own preview", () => {
     );
 
     await settle();
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("DW-165");
-    expect(screen.getByLabelText("Source of diagram.md")).not.toHaveAttribute("readonly");
+    // Until Story 45.10 this pane showed a refusal naming DW-165, because the
+    // renderer threw on constructing a view over this exact document.
+    //
+    // Asserted as "the pane did not fall back to source", not as "there is no
+    // alert on screen": mermaid itself degrades to a `role="alert"` inside its
+    // own block under jsdom, which has no `getComputedTextLength` for it to
+    // measure with. That degrade is the widget's documented behaviour and is
+    // not what this test is about — the pane refusing to draw at all is.
+    expect(screen.queryByLabelText("Source of diagram.md")).toBeNull();
+    expect(container.querySelector(".cm-mermaid-block")).not.toBeNull();
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(cookie.read()).toBe("");
+  });
+
+  it("names a document it cannot draw and hands over an editable source view", async () => {
+    forcedPreviewFailure = "keeper could not draw this document: the renderer threw";
+    const cookie = jar();
+    render(
+      <Host
+        format="markdown"
+        rendered="markdown"
+        language="markdown"
+        cookie={cookie}
+        fileName="broken.md"
+        initial={"# Title\n"}
+      />,
+    );
+
+    await settle();
+    expect(screen.getByRole("alert")).toHaveTextContent("the renderer threw");
+    expect(screen.getByLabelText("Source of broken.md")).not.toHaveAttribute("readonly");
     // Still the reader's stated preference; the next markdown file previews.
     expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
     expect(cookie.read()).toBe("");
   });
 
   it("previews again the moment the source is edited into something it can draw", async () => {
-    vi.spyOn(console, "info").mockImplementation(() => {});
+    forcedPreviewFailure = "keeper could not draw this document: the renderer threw";
     const { container } = render(
       <Host
         format="markdown"
         rendered="markdown"
         language="markdown"
         cookie={jar()}
-        fileName="diagram.md"
-        initial={"intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n"}
+        fileName="broken.md"
+        initial={"# Title\n"}
       />,
     );
     await settle();
     expect(screen.getByRole("alert")).toBeInTheDocument();
 
-    // The reader deletes the diagram. A refusal that outlived the bytes it was
+    // The reader edits the file. A refusal that outlived the bytes it was
     // about would keep the pane on source forever, and the reader would have no
     // way to tell a file keeper will not draw from a file keeper has given up
     // on — which is the "makes the user think the file changed" failure this
     // story forbids.
-    fireEvent.change(screen.getByLabelText("Source of diagram.md"), {
+    forcedPreviewFailure = null;
+    fireEvent.change(screen.getByLabelText("Source of broken.md"), {
       target: { value: "# just a heading\n" },
     });
     await settle();

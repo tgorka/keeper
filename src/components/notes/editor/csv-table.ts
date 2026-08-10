@@ -1,5 +1,12 @@
 /**
- * The `![[…csv]]` embed rendered as a table you can edit (Story 44.16, FR-172).
+ * A CSV rendered as a table you can edit (Story 44.16, FR-172).
+ *
+ * **The table, not the embed.** Story 45.12 generalised 44.16's `![[….csv]]`
+ * widget into `file-embed.ts`, which mounts a panel for every format the
+ * registry gives a rendered half to and knows nothing about CSV. What stayed
+ * here is the thing that was always about CSV: the table itself, mounted by
+ * 45.4's `RawRenderedView` in a note and in a Files panel alike. So there is
+ * still exactly one CSV table in this app, and it is this one.
  *
  * **This file holds no CSV grammar.** Not one `split(",")`, not one quote rule,
  * not one line-ending decision. Quoting, embedded newlines and separators, the
@@ -17,9 +24,9 @@
  * it cannot reformat it.
  *
  * **No second embed syntax.** `![[target]]` is the one embed this app has, the
- * one the attachments panel writes and the one Obsidian reads; a `.csv` target
- * gets a table and everything else is untouched. The target is passed to Rust
- * verbatim — the webview never joins a vault root to a subpath (AD-65).
+ * one the attachments panel writes and the one Obsidian reads. The target is
+ * passed to Rust verbatim — the webview never joins a vault root to a subpath
+ * (AD-65).
  *
  * **Degrading, never an empty box.** Every failure — a file the vault does not
  * have, one too large to table, one that is not UTF-8, a revision that moved
@@ -34,19 +41,7 @@
  * are drawn as absent rather than as empty cells, because an empty cell invites
  * an edit keeper will refuse: it does not add a field to a row it did not write.
  */
-import { WidgetType } from "@codemirror/view";
 import { type NoteCsvVm, notesCsvRead, notesCsvSetCell } from "@/lib/ipc/client";
-
-/** The extension that makes an embed a table. Lower-cased before comparison —
- *  `DATA.CSV` came off somebody's Windows export and is the same file. */
-const CSV_EXTENSION = ".csv";
-
-/** Whether this embed target names a CSV. The only classification this file
- *  does, and it is about the *embed*, not about the file's kind — 43.5's
- *  `kind_for_file_name` stays the one answer to what a file IS. */
-export function isCsvTarget(target: string): boolean {
-  return target.toLowerCase().endsWith(CSV_EXTENSION);
-}
 
 /** What a cell's editor is announced as, so the control has a name. */
 export const CSV_CELL_LABEL = "Edit cell";
@@ -314,68 +309,5 @@ async function commit(
     // state keeper actually confirmed — so the cell shows what is on disk
     // rather than the edit that did not land.
     paint(host, vaultId, target, table, options, reasonOf(error));
-  }
-}
-
-/**
- * The CodeMirror widget that replaces a `![[….csv]]` embed.
- *
- * An **inline** replace whose host is styled `display: block`, which is the
- * same shape `RecordingEmbedWidget` uses and the only one available: these
- * decorations come from a `ViewPlugin`, and CodeMirror refuses a block
- * decoration from a plugin (DW-165). An embed is one line, so the inline form
- * costs nothing here — a mermaid fence is several, which is why that widget
- * asks for `block: true` and throws for it.
- */
-export class CsvTableWidget extends WidgetType {
-  /** Set by {@link destroy}, read by the fetch that may still be in flight. */
-  private disposed = false;
-
-  constructor(
-    private readonly vaultId: string,
-    private readonly target: string,
-    private readonly options: CsvTableOptions = {},
-  ) {
-    super();
-  }
-
-  /** Same vault and same target, same table: CodeMirror may reuse the DOM,
-   *  which is what keeps a half-typed cell alive while the caret moves. */
-  eq(other: CsvTableWidget): boolean {
-    return other.vaultId === this.vaultId && other.target === this.target;
-  }
-
-  toDOM(): HTMLElement {
-    const host = document.createElement("div");
-    host.className = "cm-csv-block";
-    host.append(link(this.target));
-    // Fired and forgotten, exactly as the mermaid fence is: the link is in the
-    // document immediately and the table takes its place when the file is read.
-    // Blocking `toDOM` on an IPC round trip would stall the editor on every
-    // keystroke that rebuilds the decorations.
-    void renderCsvTableInto(host, this.vaultId, this.target, {
-      ...this.options,
-      cancelled: () => this.disposed || this.options.cancelled?.() === true,
-    });
-    return host;
-  }
-
-  destroy(): void {
-    this.disposed = true;
-  }
-
-  /**
-   * Keep the events aimed at a cell.
-   *
-   * `true` means CodeMirror ignores the event entirely, including the
-   * renderer's own wikilink handler. A cell has to keep its clicks and keys:
-   * letting them through would put the caret on the line, and a revealed line
-   * drops its decorations — so clicking a cell would destroy the table instead
-   * of editing it, and typing into the input would type into the note. The same
-   * trade `RecordingEmbedWidget` makes for its controls. Everything else gives
-   * its events up, so the degraded link behaves like the wikilink it is.
-   */
-  ignoreEvent(event: Event): boolean {
-    return event.target instanceof Element && event.target.closest(".cm-csv-cell, input") !== null;
   }
 }

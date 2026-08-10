@@ -5,9 +5,26 @@
  *
  * Two surfaces need this and neither is the other: Story 45.4's raw/rendered
  * shell binds the registry's `text` viewer and needs to load, and Story 45.12's
- * note embed will need to load the same way inside a note. A component would
- * have made one of them mount the other's chrome. A hook lets there be exactly
- * one loader and exactly one save rule under two different frames.
+ * note embed loads the same way inside a note. A component would have made one
+ * of them mount the other's chrome. A hook lets there be exactly one loader and
+ * exactly one save rule under two different frames.
+ *
+ * # One engine, two coordinate systems
+ *
+ * Those two surfaces do not address a file the same way. A Files panel holds a
+ * **sync profile id** and a profile-relative subpath; a note holds a **notes
+ * vault id** and the text between a pair of brackets. Neither is derivable from
+ * the other in the webview (AD-65; the resolution is Story 45.18's), so the two
+ * commands are genuinely different commands.
+ *
+ * Everything else about them is identical, and everything else is where the
+ * bugs live: the generation counter that stops a slow read for the previous
+ * file overwriting the current one's buffer, `persisted` being state rather
+ * than a ref, the rule that a refused save leaves the buffer dirty and never
+ * rolls it back, and the four reasons a save declines out loud. So the commands
+ * are a {@link TextFileSource} the caller supplies and {@link useTextBuffer} is
+ * the rest — one implementation, and a second surface cannot drift from it by
+ * copying it.
  *
  * It is also a separate module from `text-viewer.tsx` so that importing the
  * loader does not import CodeMirror. 45.4's chrome asks whether a file is too
@@ -15,14 +32,15 @@
  * for that question would defeat the lazy boundary `note-editor.tsx` set up for
  * NFR-27.
  *
- * # One writer, and it is Story 45.3's
+ * # One writer per vault, and neither of them is new
  *
  * AD-89 retired AD-75 and gave the Files surface a write path — through
  * `write_vault_file` + `mark_dirty`, the same path notes use, never a second
- * writer. This hook calls {@link syncWriteEntry} and composes no path of its
- * own: the `subpath` it saves to is the one the listing handed it, and Rust
- * re-resolves it through `keeper_sync::browse`'s containment on every call
- * (AD-65).
+ * writer. {@link useTextFile} calls {@link syncWriteEntry} and composes no path
+ * of its own: the `subpath` it saves to is the one the listing handed it, and
+ * Rust re-resolves it through `keeper_sync::browse`'s containment on every call
+ * (AD-65). A note embed's `notes_embed_write` lands on that same
+ * `write_vault_file`, after the vault's own containment check.
  *
  * # Declining out loud
  *
@@ -33,8 +51,41 @@
  * change, and nothing on the machine says why. `console.debug` would not do,
  * for the same reason `tracing::debug!` does not reach a packaged app's log.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { syncReadText, syncWriteEntry, type TextFileVm } from "@/lib/ipc/client";
+
+/**
+ * The two commands one surface addresses one file with, plus what to call it.
+ *
+ * **Must be referentially stable.** {@link useTextBuffer} re-reads whenever this
+ * changes, which is exactly right when the file changes and an infinite loop
+ * when it does not — so a caller builds it with `useMemo` over the identifiers
+ * it is keyed on. Both facades in this repository do; a caller that forgets
+ * gets a read per render, which the tests below catch by counting calls.
+ */
+export interface TextFileSource {
+  /** What this file is called in a sentence and in a log line. Never a path
+   *  that could be absolute (FR-145) — the callers pass a relative one. */
+  readonly label: string;
+  /** Read it, or reject with Rust's sentence. */
+  readonly read: () => Promise<TextFileVm>;
+  /** Write the whole buffer exactly, or reject with Rust's sentence. */
+  readonly write: (content: string) => Promise<void>;
+  /**
+   * Why this surface cannot address this file at all, or `null`.
+   *
+   * Not a loading placeholder and not an error from a command: it is the
+   * surface admitting up front that it holds no coordinates for this file — a
+   * Files panel showing something outside every profile. Non-null
+   * short-circuits both halves, so **no command is called**, which matters
+   * because the alternative route (reading through an absolute path) would go
+   * around Rust's containment check.
+   *
+   * Two wordings because they appear in two places: `notice` is rendered in
+   * place of the file, `reason` completes "not saving <label> — …" in the log.
+   */
+  readonly unreachable: { readonly notice: string; readonly reason: string } | null;
+}
 
 export interface UseTextFileArgs {
   /**
@@ -93,7 +144,13 @@ function sentence(error: unknown, fallback: string): string {
   return fallback;
 }
 
-export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFileResult {
+/**
+ * Load, track and save one file, whatever commands address it.
+ *
+ * The whole of this module's behaviour lives here; {@link useTextFile} and a
+ * note embed's own facade differ only in the {@link TextFileSource} they build.
+ */
+export function useTextBuffer(source: TextFileSource): UseTextFileResult {
   const [vm, setVm] = useState<TextFileVm | null>(null);
   const [content, setContentState] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -118,18 +175,16 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
   const read = useCallback(async (): Promise<void> => {
     const mine = ++generation.current;
     setLoading(true);
-    if (profileId === null) {
+    if (source.unreachable !== null) {
       setVm(null);
       setContentState("");
       setPersisted("");
-      setError(
-        "This file is not inside a synced folder, so keeper cannot open or save it here. Use Open With to read it.",
-      );
+      setError(source.unreachable.notice);
       setLoading(false);
       return;
     }
     try {
-      const next = await syncReadText(profileId, subpath);
+      const next = await source.read();
       if (generation.current !== mine) {
         return;
       }
@@ -147,13 +202,13 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
       setVm(null);
       setContentState("");
       setPersisted("");
-      setError(sentence(failure, `keeper could not read ${subpath}.`));
+      setError(sentence(failure, `keeper could not read ${source.label}.`));
     } finally {
       if (generation.current === mine) {
         setLoading(false);
       }
     }
-  }, [profileId, subpath]);
+  }, [source]);
 
   useEffect(() => {
     void read();
@@ -161,10 +216,10 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
 
   const save = useCallback(async (): Promise<void> => {
     const declined = (reason: string): void => {
-      console.info(`keeper: not saving ${subpath} — ${reason}`);
+      console.info(`keeper: not saving ${source.label} — ${reason}`);
     };
-    if (profileId === null) {
-      declined("it is not inside a synced folder.");
+    if (source.unreachable !== null) {
+      declined(source.unreachable.reason);
       return;
     }
     if (vm === null) {
@@ -186,16 +241,16 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
       return;
     }
     try {
-      await syncWriteEntry(profileId, subpath, content);
+      await source.write(content);
       // Only now. A rejection must leave the file dirty so the next save tries
       // again, and must never roll the buffer back: losing what someone typed
       // is worse than showing text the disk does not have yet.
       setPersisted(content);
       setError(null);
     } catch (failure) {
-      setError(sentence(failure, `keeper could not save ${subpath}.`));
+      setError(sentence(failure, `keeper could not save ${source.label}.`));
     }
-  }, [content, persisted, profileId, subpath, vm]);
+  }, [content, persisted, source, vm]);
 
   return {
     vm,
@@ -207,4 +262,45 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
     error,
     loading,
   };
+}
+
+/**
+ * The Files surface's file: a sync profile id and a profile-relative subpath
+ * (Story 45.6, FR-179, AD-89).
+ *
+ * Nothing is composed here. The subpath is the one the listing produced, and
+ * Rust re-resolves it through `keeper_sync::browse`'s containment on every call
+ * (AD-65) — which is also why a file outside every profile is `unreachable`
+ * rather than read through its `absolutePath`: that route would go around the
+ * containment check the profile commands exist to enforce.
+ */
+export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFileResult {
+  const source = useMemo<TextFileSource>(() => {
+    if (profileId === null) {
+      // A rejection rather than a call with `""` for the profile: if
+      // `unreachable` ever stopped short-circuiting, this surfaces as a failed
+      // read rather than as a command quietly aimed at a profile that does not
+      // exist.
+      const refuse = async (): Promise<never> => {
+        throw new Error(`${subpath} is not inside a synced folder`);
+      };
+      return {
+        label: subpath,
+        read: refuse,
+        write: refuse,
+        unreachable: {
+          notice:
+            "This file is not inside a synced folder, so keeper cannot open or save it here. Use Open With to read it.",
+          reason: "it is not inside a synced folder.",
+        },
+      };
+    }
+    return {
+      label: subpath,
+      read: () => syncReadText(profileId, subpath),
+      write: (content) => syncWriteEntry(profileId, subpath, content),
+      unreachable: null,
+    };
+  }, [profileId, subpath]);
+  return useTextBuffer(source);
 }

@@ -24,7 +24,7 @@
  * it.
  */
 import { render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
 
 const notesOpen =
@@ -48,15 +48,37 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { EditorView } from "@codemirror/view";
 import { notesEditorStore } from "@/lib/stores/notes-editor";
+import { withRangeRects } from "@/test/layout";
 import { NoteEditor } from "./note-editor";
 
-// jsdom does no layout, so CodeMirror's measure pass would throw out of the
-// test on the first frame. Same shim, same reason, as `tab-wiring.test.tsx`.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom does no layout, so CodeMirror's measure pass — which runs on ANY
+// animation frame that elapses during a test, and this file mounts the real
+// `NoteEditor` — would throw outside every `try` a test can write and take the
+// run's exit code with it while the summary still printed passes.
+//
+// The hand-rolled shim this replaced returned an EMPTY rect list, so a measure
+// that did run read `rects[0]` as undefined and threw anyway — a permanent
+// latent fault that surfaced only when a box was busy enough for a frame to
+// elapse mid-test, which is what made it look like flake. Its
+// `if (!Range.prototype.getClientRects)` guard read like order-dependence and
+// was not: vitest isolates per file, so that condition was always true.
+// Measured with a two-file probe rather than derived from the config.
+//
+// `withRangeRects` always installs and returns rects with numbers in them; its
+// undo is mandatory because `Range.prototype` is shared with every other test
+// in the file, and `afterAll` is the hook that can carry it — an `afterEach`
+// undo restores the prototype while a just-unmounted view still has frames
+// pending, which is itself a non-zero exit.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+  restoreRects = null;
+});
 
 /**
  * The frontmatter `create_note` writes for a brand-new note, verbatim in shape.

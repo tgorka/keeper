@@ -14,6 +14,7 @@ export {
   VIEWER_COMPONENTS,
   viewerComponentFor,
 } from "./components";
+export { FILE_ASSET_SCHEME, fileAssetUrl } from "./file-asset-url";
 export {
   extensionOf,
   FILE_FORMAT_ENTRIES,

@@ -1,5 +1,21 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/react";
 import { vi } from "vitest";
+
+// Testing Library's `findBy*` and `waitFor` default to a 1000 ms budget, which
+// is a wall-clock number in a suite that runs 217 files in parallel on three
+// throttled cores. A component that resolves an IPC promise and then waits for
+// a React commit can exceed it purely because the box is busy — and the failure
+// reads as "the element was never rendered", which sends the next reader
+// looking for a logic bug in code that is correct.
+//
+// Measured during epic 45's wave-2 gate: five `findByTestId` assertions in
+// document-viewer.test.tsx failed inside a full-suite run, and all 22 tests in
+// that file passed when it ran alone, twice, with nothing changed in between.
+//
+// Five seconds, because this number only has to exceed the worst scheduling
+// delay — a genuinely missing element still fails, five seconds later.
+configure({ asyncUtilTimeout: 5000 });
 
 // jsdom does not implement matchMedia; the shell hook and theme provider need it.
 if (!window.matchMedia) {

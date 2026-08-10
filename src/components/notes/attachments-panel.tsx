@@ -44,16 +44,22 @@
  * list reads as "this note has no attachments" when the truth is "this is not a
  * recording note at all", and the two are different facts about the note.
  *
- * `WIKILINK` is imported from the editor's own module rather than re-spelled
- * here: "no second embed syntax" is the epic's rule, and a second regex for the
- * one syntax is how a second syntax starts. The import costs no bundle weight
- * that matters — `wikilink.ts`'s only runtime dependency is the IPC client this
- * file already imports, and its CodeMirror imports are type-only.
+ * **The embed is not spelled here.** {@link attachmentEmbed} in
+ * `@/lib/notes/attach` is the one place this app composes an attachment embed
+ * (Story 45.13): this panel, the Files pane's chooser and the editor's file
+ * picker all write the same bytes for the same file because they all call it.
+ * Before that story there were two spellings for one act — this one, and a
+ * dead `![name](rel)` in Rust that nothing rendered.
+ *
+ * {@link embeddedAttachmentNames} answers "does the body already have it" for
+ * the same reason and in the same place, and is pinned to `keeper-core`'s copy
+ * of the rule by a shared vector table so the panel and the chooser cannot
+ * disagree.
  */
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { type RecordingNoteTargetVm, recordingNoteTargets } from "@/lib/ipc/client";
-import { WIKILINK } from "./editor/wikilink";
+import { attachmentEmbed, attachmentName, embeddedAttachmentNames } from "@/lib/notes/attach";
 import { type ParsedFrontmatter, readFrontmatter, recordingSessionId } from "./properties-panel";
 
 /** The panel's accessible name, and the word on the button that opens it. */
@@ -75,12 +81,6 @@ const ATTACHMENT_PRESENT_LABEL = "In the note";
 /** The key carrying a recording note's files, each relative to the recordings
  *  destination root — the same frame `recording:` is written in. */
 const FILES_KEY = "files";
-
-/** The last `/`-separated component of a relative path. */
-function fileName(relativePath: string): string {
-  const segments = relativePath.split("/").filter((segment) => segment !== "");
-  return segments[segments.length - 1] ?? relativePath;
-}
 
 /**
  * The paths this note calls its own, in the order the note lists them.
@@ -105,32 +105,6 @@ export function noteAttachments(parsed: ParsedFrontmatter): string[] {
 }
 
 /**
- * The file names the body already embeds.
- *
- * Matched by NAME, not by the whole path, because that is the join key every
- * other surface in this feature uses and for the same reason: Story 40.4
- * renames a session folder after the note is written, so `![[old/screen.mov]]`
- * and `![[new/screen.mov]]` are one file rendered twice — a duplicate by the
- * only definition the reader can see. `recording-embed.ts` resolves by name
- * too, so the panel's idea of "already there" and the widget's idea of "this is
- * that file" cannot drift apart.
- *
- * Links are ignored and embeds are not: `[[screen.mov]]` is a mention, `!` is
- * the whole of the difference, and the panel only ever writes the second.
- */
-export function embeddedAttachmentNames(body: string): Set<string> {
-  const names = new Set<string>();
-  // Stateful regex, shared with the decoration layer: reset before use.
-  WIKILINK.lastIndex = 0;
-  for (const match of body.matchAll(WIKILINK)) {
-    if (match[0].startsWith("!")) {
-      names.add(fileName(match[1]));
-    }
-  }
-  return names;
-}
-
-/**
  * What the index says one of the note's files IS, or `null` when it cannot say.
  *
  * Never decided here. The kind is 43.5's one answer, computed in Rust by
@@ -147,9 +121,9 @@ function kindOf(
   if (targets === null || targets === undefined) {
     return null;
   }
-  const name = fileName(relativePath);
+  const name = attachmentName(relativePath);
   const found = targets.find(
-    (target) => target.kind !== "folder" && fileName(target.relativePath) === name,
+    (target) => target.kind !== "folder" && attachmentName(target.relativePath) === name,
   );
   return found?.kind ?? null;
 }
@@ -232,14 +206,16 @@ export function AttachmentsPanel({ frontmatter, body, onInsert }: AttachmentsPan
       <ul className="flex flex-col gap-0.5">
         {attachments.map((relativePath) => {
           const kind = kindOf(targets, relativePath);
-          const present = embedded.has(fileName(relativePath));
+          // Folded, because {@link embeddedAttachmentNames} folds: APFS is
+          // case-insensitive, so `Screen.MOV` in the note is this file.
+          const present = embedded.has(attachmentName(relativePath).toLowerCase());
           return (
             <li key={relativePath} className="flex min-w-0 items-center gap-2">
               {/* The name, with the note's own relative path as the tooltip.
                   The absolute path is never on screen (FR-145) — this panel
                   does not even hold one, since it never acts on a file. */}
               <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={relativePath}>
-                {fileName(relativePath)}
+                {attachmentName(relativePath)}
               </span>
               {kind === null ? null : (
                 <span className="shrink-0 text-muted-foreground">{kind}</span>
@@ -256,9 +232,9 @@ export function AttachmentsPanel({ frontmatter, body, onInsert }: AttachmentsPan
                   // not the name on screen: a session's four files are four
                   // identical "Insert" buttons to anyone not looking at it.
                   aria-label={`${ATTACHMENT_INSERT_LABEL} ${relativePath}`}
-                  // The embed, spelled here and nowhere else, exactly as a
-                  // person types it: `!`, the wikilink, the note's own path.
-                  onClick={() => onInsert(`![[${relativePath}]]`)}
+                  // Spelled in one place for the whole app (Story 45.13), so
+                  // this row and the Files pane's chooser write the same bytes.
+                  onClick={() => onInsert(attachmentEmbed(relativePath))}
                 >
                   {ATTACHMENT_INSERT_LABEL}
                 </Button>

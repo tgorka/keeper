@@ -942,3 +942,117 @@ export function transportFor(scope: object, sessionId: string): RecordingTranspo
   }
   return transport;
 }
+
+// ---------------------------------------------------------------------------
+// The two facts about an HTMLMediaElement that every surface needs
+// ---------------------------------------------------------------------------
+//
+// Homed in this module, and it is worth saying why here rather than only in a
+// commit message. They arrived in Story 44.1 inside `recording-embed.ts`, which
+// is a CodeMirror widget module: it imports `@codemirror/view` and the Tauri
+// IPC client. By Story 45.7 there are three consumers — the note embed, Story
+// 44.15's gallery, and the Files panel's media viewer, which is React and has
+// no business importing an editor widget to learn how to release a `<video>`.
+// This module imports NOTHING, which is what makes it the honest home for two
+// facts that are about the platform rather than about any surface.
+//
+// The alternative was a fourth module for two functions, or three surfaces each
+// spelling `pause(); removeAttribute("src"); load();` for themselves — and a
+// release that three places implement is a release that two of them will get
+// wrong, which is the leak `releaseRecordingMedia` exists to prevent.
+
+/**
+ * How far past a standing position a video is nudged to make it show a frame.
+ *
+ * **The defect this exists for, measured rather than reasoned about.** In a
+ * real WKWebView — the engine the Tauri shell renders in — driving the owner's
+ * own two-track session, `preload="metadata"` settles at `readyState` 1
+ * (HAVE_METADATA). The HTML spec says a video element at HAVE_METADATA that
+ * has obtained no video data represents *transparent black*, and WebKit obeys
+ * it exactly: a canvas readback of the element counted ZERO lit pixels. The
+ * element is genuinely frameless. What the reader sees through it is whatever
+ * background the host draws, which is the grey box the field report describes.
+ *
+ * **This was never a two-video defect.** The single video measured the same —
+ * zero lit pixels — and read as working only because WebKit paints its native
+ * `controls` chrome over the emptiness. Story 43.6's transport takes `controls`
+ * away at two tracks and the emptiness becomes visible. So the prime belongs to
+ * every video anyone mounts, whether there is one of them or two, and whether
+ * it has native controls or not: a video that shows nothing until you press
+ * play is not a video.
+ *
+ * **The cost, stated rather than left to be discovered.** Assigning
+ * `currentTime` is a seek, and a seek is a real range request for real bytes
+ * against a file that may be a multi-hundred-megabyte screen recording on a
+ * pendrive or a network volume. Opening a note — or a panel — therefore touches
+ * the drive once per video. That is the right price: it buys one keyframe, not
+ * the `preload="auto"` download of the whole file. But it is a price, and it is
+ * paid on open rather than on play.
+ *
+ * A millisecond, and both bounds are real. Non-zero because a seek to the
+ * position the element already reports is one a user agent may collapse into
+ * nothing, and nothing is exactly what cannot be afforded here. Far below one
+ * frame's duration — 33 ms at 30 fps — so the frame presented is the frame at
+ * the position asked for and not the one after it.
+ */
+export const FRAME_PRIME_SECONDS = 0.001;
+
+/** `HAVE_CURRENT_DATA`: the first `readyState` at which the element has a
+ *  frame to paint. Spelled as a constant because that threshold, not the
+ *  number, is the thing being tested. */
+const HAVE_CURRENT_DATA = 2;
+
+/**
+ * Ask a video for the frame that `preload="metadata"` does not fetch.
+ *
+ * Once, on `loadedmetadata`, and only for an element nobody has moved. Both
+ * halves of that matter. Once, because the point is to buy a frame and not to
+ * keep buying one. And only for an untouched element, because by the time
+ * metadata arrives the reader may have scrubbed, or the transport may have
+ * placed the pair at a shared position — dragging either of them back to the
+ * top would make a cosmetic fix into a control that moves the recording under
+ * someone's hand.
+ *
+ * An element that already has a frame is left alone: there is nothing to buy
+ * and the request would be spent for nothing.
+ */
+export function primeFirstFrame(player: HTMLVideoElement): void {
+  // `once`, declared rather than unregistered by hand: the guard below already
+  // refuses to move an element that is not at the top, but an element the
+  // reader has scrubbed BACK to zero is at the top and would be primed a
+  // second time by a later `loadedmetadata` — a source change or a reload —
+  // moving them a millisecond they did not ask for. The platform enforcing
+  // "once" is also one fewer listener left on an element this module works
+  // hard to let go of.
+  player.addEventListener(
+    "loadedmetadata",
+    () => {
+      if (player.currentTime !== 0 || player.readyState >= HAVE_CURRENT_DATA) {
+        return;
+      }
+      player.currentTime = FRAME_PRIME_SECONDS;
+    },
+    { once: true },
+  );
+}
+
+/**
+ * Make a media element let go of the resource it selected.
+ *
+ * **Removing the node is not enough, and that is the whole of this function.**
+ * A `<video>` or `<audio>` with a `src` holds an open range-request pipeline
+ * and a decoder until it is told to let go. A long editing session that
+ * scrolled past a dozen recordings, or a panel strip a reader opened and closed
+ * all afternoon, would otherwise accumulate a dozen of them against files that
+ * may live on a removable volume the user then cannot eject.
+ *
+ * Three calls and the order matters. `pause()` first, so nothing is decoding
+ * while the source is pulled. Clearing `src` alone only changes what the NEXT
+ * load would fetch — `load()` is what actually aborts the selected resource,
+ * and it is the call people leave out.
+ */
+export function releaseMediaElement(player: HTMLMediaElement): void {
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+}

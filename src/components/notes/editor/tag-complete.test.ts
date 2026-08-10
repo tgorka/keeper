@@ -6,9 +6,10 @@ import {
 } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { tagCompleteSource, tagPaths } from "@/components/notes/editor/tag-complete";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
+import { withRangeRects } from "@/test/layout";
 
 function node(p: Partial<NoteTagNodeVm> & Pick<NoteTagNodeVm, "path">): NoteTagNodeVm {
   return {
@@ -128,12 +129,29 @@ describe("tagCompleteSource", () => {
  */
 describe("the popup in a real editor", () => {
   // jsdom lays nothing out, so CodeMirror's measure pass throws on a `Range`
-  // with no client rects. Same shim, same reason, as `indent-keymap.test.ts`.
-  if (!Range.prototype.getClientRects) {
-    Range.prototype.getClientRects = () =>
-      Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-    Range.prototype.getBoundingClientRect = () => new DOMRect();
-  }
+  // with no client rects.
+  //
+  // The hand-rolled shim this replaced returned an EMPTY rect list, so a
+  // measure that did run read `rects[0]` as undefined and threw anyway — a
+  // permanent latent fault that surfaced only when a box was busy enough for a
+  // frame to elapse mid-test, which is what made it look like flake. Its
+  // `if (!Range.prototype.getClientRects)` guard read like order-dependence
+  // and was not: vitest isolates per file, so that condition was always true.
+  // Measured with a two-file probe rather than derived from the config.
+  //
+  // `withRangeRects` always installs and returns rects with numbers in them;
+  // its undo is mandatory because `Range.prototype` is shared with every other
+  // test in the file.
+  let restoreRects: (() => void) | null = null;
+
+  beforeAll(() => {
+    restoreRects = withRangeRects();
+  });
+
+  afterAll(() => {
+    restoreRects?.();
+    restoreRects = null;
+  });
 
   const VOCABULARY = ["work", "work/clients", "work/clients/acme", "worry"];
 

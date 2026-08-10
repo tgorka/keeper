@@ -17,8 +17,9 @@
 import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
+import { withRangeRects } from "@/test/layout";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
@@ -42,13 +43,27 @@ vi.mock("@/lib/ipc/client", () => ({
 import { notesEditorStore } from "@/lib/stores/notes-editor";
 import { NoteEditor } from "./note-editor";
 
-// Same shim, same reason, as `tab-wiring.test.tsx`: jsdom does no layout, so
-// CodeMirror's measure pass would throw out of the test on the first frame.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// jsdom has no `Range.getClientRects`, and CodeMirror's measure pass calls it
+// on any animation frame that elapses mid-test.
+//
+// The stub this file used to carry installed an EMPTY `DOMRectList`, so a
+// measure that did run read `rects[0]` as undefined and threw anyway — a
+// PERMANENT fault that only ever SHOWED as an occasional red, because whether a
+// frame elapses at all depends on how busy the box is. It was never an ordering
+// problem: vitest isolates per test file (measured with a two-file probe, and
+// `isolate`/`pool` are unset in `vitest.config.ts`, where the default is true),
+// so every file starts with a clean `Range.prototype` and the stub's
+// `if (!Range.prototype.getClientRects)` guard was always true.
+//
+// `withRangeRects` hands back a real rect, and its undo is paired because
+// `Range.prototype` is shared with every test in the file.
+let removeRangeRects: (() => void) | null = null;
+beforeAll(() => {
+  removeRangeRects = withRangeRects();
+});
+afterAll(() => {
+  removeRangeRects?.();
+});
 
 const OPENED = "alpha\nbeta\n";
 
@@ -142,7 +157,19 @@ describe("the formatting toolbar, in the editor the user actually types into", (
     // cancellation as `false`.
     render(<NoteEditor vaultId="v1" noteId="n1" />);
 
-    for (const name of ["Bold", "Italic", "Strikethrough", "Inline code", "Heading", "Table"]) {
+    for (const name of [
+      "Bold",
+      "Italic",
+      "Underline",
+      "Strikethrough",
+      "Subscript",
+      "Superscript",
+      "Inline code",
+      "Code block",
+      "Task list",
+      "Heading",
+      "Table",
+    ]) {
       expect(fireEvent.mouseDown(screen.getByRole("button", { name }))).toBe(false);
     }
   });
@@ -175,6 +202,76 @@ describe("the formatting toolbar, in the editor the user actually types into", (
 
     await waitFor(() => {
       expect(notesEditorStore.getState().text).toBe("> alpha\n> beta\n");
+    });
+  });
+
+  /**
+   * Story 45.10's five, through the surface the user presses.
+   *
+   * `editor/format-commands.test.ts` proves each command produces the right
+   * document over an editor it assembles itself. That is exactly the proof
+   * 43.9's `/` menu had while the feature did not exist for anybody, so each
+   * new button is also pressed here, on the real `NoteEditor`, and read back
+   * through the notes store — the buffer that would be written to the file.
+   */
+  describe("the marks Story 45.10 added", () => {
+    const buttons: readonly { name: string; wrapped: string }[] = [
+      { name: "Underline", wrapped: "<u>beta</u>" },
+      { name: "Subscript", wrapped: "~beta~" },
+      { name: "Superscript", wrapped: "^beta^" },
+    ];
+
+    for (const button of buttons) {
+      it(`${button.name} wraps the selection, and a second press puts it back`, async () => {
+        const view = await mounted();
+        select(view, "beta");
+
+        fireEvent.click(screen.getByRole("button", { name: button.name }));
+        await waitFor(() => {
+          expect(notesEditorStore.getState().text).toBe(`alpha\n${button.wrapped}\n`);
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: button.name }));
+        await waitFor(() => {
+          expect(notesEditorStore.getState().text).toBe(OPENED);
+        });
+      });
+    }
+
+    it("Task list writes a checkbox on both selected lines and takes them off again", async () => {
+      const view = await mounted();
+      select(view, "alpha\nbeta");
+
+      fireEvent.click(screen.getByRole("button", { name: "Task list" }));
+      await waitFor(() => {
+        expect(notesEditorStore.getState().text).toBe("- [ ] alpha\n- [ ] beta\n");
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Task list" }));
+      await waitFor(() => {
+        expect(notesEditorStore.getState().text).toBe(OPENED);
+      });
+    });
+
+    it("Code block fences the selection, where Inline code backticks it in place", async () => {
+      const view = await mounted();
+      select(view, "beta");
+
+      fireEvent.click(screen.getByRole("button", { name: "Code block" }));
+      await waitFor(() => {
+        expect(notesEditorStore.getState().text).toBe("alpha\n```\nbeta\n```\n");
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: "Code block" }));
+      await waitFor(() => {
+        expect(notesEditorStore.getState().text).toBe(OPENED);
+      });
+
+      select(view, "beta");
+      fireEvent.click(screen.getByRole("button", { name: "Inline code" }));
+      await waitFor(() => {
+        expect(notesEditorStore.getState().text).toBe("alpha\n`beta`\n");
+      });
     });
   });
 

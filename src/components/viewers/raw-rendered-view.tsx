@@ -297,7 +297,7 @@ function MarkdownPane({
 }: {
   text: string;
   options: MarkdownPreviewOptions | undefined;
-  onOutcome: (failure: string | null, line: number | null) => void;
+  onOutcome: (failure: string | null) => void;
 }): React.ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const latest = useRef({ options, onOutcome });
@@ -320,7 +320,7 @@ function MarkdownPane({
         return;
       }
       preview = mounted;
-      latest.current.onOutcome(mounted.failure, mounted.failureLine);
+      latest.current.onOutcome(mounted.failure);
     })();
     return () => {
       disposed = true;
@@ -372,11 +372,7 @@ export function RawRenderedView({
 
   /** A preview that refused, and the text it refused — so the refusal does not
    *  outlive the bytes it was about. */
-  const [refusal, setRefusal] = useState<{
-    text: string;
-    message: string;
-    line: number | null;
-  } | null>(null);
+  const [refusal, setRefusal] = useState<{ text: string; message: string } | null>(null);
   const previewFailure = refusal !== null && refusal.text === content ? refusal : null;
 
   const structure = useMemo<JsonStructure | null>(() => {
@@ -422,8 +418,8 @@ export function RawRenderedView({
   };
 
   const onOutcome = useCallback(
-    (failure: string | null, line: number | null) => {
-      setRefusal(failure === null ? null : { text: content, message: failure, line });
+    (failure: string | null) => {
+      setRefusal(failure === null ? null : { text: content, message: failure });
     },
     [content],
   );

@@ -106,8 +106,30 @@ function Fact({ label, slot, value }: { label: string; slot: string; value: stri
   );
 }
 
-/** The placeholder for a file keeper will not render. */
-export function UnknownViewer({ file, entry }: ViewerProps) {
+/**
+ * What {@link UnknownViewer} renders — {@link ViewerProps} plus one optional
+ * override.
+ *
+ * **Why the sentence became a prop in Story 45.7.** AD-91 makes "unknown" a
+ * first-class kind whose viewer names the extension, states the size and offers
+ * Reveal and Open With. A media file the platform will not decode wants exactly
+ * that placeholder and a different sentence: keeper knows what the format is
+ * and has a viewer for it, and the decoder said no. Rendering the stock
+ * sentence there would tell the reader their `.mkv` is an unknown file, which
+ * is a small lie that costs them a bug report; building a second placeholder
+ * beside this one would give the two of them different facts within a release.
+ *
+ * Optional, so every existing caller is unchanged and the default is still the
+ * sentence the row itself implies.
+ */
+export interface UnknownViewerProps extends ViewerProps {
+  /** Why there is nothing to render, when the caller knows better than
+   *  {@link unknownViewerSentence} does. */
+  readonly reason?: string;
+}
+
+/** The placeholder for a file keeper will not — or cannot — render. */
+export function UnknownViewer({ file, entry, reason }: UnknownViewerProps) {
   const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
   const extension = extensionOf(file.name);
   const absolutePath = file.absolutePath;
@@ -148,7 +170,7 @@ export function UnknownViewer({ file, entry }: ViewerProps) {
         />
       </dl>
 
-      <p className="text-muted-foreground text-sm">{unknownViewerSentence(entry)}</p>
+      <p className="text-muted-foreground text-sm">{reason ?? unknownViewerSentence(entry)}</p>
 
       <div className="flex flex-wrap gap-2">
         {file.openWith !== null && (

@@ -15,6 +15,13 @@ const syncDeletePlan = vi.fn();
 const syncDeleteEntries = vi.fn();
 const syncCreateEntry = vi.fn();
 const revealPath = vi.fn();
+// Story 45.13's chooser is mounted by this pane and imports these four. They
+// answer for the two tests at the bottom of this file; every other test never
+// opens the dialog and never reaches them.
+const notesAttachTargets = vi.fn();
+const notesAttachSources = vi.fn();
+const notesBodyRead = vi.fn();
+const notesBodyWrite = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncProfiles: () => syncProfiles(),
   syncBrowse: (id: unknown, subpath: unknown) => syncBrowse(id, subpath),
@@ -24,6 +31,10 @@ vi.mock("@/lib/ipc/client", () => ({
   syncCreateEntry: (id: unknown, subpath: unknown, name: unknown) =>
     syncCreateEntry(id, subpath, name),
   revealPath: (path: unknown) => revealPath(path),
+  notesAttachTargets: (v: unknown, q: unknown, n: unknown) => notesAttachTargets(v, q, n),
+  notesAttachSources: (v: unknown, s: unknown) => notesAttachSources(v, s),
+  notesBodyRead: (v: unknown, n: unknown) => notesBodyRead(v, n),
+  notesBodyWrite: (v: unknown, n: unknown, t: unknown, r: unknown) => notesBodyWrite(v, n, t, r),
 }));
 
 import {
@@ -56,10 +67,12 @@ import {
   FILES_SYNC_MARK_LABEL,
   FILES_SYNC_MARK_TESTID,
 } from "@/components/layout/sync-status-mark";
+import { ATTACH_TO_NOTE_LABEL } from "@/components/notes/attach-to-note-dialog";
 import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import { formatFileSize } from "@/lib/file-size";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { type ListGeometry, withListGeometry, withTextLayout } from "@/test/layout";
 
@@ -1857,5 +1870,152 @@ describe("FilesPane — the write path", () => {
       await Promise.resolve();
     });
     expect(screen.queryByTestId(FILES_SELECTED_TESTID)).toBeNull();
+  });
+});
+
+/**
+ * Story 45.13's entry point into this pane.
+ *
+ * The control hangs off the SAME selection Delete does — Story 45.3's, the only
+ * one this pane has — so these tests select with the same gestures the write
+ * -path tests above use and then assert on the header. What is deliberately not
+ * asserted here is what gets written into the note: that is
+ * `attach-entry-points.test.tsx`'s job, where it is compared against the other
+ * two entry points rather than against a literal.
+ */
+describe("FilesPane — attaching a selection to a note", () => {
+  beforeEach(() => {
+    notesAttachTargets.mockResolvedValue([
+      { id: "n1", title: "Standup", path: "notes/standup.md", holds: [] },
+    ]);
+    notesAttachSources.mockResolvedValue([
+      { name: "a.md", relPath: "a.md", copied: false, refusal: null },
+    ]);
+    notesBodyRead.mockResolvedValue({ rev: "r0", text: "intro\n" });
+    notesBodyWrite.mockResolvedValue({
+      rev: "r1",
+      path: "notes/standup.md",
+      frontmatter: "",
+      conflictCopy: null,
+    });
+    notesVaultsStore.setState({ activeVaultId: "v1" });
+  });
+
+  afterEach(() => {
+    notesVaultsStore.setState({ activeVaultId: null });
+  });
+
+  /** A vault with a file and a folder in it, expanded. */
+  async function vaultWithBoth(): Promise<void> {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [entry("a.md", "file"), entry("Photos", "folder")]),
+    );
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await screen.findByRole("treeitem", { name: "a.md" });
+  }
+
+  it("offers the control once files are selected, and not before", async () => {
+    await vaultWithBoth();
+    expect(screen.queryByRole("button", { name: ATTACH_TO_NOTE_LABEL })).toBeNull();
+
+    await click(screen.getByRole("treeitem", { name: "a.md" }));
+
+    expect(screen.getByRole("button", { name: ATTACH_TO_NOTE_LABEL })).toBeInTheDocument();
+  });
+
+  /**
+   * A folder is not an attachment — there is no element for a directory — so a
+   * selection of only folders offers nothing rather than offering a control
+   * that would be refused.
+   */
+  it("offers nothing for a selection of folders", async () => {
+    await vaultWithBoth();
+
+    await click(screen.getByRole("treeitem", { name: "Photos" }));
+
+    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: ATTACH_TO_NOTE_LABEL })).toBeNull();
+  });
+
+  /**
+   * A note lives in the open vault. With no vault open there is nowhere for the
+   * file to go, and a control that opened a chooser over nothing would be a
+   * control that lies.
+   */
+  it("offers nothing when no vault is open", async () => {
+    notesVaultsStore.setState({ activeVaultId: null });
+    await vaultWithBoth();
+
+    await click(screen.getByRole("treeitem", { name: "a.md" }));
+
+    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: ATTACH_TO_NOTE_LABEL })).toBeNull();
+  });
+
+  /**
+   * A read-only file is still a perfectly good thing to put in a note. The
+   * write verdict is about changing the FILE, and attaching changes the note.
+   */
+  it("offers the control for a file keeper may not write", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [
+        entry("report.pdf", "file", undefined, undefined, {
+          write: { writable: false, reason: OUTSIDE_VAULT },
+        }),
+      ]),
+    );
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await click(await screen.findByRole("treeitem", { name: "report.pdf" }));
+
+    // No Delete — the location said no — but Attach, because the note is what
+    // changes.
+    expect(screen.queryByRole("button", { name: FILES_DELETE_LABEL })).toBeNull();
+    expect(screen.getByRole("button", { name: ATTACH_TO_NOTE_LABEL })).toBeInTheDocument();
+  });
+
+  /** The chooser is handed the selection's absolute paths, which is what Rust
+   *  resolves; the webview never turns one into a vault-relative path (AD-65). */
+  it("opens the chooser over exactly the files selected", async () => {
+    await vaultWithBoth();
+    await click(screen.getByRole("treeitem", { name: "a.md" }));
+
+    await click(screen.getByRole("button", { name: ATTACH_TO_NOTE_LABEL }));
+
+    await waitFor(() => {
+      expect(notesAttachTargets).toHaveBeenCalledWith("v1", "", ["a.md"]);
+    });
+    expect(await screen.findByRole("button", { name: "Attach to Standup" })).toBeInTheDocument();
+  });
+
+  /**
+   * The seam between this pane and Rust, which nothing else covers.
+   *
+   * A mutation swapping `absolutePath` for `relativePath` in the pane's
+   * derivation survived the whole sweep: the chooser's search is keyed on file
+   * NAMES, and `a.md` is the basename of both spellings, so every existing
+   * assertion passed. The consequence would not have been subtle —
+   * `notes_attach_sources` calls `std::fs::metadata` on what it is handed, so a
+   * profile-relative path resolves against the process working directory and
+   * every attach from this pane refuses with "keeper could not read…" — it was
+   * simply invisible until the click reached the command that consumes it.
+   *
+   * So this test presses Attach rather than stopping at the offer. AD-65 in the
+   * direction that matters: the webview hands over the path the shell gave it
+   * and composes nothing.
+   */
+  it("hands Rust the absolute path, not the one the tree renders", async () => {
+    await vaultWithBoth();
+    await click(screen.getByRole("treeitem", { name: "a.md" }));
+    await click(screen.getByRole("button", { name: ATTACH_TO_NOTE_LABEL }));
+
+    await click(await screen.findByRole("button", { name: "Attach to Standup" }));
+
+    await waitFor(() => {
+      expect(notesAttachSources).toHaveBeenCalledWith("v1", ["/Users/alice/Vault/a.md"]);
+    });
   });
 });

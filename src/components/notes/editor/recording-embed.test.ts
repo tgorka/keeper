@@ -1,13 +1,12 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IpcClient from "@/lib/ipc/client";
 import type { RecordingNoteTargetVm } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { withRangeRects } from "@/test/layout";
 import { livePreview } from "./live-preview";
 import {
-  FRAME_PRIME_SECONDS,
-  primeFirstFrame,
   RECORDING_ASSET_SCHEME,
   RECORDING_EMBED_COPY_PATH_LABEL,
   RECORDING_EMBED_REVEAL_LABEL,
@@ -16,11 +15,18 @@ import {
   releaseRecordingMedia,
   renderRecordingEmbedInto,
 } from "./recording-embed";
+// `FRAME_PRIME_SECONDS` and `primeFirstFrame` moved to `recording-transport.ts`
+// in Story 45.7: they are facts about an HTMLMediaElement rather than about a
+// CodeMirror widget, and the Files panel's media viewer is a third consumer
+// that must not import an editor module to learn them. Only the import moved;
+// every assertion below is Story 44.1's, unchanged.
 import {
   BACK_LABEL,
+  FRAME_PRIME_SECONDS,
   MAX_DRIFT_SECONDS,
   MUTE_LABEL,
   PLAY_LABEL,
+  primeFirstFrame,
   SCRUB_LABEL,
   SKIP_SECONDS,
   VOLUME_LABEL,
@@ -385,7 +391,10 @@ describe("renderRecordingEmbedInto", () => {
       renderRecordingEmbedInto(node, SESSION, `${WRITTEN}/screen-0000.mov`, {
         load: () => Promise.reject(new Error("the archive is locked")),
       }),
-    ).resolves.toBeUndefined();
+      // `false`: not one of this session's files as far as this call could
+      // tell, and the link the host holds is still the answer. Story 45.12
+      // reads that as licence to look in the vault instead.
+    ).resolves.toBe(false);
 
     expect(node.querySelector("video")).toBeNull();
     expect(node.querySelector(`[${WIKILINK_ATTR}]`)).not.toBeNull();
@@ -531,15 +540,27 @@ describe("releaseRecordingMedia", () => {
 
 // jsdom performs no layout, so a `Range` reports no client rects at all and
 // CodeMirror's measure pass — which runs in a `requestAnimationFrame`, after
-// the assertions below have started awaiting — throws out of the test. Shimmed
-// here rather than in the shared setup because this is the only suite that
-// mounts a real `EditorView`; an empty rect list is exactly what "no layout"
-// means, and CodeMirror falls back to its default metrics for it.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+// the assertions below have started awaiting — throws out of the test, outside
+// every `try` a test can write, taking the run's exit code with it.
+//
+// `withRangeRects` is the shared model of that, in the file whose whole purpose
+// is modelling the browser jsdom is not. The hand-rolled shim it replaces
+// installed an EMPTY `DOMRectList`, so a measure that did run read `rects[0]`
+// as undefined and threw anyway — a PERMANENT fault that only ever SHOWED as an
+// occasional red, because whether a frame elapses at all depends on how busy
+// the box is. It was never an ordering problem: vitest isolates per test file
+// (measured with a two-file probe; `isolate` and `pool` are unset in
+// vitest.config.ts and default to isolated), so every file starts with a clean
+// `Range.prototype` and the shim's `if (!…)` guard was always true.
+let restoreRects: (() => void) | null = null;
+
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+
+afterAll(() => {
+  restoreRects?.();
+});
 
 /**
  * Through the real decoration layer, because everything above this point drives

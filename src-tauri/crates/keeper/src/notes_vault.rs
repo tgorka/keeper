@@ -628,7 +628,7 @@ fn vault_relative(vault: &Vault, path: &Path) -> Option<String> {
 ///
 /// `.obsidian/` is refused here as well as skipped by the walk, because "we
 /// never generate that path" is not the same as "that path cannot be requested".
-fn is_internal(rel: &str) -> bool {
+pub(crate) fn is_internal(rel: &str) -> bool {
     rel.split('/')
         .any(|part| part == KEEPER_DIR || part == OBSIDIAN_DIR || part == ".git")
 }
@@ -1818,11 +1818,15 @@ pub fn contained(vault: &Vault, rel: &str) -> Result<PathBuf, NotesError> {
     Ok(vault.root.join(relative))
 }
 
-/// Import a file into `attachments/`, returning what the editor should insert.
+/// Copy a file into `attachments/`, returning where it landed.
 ///
-/// The bytes never cross IPC in either direction (AD-58): the webview hands over
-/// a path Tauri's own drag-drop event gave it, or nothing at all for a clipboard
-/// paste, and Rust does the reading.
+/// The bytes never cross IPC in either direction (AD-58): the webview hands
+/// over a path Tauri's own drag-drop event or the file picker gave it, and Rust
+/// does the reading.
+///
+/// **Returns a location, never markdown.** It used to compose the embed too,
+/// in a spelling nothing in this app renders; Story 45.13 made
+/// `src/lib/notes/attach.ts` the one place an attachment embed is spelled.
 pub fn import_attachment(vault: &Vault, source: &Path) -> Result<NoteAttachmentVm, NotesError> {
     let name = source
         .file_name()
@@ -1837,7 +1841,6 @@ pub fn import_attachment(vault: &Vault, source: &Path) -> Result<NoteAttachmentV
     std::fs::copy(source, &target).map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
     mark_dirty(&vault.id);
     Ok(NoteAttachmentVm {
-        markdown: attachment_markdown(&rel, &chosen),
         url: asset_url(&vault.id, &rel),
         rel_path: rel,
     })
@@ -1869,23 +1872,6 @@ fn unique_name(name: &str, taken: &[String]) -> String {
     // Ten thousand files of one name is not a real vault, but a name is still
     // owed; a ULID cannot collide with the counters above.
     format!("{stem}-{}{extension}", crate::sync_ipc::new_ulid())
-}
-
-/// The markdown an imported attachment inserts: an embed for an image, an
-/// ordinary link otherwise.
-fn attachment_markdown(rel: &str, name: &str) -> String {
-    if is_image(rel) {
-        format!("![{name}]({rel})")
-    } else {
-        format!("[{name}]({rel})")
-    }
-}
-
-fn is_image(rel: &str) -> bool {
-    matches!(
-        extension(rel).as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "bmp")
-    )
 }
 
 /// A path's lowercased extension.

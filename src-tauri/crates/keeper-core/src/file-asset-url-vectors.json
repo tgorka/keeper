@@ -1,0 +1,77 @@
+{
+  "why": "Story 45.7, FR-180, AD-65. The pinning between keeper_core::file_asset::parse_file_url and the TypeScript composer src/lib/viewers/file-asset-url.ts. Rust parses the URL a <video src> carries; TypeScript writes it. They never meet at runtime, so the only thing that can stop them drifting is a table both test suites load from THIS file. 'ok' round-trips: the composer must produce url from the two halves, and the parser must take url back apart into the same two halves. 'refused' is the belt-and-braces pair: the composer still produces a URL for a dot segment, deliberately, so a traversal attempt reaches the log as visible text rather than as a path that already collapsed - and the parser refuses every one of them. Encoding is RFC 3986's unreserved set (alphanumeric plus - . _ ~), which is keeper/src/notes_vault.rs::asset_url's set exactly, so keeper has ONE spelling for an asset URL rather than one per scheme. That is stricter than encodeURIComponent, which leaves ! ' ( ) * unescaped; those are legal sub-delims in a path segment, and escaping them anyway costs nothing and removes a question about what a webview will normalise.",
+  "ok": [
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "clip.mov",
+      "url": "keeper-file://01PROFILE/clip.mov"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "2026/08/screen-0000.mov",
+      "url": "keeper-file://01PROFILE/2026/08/screen-0000.mov"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "a b/c d.png",
+      "url": "keeper-file://01PROFILE/a%20b/c%20d.png"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "Ünterlagen/Grüße.wav",
+      "url": "keeper-file://01PROFILE/%C3%9Cnterlagen/Gr%C3%BC%C3%9Fe.wav"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "notes #1/take?2.mp3",
+      "url": "keeper-file://01PROFILE/notes%20%231/take%3F2.mp3"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "100% done/50%2B.m4a",
+      "url": "keeper-file://01PROFILE/100%25%20done/50%252B.m4a"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "it's (final) ~ v2!/a*b.jpg",
+      "url": "keeper-file://01PROFILE/it%27s%20%28final%29%20~%20v2%21/a%2Ab.jpg"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "a+b&c=d,e@f/[x].gif",
+      "url": "keeper-file://01PROFILE/a%2Bb%26c%3Dd%2Ce%40f/%5Bx%5D.gif"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "日本語/写真.png",
+      "url": "keeper-file://01PROFILE/%E6%97%A5%E6%9C%AC%E8%AA%9E/%E5%86%99%E7%9C%9F.png"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "trailing space /leading.webm",
+      "url": "keeper-file://01PROFILE/trailing%20space%20/leading.webm"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "dot.folder/.hidden.flac",
+      "url": "keeper-file://01PROFILE/dot.folder/.hidden.flac"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "reports/2026 Q3.pdf",
+      "url": "keeper-file://01PROFILE/reports/2026%20Q3.pdf"
+    }
+  ],
+  "refused": [
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "../secrets.mov",
+      "url": "keeper-file://01PROFILE/%2E%2E/secrets.mov"
+    },
+    {
+      "profile_id": "01PROFILE",
+      "relative_path": "a/./b.png",
+      "url": "keeper-file://01PROFILE/a/%2E/b.png"
+    }
+  ]
+}

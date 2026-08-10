@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use keeper_core::archive::recordings_fts::kind_for_file_name;
 use keeper_core::notes::default_spaces::{self, SPACES_DIR};
+use keeper_core::notes::embed::{self, NoteEmbedVm};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
 use keeper_core::notes::template_update::{
@@ -41,15 +42,16 @@ use keeper_core::notes::template_update::{
     TemplateUpdateResultVm,
 };
 use keeper_core::notes::vm::{
-    NoteAttachmentVm, NoteBodyBatch, NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm,
-    NoteCreateReq, NoteCreateVm, NoteCsvVm, NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm,
-    NoteGalleryVm, NoteIndexProgressVm, NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm,
-    NoteQueryReq, NoteRefVm, NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm,
-    NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm,
-    NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
+    NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
+    NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm, NoteCreateReq, NoteCreateVm, NoteCsvVm,
+    NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm, NoteGalleryVm, NoteIndexProgressVm,
+    NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq, NoteRefVm,
+    NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm, NoteSearchReq, NoteSpaceReq,
+    NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm,
+    NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{
-    counts, csv, naming, query, search, seed, sort, tags, templates, NotesError,
+    attach, counts, csv, naming, query, search, seed, sort, tags, templates, NotesError,
 };
 use keeper_core::vm::{
     IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm, TagVocabularyVm,
@@ -463,11 +465,11 @@ fn matches_filter(
     true
 }
 
-/// Case-fold for the wikilink completion prefix, its one caller. Cheap on
-/// purpose: a `[[` prefix is matched on every keystroke against every entry,
-/// and a completion list is a ranked guess rather than a promise about what
-/// "café" equals — which is a promise `search::fold_str` makes, for the
-/// surfaces that need it.
+/// Case-fold for the two note-picking searches: the wikilink completion prefix
+/// and Story 45.13's "which note should these files go into". Cheap on purpose
+/// — a prefix is matched on every keystroke against every entry, and a picker's
+/// list is a ranked guess rather than a promise about what "café" equals, which
+/// is a promise `search::fold_str` makes for the surfaces that need it.
 fn fold(value: &str) -> String {
     value.to_lowercase()
 }
@@ -3162,7 +3164,7 @@ pub async fn notes_restore_revision(
 /// equivalent — and this build links none: it is absent from `Cargo.toml`, from
 /// `Cargo.lock` and from `package.json`, and the phase's dependency rules add no
 /// Rust crates. So rather than pretend, this refuses with `Unsupported` and names
-/// the working alternative, which needs nothing new: `notes_attachment_drop`
+/// the working alternative, which needs nothing new: `notes_attach_sources`
 /// takes real paths, from Tauri's own drag-drop event or from the file picker the
 /// dialog plugin already provides.
 #[tauri::command]
@@ -3182,58 +3184,266 @@ pub async fn notes_attachment_paste(
     })
 }
 
-/// Import dropped files into the vault (FR-110).
+/// Resolve files a person picked into paths a note can name (Story 45.13,
+/// FR-188, FR-189).
 ///
-/// The paths come from Tauri's own `DragDropEvent`, never from JavaScript, and
-/// the bytes never cross IPC in either direction (AD-58).
+/// The one resolution behind all three of the story's entry points: a path from
+/// the file picker, a path from a Files-pane row, a path from anywhere else the
+/// shell can hand one over. The bytes never cross IPC in either direction
+/// (AD-58), and the webview never learns where the vault is (AD-65) — it sends
+/// absolute paths it was given and receives vault-relative ones it may write.
+///
+/// **Inside the vault is named, outside the vault is copied in.** Those are the
+/// only two answers, and the second is the interesting one. FR-145 forbids an
+/// absolute path in a synced artefact, so linking to `~/Desktop/photo.png` is
+/// not available: the vault syncs to other machines, where that path names
+/// nothing — or names a different file, which is worse than nothing. Refusing
+/// the file instead would leave "attach from anywhere" meaning "attach from the
+/// vault", which is the thing that already worked. So keeper copies it into
+/// `attachments/` under a collision-free name and the note names the copy,
+/// which is a file that travels with the note by construction.
+///
+/// **A file already in the vault is NOT copied.** The command this replaces,
+/// `notes_attachment_drop`, copied unconditionally, so attaching a file the
+/// vault already held would have made a second copy in `attachments/` and
+/// pointed the note at the duplicate. Nothing ever called it, so nobody found
+/// out.
+///
+/// One `NoteAttachSourceVm` per source, in the order given, including for the
+/// ones keeper refused: a person who selected six files and got four needs to
+/// know which two and why, and a shorter list cannot say.
 #[tauri::command]
-pub async fn notes_attachment_drop(
+pub async fn notes_attach_sources(
+    vault_id: String,
+    sources: Vec<String>,
+) -> Result<Vec<NoteAttachSourceVm>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    // Blocking: `canonicalize` stats every component and a copy moves bytes.
+    // On the async runtime that would stall every other command on this thread
+    // for as long as the slowest volume takes to answer.
+    tokio::task::spawn_blocking(move || {
+        sources
+            .iter()
+            .map(|source| resolve_attach_source(&vault, Path::new(source)))
+            .collect()
+    })
+    .await
+    .map_err(|error| notes_error(NotesError::Name(format!("attach: {error}"))))
+}
+
+/// One source, resolved or refused. Never panics and never propagates: a
+/// selection of six files must not lose the other five to one unreadable one.
+fn resolve_attach_source(vault: &Vault, source: &Path) -> NoteAttachSourceVm {
+    let name = source.file_name().map_or_else(
+        || source.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let refuse = |why: String| NoteAttachSourceVm {
+        name: name.clone(),
+        rel_path: None,
+        copied: false,
+        refusal: Some(why),
+    };
+
+    // `metadata`, which follows a symlink, rather than `symlink_metadata`: a
+    // symlink is resolved and then judged on where it really points, so one
+    // inside the vault pointing outside is copied in rather than named at a
+    // path whose bytes are not in the vault at all. A broken one fails here.
+    let Ok(meta) = std::fs::metadata(source) else {
+        return refuse(format!(
+            "keeper could not read {name}, so it did not attach it."
+        ));
+    };
+    if meta.is_dir() {
+        // Story 43.5's rule, restated where it is enforced: there is no element
+        // for a directory, so an embed of one renders as the link it already was.
+        return refuse(format!(
+            "{name} is a folder. A note can embed a file, but there is nothing to show for a directory."
+        ));
+    }
+    if !meta.is_file() {
+        return refuse(format!(
+            "{name} is not a regular file — a device or a pipe — and keeper does not attach one."
+        ));
+    }
+
+    let (Ok(root), Ok(canonical)) = (vault.root.canonicalize(), source.canonicalize()) else {
+        return refuse(format!(
+            "keeper could not place {name} against this vault, so it did not attach it."
+        ));
+    };
+
+    match attach::vault_relative(&root, &canonical) {
+        Some(rel) => {
+            if notes_vault::is_internal(&rel) {
+                return refuse(format!(
+                    "{name} is inside a folder keeper, git or Obsidian owns, so it is not an attachment."
+                ));
+            }
+            NoteAttachSourceVm {
+                name,
+                rel_path: Some(rel),
+                copied: false,
+                refusal: None,
+            }
+        }
+        None => match notes_vault::import_attachment(vault, &canonical) {
+            Ok(written) => NoteAttachSourceVm {
+                name,
+                rel_path: Some(written.rel_path),
+                copied: true,
+                refusal: None,
+            },
+            Err(error) => refuse(format!(
+                "keeper could not copy {name} into the vault, so it did not attach it: {error}"
+            )),
+        },
+    }
+}
+
+/// Notes a person could attach these files to, searchable (Story 45.13, FR-189).
+///
+/// `holds` is what makes this a different question from `notes_link_targets`,
+/// which is otherwise the same search: a note that already embeds one of these
+/// files must not be offered as somewhere to put it, and the surface can only
+/// know that if this says so. The rule itself —
+/// [`keeper_core::notes::attach::already_attached`] — is the same one
+/// `src/lib/notes/attach.ts` applies to the open editor's buffer, pinned to it
+/// by `attach-vectors.json`.
+///
+/// Capped at [`MAX_LINK_TARGETS`], and the cap is load-bearing here in a way it
+/// is not for the completion: each candidate costs a file read. A chooser over
+/// a ten-thousand-note vault reads thirty notes per query and no more.
+#[tauri::command]
+pub async fn notes_attach_targets(
+    vault_id: String,
+    query: String,
+    names: Vec<String>,
+) -> Result<Vec<NoteAttachTargetVm>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id)))?;
+    let needle = fold(&query);
+    let folded: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
+    let candidates: Vec<IndexEntry> = snapshot
+        .entries()
+        .iter()
+        .filter(|entry| {
+            needle.is_empty()
+                || fold(&entry.title).contains(&needle)
+                || fold(&entry.path).contains(&needle)
+        })
+        .take(MAX_LINK_TARGETS)
+        .cloned()
+        .collect();
+
+    let mut hits: Vec<NoteAttachTargetVm> = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|entry| {
+                // A note that cannot be read holds nothing anyone can prove, so
+                // it is offered: refusing to offer it would hide a note because
+                // of a transient read error.
+                let source = notes_vault::read_note(&vault, &entry.path).unwrap_or_default();
+                let holds = attach::already_attached(split_note(&source).1, &folded);
+                NoteAttachTargetVm {
+                    id: entry.id,
+                    title: entry.title,
+                    path: entry.path,
+                    holds,
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| notes_error(NotesError::Name(format!("attach targets: {error}"))))?;
+    hits.sort_by(|a, b| a.title.cmp(&b.title));
+    Ok(hits)
+}
+
+/// A note's body as it is on disk, for a surface that has not opened it
+/// (Story 45.13).
+///
+/// The read half of a read-modify-write on a closed note, and deliberately not
+/// a second `notes_open`: there is no subscription, no watcher task and no
+/// channel, because the caller wants one answer rather than a stream. `rev`
+/// is the whole file's revision and is what [`notes_body_write`] must be given
+/// back, so a note that changed in between is conflict-copied rather than
+/// clobbered.
+#[tauri::command]
+pub async fn notes_body_read(vault_id: String, note_id: String) -> Result<NoteBodyVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let entry = entry_of(&vault_id, &note_id)?;
+    let source = notes_vault::read_note(&vault, &entry.path).map_err(notes_error)?;
+    Ok(NoteBodyVm {
+        rev: notes_vault::content_rev(&source),
+        text: split_note(&source).1.to_owned(),
+    })
+}
+
+/// Write a body back to a note nobody has open (Story 45.13).
+///
+/// The write half, and it makes exactly the same promises [`notes_save`] makes
+/// the editor, through the same three functions: the frontmatter block on disk
+/// survives byte for byte except for `updated` ([`save_document`], FR-121); a
+/// `base_rev` older than disk means the other side changed, so the disk bytes
+/// are written aside as an AD-43 conflict copy **before** this write lands; and
+/// nothing is lost either way.
+///
+/// If the note happens to be open in the editor, this is an external write like
+/// any other: the body watcher sees it and the editor adopts it, or raises its
+/// diff bar over unsaved edits. That path is Story 37.6's and is not special
+/// -cased here — a headless write that announced itself would be a second
+/// protocol for the same event.
+#[tauri::command]
+pub async fn notes_body_write(
     vault_id: String,
     note_id: String,
-    paths: Vec<String>,
-) -> Result<Vec<NoteAttachmentVm>, IpcError> {
+    text: String,
+    base_rev: String,
+) -> Result<NoteWriteVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let _ = entry_of(&vault_id, &note_id)?;
-    let mut imported = Vec::with_capacity(paths.len());
-    for path in paths {
-        let source = PathBuf::from(&path);
-        // A directory drop is not an attachment, and a path that is not a regular
-        // file is refused rather than copied blindly.
-        if !source.is_file() {
-            tracing::info!("notes: skipped a dropped path that is not a file");
-            continue;
-        }
-        imported.push(notes_vault::import_attachment(&vault, &source).map_err(notes_error)?);
-    }
-    Ok(imported)
+    let rel = entry_of(&vault_id, &note_id)?.path;
+
+    let disk = notes_vault::read_note(&vault, &rel).unwrap_or_default();
+    let conflict_copy = if notes_vault::content_rev(&disk) == base_rev || disk.is_empty() {
+        None
+    } else {
+        notes_vault::write_conflict_copy(&vault, &rel, &disk)
+    };
+
+    let stamped = save_document(split_note(&disk).0, &text);
+    notes_vault::write_note(&vault, &rel, &stamped).map_err(notes_error)?;
+    Ok(NoteWriteVm {
+        rev: notes_vault::content_rev(&stamped),
+        path: rel,
+        frontmatter: split_note(&stamped).0.to_owned(),
+        conflict_copy,
+    })
 }
 
 // ---------------------------------------------------------------------------
-// CSV tables
+// Embedded files: CSV tables, and the raw text behind every embed
 // ---------------------------------------------------------------------------
 
-/// Resolve a `![[…]]` embed target to the CSV file it names.
+/// Resolve a `![[…]]` embed target to the file in this vault it names.
 ///
 /// **The webview never joins a root to a subpath** (AD-65). It hands over the
 /// text between the brackets — which is what the user typed, or what the
-/// attachments panel wrote — and the two candidates are formed here, in the
-/// only process that knows where the vault is:
-///
-/// 1. the target read as a vault-relative path, which is the form
-///    `import_attachment` produces (`attachments/data.csv`);
-/// 2. and, only when the target names no directory at all, the same name inside
-///    `attachments/` — because that is the one folder keeper itself drops files
-///    into, so `![[data.csv]]` finds the file the user just dragged in.
+/// attachments panel wrote — and the candidates are formed by
+/// [`embed::candidates`], in the only process that knows where the vault is.
 ///
 /// Two candidates and no search: a resolver that walked the vault looking for a
 /// matching name would make which file an embed opens depend on what else is in
 /// the vault, and an edit would then write to whichever one it found today.
-fn csv_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError> {
-    let mut candidates = vec![target.to_owned()];
-    if !target.contains('/') {
-        candidates.push(format!("{ATTACHMENTS_DIR}/{target}"));
-    }
-    for rel in candidates {
+///
+/// The refusal names the paths it tried, because Story 45.12's criterion is
+/// that an embed whose file has moved says so where the embed is and names what
+/// keeper looked for. The candidate list and the sentence come from the same
+/// module so the words cannot describe a search this loop did not run.
+fn embed_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError> {
+    let candidates = embed::candidates(target, ATTACHMENTS_DIR);
+    for rel in &candidates {
         // `contained_read` is the whole containment check and it is stricter
         // than "inside the vault": it refuses `..`, canonicalises so a symlink
         // out of the vault cannot escape, and — because it stats with
@@ -3247,14 +3457,15 @@ fn csv_path(vault: &Vault, target: &str) -> Result<(String, PathBuf), IpcError> 
         // The `is_file` filter is therefore belt-and-braces, and deliberately
         // kept: it makes this function's precondition true on its own terms
         // rather than by depending on which `stat` another module chose.
-        if let Some(path) = crate::note_protocol::contained_read(vault, &rel)
-            .filter(|candidate| candidate.is_file())
+        if let Some(path) =
+            crate::note_protocol::contained_read(vault, rel).filter(|candidate| candidate.is_file())
         {
-            return Ok((rel, path));
+            return Ok((rel.clone(), path));
         }
     }
-    Err(notes_error(NotesError::NotFound(format!(
-        "{target}: this note embeds a file the vault does not have"
+    Err(notes_error(NotesError::NotFound(embed::not_found_notice(
+        target,
+        &candidates,
     ))))
 }
 
@@ -3303,7 +3514,7 @@ fn read_csv(rel: &str, path: &Path) -> Result<String, IpcError> {
 #[tauri::command]
 pub async fn notes_csv_read(vault_id: String, target: String) -> Result<NoteCsvVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let (rel, path) = csv_path(&vault, &target)?;
+    let (rel, path) = embed_path(&vault, &target)?;
     let text = read_csv(&rel, &path)?;
     let rev = notes_vault::content_rev(&text);
     Ok(csv::project(&text, rel, rev))
@@ -3337,7 +3548,7 @@ pub async fn notes_csv_set_cell(
     value: String,
 ) -> Result<NoteCsvVm, IpcError> {
     let vault = vault_of(&vault_id)?;
-    let (rel, path) = csv_path(&vault, &target)?;
+    let (rel, path) = embed_path(&vault, &target)?;
     let text = read_csv(&rel, &path)?;
     let disk_rev = notes_vault::content_rev(&text);
     if disk_rev != rev {
@@ -3377,6 +3588,79 @@ pub async fn notes_csv_set_cell(
     tracing::info!(%rel, row, column, "notes: csv cell written");
     let next_rev = notes_vault::content_rev(&written);
     Ok(csv::project(&written, rel, next_rev))
+}
+
+/// A file embedded in a note, as text an editor can show (Story 45.12, FR-186).
+///
+/// **The vault-scoped sibling of `sync_read_text`, and it exists because the
+/// two surfaces are addressed differently.** Story 45.6's reader takes a sync
+/// profile id and a profile-relative subpath; a note holds a notes vault id and
+/// the text between a pair of brackets. Deriving one from the other in the
+/// webview would be the frontend deciding which folders are vaults, which is
+/// the path arithmetic AD-65 forbids, and doing it here would duplicate the
+/// profile→vault resolution Story 45.18 owns. So this command answers the
+/// question the note can actually ask.
+///
+/// What is deliberately NOT duplicated is the reading: [`text_file`] is Story
+/// 45.6's one reader, with its one size limit and its one "these bytes are not
+/// text" answer, so a file too large to edit in a panel is too large to edit in
+/// a note and neither surface has its own opinion about where that line is.
+#[tauri::command]
+pub async fn notes_embed_read(vault_id: String, target: String) -> Result<NoteEmbedVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let (rel, path) = embed_path(&vault, &target)?;
+    let file = keeper_core::text_file::open_text_file(&path).map_err(|error| {
+        tracing::warn!(%rel, %error, "notes: could not read an embedded file");
+        notes_error(NotesError::NotFound(format!("{rel}: {error}")))
+    })?;
+    Ok(embed::describe(rel, file))
+}
+
+/// Write an embedded file's raw bytes back (Story 45.12, FR-187).
+///
+/// **The whole buffer, and the same writer everything else in the vault uses.**
+/// `write_vault_file` is the temp-and-rename `write_note` and `notes_csv_set_cell`
+/// both go through, so a `kill -9` mid-write leaves no torn file, and
+/// `mark_dirty` is the same announcement, so the commit cadence picks the change
+/// up. There is no `touch`: the notes walk collects `.md` and nothing else, so
+/// asking the reconciler to re-read a `.csv` would be asking for an index entry
+/// that cannot exist.
+///
+/// **A note is refused.** [`embed::write_refusal`] holds that rule and its
+/// wording. A `.md` written here would bypass `notes_save`'s `base_rev`, its
+/// conflict copy and its reindex — so a stale buffer in one machine's embed
+/// would silently overwrite a note edited on another, with nothing left behind
+/// to recover. The frontend does not route a markdown embed here, and that is
+/// exactly why this guard is here: a rule enforced only by the caller that
+/// happens to exist today is enforced by nothing.
+///
+/// No revision is carried, unlike `notes_csv_set_cell`. That command splices one
+/// field into bytes it did not read again, so it must prove the bytes have not
+/// moved; this is a whole-file save of a buffer the reader is looking at, which
+/// is the same contract `sync_write_entry` gives the Files surface for the same
+/// file. Two answers to "may I save this" for one file, differing by which
+/// surface you opened it from, would be worse than either.
+#[tauri::command]
+pub async fn notes_embed_write(
+    vault_id: String,
+    target: String,
+    content: String,
+) -> Result<(), IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let (rel, _) = embed_path(&vault, &target)?;
+    if let Some(refusal) = embed::write_refusal(&rel, notes_vault::extension(&rel).as_deref()) {
+        tracing::warn!(%rel, "notes: refused to write a note through an embed");
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: refusal,
+            account_id: None,
+            retriable: false,
+        });
+    }
+    notes_vault::write_vault_file(&vault, &rel, &content).map_err(notes_error)?;
+    notes_vault::mark_dirty(&vault.id);
+    tracing::info!(%rel, bytes = content.len(), "notes: wrote an embedded file");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

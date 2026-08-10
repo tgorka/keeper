@@ -45,10 +45,15 @@ export type FormatAction =
   | { kind: "italic" }
   | { kind: "strikethrough" }
   | { kind: "code" }
+  | { kind: "subscript" }
+  | { kind: "superscript" }
+  | { kind: "underline" }
   | { kind: "bullet" }
   | { kind: "ordered" }
+  | { kind: "task" }
   | { kind: "quote" }
   | { kind: "link" }
+  | { kind: "codeblock" }
   | { kind: "heading"; level: number }
   | ({ kind: "table" } & TableShape);
 
@@ -66,6 +71,28 @@ const BOLD: InlineMark = { token: "**", node: "StrongEmphasis", mark: "EmphasisM
 const ITALIC: InlineMark = { token: "*", node: "Emphasis", mark: "EmphasisMark" };
 const STRIKE: InlineMark = { token: "~~", node: "Strikethrough", mark: "StrikethroughMark" };
 const CODE: InlineMark = { token: "`", node: "InlineCode", mark: "CodeMark" };
+
+/**
+ * Subscript and superscript, in the spelling the parser already in this editor
+ * understands.
+ *
+ * `markdownLanguage` — the base `note-editor.tsx` loads — is CommonMark + GFM
+ * *plus* the Subscript and Superscript extensions, so `H~2~O` and `x^2^`
+ * already arrive as `Subscript` and `Superscript` nodes with their own mark
+ * children. Nothing here teaches the editor a new syntax; it names one it was
+ * already parsing and nobody had rendered or written.
+ *
+ * **What Obsidian does with these bytes.** Obsidian is CommonMark + GFM without
+ * those two extensions, so `H~2~O` and `x^2^` render there as themselves —
+ * literal, legible, unambiguous, and losslessly round-tripped back into keeper.
+ * That is the whole test the epic sets: a note must not get *worse* to read
+ * outside keeper. `<sub>`/`<sup>` would render correctly in Obsidian and as raw
+ * angle brackets here (this editor renders no HTML), which fails the same test
+ * from the other side, and would put a second HTML spelling in the vault beside
+ * the one underline needs.
+ */
+const SUBSCRIPT: InlineMark = { token: "~", node: "Subscript", mark: "SubscriptMark" };
+const SUPERSCRIPT: InlineMark = { token: "^", node: "Superscript", mark: "SuperscriptMark" };
 
 /** What a fresh link's destination reads before the user types over it. It is
  *  selected after insertion, so this is a prompt rather than a value that could
@@ -222,13 +249,162 @@ const toggleLink: Command = (view) => {
 };
 
 /**
+ * Underline's two delimiters.
+ *
+ * **Every markdown spelling of underline is a compromise; this is the one that
+ * does not lie.** `__text__` is *bold* in CommonMark and in Obsidian, and this
+ * editor's own parser agrees — it reports `StrongEmphasis` for it, so keeper
+ * could not tell an underline from a bold even if it wanted to. `==text==` is
+ * *highlight* in Obsidian, a different mark with a different meaning. `_text_`
+ * is italic. Each of those makes the same file say two different things
+ * depending on who opens it, which is exactly the failure the epic told this
+ * story to reject.
+ *
+ * `<u>` means underline and nothing else, in Obsidian, on GitHub, in Pandoc and
+ * in every browser. Obsidian renders it as a real underline; keeper renders it
+ * as one too (`live-preview.ts` hides these two tags and marks the run between
+ * them, the same treatment `**` gets).
+ *
+ * **This is not an HTML sink.** `live-preview.ts` recognises the two literal
+ * strings below as delimiters and paints a CSS class over the text between
+ * them. Nothing is ever parsed as HTML and nothing reaches `innerHTML`, so the
+ * module's standing refusal to render HTML in a note body is intact: every
+ * other tag a note contains is still inert text.
+ */
+const UNDERLINE_OPEN = "<u>";
+const UNDERLINE_CLOSE = "</u>";
+
+/**
+ * The top-level block `pos` sits in, or the whole document when it sits in none.
+ *
+ * Underline pairing is bounded to one block because an unclosed `<u>` three
+ * paragraphs up must not pair with the `</u>` under the caret and delete a tag
+ * the user cannot see.
+ *
+ * **Found by walking the root's children, not by resolving upward from `pos`.**
+ * `markdownLanguage` mixes in the HTML parser, so resolving inside an
+ * `HTMLTag` descends into a nested tree that has a `Document` node of its own —
+ * three characters wide. Climbing until "the parent is a Document" therefore
+ * stopped at the opening tag itself, the search range became `<u>`, and the
+ * closing tag was never in it: a selection covering `<u>word</u>` got wrapped a
+ * second time instead of unwrapped.
+ */
+function topBlock(state: EditorState, pos: number): { from: number; to: number } {
+  for (
+    let child = syntaxTree(state).topNode.firstChild;
+    child !== null;
+    child = child.nextSibling
+  ) {
+    if (child.from <= pos && child.to >= pos) {
+      return { from: child.from, to: child.to };
+    }
+  }
+  return { from: 0, to: state.doc.length };
+}
+
+/**
+ * The `<u>` … `</u>` pair enclosing `from`..`to`, or null.
+ *
+ * Found through the syntax tree rather than by scanning characters, for the
+ * reason the module header gives about the other marks: the parser has already
+ * decided which angle brackets are a tag, so a `<u>` written inside `` `code` ``
+ * or inside a fence is not one of these nodes and cannot be paired with.
+ * Nesting is handled by the stack — the innermost pair that still matches the
+ * selection wins, so a second press undoes the press before it.
+ *
+ * A pair matches in both of the directions `toggleInline` accepts: the
+ * selection sitting *inside* the run (a caret in the middle of it), and the
+ * selection *containing* the pair (a user who dragged over the tags as well as
+ * the word). The second is not a nicety — without it, selecting exactly what
+ * the first press produced and pressing again wraps it a second time, which is
+ * the opposite of a toggle.
+ */
+function underlinePair(
+  state: EditorState,
+  from: number,
+  to: number,
+): { open: SyntaxNode; close: SyntaxNode } | null {
+  const block = topBlock(state, from);
+  const open: SyntaxNode[] = [];
+  let found: { open: SyntaxNode; close: SyntaxNode } | null = null;
+  syntaxTree(state).iterate({
+    from: block.from,
+    to: block.to,
+    enter: (node) => {
+      if (found !== null || node.name !== "HTMLTag") {
+        return undefined;
+      }
+      const text = state.doc.sliceString(node.from, node.to);
+      if (text === UNDERLINE_OPEN) {
+        open.push(node.node);
+      } else if (text === UNDERLINE_CLOSE) {
+        const start = open.pop();
+        const encloses = start !== undefined && start.to <= from && node.from >= to;
+        const enclosed = start !== undefined && start.from >= from && node.to <= to;
+        if (start !== undefined && (encloses || enclosed)) {
+          found = { open: start, close: node.node };
+        }
+      }
+      return undefined;
+    },
+  });
+  return found;
+}
+
+/**
+ * Toggle underline, with the same selection contract as {@link toggleInline}:
+ * whatever text was selected is still selected afterwards, so pressing the
+ * button twice is a true undo of pressing it once.
+ */
+const toggleUnderline: Command = (view) => {
+  view.dispatch(
+    view.state.changeByRange((range) => {
+      const pair = underlinePair(view.state, range.from, range.to);
+      if (pair !== null) {
+        const changes = view.state.changes([
+          { from: pair.open.from, to: pair.open.to },
+          { from: pair.close.from, to: pair.close.to },
+        ]);
+        return {
+          changes,
+          range: EditorSelection.range(changes.mapPos(range.from, 1), changes.mapPos(range.to, -1)),
+        };
+      }
+      if (range.empty) {
+        return {
+          changes: { from: range.from, insert: UNDERLINE_OPEN + UNDERLINE_CLOSE },
+          range: EditorSelection.cursor(range.from + UNDERLINE_OPEN.length),
+        };
+      }
+      const changes = view.state.changes([
+        { from: range.from, insert: UNDERLINE_OPEN },
+        { from: range.to, insert: UNDERLINE_CLOSE },
+      ]);
+      return {
+        changes,
+        range: EditorSelection.range(changes.mapPos(range.from, 1), changes.mapPos(range.to, -1)),
+      };
+    }),
+  );
+  view.focus();
+  return true;
+};
+
+/**
  * A line's leading markers, split so each block action edits only its own.
  *
  * Two groups rather than one because `> - a` is both a quote and a bullet, and
  * a toolbar that turned it into `- - a` because it treated the prefix as a
  * single token would be destroying structure the user can see.
+ *
+ * **The checkbox belongs to the marker group, not to the content.** A task is
+ * `- ` plus `[ ] `, and if the marker stopped at the bullet then pressing the
+ * task button on `- [ ] a` would write a second box and produce `- [ ] [ ] a`.
+ * Owning both means every block action agrees about where the text starts:
+ * pressing bullet on a task turns it back into a plain bullet, pressing heading
+ * on one takes the whole marker with it, and neither leaves an orphan `[ ]`.
  */
-const PREFIX = /^([ \t]*)((?:> )*)((?:#{1,6} |[-*+] |\d+\. )?)/;
+const PREFIX = /^([ \t]*)((?:> )*)((?:#{1,6} |(?:[-*+]|\d+\.) (?:\[[ xX]\] )?)?)/;
 
 interface Prefix {
   /** Where the quote markers start, relative to the line. */
@@ -337,7 +513,7 @@ function blockCommand(
   };
 }
 
-/** Which of the two prefix groups an action owns. Three block actions share
+/** Which of the two prefix groups an action owns. Four block actions share
  *  the marker group and have to agree on it exactly, or heading would delete a
  *  bullet's indent along with its own token. */
 const markerRegion = (prefix: Prefix) => ({
@@ -348,6 +524,75 @@ const markerRegion = (prefix: Prefix) => ({
 
 const BULLET = /^[-*+] $/;
 const ORDERED = /^\d+\. $/;
+
+/**
+ * A task marker, whichever list it hangs off and whichever case the tick is in.
+ *
+ * Both cases, because `- [X] done` is what several other editors write and a
+ * toolbar that did not recognise it would add a second box to a line that
+ * already had one. GFM, Obsidian and this editor's parser all accept either.
+ */
+const TASK = /^(?:[-*+]|\d+\.) \[[ xX]\] $/;
+
+/** The fence a code block is written with. Backticks rather than tildes because
+ *  it is what every other tool writes, so a diff of this vault stays uniform. */
+const FENCE = "```";
+
+/**
+ * Wrap the selection in a fenced code block, or unwrap the fence it is inside.
+ *
+ * A fence owns whole lines, so this works in lines rather than in characters —
+ * which is also the thing that keeps it from being confused with the `code`
+ * action beside it. `code` writes one backtick either side of a run *within* a
+ * line and produces an `InlineCode` node; this writes three backticks on lines
+ * of their own and produces a `FencedCode`. They are different nodes, they get
+ * different decorations, and neither can turn into the other by accident.
+ *
+ * Unwrapping keeps the body and drops the fence lines. A fence the user has
+ * opened but not yet closed has only one of them, and dropping "the closing
+ * line" it does not have would eat whatever came after it — so the closer is
+ * looked for rather than assumed, and its absence means the body runs to the
+ * end of the block the parser found.
+ */
+const toggleCodeBlock: Command = (view) => {
+  const { state } = view;
+  const range = state.selection.main;
+  const fence = enclosing(state, range.from, range.to, "FencedCode");
+  const marks: SyntaxNode[] = [];
+  for (let child = fence?.firstChild ?? null; child !== null; child = child.nextSibling) {
+    if (child.name === "CodeMark") {
+      marks.push(child);
+    }
+  }
+  if (fence !== null && marks.length >= 1) {
+    const open = state.doc.lineAt(marks[0].from);
+    const close = marks.length >= 2 ? state.doc.lineAt(marks[marks.length - 1].from) : null;
+    // Sliced rather than spliced around, because an empty fence has no body
+    // and its two "delete the line break too" ranges would overlap.
+    const bodyFrom = open.to + 1;
+    const bodyTo = close === null ? fence.to : close.from - 1;
+    const body = bodyTo > bodyFrom ? state.doc.sliceString(bodyFrom, bodyTo) : "";
+    view.dispatch({
+      changes: { from: open.from, to: close === null ? fence.to : close.to, insert: body },
+      selection: EditorSelection.range(open.from, open.from + body.length),
+    });
+    view.focus();
+    return true;
+  }
+  const first = state.doc.lineAt(range.from);
+  const last = state.doc.lineAt(range.to);
+  const body = state.doc.sliceString(first.from, last.to);
+  const anchor = first.from + FENCE.length + 1;
+  view.dispatch({
+    changes: { from: first.from, to: last.to, insert: `${FENCE}\n${body}\n${FENCE}` },
+    // The body stays selected, and an empty one leaves a caret on the empty
+    // middle line — which is where the next keystroke belongs either way.
+    selection: EditorSelection.range(anchor, anchor + body.length),
+    scrollIntoView: true,
+  });
+  view.focus();
+  return true;
+};
 
 /** Rows the reader will count and columns they will fill in. */
 export interface TableShape {
@@ -366,6 +611,74 @@ export interface TableShape {
  * stops being visible as a cell in the source.
  */
 const MIN_COLUMN = 3;
+
+/**
+ * Which way a column's cells are set, as its delimiter row spells it.
+ *
+ * Carried through {@link alignedTable} so that realigning a table somebody
+ * wrote with `:---:` does not quietly re-centre their numbers to the left.
+ */
+export type TableAlign = "none" | "left" | "center" | "right";
+
+/** One delimiter cell: the dashes, plus the colons that carry the column's
+ *  alignment. `width` is never below {@link MIN_COLUMN}, so `:-:` is the
+ *  narrowest a centred column can get and no form can run out of dashes. */
+function delimiterCell(width: number, align: TableAlign): string {
+  switch (align) {
+    case "left":
+      return `:${"-".repeat(width - 1)}`;
+    case "right":
+      return `${"-".repeat(width - 1)}:`;
+    case "center":
+      return `:${"-".repeat(width - 2)}:`;
+    default:
+      return "-".repeat(width);
+  }
+}
+
+/**
+ * Cells in, aligned GFM source out. **The one aligner in the app.**
+ *
+ * Story 45.9 realigns a table the user is typing in, and a second aligner
+ * written there would disagree with this one about a cell holding an escaped
+ * pipe — `a \| b` is one cell six characters wide to the writer of the table
+ * and two cells to a second reader of it. Then the table the `/` menu inserts
+ * and the table the editor maintains are different tables, and the difference
+ * only shows up in somebody's diff. So the padding lives here, once, and
+ * {@link gfmTable} is one caller of it.
+ *
+ * `rows[0]` is the header, and the header decides how many columns the table
+ * has: GFM only recognises a table when the delimiter row matches the header
+ * cell for cell, so those two are always emitted at the same width. A body row
+ * with fewer cells is filled out to that width (GFM inserts the empty cells
+ * anyway; writing them makes the source legible). A body row with *more* keeps
+ * every one of them — a renderer ignores the excess, and dropping a cell here
+ * would delete text the user can see in their file.
+ */
+export function alignedTable(
+  rows: readonly (readonly string[])[],
+  aligns: readonly TableAlign[] = [],
+): string {
+  const columns = Math.max(1, rows[0]?.length ?? 0);
+  const widest = rows.reduce((most, row) => Math.max(most, row.length), columns);
+  const widths = Array.from({ length: widest }, (_, index) =>
+    rows.reduce((width, row) => Math.max(width, (row[index] ?? "").length), MIN_COLUMN),
+  );
+  const line = (cells: readonly string[], count: number): string => {
+    const padded = Array.from({ length: count }, (_, index) =>
+      (cells[index] ?? "").padEnd(widths[index]),
+    );
+    return `| ${padded.join(" | ")} |`;
+  };
+  const delimiter = Array.from({ length: columns }, (_, index) =>
+    delimiterCell(widths[index], aligns[index] ?? "none"),
+  );
+  const source = [line(rows[0] ?? [], columns), `| ${delimiter.join(" | ")} |`];
+  for (const row of rows.slice(1)) {
+    source.push(line(row, Math.max(columns, row.length)));
+  }
+  return `${source.join("\n")}\n`;
+}
 
 /**
  * An aligned GFM table.
@@ -388,15 +701,9 @@ export function gfmTable(shape: TableShape): string {
   const heading = Array.from({ length: columns }, (_, index) =>
     shape.header ? `Column ${index + 1}` : "",
   );
-  const widths = heading.map((cell) => Math.max(MIN_COLUMN, cell.length));
-  const row = (cells: readonly string[]) =>
-    `| ${cells.map((cell, index) => cell.padEnd(widths[index])).join(" | ")} |`;
   const blank = Array.from({ length: columns }, () => "");
-  const lines = [row(heading), `| ${widths.map((width) => "-".repeat(width)).join(" | ")} |`];
-  for (let index = shape.header ? 1 : 0; index < rows; index += 1) {
-    lines.push(row(blank));
-  }
-  return `${lines.join("\n")}\n`;
+  const body = Array.from({ length: rows - (shape.header ? 1 : 0) }, () => blank);
+  return alignedTable([heading, ...body]);
 }
 
 /**
@@ -434,6 +741,14 @@ export function formatCommand(action: FormatAction): Command {
       return toggleInline(STRIKE);
     case "code":
       return toggleInline(CODE);
+    case "subscript":
+      return toggleInline(SUBSCRIPT);
+    case "superscript":
+      return toggleInline(SUPERSCRIPT);
+    case "underline":
+      return toggleUnderline;
+    case "codeblock":
+      return toggleCodeBlock;
     case "link":
       return toggleLink;
     case "quote":
@@ -453,6 +768,12 @@ export function formatCommand(action: FormatAction): Command {
         markerRegion,
         (current) => ORDERED.test(current),
         (index) => `${index + 1}. `,
+      );
+    case "task":
+      return blockCommand(
+        markerRegion,
+        (current) => TASK.test(current),
+        () => "- [ ] ",
       );
     case "heading": {
       const token = `${"#".repeat(Math.min(6, Math.max(1, action.level)))} `;

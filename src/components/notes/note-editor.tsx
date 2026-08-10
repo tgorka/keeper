@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
 import { markSaved, notesEditorStore, useNotesEditorStore } from "@/lib/stores/notes-editor";
+import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
 import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
@@ -176,6 +177,11 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
   const [showProperties, setShowProperties] = useState(false);
   const [showAttachments, setShowAttachments] = useState(false);
   const [conflictTheirs, setConflictTheirs] = useState<string | null>(null);
+  // Story 45.13's sentence about what attaching just did — what was copied in,
+  // what was already there. Rendered as a banner beside the conflict-copy one
+  // below, because both are "here is what keeper did to your file after you
+  // asked for something else".
+  const [attachOutcome, setAttachOutcome] = useState<string | null>(null);
 
   const openHistory = useCallback(() => setMode("history"), []);
   const toggleProperties = useCallback(() => setShowProperties((shown) => !shown), []);
@@ -227,6 +233,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         tags,
         slash,
         indent,
+        emoji,
         format,
       ] = await Promise.all([
         import("@codemirror/state"),
@@ -239,6 +246,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         import("./editor/tag-complete"),
         import("./editor/slash-menu"),
         import("./editor/indent-keymap"),
+        import("./editor/emoji-complete"),
         import("./editor/format-commands"),
       ]);
       if (disposed) {
@@ -311,8 +319,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
                   return cachedTags;
                 }),
                 slash.slashMenuSource(),
+                emoji.emojiCompleteSource(),
               ],
             }),
+            // The other half of Story 45.11: a shortcode somebody typed in full
+            // becomes its character as the closing colon lands, so `:tada:`
+            // never has to be recognised as a menu interaction.
+            emoji.emojiShortcodeCommit(),
             preview.livePreview({
               vaultId,
               assetUrl: (rel) =>
@@ -458,6 +471,16 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
         <span className="text-[11px] text-muted-foreground">
           {saveStateWord({ saving: body.saving, dirty: body.dirty, savedAtMs, error })}
         </span>
+        {/* Story 45.13. Beside Attachments rather than inside it: the panel
+            lists what THIS note already has, and this brings in what it does
+            not — including for a note that has no `files:` key and therefore
+            no panel worth opening. */}
+        <AttachFileButton
+          vaultId={vaultId}
+          body={body.text}
+          onInsert={insertAtCursor}
+          onOutcome={setAttachOutcome}
+        />
         <Button size="sm" variant="ghost" onClick={toggleAttachments}>
           {ATTACHMENTS_LABEL}
         </Button>
@@ -480,6 +503,15 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, onFollowLink }: NoteEd
       {conflictCopy === null ? null : (
         <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">
           keeper kept the version that was on disk as {conflictCopy} before writing yours.
+        </p>
+      )}
+
+      {/* Story 45.13's receipt: which files were copied into the vault, and
+          which were already in this note. `role="status"` because it answers
+          something the person just did and they may not be looking here. */}
+      {attachOutcome === null ? null : (
+        <p role="status" className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+          {attachOutcome}
         </p>
       )}
 

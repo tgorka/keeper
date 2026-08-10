@@ -11,6 +11,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 import type { DockBadgeMode } from "./gen/DockBadgeMode";
+import type { DocumentVm } from "./gen/DocumentVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
@@ -52,6 +53,8 @@ export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
+export type { DocumentFormat } from "./gen/DocumentFormat";
+export type { DocumentVm } from "./gen/DocumentVm";
 export type { DraftMirrorBatch } from "./gen/DraftMirrorBatch";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { EgressEndpointVm } from "./gen/EgressEndpointVm";
@@ -94,7 +97,10 @@ export type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 export type { NetworkVm } from "./gen/NetworkVm";
 export type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 export type { NoteAttachmentVm } from "./gen/NoteAttachmentVm";
+export type { NoteAttachSourceVm } from "./gen/NoteAttachSourceVm";
+export type { NoteAttachTargetVm } from "./gen/NoteAttachTargetVm";
 export type { NoteBodyBatch } from "./gen/NoteBodyBatch";
+export type { NoteBodyVm } from "./gen/NoteBodyVm";
 export type { NoteCadenceVm } from "./gen/NoteCadenceVm";
 export type { NoteChangeBatch } from "./gen/NoteChangeBatch";
 export type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
@@ -104,6 +110,7 @@ export type { NoteCreateVm } from "./gen/NoteCreateVm";
 export type { NoteCsvRowVm } from "./gen/NoteCsvRowVm";
 export type { NoteCsvVm } from "./gen/NoteCsvVm";
 export type { NoteDiffVm } from "./gen/NoteDiffVm";
+export type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 export type { NoteFlag } from "./gen/NoteFlag";
 export type { NoteFolderVm } from "./gen/NoteFolderVm";
 export type { NoteGalleryItemVm } from "./gen/NoteGalleryItemVm";
@@ -144,6 +151,12 @@ export type { PaletteChatVm } from "./gen/PaletteChatVm";
 export type { PaletteMode } from "./gen/PaletteMode";
 export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 export type { PanelTargetVm } from "./gen/PanelTargetVm";
+// Story 45.8's document bodies. Exported beside `DocumentVm` rather than left
+// reachable only through it, because a viewer that renders one sheet or one
+// paragraph takes that piece as a prop and would otherwise have to spell
+// `DocumentVm["sheets"]` — which is nullable, so every such component would
+// begin by narrowing a type it was handed already narrowed.
+export type { PdfProbeVm } from "./gen/PdfProbeVm";
 export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
@@ -180,6 +193,10 @@ export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
+export type { SheetsVm } from "./gen/SheetsVm";
+export type { SheetVm } from "./gen/SheetVm";
+export type { SlidesVm } from "./gen/SlidesVm";
+export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
@@ -213,6 +230,10 @@ export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { WordBlockStyle } from "./gen/WordBlockStyle";
+export type { WordBlockVm } from "./gen/WordBlockVm";
+export type { WordRunVm } from "./gen/WordRunVm";
+export type { WordsVm } from "./gen/WordsVm";
 
 import type { AccountVm } from "./gen/AccountVm";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
@@ -240,7 +261,10 @@ import type { MenuSectionVm } from "./gen/MenuSectionVm";
 import type { NetworksSnapshot } from "./gen/NetworksSnapshot";
 import type { NewChatResolutionVm } from "./gen/NewChatResolutionVm";
 import type { NoteAttachmentVm } from "./gen/NoteAttachmentVm";
+import type { NoteAttachSourceVm } from "./gen/NoteAttachSourceVm";
+import type { NoteAttachTargetVm } from "./gen/NoteAttachTargetVm";
 import type { NoteBodyBatch } from "./gen/NoteBodyBatch";
+import type { NoteBodyVm } from "./gen/NoteBodyVm";
 import type { NoteChangeBatch } from "./gen/NoteChangeBatch";
 import type { NoteConflictChoiceReq } from "./gen/NoteConflictChoiceReq";
 import type { NoteConflictVm } from "./gen/NoteConflictVm";
@@ -248,6 +272,7 @@ import type { NoteCreateReq } from "./gen/NoteCreateReq";
 import type { NoteCreateVm } from "./gen/NoteCreateVm";
 import type { NoteCsvVm } from "./gen/NoteCsvVm";
 import type { NoteDiffVm } from "./gen/NoteDiffVm";
+import type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 import type { NoteFlag } from "./gen/NoteFlag";
 import type { NoteFolderVm } from "./gen/NoteFolderVm";
 import type { NoteGalleryVm } from "./gen/NoteGalleryVm";
@@ -3023,6 +3048,42 @@ export async function syncReadText(id: string, subpath: string): Promise<TextFil
 }
 
 /**
+ * Read one file inside a synced folder as a document (FR-181, FR-182, AD-65,
+ * Story 45.8).
+ *
+ * Takes the profile id and a profile-relative `subpath` this surface was handed
+ * by {@link syncBrowse}, never a path, for the same reason {@link syncReadText}
+ * does: Rust re-resolves it through the containment rule the listing uses. It
+ * is NOT given `FilesEntryVm.absolutePath`.
+ *
+ * **The bytes never come back.** A PDF's pages are drawn by the webview from
+ * Story 45.7's `keeper-file://` URL, and DOCX, PPTX and XLSX are parsed in Rust
+ * — so what resolves here is a bounded projection whose size does not depend on
+ * the document's. A 400-page PDF and a 50 000-row spreadsheet both return a few
+ * kilobytes.
+ *
+ * **Every failure is a resolution, not a rejection**, because all of them are
+ * things the viewer draws: a file that is not a document, a container over the
+ * cap, a corrupt part, a decompression bomb and an encrypted PDF all resolve to
+ * a `DocumentVm` whose `detail` is the sentence to show and whose four bodies
+ * are null.
+ *
+ * **`format` is what Rust FOUND, not what the name implied.** Compare it with
+ * the registry row's `format` to notice a mis-named file; do not assume they
+ * agree.
+ *
+ * Anything truncated says so twice — a `truncated` flag beside the collection
+ * and a real count of what the document holds — so a 500-row window over a
+ * 50 000-row sheet can never be mistaken for the whole sheet.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a file no longer on disk, an unreadable file).
+ */
+export async function syncReadDocument(id: string, subpath: string): Promise<DocumentVm> {
+  return await invoke<DocumentVm>("sync_read_document", { id, subpath });
+}
+
+/**
  * Save one file inside a synced folder's notes vault (FR-175, AD-89, AD-65,
  * Story 45.3).
  *
@@ -3999,18 +4060,77 @@ export async function notesAttachmentPaste(
 }
 
 /**
- * Import dropped files into `attachments/` and answer with their embeds
- * (FR-110). `paths` come from Tauri's own window drag-drop event, which hands
- * Rust real paths — they are never composed in JavaScript.
+ * Resolve files a person picked into paths a note can name (Story 45.13,
+ * FR-188, FR-189).
  *
- * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ * `sources` are absolute paths the shell handed the webview — a file picker's
+ * result, a Files-pane row's `absolutePath`. They are never composed here
+ * (AD-65), and what comes back is vault-relative, because FR-145 forbids an
+ * absolute path in a note.
+ *
+ * One entry per source, in the order given, including the refused ones: a
+ * shorter array could not say which of six files did not make it. A source
+ * outside the vault is COPIED into `attachments/` and reported with
+ * `copied: true` — a link to a file outside the vault would name nothing on the
+ * next machine the vault syncs to.
+ *
+ * Rejects with: `notesVaultUnknown`, `internal`.
  */
-export async function notesAttachmentDrop(
+export async function notesAttachSources(
+  vaultId: string,
+  sources: string[],
+): Promise<NoteAttachSourceVm[]> {
+  return await invoke<NoteAttachSourceVm[]>("notes_attach_sources", { vaultId, sources });
+}
+
+/**
+ * Notes these files could be attached to, searched by title and path
+ * (Story 45.13, FR-189).
+ *
+ * `names` are the file names being attached, folded or not — Rust folds them.
+ * Each hit carries `holds`: which of those names that note's body already
+ * embeds, so the chooser can decline to offer a note that already has the file
+ * rather than offering it and then refusing the write.
+ *
+ * Rejects with: `notesVaultUnknown`, `internal`.
+ */
+export async function notesAttachTargets(
+  vaultId: string,
+  query: string,
+  names: string[],
+): Promise<NoteAttachTargetVm[]> {
+  return await invoke<NoteAttachTargetVm[]>("notes_attach_targets", { vaultId, query, names });
+}
+
+/**
+ * A closed note's body and the revision it was read at (Story 45.13).
+ *
+ * For a surface that has to change a note it has not opened in the editor. Not
+ * a substitute for `notesOpen`, which subscribes: this answers once and follows
+ * nothing.
+ *
+ * Rejects with: `notFound`, `notesVaultUnknown`, `internal`.
+ */
+export async function notesBodyRead(vaultId: string, noteId: string): Promise<NoteBodyVm> {
+  return await invoke<NoteBodyVm>("notes_body_read", { vaultId, noteId });
+}
+
+/**
+ * Write a body back to a note nobody has open (Story 45.13).
+ *
+ * `baseRev` is what {@link notesBodyRead} answered. A note that changed on disk
+ * in between is written aside as a conflict copy before this write lands, which
+ * is the same promise `notesSave` makes the editor and through the same code.
+ *
+ * Rejects with: `notFound`, `notesVaultUnknown`, `internal`.
+ */
+export async function notesBodyWrite(
   vaultId: string,
   noteId: string,
-  paths: string[],
-): Promise<NoteAttachmentVm[]> {
-  return await invoke<NoteAttachmentVm[]>("notes_attachment_drop", { vaultId, noteId, paths });
+  text: string,
+  baseRev: string,
+): Promise<NoteWriteVm> {
+  return await invoke<NoteWriteVm>("notes_body_write", { vaultId, noteId, text, baseRev });
 }
 
 /**
@@ -4060,6 +4180,47 @@ export async function notesCsvSetCell(
     column,
     value,
   });
+}
+
+/**
+ * A file embedded in a note, as text an editor can show (Story 45.12, FR-186).
+ *
+ * The vault-scoped sibling of {@link syncReadText}. A note holds a **notes
+ * vault id** and the text between a pair of brackets; a Files panel holds a
+ * **sync profile id** and a profile-relative path. Neither identifier can be
+ * derived from the other in the webview — that is the path arithmetic AD-65
+ * forbids, and the resolution between them is Story 45.18's — so a note embed
+ * asks the question a note can actually ask.
+ *
+ * The target is passed verbatim. Rust forms the candidates, resolves them
+ * through the vault's containment check and answers with the `relPath` it
+ * actually read, the `name` and the `kind` — so the viewer registry gets Rust's
+ * answer to "what is this file" rather than a guess made from the spelling.
+ *
+ * Rejects with: `internal` (no such file — the message names every path keeper
+ * looked for), `unsupported`, `notesInvalid`.
+ */
+export async function notesEmbedRead(vaultId: string, target: string): Promise<NoteEmbedVm> {
+  return await invoke<NoteEmbedVm>("notes_embed_read", { vaultId, target });
+}
+
+/**
+ * Write an embedded file's raw bytes back (Story 45.12, FR-187).
+ *
+ * The whole buffer, exactly as the editor holds it: no line-ending
+ * normalisation, no trailing newline, nothing added. A `.md` target is refused
+ * in Rust — a note is saved through {@link notesSave}, which carries a base
+ * revision and writes a conflict copy, and neither of those exists here.
+ *
+ * Rejects with: `notesInvalid` (the target is a note), `internal` (no such
+ * file, or the write failed).
+ */
+export async function notesEmbedWrite(
+  vaultId: string,
+  target: string,
+  content: string,
+): Promise<void> {
+  await invoke<void>("notes_embed_write", { vaultId, target, content });
 }
 
 /**

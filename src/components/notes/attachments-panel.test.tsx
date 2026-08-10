@@ -12,8 +12,9 @@
  * the click itself causes.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteWriteVm, RecordingNoteTargetVm } from "@/lib/ipc/client";
+import { withRangeRects } from "@/test/layout";
 
 const recordingNoteTargets =
   vi.fn<(sessionId: string) => Promise<RecordingNoteTargetVm[] | null>>();
@@ -47,13 +48,31 @@ import { notesEditorStore } from "@/lib/stores/notes-editor";
 import { AttachmentsPanel } from "./attachments-panel";
 import { NoteEditor } from "./note-editor";
 
-// Same shim, same reason, as `tab-wiring.test.tsx`: jsdom does no layout, so
-// CodeMirror's measure pass would throw out of the test on the first frame.
-if (!Range.prototype.getClientRects) {
-  Range.prototype.getClientRects = () =>
-    Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
-  Range.prototype.getBoundingClientRect = () => new DOMRect();
-}
+/**
+ * jsdom does no layout, so CodeMirror's measure pass throws on any frame that
+ * elapses mid-test — and a jsdom throw escaping a measure pass takes the run's
+ * exit code while the summary line still prints passes.
+ *
+ * This file used to carry its own shim. It was wrong in the way that matters:
+ * it installed an EMPTY `DOMRectList`, so a measure that DID run read
+ * `rects[0]` as undefined and threw anyway. That is a permanent fault which
+ * only ever SHOWED as an occasional red, because whether a frame elapses at all
+ * depends on how busy the machine is. It was never an ordering problem —
+ * vitest isolates per test file (measured by W2Marks and W2Emoji with a
+ * two-file probe, one of them checked for sensitivity by inverting it;
+ * `isolate` and `pool` are unset in `vitest.config.ts` and default to
+ * isolated), so every file starts with a clean `Range.prototype` and the old
+ * `if (!…)` guard was always true.
+ *
+ * `withRangeRects` returns real rects and its undo is mandatory and paired.
+ */
+let restoreRects: (() => void) | undefined;
+beforeAll(() => {
+  restoreRects = withRangeRects();
+});
+afterAll(() => {
+  restoreRects?.();
+});
 
 /** The folder as the note was written: Story 42.4's stub, before a retitle. */
 const WRITTEN = "recordings/2026/2026-08-08 1552 standup";
