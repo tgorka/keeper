@@ -13,10 +13,16 @@
  * The dead component is deleted and this is the one fold mechanism.
  *
  * **The cookie, following {@link "@/lib/column-widths"}** — same shape, same
- * year-long life, same tolerance for a jar full of other people's cookies. Not
- * `localStorage`, which this codebase refuses out loud (`iosSyncDisclosureShownGet`
- * says so), and not an IPC command, because which submenus a person has folded
- * is a lens they chose and not a fact Rust has any use for.
+ * year-long life, same tolerance for a jar full of other people's cookies. The
+ * encoding itself now lives in {@link "@/lib/stores/fold-cookie"}, shared with
+ * the notes rail's own fold (Story 47.3) so the two cannot drift; what stays
+ * here is what is specific to THIS surface — its cookie name, its closed key
+ * set, and the shape the sidebar reads.
+ *
+ * **This cookie is the chat sidebar's alone.** The notes rail has a section
+ * also called Spaces, and it is a different Spaces; it writes a cookie of its
+ * own rather than borrowing a key out of this one, so folding a saved-query
+ * list cannot fold a Matrix space list.
  *
  * **Two folds, not one.** The menu folds to the rail; each submenu folds shut on
  * its own. They are independent because they answer different questions — "I
@@ -31,13 +37,19 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import {
+  FOLD_MAX_AGE,
+  foldFlagsCookie,
+  persistFold,
+  readFoldFlags,
+} from "@/lib/stores/fold-cookie";
 
 /** The cookie the whole fold state lives in. One cookie, not one per group. */
 export const SIDEBAR_FOLD_COOKIE = "keeper_sidebar_fold";
 
 /** A year, matching the panel list and the column widths. A menu that unfolds
  *  itself every Monday is a menu nobody bothers to fold. */
-export const SIDEBAR_FOLD_MAX_AGE = 60 * 60 * 24 * 365;
+export const SIDEBAR_FOLD_MAX_AGE = FOLD_MAX_AGE;
 
 /**
  * The submenus that fold on their own.
@@ -63,10 +75,23 @@ export function unfolded(): SidebarFold {
   return { menu: false, groups: { spaces: false, networks: false } };
 }
 
-/** Whether `value` names a submenu this build knows. */
-function isGroup(value: string): value is SidebarGroup {
-  return (SIDEBAR_GROUPS as readonly string[]).includes(value);
-}
+/**
+ * Every key this cookie carries, in the order it writes them.
+ *
+ * `menu` first, then the groups, because that is the order the cookie has been
+ * written in since Story 45.20 and a jar written by that build must still read
+ * back byte-identically.
+ */
+const SIDEBAR_FOLD_KEYS = ["menu", ...SIDEBAR_GROUPS] as const;
+
+type SidebarFoldKey = (typeof SIDEBAR_FOLD_KEYS)[number];
+
+/** Every key at "open", which is the state where every control is reachable. */
+const SIDEBAR_FOLD_DEFAULTS: Record<SidebarFoldKey, boolean> = {
+  menu: false,
+  spaces: false,
+  networks: false,
+};
 
 /**
  * The fold state remembered in a `document.cookie` string.
@@ -78,29 +103,16 @@ function isGroup(value: string): value is SidebarGroup {
  * where every control is reachable.
  */
 export function readSidebarFold(cookie: string): SidebarFold {
+  const flags = readFoldFlags(
+    cookie,
+    SIDEBAR_FOLD_COOKIE,
+    SIDEBAR_FOLD_KEYS,
+    SIDEBAR_FOLD_DEFAULTS,
+  );
   const fold = unfolded();
-  for (const pair of cookie.split(";")) {
-    const separator = pair.indexOf("=");
-    if (separator === -1 || pair.slice(0, separator).trim() !== SIDEBAR_FOLD_COOKIE) {
-      continue;
-    }
-    for (const entry of decodeURIComponent(pair.slice(separator + 1).trim()).split("|")) {
-      const colon = entry.indexOf(":");
-      if (colon === -1) {
-        continue;
-      }
-      const key = entry.slice(0, colon);
-      const value = entry.slice(colon + 1);
-      if (value !== "0" && value !== "1") {
-        continue;
-      }
-      const folded = value === "1";
-      if (key === "menu") {
-        fold.menu = folded;
-      } else if (isGroup(key)) {
-        fold.groups[key] = folded;
-      }
-    }
+  fold.menu = flags.menu;
+  for (const group of SIDEBAR_GROUPS) {
+    fold.groups[group] = flags[group];
   }
   return fold;
 }
@@ -114,11 +126,10 @@ export function readSidebarFold(cookie: string): SidebarFold {
  * differ the moment a group's default stops being open.
  */
 export function sidebarFoldCookie(fold: SidebarFold): string {
-  const value = [
-    `menu:${fold.menu ? 1 : 0}`,
-    ...SIDEBAR_GROUPS.map((group) => `${group}:${fold.groups[group] ? 1 : 0}`),
-  ].join("|");
-  return `${SIDEBAR_FOLD_COOKIE}=${encodeURIComponent(value)}; path=/; max-age=${SIDEBAR_FOLD_MAX_AGE}`;
+  return foldFlagsCookie(SIDEBAR_FOLD_COOKIE, SIDEBAR_FOLD_KEYS, {
+    menu: fold.menu,
+    ...fold.groups,
+  });
 }
 
 export interface SidebarFoldState extends SidebarFold {
@@ -128,18 +139,9 @@ export interface SidebarFoldState extends SidebarFold {
   toggleGroup: (group: SidebarGroup) => void;
 }
 
-/** Write the fold out. Best effort: a document that refuses cookies costs the
- *  user the restore, and must not cost them the click. */
+/** Write the fold out. */
 function persist(fold: SidebarFold): void {
-  if (typeof document === "undefined") {
-    return;
-  }
-  try {
-    // biome-ignore lint/suspicious/noDocumentCookie: chrome state read before React mounts, following `panels.ts` and `column-widths.ts`; CookieStore is async and unavailable there
-    document.cookie = sidebarFoldCookie(fold);
-  } catch {
-    // A jar that will not take a write is not a reason to refuse the fold.
-  }
+  persistFold(sidebarFoldCookie(fold));
 }
 
 export const sidebarFoldStore = createStore<SidebarFoldState>()((set, get) => ({

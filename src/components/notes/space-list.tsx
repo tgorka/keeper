@@ -26,8 +26,9 @@
  * therefore knows nothing about the DSL — the row hands up a space and the pane
  * hands up an id.
  */
-import { FilePlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, FilePlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { FoldSection } from "@/components/layout/sidebar-group";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { SpaceEditor } from "@/components/notes/space-editor";
 import { spaceIcon } from "@/components/notes/space-icons";
@@ -38,6 +39,7 @@ import {
   notesFiltersStore,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
+import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -98,6 +100,7 @@ export function SpaceList({
   const [restoring, setRestoring] = useState(false);
   const [restoreResult, setRestoreResult] = useState<string | null>(null);
   const activeSpaceId = useNotesFiltersStore((s) => (s.scope.kind === "space" ? s.scope.id : null));
+  const folded = useNotesRailFold((state) => state.groups.spaces);
 
   const reload = useCallback(() => {
     if (vaultId === null) {
@@ -159,37 +162,47 @@ export function SpaceList({
 
   const edited = spaces.find((space) => space.id === editing) ?? null;
 
-  // The section renders even when the vault has none. Spaces are the rail now
-  // (Story 44.3): folding it away when it is empty would hide the one control
+  // Spaces are the rail now (Story 44.3), so this section renders even when the
+  // vault has none: folding it AWAY when it is empty would hide the one control
   // that fills it, and a vault whose owner deleted every default would have no
-  // way back.
+  // way back. Story 47.3 makes it fold, and that reason still holds — a fold
+  // hides the rows and never the header, so "Restore default spaces" and what
+  // it reports both sit outside the folded region and stay reachable shut.
   return (
-    <section aria-label="Spaces" className="flex shrink-0 flex-col px-2 pb-1">
-      <div className="flex items-center justify-between gap-1 px-2 py-1">
-        <span className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-          Spaces
-        </span>
-        <button
-          type="button"
-          aria-label={RESTORE_DEFAULTS}
-          title={RESTORE_DEFAULTS}
-          disabled={vaultId === null || restoring}
-          onClick={restore}
-          className={cn(
-            "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-            "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-            "disabled:pointer-events-none disabled:opacity-50",
-          )}
-        >
-          <RotateCcw aria-hidden="true" className="size-3.5" />
-        </button>
-      </div>
-      {restoreResult !== null && (
-        <p role="status" className="px-2 pb-1 text-muted-foreground text-xs">
-          {restoreResult}
-        </p>
-      )}
-      <ul className="flex flex-col gap-0.5">
+    <>
+      <FoldSection
+        label="Spaces"
+        icon={folded ? ChevronRight : ChevronDown}
+        folded={folded}
+        onToggle={() => notesRailFoldStore.getState().toggleGroup("spaces")}
+        id="notes-rail-spaces"
+        className="shrink-0"
+        as="ul"
+        bodyClassName="flex flex-col gap-0.5"
+        actions={
+          <button
+            type="button"
+            aria-label={RESTORE_DEFAULTS}
+            title={RESTORE_DEFAULTS}
+            disabled={vaultId === null || restoring}
+            onClick={restore}
+            className={cn(
+              "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              "disabled:pointer-events-none disabled:opacity-50",
+            )}
+          >
+            <RotateCcw aria-hidden="true" className="size-3.5" />
+          </button>
+        }
+        notice={
+          restoreResult !== null && (
+            <p role="status" className="px-2 pb-1 text-muted-foreground text-xs">
+              {restoreResult}
+            </p>
+          )
+        }
+      >
         {spaces.map((space) => {
           const broken = space.error !== null;
           // A presentation key keeper could not read is not a broken space: it
@@ -310,7 +323,7 @@ export function SpaceList({
             </li>
           );
         })}
-      </ul>
+      </FoldSection>
       {vaultId !== null && edited !== null && (
         // Keyed on the space, so opening a second editor after the first seeds
         // its form from the right space rather than from stale state.
@@ -347,6 +360,6 @@ export function SpaceList({
           }}
         />
       )}
-    </section>
+    </>
   );
 }

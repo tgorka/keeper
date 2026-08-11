@@ -65,6 +65,7 @@ import {
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
+import { hydrateNotesRailFold } from "@/lib/stores/notes-rail-fold";
 import {
   ensureNotesVaultsHydrated,
   useActiveVault,
@@ -149,6 +150,16 @@ export function NotesPane() {
 
   useEffect(() => {
     void ensureNotesVaultsHydrated();
+  }, []);
+
+  // Restore which rail sections were folded (Story 47.3). Here and not in
+  // `AppShell`, unlike the chat sidebar's fold: Spaces, Tags and Files render
+  // nowhere but this pane, and this pane is unmounted whenever another primary
+  // view is showing. Idempotent, so the double-invoked development effect and
+  // every later remount restore exactly once and never overwrite a fold the
+  // user has changed since.
+  useEffect(() => {
+    hydrateNotesRailFold(document.cookie);
   }, []);
 
   // The list mirror follows the active vault and the chip set; this is the only

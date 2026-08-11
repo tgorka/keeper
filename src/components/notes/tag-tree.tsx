@@ -42,6 +42,7 @@
  */
 import { ChevronDown, ChevronRight, Minus, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
+import { FoldSection } from "@/components/layout/sidebar-group";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
 import { notesTagTree } from "@/lib/ipc/client";
 import {
@@ -51,6 +52,7 @@ import {
   tagChipState,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
+import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
 import { cn } from "@/lib/utils";
 
 function TagNode({
@@ -177,6 +179,7 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
   const [nodes, setNodes] = useState<NoteTagNodeVm[]>([]);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
+  const folded = useNotesRailFold((state) => state.groups.tags);
 
   useEffect(() => {
     if (vaultId === null) {
@@ -205,10 +208,20 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
   }
 
   return (
-    <section aria-label="Tags" className="flex min-h-0 flex-1 flex-col px-2 pb-1">
-      <span className="px-2 py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        Tags
-      </span>
+    // The section owns the column's spare height while it is open and gives all
+    // of it back when it is shut. Both halves matter: `flex-1` on a folded
+    // section would leave an empty stripe where the tree used to be, and the
+    // body's own `hidden` only takes the BODY out of the layout, not the
+    // section around it (Story 47.3, AD-34-4).
+    <FoldSection
+      label="Tags"
+      icon={folded ? ChevronRight : ChevronDown}
+      folded={folded}
+      onToggle={() => notesRailFoldStore.getState().toggleGroup("tags")}
+      id="notes-rail-tags"
+      className={folded ? "shrink-0" : "min-h-0 flex-1"}
+      bodyClassName="flex min-h-0 flex-1 flex-col"
+    >
       <div aria-label="Tag tree" className="min-h-0 flex-1 overflow-y-auto" role="tree">
         {nodes.map((node, index) => (
           <TagNode
@@ -231,6 +244,6 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
           />
         ))}
       </div>
-    </section>
+    </FoldSection>
   );
 }
