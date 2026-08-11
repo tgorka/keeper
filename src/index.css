@@ -2,11 +2,52 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
+/* The room's two voices, self-hosted because a desktop app has no network at
+   first paint and a webfont CDN would be both a hang and a phone-home.
+   `latin-ext` is not optional: it carries ą ć ę ł ń ó ś ź ż. */
+@import "@fontsource-variable/instrument-sans";
+@import "@fontsource-variable/jetbrains-mono";
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
+    /* Instrument Sans is a grotesque with slightly narrowed forms — it sets 13px
+       UI text densely without the roundness that reads as a web app. Headings use
+       the same face: the register is set by weight and letterspacing, not by a
+       second personality. The system stack stays behind it as the fallback that
+       renders before the woff2 lands. */
+    --font-sans: "Instrument Sans Variable", -apple-system, BlinkMacSystemFont, "SF Pro Text",
+        "Helvetica Neue", sans-serif;
     --font-heading: var(--font-sans);
-    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    /* Previously UNDEFINED while 26 files used `font-mono`, so every figure in the
+       app fell back to whatever the platform happened to have. JetBrains Mono is
+       used only where a figure must line up — sizes, counts, timestamps, hashes,
+       paths, the recording clock. A monospace used for atmosphere is terminal
+       cosplay; used for columns it is an instrument. */
+    --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    /* The six steps of DESIGN.md → Typography, named so they can be spelled and
+       so the gate can ban everything else. Three of them have no Tailwind class,
+       and the alternative was 21 arbitrary `text-[22px]` values that no rule can
+       police. `body` and `figure` keep their existing Tailwind names because they
+       are already correct at 625 call sites. */
+    --text-display: 22px;
+    --text-display--line-height: 1.2;
+    --text-display--letter-spacing: -0.01em;
+    --text-display--font-weight: 600;
+    --text-title: 15px;
+    --text-title--line-height: 1.3;
+    --text-title--font-weight: 600;
+    --text-meta: 11px;
+    --text-meta--line-height: 1.4;
+    --text-meta--letter-spacing: 0.02em;
+    /* Body is 13px, not Tailwind's 14. Redefining the step fixes 248 call sites
+       at once instead of churning them, and density is the whole thesis: a
+       workroom is impressive because everything is to hand, so the type has to
+       earn its line. This does shrink every shadcn primitive that hardcodes
+       `text-sm`, which is exactly why it is a token decision and not a sweep. */
+    --text-sm: 13px;
+    --text-sm--line-height: 1.5;
     --color-held: var(--held);
     --color-held-foreground: var(--held-foreground);
     --color-incognito: var(--incognito);
@@ -43,6 +84,11 @@
     --color-accent-foreground: var(--accent-foreground);
     --color-accent: var(--accent);
     --color-muted-foreground: var(--muted-foreground);
+    /* The register's quietest voice. Held to 3:1, not 4.5:1, and therefore
+       allowed ONLY on section labels and `aria-hidden` glyphs — it may never
+       carry a fact. `--muted-foreground` is the one to reach for when the text
+       is metadata, because metadata in this app is information. */
+    --color-faint: var(--faint);
     --color-muted: var(--muted);
     --color-secondary-foreground: var(--secondary-foreground);
     --color-secondary: var(--secondary);
@@ -64,38 +110,39 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: #0f6e5c;
-  --primary-foreground: #ffffff;
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --background: #f4f2ec;
+  --foreground: #1a1f1c;
+  --card: #eceae2;
+  --card-foreground: #1a1f1c;
+  --popover: #eceae2;
+  --popover-foreground: #1a1f1c;
+  --primary: #41651f;
+  --primary-foreground: #f4f2ec;
+  --secondary: #e3e0d6;
+  --secondary-foreground: #1a1f1c;
+  --muted: #eceae2;
+  --muted-foreground: #5c655e;
+  --faint: #7a817b;
+  --accent: #e3e0d6;
+  --accent-foreground: #1a1f1c;
+  --destructive: #a8322b;
+  --border: #d2cec1;
+  --input: #d2cec1;
+  --ring: #41651f;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --held: #b45309;
+  --held: #895912;
   --held-foreground: #ffffff;
-  --incognito: #6d28d9;
-  --incognito-foreground: #ffffff;
-  --recording-red: #dc2626;
-  --bridge-healthy: #16a34a;
-  --bridge-degraded: #d97706;
-  --bridge-disconnected: #dc2626;
-  --search-highlight: #fde68a;
+  --incognito: #5c655e;
+  --incognito-foreground: #f4f2ec;
+  --recording-red: #a8322b;
+  --bridge-healthy: #0f6e5c;
+  --bridge-degraded: #895912;
+  --bridge-disconnected: #a8322b;
+  --search-highlight: #ded08f;
   --search-highlight-foreground: #231303;
   /* Row-swipe action surfaces (Story 13.6): mapped onto existing theme colors —
      no new palette. Archive is the neutral triage verb, read/unread the primary
@@ -106,7 +153,7 @@
   --swipe-read-foreground: var(--primary-foreground);
   --swipe-discard: var(--destructive);
   --swipe-discard-foreground: var(--background);
-  --radius: 10px;
+  --radius: 5px;
   /* Phone-tier stack header height (Story 13.2, UX-DR21): the single 52px bar
      the PhoneShell renders at the Room and Detail levels. */
   --phone-header: 52px;
@@ -121,14 +168,14 @@
      covers, driven by the visualViewport hook (use-keyboard-inset.ts) on the
      phone tier only; 0px whenever the keyboard is closed or off-phone. */
   --kb-inset: 0px;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: #eceae2;
+  --sidebar-foreground: #1a1f1c;
+  --sidebar-primary: #41651f;
+  --sidebar-primary-foreground: #f4f2ec;
+  --sidebar-accent: #e3e0d6;
+  --sidebar-accent-foreground: #1a1f1c;
+  --sidebar-border: #d2cec1;
+  --sidebar-ring: #41651f;
   /* Per-account hue wheel (8 hues, Story 2.1). The backend assigns a stable
      hue index 0–7 per account; the frontend maps it to one of these variables
      and renders it as a 3 px chat-row edge bar. Evenly spaced around the hue
@@ -138,45 +185,46 @@
   --account-hue-2: oklch(0.72 0.15 130);
   --account-hue-3: oklch(0.66 0.14 170);
   --account-hue-4: oklch(0.64 0.13 220);
-  --account-hue-5: oklch(0.55 0.18 275);
-  --account-hue-6: oklch(0.6 0.2 320);
+  --account-hue-5: oklch(0.55 0.15 245);
+  --account-hue-6: oklch(0.6 0.16 200);
   --account-hue-7: oklch(0.62 0.19 355);
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: #3ecfae;
-  --primary-foreground: #06231c;
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --background: #0d1210;
+  --foreground: #e4e9e4;
+  --card: #141a17;
+  --card-foreground: #e4e9e4;
+  --popover: #141a17;
+  --popover-foreground: #e4e9e4;
+  --primary: #8fc659;
+  --primary-foreground: #0d1210;
+  --secondary: #1b221e;
+  --secondary-foreground: #e4e9e4;
+  --muted: #141a17;
+  --muted-foreground: #98a49b;
+  --faint: #6b756e;
+  --accent: #1b221e;
+  --accent-foreground: #e4e9e4;
+  --destructive: #e0625a;
+  --border: #28312c;
+  --input: #303a34;
+  --ring: #8fc659;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --held: #f5a623;
-  --held-foreground: #231303;
-  --incognito: #a78bfa;
-  --incognito-foreground: #1e1038;
-  --recording-red: #ef4444;
-  --bridge-healthy: #16a34a;
-  --bridge-degraded: #d97706;
-  --bridge-disconnected: #dc2626;
-  --search-highlight: #78560a;
-  --search-highlight-foreground: #fde68a;
+  --held: #d9a441;
+  --held-foreground: #0d1210;
+  --incognito: #98a49b;
+  --incognito-foreground: #0d1210;
+  --recording-red: #e0625a;
+  --bridge-healthy: #2fb8a0;
+  --bridge-degraded: #d9a441;
+  --bridge-disconnected: #e0625a;
+  --search-highlight: #4a4415;
+  --search-highlight-foreground: #e4e9e4;
   /* Row-swipe action surfaces (Story 13.6), dark theme: the same theme-color
      mapping; the dark background/primary/destructive values carry the contrast. */
   --swipe-archive: var(--muted-foreground);
@@ -185,14 +233,14 @@
   --swipe-read-foreground: var(--primary-foreground);
   --swipe-discard: var(--destructive);
   --swipe-discard-foreground: var(--background);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar: #141a17;
+  --sidebar-foreground: #e4e9e4;
+  --sidebar-primary: #8fc659;
+  --sidebar-primary-foreground: #0d1210;
+  --sidebar-accent: #1b221e;
+  --sidebar-accent-foreground: #e4e9e4;
+  --sidebar-border: #28312c;
+  --sidebar-ring: #8fc659;
   /* Per-account hue wheel, dark theme: slightly brighter/more saturated so the
      3 px edge bar reads against the dark background. */
   --account-hue-0: oklch(0.7 0.19 25);
@@ -200,8 +248,8 @@
   --account-hue-2: oklch(0.8 0.16 130);
   --account-hue-3: oklch(0.74 0.14 170);
   --account-hue-4: oklch(0.72 0.14 220);
-  --account-hue-5: oklch(0.66 0.18 275);
-  --account-hue-6: oklch(0.7 0.2 320);
+  --account-hue-5: oklch(0.66 0.15 245);
+  --account-hue-6: oklch(0.7 0.16 200);
   --account-hue-7: oklch(0.7 0.19 355);
 }
 
@@ -211,6 +259,24 @@
 @utility touch-callout-none {
   -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
+}
+
+/* The register's label (DESIGN.md → Typography). The one place letterspacing is
+   allowed, because caps at 11px close up without it. Pairs with `text-faint`,
+   which is held to 3:1 and never carries a fact. */
+@utility label-caps {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Tabular figures. JetBrains Mono is already tabular by construction, so this is
+   for the SANS face: a count or a duration that changes in place must not make
+   the row reflow. `slashed-zero` keeps 0/O apart in ids and hashes. */
+@utility figures {
+  font-variant-numeric: tabular-nums slashed-zero;
 }
 
 @layer base {

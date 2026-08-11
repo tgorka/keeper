@@ -1,0 +1,2018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keeper — visual identity and UI direction — brainstorming session 2026-08-11</title>
+<style>
+/* ==========================================================================
+   THE KEEPER ROOM — session keepsake.
+   Practises what the session decided: near-black ground with a trace of
+   green, one lichen lamp, mono for machine strings, hairlines, calibration
+   ticks, label strips. No gradients. No glass. No violet. No shimmer.
+   ========================================================================== */
+
+:root {
+  /* ground family — hue 155, chroma 0.014, so the greys are the same
+     material as the accent */
+  --ground:  #0c120e;
+  --raised:  #171e19;
+  --overlay: #222a25;
+  --border:  #2d3530;
+
+  /* ink */
+  --text:       #e1e9e2;
+  --text-dim:   #99a19a;
+  --text-faint: #636b65;
+
+  /* one lamp */
+  --accent: #99d267;
+
+  /* status only — never brand */
+  --held:     #b45309;
+  --degraded: #d97706;
+
+  /* paper theme, quoted in the palette section */
+  --paper:        #f4f8f3;
+  --paper-raised: #eaeee9;
+  --paper-ink:    #131a14;
+  --paper-accent: #396d0a;
+
+  --hair:   rgba(225, 233, 226, 0.09);
+  --hair-2: rgba(225, 233, 226, 0.05);
+  --rake:   rgba(225, 233, 226, 0.07);
+  --tick:   rgba(225, 233, 226, 0.22);
+
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "DejaVu Sans Mono",
+          "Liberation Mono", "Cascadia Mono", "Segoe UI Mono", Menlo,
+          Consolas, monospace;
+  --prop: -apple-system, "Avenir Next", "Segoe UI Variable Text", "Segoe UI",
+          "Noto Sans", "DejaVu Sans", "Liberation Sans", sans-serif;
+
+  /* 4px grid */
+  --u1: 4px;  --u2: 8px;  --u3: 12px; --u4: 16px;
+  --u6: 24px; --u8: 32px; --u12: 48px; --u16: 64px;
+
+  --row: 28px;
+  --r-control: 4px;
+  --r-float: 6px;
+}
+
+* { box-sizing: border-box; }
+
+html { background: var(--ground); }
+
+body {
+  margin: 0;
+  padding: 0 var(--u6) var(--u16);
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--prop);
+  font-size: 14px;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums lining-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+body.greyscale { filter: grayscale(1); }
+
+/* tooth — a fine grain at 2%, on chrome only. The media plate below opts out
+   by sitting above this layer, which is the actual product constraint. */
+.grain {
+  position: fixed; inset: 0; z-index: 50;
+  opacity: 0.02; pointer-events: none;
+}
+
+.wrap { max-width: 1080px; margin: 0 auto; }
+
+/* ---------- label strip: the pane-header grammar, repeated ---------------- */
+
+.strip {
+  display: flex; align-items: baseline; gap: var(--u3);
+  padding: var(--u2) 0 var(--u2) 0;
+  border-bottom: 1px solid var(--hair);
+  margin: var(--u16) 0 var(--u6);
+}
+.strip .idx {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  color: var(--ground); background: var(--accent);
+  padding: 2px 5px; border-radius: 2px; font-weight: 600;
+}
+.strip .name {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--text);
+}
+.strip .fill { flex: 1 1 auto; height: 1px; background: var(--hair); }
+.strip .count, .strip .state {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-dim); white-space: nowrap;
+}
+.strip .state { color: var(--accent); }
+
+.lede {
+  max-width: 68ch; color: var(--text-dim);
+  margin: 0 0 var(--u6);
+}
+.lede b { color: var(--text); font-weight: 600; }
+
+/* micro-label — the specimen tag */
+.tag {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-dim);
+}
+.m { font-family: var(--mono); font-size: 12px; }
+.cite {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  white-space: nowrap;
+}
+.acc { color: var(--accent); }
+.dim { color: var(--text-dim); }
+
+/* ---------- masthead ----------------------------------------------------- */
+
+.masthead { padding-top: var(--u12); }
+
+.masthead .over {
+  display: flex; gap: var(--u3); align-items: center;
+  border-bottom: 1px solid var(--hair); padding-bottom: var(--u2);
+}
+.masthead h1 {
+  font-family: var(--prop); font-weight: 600;
+  font-size: clamp(28px, 4.4vw, 46px); line-height: 1.08;
+  letter-spacing: -0.008em;
+  margin: var(--u8) 0 var(--u4); max-width: 22ch;
+}
+.masthead h1 .lower { font-family: var(--mono); font-weight: 500; letter-spacing: -0.01em; }
+.masthead .goal {
+  max-width: 62ch; font-size: 16px; color: var(--text);
+  border-left: 2px solid var(--accent); padding-left: var(--u3);
+  margin: 0 0 var(--u8);
+}
+
+.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1px;
+        background: var(--hair-2); border: 1px solid var(--hair); border-radius: var(--r-control); }
+.meta div { background: var(--raised); padding: var(--u3); box-shadow: inset 0 1px 0 var(--rake); }
+.meta dt, .meta .k { display: block; margin-bottom: 3px; }
+.meta .v { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
+/* technique index */
+.index { margin: var(--u8) 0 0; display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--u8); }
+.index a {
+  display: flex; align-items: baseline; gap: var(--u3);
+  height: var(--row); text-decoration: none; color: var(--text-dim);
+  border-bottom: 1px solid var(--hair-2);
+}
+.index a:hover, .index a:focus-visible { color: var(--text); }
+.index a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.index a .n { font-family: var(--mono); font-size: 11px; color: var(--text-faint); width: 2.4em; }
+.index a .t { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; }
+.index a .d { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
+
+.gsbtn {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-dim);
+  background: var(--overlay); border: 1px solid var(--border);
+  border-radius: var(--r-control); padding: 4px 8px; cursor: pointer;
+  margin-left: auto;
+}
+.gsbtn:hover { color: var(--text); }
+.gsbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.gsbtn[aria-pressed="true"] { color: var(--ground); background: var(--accent); border-color: var(--accent); }
+
+/* ---------- tick rail (calibration ticks on the divider) ----------------- */
+
+.rail { position: relative; width: 1px; background: var(--hair); flex: 0 0 1px; }
+.rail i { position: absolute; left: 0; width: 5px; height: 1px; background: var(--tick); }
+.rail i.maj { width: 9px; background: var(--text-faint); }
+
+/* ==========================================================================
+   T1 — METAPHOR MAPPING: a candidate register, ledger-ruled
+   ========================================================================== */
+
+.register { border-top: 1px solid var(--hair); }
+.reg-row {
+  display: grid; grid-template-columns: 84px 190px 1fr;
+  gap: var(--u3); align-items: baseline;
+  padding: var(--u2) 0; border-bottom: 1px solid var(--hair-2);
+}
+.reg-row:nth-child(5n) { border-bottom-color: var(--hair); }
+.reg-row .v {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  color: var(--text-faint); border: 1px solid var(--border);
+  border-radius: 2px; padding: 1px 4px; text-align: center;
+}
+.reg-row .cand { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+.reg-row .note { color: var(--text-dim); font-size: 13px; }
+.reg-row.rejected .cand { text-decoration: line-through; text-decoration-thickness: 1px; }
+.reg-row.survivor {
+  border-left: 2px solid var(--accent); padding-left: var(--u3);
+  margin-left: -14px; background: var(--raised);
+}
+.reg-row.survivor .cand { color: var(--accent); font-weight: 600; }
+.reg-row.survivor .note { color: var(--text); }
+.reg-row.survivor .v { color: var(--accent); border-color: var(--accent); }
+.reg-row.held .v { color: var(--degraded); border-color: var(--held); }
+
+.ext { margin-top: var(--u8); display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1px var(--u8); }
+.ext .row { display: grid; grid-template-columns: 148px 1fr; gap: var(--u3);
+            padding: var(--u2) 0; border-top: 1px solid var(--hair-2); }
+.ext .row .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
+               text-transform: uppercase; color: var(--accent); }
+.ext .row .v { color: var(--text-dim); font-size: 13px; }
+
+/* ==========================================================================
+   T2 — ALIEN ANTHROPOLOGIST: annotated specimens
+   ========================================================================== */
+
+.specimens { display: grid; gap: 1px; background: var(--hair-2); border: 1px solid var(--hair); }
+.spec { display: grid; grid-template-columns: 74px 1fr; background: var(--ground); }
+.spec .no {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em;
+  color: var(--text-faint); padding: var(--u3) 0 var(--u3) var(--u3);
+  border-right: 1px solid var(--hair);
+}
+.spec .body { padding: var(--u3); }
+.spec .body p { margin: 0 0 var(--u2); }
+.spec .body p:last-child { margin-bottom: 0; }
+.spec .obs { color: var(--text); font-size: 13.5px; }
+.spec .obs em { color: var(--accent); font-style: normal; }
+.spec .strings { display: flex; flex-wrap: wrap; gap: 4px var(--u2); align-items: center; }
+.spec .strings .chip {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-dim);
+  background: var(--raised); border: 1px solid var(--border);
+  border-radius: 2px; padding: 1px 5px;
+}
+.spec.find { background: var(--raised); box-shadow: inset 0 1px 0 var(--rake); }
+.spec.find .no { color: var(--accent); }
+.spec.find .obs { color: var(--text); }
+.spec.find .lab {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--accent); display: block; margin-bottom: var(--u1);
+}
+
+/* ==========================================================================
+   T3 — CONCEPT BLENDING: a grid of blends, rejects struck through
+   ========================================================================== */
+
+.blends { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1px;
+          background: var(--hair-2); border: 1px solid var(--hair); }
+.blend { background: var(--ground); padding: var(--u3); min-height: 132px; display: flex; flex-direction: column; }
+.blend .op { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.blend h4 {
+  font-family: var(--mono); font-weight: 500; font-size: 12.5px; letter-spacing: 0.01em;
+  margin: 2px 0 var(--u2); color: var(--text);
+}
+.blend p { margin: 0; font-size: 12.5px; color: var(--text-dim); }
+.blend .verdict {
+  margin-top: auto; padding-top: var(--u2);
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-faint);
+}
+.blend.out h4 { text-decoration: line-through; text-decoration-thickness: 1px; color: var(--text-dim); }
+.blend.keep {
+  background: var(--raised); border-left: 2px solid var(--accent);
+  box-shadow: inset 0 1px 0 var(--rake);
+}
+.blend.keep h4 { color: var(--accent); }
+.blend.keep p { color: var(--text); }
+.blend.keep .verdict { color: var(--accent); }
+
+/* ==========================================================================
+   T4 — ASSUMPTION REVERSAL: assumption flipped to rule
+   ========================================================================== */
+
+.flips { display: grid; gap: var(--u2); }
+.flip {
+  display: grid; grid-template-columns: 1fr 40px 1fr; align-items: stretch;
+  border: 1px solid var(--hair); border-radius: var(--r-control);
+  background: var(--raised); box-shadow: inset 0 1px 0 var(--rake);
+}
+.flip > div { padding: var(--u3); }
+.flip .was { color: var(--text-dim); border-right: 1px solid var(--hair); }
+.flip .pivot {
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 13px; color: var(--accent);
+  border-right: 1px solid var(--hair); padding: 0;
+}
+.flip .now { color: var(--text); }
+.flip .tag { display: block; margin-bottom: var(--u1); }
+.flip .was .body { text-decoration: line-through; text-decoration-thickness: 1px; text-decoration-color: var(--text-faint); }
+.flip .now b { color: var(--accent); font-weight: 600; }
+
+.greens { margin-top: var(--u8); border-top: 1px solid var(--hair); }
+.green-row {
+  display: grid; grid-template-columns: 18px 210px 130px 1fr; gap: var(--u3);
+  align-items: center; padding: 5px 0; border-bottom: 1px solid var(--hair-2);
+}
+.green-row .chip { width: 16px; height: 16px; border-radius: 2px; border: 1px solid var(--border); }
+.green-row .nm { font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+                 text-decoration: line-through; text-decoration-thickness: 1px; }
+.green-row .hx { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.green-row .why { font-size: 12.5px; color: var(--text-dim); }
+
+/* ==========================================================================
+   T5 — SENSORY EXPLORATION: material swatches
+   ========================================================================== */
+
+.materials { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: var(--u4); }
+.mat { border: 1px solid var(--hair); border-radius: var(--r-control); overflow: hidden; }
+.mat .face { height: 108px; position: relative; background: var(--raised);
+             box-shadow: inset 0 1px 0 var(--rake); }
+.mat .cap { padding: var(--u2) var(--u3) var(--u3); border-top: 1px solid var(--hair); background: var(--ground); }
+.mat .cap .tag { display: block; margin-bottom: 3px; }
+.mat .cap p { margin: 0; font-size: 12.5px; color: var(--text-dim); }
+
+.face.anodised { background: var(--overlay); }
+.face.anodised .plate {
+  position: absolute; inset: 18px; background: var(--raised);
+  border: 1px solid var(--border); border-radius: var(--r-control);
+  box-shadow: inset 0 1px 0 var(--rake);
+}
+.face.glass-no { display: flex; align-items: center; justify-content: center; }
+.face.glass-no span {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  text-decoration: line-through; text-decoration-thickness: 1px;
+}
+.face.rake { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; padding: 14px; }
+.face.rake div { border: 1px solid var(--border); border-radius: var(--r-control);
+                 background: var(--overlay); position: relative; }
+.face.rake .lit { box-shadow: inset 0 1px 0 var(--rake); }
+.face.rake span { position: absolute; bottom: 4px; left: 5px; font-family: var(--mono);
+                  font-size: 9px; letter-spacing: 0.06em; color: var(--text-faint); }
+.face.tooth { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 14px; }
+.face.tooth .chrome, .face.tooth .media {
+  border: 1px solid var(--border); border-radius: var(--r-control);
+  display: flex; align-items: flex-end; padding: 4px 5px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; color: var(--text-faint);
+}
+.face.tooth .chrome { background: var(--overlay); box-shadow: inset 0 1px 0 var(--rake); }
+/* the media plate sits ABOVE the page grain — grain never crosses a viewer */
+.face.tooth .media { background: #1b1b1b; position: relative; z-index: 60; color: #8a8a8a; }
+.face.temp { display: grid; grid-template-rows: 1fr 1fr; gap: 8px; padding: 14px; align-items: center; }
+.face.temp .ok { display: flex; align-items: center; gap: 8px; }
+.face.temp .btn {
+  background: var(--accent); color: var(--ground); font-family: var(--mono);
+  font-size: 10px; letter-spacing: 0.06em; padding: 3px 8px; border-radius: var(--r-control);
+}
+.face.temp .bad { position: relative; height: 26px; border: 1px solid var(--border);
+                  border-radius: var(--r-control); background: var(--overlay);
+                  display: flex; align-items: center; justify-content: center; }
+.face.temp .bad em { font-family: var(--mono); font-size: 9.5px; color: var(--text-dim);
+                     font-style: normal; text-decoration: line-through; }
+.face.temp .lbl { font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; color: var(--text-faint); }
+.face.silent { display: flex; align-items: center; justify-content: center; }
+.face.silent .waveline { width: 70%; height: 1px; background: var(--border); position: relative; }
+.face.silent .waveline b { position: absolute; left: 50%; top: -3px; width: 2px; height: 7px;
+                           background: var(--accent); }
+.face.weight { padding: 10px 14px; }
+.face.weight .hairline { height: 1px; background: var(--hair); margin: 0 0 7px; }
+.face.weight .r { display: flex; justify-content: space-between; font-family: var(--mono);
+                  font-size: 10px; color: var(--text-dim); padding: 1px 0; }
+.face.weight .r.hd { color: var(--text-faint); letter-spacing: 0.08em; }
+.face.type { padding: 12px 14px; }
+.face.type .prose { font-size: 12.5px; color: var(--text); line-height: 1.35; }
+.face.type .machine { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+.face.type .micro { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+                    text-transform: uppercase; color: var(--text-dim); margin-top: 8px; }
+.face.figs { padding: 10px 14px; font-family: var(--mono); font-size: 11px; }
+.face.figs .r { display: flex; justify-content: space-between; color: var(--text-dim); }
+.face.figs .r span:last-child { font-variant-numeric: tabular-nums; }
+
+/* ==========================================================================
+   T6 — TRIZ: contradiction and separations
+   ========================================================================== */
+
+.contradiction {
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: var(--u4);
+  border: 1px solid var(--border); border-radius: var(--r-control);
+  padding: var(--u4); background: var(--raised); box-shadow: inset 0 1px 0 var(--rake);
+}
+.contradiction .pole { font-family: var(--mono); font-size: clamp(15px, 2.4vw, 22px);
+                       letter-spacing: 0.04em; text-transform: uppercase; }
+.contradiction .pole:last-child { text-align: right; }
+.contradiction .vs { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+                     color: var(--accent); }
+.contradiction + p { max-width: 72ch; color: var(--text-dim); margin: var(--u3) 0 var(--u8); }
+
+.seps { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--u4); }
+.sep { border-top: 2px solid var(--accent); padding-top: var(--u3); }
+.sep h4 { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+          margin: 0 0 var(--u2); color: var(--text); }
+.sep p { margin: 0 0 var(--u2); font-size: 13px; color: var(--text-dim); }
+.sep ul { margin: 0; padding-left: 14px; font-size: 12.5px; color: var(--text-dim); }
+.sep li { margin-bottom: 3px; }
+
+.frame-demo { margin-top: var(--u8); display: flex; gap: 0; border: 1px solid var(--border);
+              border-radius: var(--r-control); background: var(--raised); overflow: hidden; }
+.frame-demo .chrome-side { width: 176px; padding: var(--u3); box-shadow: inset 0 1px 0 var(--rake); }
+.frame-demo .chrome-side .tag { display: block; margin-bottom: var(--u2); }
+.frame-demo .navrow { display: flex; align-items: center; gap: var(--u2); height: var(--row);
+                      font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.frame-demo .navrow.on { color: var(--text); border-left: 2px solid var(--accent); padding-left: 6px; margin-left: -8px; }
+.frame-demo .navrow b { width: 5px; height: 5px; background: var(--text-faint); border-radius: 1px; }
+.frame-demo .navrow.on b { background: var(--accent); }
+.frame-demo .content-side { flex: 1; background: var(--ground); border-left: 1px solid var(--border); }
+.frame-demo .content-side .hdr {
+  display: flex; align-items: baseline; gap: var(--u2); padding: var(--u2) var(--u3);
+  border-bottom: 1px solid var(--hair);
+}
+.frame-demo .content-side .hdr .fill { flex: 1; height: 1px; background: var(--hair); }
+.frame-demo .trow { display: grid; grid-template-columns: 1fr 88px 96px; gap: var(--u3);
+                    height: var(--row); align-items: center; padding: 0 var(--u3);
+                    font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+                    border-bottom: 1px solid var(--hair-2); }
+.frame-demo .trow:nth-child(5n) { border-bottom-color: var(--hair); }
+.frame-demo .trow span:not(:first-child) { text-align: right; }
+.frame-demo .trow.sel { color: var(--text); background: var(--raised); box-shadow: inset 2px 0 0 var(--accent); }
+.frame-demo .statusband {
+  display: flex; gap: var(--u4); padding: 5px var(--u3); border-top: 1px solid var(--hair);
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-dim); background: var(--raised);
+}
+.frame-demo .statusband .caret { width: 2px; height: 11px; background: var(--accent); display: inline-block; }
+
+.budget { margin-top: var(--u8); display: flex; align-items: center; gap: var(--u4);
+          border: 1px solid var(--hair); border-radius: var(--r-control); padding: var(--u4); }
+.budget .n { font-family: var(--mono); font-size: 54px; line-height: 1; color: var(--accent); }
+.budget p { margin: 0; color: var(--text-dim); max-width: 60ch; font-size: 13px; }
+
+/* ==========================================================================
+   T7 — WORST POSSIBLE IDEA: two-column ledger
+   ========================================================================== */
+
+.ledger { border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair); }
+.ledger .head, .ledger .lrow {
+  display: grid; grid-template-columns: 34px 1fr 1fr; gap: var(--u4);
+  padding: var(--u2) 0; border-bottom: 1px solid var(--hair-2);
+}
+.ledger .head { border-bottom: 1px solid var(--hair); }
+.ledger .head span { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+                     text-transform: uppercase; color: var(--text-faint); }
+.ledger .lrow:nth-child(5n) { border-bottom-color: var(--hair); }
+.ledger .lrow .n { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+.ledger .lrow .worst { color: var(--text-dim); font-size: 13px;
+                       text-decoration: line-through; text-decoration-thickness: 1px;
+                       text-decoration-color: var(--text-faint);
+                       border-right: 1px solid var(--hair-2); padding-right: var(--u4); }
+.ledger .lrow .rule { color: var(--text); font-size: 13px; }
+.ledger .lrow .rule .m { color: var(--text-dim); }
+.ledger .lrow:last-child { border-bottom: 0; }
+
+/* ==========================================================================
+   T8 — FORCED RELATIONSHIPS: domain collisions
+   ========================================================================== */
+
+.collisions { display: grid; gap: 1px; background: var(--hair-2); }
+.coll { display: grid; grid-template-columns: 96px 26px 178px 1fr; gap: var(--u3);
+        align-items: baseline; background: var(--ground); padding: var(--u3) 0; }
+.coll .a { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+           text-transform: uppercase; color: var(--accent); }
+.coll .x { font-family: var(--mono); font-size: 12px; color: var(--text-faint); text-align: center; }
+.coll .b { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
+           text-transform: uppercase; color: var(--text); }
+.coll .yield { color: var(--text-dim); font-size: 13px; }
+.coll .yield b { color: var(--text); font-weight: 600; }
+.coll.spent .b { color: var(--text-dim); }
+
+/* ==========================================================================
+   PALETTE
+   ========================================================================== */
+
+.pal { border: 1px solid var(--hair); border-radius: var(--r-control); overflow: hidden; }
+.pal .phead, .pal .prow {
+  display: grid; grid-template-columns: 62px 132px 92px 190px 108px 1fr; gap: var(--u3);
+  align-items: center; padding: 6px var(--u3); border-bottom: 1px solid var(--hair-2);
+}
+.pal .phead { background: var(--raised); border-bottom: 1px solid var(--hair);
+              box-shadow: inset 0 1px 0 var(--rake); }
+.pal .phead span { font-family: var(--mono); font-size: 10px; letter-spacing: 0.09em;
+                   text-transform: uppercase; color: var(--text-faint); }
+.pal .prow { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.pal .prow .sw { height: 26px; border-radius: 2px; border: 1px solid var(--border);
+                 box-shadow: inset 0 1px 0 var(--rake); }
+.pal .prow .tok { color: var(--text); }
+.pal .prow .ratio { text-align: right; }
+.pal .prow .use { color: var(--text-dim); font-family: var(--prop); font-size: 12.5px; }
+.pal .sub { padding: var(--u2) var(--u3); background: var(--raised); border-bottom: 1px solid var(--hair);
+            font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+            text-transform: uppercase; color: var(--accent); }
+
+.kill { margin-top: var(--u8); border: 1px solid var(--held); border-radius: var(--r-control); }
+.kill .kh { padding: var(--u2) var(--u3); border-bottom: 1px solid var(--hair);
+            font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+            text-transform: uppercase; color: var(--degraded); }
+.kill .krow { display: grid; grid-template-columns: 220px 1fr 200px; gap: var(--u3);
+              padding: 5px var(--u3); border-bottom: 1px solid var(--hair-2);
+              font-family: var(--mono); font-size: 11.5px; }
+.kill .krow:last-child { border-bottom: 0; }
+.kill .krow .v { color: var(--text-dim); text-decoration: line-through; text-decoration-thickness: 1px; }
+.kill .krow .w { color: var(--text-dim); font-family: var(--prop); font-size: 12.5px; text-decoration: none; }
+.kill .krow .at { color: var(--text-faint); text-align: right; }
+.kill .foot { padding: var(--u2) var(--u3); border-top: 1px solid var(--hair);
+              font-size: 12.5px; color: var(--text-dim); }
+
+/* ==========================================================================
+   MARK
+   ========================================================================== */
+
+.markwrap { display: grid; grid-template-columns: minmax(300px, 460px) 1fr; gap: var(--u12);
+            align-items: start; }
+.spec-drawing { width: 100%; height: auto; display: block;
+                border: 1px solid var(--hair); border-radius: var(--r-control);
+                background: var(--raised); }
+.mark-notes { }
+.mark-notes h4 { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+                 text-transform: uppercase; margin: 0 0 var(--u2); }
+.mark-notes ul { margin: 0 0 var(--u6); padding-left: 15px; color: var(--text-dim); font-size: 13px; }
+.mark-notes li { margin-bottom: 4px; }
+.mark-notes li b { color: var(--text); font-weight: 600; }
+
+.states { display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--u3); margin-top: var(--u6); }
+.state-cell { border: 1px solid var(--hair); border-radius: var(--r-control); overflow: hidden;
+              background: var(--raised); box-shadow: inset 0 1px 0 var(--rake); }
+.state-cell .big { display: flex; align-items: center; justify-content: center; padding: var(--u4) 0 var(--u2); }
+.state-cell .big svg { width: 72px; height: 72px; }
+.state-cell .cap { border-top: 1px solid var(--hair); background: var(--ground);
+                   padding: var(--u2) var(--u3) var(--u3); }
+.state-cell .cap .tag { display: block; color: var(--accent); margin-bottom: 3px; }
+.state-cell .cap p { margin: 0; font-size: 12px; color: var(--text-dim); }
+
+.tray { margin-top: var(--u6); display: flex; align-items: center; gap: var(--u4);
+        border: 1px solid var(--hair); border-radius: var(--r-control);
+        background: var(--overlay); padding: var(--u3) var(--u4);
+        box-shadow: inset 0 1px 0 var(--rake); }
+.tray .slot { display: flex; align-items: center; gap: var(--u2); }
+.tray .slot svg { width: 22px; height: 22px; }
+.tray .slot span { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em;
+                   text-transform: uppercase; color: var(--text-dim); }
+.tray .note { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
+
+.antilist { margin-top: var(--u8); border-top: 1px solid var(--hair); padding-top: var(--u3); }
+.antilist .tag { display: block; margin-bottom: var(--u2); }
+.antilist .items { display: flex; flex-wrap: wrap; gap: 6px; }
+.antilist .items span { font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+                        border: 1px solid var(--border); border-radius: 2px; padding: 2px 6px;
+                        text-decoration: line-through; text-decoration-thickness: 1px;
+                        text-decoration-color: var(--text-faint); }
+
+/* ==========================================================================
+   CONVERGENCE + PMI + DIRECTION
+   ========================================================================== */
+
+.clusters { display: grid; gap: var(--u2); }
+.cluster { display: grid; grid-template-columns: 44px 168px 1fr 172px; gap: var(--u3);
+           align-items: start; border: 1px solid var(--hair); border-radius: var(--r-control);
+           padding: var(--u3); background: var(--raised); box-shadow: inset 0 1px 0 var(--rake); }
+.cluster .n { font-family: var(--mono); font-size: 20px; color: var(--text-faint); line-height: 1; }
+.cluster h4 { font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+              text-transform: uppercase; margin: 0; color: var(--accent); }
+.cluster .members { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.cluster .supplies { font-size: 12.5px; color: var(--text); }
+.cluster.fused { border-color: var(--accent); }
+.cluster.fused .n { color: var(--accent); }
+
+.throughline { margin: var(--u6) 0 0; border-left: 2px solid var(--accent); padding-left: var(--u4);
+               font-size: 15px; max-width: 74ch; }
+.throughline .tag { display: block; margin-bottom: var(--u1); }
+
+.pmi { display: grid; grid-template-columns: repeat(auto-fit, minmax(276px, 1fr)); gap: var(--u4);
+       margin-top: var(--u8); }
+.pmi .col { border-top: 2px solid var(--border); padding-top: var(--u3); }
+.pmi .col.p { border-top-color: var(--accent); }
+.pmi .col.mi { border-top-color: var(--held); }
+.pmi .col.i { border-top-color: var(--text-dim); }
+.pmi .col h4 { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+               text-transform: uppercase; margin: 0 0 var(--u3); }
+.pmi .item { margin-bottom: var(--u3); font-size: 13px; color: var(--text); }
+.pmi .item .mit { display: block; margin-top: 3px; font-size: 12.5px; color: var(--text-dim); }
+.pmi .item .mit b { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+                    text-transform: uppercase; color: var(--degraded); font-weight: 500; }
+
+.direction { margin-top: var(--u12); border: 1px solid var(--border); border-left: 2px solid var(--accent);
+             border-radius: var(--r-control); background: var(--raised);
+             box-shadow: inset 0 1px 0 var(--rake); overflow: hidden; }
+.direction .dh { display: flex; align-items: baseline; gap: var(--u3);
+                 padding: var(--u2) var(--u4); border-bottom: 1px solid var(--hair); }
+.direction .dh .fill { flex: 1; height: 1px; background: var(--hair); }
+.direction .db { padding: var(--u8) var(--u4) var(--u6); display: grid;
+                 grid-template-columns: 108px 1fr; gap: var(--u6); align-items: start; }
+.direction h2 { font-family: var(--mono); font-weight: 500;
+                font-size: clamp(26px, 5vw, 52px); line-height: 1.02; letter-spacing: -0.01em;
+                margin: 0 0 var(--u4); color: var(--text); }
+.direction h2 em { color: var(--accent); font-style: normal; }
+.direction .props { display: grid; gap: 0; border-top: 1px solid var(--hair); }
+.direction .props .r { display: grid; grid-template-columns: 128px 1fr; gap: var(--u3);
+                       padding: 7px 0; border-bottom: 1px solid var(--hair-2); }
+.direction .props .r .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+                          text-transform: uppercase; color: var(--text-faint); }
+.direction .props .r .v { font-size: 13.5px; color: var(--text); }
+.direction .props .r .v .m { color: var(--accent); }
+.direction .glyph { display: flex; justify-content: center; }
+.direction .glyph svg { width: 96px; height: 96px; }
+
+/* refusals + risk */
+.refusals { display: grid; grid-template-columns: repeat(auto-fit, minmax(276px, 1fr)); gap: var(--u4); }
+.refusal { border: 1px solid var(--border); border-radius: var(--r-control); padding: var(--u4);
+           background: var(--ground); }
+.refusal .n { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: 0.1em; }
+.refusal h4 { font-family: var(--prop); font-size: 17px; font-weight: 600; letter-spacing: -0.006em;
+              margin: var(--u2) 0 var(--u2); }
+.refusal p { margin: 0; font-size: 13px; color: var(--text-dim); }
+.refusal .grep { display: block; margin-top: var(--u3); font-family: var(--mono); font-size: 10.5px;
+                 color: var(--text-faint); border-top: 1px solid var(--hair-2); padding-top: 6px; }
+
+.risk { margin-top: var(--u8); border: 1px solid var(--held); border-radius: var(--r-control); }
+.risk .rh { padding: var(--u2) var(--u4); border-bottom: 1px solid var(--hair);
+            font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+            text-transform: uppercase; color: var(--degraded); }
+.risk .rb { padding: var(--u4); display: grid; grid-template-columns: 132px 1fr; gap: var(--u6);
+            align-items: center; }
+.risk .pct { font-family: var(--mono); font-size: 46px; line-height: 1; color: var(--text); }
+.risk .pct small { display: block; font-size: 10px; letter-spacing: 0.1em; color: var(--text-faint);
+                   margin-top: 6px; }
+.risk p { margin: 0; font-size: 14px; color: var(--text); max-width: 70ch; }
+
+footer { margin-top: var(--u16); border-top: 1px solid var(--hair); padding-top: var(--u4); }
+footer .audit { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--u4); }
+footer .audit span { font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+                     color: var(--text-dim); border: 1px solid var(--border); border-radius: 2px;
+                     padding: 2px 6px; }
+footer .audit span b { color: var(--accent); font-weight: 500; }
+footer .seq { font-size: 13px; color: var(--text-dim); max-width: 78ch; margin: 0 0 var(--u4); }
+footer .colophon { display: flex; flex-wrap: wrap; gap: var(--u4);
+                   font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+
+@media (max-width: 880px) {
+  .index { grid-template-columns: 1fr; }
+  .markwrap { grid-template-columns: 1fr; gap: var(--u8); }
+  .states { grid-template-columns: repeat(2, 1fr); }
+  .ledger .head, .ledger .lrow { grid-template-columns: 26px 1fr; gap: var(--u2) var(--u3); }
+  .ledger .head span:nth-child(3), .ledger .lrow .rule { grid-column: 2; }
+  .ledger .lrow .worst { border-right: 0; padding-right: 0; }
+  .reg-row, .coll { grid-template-columns: 1fr; }
+  .flip { grid-template-columns: 1fr; }
+  .flip .was { border-right: 0; border-bottom: 1px solid var(--hair); }
+  .flip .pivot { border-right: 0; border-bottom: 1px solid var(--hair); height: 26px; }
+  .pal .phead, .pal .prow { grid-template-columns: 48px 118px 84px 1fr; }
+  .pal .phead span:nth-child(5), .pal .phead span:nth-child(6),
+  .pal .prow .ratio, .pal .prow .use { display: none; }
+  .cluster { grid-template-columns: 32px 1fr; }
+  .direction .db, .risk .rb { grid-template-columns: 1fr; }
+  .spec { grid-template-columns: 1fr; }
+  .spec .no { border-right: 0; border-bottom: 1px solid var(--hair); padding: var(--u2) var(--u3); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a, .gsbtn { transition: color 120ms ease-out, background-color 120ms ease-out; }
+}
+</style>
+</head>
+<body>
+
+<svg class="grain" aria-hidden="true" focusable="false" preserveAspectRatio="none">
+  <filter id="tooth">
+    <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="3" stitchTiles="stitch"/>
+    <feColorMatrix type="saturate" values="0"/>
+  </filter>
+  <rect width="100%" height="100%" filter="url(#tooth)"/>
+</svg>
+
+<div class="wrap">
+
+<!-- ===================== MASTHEAD ===================== -->
+<header class="masthead">
+  <div class="over">
+    <span class="tag">KEEPER</span>
+    <span class="tag">/</span>
+    <span class="tag">BRAINSTORMING SESSION</span>
+    <span class="tag">/</span>
+    <span class="tag">2026-08-11</span>
+    <button class="gsbtn" id="gs" type="button" aria-pressed="false">Greyscale test</button>
+  </div>
+
+  <h1><span class="lower">keeper</span>&rsquo;s visual identity and UI direction</h1>
+
+  <p class="goal">Goal: a direction decisive enough to write DESIGN.md from &mdash; one organising
+  metaphor, what it refuses, what makes it recognisably this app.</p>
+
+  <div class="meta">
+    <div>
+      <span class="tag k">Stance</span>
+      <span class="v">Ideate for me (autonomous)</span>
+    </div>
+    <div>
+      <span class="tag k">Human in the loop</span>
+      <span class="v">none this run</span>
+    </div>
+    <div>
+      <span class="tag k">Divergence spent</span>
+      <span class="v">~124 ideas / 8 techniques</span>
+    </div>
+    <div>
+      <span class="tag k">Convergence</span>
+      <span class="v">affinity clustering &rarr; PMI</span>
+    </div>
+    <div>
+      <span class="tag k">Status</span>
+      <span class="v acc">complete</span>
+    </div>
+  </div>
+
+  <p class="lede" style="margin-top:var(--u6)">Grounding read before the first technique:
+    <span class="cite">src/index.css</span> (tokens),
+    <span class="cite">src/components/layout/sidebar-pane.tsx</span> (nav),
+    <span class="cite">src/components/layout/panel-strip.tsx</span> (copy voice),
+    <span class="cite">src-tauri/crates/keeper/icons/128x128.png</span> (current mark),
+    <span class="cite">/workspace/tgsite/DESIGN.md</span> (format standard).
+  </p>
+
+  <nav class="index" aria-label="The eight techniques">
+    <a href="#t1"><span class="n">T1</span><span class="t">Metaphor Mapping</span><span class="d">11 candidates</span></a>
+    <a href="#t2"><span class="n">T2</span><span class="t">Alien Anthropologist</span><span class="d">12 specimens</span></a>
+    <a href="#t3"><span class="n">T3</span><span class="t">Concept Blending</span><span class="d">11 blends</span></a>
+    <a href="#t4"><span class="n">T4</span><span class="t">Assumption Reversal</span><span class="d">4 reversals</span></a>
+    <a href="#t5"><span class="n">T5</span><span class="t">Sensory Exploration</span><span class="d">9 materials</span></a>
+    <a href="#t6"><span class="n">T6</span><span class="t">TRIZ Contradiction</span><span class="d">3 separations</span></a>
+    <a href="#t7"><span class="n">T7</span><span class="t">Worst Possible Idea</span><span class="d">17 worst moves</span></a>
+    <a href="#t8"><span class="n">T8</span><span class="t">Forced Relationships</span><span class="d">11 collisions</span></a>
+  </nav>
+</header>
+
+<!-- ===================== T1 METAPHOR MAPPING ===================== -->
+<section id="t1">
+  <div class="strip">
+    <span class="idx">T1</span>
+    <span class="name">Metaphor Mapping</span>
+    <span class="fill"></span>
+    <span class="count">11 candidates</span>
+    <span class="state">1 survivor</span>
+  </div>
+
+  <p class="lede">Eleven rooms were tried on. Ten are struck. The decisive one was not a room at all
+  at first: <b>keeper is a museum job title</b> &mdash; Keeper of Manuscripts, Keeper of Prints and
+  Drawings, the curator-custodian of a collection who also maintains its register.</p>
+
+  <div class="register">
+    <div class="reg-row rejected"><span class="v">REJECT</span><span class="cand">vault</span><span class="note">Literal fit for local-first, but a vault is for storing, not working. A vault you sit inside 14h/day is a cell.</span></div>
+    <div class="reg-row rejected"><span class="v">REJECT</span><span class="cand">workshop / bench</span><span class="note">Fits density. The generic maker aesthetic &mdash; wood plus orange &mdash; is a template of its own.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">field station / outpost</span><span class="note">Self-sufficient, off-grid, keeps logs and readings. Maps hard onto local-first, sync, no telemetry.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">instrument</span><span class="note">Oscilloscope, seismograph, sonar. Precision, calibration, one glowing trace on a dark faceplate. Supplies the impressive register.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">darkroom</span><span class="note">A near-black room with one safe light; you do not open the door mid-process. Maps onto privacy, and onto incognito mode literally.</span></div>
+    <div class="reg-row rejected"><span class="v">OWNED</span><span class="cand">terminal</span><span class="note">The obvious pick, and already owned by tgsite (Night Signal). A second terminal identity would make the two products one product.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">cockpit / avionics</span><span class="note">Dense readouts, low-luminance lighting, everything labelled. Density IS the aesthetic there.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">lighthouse keeper</span><span class="note">The name resonates: one person, one light, a nightly log, weather. Solitary and unglamorous in a good way.</span></div>
+    <div class="reg-row rejected"><span class="v">REJECT</span><span class="cand">beekeeper</span><span class="note">A keeper of a colony of workers &mdash; the incoming bots are the colony. But a hex or insect mark says colony, not custody.</span></div>
+    <div class="reg-row held"><span class="v">HOLD</span><span class="cand">gamekeeper</span><span class="note">Walks the boundary of private land, knows every animal, admits no visitors. Exactly the local-first stance.</span></div>
+    <div class="reg-row survivor"><span class="v">SURVIVOR</span><span class="cand">the keeper room</span><span class="note">Not the gallery &mdash; the <b>back-of-house keeper room</b>: trays, labels, accession numbers, raking light, a register with an entry for every object, conservation over display. Galleries are polished, empty and lit for visitors; workrooms are dense, labelled and lit for work. That single distinction settles the impressive-vs-usable fight before it starts.</span></div>
+  </div>
+
+  <div class="ext">
+    <div class="row"><span class="k">accession number</span><span class="v">Every object carries a stable visible address. In keeper that is the real path or id, in mono, always in the same corner. Not decoration &mdash; navigation.</span></div>
+    <div class="row"><span class="k">the label</span><span class="v">A small mono uppercase tag with letterspacing on every tray. Becomes the pane-header grammar across all six surfaces.</span></div>
+    <div class="row"><span class="k">the register</span><span class="v">Sync history and the recordings archive as dated one-line entries, ledger-ruled.</span></div>
+    <div class="row"><span class="k">condition report</span><span class="v">Bridge health, sync health, drive present or absent. A condition report is terse and never celebratory.</span></div>
+    <div class="row"><span class="k">provenance</span><span class="v">Git history is provenance. Show it as chain-of-custody, not as a devtool.</span></div>
+    <div class="row"><span class="k">raking light</span><span class="v">Conservators light objects from a low angle to reveal surface. Translates to depth by a single 1px top-edge highlight, never a drop shadow on inline elements.</span></div>
+    <div class="row"><span class="k">reversibility</span><span class="v">A conservator only makes interventions that can be undone. keeper never mutates files destructively; no irreversible action without a named undo.</span></div>
+    <div class="row"><span class="k">trays and drawers</span><span class="v">The pane and panel strip IS the tray rack. Panels slide, are labelled, and are never modal.</span></div>
+  </div>
+
+  <p class="lede" style="margin-top:var(--u6)">The blend held in tension:
+  <b>keeper-room</b> (custody, labels, register, raking light) <span class="m dim">&times;</span>
+  <b>instrument panel</b> (readouts, calibration ticks, one lit lamp).
+  Custody supplies the meaning; the instrument supplies the impressiveness.</p>
+</section>
+
+<!-- ===================== T2 ALIEN ANTHROPOLOGIST ===================== -->
+<section id="t2">
+  <div class="strip">
+    <span class="idx">T2</span>
+    <span class="name">Alien Anthropologist</span>
+    <span class="fill"></span>
+    <span class="count">12 specimens</span>
+    <span class="state">voice found</span>
+  </div>
+
+  <p class="lede">Narrate what is strange about the app <b>as it actually ships</b>. Each finding is a
+  specimen: an observation, and the exact place in the tree where it can be verified.</p>
+
+  <div class="specimens">
+    <div class="spec">
+      <div class="no">SP-001</div>
+      <div class="body">
+        <p class="obs">Every neutral in the theme has chroma exactly <em>0</em> while the brand is a green.
+        The app is a greyscale app wearing one green button.</p>
+        <p class="strings"><span class="chip">src/index.css:75-89</span><span class="chip">src/index.css:155-169</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-002</div>
+      <div class="body">
+        <p class="obs">The dark theme carries <span class="m">--sidebar-primary: oklch(0.488 0.243 264.376)</span>
+        &mdash; a violet-blue nobody chose. It is the shadcn default, still sitting in the file.
+        <em>The theme has an author it has never met.</em></p>
+        <p class="strings"><span class="chip">src/index.css:190</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-003</div>
+      <div class="body">
+        <p class="obs">The one semantic colour that is not grey is <span class="m">--incognito</span>
+        <span class="m">#6d28d9</span> / <span class="m">#a78bfa</span>. Of all hues available, privacy was
+        painted the exact violet every AI product of 2026 uses.</p>
+        <p class="strings"><span class="chip">src/index.css:92</span><span class="chip">src/index.css:172</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-004</div>
+      <div class="body">
+        <p class="obs"><span class="m">--background</span> is <span class="m">oklch(1 0 0)</span> &mdash; pure white.
+        No tool someone stares at for fourteen hours should have a pure white ground.</p>
+        <p class="strings"><span class="chip">src/index.css:67</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-005</div>
+      <div class="body">
+        <p class="obs"><span class="m">--radius</span> is <span class="m">10px</span> on a surface whose list rows are
+        ~28px tall. The corner is a third of the row. <em>The app is rounder than it is tall.</em></p>
+        <p class="strings"><span class="chip">src/index.css:109</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-006</div>
+      <div class="body">
+        <p class="obs"><span class="m">--font-heading</span> is literally <span class="m">var(--font-sans)</span>, and
+        <span class="m">--font-sans</span> is the OS UI stack. There is no heading voice, no machine voice,
+        no typographic opinion at all.</p>
+        <p class="strings"><span class="chip">src/index.css:8</span><span class="chip">src/index.css:9</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-007</div>
+      <div class="body">
+        <p class="obs"><span class="m">chart-1..5</span> are five greys, so DATA has no colour, while a bridge badge
+        does. Colour is spent on chrome and withheld from content &mdash; exactly backwards.</p>
+        <p class="strings"><span class="chip">src/index.css:85-89</span><span class="chip">src/index.css:95-97</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-008</div>
+      <div class="body">
+        <p class="obs">The only saturated palette in the app is the 8-hue account wheel, evenly spaced round the
+        circle. It is a rainbow by arithmetic, not by choice: hues 130 and 170 collide with the brand green,
+        while 275 and 320 are the banned violet-magenta.</p>
+        <p class="strings"><span class="chip">src/index.css:136-143</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-009</div>
+      <div class="body">
+        <p class="obs">The app icon is a white speech bubble on a green rounded square. The product is chat plus
+        notes plus files plus recordings plus sync. <em>The mark describes one sixth of the app, and describes it
+        in the visual language of every messenger ever shipped.</em></p>
+        <p class="strings"><span class="chip">src-tauri/crates/keeper/icons/128x128.png</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-010</div>
+      <div class="body">
+        <p class="obs">The nav is thirteen lucide imports &mdash; MessageSquare, Archive, Inbox, Radio, Video, Film,
+        FolderSync, FolderTree, NotebookPen, Settings. The same glyph set as every other product of the era,
+        at the same stroke weight.</p>
+        <p class="strings"><span class="chip">src/components/layout/sidebar-pane.tsx:1-15</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-011</div>
+      <div class="body">
+        <p class="obs">Up to ten nav rows, all icon plus label, all equal weight. Nothing in the chrome says which
+        surface is THE surface, so the app has no centre of gravity.</p>
+        <p class="strings"><span class="chip">src/components/layout/sidebar-pane.tsx:49-83</span></p>
+      </div>
+    </div>
+    <div class="spec">
+      <div class="no">SP-012</div>
+      <div class="body">
+        <p class="obs">The app is capability-honest: entries are <em>absent</em>, not disabled. A strong product
+        principle with no visual expression yet. Absence should look deliberate, not like a gap.</p>
+        <p class="strings"><span class="chip">src/components/layout/sidebar-pane.tsx:43-48</span><span class="chip">src/components/layout/sidebar-pane.tsx:77-81</span></p>
+      </div>
+    </div>
+
+    <div class="spec find">
+      <div class="no">THE REAL FIND</div>
+      <div class="body">
+        <p class="obs"><span class="lab">keeper already has a voice &mdash; in its prose</span>
+        <span class="m dim">panel-strip.tsx:49</span> &ldquo;Nothing is open here yet. Click a file to open it.&rdquo;
+        <span class="m dim">:77</span> &ldquo;The folder this file was in is no longer set up in keeper.&rdquo;
+        <span class="m dim">:91</span> &ldquo;keeper cannot show a recording in a panel yet.&rdquo;
+        <span class="m dim">:121</span> names the missing file. Full sentences, lowercase brand, no error codes,
+        no marketing adjectives.</p>
+        <p class="strings"><span class="chip">src/components/layout/panel-strip.tsx:49</span><span class="chip">src/components/layout/panel-strip.tsx:77</span><span class="chip">src/components/layout/panel-strip.tsx:91</span><span class="chip">src/components/layout/panel-strip.tsx:121</span></p>
+      </div>
+    </div>
+    <div class="spec find">
+      <div class="no">SO</div>
+      <div class="body">
+        <p class="obs"><span class="lab">the brief, restated</span>
+        The design brief is not &ldquo;invent a personality&rdquo;. It is: <b>give the pixels the voice the copy
+        already has.</b> Terse, exact, unshowy, never cheerful, always names the specific thing. That is the
+        whole aesthetic spec.</p>
+        <p class="obs" style="margin-top:var(--u2)">Corollary: the identity must be checkable the way the copy is
+        consistent. Anything that cannot be enforced by a script will drift back to shadcn defaults inside two
+        epics &mdash; the violet at <span class="m">src/index.css:190</span> is the proof.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== T3 CONCEPT BLENDING ===================== -->
+<section id="t3">
+  <div class="strip">
+    <span class="idx">T3</span>
+    <span class="name">Concept Blending</span>
+    <span class="fill"></span>
+    <span class="count">11 blends</span>
+    <span class="state">mark decided</span>
+  </div>
+
+  <p class="lede">One term fixed &mdash; <span class="m">ROBOT HEAD</span> &mdash; collided with ten others.
+  Four survive, and they compose into a single object.</p>
+
+  <div class="blends">
+    <div class="blend out">
+      <span class="op">DEFAULT</span>
+      <h4>rounded square + two dot eyes + antenna</h4>
+      <p>The Claude / ChatGPT / every-AI-startup face. It is the speech bubble again, one trend later.</p>
+      <span class="verdict">refused</span>
+    </div>
+    <div class="blend keep">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>helmet visor</h4>
+      <p>One horizontal slot, no eyes, no mouth. A visor has no expression and cannot be chirpy. Reads as robot instantly.</p>
+      <span class="verdict">kept &mdash; the geometry</span>
+    </div>
+    <div class="blend keep">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>instrument faceplate</h4>
+      <p>The visor is not an eye slot, it is a READOUT. The head is a small dark panel with one lit band.</p>
+      <span class="verdict">kept &mdash; the state display</span>
+    </div>
+    <div class="blend keep">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>lighthouse lantern room</h4>
+      <p>The head IS the lamp. Its light is the accent. Merges mark and accent colour into one story.</p>
+      <span class="verdict">kept &mdash; the lamp</span>
+    </div>
+    <div class="blend keep">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>strike plate</h4>
+      <p>&ldquo;keeper&rdquo; is also hardware &mdash; the metal plate a bolt slides into, and the loop that holds a belt tail. Both are the part that HOLDS.</p>
+      <span class="verdict">kept &mdash; the notch</span>
+    </div>
+    <div class="blend out">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>accession label</h4>
+      <p>A head with a tag &mdash; too fussy at 16px. Idea kept, spent on the UI label grammar instead.</p>
+      <span class="verdict">deferred to the UI</span>
+    </div>
+    <div class="blend out">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>Stevenson screen</h4>
+      <p>The louvred white instrument shelter at a weather station: a slotted head. Beautiful, but louvres die below 32px.</p>
+      <span class="verdict">out on scale</span>
+    </div>
+    <div class="blend">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>pane</h4>
+      <p>The head is the same rectangle as the app&rsquo;s panels, so the mark is literally the app&rsquo;s primitive at 1:1.</p>
+      <span class="verdict">absorbed into the geometry</span>
+    </div>
+    <div class="blend out">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>bracket pair</h4>
+      <p>A head drawn as <span class="m">[ ]</span> with a rule between. Sets beautifully in mono, but too clever and unreadable at 32px.</p>
+      <span class="verdict">out on legibility</span>
+    </div>
+    <div class="blend out">
+      <span class="op">ROBOT HEAD &times;</span>
+      <h4>Easter Island moai</h4>
+      <p>Monolithic, silent, standing watch. Impressive and un-chirpy, but too mythic for a utility.</p>
+      <span class="verdict">out on register</span>
+    </div>
+    <div class="blend out">
+      <span class="op">REJECTED OUTRIGHT</span>
+      <h4>leaf / seed &mdash; hexagon &mdash; bee</h4>
+      <p>Leaf and seed: soft, ecological, wrong stance. Hexagon: crypto. Bee: charming, but a hex or insect mark says colony, not custody.</p>
+      <span class="verdict">refused</span>
+    </div>
+  </div>
+
+  <div class="throughline" style="margin-top:var(--u8)">
+    <span class="tag">WHY THE MARK HAS NO FACE</span>
+    keeper&rsquo;s position is that your AI is a <b>kept instrument, not a friend</b>. Faces promise
+    personality; keeper promises custody. The refusal to draw eyes IS the brand statement, and it
+    pre-answers the bots surface.
+  </div>
+</section>
+
+<!-- ===================== T4 ASSUMPTION REVERSAL ===================== -->
+<section id="t4">
+  <div class="strip">
+    <span class="idx">T4</span>
+    <span class="name">Assumption Reversal</span>
+    <span class="fill"></span>
+    <span class="count">4 reversals</span>
+    <span class="state">green resolved</span>
+  </div>
+
+  <p class="lede">Four assumptions about the colour green, each flipped until it became a rule.</p>
+
+  <div class="flips">
+    <div class="flip">
+      <div class="was">
+        <span class="tag">ASSUMPTION</span>
+        <span class="body">Greenish means terminal phosphor.</span>
+      </div>
+      <div class="pivot" aria-hidden="true">&rarr;</div>
+      <div class="now">
+        <span class="tag">REVERSED</span>
+        Greenish means the green of things that are <b>KEPT</b> &mdash; verdigris on a copper roof, moss on
+        stone, the baize of a desk, the green of a bank ledger, a chalkboard, a museum label,
+        British racing green.
+      </div>
+    </div>
+    <div class="flip">
+      <div class="was">
+        <span class="tag">ASSUMPTION</span>
+        <span class="body">Green must be the accent.</span>
+      </div>
+      <div class="pivot" aria-hidden="true">&rarr;</div>
+      <div class="now">
+        <span class="tag">REVERSED</span>
+        Make green the <b>GROUND</b> &mdash; a green-black surface like baize or a chalkboard. It instantly
+        stops looking like every dark-grey app. Cost, and it is real: keeper is also a file browser with
+        image, PDF and video viewers, and a tinted ground casts on every preview. So the ground must be
+        <b>barely</b> green &mdash; enough chroma to read as material, not enough to colour-cast.
+      </div>
+    </div>
+    <div class="flip">
+      <div class="was">
+        <span class="tag">ASSUMPTION</span>
+        <span class="body">Green means OK / success.</span>
+      </div>
+      <div class="pivot" aria-hidden="true">&rarr;</div>
+      <div class="now">
+        <span class="tag">REVERSED &mdash; THE RULE</span>
+        <b>Green is the brand, therefore green cannot mean OK.</b> Healthy is never coloured: it is a lit
+        neutral lamp plus text-dim. Only degraded (amber) and broken (red) spend colour. This collides
+        head-on with <span class="m">--bridge-healthy #16a34a</span> (<span class="m">src/index.css:95</span>)
+        and <span class="m">--swipe-read</span> mapping to <span class="m">--primary</span>
+        (<span class="m">src/index.css:105</span>) &mdash; so it retires them. Checkable by script.
+        Corollary: <b>colour in keeper only ever marks a deviation or the user&rsquo;s own attention.</b>
+      </div>
+    </div>
+    <div class="flip">
+      <div class="was">
+        <span class="tag">ASSUMPTION</span>
+        <span class="body">Warm greens are unfashionable.</span>
+      </div>
+      <div class="pivot" aria-hidden="true">&rarr;</div>
+      <div class="now">
+        <span class="tag">REVERSED</span>
+        That is the point. Hue <b>130-ish</b> yellow-greens are rare in software and read as material
+        &mdash; lichen, moss, sap &mdash; rather than as digital. Naming it <b>lichen</b> is not a mood word:
+        lichen grows only in clean air, grows slowly, grows on stone, and is used to DATE surfaces.
+        A keeper&rsquo;s organism, and the story survives being said out loud to an engineer.
+      </div>
+    </div>
+  </div>
+
+  <div class="greens">
+    <div class="green-row" style="border-bottom-color:var(--hair)">
+      <span></span>
+      <span class="tag">GREEN REFUSED BY NAME</span>
+      <span class="tag">VALUE</span>
+      <span class="tag">WHY</span>
+    </div>
+    <div class="green-row">
+      <span class="chip" style="background:#00ff00" aria-hidden="true"></span>
+      <span class="nm">phosphor</span>
+      <span class="hx">#00ff00</span>
+      <span class="why">Obvious pick #1 and retro cosplay. tgsite already bans phosphor glow and scanlines for the same reason (<span class="m">DESIGN.md:124</span>).</span>
+    </div>
+    <div class="green-row">
+      <span class="chip" style="background:var(--overlay)" aria-hidden="true"></span>
+      <span class="nm">acid lime / chartreuse</span>
+      <span class="hx">the 2025-26 trend</span>
+      <span class="why">Obvious pick #2. Fashionable now means dated in eighteen months, and template-shaped today.</span>
+    </div>
+    <div class="green-row">
+      <span class="chip" style="background:#10b981" aria-hidden="true"></span>
+      <span class="nm">emerald</span>
+      <span class="hx">#10b981</span>
+      <span class="why">Tailwind emerald-500. Literally the framework default; using it is indistinguishable from not choosing.</span>
+    </div>
+    <div class="green-row">
+      <span class="chip" style="background:#3ecfae" aria-hidden="true"></span>
+      <span class="nm">current dark brand</span>
+      <span class="hx">#3ecfae</span>
+      <span class="why">Not green &mdash; mint/aqua at hue ~175, the fintech-SaaS teal (<span class="m">src/index.css:153</span>). Retire.</span>
+    </div>
+    <div class="green-row">
+      <span class="chip" style="background:#0f6e5c" aria-hidden="true"></span>
+      <span class="nm">current light brand</span>
+      <span class="hx">#0f6e5c</span>
+      <span class="why">A deep teal (<span class="m">src/index.css:73</span>). The app is already teal, not green. Retire.</span>
+    </div>
+  </div>
+
+  <p class="lede" style="margin-top:var(--u6)"><b>Decision: two greens with different jobs</b>, which is
+  exactly the workroom pairing &mdash; a near-black GROUND with a trace of green (the baize) and a bright
+  warm-green LAMP (the accent). Both are computed in the next section.</p>
+
+  <p class="lede">Replacement for the violet incognito: <b>the room goes to safelight.</b> In incognito the
+  accent disappears entirely, everything drops to text-dim, and the pane header carries a 45-degree hatch
+  band. Diegetic to the darkroom, zero purple, and it reads at a glance from across the desk.</p>
+
+  <p class="lede">Account hues stay &mdash; eight accounts genuinely need telling apart &mdash; but pulled off
+  the rainbow: drop violet and magenta, cut chroma, and add a second axis (solid / dashed / double 3px edge
+  bar) so the set survives colour-blindness and monochrome printing.</p>
+</section>
+
+<!-- ===================== T5 SENSORY EXPLORATION ===================== -->
+<section id="t5">
+  <div class="strip">
+    <span class="idx">T5</span>
+    <span class="name">Sensory Exploration</span>
+    <span class="fill"></span>
+    <span class="count">9 materials</span>
+    <span class="state">two faces</span>
+  </div>
+
+  <p class="lede">The material board. Every swatch below is built from the decided tokens, so the board is
+  also the first test of them.</p>
+
+  <div class="materials">
+    <div class="mat">
+      <div class="face anodised"><div class="plate"></div></div>
+      <div class="cap">
+        <span class="tag">TOUCH &mdash; ANODISED ALUMINIUM AND PAPER</span>
+        <p>A flat plate, a hairline edge, one top highlight. Never glass.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face glass-no"><span>backdrop-filter: blur()</span></div>
+      <div class="cap">
+        <span class="tag">TOUCH &mdash; NEVER GLASS</span>
+        <p>Glass is glassmorphism is backdrop-filter is the single most 2026 material there is. Named
+        explicitly because it is the specific temptation of a Tauri app on macOS.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face rake">
+        <div class="lit"><span>FOCUSED</span></div>
+        <div><span>UNFOCUSED</span></div>
+      </div>
+      <div class="cap">
+        <span class="tag">LIGHT &mdash; ONE RAKING SOURCE, UPPER-LEFT</span>
+        <p>Depth is a 1px top-edge highlight at ~7% ink. Drop shadows exist only on things that genuinely
+        float &mdash; dialog, command palette, tooltip, context menu. Nothing inline casts a shadow.
+        Focus is indicated by <b>light</b>: the unfocused pane loses its highlight.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face tooth">
+        <div class="chrome">CHROME &mdash; GRAINED</div>
+        <div class="media">MEDIA &mdash; CLEAN</div>
+      </div>
+      <div class="cap">
+        <span class="tag">TOOTH &mdash; 2% GRAIN, CHROME ONLY</span>
+        <p>Never over a media viewer, a video frame or a PDF, where it would look like a compression
+        artefact. tgsite grains the whole viewport (<span class="m">DESIGN.md:200-203</span>); keeper cannot,
+        and the difference is a real product constraint, not a preference. The right-hand plate above sits
+        above this page&rsquo;s own grain layer to prove it.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face temp">
+        <div class="ok"><span class="btn">DEPOSIT</span><span class="lbl">accent, button-sized</span></div>
+        <div class="bad"><em>accent fill across an area</em></div>
+      </div>
+      <div class="cap">
+        <span class="tag">TEMPERATURE &mdash; STRONG TEA, NOT AN ENERGY DRINK</span>
+        <p>Operationally: no fill ever uses the accent at full chroma across an area larger than a button.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face silent"><div class="waveline"><b></b></div></div>
+      <div class="cap">
+        <span class="tag">SOUND &mdash; SILENT</span>
+        <p>The only audible event in the product is recording start and stop, because that one has legal
+        weight.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face weight">
+        <div class="r hd"><span>NAME</span><span>SIZE</span></div>
+        <div class="hairline"></div>
+        <div class="r"><span>notes/2026-08-11.md</span><span>4.2 kB</span></div>
+        <div class="r"><span>recordings/0413.mkv</span><span>182 MB</span></div>
+        <div class="r"><span>vault/register.jsonl</span><span>91 kB</span></div>
+        <div class="r"><span>files/scan-0007.pdf</span><span>1.4 MB</span></div>
+      </div>
+      <div class="cap">
+        <span class="tag">WEIGHT &mdash; HEAVY CHROME, LIGHT CONTENT</span>
+        <p>Hairline borders at 8-10% opacity and FEW of them. Structure carried by ink hierarchy and
+        alignment, not by boxing everything.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face type">
+        <div class="prose">The folder this file was in is no longer set up in keeper.</div>
+        <div class="machine">files/2026/scan-0007.pdf &middot; 1.4 MB &middot; 14:02:11 &middot; 8f3c1ab</div>
+        <div class="micro">FILES &middot; 214 ITEMS</div>
+      </div>
+      <div class="cap">
+        <span class="tag">TYPE &mdash; TWO FACES</span>
+        <p>One proportional for prose and labels; one MONO for every machine-generated string &mdash; paths,
+        ids, timestamps, byte sizes, durations, hashes, git refs, room ids. keeper is full of these and
+        currently sets them all in the OS UI font (<span class="m">src/index.css:8-9</span>). The mono face
+        is the accession number made visible: the label is printed, the note is handwritten.
+        Micro-label spec: mono, uppercase, ~10px, +0.08em tracking, text-dim &mdash; costs 14px of height and
+        buys the whole identity. <b>Inter is banned by name</b>; keeper shares tgsite&rsquo;s mono family
+        (<span class="m">DESIGN.md:44,60</span>) and takes a different proportional face, so they are siblings,
+        not clones.</p>
+      </div>
+    </div>
+    <div class="mat">
+      <div class="face figs">
+        <div class="r"><span>00:14:02</span><span>1,182</span></div>
+        <div class="r"><span>00:09:47</span><span>96</span></div>
+        <div class="r"><span>01:03:11</span><span>14,003</span></div>
+        <div class="r"><span>00:00:38</span><span>7</span></div>
+        <div class="r"><span>02:41:09</span><span>203</span></div>
+        <div class="r"><span>00:22:55</span><span>1,940</span></div>
+      </div>
+      <div class="cap">
+        <span class="tag">FIGURES &mdash; TABULAR LINING, EVERYWHERE</span>
+        <p>In a tool that shows sizes, durations, counts and dates in columns, tabular figures are
+        simultaneously a usability fix and the most legible signal that someone designed this.</p>
+      </div>
+    </div>
+  </div>
+
+  <p class="lede" style="margin-top:var(--u6)"><b>The one-colour test:</b> print a screenshot in greyscale.
+  If the hierarchy survives, colour is doing its proper job &mdash; marking deviation and attention &mdash;
+  and nothing else. The button in the masthead runs that test on this page.</p>
+</section>
+
+<!-- ===================== PALETTE ===================== -->
+<section id="palette">
+  <div class="strip">
+    <span class="idx">P</span>
+    <span class="name">Computed palette</span>
+    <span class="fill"></span>
+    <span class="count">hue 155 / chroma 0.014</span>
+    <span class="state">text-grade accent</span>
+  </div>
+
+  <p class="lede">Giving every neutral a chroma of <b>0.014</b> instead of 0 is the single cheapest move in
+  the whole redesign. It costs one search-and-replace, and it is the difference between &ldquo;a themed
+  shadcn app&rdquo; and &ldquo;a designed app&rdquo;. All neutrals sit at hue 155 so the greys are the
+  <b>same material</b> as the accent.</p>
+
+  <div class="pal">
+    <div class="phead">
+      <span>SWATCH</span><span>TOKEN</span><span>HEX</span><span>OKLCH</span><span>ON GROUND</span><span>ROLE</span>
+    </div>
+
+    <div class="sub">ground family &mdash; the baize</div>
+    <div class="prow">
+      <span class="sw" style="background:#0c120e"></span>
+      <span class="tok">--ground</span><span>#0c120e</span><span>oklch(0.174 0.012 156)</span>
+      <span class="ratio">&mdash;</span><span class="use">The room. Near-black with a trace of green.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#171e19"></span>
+      <span class="tok">--raised</span><span>#171e19</span><span>oklch(0.226 0.014 154)</span>
+      <span class="ratio">1.12:1</span><span class="use">Trays, pane headers, status band.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#222a25"></span>
+      <span class="tok">--overlay</span><span>#222a25</span><span>oklch(0.275 0.014 158)</span>
+      <span class="ratio">1.29:1</span><span class="use">Floating layers: dialog, palette, menu.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#2d3530"></span>
+      <span class="tok">--border</span><span>#2d3530</span><span>oklch(0.320 0.014 158)</span>
+      <span class="ratio">1.50:1</span><span class="use">Hairlines and calibration ticks.</span>
+    </div>
+
+    <div class="sub">ink</div>
+    <div class="prow">
+      <span class="sw" style="background:#e1e9e2"></span>
+      <span class="tok">--text</span><span>#e1e9e2</span><span>oklch(0.926 0.013 149)</span>
+      <span class="ratio">15.3:1</span><span class="use">Content and headings. Never pure white.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#99a19a"></span>
+      <span class="tok">--text-dim</span><span>#99a19a</span><span>oklch(0.700 0.014 149)</span>
+      <span class="ratio">7.14:1</span><span class="use">Legally carries every timestamp, path and count.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#636b65"></span>
+      <span class="tok">--text-faint</span><span>#636b65</span><span>oklch(0.519 0.013 153)</span>
+      <span class="ratio">3.45:1</span><span class="use">Decorative only. Never information.</span>
+    </div>
+
+    <div class="sub">the lamp &mdash; one accent, text-grade</div>
+    <div class="prow">
+      <span class="sw" style="background:#99d267"></span>
+      <span class="tok">--accent</span><span>#99d267</span><span>oklch(0.80 0.15 132)</span>
+      <span class="ratio">10.62:1</span><span class="use"><b>lichen.</b> Text-grade, not just decoration.</span>
+    </div>
+
+    <div class="sub">paper theme &mdash; the same room by daylight, not a second design</div>
+    <div class="prow">
+      <span class="sw" style="background:#f4f8f3"></span>
+      <span class="tok">--paper</span><span>#f4f8f3</span><span>oklch(0.975 0.008 139)</span>
+      <span class="ratio">&mdash;</span><span class="use">Ground. Paper, not white.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#eaeee9"></span>
+      <span class="tok">--paper-raised</span><span>#eaeee9</span><span>oklch(0.945 0.008 139)</span>
+      <span class="ratio">&mdash;</span><span class="use">Trays on paper.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#131a14"></span>
+      <span class="tok">--paper-ink</span><span>#131a14</span><span>oklch(0.208 0.016 149)</span>
+      <span class="ratio">16.5:1</span><span class="use">On paper. Never pure black.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#396d0a"></span>
+      <span class="tok">--paper-accent</span><span>#396d0a</span><span>oklch(0.480 0.135 135)</span>
+      <span class="ratio">5.81:1</span><span class="use">Accent deepened for paper.</span>
+    </div>
+
+    <div class="sub">status only &mdash; colour marks deviation, never health</div>
+    <div class="prow">
+      <span class="sw" style="background:#b45309"></span>
+      <span class="tok">--held</span><span>#b45309</span><span>oklch(0.555 0.146 49)</span>
+      <span class="ratio">3.77:1</span><span class="use">Held. Amber is tgsite&rsquo;s brand colour, so keeper takes it only as status (<span class="m">src/index.css:90</span>).</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:#d97706"></span>
+      <span class="tok">--degraded</span><span>#d97706</span><span>oklch(0.666 0.157 58)</span>
+      <span class="ratio">5.95:1</span><span class="use">Degraded (<span class="m">src/index.css:96</span>). Never a brand.</span>
+    </div>
+    <div class="prow">
+      <span class="sw" style="background:var(--overlay); border-style:dashed"></span>
+      <span class="tok">--recording-red</span><span>src/index.css:94</span><span>&mdash;</span>
+      <span class="ratio">&mdash;</span><span class="use"><b>Red budget:</b> red appears in exactly two roles &mdash; the recording lamp and destructive confirmation. Nowhere else, ever (keeper&rsquo;s version of <span class="m">DESIGN.md:138-141</span>). Not swatched here because red is not part of the identity.</span>
+    </div>
+  </div>
+
+  <div class="kill">
+    <div class="kh">Exterminated by name &mdash; five instances of violet in the codebase</div>
+    <div class="krow"><span class="v">--incognito #6d28d9</span><span class="w">Privacy painted the exact violet every AI product of 2026 uses. Replaced by safelight.</span><span class="at">src/index.css:92</span></div>
+    <div class="krow"><span class="v">--incognito #a78bfa</span><span class="w">Dark-theme pair of the same. Replaced by safelight.</span><span class="at">src/index.css:172</span></div>
+    <div class="krow"><span class="v">--sidebar-primary oklch(0.488 0.243 264.376)</span><span class="w">A violet-blue nobody chose: the shadcn default, unused, still in the file.</span><span class="at">src/index.css:190</span></div>
+    <div class="krow"><span class="v">--account-hue-5 (275)</span><span class="w">Rainbow-by-arithmetic violet. Dropped from the wheel.</span><span class="at">src/index.css:141, :203</span></div>
+    <div class="krow"><span class="v">--account-hue-6 (320)</span><span class="w">Rainbow-by-arithmetic magenta. Dropped from the wheel.</span><span class="at">src/index.css:142, :204</span></div>
+    <div class="krow"><span class="v">--bridge-healthy #16a34a</span><span class="w">Not violet, but retired all the same: green is the brand, therefore green cannot mean OK.</span><span class="at">src/index.css:95</span></div>
+    <div class="foot">These are printed here as <b>strings, never as swatches</b>. Rendering the violet would break
+    the first binding refusal on the very page that states it.</div>
+  </div>
+</section>
+
+<!-- ===================== MARK ===================== -->
+<section id="mark">
+  <div class="strip">
+    <span class="idx">M</span>
+    <span class="name">The mark</span>
+    <span class="fill"></span>
+    <span class="count">24 grid / stroke 1.25</span>
+    <span class="state">visor = state display</span>
+  </div>
+
+  <p class="lede"><b>A visored sentinel head</b> &mdash; squared, slightly wider than tall, near-square
+  corners, ONE horizontal visor slot, no eyes, no mouth, no antenna, no neck. The visor is the only place
+  the accent appears, so the rest is a single flat shape &mdash; which is exactly what a macOS template
+  tray icon needs.</p>
+
+  <div class="markwrap">
+    <svg class="spec-drawing" viewBox="0 0 232 186" role="img"
+         aria-label="Specification drawing of the keeper mark on a 24 unit grid: a squared head 20 by 16 units with 2 unit corners, a 4.5 by 4.5 unit notch bitten out of the upper left, and a 12 by 2.5 unit horizontal visor slot.">
+      <g stroke="#2d3530" stroke-width="1" fill="none">
+        <!-- 24 grid, 4-unit intervals, unit = 6px, origin 44,18 -->
+        <path d="M44 18 H188 M44 42 H188 M44 66 H188 M44 90 H188 M44 114 H188 M44 138 H188 M44 162 H188"/>
+        <path d="M44 18 V162 M68 18 V162 M92 18 V162 M116 18 V162 M140 18 V162 M164 18 V162 M188 18 V162"/>
+      </g>
+
+      <!-- the head: 24-grid path, scaled x6, translated to grid origin -->
+      <g transform="translate(44 18) scale(6)">
+        <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z"
+              fill="#222a25" stroke="#636b65" stroke-width="0.2083" vector-effect="non-scaling-stroke"/>
+        <rect x="6" y="11.5" width="12" height="2.5" rx="0.4" fill="#99d267"/>
+      </g>
+
+      <!-- annotations -->
+      <g fill="#636b65" font-family="ui-monospace, monospace" font-size="8" letter-spacing="0.6">
+        <!-- top width dimension: head spans x = 2..22 grid -->
+        <g stroke="#636b65" stroke-width="1" fill="none">
+          <path d="M56 12 H176"/>
+          <path d="M56 8 V16 M176 8 V16"/>
+        </g>
+        <text x="106" y="8" fill="#99a19a">20u</text>
+
+        <!-- left height dimension: head spans y = 4..20 -->
+        <g stroke="#636b65" stroke-width="1" fill="none">
+          <path d="M36 42 V138"/>
+          <path d="M32 42 H40 M32 138 H40"/>
+        </g>
+        <text x="8" y="93" fill="#99a19a">16u</text>
+
+        <!-- notch leader -->
+        <g stroke="#99d267" stroke-width="1" fill="none">
+          <path d="M62 32 L204 32"/>
+        </g>
+        <text x="196" y="28" text-anchor="end" fill="#99d267">NOTCH 4.5u &times; 4.5u</text>
+        <text x="196" y="42" text-anchor="end">HALLMARK, UPPER-LEFT, PUNCHED</text>
+
+        <!-- visor leader -->
+        <g stroke="#99a19a" stroke-width="1" fill="none">
+          <path d="M116 94 L204 94"/>
+        </g>
+        <text x="196" y="90" text-anchor="end" fill="#e1e9e2">VISOR 12u &times; 2.5u</text>
+        <text x="196" y="104" text-anchor="end">STATE DISPLAY, r0.4u</text>
+
+        <!-- corner radius leader -->
+        <g stroke="#99a19a" stroke-width="1" fill="none">
+          <path d="M176 138 L204 152"/>
+        </g>
+        <text x="196" y="166" text-anchor="end">CORNER r2u ON A 24 GRID</text>
+        <text x="8" y="178">GRID 24 &middot; RULE = 4u</text>
+        <text x="128" y="178">STROKE 1.25 AT 20u FOR RAIL GLYPHS</text>
+      </g>
+    </svg>
+
+    <div class="mark-notes">
+      <h4>Why this shape</h4>
+      <ul>
+        <li><b>The visor is a READOUT, not an eye slot.</b> The head is a small dark panel with one lit band, which ties the mark to the instrument half of the metaphor.</li>
+        <li><b>The head is the app&rsquo;s own primitive.</b> Same rectangle as a pane, at 1:1.</li>
+        <li><b>One asymmetry so it cannot be a template:</b> a single hallmark notch bitten out of the upper-left corner &mdash; the keeper&rsquo;s punch mark on the underside of the object. Repeated exactly once in the UI, as the top-left corner cut of the launch window. One motif, two places, never more.</li>
+        <li><b>No face.</b> Faces promise personality; keeper promises custody.</li>
+        <li><b>Rail glyphs and the mark are ONE custom family</b> drawn on a 20 grid at stroke 1.25 to the mark&rsquo;s geometry. lucide is permitted only below rail level, and never in the same row as a custom glyph.</li>
+      </ul>
+
+      <h4>Killer detail: the visor is a state display</h4>
+      <ul>
+        <li>One glyph carries the whole tray family, and the mark and the status system become the same object.</li>
+        <li>The same four states run across mark, tray, bot list and sync indicator. A bot that is running shows the visor mid-state; a bot that is waiting shows it unlit.</li>
+        <li>These four must be specified <b>before</b> the tray icons are redrawn: the repo already ships <span class="m">tray-idle / tray-sync / tray-recording / tray-error-template.png</span>, and that family is the mark&rsquo;s real production constraint &mdash; it has to survive as a 22px monochrome template.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="states">
+    <div class="state-cell">
+      <div class="big">
+        <svg viewBox="0 0 24 24" role="img" aria-label="Idle: full visor bar.">
+          <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#222a25" stroke="#2d3530" stroke-width="0.25"/>
+          <rect x="6" y="11.5" width="12" height="2.5" rx="0.4" fill="#99d267"/>
+        </svg>
+      </div>
+      <div class="cap"><span class="tag">IDLE</span><p>Full bar. The lamp is lit and steady; nothing is happening and that is the normal state.</p></div>
+    </div>
+    <div class="state-cell">
+      <div class="big">
+        <svg viewBox="0 0 24 24" role="img" aria-label="Syncing: broken visor bar in three segments.">
+          <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#222a25" stroke="#2d3530" stroke-width="0.25"/>
+          <rect x="6" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#99d267"/>
+          <rect x="10.25" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#99d267"/>
+          <rect x="14.5" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#99d267"/>
+        </svg>
+      </div>
+      <div class="cap"><span class="tag">SYNCING</span><p>Broken bar. This is the one animating element permitted on screen at any time.</p></div>
+    </div>
+    <div class="state-cell">
+      <div class="big">
+        <svg viewBox="0 0 24 24" role="img" aria-label="Error: short centred visor bar.">
+          <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#222a25" stroke="#2d3530" stroke-width="0.25"/>
+          <rect x="9.5" y="11.5" width="5" height="2.5" rx="0.4" fill="#99d267"/>
+        </svg>
+      </div>
+      <div class="cap"><span class="tag">ERROR</span><p>Short centred bar. The lamp narrows; the copy names the specific thing that failed.</p></div>
+    </div>
+    <div class="state-cell">
+      <div class="big">
+        <svg viewBox="0 0 24 24" role="img" aria-label="Recording: filled dot in the visor.">
+          <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#222a25" stroke="#2d3530" stroke-width="0.25"/>
+          <circle cx="12" cy="12.75" r="1.7" fill="#99d267"/>
+        </svg>
+      </div>
+      <div class="cap"><span class="tag">RECORDING</span><p>Filled dot. In the app this lamp is one of only two places red is ever spent (<span class="m">src/index.css:94</span>).</p></div>
+    </div>
+  </div>
+
+  <div class="tray">
+    <span class="tag">22PX MONOCHROME TEMPLATE</span>
+    <div class="slot">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#e1e9e2"/>
+        <rect x="6" y="11.5" width="12" height="2.5" rx="0.4" fill="#222a25"/>
+      </svg><span>idle</span>
+    </div>
+    <div class="slot">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#e1e9e2"/>
+        <rect x="6" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#222a25"/>
+        <rect x="10.25" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#222a25"/>
+        <rect x="14.5" y="11.5" width="3.5" height="2.5" rx="0.4" fill="#222a25"/>
+      </svg><span>sync</span>
+    </div>
+    <div class="slot">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#e1e9e2"/>
+        <rect x="9.5" y="11.5" width="5" height="2.5" rx="0.4" fill="#222a25"/>
+      </svg><span>error</span>
+    </div>
+    <div class="slot">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#e1e9e2"/>
+        <circle cx="12" cy="12.75" r="1.7" fill="#222a25"/>
+      </svg><span>recording</span>
+    </div>
+    <span class="note">one shape, knocked out, no accent &mdash; survives the template constraint</span>
+  </div>
+
+  <div class="antilist">
+    <span class="tag">ANTI-LIST FOR THE MARK</span>
+    <div class="items">
+      <span>antennae</span><span>ears</span><span>rivets</span><span>bolts</span><span>smile arc</span>
+      <span>two dots</span><span>3/4 perspective render</span><span>gloss highlight</span>
+      <span>gradient body</span><span>blink-on-typing idle animation</span>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== T6 TRIZ ===================== -->
+<section id="t6">
+  <div class="strip">
+    <span class="idx">T6</span>
+    <span class="name">TRIZ Contradiction</span>
+    <span class="fill"></span>
+    <span class="count">3 separations</span>
+    <span class="state">resolved in space</span>
+  </div>
+
+  <div class="contradiction">
+    <span class="pole">Impressive</span>
+    <span class="vs">CONTRADICTS</span>
+    <span class="pole">Usable</span>
+  </div>
+  <p>Stated exactly: impressive normally buys attention with large type, whitespace, imagery and motion.
+  A dense all-day tool can afford none of the four. Every gram spent on impression is taken from
+  information.</p>
+
+  <div class="seps">
+    <div class="sep">
+      <h4>Separation in space &mdash; the resolution</h4>
+      <p>Character lives entirely in the <b>CHROME</b> &mdash; rail, pane headers, status band, command
+      palette, tray, launch, about, empty states &mdash; and is <b>banned from the CONTENT</b>: message list,
+      note body, file table. The frame is where the app is beautiful; the content is deliberately boring.</p>
+      <ul>
+        <li>The content rule that makes it hold: the accent may appear in content only as a 2px edge bar, a selection, or a caret. Never a fill, never a background, never a badge.</li>
+        <li>Second-order benefit: banning character from content makes every future feature cheap to design. A new surface inherits the frame and only has to solve its own table.</li>
+      </ul>
+    </div>
+    <div class="sep">
+      <h4>Separation in time</h4>
+      <p>The app is silent while you work and expressive at transitions &mdash; launch, first paint of a
+      surface, the empty state. Impression lands in the moments nobody is reading.</p>
+      <ul>
+        <li>Empty states are the one place a dense app has room, and keeper already writes real sentences for them (<span class="m">src/components/layout/panel-strip.tsx:49</span>, <span class="m">:71</span>, <span class="m">:77</span>, <span class="m">:80</span>, <span class="m">:91</span>). Give those sentences a stage: generous space, the mono face set larger, the mark at low contrast.</li>
+        <li>The launch window and the about panel can be lavish, because each is seen once and neither competes with data.</li>
+      </ul>
+    </div>
+    <div class="sep">
+      <h4>Separation in scale</h4>
+      <p>Be impressive at <b>1px</b>. In a dense tool the only uncontested real estate is the 1-4px gutter,
+      so put the identity there: hairlines, tick marks, a corner notch, a 2px accent bar.</p>
+      <ul>
+        <li>Calibration ticks along the pane divider &mdash; a vertical rule with small marks at a fixed interval. Costs one pixel of width, says instrument immediately, and no template ships it.</li>
+        <li>Density itself as the flex: publish the row height as a token, put everything on a 4px grid, and let rigour be the impression. People call perfectly aligned dense information &ldquo;fast&rdquo; even when it is not.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="frame-demo">
+    <div class="chrome-side">
+      <span class="tag">CHROME &mdash; CHARACTER LIVES HERE</span>
+      <div class="navrow on"><b></b> FILES</div>
+      <div class="navrow"><b></b> CHAT</div>
+      <div class="navrow"><b></b> NOTES</div>
+      <div class="navrow"><b></b> RECORDINGS</div>
+      <div class="navrow"><b></b> SYNC</div>
+    </div>
+    <div class="rail" data-rail aria-hidden="true"></div>
+    <div class="content-side">
+      <div class="hdr">
+        <span class="tag">FILES</span>
+        <span class="fill"></span>
+        <span class="tag">214 ITEMS</span>
+        <span class="tag acc">DEPOSITED 14:02</span>
+      </div>
+      <div class="trow"><span>notes/2026-08-11.md</span><span>4.2 kB</span><span>14:02:11</span></div>
+      <div class="trow sel"><span>files/scan-0007.pdf</span><span>1.4 MB</span><span>13:58:02</span></div>
+      <div class="trow"><span>recordings/0413.mkv</span><span>182 MB</span><span>11:20:44</span></div>
+      <div class="trow"><span>vault/register.jsonl</span><span>91 kB</span><span>09:07:15</span></div>
+      <div class="trow"><span>files/contract-v3.pdf</span><span>820 kB</span><span>08:41:09</span></div>
+      <div class="trow"><span>notes/2026-08-10.md</span><span>3.1 kB</span><span>yesterday</span></div>
+      <div class="statusband">
+        <span>vault: ~/keeper</span><span>branch: main</span><span>sync: idle</span>
+        <span>bot: register-clerk <span class="caret" aria-hidden="true"></span></span>
+      </div>
+    </div>
+  </div>
+  <p class="lede" style="margin-top:var(--u2)">Above: the pane header as a <b>label strip</b> &mdash; mono
+  uppercase name, hairline, count in tabular figures, right-aligned state. The <b>status band</b> at the very
+  bottom is one line, mono, showing vault, branch, sync state and the active bot, and it is zero pixels when
+  there is nothing to say (tgsite&rsquo;s console dock rule, <span class="m">DESIGN.md:224-227</span>, applied
+  to a different problem). The bot&rsquo;s thinking indicator is that single static caret.</p>
+
+  <div class="budget">
+    <span class="n">1</span>
+    <p><b>Motion budget.</b> Exactly ONE animating element on screen at any time, and it is always the
+    sync/activity indicator. Everything else is a state transition of 160ms or less. Written as a number, it
+    is enforceable in review.</p>
+  </div>
+
+  <p class="lede" style="margin-top:var(--u6)"><b>Named risk of the split:</b> it can read as two designs
+  bolted together. Mitigation is material continuity &mdash; the same chroma-0.014 neutrals, the same hairline
+  weight and the same 4px grid run through both; only the ink density changes.</p>
+</section>
+
+<!-- ===================== T7 WORST POSSIBLE IDEA ===================== -->
+<section id="t7">
+  <div class="strip">
+    <span class="idx">T7</span>
+    <span class="name">Worst Possible Idea</span>
+    <span class="fill"></span>
+    <span class="count">17 worst moves</span>
+    <span class="state">17 rules</span>
+  </div>
+
+  <p class="lede">Design the most AI-generated keeper imaginable, then invert each move into a rule. Every
+  rule on the right was written to be <b>greppable</b>.</p>
+
+  <div class="ledger">
+    <div class="head"><span>NO.</span><span>WORST MOVE</span><span>RULE IT BECOMES</span></div>
+
+    <div class="lrow"><span class="n">01</span>
+      <span class="worst">A violet-to-blue gradient banner across the settings page.</span>
+      <span class="rule">No gradients in app chrome, and no hue in <span class="m">260-330</span> anywhere in the product.</span></div>
+    <div class="lrow"><span class="n">02</span>
+      <span class="worst">A glassmorphic floating sidebar with backdrop-blur over the desktop.</span>
+      <span class="rule">No <span class="m">backdrop-filter</span>, no vibrancy on keeper&rsquo;s own surfaces. This is the specific temptation of a Tauri app on macOS, so it must be named.</span></div>
+    <div class="lrow"><span class="n">03</span>
+      <span class="worst">A friendly rounded robot that blinks when you type.</span>
+      <span class="rule">The mark has no eyes and no idle animation, ever.</span></div>
+    <div class="lrow"><span class="n">04</span>
+      <span class="worst">An &ldquo;Ask AI&rdquo; button with a sparkle emoji.</span>
+      <span class="rule">No emoji in UI chrome at all, and the sparkle glyph is banned by codepoint. It is THE signature of the era and it will be the first thing a future contributor reaches for.</span></div>
+    <div class="lrow"><span class="n">05</span>
+      <span class="worst">A shimmering skeleton loader with a diagonal sweep.</span>
+      <span class="rule">No shimmer. Loading is a dimmed static row, or one word &mdash; keeper already says <span class="m">&ldquo;Reading...&rdquo;</span> (<span class="m">src/components/layout/panel-strip.tsx:71</span>).</span></div>
+    <div class="lrow"><span class="n">06</span>
+      <span class="worst">Three bouncing dots while the bot thinks.</span>
+      <span class="rule">The bot&rsquo;s thinking indicator is a single static caret in the accent. The visor on the mark may switch state; nothing bounces.</span></div>
+    <div class="lrow"><span class="n">07</span>
+      <span class="worst">Chat as pastel bubbles with 18px radii and tails, alternating two colours.</span>
+      <span class="rule">No bubble tails, no alternating bubble fills. Messages are rows in a dense list with an author column &mdash; the same grammar as every other surface.</span></div>
+    <div class="lrow"><span class="n">08</span>
+      <span class="worst">A gradient-mesh blob behind the empty state.</span>
+      <span class="rule">No mesh gradients, no blurred colour blobs, no abstract background art.</span></div>
+    <div class="lrow"><span class="n">09</span>
+      <span class="worst">Rounded 16px cards with 24px padding, three across, each with a soft shadow.</span>
+      <span class="rule">No three-card grid, and radius drops from today&rsquo;s <span class="m">10px</span> (<span class="m">src/index.css:109</span>) to <span class="m">4px</span> for controls and <span class="m">6px</span> for floating layers.</span></div>
+    <div class="lrow"><span class="n">10</span>
+      <span class="worst">An onboarding modal with a flat two-tone illustration of a person at a laptop.</span>
+      <span class="rule">No illustrated people, no spot illustrations, no stock 3D renders.</span></div>
+    <div class="lrow"><span class="n">11</span>
+      <span class="worst">A &ldquo;Powered by AI&rdquo; badge and a tooltip promising it is &ldquo;seamless and powerful&rdquo;.</span>
+      <span class="rule">No marketing adjectives in microcopy. keeper&rsquo;s existing copy already passes this test (<span class="m">src/components/layout/panel-strip.tsx:77</span>, <span class="m">:121</span>) &mdash; the rule just protects it.</span></div>
+    <div class="lrow"><span class="n">12</span>
+      <span class="worst">Inter at tracking-tight in a 14/20 scale with a geometric sans for headings.</span>
+      <span class="rule">Inter is banned by name; display type is never tracked tighter than <span class="m">-0.01em</span>.</span></div>
+    <div class="lrow"><span class="n">13</span>
+      <span class="worst">Pure <span class="m">#000</span> ground with pure <span class="m">#fff</span> text.</span>
+      <span class="rule">No pure black, no pure white. Today&rsquo;s light theme is literally <span class="m">oklch(1 0 0)</span> (<span class="m">src/index.css:67</span>), so this rule has a concrete first victim.</span></div>
+    <div class="lrow"><span class="n">14</span>
+      <span class="worst">An accent-tinted hero card at the top of every surface summarising what you are looking at.</span>
+      <span class="rule">No hero anything. Surfaces open on their content.</span></div>
+    <div class="lrow"><span class="n">15</span>
+      <span class="worst">Confetti when a sync completes.</span>
+      <span class="rule">No celebratory motion, no success animation. A finished sync is a line in the register.</span></div>
+    <div class="lrow"><span class="n">16</span>
+      <span class="worst">lucide at stroke 2 for everything, forever.</span>
+      <span class="rule">Honest rule, since a full custom set is not affordable: the primary rail glyphs and the mark are ONE custom family drawn on a 20 grid at stroke 1.25 to the mark&rsquo;s geometry; lucide is permitted only below rail level and never in the same row as a custom glyph.</span></div>
+    <div class="lrow"><span class="n">17</span>
+      <span class="worst">A rainbow of pill buttons with icon and label.</span>
+      <span class="rule">Buttons are rectangles at 4px; the only pill in the product is a status chip, if one survives at all.</span></div>
+  </div>
+</section>
+
+<!-- ===================== T8 FORCED RELATIONSHIPS ===================== -->
+<section id="t8">
+  <div class="strip">
+    <span class="idx">T8</span>
+    <span class="name">Forced Relationships</span>
+    <span class="fill"></span>
+    <span class="count">11 collisions</span>
+    <span class="state">details only this app could have</span>
+  </div>
+
+  <p class="lede">Collide keeper with unrelated domains to find the details <b>only this app</b> could have.</p>
+
+  <div class="collisions">
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">film contact sheet</span>
+      <span class="yield">The Recordings archive as a contact sheet &mdash; a grid of frames under mono labels with durations in tabular figures. <b>The one surface where imagery is legitimate, because the imagery IS the content.</b></span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">herbarium sheet</span>
+      <span class="yield">A Files entry as a mounted specimen &mdash; the preview occupying the sheet, the label block fixed bottom-left with name, size, modified, path. Same layout for an image, a PDF and a CSV.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">ledger paper</span>
+      <span class="yield">A hairline rule every five rows in long tables. Not zebra striping &mdash; a <b>ledger rule</b>. Costs nothing, aids the eye across a wide row, and it is a nineteenth-century move no template makes. (Used on this page, in the register and the ledger above.)</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">lighthouse log</span>
+      <span class="yield">The Sync surface as a logbook &mdash; dated one-line entries in mono, newest at the bottom like a real log, not a feed of cards.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">seed bank</span>
+      <span class="yield">Sync is a <b>DEPOSIT</b>, not an upload. The word and the visual should say a copy was placed somewhere safe, not that data left the building.</span>
+    </div>
+    <div class="coll spent">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">darkroom safelight</span>
+      <span class="yield">Already spent on incognito, and it is the best use of it.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">conservator&rsquo;s raking lamp</span>
+      <span class="yield">The focused pane is the one lit from the left; unfocused panes lose their top-edge highlight. <b>Focus indicated by LIGHT rather than by an accent border</b> &mdash; subtle, cheap, and unlike anything shipping.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">strike plate</span>
+      <span class="yield">The hallmark notch in the mark, repeated once in the UI as the top-left corner cut of the launch window. One motif, two places, never more.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">beekeeping</span>
+      <span class="yield">The bots are a colony of kept workers. Listed like accounts &mdash; name, job, state, lamp. <b>Never an avatar, never a face, never a persona portrait.</b> Bot messages sit in the same dense row grammar as human messages, distinguished by a mono author label and a visor glyph, never by a bubble colour or an avatar circle.</span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">chain of custody form</span>
+      <span class="yield">Every destructive or outbound action names what will happen to which object, in the copy voice the app already has. <b>The confirmation IS the design.</b></span>
+    </div>
+    <div class="coll">
+      <span class="a">keeper</span><span class="x">&times;</span><span class="b">the museum&rsquo;s own signage</span>
+      <span class="yield">The About panel as an object label &mdash; name, date, maker, materials, accession number (the build hash). Seen once, costs nothing, and it is the single most charming thing in the product.</span>
+    </div>
+  </div>
+
+  <div class="throughline" style="margin-top:var(--u8)">
+    <span class="tag">THE BOTS SURFACE IS ALREADY SOLVED</span>
+    Because keeper&rsquo;s robot has no face, every bot in the product is rendered as an <b>instrument with a
+    state</b>, not a character with a personality. The mark is a policy, and the policy scales to a surface
+    that does not exist yet.
+  </div>
+</section>
+
+<!-- ===================== CONVERGENCE ===================== -->
+<section id="converge">
+  <div class="strip">
+    <span class="idx">C</span>
+    <span class="name">Affinity Clustering</span>
+    <span class="fill"></span>
+    <span class="count">~124 ideas &rarr; 5 clusters</span>
+    <span class="state">1 and 2 fuse</span>
+  </div>
+
+  <div class="clusters">
+    <div class="cluster fused">
+      <span class="n">01</span>
+      <div><h4>Custody</h4></div>
+      <span class="members">the keeper room &middot; accession numbers &middot; labels &middot; the register &middot; condition reports &middot; provenance &middot; reversibility &middot; chain of custody</span>
+      <span class="supplies">Supplies <b>MEANING</b>. The only cluster that comes from the product&rsquo;s own name.</span>
+    </div>
+    <div class="cluster fused">
+      <span class="n">02</span>
+      <div><h4>Instrument</h4></div>
+      <span class="members">calibration ticks &middot; readouts &middot; the status band &middot; the visor &middot; the tray state family &middot; lit/unlit lamps &middot; tabular figures</span>
+      <span class="supplies">Supplies <b>IMPRESSIVENESS</b> at zero pixel cost.</span>
+    </div>
+    <div class="cluster">
+      <span class="n">03</span>
+      <div><h4>Material</h4></div>
+      <span class="members">chroma-0.014 neutrals &middot; lichen accent &middot; paper light theme &middot; 2% grain on chrome only &middot; raking light &middot; hairlines &middot; no glass</span>
+      <span class="supplies">What stops it looking like themed shadcn, and the cheapest to ship.</span>
+    </div>
+    <div class="cluster">
+      <span class="n">04</span>
+      <div><h4>Refusals</h4></div>
+      <span class="members">no violet &middot; no glass &middot; no gradients &middot; no sparkle &middot; no faces &middot; no bubbles &middot; no Inter &middot; no hero &middot; no shimmer &middot; no confetti &middot; no illustration</span>
+      <span class="supplies">The only cluster that survives contact with future contributors, because it can be a script.</span>
+    </div>
+    <div class="cluster">
+      <span class="n">05</span>
+      <div><h4>Voice</h4></div>
+      <span class="members">the copy that already exists in <span class="m">panel-strip.tsx</span></span>
+      <span class="supplies">Not a cluster to invent &mdash; a cluster to <b>MATCH</b>. Proof the app can hold a standard, and the argument that a design standard will stick.</span>
+    </div>
+  </div>
+
+  <div class="throughline">
+    <span class="tag">THE THROUGH-LINE</span>
+    Clusters 1 and 2 are the <b>same object seen twice</b> &mdash; a keeper&rsquo;s workroom IS a room full of
+    instruments and labels. Fusing them gives one metaphor with two registers: <b>custody says what things
+    mean, instrument says how they look.</b>
+  </div>
+
+  <div class="strip">
+    <span class="idx">PMI</span>
+    <span class="name">Plus / Minus / Interesting on the fused direction</span>
+    <span class="fill"></span>
+    <span class="count">the keeper room</span>
+    <span class="state">carried</span>
+  </div>
+
+  <div class="pmi">
+    <div class="col p">
+      <h4>Plus</h4>
+      <div class="item">Derived from the product&rsquo;s own name, so no competitor and no template can arrive at it.</div>
+      <div class="item">It pre-answers the bots surface.</div>
+      <div class="item">It makes density a virtue instead of a constraint.</div>
+      <div class="item">A sibling to tgsite without being a copy &mdash; same author, different room, shared mono face.</div>
+    </div>
+    <div class="col mi">
+      <h4>Minus</h4>
+      <div class="item">&ldquo;Museum&rdquo; risks reading as dusty or precious, which is death for a tool that must feel fast.
+        <span class="mit"><b>Mitigation</b> The room is the WORKROOM at night, never the gallery &mdash; no serif, no beige, no ornament, no brass.</span></div>
+      <div class="item">A green-tinted ground fights the file and media viewers.
+        <span class="mit"><b>Mitigation</b> Already a rule &mdash; chroma capped at 0.014, and viewers render on a strictly neutral plate inside the tinted chrome.</span></div>
+      <div class="item">The frame-carries-character split is only as good as its enforcement; without a check script it decays.
+        <span class="mit"><b>Mitigation</b> Every refusal was written to be greppable &mdash; hex literals, hue ranges, <span class="m">backdrop-filter</span>, font names, the sparkle codepoint.</span></div>
+    </div>
+    <div class="col i">
+      <h4>Interesting</h4>
+      <div class="item">The visor-as-state-display collapses the mark, the tray family, the bot list and the sync indicator into <b>one vocabulary</b>. That is unusual enough to be the thing people remember.</div>
+      <div class="item">Focus-by-light rather than focus-by-border is the only genuinely novel interaction detail in the set &mdash; and also the riskiest for accessibility. It must be <b>additive to a real focus ring, never a replacement</b>.</div>
+    </div>
+  </div>
+
+  <!-- ===================== THE DECISION ===================== -->
+  <div class="direction">
+    <div class="dh">
+      <span class="tag acc">DECISION</span>
+      <span class="fill"></span>
+      <span class="tag">2026-08-11 10:24</span>
+    </div>
+    <div class="db">
+      <div class="glyph">
+        <svg viewBox="0 0 24 24" role="img" aria-label="The keeper mark: a visored sentinel head with a lit visor bar and a notch bitten out of the upper left.">
+          <path d="M6.5 4 H20 A2 2 0 0 1 22 6 V18 A2 2 0 0 1 20 20 H4 A2 2 0 0 1 2 18 V8.5 H6.5 Z" fill="#222a25" stroke="#2d3530" stroke-width="0.25"/>
+          <rect x="6" y="11.5" width="12" height="2.5" rx="0.4" fill="#99d267"/>
+        </svg>
+      </div>
+      <div>
+        <span class="tag">DIRECTION</span>
+        <h2>The <em>Keeper Room</em></h2>
+        <div class="props">
+          <div class="r"><span class="k">metaphor</span><span class="v">The back-of-house workroom of a collection, at night, one lamp.</span></div>
+          <div class="r"><span class="k">ground</span><span class="v">Near-black with a trace of green &mdash; <span class="m">#0c120e</span></span></div>
+          <div class="r"><span class="k">accent</span><span class="v">Lichen <span class="m">#99d267</span>, one lamp, text-grade at <span class="m">10.62:1</span></span></div>
+          <div class="r"><span class="k">mark</span><span class="v">A visored sentinel head whose visor is a state display.</span></div>
+          <div class="r"><span class="k">character</span><span class="v">Lives in the chrome. Content stays boring.</span></div>
+          <div class="r"><span class="k">colour</span><span class="v">Marks only deviation and attention.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== REFUSALS + RISK ===================== -->
+<section id="refusals">
+  <div class="strip">
+    <span class="idx">R</span>
+    <span class="name">Binding refusals</span>
+    <span class="fill"></span>
+    <span class="count">the three that matter most</span>
+    <span class="state">greppable</span>
+  </div>
+
+  <div class="refusals">
+    <div class="refusal">
+      <span class="n">01</span>
+      <h4>No hue 260-330 anywhere.</h4>
+      <p>Violet is the tell of the era, and the codebase already carries five instances of it.</p>
+      <span class="grep">src/index.css:92 &middot; :172 &middot; :190 &middot; :141, :203 &middot; :142, :204</span>
+    </div>
+    <div class="refusal">
+      <span class="n">02</span>
+      <h4>No glass, gradients, shimmer, mesh or blur.</h4>
+      <p>keeper&rsquo;s depth comes from one raking light and hairlines.</p>
+      <span class="grep">backdrop-filter &middot; linear-gradient &middot; radial-gradient &middot; blur( &middot; animate-pulse</span>
+    </div>
+    <div class="refusal">
+      <span class="n">03</span>
+      <h4>The mark has no face.</h4>
+      <p>No eyes, no mouth, no smile, no idle animation &mdash; because keeper&rsquo;s AI is a kept instrument,
+      not a friend.</p>
+      <span class="grep">no two-dot eyes &middot; no antenna &middot; no blink-on-typing</span>
+    </div>
+  </div>
+
+  <div class="risk">
+    <div class="rh">Riskiest thing</div>
+    <div class="rb">
+      <span class="pct">4%<small>OF THE PIXELS</small></span>
+      <p>Banishing character from the content areas means the app&rsquo;s beauty is carried by roughly 4% of
+      its pixels. If the chrome is executed at 90% instead of 100%, the result is <b>not a slightly-less-impressive
+      app &mdash; it is an ordinary app with an odd green tint.</b></p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="audit">
+    <span><b>no</b> gradients</span>
+    <span><b>no</b> backdrop-filter</span>
+    <span><b>no</b> hue 260-330</span>
+    <span><b>no</b> emoji</span>
+    <span><b>no</b> shimmer</span>
+    <span><b>no</b> bouncing dots</span>
+    <span><b>no</b> confetti</span>
+    <span><b>no</b> pills</span>
+    <span><b>no</b> pure black</span>
+    <span><b>no</b> pure white</span>
+    <span><b>no</b> Inter</span>
+    <span><b>no</b> webfonts</span>
+    <span><b>no</b> illustration</span>
+    <span><b>no</b> hero</span>
+    <span><b>one</b> lamp</span>
+  </div>
+
+  <p class="seq"><span class="tag">SEQUENCING, FOR WHOEVER WRITES DESIGN.MD</span>
+  The neutrals-get-chroma change and the two-face typography change together deliver most of the perceived
+  redesign, and both are mechanical. The mark and the custom rail glyphs are the expensive half and can follow
+  &mdash; but the mark&rsquo;s four visor states must be specified before the tray icons are redrawn, because the
+  repo&rsquo;s existing tray family is the mark&rsquo;s real production constraint: it has to survive as a 22px
+  monochrome template.</p>
+
+  <div class="colophon">
+    <span>keeper &mdash; visual identity and UI direction</span>
+    <span>brainstorming session &middot; 2026-08-11</span>
+    <span>8 techniques &middot; ~124 ideas &middot; 5 clusters &middot; 1 direction</span>
+    <span>ground #0c120e &middot; lichen #99d267 &middot; 10.62:1</span>
+    <span>self-contained &middot; no network &middot; system fonts only</span>
+  </div>
+</footer>
+
+</div>
+
+<script>
+(function () {
+  /* Calibration ticks on the pane divider: 12px minor interval, major every 4th.
+     Purely additive - the rail is already a hairline without this. */
+  function drawRails() {
+    document.querySelectorAll('[data-rail]').forEach(function (rail) {
+      var h = rail.getBoundingClientRect().height;
+      if (!h) return;
+      rail.textContent = '';
+      var step = 12, i = 0;
+      for (var y = step; y < h - 2; y += step, i++) {
+        var t = document.createElement('i');
+        if (i % 4 === 3) t.className = 'maj';
+        t.style.top = Math.round(y) + 'px';
+        rail.appendChild(t);
+      }
+    });
+  }
+  drawRails();
+  window.addEventListener('resize', drawRails);
+
+  /* The session's own one-colour test, run on the session's own keepsake. */
+  var btn = document.getElementById('gs');
+  btn.addEventListener('click', function () {
+    var on = document.body.classList.toggle('greyscale');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+})();
+</script>
+
+</body>
+</html>
