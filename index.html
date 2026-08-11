@@ -2,7 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <!-- The mark, cut by `bun run scripts/gen-mark-icons.ts` into the repo root so
+         one file serves the browser tab, the file browser and GitHub. The path is
+         RELATIVE: Vite has no publicDir here, so `/favicon.png` would be passed
+         through untouched and 404 in dev and in the bundle alike. A relative href
+         is resolved as a build asset and emitted into dist. This replaced a link
+         to `/vite.svg`, a scaffold leftover that has never existed in this repo. -->
+    <link rel="icon" type="image/png" href="./favicon.png" />
     <!-- viewport-fit=cover exposes env(safe-area-inset-*) for edge-to-edge phone
          rendering (Story 13.5, FR-59); interactive-widget=resizes-content resizes
          the layout viewport under the on-screen keyboard on Chromium webviews
@@ -11,7 +17,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
-    <title>Tauri + React + Typescript</title>
+    <title>keeper</title>
   </head>
 
   <body>
