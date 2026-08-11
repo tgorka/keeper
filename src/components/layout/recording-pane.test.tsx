@@ -59,8 +59,18 @@ vi.mock("@/lib/ipc/client", () => ({
   ),
   recoveredSessionsList: vi.fn(() => Promise.resolve([])),
   recoveredSessionAcknowledge: vi.fn(() => Promise.resolve()),
-  // The summary card's inline rename (Story 40.4) — it MOVES the session.
+  // The summary card's inline details editor (Story 40.4 title, Story 45.19 the
+  // rest) — the title MOVES the session; the other four are a manifest rewrite.
   recordingRetitle: vi.fn(),
+  recordingSessionMeta: vi.fn(() =>
+    Promise.resolve({ title: null, participants: "", note: "", tags: "", custom: [] }),
+  ),
+  recordingMetaUpdate: vi.fn(),
+  // Story 45.19: the header's way across to the Recordings space in Notes. No
+  // vault is this suite's world, so the button is absent — the linked case has
+  // its own tests below.
+  notesSpaces: vi.fn(() => Promise.resolve([])),
+  notesVaults: vi.fn(() => Promise.resolve([])),
   revealPath: vi.fn(() => Promise.resolve()),
   // Story 42.4: the completion card resolves its note stub on mount. No stub
   // is this suite's world — the pane's job is the summary, and it must render
@@ -75,7 +85,9 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import {
+  RECORDINGS_SPACE_TESTID,
   RecordingPane,
+  recordingsSpaceLabel,
   START_RECORDING_LABEL,
   STOP_RECORDING_LABEL,
   startBlockedNote,
@@ -103,6 +115,13 @@ import {
 } from "@/components/recording/recording-audio-controls";
 import { DESTINATION_PATH_TESTID } from "@/components/recording/recording-destination-controls";
 import {
+  META_CUSTOM_NAME_LABEL,
+  META_NOTE_LABEL,
+  META_PARTICIPANTS_LABEL,
+  META_TAGS_LABEL,
+  META_TITLE_LABEL,
+} from "@/components/recording/recording-meta-fields";
+import {
   CAMERA_PERMISSION_NAME,
   CAMERA_ROW_NOTE,
   MICROPHONE_PERMISSION_NAME,
@@ -119,11 +138,14 @@ import {
 } from "@/components/settings/recording-settings-controls";
 import { clearRecordingSessionMove } from "@/hooks/use-recording-session";
 import type {
+  NoteSpaceVm,
+  NoteVaultVm,
   RecordingPermissionVm,
   RecordingStatusVm,
   RecordingSummaryVm,
 } from "@/lib/ipc/client";
 import {
+  notesSpaces,
   openCameraSettings,
   openMicrophoneSettings,
   openScreenRecordingSettings,
@@ -142,10 +164,23 @@ import {
   revealPath,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { ALL_NOTES_SCOPE, notesFiltersStore } from "@/lib/stores/notes-filters";
+import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { resetRecordingAudioForTest } from "@/lib/stores/recording-audio";
+import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import { resetRecordingMicForTest, setMicEnabled } from "@/lib/stores/recording-mic";
 import { resetRecordingSourceForTest, selectRecordingTarget } from "@/lib/stores/recording-source";
 import { resetRecordingWebcamForTest, setWebcamEnabled } from "@/lib/stores/recording-webcam";
+
+/** The empty "Next session" form, for resetting the module-level store. */
+const EMPTY_META_FIELDS = {
+  title: "",
+  participants: "",
+  note: "",
+  tags: "",
+  custom: [],
+};
 
 const mockFetch = vi.mocked(recordingPermission);
 const mockRequest = vi.mocked(requestScreenRecordingPermission);
@@ -1006,5 +1041,153 @@ describe("RecordingPane", () => {
     // Start affordance is back.
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
     expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeInTheDocument();
+  });
+});
+
+describe("RecordingPane — the way across to Notes (Story 45.19, FR-197)", () => {
+  const RECORDINGS_SPACE = {
+    id: "spaces/2026-08-09-recordings.md",
+    name: "Recordings",
+    defaultKey: "recordings",
+  } as unknown as NoteSpaceVm;
+
+  /** A space the USER named "Recordings" — no `keeper.default`, so not it. */
+  const IMPOSTOR = {
+    id: "spaces/2026-08-09-mine.md",
+    name: "Recordings",
+    defaultKey: null,
+  } as unknown as NoteSpaceVm;
+
+  beforeEach(() => {
+    // Hydrated directly: the pane's own boot path only needs the mirror to have
+    // an active vault, and driving it through `notesVaults`/`notesVaultActive`
+    // would test the hydration helper rather than this button.
+    notesVaultsStore.setState({
+      vaults: [{ id: "v1" } as unknown as NoteVaultVm],
+      activeVaultId: "v1",
+      hydrated: true,
+      error: null,
+    });
+    vi.mocked(notesSpaces).mockReset();
+    vi.mocked(notesSpaces).mockResolvedValue([]);
+    primaryViewStore.getState().setView("recording");
+    notesFiltersStore.setState({ scope: ALL_NOTES_SCOPE });
+  });
+
+  afterEach(() => {
+    resetNotesVaultsStoreForTest();
+  });
+
+  it("offers the space, named as the user named it, and goes there", async () => {
+    vi.mocked(notesSpaces).mockResolvedValue([
+      { ...RECORDINGS_SPACE, name: "Sessions" } as unknown as NoteSpaceVm,
+    ]);
+    render(<RecordingPane />);
+
+    const button = await screen.findByTestId(RECORDINGS_SPACE_TESTID);
+    // Asserted on the CALL too: a button that asked a different vault for its
+    // spaces would offer a space this vault does not have.
+    expect(notesSpaces).toHaveBeenCalledWith("v1");
+    // A renamed default keeps its identity (AD-79) and the label follows the
+    // rename — a button saying "Recordings" for a space the sidebar calls
+    // "Sessions" is a button about somewhere else.
+    expect(button).toHaveTextContent(recordingsSpaceLabel("Sessions"));
+
+    fireEvent.click(button);
+    expect(primaryViewStore.getState().view).toBe("notes");
+    expect(notesFiltersStore.getState().scope).toMatchObject({
+      kind: "space",
+      id: RECORDINGS_SPACE.id,
+    });
+  });
+
+  it("offers nothing when the vault has no Recordings space, whatever its spaces are called", async () => {
+    // TWO spaces, and one of them is the user's own space NAMED "Recordings":
+    // a link decided by name would light up here and take the user to somebody
+    // else's saved query. The identity is `keeper.default`.
+    vi.mocked(notesSpaces).mockResolvedValue([
+      { id: "spaces/inbox.md", name: "Inbox", defaultKey: "inbox" } as unknown as NoteSpaceVm,
+      IMPOSTOR,
+    ]);
+    render(<RecordingPane />);
+
+    await waitFor(() => expect(notesSpaces).toHaveBeenCalled());
+    expect(screen.queryByTestId(RECORDINGS_SPACE_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("offers nothing when no vault is active", async () => {
+    resetNotesVaultsStoreForTest();
+    notesVaultsStore.setState({ vaults: [], activeVaultId: null, hydrated: true, error: null });
+    render(<RecordingPane />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: START_RECORDING_LABEL })).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId(RECORDINGS_SPACE_TESTID)).not.toBeInTheDocument();
+    expect(notesSpaces).not.toHaveBeenCalled();
+  });
+
+  it("offers nothing when the space list cannot be read", async () => {
+    vi.mocked(notesSpaces).mockRejectedValue(new Error("no vault on disk"));
+    render(<RecordingPane />);
+
+    await waitFor(() => expect(notesSpaces).toHaveBeenCalled());
+    expect(screen.queryByTestId(RECORDINGS_SPACE_TESTID)).not.toBeInTheDocument();
+  });
+});
+
+describe("RecordingPane — a form filled by 'record another like this' (Story 45.19)", () => {
+  beforeEach(() => {
+    recordingMetaStore.setState({ fields: EMPTY_META_FIELDS, last: null });
+  });
+
+  afterEach(() => {
+    recordingMetaStore.setState({ fields: EMPTY_META_FIELDS, last: null });
+  });
+
+  it("shows the copied values and leaves the recorder STOPPED until Start is pressed", async () => {
+    mockFetch.mockResolvedValue(GRANTED);
+    // Exactly what the note's action writes into the store.
+    recordingMetaStore.getState().setFields({
+      title: "Standup",
+      participants: "Ada, Grace",
+      note: "weekly",
+      tags: "standup, q3",
+      custom: [
+        { name: "Ticket", value: "KPR-1" },
+        { name: "Room", value: "Blue" },
+      ],
+    });
+
+    render(<RecordingPane />);
+
+    // The form carries every field...
+    const start = await screen.findByRole("button", { name: START_RECORDING_LABEL });
+    expect(screen.getByLabelText(META_TITLE_LABEL)).toHaveValue("Standup");
+    expect(screen.getByLabelText(META_PARTICIPANTS_LABEL)).toHaveValue("Ada, Grace");
+    expect(screen.getByLabelText(META_NOTE_LABEL)).toHaveValue("weekly");
+    expect(screen.getByLabelText(META_TAGS_LABEL)).toHaveValue("standup, q3");
+    expect(screen.getAllByLabelText(META_CUSTOM_NAME_LABEL)).toHaveLength(2);
+
+    // ...and the RECORDER is untouched. Asserted on the recorder's own state,
+    // not on the form's: a filled form beside a session that already began is
+    // the exact failure "never auto-start" names.
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(start).toBeEnabled();
+    expect(screen.queryByRole("button", { name: STOP_RECORDING_LABEL })).not.toBeInTheDocument();
+
+    // Only now, on a deliberate press, and with the values that were filled in.
+    fireEvent.click(start);
+    await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+    expect(mockStart.mock.calls[0]?.[6]).toEqual({
+      title: "Standup",
+      participants: "Ada, Grace",
+      note: "weekly",
+      tags: "standup, q3",
+      custom: [
+        { name: "Ticket", value: "KPR-1" },
+        { name: "Room", value: "Blue" },
+      ],
+    });
   });
 });

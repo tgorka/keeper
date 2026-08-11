@@ -48,3 +48,21 @@ rand = "0.8"
 # it drags in neither tauri nor gix, so `check:core-tauri-free` and
 # `check:core-sync-free` stay green.
 globset = { workspace = true }
+# Reading DOCX, PPTX and XLSX (Story 45.8, FR-181, FR-182). Those three formats
+# are a ZIP of XML, so the whole of `document.rs` is these two crates plus a
+# pile of caps. Both are already compiled in every keeper build — `zip` via
+# tauri-plugin-updater, `quick-xml` via plist <- tauri-utils — so this adds no
+# new package to Cargo.lock, and the alternative was ~1.2 MB of JavaScript
+# parsers in the bundle. Neither drags in tauri or gix, so
+# `check:core-tauri-free` and `check:core-sync-free` stay green. See the
+# workspace manifest for the feature choices and the decompression caveat.
+zip = { workspace = true }
+quick-xml = { workspace = true }
+flate2 = { workspace = true }
+# The layer stack's on-disk format (Story 46.6, AD-98/AD-99). Already resolved
+# in Cargo.lock as `keeper-syncd`'s profile-config parser, so this adds no new
+# package to the tree, and it is the same parser the daemon's `[[profile]]`
+# tables go through — one TOML dialect across the product, not two. MIT OR
+# Apache-2.0, and it drags in neither tauri nor gix, so `check:core-tauri-free`
+# and `check:core-sync-free` stay green.
+toml = { workspace = true }

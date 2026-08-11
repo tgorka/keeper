@@ -39,6 +39,8 @@ relativePath: string,
  */
 absolutePath: string, 
 /**
- * What the target is, which is what decides whether Preview is offered.
+ * What the target is: which element a note embeds it as, whether the
+ * panel offers Preview, and whether `keeper-recording://` will serve its
+ * bytes. One answer, so those three cannot disagree (AD-73).
  */
 kind: RecordingNoteTargetKind, };

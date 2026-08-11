@@ -42,6 +42,21 @@ const MIN_CHAT_QUERY_LEN: usize = 2;
 /// iOS, which is the exact bug FR-122 forbids.
 const NOTES_CATEGORY: &str = "Notes";
 
+/// The registry ids of the three Recording verbs (Story 20.4, FR-48), named
+/// because a fourth surface now dispatches on them.
+///
+/// The palette, the ⌘? cheat sheet and the native menu bar all read the id off a
+/// rendered [`MenuItemVm`] and never spell it. The menu-bar tray cannot: it is
+/// built in Rust and has to name the verb it offers (Story 46.16). A title is
+/// allowed to change — Story 46.5 renamed the start verb and three surfaces
+/// changed with it, precisely because they all read this registry — but an id is
+/// the dispatch key `actions.ts` resolves and never does. Naming each once is
+/// what keeps the registry entry, the tray projection and the tray's click
+/// router from holding three copies of one string.
+pub const RECORDING_START_ID: &str = "recording-start";
+pub const RECORDING_STOP_ID: &str = "recording-stop";
+pub const RECORDING_OPEN_FOLDER_ID: &str = "recording-open-folder";
+
 /// One lightweight, non-secret projection of a room held in the [`PaletteIndex`]
 /// (Story 9.1). Carries only render + ranking data: the owning account id and hue,
 /// the room id, its display name (with a lowercased copy cached for scoring), the
@@ -470,17 +485,27 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
-        // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
-        // `open-recording` — `requires_recording: true` drops them from every
-        // surface (palette, cheat sheet, native menu) when recording is off
-        // (desktop macOS ≥ 13.0 only). Palette-only (`shortcut: None`): no
-        // single-key verb exists on this surface (UX-DR29). Built inline so the
-        // shared `action` closure keeps `requires_recording: false`.
+        // The Recordings archive (Story 42.3, Story 45.20, FR-198). A SECOND
+        // navigation action beside `open-recording`, not a rename of it: the
+        // capture surface and the browser over what capture produced are two
+        // primary views (`recording` and `recordings`), the sidebar has carried
+        // two entries for them since 42.3, and the menu bar carried one — so
+        // the one surface a person reaches for after recording was the one
+        // surface the menu could not open.
+        //
+        // No shortcut chip: `⌘5` belongs to the capture surface and is bound by
+        // a shipped JS hook. A chip here would either teach a chord that opens
+        // the other view or claim a second one nothing binds, and this registry
+        // is where the cheat sheet learns what to promise.
+        //
+        // `requires_recording`, exactly like `open-recording` and for the same
+        // reason the sidebar gates both on one flag: a browser over recordings
+        // this build cannot make is a puzzle, not a surface.
         PaletteActionVm {
-            id: "recording-start".to_owned(),
-            title: "Start Recording".to_owned(),
-            category: "Recording".to_owned(),
-            keywords: ["record", "capture", "screen", "begin", "go live"]
+            id: "open-recordings".to_owned(),
+            title: "Open Recordings".to_owned(),
+            category: "Navigation".to_owned(),
+            keywords: ["record", "archive", "browse", "sessions", "library"]
                 .iter()
                 .map(|k| (*k).to_owned())
                 .collect(),
@@ -489,8 +514,42 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
+        // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
+        // `open-recording` — `requires_recording: true` drops them from every
+        // surface (palette, cheat sheet, native menu) when recording is off
+        // (desktop macOS ≥ 13.0 only). Palette-only (`shortcut: None`): no
+        // single-key verb exists on this surface (UX-DR29). Built inline so the
+        // shared `action` closure keeps `requires_recording: false`.
+        // Story 46.5: titled "New Recording", not "Start Recording". The owner
+        // searched the palette for "new recording" and found nothing, one
+        // submenu away from "Open Recordings" — which only navigates. "New X"
+        // is this registry's own word for making one (`notes-new` → "New
+        // Note"); "Start Recording" was the outlier, and the outlier is the
+        // one nobody could find. `id`, `category` and the count below are
+        // untouched: moving it out of Recording would break the section, and
+        // the id is what `actions.ts` dispatches on.
+        //
+        // `start` joins the keywords because it just left the title, and `new`
+        // joins it even though the title now carries it — pinning the owner's
+        // word here means the next retitle cannot silently take it away again,
+        // which is precisely how this defect was made.
         PaletteActionVm {
-            id: "recording-stop".to_owned(),
+            id: RECORDING_START_ID.to_owned(),
+            title: "New Recording".to_owned(),
+            category: "Recording".to_owned(),
+            keywords: [
+                "record", "capture", "screen", "new", "start", "begin", "go live",
+            ]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
+        PaletteActionVm {
+            id: RECORDING_STOP_ID.to_owned(),
             title: "Stop Recording".to_owned(),
             category: "Recording".to_owned(),
             keywords: ["record", "capture", "end", "finish", "finalize"]
@@ -503,7 +562,7 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             toggle_group: None,
         },
         PaletteActionVm {
-            id: "recording-open-folder".to_owned(),
+            id: RECORDING_OPEN_FOLDER_ID.to_owned(),
             title: "Open Recordings Folder".to_owned(),
             category: "Recording".to_owned(),
             keywords: ["record", "reveal", "finder", "destination", "files"]
@@ -837,6 +896,82 @@ pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
         .collect()
 }
 
+/// Which tray rendering is being built (Story 46.16).
+///
+/// The menu-bar tray is not one menu: it swaps a whole menu per state, and a verb
+/// in the wrong one is a defect in both directions. A start verb that lingered
+/// into the live-session menu would offer a second recording; a verb missing from
+/// a rendering that *replaces* the idle menu — the folder-sync one does, on the
+/// first sync tick (Story 29.2) — would silently disappear from the menu bar for
+/// as long as a folder is syncing, which is most of the time.
+///
+/// So membership is a pure function of the rendering, decided and tested here,
+/// rather than four hand-built menus in the shell each remembering what belongs
+/// in it — none of which can be compiled, let alone tested, off macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenu {
+    /// Presence only (Story 10.3): no live session, no folder syncing.
+    Idle,
+    /// The folder-sync rendering (Story 29.2), which REPLACES the idle menu on
+    /// the first sync tick — so it carries whatever the idle menu carries.
+    Sync,
+    /// A live session (Story 18.1).
+    Recording,
+    /// The hold over a terminal failed session (Story 18.4).
+    Error,
+}
+
+/// The registry ids one tray rendering offers. Membership only — the order the
+/// tray shows them in is the registry's (see [`tray_recording_verbs`]).
+///
+/// - **Idle / Sync**: start, and nothing else. A stop and a folder reveal belong
+///   to a session that exists; the idle tray had no way to begin one at all,
+///   which is the absence Story 46.16 fills.
+/// - **Recording**: stop + the folder reveal (Story 18.1). Not start: there is
+///   one session, and a second start item is the lingering-verb bug.
+/// - **Error**: the folder reveal only. The one-click restart over a terminal
+///   failed session lives on the window's banner, and the tray deliberately
+///   never restarts a session itself (Story 18.4) — a start verb here would be a
+///   second restart path with different words.
+fn tray_verb_ids(menu: TrayMenu) -> &'static [&'static str] {
+    match menu {
+        TrayMenu::Idle | TrayMenu::Sync => &[RECORDING_START_ID],
+        TrayMenu::Recording => &[RECORDING_STOP_ID, RECORDING_OPEN_FOLDER_ID],
+        TrayMenu::Error => &[RECORDING_OPEN_FOLDER_ID],
+    }
+}
+
+/// The recording verbs the menu-bar tray offers in `menu` — the tray's rendering
+/// of the same [`registry_sections`] projection the native menu bar and the ⌘?
+/// cheat sheet render (Story 46.16).
+///
+/// The tray was the one discovery surface that did not project this registry: it
+/// hand-built every label. That is why Story 46.5's rename of the start verb
+/// reached the palette, the cheat sheet and the menu bar in a single edit and
+/// reached the tray not at all — and why the tray had no start verb to rename in
+/// the first place. Membership per rendering is [`tray_verb_ids`]; the ORDER and
+/// the WORDS are the registry's, taken by filtering the projection in place, so
+/// the tray cannot order or word a verb differently from the menu bar.
+///
+/// `recording` is the capability flag (`recording_supported()` in the shell:
+/// desktop macOS ≥ 13 only). With it off every `requires_recording` action is
+/// already gone from the projection, so the tray offers no recording verb at all
+/// — absent, not disabled, exactly as on the other three surfaces (FR-66,
+/// AD-35). Pure — no I/O, no state.
+pub fn tray_recording_verbs(menu: TrayMenu, recording: bool) -> Vec<MenuItemVm> {
+    let wanted = tray_verb_ids(menu);
+    // `notes: false`: no tray verb is a notes action, because the tray composes
+    // its own notes section on retained handles (AD-61) whose labels mutate per
+    // tick — a static projection could not carry "3 unread note changes". A verb
+    // that failed to resolve for this or any other reason is caught by the test
+    // that counts what each rendering asks for against what it gets.
+    registry_sections(recording, false)
+        .into_iter()
+        .flat_map(|section| section.items)
+        .filter(|item| wanted.contains(&item.id.as_str()))
+        .collect()
+}
+
 /// Build the collapsed toggle title for a pair into one unambiguous label.
 ///
 /// Factors out the words the two direction titles share as a common word-prefix and
@@ -1036,9 +1171,16 @@ mod tests {
     }
 
     /// Every `requires_recording` action the registry ships — `open-recording`
-    /// (Story 16.3) plus the three recording verbs (Story 20.4, FR-48/FR-66).
-    const RECORDING_ACTION_IDS: [&str; 4] = [
+    /// (Story 16.3), `open-recordings` (Story 45.20) and the three recording
+    /// verbs (Story 20.4, FR-48/FR-66).
+    ///
+    /// The archive entry is in this list rather than in a test of its own so it
+    /// is gated by the same assertions as its four siblings: a navigation entry
+    /// that survived the capability going off would offer a browser over
+    /// recordings the build cannot make.
+    const RECORDING_ACTION_IDS: [&str; 5] = [
         "open-recording",
+        "open-recordings",
         "recording-start",
         "recording-stop",
         "recording-open-folder",
@@ -1121,6 +1263,104 @@ mod tests {
                 "registry projection omits {id} when recording is off"
             );
         }
+    }
+
+    #[test]
+    fn the_start_verb_answers_the_word_people_search_for() {
+        // Story 46.5. The owner went looking for "new recording", found
+        // nothing, and concluded the verb did not exist — it did, titled
+        // "Start Recording", one submenu away from "Open Recordings", which
+        // only navigates.
+        //
+        // Queried, not read off the struct: asserting `title == "New
+        // Recording"` would restate the diff and pass on a title nothing can
+        // find. What was broken is the search, so the search is what is
+        // asserted. "new" and "new recording" both missed under the old title
+        // and both of its old keywords ("begin", "go live") — neither string
+        // is a subsequence of either.
+        let index = sample_index();
+        for needle in ["new", "new recording"] {
+            let hits = index.query(needle, PaletteMode::Action, false, true, false);
+            let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
+            assert!(
+                ids.contains(&"recording-start"),
+                "{needle:?} finds the start verb: {ids:?}"
+            );
+        }
+        // And it is the FIRST answer, not a tail hit under the navigation
+        // entry the owner already found by accident.
+        let top = index.query("new recording", PaletteMode::Action, false, true, false);
+        assert_eq!(
+            top.actions.first().map(|a| a.id.as_str()),
+            Some("recording-start"),
+            "the start verb leads the results: {:?}",
+            top.actions
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The word that left the title still finds it: a rename that dropped
+        // "start" from both places would trade one lost vocabulary for another.
+        let by_old_word = index.query("start", PaletteMode::Action, false, true, false);
+        assert!(
+            by_old_word
+                .actions
+                .iter()
+                .any(|a| a.id == "recording-start"),
+            "\"start\" still finds it"
+        );
+        // A rename must not become a re-home: `palette.rs`'s section-count
+        // assertion above is what moving this item to Navigation would break,
+        // and this says out loud that the category is load-bearing.
+        let recording = registry_sections(true, false)
+            .into_iter()
+            .find(|s| s.category == "Recording")
+            .expect("Recording section present");
+        assert!(
+            recording.items.iter().any(|i| i.id == "recording-start"),
+            "the renamed verb stays in the Recording section"
+        );
+    }
+
+    #[test]
+    fn the_archive_entry_is_a_second_navigation_action_beside_the_capture_one() {
+        // Story 45.20: the reported gap was that the menu bar could open the
+        // capture surface and not the archive. Two DISTINCT ids in Navigation,
+        // with two distinct titles, is what closes it — a test that only asked
+        // "is there a recordings entry" would pass on a renamed `open-recording`
+        // and the menu would still have one item where it needs two.
+        let actions = palette_actions();
+        let nav: Vec<(&str, &str)> = actions
+            .iter()
+            .filter(|a| a.category == "Navigation")
+            .map(|a| (a.id.as_str(), a.title.as_str()))
+            .collect();
+        assert!(
+            nav.contains(&("open-recording", "Open Recording")),
+            "the capture surface keeps its entry: {nav:?}"
+        );
+        assert!(
+            nav.contains(&("open-recordings", "Open Recordings")),
+            "the archive gains one: {nav:?}"
+        );
+
+        let archive = actions
+            .iter()
+            .find(|a| a.id == "open-recordings")
+            .expect("open-recordings is registered");
+        // No chip: ⌘5 is the capture surface's and nothing binds a second chord.
+        // A chip here is a promise the cheat sheet would print and no hook keeps.
+        assert_eq!(archive.shortcut, None, "the archive claims no chord");
+        assert!(archive.requires_recording, "gated like every sibling");
+        assert!(!archive.requires_open_chat);
+        assert_eq!(archive.toggle_group, None);
+
+        // Both entries reachable from one search, because "recordings" is what
+        // a person types when they want either.
+        let index = sample_index();
+        let hits = index.query("recordings", PaletteMode::Action, false, true, false);
+        let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"open-recordings"), "searchable: {ids:?}");
     }
 
     /// The six notes actions the registry ships (Phase 5, build contract §1).
@@ -1583,5 +1823,122 @@ mod tests {
             cjk_prefix > cjk_mid,
             "CJK prefix ({cjk_prefix}) should beat mid-string ({cjk_mid})"
         );
+    }
+
+    // --- The tray projection (Story 46.16) ---------------------------------
+
+    /// Every tray rendering, so a fifth cannot be added without deciding what it
+    /// offers: a new variant makes this array fail to compile-length-match below.
+    const TRAY_MENUS: [TrayMenu; 4] = [
+        TrayMenu::Idle,
+        TrayMenu::Sync,
+        TrayMenu::Recording,
+        TrayMenu::Error,
+    ];
+
+    fn tray_ids(menu: TrayMenu) -> Vec<String> {
+        tray_recording_verbs(menu, true)
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_tray_offers_the_start_verb_exactly_where_a_session_can_begin() {
+        // The reported absence: from the menu-bar icon there was no way to begin
+        // a recording in ANY state. It belongs in the two renderings that mean
+        // "no session" — and the sync one is not optional, because it REPLACES
+        // the idle menu on the first sync tick, so a verb only in the idle menu
+        // vanishes for as long as a folder syncs.
+        assert_eq!(tray_ids(TrayMenu::Idle), [RECORDING_START_ID]);
+        assert_eq!(
+            tray_ids(TrayMenu::Sync),
+            [RECORDING_START_ID],
+            "the sync menu replaces the idle one and must carry the same verb"
+        );
+
+        // …and nowhere else. A start item that lingered into a live session
+        // would offer a second recording; one in the error hold would be a
+        // second restart path beside the banner's (Story 18.4).
+        for menu in [TrayMenu::Recording, TrayMenu::Error] {
+            let ids = tray_ids(menu);
+            assert!(
+                !ids.iter().any(|id| id == RECORDING_START_ID),
+                "{menu:?} must not offer a start verb: {ids:?}"
+            );
+        }
+
+        // The session-scoped verbs stay where Story 18.1/18.4 put them, in the
+        // registry's own order (start, stop, folder → filtered in place).
+        assert_eq!(
+            tray_ids(TrayMenu::Recording),
+            [RECORDING_STOP_ID, RECORDING_OPEN_FOLDER_ID]
+        );
+        assert_eq!(tray_ids(TrayMenu::Error), [RECORDING_OPEN_FOLDER_ID]);
+    }
+
+    #[test]
+    fn the_tray_shows_the_registrys_own_words_for_every_verb_it_projects() {
+        // The point of the story. Story 46.5 renamed the start verb in the
+        // registry and three surfaces changed; the tray did not, because it
+        // hand-typed its labels. Asserting the projected title EQUALS the
+        // registry's title — never the literal "New Recording" — is what makes
+        // the tray the fourth surface: a hand-typed label would satisfy a
+        // `== "New Recording"` assertion today and drift on the next rename.
+        let registry = palette_actions();
+        for menu in TRAY_MENUS {
+            for item in tray_recording_verbs(menu, true) {
+                let action = registry
+                    .iter()
+                    .find(|action| action.id == item.id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{menu:?} projects {}, which the registry does not ship",
+                            item.id
+                        )
+                    });
+                assert_eq!(
+                    item.title, action.title,
+                    "{menu:?} shows {}'s registry words",
+                    item.id
+                );
+                // The tray renders `title` alone (its labels carry no chords).
+                // These verbs are palette-only by design (UX-DR29); if one ever
+                // gained a chord, the tray would be dropping it silently.
+                assert_eq!(
+                    item.shortcut, None,
+                    "{} claims a chord the tray's label would drop",
+                    item.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_verb_a_tray_rendering_names_reaches_the_projection() {
+        // A rendering that names an id the registry no longer ships — renamed
+        // away, re-homed out of the projection, deleted — would render a shorter
+        // menu with no error anywhere. The count is the guard.
+        for menu in TRAY_MENUS {
+            assert_eq!(
+                tray_recording_verbs(menu, true).len(),
+                tray_verb_ids(menu).len(),
+                "{menu:?} resolves every id it names"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tray_rendering_projects_a_recording_verb_when_the_capability_is_off() {
+        // Absent, not disabled (FR-66, AD-35): the same gate the palette, the
+        // cheat sheet and the native menu bar apply, which is what makes the
+        // shell's `recording_supported()` check the same check rather than a
+        // second one that could disagree.
+        for menu in TRAY_MENUS {
+            assert!(
+                tray_recording_verbs(menu, false).is_empty(),
+                "{menu:?} offers nothing when recording is off"
+            );
+        }
     }
 }

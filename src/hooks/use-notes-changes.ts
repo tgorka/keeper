@@ -55,13 +55,19 @@ import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
  * The physical lens is the one scope that does not go through `notes_list`: a
  * vault-relative directory is not one of `NoteQueryReq`'s axes, so FR-106's own
  * command serves those rows. One folder level IS the whole set, so its `total`
- * is its own length — there is no window to be honest about.
+ * is its own length — there is no window to be honest about, and nothing caps
+ * it, so `matched` is the same number (Story 44.11).
  */
 async function readWindow(vaultId: string): Promise<NoteListVm> {
   const filters = notesFiltersStore.getState();
   if (isFolderScope(filters.scope)) {
     const folder = await notesTree(vaultId, filters.scope.path);
-    return { rows: folder.notes, total: folder.notes.length, offset: 0 };
+    return {
+      rows: folder.notes,
+      total: folder.notes.length,
+      matched: folder.notes.length,
+      offset: 0,
+    };
   }
   const { limit } = notesListStore.getState();
   return await notesList(vaultId, noteQueryFor(filters, 0, limit));
@@ -75,7 +81,7 @@ export function useNotesChanges(vaultId: string | null): void {
   // The chip set as one string, so the query effect re-runs on a real change
   // rather than on every render that rebuilds an equal array.
   const filterKey = useNotesFiltersStore((s) =>
-    JSON.stringify([s.scope, s.tags, s.text.trim(), s.agentOnly, s.pinnedOnly]),
+    JSON.stringify([s.scope, s.tagTerms, s.text.trim(), s.agentOnly, s.pinnedOnly]),
   );
   const limit = useNotesListStore((s) => s.limit);
 

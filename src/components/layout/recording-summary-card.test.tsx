@@ -4,6 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   revealPath: vi.fn(() => Promise.resolve()),
   recordingRetitle: vi.fn(),
+  // Story 45.19: opening the editor reads the session's stored details, and
+  // saving them writes back. Defaulted below to "a session with details", so
+  // every pre-45.19 case still opens an editor whose four extra fields are
+  // simply left alone.
+  recordingSessionMeta: vi.fn(),
+  recordingMetaUpdate: vi.fn(),
+  // Story 42.5: the details editor's Tags field completes over the one tag
+  // vocabulary. An empty vocabulary is this suite's world — nothing here is
+  // about completion.
+  tagsVocabulary: vi.fn(() => Promise.resolve({ entries: [] })),
   // Story 42.4: the card now hosts the note stub, which resolves its own note
   // through these three. Defaulted to "no stub" below, so every pre-42.4 case
   // renders exactly the DOM it always did.
@@ -16,6 +26,8 @@ import {
   RECOVERY_DISMISS_LABEL,
   REVEAL_IN_FINDER_LABEL,
   RecordingSummaryCard,
+  SUMMARY_DETAILS_UNAVAILABLE,
+  SUMMARY_DETAILS_UNAVAILABLE_TESTID,
   SUMMARY_FOLDER_TESTID,
   SUMMARY_RETITLE_CANCEL_TESTID,
   SUMMARY_RETITLE_EDIT_TESTID,
@@ -26,21 +38,36 @@ import {
   SUMMARY_RETITLE_UNTITLED_LABEL,
 } from "@/components/layout/recording-summary-card";
 import {
+  META_CUSTOM_NAME_LABEL,
+  META_CUSTOM_VALUE_LABEL,
+  META_NOTE_LABEL,
+  META_PARTICIPANTS_LABEL,
+  META_TAGS_LABEL,
+} from "@/components/recording/recording-meta-fields";
+import {
   NOTE_STUB_BODY_TESTID,
   NOTE_STUB_KEPT_TESTID,
 } from "@/components/recording/recording-note-stub";
-import type { RecordingNoteStubVm, RecordingSummaryVm } from "@/lib/ipc/client";
+import type {
+  RecordingNoteStubVm,
+  RecordingSessionMetaVm,
+  RecordingSummaryVm,
+} from "@/lib/ipc/client";
 import {
+  recordingMetaUpdate,
   recordingNoteStub,
   recordingNoteStubDismiss,
   recordingNoteStubSave,
   recordingRetitle,
+  recordingSessionMeta,
   revealPath,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const mockReveal = vi.mocked(revealPath);
 const mockRetitle = vi.mocked(recordingRetitle);
+const mockSessionMeta = vi.mocked(recordingSessionMeta);
+const mockMetaUpdate = vi.mocked(recordingMetaUpdate);
 const mockNoteStub = vi.mocked(recordingNoteStub);
 const mockNoteStubSave = vi.mocked(recordingNoteStubSave);
 const mockNoteStubDismiss = vi.mocked(recordingNoteStubDismiss);
@@ -72,11 +99,38 @@ const STUB: RecordingNoteStubVm = {
   relativePath: "2026-07-19-standup.md",
 };
 
+/**
+ * What the session's manifest currently says (Story 45.19).
+ *
+ * TWO custom rows and TWO tags on purpose: a change that keeps only the first
+ * element of either collection passes every single-item fixture, and nothing in
+ * the shape of the result says anything went missing.
+ */
+const STORED: RecordingSessionMetaVm = {
+  title: "Standup",
+  participants: "Ada, Grace",
+  note: "weekly",
+  tags: "standup, q3",
+  custom: [
+    { name: "Ticket", value: "KPR-1" },
+    { name: "Room", value: "Blue" },
+  ],
+};
+
 beforeEach(() => {
   mockReveal.mockReset();
   mockReveal.mockResolvedValue(undefined);
   mockRetitle.mockReset();
   mockRetitle.mockResolvedValue(MOVED);
+  mockSessionMeta.mockReset();
+  mockSessionMeta.mockResolvedValue(STORED);
+  mockMetaUpdate.mockReset();
+  // The command answers with what was STORED, which is what Rust does: it
+  // trims, drops nameless rows and re-joins the tag line. Tests that care set
+  // their own answer.
+  mockMetaUpdate.mockImplementation((_folder, participants, note, tags, custom) =>
+    Promise.resolve({ title: STORED.title, participants, note, tags, custom }),
+  );
   mockNoteStub.mockReset();
   // No stub by default: a stub is an addition to this card, and every case that
   // predates Story 42.4 must render exactly the DOM it rendered before.
@@ -657,5 +711,357 @@ describe("RecordingSummaryCard", () => {
     // card now points at, and the words typed into it survive the move.
     await waitFor(() => expect(mockNoteStub).toHaveBeenCalledWith(MOVED_FOLDER));
     expect(screen.getByTestId(NOTE_STUB_BODY_TESTID)).toHaveValue(`${STUB_BODY}Half a sentence`);
+  });
+
+  // --- Story 45.19: every field of the "Next session" form, on the last
+  // recording. ----------------------------------------------------------------
+
+  /** Open the editor and wait for the session's stored details to land. */
+  const openDetails = async (): Promise<void> => {
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    await waitFor(() =>
+      expect(screen.getByLabelText(META_PARTICIPANTS_LABEL)).toHaveValue(STORED.participants),
+    );
+  };
+
+  it("opens the editor on what the session's manifest actually holds", async () => {
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    await openDetails();
+    // Asserted on the CALL as well as the values: the folder is what the read
+    // is about, and a read of the wrong session would fill the form with
+    // somebody else's meeting and look entirely normal.
+    expect(mockSessionMeta).toHaveBeenCalledWith(FOLDER);
+    // The readable case asserts the ABSENCE of the unreadable one, and that the
+    // fields are live. Without these two, a change that raised
+    // `detailsUnavailable` for every session would still satisfy every
+    // `toHaveValue` below — the values would be right and frozen, which is the
+    // same DOM to a value assertion and a dead editor to the user.
+    expect(screen.queryByTestId(SUMMARY_DETAILS_UNAVAILABLE_TESTID)).toBeNull();
+    expect(screen.getByLabelText(META_PARTICIPANTS_LABEL)).toBeEnabled();
+    expect(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID)).toHaveValue("Standup");
+    expect(screen.getByLabelText(META_NOTE_LABEL)).toHaveValue(STORED.note);
+    expect(screen.getByLabelText(META_TAGS_LABEL)).toHaveValue(STORED.tags);
+    // BOTH custom rows: a read that kept only the first would leave a card that
+    // silently drops the second on the next save.
+    expect(
+      screen.getAllByLabelText(META_CUSTOM_NAME_LABEL).map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["Ticket", "Room"]);
+    expect(
+      screen.getAllByLabelText(META_CUSTOM_VALUE_LABEL).map((i) => (i as HTMLInputElement).value),
+    ).toEqual(["KPR-1", "Blue"]);
+  });
+
+  it("sends every edited detail to the manifest, and leaves the title alone", async () => {
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    await openDetails();
+    fireEvent.change(screen.getByLabelText(META_PARTICIPANTS_LABEL), {
+      target: { value: "Ada, Grace, Sam" },
+    });
+    fireEvent.change(screen.getByLabelText(META_NOTE_LABEL), { target: { value: "monthly" } });
+    fireEvent.change(screen.getByLabelText(META_TAGS_LABEL), {
+      target: { value: "standup, q3, demo" },
+    });
+    fireEvent.change(screen.getAllByLabelText(META_CUSTOM_VALUE_LABEL)[1] as HTMLElement, {
+      target: { value: "Green" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+
+    // The CALL, not merely the fact that a save happened: the tag line goes
+    // whole (Story 42.5 — Rust splits it), and both custom rows travel.
+    await waitFor(() =>
+      expect(mockMetaUpdate).toHaveBeenCalledWith(
+        FOLDER,
+        "Ada, Grace, Sam",
+        "monthly",
+        "standup, q3, demo",
+        [
+          { name: "Ticket", value: "KPR-1" },
+          { name: "Room", value: "Green" },
+        ],
+      ),
+    );
+    // The title did not change, so the session did not MOVE. A details edit
+    // that renamed the folder would be a file operation nobody asked for.
+    expect(mockRetitle).not.toHaveBeenCalled();
+  });
+
+  it("writes the details before the rename, so a refused rename cannot cost them", async () => {
+    mockRetitle.mockRejectedValue({
+      code: "recordingSessionLive",
+      message: "Stop the recording first.",
+    });
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    await openDetails();
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Retro" },
+    });
+    fireEvent.change(screen.getByLabelText(META_PARTICIPANTS_LABEL), { target: { value: "Ada" } });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_RETITLE_FAULT_TESTID)).toHaveTextContent(
+        "Stop the recording first.",
+      ),
+    );
+    // The field POINTS at that sentence, and the reference RESOLVES. A dangling
+    // `aria-describedby` renders byte-identically — the attribute is there, the
+    // testid query still finds the paragraph, both look right — and the only
+    // thing lost is the announcement to the person who cannot see the red text.
+    //
+    // `toHaveAccessibleDescription` rather than reading the attribute and
+    // looking the id up by hand: it computes the description THROUGH the
+    // reference, so it cannot pass while the reference dangles, and it is also
+    // the shortest way to write the assertion. The checking form and the
+    // convenient form are the same form, so the next person cannot write the
+    // weaker one by accident.
+    expect(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID)).toHaveAccessibleDescription(
+      "Stop the recording first.",
+    );
+    // The details landed first and stayed landed; only the rename was refused.
+    expect(mockMetaUpdate).toHaveBeenCalledTimes(1);
+    expect(mockMetaUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+      mockRetitle.mock.invocationCallOrder[0] as number,
+    );
+    // And the editor is still open on the user's text, so the reason is
+    // actionable rather than a sentence beside an empty card.
+    expect(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID)).toHaveValue("Retro");
+  });
+
+  it("does not attempt the rename when the details write failed", async () => {
+    // The invariant that makes the two sequenced writes safe to share ONE fault
+    // slot: they live in one `try`, so a failed details write SKIPS the rename.
+    // Nothing pinned it. Move the rename out of that block — which reads like
+    // ordinary "do both halves" code — and a refused details write would be
+    // followed by a rename that MOVES the session, so the user gets a folder in
+    // a new place and a sentence saying the save failed.
+    mockMetaUpdate.mockRejectedValue({ code: "internal", message: "The disk is full." });
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    await openDetails();
+    fireEvent.change(screen.getByLabelText(META_PARTICIPANTS_LABEL), { target: { value: "Ada" } });
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Retro" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_RETITLE_FAULT_TESTID)).toHaveTextContent(
+        "The disk is full.",
+      ),
+    );
+    // The session did not move. The witness for this absence is the test above,
+    // which asserts the rename IS called on the same mock when the details
+    // succeed — so a rename that stopped being wired at all fails there.
+    expect(mockRetitle).not.toHaveBeenCalled();
+    expect(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID)).toHaveValue("Retro");
+  });
+
+  it("repaints the fields from what Rust stored, not from what was typed", async () => {
+    // Rust trims, drops a nameless custom row and re-joins the tag line. The
+    // editor must show what is in the file — echoing the request back would
+    // show the user their own typing and hide the rules that applied.
+    mockMetaUpdate.mockResolvedValue({
+      title: "Standup",
+      participants: "Ada, Grace",
+      note: "weekly",
+      tags: "standup, q3",
+      custom: [{ name: "Ticket", value: "KPR-1" }],
+    });
+    mockRetitle.mockRejectedValue({ code: "internal", message: "nope" });
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    await openDetails();
+    fireEvent.change(screen.getByLabelText(META_PARTICIPANTS_LABEL), {
+      target: { value: "   Ada, Grace   " },
+    });
+    // A title edit too, so the rename's refusal keeps the editor open and the
+    // repainted fields are observable.
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Retro" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(META_PARTICIPANTS_LABEL)).toHaveValue("Ada, Grace"),
+    );
+    expect(screen.getAllByLabelText(META_CUSTOM_NAME_LABEL)).toHaveLength(1);
+  });
+
+  it("freezes the detail fields, and writes nothing, for a session with no manifest", async () => {
+    mockSessionMeta.mockResolvedValue(null);
+    render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_DETAILS_UNAVAILABLE_TESTID)).toHaveTextContent(
+        SUMMARY_DETAILS_UNAVAILABLE,
+      ),
+    );
+    expect(screen.getByLabelText(META_PARTICIPANTS_LABEL)).toBeDisabled();
+    expect(screen.getByLabelText(META_TAGS_LABEL)).toBeDisabled();
+
+    // The name still goes through, because the rename path has its own refusal
+    // and will say so; the four fields keeper cannot read send nothing at all.
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Retro" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() => expect(mockRetitle).toHaveBeenCalledWith(FOLDER, "Retro"));
+    expect(mockMetaUpdate).not.toHaveBeenCalled();
+  });
+
+  it("reads and writes the folder the session moved to, not the one it was renamed from", async () => {
+    const { rerender } = render(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={FOLDER}
+        title={null}
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+    // Rename first: the card now points at MOVED_FOLDER even though the owner
+    // still holds the old path.
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_EDIT_TESTID));
+    fireEvent.change(screen.getByTestId(SUMMARY_RETITLE_FIELD_TESTID), {
+      target: { value: "Standup" },
+    });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() =>
+      expect(screen.getByTestId(SUMMARY_FOLDER_TESTID).textContent).toBe(MOVED_FOLDER),
+    );
+    rerender(
+      <RecordingSummaryCard
+        variant="completion"
+        sessionFolder={MOVED_FOLDER}
+        title="Standup"
+        screenSegmentCount={3}
+        totalBytes={412_000_000}
+      />,
+    );
+
+    mockSessionMeta.mockClear();
+    await openDetails();
+    expect(mockSessionMeta).toHaveBeenCalledWith(MOVED_FOLDER);
+    fireEvent.change(screen.getByLabelText(META_NOTE_LABEL), { target: { value: "after" } });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() => expect(mockMetaUpdate).toHaveBeenCalled());
+    expect(mockMetaUpdate.mock.calls[0]?.[0]).toBe(MOVED_FOLDER);
+  });
+
+  it("gives each card's fields their own ids, so two open editors cannot cross labels", async () => {
+    // Two recovery cards on screen at once is the ordinary shape of a scan that
+    // salvaged two sessions, and the card's own comment claims its element ids
+    // are per-card. Nothing enforced that: a constant prefix renders two inputs
+    // with one id, every `<label for>` resolves to whichever the browser found
+    // first, and typing a participant into the second card's field edits the
+    // label of the first. Byte-identical to a single-card test.
+    render(
+      <>
+        <RecordingSummaryCard
+          variant="recovered"
+          sessionFolder={FOLDER}
+          title="Standup"
+          screenSegmentCount={2}
+          totalBytes={1_000_000}
+          onDismiss={vi.fn()}
+        />
+        <RecordingSummaryCard
+          variant="recovered"
+          sessionFolder={MOVED_FOLDER}
+          title="Retro"
+          screenSegmentCount={1}
+          totalBytes={1_000}
+          onDismiss={vi.fn()}
+        />
+      </>,
+    );
+
+    for (const open of screen.getAllByTestId(SUMMARY_RETITLE_EDIT_TESTID)) {
+      fireEvent.click(open);
+    }
+    await waitFor(() => expect(screen.getAllByLabelText(META_PARTICIPANTS_LABEL)).toHaveLength(2));
+    const ids = screen.getAllByLabelText(META_PARTICIPANTS_LABEL).map((field) => field.id);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("edits the details of a RECOVERED session too, on that card's own folder", async () => {
+    // The second host for this editor. A recovery scan mounts these, one per
+    // salvaged session, and a branch reachable only from the completion card is
+    // a branch every completion-card test would pass over.
+    render(
+      <RecordingSummaryCard
+        variant="recovered"
+        sessionFolder={FOLDER}
+        title="Standup"
+        screenSegmentCount={2}
+        totalBytes={1_000_000}
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    await openDetails();
+    fireEvent.change(screen.getByLabelText(META_NOTE_LABEL), { target: { value: "salvaged" } });
+    fireEvent.click(screen.getByTestId(SUMMARY_RETITLE_SAVE_TESTID));
+    await waitFor(() =>
+      expect(mockMetaUpdate).toHaveBeenCalledWith(
+        FOLDER,
+        STORED.participants,
+        "salvaged",
+        STORED.tags,
+        STORED.custom,
+      ),
+    );
   });
 });

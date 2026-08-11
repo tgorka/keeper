@@ -36,12 +36,16 @@
 //! * **An absent volume is never a deletion** ([`volume`]).
 
 pub mod backoff;
+pub mod browse;
 pub mod copy;
 pub mod credential;
 pub mod db;
 pub mod engine;
 pub mod error;
 pub mod exclude;
+pub mod export;
+pub mod file_serve;
+pub mod files_write;
 pub mod git;
 pub mod lfs;
 pub mod platform;

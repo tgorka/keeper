@@ -11,16 +11,31 @@
  * Single-select toggle: clicking the active row clears the filter; clicking any
  * other row selects it. The group is hidden entirely (`return null`) when the
  * aggregated Space list is empty (UX-DR — no label, no rows).
+ *
+ * **It folds, and it survives the menu folding** (Story 45.20, UX-DR81). The
+ * group used to be dropped from the collapsed rail outright, on the grounds
+ * that it "needs labels + names" — so folding the drawer silently removed a
+ * navigation surface instead of shrinking one. On the rail each row is its
+ * Space's avatar carrying the Space's name as its accessible name, which is the
+ * rail every chat app draws and is a name rather than an unlabelled glyph. No
+ * tooltip: the avatar already shows the Space's own initials, and a tooltip
+ * would restate the accessible name a second time over a control whose other
+ * gesture is a press.
+ *
+ * The group's own fold is remembered separately from the menu's, because "give
+ * me the width back" and "I do not care about Spaces today" are two asks.
  */
 
+import { Layers } from "lucide-react";
 import { roomInitials } from "@/components/chat/RoomAvatar";
+import { FoldableGroup } from "@/components/layout/sidebar-group";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import type { SpaceVm } from "@/lib/ipc/client";
 import { setSpaceFilter } from "@/lib/ipc/client";
 import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
 import { cn } from "@/lib/utils";
 
-export function SpacesGroup() {
+export function SpacesGroup({ collapsed = false }: { collapsed?: boolean }) {
   const spaces = useSpacesStore((s) => s.spaces);
   const activeSpace = useSpacesStore((s) => s.activeSpace);
 
@@ -44,38 +59,39 @@ export function SpacesGroup() {
   };
 
   return (
-    <section aria-label="Spaces" className="flex flex-col px-2 pb-1">
-      <span className="px-2 py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        Spaces
-      </span>
-      <ul className="flex flex-col gap-0.5">
-        {spaces.map((space) => {
-          const isActive =
-            activeSpace?.accountId === space.accountId && activeSpace?.spaceId === space.spaceId;
-          const httpAvatar =
-            space.avatarUrl && /^https?:\/\//.test(space.avatarUrl) ? space.avatarUrl : null;
-          return (
-            <li key={`${space.accountId}:${space.spaceId}`}>
-              <button
-                type="button"
-                onClick={() => onRowClick(space)}
-                aria-current={isActive ? "true" : undefined}
-                aria-pressed={isActive}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-                  isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
-                )}
-              >
-                <Avatar size="sm">
-                  {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
-                  <AvatarFallback>{roomInitials(space.name)}</AvatarFallback>
-                </Avatar>
-                <span className="truncate text-sm">{space.name}</span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-    </section>
+    <FoldableGroup label="Spaces" icon={Layers} group="spaces" collapsed={collapsed}>
+      {spaces.map((space) => {
+        const isActive =
+          activeSpace?.accountId === space.accountId && activeSpace?.spaceId === space.spaceId;
+        const httpAvatar =
+          space.avatarUrl && /^https?:\/\//.test(space.avatarUrl) ? space.avatarUrl : null;
+        return (
+          <li key={`${space.accountId}:${space.spaceId}`}>
+            <button
+              type="button"
+              onClick={() => onRowClick(space)}
+              aria-current={isActive ? "true" : undefined}
+              aria-pressed={isActive}
+              // The name is the Space's own in BOTH renderings. On the rail it
+              // is the only carrier of the name, which is the whole difference
+              // between a folded menu and a strip of glyphs; unfolded it is
+              // identical to the visible text, so the two cannot come apart.
+              aria-label={space.name}
+              className={cn(
+                "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+                collapsed ? "justify-center p-1" : "w-full gap-2 px-2 py-1.5",
+                isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
+              )}
+            >
+              <Avatar size="sm">
+                {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
+                <AvatarFallback>{roomInitials(space.name)}</AvatarFallback>
+              </Avatar>
+              {!collapsed && <span className="truncate text-sm">{space.name}</span>}
+            </button>
+          </li>
+        );
+      })}
+    </FoldableGroup>
   );
 }

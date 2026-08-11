@@ -6,6 +6,18 @@
  * Only the reference crosses IPC. The bytes were read and written entirely in
  * Rust, and the webview reaches them through the custom protocol at `url`
  * (AD-58) rather than through a base64 payload.
+ *
+ * **There was a `markdown` field here and Story 45.13 deleted it.** It carried
+ * `![name](attachments/name.png)` — CommonMark's embed — while the attachments
+ * panel wrote `![[attachments/name.png]]`, Obsidian's. Two spellings for one
+ * act, and only the second is decorated by `live-preview.ts`, so an attachment
+ * imported through this VM would have rendered as flat text. It was never
+ * noticed because nothing in the webview has read this field since epic 37:
+ * `notes_attachment_drop` and `notes_attachment_paste` have client wrappers
+ * and no callers. A dead field is not a spare part, it is an untested code
+ * path waiting for its first caller — which is how `NoteCreateReq.dest`
+ * turned out to be an armed data-loss path the moment something set it. The
+ * one spelling now lives in `src/lib/notes/attach.ts` and nowhere else.
  */
 export type NoteAttachmentVm = { 
 /**
@@ -15,8 +27,4 @@ relPath: string,
 /**
  * `keeper-note://…` URL the webview can render.
  */
-url: string, 
-/**
- * The markdown to splice into the body at the caret.
- */
-markdown: string, };
+url: string, };

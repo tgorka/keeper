@@ -66,6 +66,12 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   // `recording` capability in Rust, so it only reaches this dispatch when recording
   // is available (desktop macOS ≥ 13.0).
   "open-recording": () => primaryViewStore.getState().setView("recording"),
+  // Story 45.20: the Recordings ARCHIVE (Story 42.3), which is a different
+  // surface from the capture pane above and had no entry outside the sidebar —
+  // so the menu bar and the palette could start a recording and not open the
+  // place recordings land. Registry-gated on the same `recording` capability,
+  // in Rust, for the same reason.
+  "open-recordings": () => primaryViewStore.getState().setView("recordings"),
 
   // --- Recording verbs (Story 20.4, FR-48) --- registry-gated on the
   // `recording` capability in Rust (dropped, not disabled, when off), and

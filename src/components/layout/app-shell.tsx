@@ -1,4 +1,4 @@
-import { type MouseEvent, useCallback, useRef } from "react";
+import { type MouseEvent, useCallback, useEffect, useRef } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
@@ -8,6 +8,8 @@ import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
+import { FilesPane } from "@/components/layout/files-pane";
+import { PanelStrip } from "@/components/layout/panel-strip";
 import { PhoneShell } from "@/components/layout/phone-shell";
 import { RecordingPane } from "@/components/layout/recording-pane";
 import { SettingsPane } from "@/components/layout/settings-pane";
@@ -43,12 +45,18 @@ import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { useDetailStore } from "@/lib/stores/detail-ui";
+import { hydrateFilesTree } from "@/lib/stores/files-tree";
+import { hydratePanels } from "@/lib/stores/panels";
 import { usePrimaryView } from "@/lib/stores/primary-view";
+import { hydrateSidebarFold, sidebarFoldStore, useSidebarFold } from "@/lib/stores/sidebar-fold";
 import { beginTitleBarDrag } from "@/lib/titlebar-drag";
 import { cn } from "@/lib/utils";
 
 export function AppShell() {
-  const { phone, sidebarCollapsed, detailFloating } = useShellLayout();
+  // `narrow` is the VIEWPORT's answer, not the user's. Kept under its own name
+  // because the two are combined a few lines down and reading one as the other
+  // is how a user's fold would silently win over "there is no room".
+  const { phone, sidebarCollapsed: narrow, detailFloating } = useShellLayout();
   // Stream every account's connectivity into the per-account status store: the
   // switcher glyphs, the shell offline pill, and the "Queued" send caption are
   // all pure projections of that single map.
@@ -100,6 +108,44 @@ export function AppShell() {
   // a press toggles capture through the shared recording-control module. The
   // hook self-gates on the `recording` capability (inert everywhere else).
   useRecordingHotkey();
+  // Restore the panel arrangement from the last run (Story 45.1, FR-173).
+  //
+  // Here rather than at the panel store's module load, and here rather than
+  // inside the strip: the notes list can retarget a panel while the Notes
+  // surface is up and the strip has never mounted, and an unhydrated store
+  // would then overwrite the remembered arrangement with one panel. Mounted at
+  // the shell so it runs exactly once per app, whatever surface comes up first
+  // — a restore the shell does not mount is a restore no hook-level test can
+  // ever see it fail to make (DW-172). `hydratePanels` is idempotent, so
+  // React's double-invoked development effects restore once.
+  useEffect(() => {
+    hydratePanels(document.cookie);
+  }, []);
+  // Restore the fold from the last run (Story 45.20, FR-198), in the same place
+  // and for the same reason: the drawer is unmounted on the phone tier and can
+  // be unmounted for a whole session, so a restore that lived inside it would
+  // silently not happen. Idempotent, like `hydratePanels`.
+  useEffect(() => {
+    hydrateSidebarFold(document.cookie);
+  }, []);
+  // Restore which folders the Files tree had open (Story 46.3), for the third
+  // time and the same reason: `FilesPane` is unmounted by every surface switch,
+  // which is exactly the defect — the tree forgot itself whenever you looked at
+  // something else. Idempotent, like the two above.
+  useEffect(() => {
+    hydrateFilesTree(document.cookie);
+  }, []);
+  // The user's fold, and how it composes with the viewport's.
+  //
+  // OR, not "the user wins": below 1080px there is no room for a 260px drawer
+  // and that has been true since long before the fold existed, so the narrow
+  // viewport forces the rail and the toggle is withdrawn rather than offered as
+  // a control that would lie. Above it, the choice is entirely the user's — and
+  // it is remembered, so widening the window later brings back the fold they
+  // chose rather than the one the window imposed.
+  const menuFolded = useSidebarFold((s) => s.menu);
+  const sidebarCollapsed = narrow || menuFolded;
+  const toggleFold = useCallback(() => sidebarFoldStore.getState().toggleMenu(), []);
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
@@ -219,7 +265,12 @@ export function AppShell() {
             <PhoneShell />
           ) : (
             <>
-              <SidebarPane collapsed={sidebarCollapsed} />
+              {/* `onToggleFold` is `null` where the viewport has already made
+                  the decision: below 1080px there is no room to unfold into, so
+                  the control is absent rather than present-and-inert. A
+                  disabled button whose only answer is "your window is too
+                  narrow" is a worse answer than no button. */}
+              <SidebarPane collapsed={sidebarCollapsed} onToggleFold={narrow ? null : toggleFold} />
               {recording && primaryView === "recording" ? (
                 <RecordingPane />
               ) : recording && primaryView === "recordings" ? (
@@ -230,6 +281,20 @@ export function AppShell() {
                 <RecordingsPane />
               ) : sync && primaryView === "sync" ? (
                 <SyncPane />
+              ) : sync && primaryView === "files" ? (
+                // Story 43.8: the browser over what sync holds, gated on the
+                // SAME `sync` capability as sync itself — where no folder can be
+                // synced there is nothing for a file browser to browse.
+                //
+                // Story 45.1 puts the panel strip beside it: the tree is the
+                // browser and the strip is the document area, which is what
+                // turns "the Files pane lists a PDF it will not open" into a
+                // click. The tree already carried its own right-hand border for
+                // a neighbour it did not have.
+                <>
+                  <FilesPane />
+                  <PanelStrip />
+                </>
               ) : notes && primaryView === "notes" ? (
                 <NotesPane />
               ) : primaryView === "bridges" ? (

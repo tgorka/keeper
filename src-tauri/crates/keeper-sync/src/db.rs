@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SyncError};
-use crate::profile::{ProfileState, SyncProfile};
+use crate::profile::{self, ProfileState, SyncProfile};
 use crate::stability::{FileSample, PersistedEntry};
 
 pub const DB_FILE_NAME: &str = "sync.db";
@@ -259,9 +259,18 @@ pub fn clear_file_state(conn: &Connection, profile_id: &str) -> Result<usize> {
 
 /// Insert or replace a profile. Validation runs first so a bad profile can
 /// never reach the database, whatever route it arrived by.
+///
+/// The folder tier is taken back off before the write (AD-98). Every read hands
+/// out a profile with the folder's own `.keeper/*.toml` layered on, so without
+/// [`profile::as_stored`] the first read-modify-write — `set_enabled` is the
+/// plain one — would copy the file's values into the row, and deleting the file
+/// later would reveal a copy of it rather than the value the user chose. That
+/// is the `config.json` failure AD-98 exists to end, and this is the one write
+/// funnel it can be prevented at.
 pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> Result<()> {
     profile.validate()?;
-    let json = serde_json::to_string(profile)
+    let profile = profile::as_stored(profile, stored_profile(conn, &profile.id)?.as_ref());
+    let json = serde_json::to_string(&profile)
         .map_err(|e| SyncError::Config(format!("profile is not serializable: {e}")))?;
     conn.execute(
         "INSERT INTO profiles (id, json, updated_ms) VALUES (?1, ?2, ?3)
@@ -271,6 +280,8 @@ pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> 
     Ok(())
 }
 
+/// Every profile **as it is in force**: the stored row with the folder's own
+/// config layered on top (Story 46.8).
 pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     let mut stmt = conn.prepare("SELECT json FROM profiles ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -278,7 +289,7 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     for row in rows {
         let json = row?;
         match serde_json::from_str::<SyncProfile>(&json) {
-            Ok(profile) => out.push(profile),
+            Ok(profile) => out.push(profile::in_force(profile)),
             // A profile written by a newer keeper must not brick an older one.
             // Skip it loudly rather than failing the whole listing.
             Err(err) => tracing::warn!(error = %err, "skipping unreadable sync profile row"),
@@ -287,7 +298,17 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     Ok(out)
 }
 
+/// One profile as it is in force, exactly as [`list_profiles`] reports it.
 pub fn get_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
+    Ok(stored_profile(conn, id)?.map(profile::in_force))
+}
+
+/// One profile as the **table** holds it, with no folder layer on top.
+///
+/// Private, and the only two callers are the ones that must not see the file:
+/// [`get_profile`], which layers it itself, and [`upsert_profile`], which needs
+/// the pre-write row to restore the fields a folder file owns.
+fn stored_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
     let json: Option<String> = conn
         .query_row("SELECT json FROM profiles WHERE id = ?1", [id], |r| {
             r.get(0)

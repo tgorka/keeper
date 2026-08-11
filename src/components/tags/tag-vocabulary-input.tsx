@@ -47,8 +47,12 @@ export function tagVocabularyListId(inputId: string): string {
  * here would be the frontend deciding what a tag looks like.
  *
  * No filtering happens here: the browser matches the typed text against the
- * offered values, and re-implementing that match would be a second matching
- * rule beside the one `tag-complete.ts` already gets from CodeMirror.
+ * offered values. Story 44.13 gave keeper its own answer to "which tags match
+ * what I typed" (`tag-match.ts`), and the two tag CHOOSERS — the editor popup
+ * and `notes/tag-combobox.tsx` — both ask it. This field still delegates,
+ * because a `<datalist>` cannot be told which of its options to show without
+ * re-rendering the list under the browser's own popup; it stays the browser's
+ * match until the recording card's field becomes a chooser (Story 44.14).
  */
 export function tagSuggestions(typed: string, vocabulary: readonly string[]): string[] {
   const lastComma = typed.lastIndexOf(",");
@@ -62,6 +66,7 @@ export function TagVocabularyInput({
   value,
   onChange,
   placeholder,
+  disabled,
   vaultId,
 }: {
   /** The input's DOM id; the label points at it and the datalist derives from it. */
@@ -71,6 +76,11 @@ export function TagVocabularyInput({
   /** Receives the raw text, unmodified. */
   onChange: (value: string) => void;
   placeholder?: string;
+  /** Freeze the field while its host has a save in flight (Story 45.19) — the
+   *  details editor on a finished session disables every control together, and
+   *  a tag field that stayed live would take edits the in-flight write cannot
+   *  carry. */
+  disabled?: boolean;
   /** Scope the vocabulary to a vault; omitted, Rust resolves the active one —
    *  the recording metadata card has no vault of its own. */
   vaultId?: string;
@@ -102,6 +112,7 @@ export function TagVocabularyInput({
         id={id}
         list={listId}
         value={value}
+        disabled={disabled}
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />

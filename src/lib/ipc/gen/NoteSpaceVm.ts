@@ -17,13 +17,103 @@ name: string,
  */
 query: string, 
 /**
- * Presentation, deliberately outside the query grammar, e.g. `modified desc`.
+ * How this space orders the notes it lists, exactly as stored, e.g.
+ * `modified desc` (FR-158, Story 44.4). Kept as the file's own text rather
+ * than as a parsed enum, so a value keeper could not read survives a round
+ * trip through the editor unrewritten — the same promise the query and the
+ * icon make. [`crate::notes::sort::read`] is what turns it into an
+ * ordering, and into the sentence in `warnings` when it cannot.
  */
 sort: string, 
 /**
- * Maximum rows the space yields.
+ * The ordering the list is actually running, as the canonical
+ * `<key> <dir>` — always one of the ten [`crate::notes::sort`] knows, even
+ * when `sort` above holds nothing, or holds `bananas`.
+ *
+ * It exists so the editor never parses `sort`. A dropdown that had to work
+ * out for itself what an empty string or an unknown word resolves to would
+ * be a second copy of the fallback rule, in the language that cannot run
+ * the tests — and the two copies would disagree the first time the rule
+ * changed. Rust decides; the form selects what Rust decided; saving sends
+ * that back.
+ */
+sortEffective: string, 
+/**
+ * The most notes this space holds — a cap on what it SELECTS, not on what
+ * a surface renders (Story 44.11, DW-163). Zero is "no cap", which is what
+ * a space with no `keeper.limit` key sends and what saving zero back
+ * leaves the file without.
+ *
+ * Applied after the sort, so a space capped at twenty keeps the twenty its
+ * own ordering put first. Not clamped to the list's page size: the page is
+ * how many rows one read carries, and shrinking a space to fit one would
+ * drop notes the space genuinely holds.
  */
 limit: number, 
+/**
+ * The icon the sidebar draws for this space, as the name of one member of
+ * the fixed set the editor offers (FR-149, UX-DR55). `None` for a space
+ * nobody has given one, and — deliberately — also the spelling for a space
+ * whose stored name is not in that set any more: the *name* survives on
+ * disk untouched, because keeper rewriting an icon it did not recognise is
+ * the same class of mistake as rewriting a query term it could not parse.
+ */
+icon: string | null, 
+/**
+ * Which seeded default this space is, when it is one
+ * ([`crate::notes::default_spaces`], Story 44.3). `None` for every space a
+ * person or an agent wrote.
+ *
+ * It is the identity, not the name: a default is editable like any other
+ * space, so renaming Recordings to "Sessions" must not stop the empty list
+ * saying who writes recording notes, and must not make restore offer a
+ * second copy. Read from `keeper.default`, which only keeper writes and the
+ * editor never touches.
+ */
+defaultKey: string | null, 
+/**
+ * The template a note created in this space starts from — a vault-relative
+ * path, or a bare name inside the template directory (FR-162, Story 44.7).
+ * `None` for a space that hands out no template, which is most of them.
+ *
+ * Carried as the stored text, unresolved: whether the path still names a
+ * note is a question about the vault at create time, not at render time, so
+ * the editor shows what the file says and the create path is what reports a
+ * template that has gone missing.
+ */
+template: string | null, 
+/**
+ * The presentation keys of this space's frontmatter that keeper could not
+ * read, each already worded as a finished sentence (Story 44.4).
+ *
+ * Separate from `error` because the severity is different and so is the
+ * remedy: a query that does not parse means the space selects **nothing**,
+ * while an unreadable `sort` or `order` means the space still works and is
+ * simply not obeying one line of its own file. Both have to be visible —
+ * frontmatter is hand-edited and agent-edited, so these values will be
+ * wrong, and a fallback nobody is told about is indistinguishable from
+ * keeper ignoring what the user wrote.
+ *
+ * A list rather than an `Option`, because a file with a bad `sort` usually
+ * has a bad `order` too — whoever was guessing at one was guessing at both
+ * — and showing one of the two would send them round the loop twice.
+ */
+warnings: Array<string>, 
+/**
+ * Where this space sits in the rail: lower first, ties by name
+ * (FR-157, AD-81).
+ *
+ * Zero for a space nobody has positioned, which is every space that exists
+ * before this story — so a rail nobody has ordered is still the
+ * alphabetical rail it was, and the seeded defaults still render Inbox,
+ * Journal, Pinned, Recordings in the order the deleted fixed rows did.
+ * Negative is allowed and is how a space floats above that block.
+ *
+ * `f64` for the reason a note's own order is one (Story 44.5): `1.5` is how
+ * a person slots a row between 1 and 2 without renumbering everything under
+ * it, and an integer would read `1.5` and `1.2` as the same position.
+ */
+order: number, 
 /**
  * The parse failure, when the stored query does not parse. A broken space
  * matches nothing and says so; it never falls back to matching everything.

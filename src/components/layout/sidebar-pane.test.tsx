@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm } from "@/lib/ipc/client";
 
@@ -26,7 +26,13 @@ import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { draftsStore } from "@/lib/stores/drafts";
+import { networksStore } from "@/lib/stores/networks";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import {
+  readSidebarFold,
+  resetSidebarFoldForTest,
+  sidebarFoldStore,
+} from "@/lib/stores/sidebar-fold";
 import { spacesStore } from "@/lib/stores/spaces";
 
 const OFFLINE_TEXT = "Offline — showing your local archive. Messages queue until you're back.";
@@ -47,10 +53,10 @@ const other: AccountVm = {
   provider: "password",
 };
 
-function renderSidebar(collapsed = false) {
+function renderSidebar(collapsed = false, onToggleFold: (() => void) | null = () => {}) {
   return render(
     <TooltipProvider>
-      <SidebarPane collapsed={collapsed} />
+      <SidebarPane collapsed={collapsed} onToggleFold={onToggleFold} />
     </TooltipProvider>,
   );
 }
@@ -62,6 +68,7 @@ beforeEach(() => {
   bridgeHealthStore.getState().reset();
   draftsStore.getState().clear();
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  resetSidebarFoldForTest();
 });
 
 afterEach(() => {
@@ -71,6 +78,9 @@ afterEach(() => {
   bridgeHealthStore.getState().reset();
   draftsStore.getState().clear();
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  resetSidebarFoldForTest();
+  spacesStore.getState().clear();
+  networksStore.getState().clear();
 });
 
 /** Seed one session's live health into the store. */
@@ -139,7 +149,7 @@ describe("SidebarPane offline pill", () => {
     accountStatusStore.getState().setStatus(account.accountId, "online");
     rerender(
       <TooltipProvider>
-        <SidebarPane collapsed={false} />
+        <SidebarPane collapsed={false} onToggleFold={() => {}} />
       </TooltipProvider>,
     );
     expect(screen.queryByText(OFFLINE_TEXT)).not.toBeInTheDocument();
@@ -257,7 +267,7 @@ describe("SidebarPane approvals", () => {
     draftsStore.getState().mark("a1", "!r1:x", false);
     rerender(
       <TooltipProvider>
-        <SidebarPane collapsed={false} />
+        <SidebarPane collapsed={false} onToggleFold={() => {}} />
       </TooltipProvider>,
     );
     expect(document.querySelector('[data-slot="approval-count"]')).not.toBeInTheDocument();
@@ -387,6 +397,38 @@ describe("SidebarPane sync entry (Story 32.5)", () => {
   });
 });
 
+describe("SidebarPane files entry (Story 43.8)", () => {
+  it("omits the Files entry entirely when the sync capability is off (the default)", () => {
+    renderSidebar();
+    // Where no folder can be synced there is nothing for a browser to browse,
+    // so the row is absent rather than empty (FR-153, AD-27).
+    expect(screen.queryByRole("button", { name: "Files" })).not.toBeInTheDocument();
+  });
+
+  it("places Files immediately after Sync, before Settings", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter((label) => label === "Sync" || label === "Files" || label === "Settings");
+    expect(labels).toEqual(["Sync", "Files", "Settings"]);
+  });
+
+  it("switches the primary view to files, leaving Sync unmarked", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+
+    expect(primaryViewStore.getState().view).toBe("files");
+    expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute("aria-current", "page");
+    // The diagnostics pane is a sibling, not the same row.
+    expect(screen.getByRole("button", { name: "Sync" })).not.toHaveAttribute("aria-current");
+  });
+});
+
 describe("SidebarPane notes entry (Story 37.1)", () => {
   it("omits the Notes entry entirely when the notes capability is off", () => {
     renderSidebar();
@@ -498,5 +540,138 @@ describe("SidebarPane reachable footer (Story 34.2)", () => {
     const nav = screen.getByRole("navigation", { name: "Views" });
     expect(nav).toHaveClass("min-h-0");
     expect(document.querySelector('[data-slot="scroll-area"]')).toHaveClass("min-h-0", "flex-1");
+  });
+});
+
+describe("SidebarPane fold (Story 45.20, FR-198, UX-DR81)", () => {
+  /** Two Spaces and two Networks. One of each cannot tell "renders the list"
+   *  from "renders the first row", and this suite asserts a whole list survives
+   *  the fold. */
+  function seedGroups() {
+    spacesStore.getState().applySnapshot({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!a:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+        { accountId: account.accountId, spaceId: "!b:example.org", name: "Ops", avatarUrl: null },
+      ],
+    });
+    networksStore.getState().applySnapshot({
+      networks: [{ name: "Telegram" }, { name: "Signal" }],
+    });
+  }
+
+  it("offers a fold control that names which way it goes, in both states", () => {
+    renderSidebar(false);
+    const collapse = screen.getByRole("button", { name: "Collapse menu" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    expect(collapse).toHaveAttribute("aria-controls", "sidebar-views");
+    expect(document.getElementById("sidebar-views")).toBeInTheDocument();
+
+    cleanup();
+    renderSidebar(true);
+    const expand = screen.getByRole("button", { name: "Expand menu" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    expect(expand).toHaveAttribute("aria-controls", "sidebar-views");
+  });
+
+  it("presses the control rather than only offering it", () => {
+    // The offer is not the act. `onToggleFold` is what the shell hands down, and
+    // a control wired to nothing renders identically to one that works.
+    const toggle = vi.fn();
+    renderSidebar(false, toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse menu" }));
+    expect(toggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("withdraws the control where the viewport has already decided", () => {
+    // `null` is the shell saying "below 1080px there is no room to unfold into".
+    // Absent rather than disabled: a button whose only answer is "your window is
+    // too narrow" is worse than no button.
+    renderSidebar(true, null);
+    expect(screen.queryByRole("button", { name: /menu$/ })).not.toBeInTheDocument();
+    // …and the rail is still navigable without it.
+    expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
+  });
+
+  it("keeps every nav control's accessible name on the folded rail", () => {
+    // The requirement in one assertion: icons that keep their names, not a strip
+    // of unlabelled glyphs. Every button in the views list is checked, so an
+    // entry added later without a name fails here rather than shipping mute.
+    capabilitiesStore.setState({
+      capabilities: { ...DEFAULT_CAPABILITIES, recording: true, sync: true, notes: true },
+      hydrated: true,
+    });
+    renderSidebar(true);
+
+    const list = document.getElementById("sidebar-views");
+    expect(list).toBeInTheDocument();
+    const buttons = [...(list?.querySelectorAll("button") ?? [])];
+    expect(buttons.length).toBe(10);
+    for (const button of buttons) {
+      expect(button).toHaveAccessibleName();
+    }
+    for (const name of [
+      "Chats",
+      "Archive",
+      "Approvals",
+      "Bridges",
+      "Recording",
+      "Recordings",
+      "Sync",
+      "Files",
+      "Notes",
+      "Settings",
+    ]) {
+      expect(screen.getByRole("button", { name }), name).toBeInTheDocument();
+    }
+  });
+
+  it("keeps the Spaces and Networks submenus on the folded rail, named", () => {
+    // They used to be dropped entirely when the drawer collapsed, so folding the
+    // menu silently removed a navigation surface. Each row keeps the Space's or
+    // Network's own name as its accessible name.
+    seedGroups();
+    renderSidebar(true);
+
+    expect(screen.getByRole("region", { name: "Spaces" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Networks" })).toBeInTheDocument();
+    for (const name of ["Design", "Ops", "Telegram", "Signal"]) {
+      expect(screen.getByRole("button", { name }), name).toBeInTheDocument();
+    }
+    // The names are the accessible ones, not visible text: the rail has none.
+    expect(screen.queryByText("Design")).not.toBeInTheDocument();
+  });
+
+  it("folds a submenu on its own, on the rail and unfolded alike", () => {
+    seedGroups();
+    renderSidebar(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Spaces" }));
+
+    // The rows are gone from the accessibility tree; the control that brings
+    // them back is not, and it now says so.
+    expect(screen.queryByRole("button", { name: "Design" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Ops" })).not.toBeInTheDocument();
+    const reopen = screen.getByRole("button", { name: "Expand Spaces" });
+    expect(reopen).toHaveAttribute("aria-expanded", "false");
+    // Its neighbour is untouched — one fold per group, not one for the pair.
+    expect(screen.getByRole("button", { name: "Telegram" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse Networks" })).toBeInTheDocument();
+
+    fireEvent.click(reopen);
+    expect(screen.getByRole("button", { name: "Design" })).toBeInTheDocument();
+  });
+
+  it("writes a folded submenu to the cookie so it survives a restart", () => {
+    seedGroups();
+    renderSidebar(false);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Networks" }));
+
+    expect(readSidebarFold(document.cookie).groups).toEqual({ spaces: false, networks: true });
+    expect(sidebarFoldStore.getState().groups.networks).toBe(true);
   });
 });

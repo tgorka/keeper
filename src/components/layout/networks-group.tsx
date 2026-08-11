@@ -17,10 +17,18 @@
  * `keeper.db`; every Chat bridged to that Network stops posting notifications while
  * unread still accrues. The muted state is Rust-authoritative — the row loads it via
  * {@link networkMuteGet} and reflects it with a bell-off glyph.
+ *
+ * **It folds, and it survives the menu folding** (Story 45.20, UX-DR81), on the
+ * same terms as SPACES: the group used to vanish from the collapsed rail, so
+ * folding the drawer removed a navigation surface rather than shrinking one.
+ * Each row keeps the Network's name as its accessible name in both renderings,
+ * and the mute context menu rides along unchanged — a folded row is the same
+ * control, drawn narrower.
  */
 
-import { BellOff } from "lucide-react";
+import { BellOff, Radio } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { FoldableGroup } from "@/components/layout/sidebar-group";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   ContextMenu,
@@ -41,7 +49,15 @@ import { cn } from "@/lib/utils";
  * bell-off glyph; a monotonic `writeId` guards a slow failed toggle from clobbering a
  * newer successful one.
  */
-function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boolean }) {
+function NetworkRow({
+  network,
+  isActive,
+  collapsed,
+}: {
+  network: NetworkVm;
+  isActive: boolean;
+  collapsed: boolean;
+}) {
   const [muted, setMuted] = useState<boolean | undefined>(undefined);
   const writeId = useRef(0);
   // Phone touch idiom (Story 13.6): a long-press opens the same mute-toggle
@@ -101,8 +117,15 @@ function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boole
           {...longPress}
           aria-current={isActive ? "true" : undefined}
           aria-pressed={isActive}
+          // The Network's own name, in both renderings, and it carries the mute
+          // state with it. On the rail the `BellOff` glyph is the only thing
+          // saying "muted" and a glyph is not a name, so the state joins the
+          // name — otherwise folding the menu would hide a fact the unfolded
+          // row states.
+          aria-label={muted === true ? `${network.name}, muted` : network.name}
           className={cn(
-            "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            collapsed ? "justify-center p-1" : "w-full gap-2 px-2 py-1.5",
             isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
             // Long-press target (Story 13.6): suppress the native callout and
             // selection on the phone tier only.
@@ -114,12 +137,15 @@ function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boole
               {[...network.name][0]?.toUpperCase() ?? ""}
             </AvatarFallback>
           </Avatar>
-          <span className="truncate text-sm">{network.name}</span>
+          {!collapsed && <span className="truncate text-sm">{network.name}</span>}
           {muted === true && (
             <BellOff
-              aria-label="Muted"
+              aria-hidden="true"
               data-testid="network-mute-glyph"
-              className="ml-auto size-3 shrink-0 text-muted-foreground"
+              className={cn(
+                "size-3 shrink-0 text-muted-foreground",
+                collapsed ? "-ml-2 self-start" : "ml-auto",
+              )}
             />
           )}
         </button>
@@ -139,7 +165,7 @@ function NetworkRow({ network, isActive }: { network: NetworkVm; isActive: boole
   );
 }
 
-export function NetworksGroup() {
+export function NetworksGroup({ collapsed = false }: { collapsed?: boolean }) {
   const networks = useNetworksStore((s) => s.networks);
   const activeNetwork = useNetworksStore((s) => s.activeNetwork);
 
@@ -149,17 +175,16 @@ export function NetworksGroup() {
   }
 
   return (
-    <section aria-label="Networks" className="flex flex-col px-2 pb-1">
-      <span className="px-2 py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        Networks
-      </span>
-      <ul className="flex flex-col gap-0.5">
-        {networks.map((network) => (
-          <li key={network.name}>
-            <NetworkRow network={network} isActive={activeNetwork === network.name} />
-          </li>
-        ))}
-      </ul>
-    </section>
+    <FoldableGroup label="Networks" icon={Radio} group="networks" collapsed={collapsed}>
+      {networks.map((network) => (
+        <li key={network.name}>
+          <NetworkRow
+            network={network}
+            isActive={activeNetwork === network.name}
+            collapsed={collapsed}
+          />
+        </li>
+      ))}
+    </FoldableGroup>
   );
 }

@@ -65,6 +65,11 @@ percent-encoding = { workspace = true }
 # 18.2, `finalize_within`). Test-only feature -- the shipped binary is unchanged.
 tokio = { workspace = true, features = ["test-util"] }
 
+# `file_protocol`'s Range tests build a real vault tree on disk: the protocol
+# handler answers with bytes read through `browse::resolve`, so a fixture that
+# is not a real directory would test the wrong half (Story 45.7).
+tempfile = { workspace = true }
+
 # Desktop-only surfaces (Story 12.2, compile seam): these crates are
 # `#![cfg(not(target_os = "ios"))]`-style desktop plugins, so iOS must never link
 # them. Cargo target tables only understand real target cfgs (never tauri-build's

@@ -200,6 +200,113 @@ fn attributes_written_for_one_profile_are_readable_as_git_attributes() {
     assert!(text.contains("c.txt: filter: unspecified"), "got:\n{text}");
 }
 
+/// A path holding a space is ONE pattern, and git agrees (Story 46.1).
+///
+/// This asks git rather than keeper's own reader, because the two agreeing
+/// with each other is exactly what was wrong. Written unquoted,
+/// `/2021 holiday/clip filter=lfs …` splits at the blank: git takes `/2021` as
+/// the pattern and `holiday/clip` as an attribute NAME to set on it. The rule
+/// covers nothing, and it is not a parse error — no exit status and no stderr
+/// mark it — which is why the file grew to fifty-nine copies of one rule
+/// before anyone noticed.
+///
+/// The `2021` row is the bug's signature: under the old spelling that path
+/// resolved to `lfs`, because `/2021` was what the pattern had become.
+#[test]
+fn a_path_with_a_space_is_one_pattern_that_git_resolves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+
+    // Both branches of `pattern_for` can produce a blank: the exact-path one
+    // for a name with no extension, and the extension one because
+    // `Path::extension` splits at the LAST dot.
+    let spaced = stage::pattern_for(Path::new("2021 holiday/clip"));
+    let versioned = stage::pattern_for(Path::new("v1.2 final draft"));
+    assert_eq!(spaced, "/2021 holiday/clip");
+    assert_eq!(versioned, "*.2 final draft");
+
+    stage::ensure_attributes(root, &[spaced, versioned, "*.mp4".into()]).expect("write");
+
+    let out = std::process::Command::new("git")
+        .args([
+            "check-attr",
+            // NUL-separated, so a path with a blank in it is not re-quoted on
+            // the way out and this test is not parsing git's own quoting.
+            "-z",
+            "filter",
+            "--",
+            "2021 holiday/clip",
+            "notes/v1.2 final draft",
+            "a.mp4",
+            "2021",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("check-attr");
+    assert!(
+        out.stderr.is_empty(),
+        "git complained about the file keeper wrote:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = std::str::from_utf8(&out.stdout).expect("check-attr -z output is utf-8");
+    let resolved: std::collections::BTreeMap<&str, &str> = text
+        .split('\0')
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+        .map(|triple| (triple[0], triple[2]))
+        .collect();
+
+    assert_eq!(
+        resolved.get("2021 holiday/clip"),
+        Some(&"lfs"),
+        "{resolved:?}"
+    );
+    assert_eq!(
+        resolved.get("notes/v1.2 final draft"),
+        Some(&"lfs"),
+        "{resolved:?}"
+    );
+    // The quoting must not have cost the ordinary case anything.
+    assert_eq!(resolved.get("a.mp4"), Some(&"lfs"), "{resolved:?}");
+    // The prefix the unquoted line used to convert into a rule of its own.
+    assert_eq!(resolved.get("2021"), Some(&"unspecified"), "{resolved:?}");
+}
+
+/// The same rule twice is one line, and the second run writes nothing.
+///
+/// FR-137 allows one `.gitattributes` write per session. The writer fix alone
+/// would have broken that harder than the bug did: a quoted line tokenises to
+/// `"/2021` under a blank-splitting reader, so it never matches and is
+/// appended on every single run. Reader and writer are one change, and this is
+/// the assertion that says so.
+#[test]
+fn re_running_ensure_attributes_for_a_spaced_path_leaves_the_file_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+
+    let patterns = [stage::pattern_for(Path::new("2021 holiday/clip"))];
+    assert!(stage::ensure_attributes(root, &patterns).expect("first"));
+    let after_first = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+
+    assert!(
+        !stage::ensure_attributes(root, &patterns).expect("second"),
+        "the rule keeper wrote a moment ago must read as already present"
+    );
+    assert!(
+        !stage::ensure_attributes(root, &patterns).expect("third"),
+        "and it must keep reading that way"
+    );
+    assert_eq!(
+        after_first,
+        std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+        "one path is one line, however many times it is staged"
+    );
+    assert_eq!(after_first.matches("filter=lfs").count(), 1);
+}
+
 /// A repository whose `clip.mp4` is committed as an LFS pointer while the
 /// worktree keeps the real bytes — the state every LFS-tracked path lives in.
 fn commit_pointer_for_clip(root: &Path, payload: &[u8]) -> stage::LfsStaging {

@@ -154,13 +154,43 @@ them with everything else there. There is no destination registry, no import
 and nothing else to configure — a synced folder holds recordings or it does
 not.
 
-The subfolder is yours to change, and keeper refuses rather than corrects: a
-subfolder that is empty, absolute, escapes the folder, or overlaps that
-folder's notes vault is rejected on save with the reason, because one folder
-cannot be both a vault and a recordings root without the notes indexer walking
-your video. Turning the switch off removes the flag and nothing else — no file
-moves, and a destination pointing at that folder falls back to the plain
-folder above.
+The subfolder is yours to change, and it may be nested as deep as you like
+(`40-media/recordings`). keeper refuses rather than corrects: a subfolder that
+is empty, absolute, escapes the folder, or overlaps that folder's notes vault is
+rejected on save with the reason, because one folder cannot be both a vault and
+a recordings root without the notes indexer walking your video. Turning the
+switch off removes the flag and nothing else — no file moves, and a destination
+pointing at that folder falls back to the plain folder above.
+
+### The whole path, in one card
+
+You do not have to go to Settings → Sync to change the subfolder. The Recording
+pane's Destination card shows both halves of the path a session takes and lets
+you set either:
+
+| | *Recordings subfolder* | *Session folder* |
+|---|---|---|
+| where it lives | the sync profile, in `sync.db` | `recording.path_template`, this machine's settings |
+| who else sees it | every machine syncing that folder | nobody — this Mac only |
+| may be nested | yes | yes |
+
+They stay two fields on purpose. The first has to be identical on every machine
+syncing the folder, or the second machine records somewhere else; the second is
+a per-machine preference and cannot be. The card says which is which rather than
+merging them into one box that could only be right on one machine.
+
+**Changing the subfolder moves no files.** Sessions already recorded under the
+old one stay exactly where they are: they drop out of the recordings browser at
+the next archive rebuild, and the `![[recordings/…]]` embeds in their note stubs
+stop resolving. The card says so before you save, not after. Move them yourself
+first if you want to keep them listed.
+
+Recordings never live at the profile root, and that is not an oversight: eight
+places depend on the root being a non-empty folder disjoint from the notes
+vault, two of them safety arguments rather than conveniences (the
+`keeper-recording://` sandbox's non-overlap proof, and the commit gate that
+skips tier-2 checks for recordings and would otherwise apply to every file in
+the folder, notes included).
 
 ### When the synced folder is on a drive you unplug
 
@@ -195,10 +225,44 @@ The toggle applies live (no restart), and log writes are best-effort — they
 never affect a running capture. For a bug report, zip the session folder:
 media, manifest, and event log travel together.
 
-## `config.json` — file-based overrides
+## Settings files — `keeper.toml`, and `config.json` beneath it
 
-For development and scripted setups, keeper imports an optional flat JSON
-file over its settings table at every startup (**file wins**):
+Every setting keeper has is readable and writable as a file. Since epic 46 there is a stack of
+TOML layers, and `config.json` sits at the bottom of it — still supported, still imported, but
+**outranked by every `keeper.toml` layer**. The full layer order, the complete key list with each
+key's scope, and which keys a shared file may not set, are in
+[`settings-keys.md`](./settings-keys.md); this section covers only what a recording setup needs.
+
+The shortest useful form, for development and scripted setups:
+
+```
+~/.keeper/keeper.toml                     # you, on every machine
+~/.keeper/keeper.<hostname>.toml          # you, on this machine only
+```
+
+```toml
+[settings]
+"recording.codec" = "hevc"
+"recording.fps" = 60
+"recording.destination_dir" = "/Users/you/Movies/keeper-dev"
+"debug.mode" = true
+```
+
+A value in a file **keeps** winning — it is resolved on every read, not imported once at boot, so
+a UI toggle over a file-controlled setting does not quietly erase it. Settings that a file
+currently owns are listed in Settings, with the file that owns them.
+
+`recording.destination_dir` is an absolute path and so is machine-local: put it in the
+`<hostname>` file, or a second machine will try to record into a folder it does not have.
+
+Note the recordings **subfolder** is not here. It belongs to the synced folder rather than to this
+machine, so it lives in that folder's own `.keeper/keeper.toml` under `[folder]` — which is why
+both machines syncing a folder agree about where its recordings go.
+
+### `config.json` (still supported, lowest precedence)
+
+The older flat JSON file, imported over the settings table at every startup and beaten by any
+TOML layer that names the same key:
 
 ```
 ~/Library/Application Support/keeper/config.json   (beside keeper.db)
@@ -224,8 +288,18 @@ to the registry's `"1"`/`"0"` convention). Keys import verbatim into the
 settings table, and the typed getters keep clamping/normalizing on read, so
 an out-of-range hand-edit degrades to its documented default. A malformed
 file is reported loudly in the app log and skipped — startup never aborts
-over it. The import runs before the debug-mode gate is seeded, so
-`"debug.mode": true` applies to that same boot.
+over it.
+
+Its ordering guarantee is unchanged and now shared: the whole settings stack
+resolves before the debug-mode gate is seeded, so `"debug.mode": true` in
+either file applies to that same boot.
+
+The one thing that did change: **`config.json` no longer wins.** It is
+imported into the settings table, and the table is what a `keeper.toml`
+layer sits in front of — so a key named in both is answered by the TOML file.
+A key named only here still works exactly as it always did. Settings lists
+which keys a file currently owns and which file owns them, so you can see
+this rather than deduce it.
 
 Known recording keys: `recording.codec` (`h264` | `hevc`),
 `recording.scale_percent` (`100` | `75` | `50` | `25`), `recording.fps`
@@ -287,6 +361,14 @@ not parse degrades to the default on read), `recording.echo_cancellation`
   **fails the build** if the result is still ad-hoc. Run it from Terminal.app:
   codesign cannot reach the login keychain over SSH
   (`errSecInternalComponent`).
+- **From a Linux workstation, `bun run install:macos` already does all of that.**
+  It rsyncs the tree to the Mac and then dispatches the signed build into the
+  Mac's GUI login session through Terminal.app — the one route to the login
+  keychain that needs neither root (`launchctl asuser`) nor the account password
+  (`security unlock-keychain`). A Terminal window opens on the Mac, its output
+  streams back to your shell, and it closes when the build succeeds. There is no
+  unsigned install path any more; before this, the script built ad-hoc over ssh
+  and merely printed a warning, which cost the TCC grant on every install.
 
   ### The "infinite Screen Recording prompt" loop
 

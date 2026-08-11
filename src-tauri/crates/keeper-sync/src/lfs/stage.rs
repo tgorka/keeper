@@ -162,6 +162,13 @@ impl LfsPolicy {
 /// A per-extension rule (`*.mp4`) rather than a per-file one, so the file's
 /// siblings are covered too and the block stays small on a media folder. A path
 /// with no extension gets an exact-path rule.
+///
+/// The pattern returned is the **raw** one — `/my holiday` for a path with a
+/// space, not `"/my holiday"`. Quoting is a property of the line, not of the
+/// pattern, and it is applied by [`ensure_attributes`] at the moment it writes
+/// one; see [`quote_pattern`]. Keeping it out of here is what lets the
+/// idempotence check compare like with like, and it keeps `ensure_lfs_rule`'s
+/// log line readable.
 pub fn pattern_for(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if !ext.is_empty() => pattern_for_extension(ext),
@@ -187,12 +194,147 @@ pub fn pattern_for_extension(ext: &str) -> String {
     format!("*.{}", ext.trim().trim_start_matches('.'))
 }
 
+/// `pattern` spelled so a `.gitattributes` line reads back as `pattern`.
+///
+/// # Why quoting, and why nothing else works
+///
+/// A gitattributes line is `<pattern> <attr>…` split on blanks, so a pattern
+/// holding a space needs an escape, and gitattributes(5) offers exactly one:
+/// *"Patterns that begin with a double quote are quoted in C style."* Git
+/// decides whether to unquote from the line's **first byte**, before it has
+/// looked for a separator, so a backslash is not an alternative spelling — it
+/// is a silent miss. `/a\ b filter=lfs` still splits at the blank, and git
+/// reads `b` as an attribute name to *set* on `/a\`; verified against git
+/// 2.53.0. gitoxide's parser branches on the same byte, so a line written this
+/// way is also the line `routed_through_lfs` reads back.
+///
+/// # Why only when required
+///
+/// `"*.mp4"` and `*.mp4` mean the same thing to git, but only one of them is
+/// what is already in every user's `.gitattributes`. Quoting unconditionally
+/// would rewrite every existing line the first time keeper touched the file —
+/// a diff in a versioned, hand-editable file, in exchange for no behaviour. So
+/// the quotes appear only for a pattern that cannot be spelled without them,
+/// and every pattern keeper has written until now comes back byte-identical.
+///
+/// # Which bytes force it
+///
+/// Blanks and the C0 controls (together, `b <= b' '`), DEL, and the two bytes
+/// the encoding itself must escape (`"` and `\`) — the last two so the emitted
+/// field is unambiguous rather than merely lucky. A leading `#` forces it too,
+/// because git reads a line beginning with `#` as a comment before it reads
+/// anything else. Bytes at or above `0x80` never force it: a UTF-8 filename is
+/// not a quoting problem, and octal-escaping one would churn `café.mp4` into
+/// `"caf\303\251.mp4"` in a file that reads it fine bare.
+///
+/// The result is the exact inverse of [`gix_quote::ansi_c::undo`] — the
+/// decoder [`attribute_pattern_matches`] reads it back with, and the one
+/// `gix-attributes` resolves it with. That crate exposes no encoder, which is
+/// why this is written by hand; the round trip is pinned by test
+/// `quoting_is_the_exact_inverse_of_the_decoder_git_and_gitoxide_use`.
+pub fn quote_pattern(pattern: &str) -> String {
+    if !needs_quotes(pattern) {
+        return pattern.to_owned();
+    }
+    // The two quotes, plus slack for the escapes that forced them.
+    let mut out = String::with_capacity(pattern.len() + 8);
+    out.push('"');
+    for ch in pattern.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\x0b' => out.push_str("\\v"),
+            '\x0c' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            // Whatever control is left is single-byte, so it fits the three
+            // octal digits `undo` reads back — and its leading digit is 0 or 1,
+            // which is inside the `\0`–`\3` opener that decoder accepts.
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                let byte = c as u32;
+                out.push('\\');
+                out.push(char::from(b'0' + ((byte >> 6) & 7) as u8));
+                out.push(char::from(b'0' + ((byte >> 3) & 7) as u8));
+                out.push(char::from(b'0' + (byte & 7) as u8));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Does `pattern` need C-style quoting to survive a `.gitattributes` line?
+///
+/// See [`quote_pattern`] for why each of these forces it. Separate so the
+/// common "no quotes needed" answer is one scan of the bytes and no allocation
+/// beyond the copy the caller was going to make anyway.
+fn needs_quotes(pattern: &str) -> bool {
+    // An empty pattern would collapse into the separator and leave `filter=lfs`
+    // standing where the pattern belongs — a line that silently sets `filter`
+    // on nothing. Neither producer can make one; this is not the failure to
+    // leave reachable.
+    pattern.is_empty()
+        || pattern.starts_with('#')
+        || pattern
+            .bytes()
+            .any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'\\')
+}
+
+/// Is the pattern field of `line` exactly `pattern`?
+///
+/// This is the half of [`ensure_attributes`] that decides a rule is already
+/// present, and it has to be able to read what [`quote_pattern`] writes.
+/// Splitting the line on blanks — what this did before Story 46.1 — tokenises
+/// `"/a b" filter=lfs` as `"/a`, which equals no pattern that has ever
+/// existed, so the rule reads as absent and is appended again on **every**
+/// run. That is not a cosmetic miss. It is how one owner's `.gitattributes`
+/// reached fifty-nine copies of the same rule, and it is why quoting the
+/// writer without teaching the reader would have been strictly worse than the
+/// bug it fixes: FR-137 allows one `.gitattributes` write per session, and an
+/// unreadable line turns every commit into another one.
+///
+/// Both spellings count. A pattern needing no quotes is still written bare, and
+/// a bare line written by an older keeper, by `git lfs track`, or by the user
+/// must keep counting as coverage.
+///
+/// Two shapes answer "absent": malformed quoting, and a quoted field that does
+/// not end where its closing quote does (`"a"b filter=lfs`). Neither is
+/// something keeper wrote. Both cost one appended rule and never a missing one,
+/// which is the direction to fail in.
+fn attribute_pattern_matches(line: &str, pattern: &str) -> bool {
+    if !line.starts_with('"') {
+        return line.split_whitespace().next() == Some(pattern);
+    }
+    let Ok((unquoted, consumed)) = gix_quote::ansi_c::undo(gix::bstr::BStr::new(line.as_bytes()))
+    else {
+        return false;
+    };
+    if !line
+        .as_bytes()
+        .get(consumed)
+        .is_none_or(u8::is_ascii_whitespace)
+    {
+        return false;
+    }
+    let unquoted: &[u8] = &unquoted;
+    unquoted == pattern.as_bytes()
+}
+
 /// Ensure `.gitattributes` contains a rule for every pattern.
 ///
 /// Returns whether the file changed. Idempotent, and it never reorders or
 /// removes anything a human wrote: keeper's rules live in an appended block
 /// below a marker, and existing coverage — however the user spelled it — is
 /// respected rather than duplicated.
+///
+/// Patterns are written through
+/// [`quote_pattern`] and read back through [`attribute_pattern_matches`], so a
+/// pattern holding a space is one line that git can parse and that this
+/// function recognises as its own on the next run.
 pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
     let file = root.join(".gitattributes");
     let existing = match std::fs::read_to_string(&file) {
@@ -206,10 +348,7 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
         let already = existing.lines().any(|line| {
             let line = line.trim();
             !line.starts_with('#')
-                && line
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|first| first == pattern)
+                && attribute_pattern_matches(line, pattern)
                 && line.contains("filter=lfs")
         });
         if !already && !wanted.contains(&pattern) {
@@ -232,7 +371,7 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
         out.push('\n');
     }
     for pattern in wanted {
-        out.push_str(pattern);
+        out.push_str(&quote_pattern(pattern));
         out.push(' ');
         out.push_str(ATTRIBUTE_SUFFIX);
         out.push('\n');
@@ -702,6 +841,216 @@ mod tests {
         assert_eq!(pattern_for(Path::new("a/b/archive.tar.gz")), "*.gz");
         // No extension: anchor an exact path at the repository root.
         assert_eq!(pattern_for(Path::new("bin/blob")), "/bin/blob");
+    }
+
+    /// The regression the story exists for: every pattern that can hold a
+    /// blank, and the raw spelling each one is expected to carry.
+    ///
+    /// `pattern_for` returns the pattern, never the line, so nothing here is
+    /// quoted — quoting belongs to `quote_pattern` and is asserted separately.
+    #[test]
+    fn a_pattern_can_hold_a_blank_from_either_branch() {
+        // Exact-path branch: no extension at all.
+        assert_eq!(
+            pattern_for(Path::new("archive/my holiday")),
+            "/archive/my holiday"
+        );
+        // Extension branch: `Path::extension` splits at the LAST dot, so a
+        // version-numbered name puts the blank inside the "extension".
+        assert_eq!(
+            pattern_for(Path::new("v1.2 final draft")),
+            "*.2 final draft"
+        );
+        // A blank in a parent directory reaches the exact-path branch too.
+        assert_eq!(pattern_for(Path::new("my media/blob")), "/my media/blob");
+    }
+
+    /// A pattern that does not need quotes is emitted byte for byte.
+    ///
+    /// This is the compatibility half of the fix. Quoting unconditionally
+    /// would be legal git and would rewrite every line in every user's
+    /// `.gitattributes` the first time keeper touched it, so "unchanged" is a
+    /// requirement rather than an optimisation — including for a UTF-8 name,
+    /// which git reads bare and which octal escaping would churn.
+    #[test]
+    fn a_pattern_needing_no_quotes_is_emitted_byte_identically() {
+        for pattern in [
+            "*.mp4",
+            "*.tar.gz",
+            "/bin/blob",
+            "/archive/café.mp4",
+            "*.mp4-",
+            "/a!b",
+            "/a#b",
+            "/a*b",
+        ] {
+            assert_eq!(quote_pattern(pattern), pattern, "{pattern} was rewritten");
+        }
+    }
+
+    /// Quoting is applied exactly when a bare spelling could not be read back.
+    #[test]
+    fn quoting_appears_only_for_a_pattern_that_needs_it() {
+        assert_eq!(quote_pattern("/a b"), "\"/a b\"");
+        assert_eq!(quote_pattern("*.2 final draft"), "\"*.2 final draft\"");
+        assert_eq!(quote_pattern("/a\tb"), "\"/a\\tb\"");
+        assert_eq!(quote_pattern("/a\"b"), "\"/a\\\"b\"");
+        assert_eq!(quote_pattern("/a\\b"), "\"/a\\\\b\"");
+        // A leading `#` is read as a comment before anything else is read.
+        assert_eq!(quote_pattern("#notes"), "\"#notes\"");
+        // An empty pattern would vanish into the separator.
+        assert_eq!(quote_pattern(""), "\"\"");
+        // Octal for the controls with no letter escape.
+        assert_eq!(quote_pattern("/a\u{1}b"), "\"/a\\001b\"");
+        assert_eq!(quote_pattern("/a\u{7f}b"), "\"/a\\177b\"");
+    }
+
+    /// `quote_pattern` is the inverse of the decoder git and gitoxide use.
+    ///
+    /// `gix-quote` ships `undo` and no encoder, so the encoder here is written
+    /// by hand against it. That is only safe while the pair actually composes,
+    /// and `gix-attributes` resolves keeper's own lines with the same `undo` —
+    /// so a divergence would not be a test failure, it would be
+    /// `routed_through_lfs` quietly failing to see a rule keeper wrote.
+    #[test]
+    fn quoting_is_the_exact_inverse_of_the_decoder_git_and_gitoxide_use() {
+        for pattern in [
+            "*.mp4",
+            "/bin/blob",
+            "/archive/café.mp4",
+            "/my holiday",
+            "*.2 final draft",
+            "/a\tb",
+            "/a\"b",
+            "/a\\b",
+            "/a\nb",
+            "/a\rb",
+            "/a\u{7}\u{8}\u{b}\u{c}b",
+            "/a\u{0}\u{1f}\u{7f}b",
+            "#notes",
+            "",
+            "/trailing space ",
+        ] {
+            let quoted = quote_pattern(pattern);
+            let (undone, consumed) = gix_quote::ansi_c::undo(gix::bstr::BStr::new(
+                quoted.as_bytes(),
+            ))
+            .unwrap_or_else(|err| panic!("{pattern:?} -> {quoted:?} did not decode: {err}"));
+            let undone: &[u8] = &undone;
+            assert_eq!(
+                undone,
+                pattern.as_bytes(),
+                "{pattern:?} round-tripped through {quoted:?} as {:?}",
+                String::from_utf8_lossy(undone)
+            );
+            assert_eq!(
+                consumed,
+                quoted.len(),
+                "{quoted:?} must be consumed whole, so the attributes start after it"
+            );
+        }
+    }
+
+    /// The reader half, asked directly.
+    ///
+    /// A quote-only fix would have been worse than the bug: keeper's own
+    /// coverage check tokenised on blanks, so a quoted line never matched and
+    /// the rule was re-appended on every run.
+    #[test]
+    fn coverage_is_recognised_in_both_the_quoted_and_the_bare_spelling() {
+        // The line keeper writes today for a spaced pattern.
+        assert!(attribute_pattern_matches(
+            "\"/my holiday\" filter=lfs diff=lfs merge=lfs -text",
+            "/my holiday"
+        ));
+        // A bare line — an older keeper, `git lfs track`, or the user.
+        assert!(attribute_pattern_matches(
+            "*.mp4 filter=lfs diff=lfs merge=lfs -text",
+            "*.mp4"
+        ));
+        // A quoted line for a pattern that needs no quotes is still coverage.
+        assert!(attribute_pattern_matches("\"*.mp4\" filter=lfs", "*.mp4"));
+        // A pattern with no attributes at all is still the same pattern.
+        assert!(attribute_pattern_matches("\"/my holiday\"", "/my holiday"));
+
+        // Discrimination, not a blanket yes.
+        assert!(!attribute_pattern_matches(
+            "\"/my other\" filter=lfs",
+            "/my holiday"
+        ));
+        assert!(!attribute_pattern_matches("*.iso filter=lfs", "*.mp4"));
+        // The broken line already in the owner's file: the pattern it names is
+        // `/2021` plus stray attributes, and it is NOT coverage for the path.
+        assert!(!attribute_pattern_matches(
+            "/2021 holiday/clip filter=lfs",
+            "/2021 holiday/clip"
+        ));
+        // Malformed quoting, and a field that does not end at its closing
+        // quote, are both read as absent — costing a rule, never hiding one.
+        assert!(!attribute_pattern_matches(
+            "\"/unterminated filter=lfs",
+            "/unterminated"
+        ));
+        assert!(!attribute_pattern_matches("\"*.mp4\"x filter=lfs", "*.mp4"));
+    }
+
+    /// FR-137's one write per session, for the path that used to defeat it.
+    ///
+    /// Fifty-nine copies of one rule is what the old reader produced: the line
+    /// it had just written tokenised to something no pattern equals, so every
+    /// commit that re-staged the path appended it again. The second call here
+    /// is the whole test.
+    #[test]
+    fn a_spaced_pattern_is_written_once_and_recognised_on_the_next_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let pattern = pattern_for(Path::new("2021 holiday/clip"));
+
+        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("first"));
+        let after_first = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+        assert!(
+            after_first.contains("\"/2021 holiday/clip\" filter=lfs diff=lfs merge=lfs -text"),
+            "got:\n{after_first}"
+        );
+        assert_eq!(
+            after_first.matches("filter=lfs").count(),
+            1,
+            "one path is one rule:\n{after_first}"
+        );
+
+        assert!(
+            !ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"),
+            "the rule keeper just wrote must read as already present"
+        );
+        assert_eq!(
+            after_first,
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            "a second run must not touch the file"
+        );
+    }
+
+    /// The bare block a pre-46.1 keeper wrote is still recognised as coverage.
+    ///
+    /// The fix must not orphan the rules already in the field: a space-free
+    /// pattern is written bare, so its old line and its new line are the same
+    /// bytes, and re-running against a file written by the previous version
+    /// has to change nothing at all.
+    #[test]
+    fn a_file_written_by_the_previous_version_is_left_exactly_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let legacy =
+            format!("{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n*.iso {ATTRIBUTE_SUFFIX}\n");
+        std::fs::write(root.join(".gitattributes"), &legacy).expect("seed");
+
+        assert!(
+            !ensure_attributes(root, &["*.mp4".into(), "*.iso".into()]).expect("rerun"),
+            "nothing changed, so nothing may be written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            legacy
+        );
     }
 
     #[test]

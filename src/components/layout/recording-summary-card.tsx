@@ -39,15 +39,22 @@
  * summary exactly as before, because finalize already succeeded and this card
  * must keep saying so.
  */
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { RecordingMetaFieldSet } from "@/components/recording/recording-meta-fields";
 import { RecordingNoteStub } from "@/components/recording/recording-note-stub";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import type { RecordingSummaryVm } from "@/lib/ipc/client";
-import { recordingRetitle, revealPath } from "@/lib/ipc/client";
+import type { RecordingSessionMetaVm, RecordingSummaryVm } from "@/lib/ipc/client";
+import {
+  recordingMetaUpdate,
+  recordingRetitle,
+  recordingSessionMeta,
+  revealPath,
+} from "@/lib/ipc/client";
 import { formatSize } from "@/lib/recording-format";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import type { RecordingMetaFields } from "@/lib/stores/recording-meta";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -57,25 +64,47 @@ export const REVEAL_IN_FINDER_LABEL = "Reveal in Finder";
 /** The recovery card's Dismiss control label (latches the one-time notice). */
 export const RECOVERY_DISMISS_LABEL = "Dismiss";
 
-/** The rename affordance's label on a session that already has a title. */
-export const SUMMARY_RETITLE_LABEL = "Rename";
+/**
+ * The details affordance's label on a session that already has a title.
+ *
+ * It said "Rename" until Story 45.19, and that stopped being true when the
+ * editor grew the other four fields the manifest carries. An affordance whose
+ * label names one of the five things behind it is how people never find the
+ * other four.
+ */
+export const SUMMARY_RETITLE_LABEL = "Edit details";
 
-/** The same affordance on an untitled session — a prompt, not a verb. Doubles
- * as the field's placeholder, so the invitation reads the same either way. */
+/** The same affordance on an untitled session — a prompt, not a verb, and
+ * still the name first, because that is what an untitled recording is missing.
+ * Doubles as the title field's placeholder, so the invitation reads the same
+ * either way. */
 export const SUMMARY_RETITLE_UNTITLED_LABEL = "Name this recording";
 
-/** The rename editor's commit affordance ("Save" alone would read as the
- * recording being saved, which happened already). */
-export const SUMMARY_RETITLE_SAVE_LABEL = "Save name";
+/** The editor's commit affordance ("Save" alone would read as the recording
+ * being saved, which happened already). */
+export const SUMMARY_RETITLE_SAVE_LABEL = "Save details";
 
-/** The rename editor's discard affordance. */
+/** The editor's discard affordance. */
 export const SUMMARY_RETITLE_CANCEL_LABEL = "Cancel";
 
-/** Accessible name for the rename field ("Title" is the manifest's word). */
+/** Accessible name for the title field ("Title" is the manifest's word). */
 export const SUMMARY_RETITLE_FIELD_LABEL = "Session title";
 
-/** Last-resort message when a rename rejection carries no readable sentence. */
-export const SUMMARY_RETITLE_UNKNOWN_ERROR = "keeper could not rename this recording.";
+/** Last-resort message when a save rejection carries no readable sentence. */
+export const SUMMARY_RETITLE_UNKNOWN_ERROR = "keeper could not save these details.";
+
+/**
+ * What the editor says when the session's own `manifest.json` will not load
+ * (Story 45.19).
+ *
+ * The four detail fields are frozen under it rather than hidden, because the
+ * alternative is an editor that silently offers four empty boxes over values
+ * keeper does not know — and a save from those would be a save of fabricated
+ * blanks. The title stays live: it goes through the rename path, which has its
+ * own refusal for exactly this and will say so in the same fault slot.
+ */
+export const SUMMARY_DETAILS_UNAVAILABLE =
+  "keeper can't read this recording's details, so only its name can be changed.";
 
 /** Test id for the mono session-folder line (the Reveal-in-Finder target). */
 export const SUMMARY_FOLDER_TESTID = "recording-summary-folder";
@@ -94,6 +123,12 @@ export const SUMMARY_RETITLE_CANCEL_TESTID = "recording-retitle-cancel";
 
 /** Test id for the inline fault line (a Rust-composed refusal, verbatim). */
 export const SUMMARY_RETITLE_FAULT_TESTID = "recording-retitle-fault";
+
+/** Test id for the detail field set, so a test can scope inside one card. */
+export const SUMMARY_DETAILS_TESTID = "recording-details-fields";
+
+/** Test id for the "keeper cannot read this session" line. */
+export const SUMMARY_DETAILS_UNAVAILABLE_TESTID = "recording-details-unavailable";
 
 /** The completion / recovery card variants (same shape, distinct edge + copy). */
 export type RecordingSummaryVariant = "completion" | "recovered";
@@ -159,6 +194,61 @@ function summaryLine(
   return `Saved ${segments} · ${formatSize(totalBytes)}`;
 }
 
+/**
+ * The editor's empty seed: what the four detail fields hold before the
+ * session's manifest has been read.
+ *
+ * `title` rides along because {@link RecordingMetaFieldSet} renders all five as
+ * one set, but on this surface it is not the field set's to own — the card's
+ * own `draft` is the title, because a title change is a rename and takes a
+ * different path out.
+ */
+const EMPTY_DETAILS: RecordingMetaFields = {
+  title: "",
+  participants: "",
+  note: "",
+  tags: "",
+  custom: [],
+};
+
+/** The stored metadata as the field set holds it. */
+function detailsOf(meta: RecordingSessionMetaVm): RecordingMetaFields {
+  return {
+    title: meta.title,
+    participants: meta.participants,
+    note: meta.note,
+    tags: meta.tags,
+    custom: meta.custom.map((row) => ({ name: row.name, value: row.value })),
+  };
+}
+
+/** Whether two custom-row lists say the same thing, in the same order. */
+function sameCustom(
+  a: readonly { name: string; value: string }[],
+  b: readonly { name: string; value: string }[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((row, index) => row.name === b[index]?.name && row.value === b[index]?.value)
+  );
+}
+
+/**
+ * Whether two drafts hold the same four details.
+ *
+ * The TITLE is deliberately not compared: it is the card's own `draft`, it goes
+ * out through the rename path, and folding it in here would make a rename look
+ * like a details change and send a second write that has nothing to say.
+ */
+function sameDetails(a: RecordingMetaFields, b: RecordingMetaFields): boolean {
+  return (
+    a.participants === b.participants &&
+    a.note === b.note &&
+    a.tags === b.tags &&
+    sameCustom(a.custom, b.custom)
+  );
+}
+
 export function RecordingSummaryCard({
   variant,
   sessionFolder,
@@ -173,6 +263,10 @@ export function RecordingSummaryCard({
   // A stable per-card id: two recovery cards can be open at once, so the fault
   // the field points at with `aria-describedby` must be this card's.
   const faultId = useId();
+  // The same per-card uniqueness, for the five element ids the detail field set
+  // mints — a label pointing at another card's input is a label pointing at the
+  // wrong recording.
+  const detailsPrefix = useId();
 
   // What a successful rename resolved, kept beside the folder it moved FROM.
   // It outranks the props for everything the move re-derived, because the
@@ -185,6 +279,16 @@ export function RecordingSummaryCard({
   const [saving, setSaving] = useState(false);
   // A Rust-authored refusal, rendered verbatim beside the field it is about.
   const [refusal, setRefusal] = useState<string | null>(null);
+  // The four fields the manifest holds beside the title (Story 45.19), drafted
+  // locally: this editor is not the pre-Start store's, and typing here must not
+  // put words into the form describing the NEXT session.
+  const [details, setDetails] = useState<RecordingMetaFields>(EMPTY_DETAILS);
+  // What the session's manifest last said those four were — `null` until the
+  // read lands, and `null` FOREVER for a session whose manifest will not load.
+  // Save compares against it, so an editor that only touched the title sends no
+  // details write at all.
+  const [stored, setStored] = useState<RecordingSessionMetaVm | null>(null);
+  const [detailsUnavailable, setDetailsUnavailable] = useState(false);
 
   // The override describes exactly one session, known by both the folder it was
   // at and the folder it moved to — the owner adopts the latter from the summary
@@ -214,23 +318,73 @@ export function RecordingSummaryCard({
   const effectiveBytes = override === null ? totalBytes : override.totalBytes;
   const named = effectiveTitle !== null && effectiveTitle !== "";
 
-  // The title arrives one IPC round trip after the completion card mounts, so an
-  // editor opened inside that window seeds an EMPTY draft over a title the user
-  // never saw — and an empty draft is a clear, which moves the folder back to
-  // the untitled path. Re-seed the untouched draft when the real title lands
-  // (a draft the user has since typed into is their edit and stands).
-  const seededWith = useRef("");
+  // The title arrives one IPC round trip after the completion card mounts, and
+  // the other four arrive one round trip after the editor opens. Either way an
+  // editor opened inside that window seeds EMPTY fields over values the user
+  // never saw — and an empty field is a clear, which for the title moves the
+  // folder back to its untitled path and for the rest wipes the manifest.
+  // Re-seed the untouched fields when the real values land, per field, so a
+  // field the user has since typed into is their edit and stands while its
+  // neighbours still catch up.
+  const seededWith = useRef<RecordingMetaFields>(EMPTY_DETAILS);
   useEffect(() => {
     if (!editing) {
       return;
     }
     const loaded = effectiveTitle ?? "";
-    if (seededWith.current === loaded) {
+    if (seededWith.current.title === loaded) {
       return;
     }
-    setDraft((current) => (current === seededWith.current ? loaded : current));
-    seededWith.current = loaded;
+    const seeded = seededWith.current.title;
+    setDraft((current) => (current === seeded ? loaded : current));
+    seededWith.current = { ...seededWith.current, title: loaded };
   }, [editing, effectiveTitle]);
+
+  /**
+   * Read the session's stored details, once per opening of the editor.
+   *
+   * **The fields and the baseline are set in the SAME update, on purpose.** An
+   * earlier shape landed the baseline in state and re-seeded the fields from an
+   * effect, which left one render in which the baseline said "the manifest has
+   * participants" while the fields still said "" — and in that render Save was
+   * enabled over an empty form. Pressing it would have written the empty seed
+   * over the stored details, which is the exact edit nobody asked for. Doing
+   * both here means the two can never disagree.
+   *
+   * Per field rather than wholesale: a field the user typed into while the read
+   * was in flight is their edit and stands, while its untouched neighbours
+   * still catch up.
+   */
+  const loadDetails = useCallback((folder: string) => {
+    setStored(null);
+    setDetailsUnavailable(false);
+    void recordingSessionMeta(folder)
+      .then((meta) => {
+        if (meta === null) {
+          // No loadable manifest. Say so and freeze the four fields rather than
+          // leave four empty boxes standing in for values keeper cannot read.
+          setDetailsUnavailable(true);
+          return;
+        }
+        const loaded = detailsOf(meta);
+        const seeded = seededWith.current;
+        setDetails((current) => ({
+          title: current.title,
+          participants:
+            current.participants === seeded.participants
+              ? loaded.participants
+              : current.participants,
+          note: current.note === seeded.note ? loaded.note : current.note,
+          tags: current.tags === seeded.tags ? loaded.tags : current.tags,
+          custom: sameCustom(current.custom, seeded.custom) ? loaded.custom : current.custom,
+        }));
+        seededWith.current = { ...loaded, title: seededWith.current.title };
+        setStored(meta);
+      })
+      .catch(() => {
+        setDetailsUnavailable(true);
+      });
+  }, []);
 
   // Focus follows the editor across the affordance↔field swap, the way the
   // approval row's inline body editor does (approval-pane.tsx: focus the field
@@ -250,24 +404,61 @@ export function RecordingSummaryCard({
   }, [editing]);
 
   const typed = draft.trim();
-  // Nothing to send when the trimmed text is already the session's title (and
-  // an empty field on an untitled session is exactly that case), and nothing to
-  // send twice while a rename is in flight.
-  const saveDisabled = saving || typed === (effectiveTitle ?? "");
+  const titleChanged = typed !== (effectiveTitle ?? "");
+  // Compared against what the manifest LAST SAID, not against what the editor
+  // opened with: a session whose details have not been read yet has nothing to
+  // compare to, and sending a write from an unread editor would save the empty
+  // seed over whatever is really in the file.
+  const detailsChanged = stored !== null && !sameDetails(details, detailsOf(stored));
+  // Nothing to send when neither half changed (an empty title field on an
+  // untitled session is exactly that case), and nothing to send twice while a
+  // save is in flight.
+  const saveDisabled = saving || (!titleChanged && !detailsChanged);
 
-  /** Commit the typed title; print a refusal in the fault slot and keep it. */
+  /**
+   * Commit the edit; print a refusal in the fault slot and keep the editor open
+   * on the typed text.
+   *
+   * **The details go first and the title goes last, and the order is the whole
+   * error story.** The details are a rewrite of four keys in a file that always
+   * succeeds if the file is there; the title MOVES the session, and Rust refuses
+   * that for a live session, for an exhausted ordinal run and for a folder
+   * outside the destination. Doing the refusable half second means a refusal
+   * costs only the rename — the details are already saved, the reason is on
+   * screen, and the user can act on it. The other order would throw away an edit
+   * that had nothing wrong with it.
+   */
   const save = async () => {
     setSaving(true);
     setRefusal(null);
     try {
-      // A cleared field is `null`, not `""`: clearing the title is a real edit,
-      // and it moves the session back to its untitled path.
-      const summary = await recordingRetitle(effectiveFolder, typed === "" ? null : typed);
-      // Keyed on the folder this card is currently mounted for, so the override
-      // still recognises the session once the owner adopts the new path.
-      setMoved({ from: sessionFolder, summary });
+      if (detailsChanged) {
+        // Answered from the manifest that was written, not echoed from the
+        // request: Rust trims, drops nameless custom rows and re-joins the tag
+        // line, and the editor must show what was stored rather than what was
+        // typed.
+        const saved = await recordingMetaUpdate(
+          effectiveFolder,
+          details.participants,
+          details.note,
+          details.tags,
+          details.custom,
+        );
+        setStored(saved);
+        setDetails(detailsOf(saved));
+        seededWith.current = { ...detailsOf(saved), title: seededWith.current.title };
+      }
+      if (titleChanged) {
+        // A cleared field is `null`, not `""`: clearing the title is a real
+        // edit, and it moves the session back to its untitled path.
+        const summary = await recordingRetitle(effectiveFolder, typed === "" ? null : typed);
+        // Keyed on the folder this card is currently mounted for, so the
+        // override still recognises the session once the owner adopts the new
+        // path.
+        setMoved({ from: sessionFolder, summary });
+        onRetitled?.(summary);
+      }
       setEditing(false);
-      onRetitled?.(summary);
     } catch (raw) {
       // `syncErrorMessage`, never `String(raw)`: an IPC rejection is a
       // `{ code, message }` object, and stringifying one prints
@@ -286,57 +477,86 @@ export function RecordingSummaryCard({
       className={cn(recovered && "border-bridge-degraded/50 text-bridge-degraded ring-0 border")}
     >
       <CardContent className="flex flex-col gap-3">
-        {/* The rename editor sits OUTSIDE the live region below: a text field
-            and its buttons inside an aria-atomic `role="status"` re-announce the
-            whole card on every keystroke — the same reason the active-recording
-            banner keeps its ticking elapsed out of one. */}
+        {/* The details editor sits OUTSIDE the live region below: text fields
+            and their buttons inside an aria-atomic `role="status"` re-announce
+            the whole card on every keystroke — the same reason the
+            active-recording banner keeps its ticking elapsed out of one. */}
         <div className="flex flex-col gap-1">
           {editing ? (
-            <div className="flex items-center gap-1">
-              <Input
-                ref={fieldRef}
-                className="h-8 text-sm"
-                data-testid={SUMMARY_RETITLE_FIELD_TESTID}
-                aria-label={SUMMARY_RETITLE_FIELD_LABEL}
-                aria-invalid={refusal !== null}
-                aria-describedby={refusal === null ? undefined : faultId}
-                placeholder={SUMMARY_RETITLE_UNTITLED_LABEL}
-                value={draft}
-                disabled={saving}
-                onChange={(event) => {
-                  setDraft(event.target.value);
-                  // A refusal is about the text that was sent; retract it (and
-                  // its `aria-invalid`) as the user edits toward a correction.
-                  setRefusal(null);
-                }}
-              />
-              <Button
-                type="button"
-                size="xs"
-                variant="outline"
-                className="shrink-0"
-                data-testid={SUMMARY_RETITLE_SAVE_TESTID}
-                disabled={saveDisabled}
-                onClick={() => {
-                  void save();
-                }}
-              >
-                {SUMMARY_RETITLE_SAVE_LABEL}
-              </Button>
-              <Button
-                type="button"
-                size="xs"
-                variant="ghost"
-                className="shrink-0"
-                data-testid={SUMMARY_RETITLE_CANCEL_TESTID}
-                disabled={saving}
-                onClick={() => {
-                  setEditing(false);
-                  setRefusal(null);
-                }}
-              >
-                {SUMMARY_RETITLE_CANCEL_LABEL}
-              </Button>
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-1">
+                <Input
+                  ref={fieldRef}
+                  className="h-8 text-sm"
+                  data-testid={SUMMARY_RETITLE_FIELD_TESTID}
+                  aria-label={SUMMARY_RETITLE_FIELD_LABEL}
+                  aria-invalid={refusal !== null}
+                  aria-describedby={refusal === null ? undefined : faultId}
+                  placeholder={SUMMARY_RETITLE_UNTITLED_LABEL}
+                  value={draft}
+                  disabled={saving}
+                  onChange={(event) => {
+                    setDraft(event.target.value);
+                    // A refusal is about the text that was sent; retract it (and
+                    // its `aria-invalid`) as the user edits toward a correction.
+                    setRefusal(null);
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  className="shrink-0"
+                  data-testid={SUMMARY_RETITLE_SAVE_TESTID}
+                  disabled={saveDisabled}
+                  onClick={() => {
+                    void save();
+                  }}
+                >
+                  {SUMMARY_RETITLE_SAVE_LABEL}
+                </Button>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  className="shrink-0"
+                  data-testid={SUMMARY_RETITLE_CANCEL_TESTID}
+                  disabled={saving}
+                  onClick={() => {
+                    setEditing(false);
+                    setRefusal(null);
+                  }}
+                >
+                  {SUMMARY_RETITLE_CANCEL_LABEL}
+                </Button>
+              </div>
+              {detailsUnavailable && (
+                <p
+                  className="text-muted-foreground text-xs"
+                  data-testid={SUMMARY_DETAILS_UNAVAILABLE_TESTID}
+                >
+                  {SUMMARY_DETAILS_UNAVAILABLE}
+                </p>
+              )}
+              {/* The SAME five fields the "Next session" card collects (Story
+                  45.19). The title one is rendered above instead, because on
+                  this surface it is a rename and leaves by a different door —
+                  so the set is handed a title it never shows a change for.
+
+                  `detailsPrefix` is per-card: two recovery cards can be open at
+                  once, and a duplicated element id points a `<label for>` at
+                  whichever input the browser found first. */}
+              <div className="flex flex-col gap-3" data-testid={SUMMARY_DETAILS_TESTID}>
+                <RecordingMetaFieldSet
+                  fields={details}
+                  idPrefix={detailsPrefix}
+                  disabled={saving || detailsUnavailable}
+                  onChange={(patch) => {
+                    setDetails((current) => ({ ...current, ...patch }));
+                    setRefusal(null);
+                  }}
+                />
+              </div>
             </div>
           ) : (
             <div className="flex items-center gap-2">
@@ -353,8 +573,14 @@ export function RecordingSummaryCard({
                   // current name rather than blanking it. `seededWith` records
                   // what that was, so a title still in flight can re-seed the
                   // untouched draft when it lands.
-                  seededWith.current = effectiveTitle ?? "";
-                  setDraft(seededWith.current);
+                  seededWith.current = { ...EMPTY_DETAILS, title: effectiveTitle ?? "" };
+                  setDraft(seededWith.current.title);
+                  setDetails(EMPTY_DETAILS);
+                  // The other four are read now rather than on mount: a
+                  // recovery scan can put a dozen of these cards on screen, and
+                  // a manifest read per card for a form nobody opened is a
+                  // dozen reads off a possibly-removable volume for nothing.
+                  loadDetails(effectiveFolder);
                   setRefusal(null);
                   setEditing(true);
                 }}

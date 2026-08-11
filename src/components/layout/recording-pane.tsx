@@ -19,6 +19,7 @@
  * UX-DR29 — centers its content at content-max-width (`mx-auto w-full
  * max-w-[720px]`, the conversation-pane realization) rather than going full-bleed.
  */
+import { NotebookText } from "lucide-react";
 import { useEffect } from "react";
 import { RecordingSummaryCard } from "@/components/layout/recording-summary-card";
 import { ActiveRecordingBanner } from "@/components/recording/active-recording-banner";
@@ -46,6 +47,7 @@ import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
 import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
+import { openRecordingsSpace, useRecordingsSpace } from "@/lib/recordings-space";
 import { systemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import { consumeRecordingMeta } from "@/lib/stores/recording-meta";
 import { micDeviceId, micEnabled, useMicEnabled } from "@/lib/stores/recording-mic";
@@ -61,6 +63,22 @@ export const START_RECORDING_LABEL = "Start recording";
 
 /** The live-session stop affordance's label (recording voice). */
 export const STOP_RECORDING_LABEL = "Stop";
+
+/** Test id for the way across to the Recordings space in Notes. */
+export const RECORDINGS_SPACE_TESTID = "recording-open-recordings-space";
+
+/**
+ * The label on that button (Story 45.19).
+ *
+ * It carries the space's OWN name rather than the word "Recordings", because a
+ * default space is renameable (AD-79) and a button naming a space the sidebar
+ * calls something else is a button about a different place. The verb is "Open"
+ * rather than "Notes", because the destination is one space and not the whole
+ * notes surface.
+ */
+export function recordingsSpaceLabel(spaceName: string): string {
+  return `Open ${spaceName} in Notes`;
+}
 
 /**
  * The highest-priority blocking permission's name (Story 20.2, FR-67): Screen
@@ -117,6 +135,8 @@ export function RecordingPane() {
   const { status, sessionFolders, elapsed, start, stop, acknowledge, adoptRetitled } =
     useRecordingSession();
   const live = isLiveRecording(status);
+  // The Recordings space in Notes, when the vault has one (Story 45.19).
+  const recordingsSpace = useRecordingsSpace();
   // The completion (finalized) and in-app recovery (recovered) terminals both
   // render the summary card from the on-disk manifest for the session folder
   // (Story 20.3): fetch it once the terminal settles with a folder.
@@ -177,9 +197,31 @@ export function RecordingPane() {
       className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
-        <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">Recording</h1>
-          <p className="text-muted-foreground text-sm">{RECORDING_SUBTITLE}</p>
+        <div className="flex min-w-0 flex-col items-start gap-1">
+          <div className="min-w-0">
+            <h1 className="font-heading font-medium text-lg">Recording</h1>
+            <p className="text-muted-foreground text-sm">{RECORDING_SUBTITLE}</p>
+          </div>
+          {/* The way across to the notes side (Story 45.19, FR-197), present
+              only while the two are actually linked: a vault with a Recordings
+              space. A vault nobody has chosen, an unreadable space list and a
+              Recordings space the user deleted (Story 45.17) all take the
+              button away rather than leaving one that lands nowhere. */}
+          {recordingsSpace !== null && (
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="-ml-2"
+              data-testid={RECORDINGS_SPACE_TESTID}
+              onClick={() => {
+                openRecordingsSpace(recordingsSpace);
+              }}
+            >
+              <NotebookText className="size-4" aria-hidden="true" />
+              {recordingsSpaceLabel(recordingsSpace.name)}
+            </Button>
+          )}
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
           {/* The live record dot / ticking elapsed / Stop cluster now lives in

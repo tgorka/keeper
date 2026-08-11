@@ -389,6 +389,105 @@ development_status:
   42-6-a-note-knows-where-its-files-are: review
   epic-42-retrospective: optional
 
+  # Epic 43, opened 2026-08-09 from a field report after epics 41/42 merged and
+  # the owner used the result. Eight items, and seven of them are one sentence
+  # from different seats: keeper knows where a file is and still will not show
+  # it. The eighth is a plain editor bug. See
+  # planning-artifacts/epic-43-a-note-can-show-you-the-file.md for the positions
+  # taken, chiefly AD-73 (one attachment vocabulary, not three widgets) and
+  # AD-75 (the files tab is a reader and stays one).
+  epic-43: in-progress
+  43-1-tab-belongs-to-the-editor: review
+  43-2-a-recording-note-says-it-is-one: review
+  43-3-include-exclude-off: review
+  43-4-spaces-you-can-edit: review
+  43-5-one-attachment-vocabulary: review
+  43-6-two-videos-one-transport: review
+  43-7-the-attachment-panel: review
+  43-8-the-files-tab: review
+  # Found while proving 43.1 — the `/` menu shipped in 37.6 has never opened for
+  # anybody: `slashMenuSource` reported a match span that included the leading
+  # slash, so the fuzzy matcher rejected every command label. Separate story so
+  # it reverts on its own rather than riding inside a Tab fix.
+  43-9-the-slash-menu-can-open: review
+  epic-43-retrospective: optional
+
+  # Epic 44, opened 2026-08-09 from a second field report after epic 43 was
+  # installed and used. Twenty-two items that are four sentences: the rail lies
+  # about its own vocabulary (four hard-coded rows beside a weaker Spaces, and
+  # one of them - Today - has never worked); a note can be typed but not
+  # authored (no New Note, no template, no formatting menu, no table); every
+  # list is a fixed-width guess with no counts and no virtualisation; and 43.6's
+  # two-video case is not finished. See
+  # planning-artifacts/epic-44-the-vocabulary-is-the-space.md, chiefly AD-79
+  # (the fixed rows BECOME spaces), AD-80 (Today is deleted, not fixed), AD-81
+  # (order is the note's, sort is the space's) and AD-82 (a template is a note
+  # and its tag is the marker that leaves).
+  epic-44: in-progress
+  44-1-two-videos-properly: review
+  44-2-the-stub-embeds-its-own-videos: review
+  44-3-default-spaces-replace-the-fixed-rail: review
+  44-4-a-space-has-an-icon-an-order-and-a-sort: review
+  44-5-a-note-has-an-order-you-can-see: review
+  44-6-new-note: review
+  44-7-templates: review
+  44-8-update-notes-from-their-template: review
+  44-9-a-formatting-menu: review
+  44-10-lists-that-render-what-you-can-see: review
+  44-11-counts: review
+  44-12-columns-you-can-size-content-you-can-read: review
+  44-13-tag-entry-that-completes: review
+  44-14-recording-notes-are-editable-notes: review
+  44-15-a-gallery-in-a-note: review
+  44-16-csv-as-a-table-you-can-edit: review
+  44-17-sync-status-in-files: review
+  epic-44-retrospective: optional
+
+  # Epic 45, opened 2026-08-10 from a third field report after epics 43/44 were
+  # installed and used. Thirty-nine items, one sentence: keeper shows you the
+  # name of a thing where it should show you the thing.
+  epic-45: in-progress
+  45-1-a-panel-shows-a-target: review
+  45-2-one-viewer-registry: review
+  45-3-the-files-surface-can-write: review
+  45-4-raw-and-rendered: review
+  45-5-a-file-says-what-it-is-and-how-big: review
+  45-6-text-and-code-files-open-and-save: review
+  45-7-media-opens: review
+  45-8-documents-render: review
+  45-9-a-table-you-can-edit: review
+  45-10-the-editors-missing-marks: review
+  45-11-emoji: review
+  45-12-embeds-render-and-edit-in-place: review
+  45-13-attachments-from-anywhere: review
+  45-14-quick-capture-is-the-note-editor: review
+  45-15-quick-capture-is-a-window-you-own: review
+  45-16-quick-capture-knows-its-template-and-its-tag: review
+  45-17-tags-you-can-edit-spaces-and-notes-you-can-delete: review
+  45-18-a-note-knows-its-file-a-file-knows-its-note: review
+  45-19-recording-remembers-the-last-session: review
+  45-20-chrome-that-makes-room: review
+  45-21-export-and-comments-on-a-pdf: review
+  epic-45-retrospective: optional
+  epic-46: in-progress
+  46-1-a-path-with-a-space-is-one-pattern: review
+  46-2-attachments-lists-what-you-attached: review
+  46-3-the-tree-stays-where-you-left-it: review
+  46-4-a-save-does-not-move-the-toolbar: review
+  46-5-delete-a-note-where-you-look-for-it: review
+  46-6-a-settings-value-is-resolved-not-imported: review
+  46-7-the-main-sync-folder-holds-the-shared-settings: review
+  46-8-a-folder-and-a-machine-can-each-say-something: review
+  46-9-every-setting-reaches-the-file: review
+  46-10-the-recording-destination-in-one-place: review
+  46-11-attach-from-a-folder-you-already-sync: review
+  46-12-several-notes-at-once: review
+  46-13-a-file-row-has-a-menu-and-a-panel-can-fold: review
+  46-14-edit-and-delete-outside-the-vault: review
+  46-15-a-capture-window-you-can-resize: review
+  46-16-start-a-recording-from-the-tray: review
+  epic-46-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

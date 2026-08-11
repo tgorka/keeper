@@ -27,10 +27,23 @@
 //! Tray glue is a shell/OS concern (AD-24) — `keeper-core` only owns the persisted
 //! *mode/flag*. Every step here is best-effort: a tray build failure is logged at `warn`
 //! and the app keeps running (the tray is a convenience, never load-bearing).
+//!
+//! The recording verbs the tray offers are not written here (Story 46.16). They
+//! are a projection of `keeper_core::palette` — the same registry the ⌘K
+//! palette, the ⌘? cheat sheet and the native menu bar render — so their words
+//! and their order are the registry's, and a rename there reaches this surface
+//! too. The tray used to hand-build every label, which is exactly why the
+//! Story 46.5 rename of the start verb reached three surfaces and not this one,
+//! and why the menu bar icon had no way to begin a recording at all. What stays
+//! here is glue: which rendering is being built (`TrayMenu`), what the item id
+//! is, and where the click goes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use keeper_core::palette::{
+    tray_recording_verbs, TrayMenu, RECORDING_OPEN_FOLDER_ID, RECORDING_START_ID, RECORDING_STOP_ID,
+};
 use keeper_core::vm::{
     RecordingDurabilityState, RecordingDurabilityVm, RecordingStatusVm, RecordingUiState,
 };
@@ -47,9 +60,22 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const SHOW_ID: &str = "tray-show";
 /// The menu item id for "Quit".
 const QUIT_ID: &str = "tray-quit";
-/// The menu item id for "Stop Recording" (Story 18.1).
+/// The menu item id for the tray's Stop Recording item (Story 18.1).
+///
+/// A `tray-` id rather than the registry's `recording-stop`, and the difference
+/// is the dispatch: a `tray-*` click is handled here in the shell, a registry id
+/// is forwarded verbatim into the shared `keeper://menu-action` dispatch (see
+/// [`tray_verb_item_id`]). A stop stays local because it is the panic button on
+/// a live capture and must not depend on a responsive webview. The item's
+/// *words* are the registry's all the same (Story 46.16).
 const STOP_ID: &str = "tray-stop-recording";
-/// The menu item id for "Open Recordings Folder" (Story 18.1).
+/// The menu item id for the tray's Open Recordings Folder item (Story 18.1).
+///
+/// Shell-dispatched like [`STOP_ID`], and deliberately so: this reveals the LIVE
+/// session's own folder (`output_path`), where the registry's
+/// `recording-open-folder` reveals the configured destination. The same words
+/// over two different folders — forwarding this one into the shared dispatch
+/// would quietly change which folder opens mid-session.
 const OPEN_FOLDER_ID: &str = "tray-open-recordings-folder";
 /// The menu item id for the disabled elapsed/segment/size line (Story 18.1).
 const STATUS_ID: &str = "tray-recording-status";
@@ -394,6 +420,27 @@ fn dismiss_recording_error(app: &AppHandle) {
     let _ = crate::ipc::acknowledge_recording(&state);
 }
 
+/// Start a recording from the tray (Story 46.16) — down the SAME path the native
+/// menu bar's own registry items take.
+///
+/// Raise the window first (the Recording view is where the banner, the meter and
+/// any permission prompt render, and a session started behind a hidden window is
+/// one the user cannot see), then emit the shared `keeper://menu-action` event
+/// with the registry id, which the frontend `use-menu-actions` hook routes into
+/// `dispatchPaletteAction` — the single dispatch table the palette, the cheat
+/// sheet and the menu bar already share.
+///
+/// Deliberately NOT a shell-side start beside [`stop_recording`]: a start carries
+/// the CURRENT capture selections (screen/window, mic, camera), which live in the
+/// frontend stores `startRecordingWithCurrentSelections` reads. A start built
+/// here would have to invent a default selection set — the parallel
+/// implementation this story exists to avoid, and a silent revert to defaults for
+/// the user. The stop is local for the opposite reason (see [`STOP_ID`]).
+fn start_recording(app: &AppHandle) {
+    show_main_window(app);
+    crate::menu::handle_menu_event(app, RECORDING_START_ID);
+}
+
 /// Reveal the current session folder (`output_path`) in the OS file manager
 /// (Story 18.1), via the same opener plugin as the export "Reveal in Finder".
 /// Best-effort: no session folder or a reveal failure is logged, never a panic.
@@ -422,6 +469,53 @@ fn menu_item(app: &AppHandle, id: &str, label: &str, enabled: bool) -> Option<Me
             None
         }
     }
+}
+
+/// The tray's own item id for a projected registry verb.
+///
+/// The id namespace says how the click is dispatched, which is the only rule this
+/// file needs about the projection: a `tray-*` id is handled by the router in
+/// [`build_tray`], and a registry id is forwarded verbatim into the shared
+/// `keeper://menu-action` dispatch every other surface uses. Stop and the folder
+/// reveal keep their shell ids for the reasons on [`STOP_ID`] and
+/// [`OPEN_FOLDER_ID`]; the start verb carries the registry's id because the
+/// registry's own handler is what has to run (see [`start_recording`]). Pure.
+fn tray_verb_item_id(registry_id: &str) -> &str {
+    match registry_id {
+        RECORDING_STOP_ID => STOP_ID,
+        RECORDING_OPEN_FOLDER_ID => OPEN_FOLDER_ID,
+        forwarded => forwarded,
+    }
+}
+
+/// Build the recording verbs one tray rendering offers, or `None` when an item
+/// fails to build (the caller then leaves the tray/menu unchanged, exactly as for
+/// the hand-built items).
+///
+/// Membership, order and labels are all [`tray_recording_verbs`]' — this is the
+/// whole of the glue. An empty vector is the ordinary answer on a build without
+/// the recording capability, and the caller then adds no separator either.
+fn build_recording_verbs(app: &AppHandle, menu: TrayMenu) -> Option<Vec<MenuItem<Wry>>> {
+    tray_recording_verbs(menu, crate::macos_version::recording_supported())
+        .iter()
+        .map(|verb| menu_item(app, tray_verb_item_id(&verb.id), &verb.title, true))
+        .collect()
+}
+
+/// Append a rendering's recording verbs plus the separator that groups them — and
+/// nothing at all when there are none, so a build that cannot record does not
+/// grow a stray separator where the verbs would have been.
+fn add_recording_verbs<'a>(
+    mut builder: MenuBuilder<'a, Wry, AppHandle>,
+    verbs: &'a [MenuItem<Wry>],
+) -> MenuBuilder<'a, Wry, AppHandle> {
+    if verbs.is_empty() {
+        return builder;
+    }
+    for verb in verbs {
+        builder = builder.item(verb);
+    }
+    builder.separator()
 }
 
 /// Build the notes section's items, or `None` when the capability is off.
@@ -469,14 +563,23 @@ fn add_notes_section<'a>(
     builder.separator().item(&items.unread).separator()
 }
 
-/// Build the idle tray menu: the notes section, then "Show keeper" + "Quit"
-/// (Story 10.3, Story 36.7).
+/// Build the idle tray menu: the notes section, the projected recording verbs,
+/// then "Show keeper" + "Quit" (Story 10.3, Story 36.7, Story 46.16).
+///
+/// This is the menu the tray is created with, which on Linux is the only menu it
+/// will ever have — and the reason the start verb has to be present here rather
+/// than added on the first tick. On a build that cannot record the projection is
+/// empty and this is the Story 36.7 menu unchanged.
 fn build_idle_menu(app: &AppHandle) -> Option<(Menu<Wry>, Option<NotesItems>)> {
     let notes = build_notes_items(app, notes_capability(app));
+    let verbs = build_recording_verbs(app, TrayMenu::Idle)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
     let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
-    match builder.items(&[&show, &quit]).build() {
+    match add_recording_verbs(builder, &verbs)
+        .items(&[&show, &quit])
+        .build()
+    {
         Ok(menu) => Some((menu, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray menu");
@@ -498,22 +601,30 @@ fn notes_capability(app: &AppHandle) -> bool {
 
 /// Build the error-hold tray menu (Story 18.4): the disabled
 /// `Recording failed — <reason>` line, then **Show Recording** (raises the
-/// window, where the banner's one-click Restart lives), **Open Recordings
-/// Folder**, and **Dismiss Error** (→ acknowledge), then Quit. The line is
+/// window, where the banner's one-click Restart lives), the projected folder
+/// reveal, and **Dismiss Error** (→ acknowledge), then Quit. The line is
 /// static — a terminal `error` never changes — so no held item is returned.
+///
+/// No start verb, by the decision recorded on `keeper_core::palette`'s
+/// `tray_verb_ids`: the restart over a terminal failure is the banner's, and the
+/// tray never restarts a session itself.
 fn build_error_menu(app: &AppHandle, line: &str) -> Option<Menu<Wry>> {
     let status = menu_item(app, STATUS_ID, line, false)?;
     let show_recording = menu_item(app, SHOW_RECORDING_ID, "Show Recording", true)?;
-    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let verbs = build_recording_verbs(app, TrayMenu::Error)?;
     let dismiss = menu_item(app, DISMISS_ERROR_ID, "Dismiss Error", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let menu = MenuBuilder::new(app)
+    // The folder reveal sits INSIDE the action group, between the two tray-owned
+    // items, so the verbs are appended by hand rather than through
+    // `add_recording_verbs`, which groups them with a trailing separator.
+    let mut builder = MenuBuilder::new(app)
         .item(&status)
         .separator()
-        .items(&[&show_recording, &open, &dismiss])
-        .separator()
-        .items(&[&quit])
-        .build();
+        .item(&show_recording);
+    for verb in &verbs {
+        builder = builder.item(verb);
+    }
+    let menu = builder.item(&dismiss).separator().items(&[&quit]).build();
     match menu {
         Ok(menu) => Some(menu),
         Err(error) => {
@@ -524,20 +635,19 @@ fn build_error_menu(app: &AppHandle, line: &str) -> Option<Menu<Wry>> {
 }
 
 /// Build the recording tray menu (Story 18.1): the disabled status `line`, then
-/// Stop Recording + Open Recordings Folder, then the idle Show/Quit pair.
-/// Returns the menu together with the held status item so the ~1 Hz tick can
-/// refresh the line via `set_text`.
+/// the projected session verbs (stop + the folder reveal), then the idle
+/// Show/Quit pair. Returns the menu together with the held status item so the
+/// ~1 Hz tick can refresh the line via `set_text`.
+///
+/// No start verb: there is one session, and a start item that lingered into the
+/// live menu is the bug Story 46.16 tested for in `keeper_core::palette`.
 fn build_recording_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
     let status = menu_item(app, STATUS_ID, line, false)?;
-    let stop = menu_item(app, STOP_ID, "Stop Recording", true)?;
-    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let verbs = build_recording_verbs(app, TrayMenu::Recording)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let menu = MenuBuilder::new(app)
-        .item(&status)
-        .separator()
-        .items(&[&stop, &open])
-        .separator()
+    let builder = MenuBuilder::new(app).item(&status).separator();
+    let menu = add_recording_verbs(builder, &verbs)
         .items(&[&show, &quit])
         .build();
     match menu {
@@ -568,6 +678,9 @@ fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
             STOP_ID => stop_recording(app),
             OPEN_FOLDER_ID => open_recordings_folder(app),
             DISMISS_ERROR_ID => dismiss_recording_error(app),
+            // Story 46.16: the one tray item whose id is a REGISTRY id, because
+            // its click is forwarded verbatim into the registry's own dispatch.
+            RECORDING_START_ID => start_recording(app),
             // The notes section (Story 36.7). Routed through the same single
             // router, which is registered on the tray rather than on a menu and
             // therefore survives every `set_menu` — so click routing needed no
@@ -1543,6 +1656,41 @@ mod tests {
             RestoreIdle
         );
     }
+
+    /// The one rule this file keeps about the projection: the id namespace says
+    /// who dispatches the click (Story 46.16). The membership and the words are
+    /// `keeper_core::palette`'s and are tested there, where they compile off
+    /// macOS.
+    #[test]
+    fn the_id_namespace_says_who_dispatches_a_projected_verb() {
+        // Shell-dispatched: a stop must not depend on a responsive webview, and
+        // the tray's reveal opens the live session's folder rather than the
+        // configured destination.
+        assert_eq!(tray_verb_item_id(RECORDING_STOP_ID), STOP_ID);
+        assert_eq!(tray_verb_item_id(RECORDING_OPEN_FOLDER_ID), OPEN_FOLDER_ID);
+        // Forwarded unchanged: the start verb carries the registry id precisely so
+        // the router hands it to the shared `keeper://menu-action` dispatch.
+        assert_eq!(tray_verb_item_id(RECORDING_START_ID), RECORDING_START_ID);
+        // And every verb any rendering can project resolves to an id this file's
+        // router actually handles — a projected verb with a `tray-` id nobody
+        // matches, or a forwarded id that is not the start verb, would be a menu
+        // item that does nothing when clicked.
+        for menu in [
+            TrayMenu::Idle,
+            TrayMenu::Sync,
+            TrayMenu::Recording,
+            TrayMenu::Error,
+        ] {
+            for verb in tray_recording_verbs(menu, true) {
+                let id = tray_verb_item_id(&verb.id);
+                assert!(
+                    id == RECORDING_START_ID || id == STOP_ID || id == OPEN_FOLDER_ID,
+                    "{menu:?} projects {} as {id}, which the tray router does not handle",
+                    verb.id
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,23 +1857,29 @@ fn dwelled(reported: TraySyncState) -> TraySyncState {
     }
 }
 
-/// Build the sync tray menu: the notes section, a disabled status line, then Show
-/// and Quit.
+/// Build the sync tray menu: the notes section, the projected recording verbs, a
+/// disabled status line, then Show and Quit.
 ///
 /// The notes items are here too, and not only in the idle menu, because this menu
 /// replaces that one on the first sync tick — on macOS, where `set_menu` works.
 /// Omitting them here would make the section vanish the moment a folder started
-/// syncing, which is most of the time.
+/// syncing, which is most of the time. The recording verbs are here for exactly
+/// the same reason (Story 46.16), in the same slot as in the idle menu, so
+/// "New Recording" neither moves nor disappears when a folder starts syncing.
 fn build_sync_menu(
     app: &AppHandle,
     line: &str,
 ) -> Option<(Menu<Wry>, MenuItem<Wry>, Option<NotesItems>)> {
     let notes = build_notes_items(app, notes_capability(app));
+    let verbs = build_recording_verbs(app, TrayMenu::Sync)?;
     let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
     let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
-    match builder.items(&[&status, &show, &quit]).build() {
+    match add_recording_verbs(builder, &verbs)
+        .items(&[&status, &show, &quit])
+        .build()
+    {
         Ok(menu) => Some((menu, status, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build the sync menu");

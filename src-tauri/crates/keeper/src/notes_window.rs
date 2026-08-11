@@ -1,92 +1,181 @@
-//! The quick-capture window (FR-101, NFR-27, AD-60).
+//! The quick-capture windows (FR-101, FR-191, FR-192, NFR-27, AD-60, UX-DR77).
 //!
-//! One extra window, declared statically in `tauri.conf.json`, created hidden at
-//! startup and **never destroyed**. That is the whole of NFR-27: the hotkey path
-//! is `set_position` → `show` → `set_focus` — three synchronous calls plus one
-//! compositor frame — with no webview construction, no bundle load, no React
-//! mount and no IPC round trip before the panel is visible. Because the window
-//! never unmounts, its `<textarea>` stays focused while hidden, so `show()`
-//! reveals an already-focused live DOM node rather than racing an `autoFocus`
-//! effect, and a keystroke typed 50 ms after the hotkey has nowhere to go but the
-//! buffer.
+//! # One prewarmed window, and as many more as the user asks for
 //!
-//! Rust owns show, hide, position and focus. The capture webview asks for nothing
-//! about its own window — it has one job and four commands, and its capability
-//! file (`capabilities/quick-capture.json`) grants it nothing else.
+//! The **draft** window is declared statically in `tauri.conf.json`, created
+//! hidden at startup and never destroyed. That is the whole of NFR-27: the
+//! hotkey path is `set_position` → `show` → `set_focus` — three synchronous
+//! calls plus one compositor frame — with no webview construction, no bundle
+//! load, no React mount and no IPC round trip before the panel is visible.
+//! Because the window never unmounts, its editor stays focused while hidden, so
+//! `show()` reveals an already-focused live DOM node rather than racing an
+//! effect, and a keystroke typed 50 ms after the hotkey has nowhere to go but
+//! the buffer. Story 45.15 changes none of that.
+//!
+//! Every **other** capture window is created on demand, one per note, labelled
+//! by [`keeper_core::capture::capture_label`]. They are ordinary windows: they
+//! cost a webview each and they are destroyed when closed. Only the draft one
+//! is prewarmed, because only the draft one is on the path a hotkey has 300 ms
+//! to travel.
+//!
+//! # What is per-window, and why a map
+//!
+//! A label is a hash of a capture key, so it cannot be read backwards. The
+//! process therefore keeps [`OPEN`]: label → target, written when a window is
+//! created and erased when it is destroyed. It is process state and nothing
+//! else — it is not persistence, it is not consulted to decide whether a window
+//! exists (`get_webview_window` answers that, and it cannot go stale), and it
+//! is rebuilt from nothing on the next launch. Its one job is to answer "what is
+//! this window holding?" for the list the main window renders.
+//!
+//! # Rust owns geometry, the webview owns chrome
+//!
+//! Show, hide, create, destroy, position, size and focus are all here. The
+//! capture webview asks for exactly three window things — hide, close and, when
+//! it is unlocked, start-dragging — and its capability file grants those and
+//! nothing more. **Resizing adds no fourth**: it is a native edge drag against
+//! a window attribute this module sets, not a plugin command the webview
+//! invokes, so `quick-capture.json` is unchanged by Story 46.15.
 //!
 //! Positioning is monitor-aware and **best-effort by design**: an undecorated
 //! always-on-top window cannot place itself on Wayland, so keeper asks and
-//! accepts the compositor's answer rather than fighting it (UX-DR43). Nothing in
-//! the UI promises a position it cannot deliver.
+//! accepts the compositor's answer rather than fighting it (UX-DR43). Nothing
+//! in the UI promises a position it cannot deliver.
+//!
+//! **Story 45.15's lock is inside that rule, not an exception to it**, and the
+//! distinction is worth keeping straight because it is the one this module's
+//! predecessor stated and a lock icon could very easily have broken. What the
+//! lock promises is **movability**, and since Story 46.15 **resizability**:
+//! unlocked, the strip becomes a `data-tauri-drag-region` and the *compositor*
+//! moves the window, and the window becomes `set_resizable(true)` so its edges
+//! answer a drag. Both work everywhere including Wayland, and for the same
+//! reason — neither is a request to put a surface at a coordinate. What is
+//! still not promised is the restore: putting the window back *there* next time
+//! is a `set_position`, which is exactly the call UX-DR43 says may be refused.
+//! So the controls are worded for what they can deliver ("so it can be moved
+//! and resized", "where it is") and never "remembers", and a compositor that
+//! declines leaves a window the person can still put wherever they like, every
+//! time, rather than a promise that quietly fails.
+//!
+//! The **size**, unlike the position, does survive a restart, and that is not a
+//! contradiction: it is stored under the same key and restored with the same
+//! best-effort `set_size`, but a compositor that honours a size request is the
+//! ordinary case rather than the exception a position request is. When it
+//! declines, the person has a window at keeper's size and can resize it again —
+//! the same recovery, one gesture long.
 
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, Runtime, WebviewWindow};
+use std::collections::BTreeMap;
+use std::sync::{LazyLock, Mutex};
 
-/// The static window label. Must match `tauri.conf.json` and the `windows` list
-/// in `capabilities/quick-capture.json`, or the panel renders and can invoke
-/// nothing.
-pub const CAPTURE_LABEL: &str = "quick-capture";
+use keeper_core::capture::{
+    capture_label, is_capture_label, CaptureTargetVm, CaptureWindowVm, Placement,
+    CAPTURE_DEFAULT_SIZE, CAPTURE_MIN_SIZE, DRAFT_CAPTURE_KEY, DRAFT_CAPTURE_LABEL,
+};
+use tauri::{
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Runtime, WebviewUrl,
+    WebviewWindow, WebviewWindowBuilder,
+};
 
-/// Emitted after the panel is shown, so the capture entry point can re-assert
-/// focus after a compositor race on Linux. Ids only, per the `keeper://kebab-case`
-/// convention — this one carries no payload at all.
+/// Emitted to **one** capture window after it is shown, so that window's entry
+/// point can re-assert focus after a compositor race on Linux.
+///
+/// Emitted with `emit_to` rather than `emit`, and that is a Story 45.15
+/// correction rather than a preference: an app-wide emit told *every* capture
+/// window to focus itself whenever *any* one of them was shown, so raising the
+/// second window would have yanked focus back and forth between all of them.
+/// With one window that bug was unobservable, which is exactly why it survived.
 pub const CAPTURE_SHOWN_EVENT: &str = "keeper://notes-capture-shown";
 
-/// How far down the focused monitor's work area the panel sits, as a fraction of
-/// the monitor height.
+/// Emitted app-wide when the set of capture windows changes, so the main
+/// window's list stops claiming a window that has gone. Carries no payload —
+/// ids only, per the `keeper://kebab-case` convention — and the listener asks
+/// for the list.
+pub const CAPTURE_WINDOWS_EVENT: &str = "keeper://notes-capture-windows";
+
+/// The capture window's document. Query-less for the draft window, so its URL
+/// is byte-for-byte what `tauri.conf.json` declares.
+const CAPTURE_DOCUMENT: &str = "capture.html";
+
+/// A capture window's two sizes — keeper's own [`CAPTURE_DEFAULT_SIZE`] and the
+/// floor [`CAPTURE_MIN_SIZE`] a user may resize one to — live in
+/// `keeper_core::capture`, not here, and they are the same numbers
+/// `tauri.conf.json` gives the prewarmed window, so the second window is the
+/// same window and not a differently sized cousin. They are over there because
+/// [`Placement::window_size`] has to answer with them, and that answer is the
+/// one part of a capture window's geometry that can be tested on a machine
+/// where this crate does not compile (AD-55/AD-56).
+///
+/// This is the only thing left on this side: they are stored as plain integers
+/// of logical pixels, and every Tauri sizing call wants a typed `f64` pair.
+fn logical(size: (u32, u32)) -> LogicalSize<f64> {
+    LogicalSize::new(f64::from(size.0), f64::from(size.1))
+}
+
+/// How far down the focused monitor's work area an *unplaced* panel sits, as a
+/// fraction of the monitor height.
 ///
 /// A fifth of the way down rather than centred: a capture panel is a thing you
-/// type into and dismiss, and vertical centring puts it exactly where a person's
-/// eyes are already busy with whatever they were reading.
+/// type into and dismiss, and vertical centring puts it exactly where a
+/// person's eyes are already busy with whatever they were reading.
 const TOP_FRACTION: f64 = 0.2;
 
-/// The quick-capture window, or `None` when it does not exist.
+/// Label → what that window is holding. Process state; see the module doc.
 ///
-/// It is declared statically, so `None` means the config and this module have
-/// drifted — logged loudly, because every capture path silently doing nothing is
-/// the failure mode that looks like a frontend bug and is not.
-fn window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
-    let window = app.get_webview_window(CAPTURE_LABEL);
-    if window.is_none() {
+/// Seeded with the draft window rather than filled in at startup, because that
+/// window is declared in `tauri.conf.json` and never passes through [`open`].
+/// Seeding it here means there is no ordering to get wrong: the map answers for
+/// the prewarmed window from the first read, including one that happens before
+/// `setup` has run.
+static OPEN: LazyLock<Mutex<BTreeMap<String, CaptureTargetVm>>> = LazyLock::new(|| {
+    Mutex::new(BTreeMap::from([(
+        DRAFT_CAPTURE_LABEL.to_owned(),
+        CaptureTargetVm::Draft,
+    )]))
+});
+
+/// The window for a capture key, or `None` when it does not exist.
+///
+/// For the draft key `None` means the static declaration and this module have
+/// drifted — logged loudly, because a capture path that silently does nothing
+/// is the failure mode that looks like a frontend bug and is not. For any other
+/// key `None` is ordinary: the window has not been opened yet.
+fn window<R: Runtime>(app: &AppHandle<R>, key: &str) -> Option<WebviewWindow<R>> {
+    let label = capture_label(key);
+    let window = app.get_webview_window(&label);
+    if window.is_none() && key == DRAFT_CAPTURE_KEY {
         tracing::warn!(
-            label = CAPTURE_LABEL,
+            label = %label,
             "notes: the quick-capture window is not declared; capture is unavailable"
         );
     }
     window
 }
 
-/// Whether the panel is currently visible.
+/// Whether the draft panel is currently visible. Read by the hotkey, which
+/// toggles.
 pub fn is_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
-    window(app).is_some_and(|window| window.is_visible().unwrap_or(false))
+    window(app, DRAFT_CAPTURE_KEY).is_some_and(|window| window.is_visible().unwrap_or(false))
 }
 
-/// Position, show and focus the panel (`notes_capture_show`).
+/// Position, show and focus the draft panel — the hotkey and tray path
+/// (`notes_capture_show`).
 ///
-/// Every step is best-effort and logged: a compositor that refuses the position
-/// still gets a visible, focused panel, which is the part that matters.
+/// Kept as a no-argument entry point because its two callers are an OS shortcut
+/// handler and a tray menu handler, neither of which has a placement to hand
+/// in. It shows the panel where keeper last knew to put it; a *remembered*
+/// placement arrives through [`open`], which the frontend calls with one read
+/// from the settings table.
 pub fn show<R: Runtime>(app: &AppHandle<R>) {
-    let Some(window) = window(app) else {
+    let Some(window) = window(app, DRAFT_CAPTURE_KEY) else {
         return;
     };
-    position(&window);
-    if let Err(error) = window.show() {
-        tracing::warn!(%error, "notes: could not show the capture panel");
-        return;
-    }
-    // `set_focus` after `show`: focusing a hidden window is a no-op on every
-    // backend, and the panel exists to receive a keystroke.
-    if let Err(error) = window.set_focus() {
-        tracing::warn!(%error, "notes: could not focus the capture panel");
-    }
-    if let Err(error) = app.emit(CAPTURE_SHOWN_EVENT, ()) {
-        tracing::warn!(%error, "notes: could not emit the capture-shown event");
-    }
+    reveal(app, &window, DRAFT_CAPTURE_KEY, None);
 }
 
-/// Hide the panel (`notes_capture_hide`). Never destroys it — the window's whole
-/// value is that it already exists.
+/// Hide the draft panel (`notes_capture_hide`). Never destroys it — the
+/// window's whole value is that it already exists.
 pub fn hide<R: Runtime>(app: &AppHandle<R>) {
-    let Some(window) = window(app) else {
+    let Some(window) = window(app, DRAFT_CAPTURE_KEY) else {
         return;
     };
     if let Err(error) = window.hide() {
@@ -94,14 +183,372 @@ pub fn hide<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Place the panel horizontally centred on the focused monitor, a fifth of the
-/// way down its work area.
+/// Show the capture window for `target`, creating it if it does not exist
+/// (FR-191).
+///
+/// Idempotent by identity rather than by a flag: a second call for the same
+/// target finds the same label and raises the window that is already there, so
+/// "open this note as a capture window" twice is one window with focus and not
+/// two windows with one note.
+///
+/// `placement` is the remembered one, read by the caller — this module does no
+/// storage, because the shell does not compile on every machine and a placement
+/// rule nobody can build is a placement rule nobody can check (AD-55/AD-56).
+pub fn open(app: &AppHandle, target: &CaptureTargetVm, placement: Placement) {
+    let key = keeper_core::capture::capture_key(target);
+    let label = capture_label(&key);
+    remember_target(&label, target);
+    let existing = app.get_webview_window(&label);
+    let window = match existing {
+        Some(window) => window,
+        None => {
+            if key == DRAFT_CAPTURE_KEY {
+                // The static declaration and this module have drifted.
+                // Deliberately NOT rebuilt here: a replacement would paper over
+                // a config error and quietly cost NFR-27 its prewarm, so every
+                // later capture would pay a webview construction that nobody
+                // could account for.
+                tracing::warn!(
+                    label = %label,
+                    "notes: the quick-capture window is not declared; capture is unavailable"
+                );
+                return;
+            }
+            let url = format!(
+                "{CAPTURE_DOCUMENT}{}",
+                keeper_core::capture::capture_search(target)
+            );
+            let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
+                .title("keeper — quick note")
+                .inner_size(CAPTURE_DEFAULT_SIZE.0.into(), CAPTURE_DEFAULT_SIZE.1.into())
+                // The floor, set on the window itself rather than only in the
+                // clamp: a `min_inner_size` is refused by the compositor
+                // mid-drag, so the user never gets to a size keeper would then
+                // have to argue with on the next open.
+                .min_inner_size(CAPTURE_MIN_SIZE.0.into(), CAPTURE_MIN_SIZE.1.into())
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                // Story 46.15: resizability follows the lock, from the first
+                // frame. Built `false` and flipped below would give an unlocked
+                // window one frame in which its edges do not answer.
+                .resizable(!placement.locked)
+                .visible(false)
+                .build();
+            match built {
+                Ok(window) => window,
+                Err(error) => {
+                    forget_target(&label);
+                    tracing::warn!(%error, %label, "notes: could not create a capture window");
+                    return;
+                }
+            }
+        }
+    };
+    // The size is NOT re-asserted unconditionally here any more (Story 46.15).
+    // A locked window is still normalised — a compositor may have resized it,
+    // and every locked capture window is the same window — but an unlocked one
+    // is left at the size the user gave it, which is the whole of the feature.
+    // Which of those two this is, is `Placement::window_size`'s decision, made
+    // in `keeper_core` where it is tested.
+    reveal(app, &window, &key, Some(placement));
+    announce(app);
+}
+
+/// Close the capture window for `key` (FR-191).
+///
+/// Follows [`keeper_core::capture::plan_close`], which decides the two things
+/// that are not obvious: the draft window is hidden rather than destroyed, and
+/// closing the last visible window raises the main one so the app is never
+/// running with nothing on screen and no taskbar entry.
+///
+/// Returns the window's last geometry so the caller can persist it — its
+/// position and, since Story 46.15, the size the user resized it to. Read
+/// *before* the window goes away, because a destroyed window has no geometry to
+/// ask for and a hidden one may report the origin.
+pub fn close(app: &AppHandle, key: &str) -> Geometry {
+    let Some(window) = window(app, key) else {
+        return Geometry::default();
+    };
+    let geometry = geometry(&window);
+    let plan = keeper_core::capture::plan_close(key, other_windows_visible(app, key));
+    if plan.destroy {
+        forget_target(&capture_label(key));
+        if let Err(error) = window.destroy() {
+            tracing::warn!(%error, %key, "notes: could not close the capture window");
+        }
+    } else if let Err(error) = window.hide() {
+        tracing::warn!(%error, %key, "notes: could not hide the capture window");
+    }
+    if plan.raise_main {
+        crate::tray::show_main_window(app);
+    }
+    announce(app);
+    geometry
+}
+
+/// What a capture window's geometry is worth remembering, in the units each
+/// half is remembered in (see [`Placement`]): the position physical, the size
+/// logical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Geometry {
+    /// The top-left in physical pixels, or `None` when the platform will not
+    /// say.
+    pub position: Option<(i32, i32)>,
+    /// The inner size in logical pixels, or `None` when the platform will not
+    /// say.
+    pub size: Option<(u32, u32)>,
+}
+
+/// Where the capture window for `key` is and how big it is right now, or an
+/// empty [`Geometry`] when it is not open or the platform will not say.
+///
+/// Read at dismissal and on blur rather than on every `Moved`/`Resized` event:
+/// a drag emits one event per compositor frame and a settings write per frame
+/// would put a sqlite transaction inside a gesture.
+pub fn geometry_of(app: &AppHandle, key: &str) -> Geometry {
+    let Some(window) = window(app, key) else {
+        return Geometry::default();
+    };
+    geometry(&window)
+}
+
+/// [`geometry_of`] against a window already in hand.
+fn geometry<R: Runtime>(window: &WebviewWindow<R>) -> Geometry {
+    Geometry {
+        position: window
+            .outer_position()
+            .ok()
+            .map(|position| (position.x, position.y)),
+        // `inner_size`, not `outer_size`: `set_size` sets the inner size, so
+        // reading the outer one would grow the window by whatever frame the
+        // platform draws on every save-and-restore cycle. On an undecorated
+        // window the two are usually equal — "usually" is not a contract.
+        size: window.scale_factor().ok().and_then(|scale| {
+            window
+                .inner_size()
+                .ok()
+                .map(|size| size.to_logical::<u32>(scale))
+                .map(|size| (size.width, size.height))
+        }),
+    }
+}
+
+/// Every capture window that exists right now (FR-191).
+///
+/// Built from the live window list rather than from [`OPEN`], so a window
+/// destroyed by the OS cannot linger in the answer; [`OPEN`] supplies only the
+/// target, which a label cannot be read backwards into.
+pub fn list(app: &AppHandle, locked: &dyn Fn(&str) -> bool) -> Vec<CaptureWindowVm> {
+    let open = OPEN.lock().map(|open| open.clone()).unwrap_or_default();
+    let mut windows: Vec<CaptureWindowVm> = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| is_capture_label(label))
+        .filter_map(|(label, window)| {
+            // A capture-shaped label this process did not open is SKIPPED, not
+            // guessed. Defaulting it to the draft target would put a second row
+            // called `draft` in the list, and every reader keys on that string.
+            let target = open.get(&label)?.clone();
+            let key = keeper_core::capture::capture_key(&target);
+            Some(CaptureWindowVm {
+                locked: locked(&key),
+                key,
+                target,
+                visible: window.is_visible().unwrap_or(false),
+            })
+        })
+        .collect();
+    // Stable order: the list renders as a list, and a set iterated in hash
+    // order would reshuffle itself every time anything changed.
+    windows.sort_by(|a, b| a.key.cmp(&b.key));
+    windows
+}
+
+/// Tell every window that the set of capture windows changed.
+pub fn announce(app: &AppHandle) {
+    if let Err(error) = app.emit(CAPTURE_WINDOWS_EVENT, ()) {
+        tracing::warn!(%error, "notes: could not emit the capture-windows event");
+    }
+}
+
+/// The capture key of the window called `label`, or `None` when this process
+/// did not open it.
+///
+/// A label is a hash of a key and cannot be read backwards, so this is the only
+/// direction available — which is why the window-event handler asks here rather
+/// than deriving. `None` for the draft window is impossible in practice (it is
+/// registered at startup) but is answered honestly rather than guessed, because
+/// guessing `draft` for an unknown capture label would write one window's
+/// position onto another's row.
+pub fn key_for_label(label: &str) -> Option<String> {
+    OPEN.lock()
+        .ok()?
+        .get(label)
+        .map(keeper_core::capture::capture_key)
+}
+
+/// Register a target against its label so [`list`] can name it.
+fn remember_target(label: &str, target: &CaptureTargetVm) {
+    if let Ok(mut open) = OPEN.lock() {
+        open.insert(label.to_owned(), target.clone());
+    }
+}
+
+/// Forget a destroyed window's target.
+fn forget_target(label: &str) {
+    if let Ok(mut open) = OPEN.lock() {
+        open.remove(label);
+    }
+}
+
+/// Whether any window other than the capture window for `key` is on screen.
+///
+/// "Other than" is the load-bearing half: asked without it, a window that is
+/// still visible at the moment it is being closed answers "yes, something is
+/// visible" about itself, and the main window is never raised.
+fn other_windows_visible(app: &AppHandle, key: &str) -> bool {
+    let closing = capture_label(key);
+    app.webview_windows()
+        .into_iter()
+        .any(|(label, window)| label != closing && window.is_visible().unwrap_or(false))
+}
+
+/// Place, size, show and focus a window, then tell it so.
+///
+/// `placement` is `None` for the hotkey and tray path, which has no settings
+/// read in front of it (NFR-27) and therefore knows nothing about this window's
+/// remembered geometry. That is not the same as "the default placement": a
+/// caller with nothing to say must **change nothing but the position**, because
+/// resizability and size were already set — at boot by [`adopt_placement`], and
+/// on every toggle by the lock command — and re-asserting a default over them
+/// would silently relock and shrink a window the user unlocked and resized.
+fn reveal<R: Runtime>(
+    app: &AppHandle<R>,
+    window: &WebviewWindow<R>,
+    key: &str,
+    placement: Option<Placement>,
+) {
+    match placement {
+        Some(placement) => apply_placement(window, placement),
+        None => position(window),
+    }
+    if let Err(error) = window.show() {
+        tracing::warn!(%error, %key, "notes: could not show the capture panel");
+        return;
+    }
+    // `set_focus` after `show`: focusing a hidden window is a no-op on every
+    // backend, and the panel exists to receive a keystroke.
+    if let Err(error) = window.set_focus() {
+        tracing::warn!(%error, %key, "notes: could not focus the capture panel");
+    }
+    if let Err(error) = app.emit_to(window.label(), CAPTURE_SHOWN_EVENT, ()) {
+        tracing::warn!(%error, %key, "notes: could not emit the capture-shown event");
+    }
+}
+
+/// Give the capture window for `key` the resizability and size its stored
+/// placement asks for, without showing it or moving it.
+///
+/// Two callers, one act. **At boot**, for the prewarmed window: it is declared
+/// `resizable: false` in `tauri.conf.json` and created before anything has read
+/// the settings, so without this a person who unlocked it yesterday finds it
+/// unlocked-looking and unresizable today — the lock reduced to a label, which
+/// is the exact failure Story 46.15 exists to fix. Done here, once, rather than
+/// in [`show`]: the hotkey path is three synchronous calls and a settings read
+/// does not belong in front of it (NFR-27).
+///
+/// **On the lock toggle**, against the live window, so unlocking takes effect
+/// without a reopen.
+pub fn adopt_placement<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Placement) {
+    let Some(window) = window(app, key) else {
+        return;
+    };
+    apply_resizability(&window, placement);
+    apply_size(&window, placement);
+}
+
+/// Put a window where its placement says — or where keeper would put it — at
+/// the size its placement says, and let the user move and resize it or not.
+///
+/// Order is load-bearing. Resizability first, because a platform may refuse a
+/// size outside a non-resizable window's constraints. Size before position,
+/// because [`position`] centres the window against its own measured width: swap
+/// the two and a window that was just resized is centred as the size it used to
+/// be.
+fn apply_placement<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
+    apply_resizability(window, placement);
+    apply_size(window, placement);
+    match placement.position {
+        Some((x, y)) => {
+            if let Err(error) = window.set_position(PhysicalPosition::new(x, y)) {
+                tracing::debug!(%error, "notes: the compositor placed the capture panel itself");
+            }
+        }
+        None => position(window),
+    }
+}
+
+/// The lock's second verb (Story 46.15). Unlocked means movable **and**
+/// resizable; locked means neither.
+///
+/// This one is not inside UX-DR43's best-effort rule, and the distinction is
+/// worth keeping straight because the module doc spends a paragraph on the
+/// other half. What Wayland refuses is `set_position` — a request to put a
+/// surface at a coordinate, which a compositor owns. Resizability is a window
+/// *attribute*: it is `gtk_window_set_resizable` on GTK, a style mask on macOS
+/// and a window style on Windows, and the edge-drag hit-testing every backend
+/// does for an undecorated window re-reads that attribute per event rather than
+/// capturing it at creation. So the lock can promise this one everywhere.
+fn apply_resizability<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
+    if let Err(error) = window.set_resizable(!placement.locked) {
+        tracing::warn!(
+            %error,
+            locked = placement.locked,
+            "notes: could not set the capture panel's resizability"
+        );
+    }
+}
+
+/// Size a window from its placement, or leave it exactly as it is.
+///
+/// Every part of that decision — normalise a locked window, restore an unlocked
+/// one, touch neither when nothing is remembered, and never restore a size the
+/// screen cannot show — belongs to [`Placement::window_size`], which lives in
+/// `keeper_core` and is tested there. This function converts units and calls it.
+fn apply_size<R: Runtime>(window: &WebviewWindow<R>, placement: Placement) {
+    let Some(size) = placement.window_size(logical_work_area(window)) else {
+        return;
+    };
+    if let Err(error) = window.set_size(logical(size)) {
+        tracing::debug!(%error, "notes: the compositor sized the capture panel itself");
+    }
+}
+
+/// The usable area of the monitor this panel belongs on, in **logical** pixels,
+/// or `None` when the platform will not name a monitor.
+///
+/// Logical because that is the unit a remembered size is stored in, and mixing
+/// the two here is the bug this function exists to make impossible: clamping a
+/// logical 900 against a physical 2880 on a 2× display would silently allow a
+/// window twice as wide as the screen.
+fn logical_work_area<R: Runtime>(window: &WebviewWindow<R>) -> Option<(u32, u32)> {
+    let monitor = focused_monitor(window)?;
+    let area = monitor
+        .work_area()
+        .size
+        .to_logical::<u32>(monitor.scale_factor());
+    Some((area.width, area.height))
+}
+
+/// The monitor a capture panel belongs on: the one under the pointer, else the
+/// one the window is already on, else the primary one.
 ///
 /// The **focused** monitor, not the primary one: on a two-screen desk the panel
-/// has to appear where the user is looking. `current_monitor` reports the monitor
-/// the window is on, which for a hidden window is where it was last placed, so
-/// the cursor's monitor is preferred when the platform can name it.
-fn position<R: Runtime>(window: &WebviewWindow<R>) {
+/// has to appear where the user is looking. `current_monitor` reports the
+/// monitor the window is on, which for a hidden window is where it was last
+/// placed, so the cursor's monitor is preferred when the platform can name it.
+fn focused_monitor<R: Runtime>(window: &WebviewWindow<R>) -> Option<Monitor> {
     let monitor = match window.cursor_position() {
         Ok(cursor) => window
             .monitor_from_point(cursor.x, cursor.y)
@@ -110,7 +557,13 @@ fn position<R: Runtime>(window: &WebviewWindow<R>) {
             .or_else(|| window.current_monitor().ok().flatten()),
         Err(_) => window.current_monitor().ok().flatten(),
     };
-    let Some(monitor) = monitor.or_else(|| window.primary_monitor().ok().flatten()) else {
+    monitor.or_else(|| window.primary_monitor().ok().flatten())
+}
+
+/// Place the panel horizontally centred on the focused monitor, a fifth of the
+/// way down its work area.
+fn position<R: Runtime>(window: &WebviewWindow<R>) {
+    let Some(monitor) = focused_monitor(window) else {
         // No monitor information at all (a headless session, or a compositor that
         // does not answer). `center: true` in the static config is the fallback,
         // and it is a perfectly good answer.
@@ -122,7 +575,8 @@ fn position<R: Runtime>(window: &WebviewWindow<R>) {
     };
     // The work area, not the raw resolution: it excludes the macOS menu bar and
     // a Linux panel, so the offset below is measured against the space a window
-    // may actually occupy.
+    // may actually occupy. Physical throughout, matching `outer_size` and the
+    // physical coordinate `set_position` takes.
     let area = monitor.work_area();
     let x = area.position.x + centred(area.size.width, size.width);
     let y = area.position.y + offset_from_top(area.size.height, size.height);
@@ -156,6 +610,10 @@ fn offset_from_top(area_height: u32, window_height: u32) -> i32 {
 mod tests {
     use super::*;
 
+    /// The capability file this window's authority comes from. Read at compile
+    /// time so a rename cannot leave the assertion pointing at nothing.
+    const CAPABILITY: &str = include_str!("../capabilities/quick-capture.json");
+
     #[test]
     fn a_panel_is_centred_horizontally_on_its_monitor() {
         assert_eq!(centred(1920, 560), 680);
@@ -182,6 +640,25 @@ mod tests {
             offset_from_top(100, 340),
             0,
             "an impossible fit sits at the top"
+        );
+    }
+
+    /// The silent failure Story 45.15 could most easily have shipped: a second
+    /// capture window whose label the capability does not cover renders
+    /// normally and can invoke no window permission at all — it cannot hide,
+    /// cannot close, cannot be dragged and cannot follow a link.
+    ///
+    /// Mirrored in `src/test/capture-capability.test.ts`, which runs on every
+    /// machine; this half runs only where the shell compiles.
+    #[test]
+    fn the_capability_covers_every_label_this_module_can_create() {
+        assert!(
+            CAPABILITY.contains(&format!("\"{DRAFT_CAPTURE_LABEL}\"")),
+            "the prewarmed window's exact label must stay listed"
+        );
+        assert!(
+            CAPABILITY.contains(&format!("\"{}\"", keeper_core::capture::CAPTURE_LABEL_GLOB)),
+            "a dynamically created capture window matches nothing without the glob"
         );
     }
 }

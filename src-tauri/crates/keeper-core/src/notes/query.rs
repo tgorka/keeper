@@ -39,10 +39,11 @@ use std::fmt;
 use globset::GlobBuilder;
 
 use crate::notes::index::{
-    link_key, IndexEntry, IndexSnapshot, FIELD_DEVICE, FIELD_LIST_SEPARATOR, FIELD_ORIGIN,
-    FIELD_TOUCHED,
+    is_tag_descendant, link_key, tag_covers, IndexEntry, IndexSnapshot, NoteTagTerm, FIELD_DEVICE,
+    FIELD_LIST_SEPARATOR, FIELD_ORIGIN, FIELD_TOUCHED,
 };
 use crate::notes::search;
+use crate::notes::vm::{NoteSpaceTagVm, NoteSpaceTermsVm};
 
 /// Maximum nesting of parenthesised groups.
 pub const MAX_DEPTH: usize = 8;
@@ -215,8 +216,13 @@ enum CmpOp {
 }
 
 /// Which of the index's three timestamps a `date:` predicate reads.
+///
+/// Public because a space's `sort` names the same two facts the DSL does
+/// (Story 44.4): `sort: created` and `date:created` have to resolve through
+/// one chain, or a space could list notes in an order its own query
+/// contradicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DateField {
+pub enum DateField {
     Created,
     Modified,
     Touched,
@@ -683,6 +689,238 @@ fn tag_pred(value: &str) -> Pred {
     Pred::Tag { path, strict }
 }
 
+// ---------------------------------------------------------------------------
+// Decomposition
+// ---------------------------------------------------------------------------
+
+/// Read a stored query back into the vocabulary a space editor's controls speak
+/// (FR-149, UX-DR55), or say which of its terms they cannot hold.
+///
+/// The inverse direction of the DSL, and it lives here for the reason the
+/// forward direction does: there is one grammar, one tokenizer and one
+/// definition of what a tag is, and a space editor that re-derived any of them
+/// in TypeScript would be a second parser drifting against this one from the
+/// day it was written (AD-20, AD-58).
+///
+/// **The chips are all-or-nothing.** A query is either entirely expressible as
+/// chips or it is not editable through them at all — see
+/// [`NoteSpaceTermsVm`]'s own note. The failure this refuses is the one the
+/// story names as the worst available outcome: an editor that shows three of a
+/// query's four terms, saves what it can see, and quietly deletes
+/// `date:modified>=-14d` on the way. keeper does not rewrite a term it could
+/// not read.
+///
+/// The chip vocabulary is a **flat conjunction** of: `tag:x` / `-tag:x` (at most
+/// one term per tag, since a chip has one slot per tag), `is:<flag>`,
+/// `origin:<value>` and one free-text term. Everything else the grammar
+/// parses — `|`, groups, `path:`, `field:`, `date:`, `link:`, `backlink:`,
+/// `tag:x/*`, and negation of anything that is not a `tag:` — is reported
+/// verbatim rather than approximated.
+///
+/// A query that does not parse is an `Err`, not an empty chip set: the space row
+/// already renders that failure (`NoteSpaceVm::error`), and an editor that
+/// silently offered "no terms" for a broken query would be one Save away from
+/// replacing a typo with a space that selects the whole vault.
+pub fn decompose(input: &str) -> Result<NoteSpaceTermsVm, QueryError> {
+    parse(input)?;
+    let tokens = tokenize(input);
+
+    // Structure first. A `|` or a group is not a term, so there is no honest way
+    // to name the offending *part* of it — the whole query goes back verbatim.
+    let mut words = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        let Tok::Word { text, colon } = &token.tok else {
+            return Ok(NoteSpaceTermsVm::Unrepresentable {
+                terms: vec![input.trim().to_owned()],
+            });
+        };
+        words.push((text.as_str(), *colon, token.span));
+    }
+
+    let mut tags: Vec<NoteSpaceTagVm> = Vec::new();
+    let mut flags: Vec<String> = Vec::new();
+    let mut origin: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+
+    let mut at = 0;
+    while at < words.len() {
+        let (word, colon, span) = words[at];
+        at += 1;
+        // A lone `-` negates the term after it. The pair is one term, so it is
+        // reported as one — splitting it would name `-` on its own, which reads
+        // like a typo rather than like the negation it is.
+        if word == "-" {
+            let end = words.get(at).map_or(span.1, |next| next.2 .1);
+            at += 1;
+            rest.push(input[span.0..end].trim().to_owned());
+            continue;
+        }
+        let source = input[span.0..span.1].to_owned();
+        let (negated, body, colon) = match word.strip_prefix('-') {
+            Some(after) => (true, after, colon.map(|c| c.saturating_sub(1))),
+            None => (false, word, colon),
+        };
+        let Some(split) = colon else {
+            // A bareword is sugar for `text:`, and the bar holds one text term.
+            if negated || text.is_some() {
+                rest.push(source);
+            } else {
+                text = Some(body.to_owned());
+            }
+            continue;
+        };
+        let value = &body[split + 1..];
+        match &body[..split] {
+            "tag" => match chip_tag(value) {
+                // One slot per tag is the whole of 43.3's guarantee, so a query
+                // naming a tag twice cannot be shown as chips without one of the
+                // two disappearing.
+                Some(tag) if !tags.iter().any(|held| held.tag == tag) => {
+                    tags.push(NoteSpaceTagVm {
+                        tag,
+                        term: if negated {
+                            NoteTagTerm::Exclude
+                        } else {
+                            NoteTagTerm::Include
+                        },
+                    })
+                }
+                _ => rest.push(source),
+            },
+            "is" if !negated && !flags.iter().any(|held| same_flag(held, value)) => {
+                flags.push(value.to_owned());
+            }
+            "origin" if !negated && origin.is_none() => origin = Some(value.to_owned()),
+            "text" if !negated && text.is_none() => text = Some(value.to_owned()),
+            _ => rest.push(source),
+        }
+    }
+
+    if rest.is_empty() {
+        Ok(NoteSpaceTermsVm::Chips {
+            tags,
+            flags,
+            origin,
+            text,
+        })
+    } else {
+        Ok(NoteSpaceTermsVm::Unrepresentable { terms: rest })
+    }
+}
+
+/// One term of a flat conjunction, in the vocabulary a surface that has to
+/// *act* on a query speaks (Story 44.6).
+///
+/// Beside [`decompose`] rather than inside it because the two answer different
+/// questions about the same tokens. `decompose` asks "can the chip bar hold all
+/// of this?" and refuses everything the moment one term is outside the chip
+/// vocabulary, because a chip that saved three terms of a four-term query would
+/// silently delete the fourth. Creation asks "which of these can a new note be
+/// made to satisfy?" and must answer term by term: a space filtered
+/// `tag:work date:created>=-7d` has one term creation acts on and one it does
+/// not need to, and refusing the pair wholesale would leave the new note
+/// untagged for no reason.
+///
+/// The two therefore share the tokenizer and nothing else — there is still one
+/// grammar and one definition of a token, which is the property that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Term {
+    /// This term's own source text, verbatim, so a surface can name a term it
+    /// could not act on without inventing a spelling for it.
+    pub source: String,
+    /// Whether the term was written with a leading `-`.
+    pub negated: bool,
+    /// The predicate key — `tag`, `is`, `path`, … — or `None` for a bareword,
+    /// which the grammar treats as `text:`.
+    pub key: Option<String>,
+    /// Everything after the first unquoted colon, with the quotes already gone;
+    /// the whole word for a bareword.
+    pub value: String,
+}
+
+/// Split a query into the flat conjunction of terms it is, or `None` when it is
+/// not one.
+///
+/// `None` for any query carrying `|`, a group, or a dangling `-`: those have
+/// structure, and a term lifted out of a disjunction is not a term the whole
+/// query requires. A caller that cannot act on the structure must then act on
+/// nothing rather than on half of it — the same refusal [`decompose`] makes,
+/// for the same reason.
+///
+/// The input is **not** validated here; a caller that needs a parseable query
+/// calls [`parse`] first. Splitting is deliberately total so a surface can
+/// still name the terms of a query that does not parse.
+pub fn conjunction(input: &str) -> Option<Vec<Term>> {
+    let tokens = tokenize(input);
+    let mut words = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        let Tok::Word { text, colon } = &token.tok else {
+            return None;
+        };
+        words.push((text.as_str(), *colon, token.span));
+    }
+
+    let mut terms = Vec::with_capacity(words.len());
+    let mut at = 0;
+    while at < words.len() {
+        let (word, colon, span) = words[at];
+        at += 1;
+        // A lone `-` negates the term after it, so the pair is one term and is
+        // reported as one. A trailing `-` negates nothing and is a parse error
+        // the caller will meet in `parse`; there is no honest term to report
+        // for it.
+        let (word, colon, span) = if word == "-" {
+            let (next, next_colon, next_span) = *words.get(at)?;
+            at += 1;
+            (
+                format!("-{next}"),
+                next_colon.map(|c| c + 1),
+                (span.0, next_span.1),
+            )
+        } else {
+            (word.to_owned(), colon, span)
+        };
+        let source = input.get(span.0..span.1).unwrap_or(&word).trim().to_owned();
+        let (negated, body, colon) = match word.strip_prefix('-') {
+            Some(after) => (true, after, colon.map(|c| c.saturating_sub(1))),
+            None => (false, word.as_str(), colon),
+        };
+        let (key, value) = match colon {
+            Some(split) => (Some(body[..split].to_owned()), body[split + 1..].to_owned()),
+            None => (None, body.to_owned()),
+        };
+        terms.push(Term {
+            source,
+            negated,
+            key,
+            value,
+        });
+    }
+    Some(terms)
+}
+
+/// The tag a chip would carry for a `tag:` value, or `None` when no chip can.
+///
+/// Two refusals, both because a chip names a node: `tag:x/*` is the subtree
+/// *without* its own node, which no chip state spells, and a value that is not a
+/// tag at all normalises to the empty path — the DSL lets that match nothing
+/// (see [`tag_pred`]), but a chip labelled with the empty string is a control
+/// with nothing written on it.
+fn chip_tag(value: &str) -> Option<String> {
+    if value.ends_with("/*") {
+        return None;
+    }
+    crate::notes::tags::normalise(value)
+}
+
+/// Whether two `is:` values name the same flag. The parser folds case before it
+/// matches [`IS_FLAGS`], so `is:Pinned is:pinned` is one flag written twice and
+/// the chip row must not show it as two.
+fn same_flag(held: &str, other: &str) -> bool {
+    held.trim().eq_ignore_ascii_case(other.trim())
+}
+
 /// Split `key OP value` at the leftmost operator, preferring the two-character
 /// forms so `>=` never lexes as `>` followed by a stray `=`.
 fn split_cmp(value: &str) -> Option<(&str, CmpOp, &str)> {
@@ -941,9 +1179,9 @@ fn eval_pred(pred: &Pred, e: &IndexEntry, body: &mut dyn FnMut() -> String, now_
     match pred {
         Pred::Tag { path, strict } => e.tags.iter().any(|tag| {
             if *strict {
-                tag_descends(tag, path)
+                is_tag_descendant(tag, path)
             } else {
-                tag == path || tag_descends(tag, path)
+                tag_covers(tag, path)
             }
         }),
         Pred::Path(glob) => glob.matcher.is_match(e.path.as_str()),
@@ -974,13 +1212,8 @@ fn eval_pred(pred: &Pred, e: &IndexEntry, body: &mut dyn FnMut() -> String, now_
     }
 }
 
-/// The `tag:` segment-prefix rule: `project` covers `project/keeper` but never
-/// `projects`. Segment-aware because a plain `starts_with` would silently widen
-/// every tag filter to its lexical neighbours.
-fn tag_descends(tag: &str, prefix: &str) -> bool {
-    tag.strip_prefix(prefix)
-        .is_some_and(|rest| rest.starts_with('/'))
-}
+// The `tag:` segment rule lives in `index::is_tag_descendant`, beside the tree
+// that rolls counts up it and the chip predicate that deselects subtrees by it.
 
 fn eval_text(needle: &str, e: &IndexEntry, body: &mut dyn FnMut() -> String) -> bool {
     if needle.is_empty() {
@@ -1020,7 +1253,11 @@ fn eval_origin(e: &IndexEntry, spec: &OriginSpec) -> bool {
 /// slot for, so it reads [`FIELD_TOUCHED`] when something supplies one and
 /// otherwise degrades to `modified` — a missing local fact must never break a
 /// shared space.
-fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
+///
+/// Public for the same reason [`DateField`] is: a space sorted by `created`
+/// and a space filtered by `date:created` must be answering the same question
+/// about the same note (Story 44.4).
+pub fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
     match field {
         DateField::Created => field_ms(e, "created").unwrap_or(e.created_ms),
         DateField::Modified => field_ms(e, "updated").unwrap_or_else(|| {
@@ -1036,10 +1273,20 @@ fn resolve_date(field: DateField, e: &IndexEntry) -> i64 {
     }
 }
 
+/// Read a stored timestamp — `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or full RFC 3339
+/// — as epoch milliseconds, or `None` when the text is not a date.
+///
+/// The one reading of a frontmatter stamp. A space's `recorded` sort composes
+/// the recording stub's own `date` and `start` keys and has to land on the
+/// instant `date:` would have compared against, so it comes through here rather
+/// than through a second parser (Story 44.4).
+pub fn stamp_ms(spec: &str) -> Option<i64> {
+    parse_absolute(spec.trim()).map(|(ms, _)| ms)
+}
+
 /// Read one field as a timestamp, or `None` when it is absent or not a date.
 fn field_ms(e: &IndexEntry, key: &str) -> Option<i64> {
-    let raw = e.fields.get(key)?;
-    parse_absolute(raw.trim()).map(|(ms, _)| ms)
+    stamp_ms(e.fields.get(key)?)
 }
 
 /// Apply an operator to a timestamp against the half-open window a datespec names.
@@ -1204,6 +1451,7 @@ mod tests {
             links: Vec::new(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: crate::notes::order::NoteOrder::default(),
         }
     }
 
@@ -1750,5 +1998,298 @@ mod tests {
             civil_from_days(months_before(march31, 12).div_euclid(DAY_MS)),
             (2025, 3, 31)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decomposition (Story 43.4)
+    // -----------------------------------------------------------------------
+
+    /// A decomposed query, flattened for assertion: tag terms, `is:` flags,
+    /// `origin:` and the free-text needle.
+    type Chips = (
+        Vec<(String, NoteTagTerm)>,
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// The chip set a query decomposes into, or a panic naming what stopped it.
+    fn chips(query: &str) -> Chips {
+        match decompose(query).unwrap_or_else(|err| panic!("parse `{query}`: {}", err.message)) {
+            NoteSpaceTermsVm::Chips {
+                tags,
+                flags,
+                origin,
+                text,
+            } => (
+                tags.into_iter().map(|t| (t.tag, t.term)).collect(),
+                flags,
+                origin,
+                text,
+            ),
+            NoteSpaceTermsVm::Unrepresentable { terms } => {
+                panic!("`{query}` should be chips, not {terms:?}")
+            }
+        }
+    }
+
+    /// The terms a query refuses to give up, or a panic when it gave them all up.
+    fn refused(query: &str) -> Vec<String> {
+        match decompose(query).unwrap_or_else(|err| panic!("parse `{query}`: {}", err.message)) {
+            NoteSpaceTermsVm::Unrepresentable { terms } => terms,
+            NoteSpaceTermsVm::Chips { .. } => panic!("`{query}` should not be chips"),
+        }
+    }
+
+    #[test]
+    fn a_query_the_chips_can_hold_comes_back_as_chips_in_the_order_it_was_written() {
+        let (tags, flags, origin, text) =
+            chips("tag:client/acme -tag:draft is:pinned origin:agent text:\"quarterly review\"");
+        assert_eq!(
+            tags,
+            vec![
+                ("client/acme".to_owned(), NoteTagTerm::Include),
+                ("draft".to_owned(), NoteTagTerm::Exclude),
+            ]
+        );
+        assert_eq!(flags, vec!["pinned".to_owned()]);
+        assert_eq!(origin.as_deref(), Some("agent"));
+        assert_eq!(text.as_deref(), Some("quarterly review"));
+    }
+
+    #[test]
+    fn a_tag_is_read_back_through_the_one_vocabulary() {
+        let (tags, ..) = chips("tag:#Client/Acme");
+        assert_eq!(tags, vec![("client/acme".to_owned(), NoteTagTerm::Include)]);
+    }
+
+    /// Everything the bar itself writes has to survive the trip back, or editing
+    /// a space keeper saved would be the first thing to lose a term.
+    #[test]
+    fn every_query_the_filter_bar_writes_decomposes_into_chips() {
+        for query in [
+            "tag:a",
+            "-tag:a",
+            "tag:a -tag:b",
+            "is:pinned",
+            "tag:a is:pinned is:journal",
+            "origin:agent",
+            "text:\"two words\"",
+            "tag:a -tag:b is:pinned origin:agent text:\"two words\"",
+        ] {
+            let _ = chips(query);
+        }
+    }
+
+    #[test]
+    fn a_grouped_or_disjoint_query_is_refused_whole_because_a_group_is_not_a_term() {
+        assert_eq!(refused("tag:a | tag:b"), vec!["tag:a | tag:b".to_owned()]);
+        assert_eq!(
+            refused("tag:a (tag:b | tag:c)"),
+            vec!["tag:a (tag:b | tag:c)".to_owned()]
+        );
+        assert_eq!(refused("-(tag:a tag:b)"), vec!["-(tag:a tag:b)".to_owned()]);
+    }
+
+    #[test]
+    fn a_term_outside_the_chip_vocabulary_is_named_verbatim() {
+        assert_eq!(
+            refused("tag:a date:modified>=-14d"),
+            vec!["date:modified>=-14d".to_owned()]
+        );
+        assert_eq!(
+            refused("path:journal/**"),
+            vec!["path:journal/**".to_owned()]
+        );
+        assert_eq!(
+            refused("field:priority=high"),
+            vec!["field:priority=high".to_owned()]
+        );
+        assert_eq!(
+            refused("link:notes/a.md"),
+            vec!["link:notes/a.md".to_owned()]
+        );
+        assert_eq!(
+            refused("backlink:notes/a.md"),
+            vec!["backlink:notes/a.md".to_owned()]
+        );
+    }
+
+    /// Every refusal in one query, which is the shape the byte-identity
+    /// guarantee has to hold for.
+    #[test]
+    fn a_query_of_nothing_but_refusals_names_every_one_of_them() {
+        assert_eq!(
+            refused(
+                "path:a/** field:x=1 date:created<today link:b.md backlink:c.md tag:d/* -is:pinned"
+            ),
+            vec![
+                "path:a/**".to_owned(),
+                "field:x=1".to_owned(),
+                "date:created<today".to_owned(),
+                "link:b.md".to_owned(),
+                "backlink:c.md".to_owned(),
+                "tag:d/*".to_owned(),
+                "-is:pinned".to_owned(),
+            ]
+        );
+    }
+
+    /// The exact query `space-editor.test.tsx` round-trips for byte identity.
+    /// The two halves of that guarantee live in two languages, so they name the
+    /// same string: if this ever decomposed into chips, the editor would start
+    /// re-emitting it and the TypeScript test would be asserting against a case
+    /// that no longer exists.
+    #[test]
+    fn the_editors_worked_lossy_example_is_refused_whole() {
+        let query = concat!(
+            "tag:client/acme (tag:urgent | tag:blocked) path:journal/** ",
+            "field:priority=high date:modified>=-14d -(tag:done tag:archive) tag:client/*"
+        );
+        assert_eq!(refused(query), vec![query.to_owned()]);
+    }
+
+    /// The flat companion of the case above, also shared with
+    /// `space-editor.test.tsx`: no grouping, so each refused term is named on
+    /// its own rather than the query being refused whole.
+    #[test]
+    fn the_editors_worked_flat_lossy_example_names_its_two_refused_terms() {
+        assert_eq!(
+            refused("tag:client/acme path:journal/** date:modified>=-14d"),
+            vec![
+                "path:journal/**".to_owned(),
+                "date:modified>=-14d".to_owned()
+            ]
+        );
+    }
+
+    /// `tag:x/*` is the subtree without its own node. No chip state spells that,
+    /// and pretending it is `tag:x` would widen the space by one node's notes.
+    #[test]
+    fn the_descendants_only_tag_form_is_refused_rather_than_flattened() {
+        assert_eq!(refused("tag:client/*"), vec!["tag:client/*".to_owned()]);
+    }
+
+    /// The DSL lets `tag:---` match nothing. A chip carrying it would be a
+    /// control with nothing written on it, and saving the bar would drop it.
+    #[test]
+    fn a_tag_term_that_names_no_tag_is_refused() {
+        assert_eq!(refused("tag:---"), vec!["tag:---".to_owned()]);
+    }
+
+    /// One slot per tag is the whole of Story 43.3's guarantee, so a query that
+    /// names one tag twice cannot become chips without one of them vanishing.
+    #[test]
+    fn a_tag_named_twice_is_refused_because_the_bar_has_one_slot_per_tag() {
+        assert_eq!(refused("tag:a tag:a"), vec!["tag:a".to_owned()]);
+        assert_eq!(refused("tag:a -tag:a"), vec!["-tag:a".to_owned()]);
+        // Two spellings of one tag collide after normalisation, exactly as they
+        // do in the chip bar.
+        assert_eq!(
+            refused("tag:Draft -tag:draft"),
+            vec!["-tag:draft".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_second_free_text_term_is_refused_because_the_bar_has_one_search_field() {
+        assert_eq!(refused("text:one text:two"), vec!["text:two".to_owned()]);
+        assert_eq!(refused("one two"), vec!["two".to_owned()]);
+    }
+
+    #[test]
+    fn a_flag_named_twice_under_two_spellings_is_refused_once() {
+        assert_eq!(refused("is:pinned is:Pinned"), vec!["is:Pinned".to_owned()]);
+    }
+
+    /// A negated anything-but-a-tag has no control. Reported as one term with
+    /// its `-`, because `-` alone reads like a typo rather than like negation.
+    #[test]
+    fn negation_of_a_term_that_is_not_a_tag_is_refused_with_its_sign() {
+        assert_eq!(refused("-is:pinned"), vec!["-is:pinned".to_owned()]);
+        assert_eq!(refused("-origin:agent"), vec!["-origin:agent".to_owned()]);
+        assert_eq!(refused("-text:draft"), vec!["-text:draft".to_owned()]);
+        assert_eq!(refused("- tag:a"), vec!["- tag:a".to_owned()]);
+    }
+
+    /// A broken space already says so on its row. Handing its editor an empty
+    /// chip set would put it one Save away from selecting the whole vault.
+    #[test]
+    fn a_query_that_does_not_parse_decomposes_into_an_error_not_an_empty_chip_set() {
+        assert!(decompose("nope:x").is_err());
+        assert!(decompose("(tag:a").is_err());
+        assert!(decompose("").is_err());
+        assert!(decompose("   ").is_err());
+    }
+
+    /// The term list a surface acting on a query reads (Story 44.6). Asserted
+    /// on `source` because that is the field a refusal is *worded* from: a term
+    /// reported as anything but what its author typed sends them looking for a
+    /// query they never wrote.
+    fn sources(query: &str) -> Vec<String> {
+        conjunction(query)
+            .expect("a flat conjunction")
+            .into_iter()
+            .map(|term| term.source)
+            .collect()
+    }
+
+    #[test]
+    fn a_flat_conjunction_splits_into_its_terms_verbatim() {
+        assert_eq!(
+            sources("tag:work is:pinned date:created>=-7d"),
+            ["tag:work", "is:pinned", "date:created>=-7d"]
+        );
+    }
+
+    /// The key/value split is the tokenizer's, so a colon the author quoted
+    /// stays inside the value instead of cutting the term in half.
+    #[test]
+    fn a_quoted_colon_does_not_split_a_term() {
+        let terms = conjunction("text:\"12:30\"").expect("a flat conjunction");
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].key.as_deref(), Some("text"));
+        assert_eq!(terms[0].value, "12:30");
+    }
+
+    /// A bareword is sugar for `text:`, and it has no key of its own to report.
+    #[test]
+    fn a_bareword_is_one_term_with_no_key() {
+        let terms = conjunction("agenda").expect("a flat conjunction");
+        assert_eq!(terms[0].key, None);
+        assert_eq!(terms[0].value, "agenda");
+        assert!(!terms[0].negated);
+    }
+
+    /// Both spellings of negation are one term, and `- tag:a` keeps the space
+    /// its author typed so the reported text is the query's own.
+    #[test]
+    fn negation_is_one_term_however_it_was_spaced() {
+        for query in ["-tag:draft", "- tag:draft"] {
+            let terms = conjunction(query).expect("a flat conjunction");
+            assert_eq!(terms.len(), 1, "{query}");
+            assert!(terms[0].negated, "{query}");
+            assert_eq!(terms[0].key.as_deref(), Some("tag"), "{query}");
+            assert_eq!(terms[0].value, "draft", "{query}");
+            assert_eq!(terms[0].source, query, "{query}");
+        }
+    }
+
+    /// Structure is not a term. A caller that cannot act on `|` or a group must
+    /// act on nothing rather than lift one branch out of it and treat it as
+    /// required — the note it created would then be filed for a condition the
+    /// query never insisted on.
+    #[test]
+    fn a_query_with_structure_is_not_a_conjunction() {
+        assert_eq!(conjunction("tag:a | tag:b"), None);
+        assert_eq!(conjunction("(tag:a tag:b) tag:c"), None);
+        assert_eq!(conjunction("tag:a -"), None);
+    }
+
+    /// Total on purpose: a surface has to be able to name the terms of a query
+    /// that does not parse, which is exactly when it has something to explain.
+    #[test]
+    fn an_unparseable_query_still_splits_into_terms() {
+        assert_eq!(sources("nope:x tag:a"), ["nope:x", "tag:a"]);
     }
 }

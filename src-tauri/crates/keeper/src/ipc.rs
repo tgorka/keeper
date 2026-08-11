@@ -51,19 +51,19 @@ use keeper_core::recording::{
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
-    DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
-    ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
-    NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingNoteStubVm,
+    CapabilitiesVm, ChatNotifyMode, ConfigLayersVm, ConnectionStatusBatch, CouplingCaveatVm,
+    DemoBatch, DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
+    IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot,
+    NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch,
+    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingDestinationKind,
+    RecordingDurabilityState, RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm,
     RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
-    RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm,
-    RecordingTargetVm, RecordingUiState, RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm,
-    ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm, SearchHitVm,
-    SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    RecordingSearchVm, RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm,
+    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -1499,13 +1499,52 @@ pub fn notes_capture_show() -> Result<(), IpcError> {
 /// Mobile twin of `notes_capture_hide`.
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn notes_capture_hide(
-    commit: bool,
-) -> Result<Option<keeper_core::notes::vm::NoteRefVm>, IpcError> {
-    let _ = commit;
+pub fn notes_capture_hide() -> Result<(), IpcError> {
     Err(to_ipc_error(CoreError::Unsupported(
         "the quick-capture panel is desktop-only".to_owned(),
     )))
+}
+
+/// Mobile twin of `notes_capture_open` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_open(target: keeper_core::capture::CaptureTargetVm) -> Result<(), IpcError> {
+    let _ = target;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_close` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_close(key: String) -> Result<(), IpcError> {
+    let _ = key;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_set_locked` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_set_locked(key: String, locked: bool) -> Result<(), IpcError> {
+    let _ = (key, locked);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_windows` (Story 45.15).
+///
+/// An empty list rather than a refusal, and that is the one twin here that is
+/// not an error: "which capture windows are open?" has a true answer on a
+/// phone — none — and a surface that asks in order to decide whether to offer
+/// something should get it rather than an exception to swallow.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_windows() -> Result<Vec<keeper_core::capture::CaptureWindowVm>, IpcError> {
+    Ok(Vec::new())
 }
 
 /// Mobile twin of `notes_reveal`.
@@ -1680,6 +1719,51 @@ pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<Syn
             retriable: false,
         })
     }
+}
+
+/// Where every file-set setting came from, and everything wrong with the
+/// settings files (Story 46.7, AD-98).
+///
+/// **This command is the whole of AD-98's second half.** The layer stack makes
+/// a file keep winning; without a surface that says so, the visible effect is a
+/// switch that flips back on its own, which is worse than the destructive
+/// import it replaced — that one at least only lost the file's value once. So
+/// the answer to "where did this value come from?" is a first-class read, not a
+/// debug affordance.
+///
+/// Registered on every platform, like [`sync_git_status`] and unlike the rest
+/// of the sync surface: `~/.keeper/keeper.toml` is read by
+/// [`keeper_core::config`], which has no desktop gate, and a phone that
+/// answered `Command config_layers not found` would force the Settings surface
+/// to special-case a question it can always answer honestly (with an empty
+/// stack).
+///
+/// No `State` parameter, deliberately: the stack is process-global and was
+/// installed at phase one of `setup()`, before `AppState` had anything in it
+/// worth reading. Taking the state would imply this depends on it.
+#[tauri::command]
+pub fn config_layers() -> Result<ConfigLayersVm, IpcError> {
+    let vm = ConfigLayersVm::new(
+        keeper_core::config::overrides(),
+        keeper_core::config::faults(),
+        keeper_core::config::main_folder(),
+    );
+    // The two fault sources meet here and nowhere earlier. AD-40 keeps
+    // `keeper-sync` free of `keeper-core` and `keeper-core` free of
+    // `keeper-sync` (`bun run check:core-sync-free` asserts both edges), so the
+    // shell is the only crate that can see a folder tier's faults and the app
+    // layers' faults at the same time. A user does not care which crate
+    // noticed; one list.
+    #[cfg(desktop)]
+    let vm = vm.with_folder_faults(
+        keeper_sync::profile::folder_faults()
+            .iter()
+            // Fully qualified rather than imported: the only use is inside this
+            // `cfg`, and an import would be an unused-import warning on iOS.
+            .map(|fault| keeper_core::vm::ConfigFaultVm::folder(&fault.path, fault.message.clone()))
+            .collect(),
+    );
+    Ok(vm)
 }
 
 /// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of
@@ -2358,11 +2442,16 @@ pub fn search_archive(
 /// row's absolute path composed from it, so no frontend surface ever joins a
 /// root to a subfolder (AD-65) and Reveal cannot open a folder the recorder
 /// would not have written to.
+///
+/// Returns the page AND the archive-wide count (Story 44.11): the page has
+/// always stopped at `recordings_fts::DEFAULT_LIMIT`, and a surface that
+/// counted its own array would say "200 sessions" to somebody with nine
+/// thousand.
 #[tauri::command]
 pub fn search_recordings(
     state: State<'_, AppState>,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let destination_root = effective_destination_dir(&data_dir, &state.platform);
     search_recordings_in(&data_dir, &destination_root, filter)
@@ -2376,9 +2465,13 @@ fn search_recordings_in(
     data_dir: &Path,
     destination_root: &Path,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     if !keeper_core::archive::db::db_path(data_dir).exists() {
-        return Ok(Vec::new());
+        // No archive is zero sessions, and zero is a number the surface prints.
+        return Ok(RecordingSearchVm {
+            rows: Vec::new(),
+            total: 0,
+        });
     }
     let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
         .map_err(CoreError::from)
@@ -6432,48 +6525,38 @@ pub async fn recording_start(
     // builds (AD-65): a second `Local::now()` below this line could name a folder
     // in the next minute and make the card's promise false by a hair.
     let now = Local::now();
-    let title = meta_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned);
+    // The folder-name title is the SAME trimmed value the manifest records, read
+    // back off the block below rather than re-derived: a folder named from one
+    // trim rule and a manifest written from another is a session whose name and
+    // whose title disagree, and nothing on screen would show it.
     // Story 21.5 + 22.3: the optional user metadata, trimmed, with blank entries
     // dropped (a custom row needs a NAME; a blank value is legal) — plus the
     // session's immutable identity, which is why the block is now ALWAYS written.
     // It used to be omitted when the user typed nothing, and an omitted block
     // would mean a session with no id at all.
+    //
+    // Story 45.19: those rules moved into `SessionMeta::from_input`, whole and
+    // unchanged, because the editor on the FINISHED session applies the same
+    // form and had nowhere to read them from. Two copies of "is this field
+    // blank" and "where does one tag end" is how a field starts round-tripping
+    // differently depending on which surface last saved it.
     let session_id = mint_session_id(&data_dir)?;
-    let session_meta = {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        // Story 42.5: one tokenisation, in the tag module, for the one field
-        // whose separator is a comma. What lands in `manifest.json` is still the
-        // user's own text — the canonical form is applied later, by
-        // `RecordingRow::from_manifest`, on the way into the index. The manifest
-        // says what they typed; the row says what it means.
-        let tags = meta_tags
-            .as_deref()
-            .map(keeper_core::notes::tags::split_list)
-            .filter(|list| !list.is_empty());
-        let custom = meta_custom
-            .map(|list| {
-                list.into_iter()
-                    .filter(|f| !f.name.trim().is_empty())
-                    .map(|f| keeper_core::recording::SessionMetaField {
-                        name: f.name.trim().to_owned(),
-                        value: f.value.trim().to_owned(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty());
-        keeper_core::recording::SessionMeta {
-            session_id: Some(session_id.clone()),
-            title: clean(meta_title.clone()),
-            participants: clean(meta_participants),
-            note: clean(meta_note),
-            tags,
-            custom,
-        }
-    };
+    let session_meta = keeper_core::recording::SessionMeta::from_input(
+        Some(session_id.clone()),
+        &keeper_core::recording::SessionMetaInput {
+            title: meta_title.as_deref(),
+            participants: meta_participants.as_deref(),
+            note: meta_note.as_deref(),
+            // Story 42.5: one tokenisation, in the tag module, for the one field
+            // whose separator is a comma. What lands in `manifest.json` is still
+            // the user's own text — the canonical form is applied later, by
+            // `RecordingRow::from_manifest`, on the way into the index. The
+            // manifest says what they typed; the row says what it means.
+            tags: meta_tags.as_deref(),
+            custom: meta_custom.as_deref().unwrap_or(&[]),
+        },
+    );
+    let title = session_meta.title.clone();
     let devices = SessionDevices {
         system_audio,
         // Story 19.3: the mic leg is live — the manifest records whether this
@@ -7120,8 +7203,8 @@ pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
     recording_snapshot(state)
 }
 
-/// One sync profile, reduced to the five facts a recordings destination turns on
-/// (Story 41.2, FR-131; Story 41.7 added the fifth).
+/// One sync profile, reduced to the facts a recordings destination turns on
+/// (Story 41.2, FR-131; Story 41.7 added the volume, Story 46.10 the subfolder).
 ///
 /// `keeper-sync`'s `SyncProfile` is a thirty-field type that only exists on
 /// desktop; this is what the destination decision actually asks of it, mapped in
@@ -7143,6 +7226,16 @@ struct DestinationProfileRow {
     /// ([`keeper_sync::SyncProfile::recordings_root`]), or `None` when it does
     /// not say it holds recordings (Story 41.1's `recordings` block absent).
     recordings_root: Option<PathBuf>,
+    /// The profile-relative subfolder [`Self::recordings_root`] was joined FROM,
+    /// carried rather than sliced back out of the root (Story 46.10).
+    ///
+    /// `Some` exactly when `recordings_root` is: [`destination_profile_row`] is
+    /// the one place either is built and builds both from the same `recordings`
+    /// block. Recovering it from the root instead would be string surgery that
+    /// normalises — `20-media//sessions` and `20-media/sessions` join to one root
+    /// and are two different stored values — and only the stored one may be
+    /// echoed back to `sync_profile_save` by an edit box.
+    recordings_subfolder: Option<String>,
     /// Whether watch mode is armed. A paused profile is neither a destination nor
     /// a collision — see [`enclosing_destination_profile`].
     enabled: bool,
@@ -7536,6 +7629,14 @@ fn destination_profile_row(profile: &keeper_sync::SyncProfile) -> DestinationPro
         name: profile.name.clone(),
         local_path: profile.local_path.clone(),
         recordings_root: profile.recordings_root(),
+        // The head the root above was composed from, taken from the SAME block, so
+        // the pair cannot describe two different profiles (Story 46.10). Trimmed
+        // exactly as `recordings_root` trims before joining, so what the card
+        // shows is what the join used.
+        recordings_subfolder: profile
+            .recordings
+            .as_ref()
+            .map(|recordings| recordings.subfolder.trim().to_owned()),
         enabled: profile.enabled,
         // Only a profile that says it is on removable media is scanned. For every
         // ordinary folder this is the whole cost of the feature: one boolean.
@@ -8583,6 +8684,138 @@ pub async fn recording_retitle(
     Ok(manifest_summary(&destination, &manifest))
 }
 
+/// A finished session's `meta` block, for the two surfaces that open a form on
+/// it (Story 45.19, FR-197): the editor on the last recording, and "record
+/// another like this" on a recording's note.
+///
+/// `Ok(None)` — never an error — for a folder with no loadable `manifest.json`.
+/// A session whose manifest is missing or unparseable is one keeper can say
+/// nothing about, and the two callers want the same thing from that: the editor
+/// stays shut and the duplicate action is absent, rather than either of them
+/// offering a form that would save into nothing. A load failure is not
+/// actionable by the person reading the card — the recording itself is fine —
+/// so it is logged and not raised.
+///
+/// `async` per AD-34-5: the manifest may be on a slow removable volume.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    off_async_runtime(move || -> Option<RecordingSessionMetaVm> {
+        let path = PathBuf::from(folder);
+        match SessionManifest::load(&path) {
+            Ok(manifest) => Some(manifest.meta.unwrap_or_default().to_form_vm()),
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    "recording meta: no loadable manifest, so the session's details cannot be shown"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Rewrite a finished session's metadata from the "Next session" form (Story
+/// 45.19, FR-197) — every field of it EXCEPT the title.
+///
+/// **The title is [`recording_retitle`]'s and stays there.** Setting one MOVES
+/// the session: Story 40.4 re-renders the path template against the session's
+/// own start instant, renames the folder, repoints the kept status snapshot and
+/// the archive row, and refuses a live session by name. Absolutely none of that
+/// is true of participants, note, tags or custom rows, which are a rewrite of
+/// four keys in a file. One editor collects both and sends each field to the one
+/// command that owns it, so neither becomes a second answer to the other.
+///
+/// Refused for a live session ([`recording_session_live_error`]) by the same
+/// compare-and-set claim the retitle uses, and for the same reason: the driver
+/// and the sidecar hold this manifest open, and a rewrite under them would be
+/// overwritten at the next reconcile at best. A folder with no loadable manifest
+/// is refused too — there is nothing to edit, and creating one here would invent
+/// a session out of a directory.
+///
+/// **The archive row is deliberately not rewritten**, exactly as a retitle does
+/// not rewrite it: Story 42.1's row carries a codec and a frame rate that exist
+/// in no manifest, so rebuilding one from what this edit knows would write nulls
+/// over them, and the row is keyed on the identity this edit never touches. The
+/// consequence is honest and bounded — the recordings browser keeps searching
+/// the tags the session was STARTED with until the index is rebuilt from disk
+/// ([`keeper_core::archive::recordings::rebuild_from_disk`]), which reads the
+/// manifests.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_meta_update(
+    state: State<'_, AppState>,
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    // The whole edit goes to the blocking pool as one unit (AD-34-5): a manifest
+    // load and an atomic rewrite, either of which can be on a slow volume.
+    off_async_runtime(move || -> Result<RecordingSessionMetaVm, IpcError> {
+        let path = PathBuf::from(folder);
+        // The claim IS the live check, as in `retitle_session_folder`: `reserve`
+        // reports whether THIS guard inserted the entry, so a folder a live (or
+        // starting) session holds is refused as one indivisible compare-and-set
+        // rather than a `contains` a start could win the instant after it read
+        // `false`. Held across the load and the write, so the orphan-recovery
+        // pass cannot reconcile and rewrite this manifest from under the edit.
+        let claim = LiveFolderReservation::reserve(&reserved, path.clone());
+        if !claim.owned {
+            return Err(recording_session_live_error());
+        }
+        let mut manifest = SessionManifest::load(&path).map_err(|err| to_ipc_error(err.into()))?;
+        manifest.edit_details(&keeper_core::recording::SessionMetaInput {
+            // Not sent, and not defaulted from the form either: `edit_details`
+            // carries the manifest's own title through untouched.
+            title: None,
+            participants: participants.as_deref(),
+            note: note.as_deref(),
+            tags: tags.as_deref(),
+            custom: custom.as_deref().unwrap_or(&[]),
+        });
+        manifest.write().map_err(|err| to_ipc_error(err.into()))?;
+        // Answered from the manifest that was just written, not echoed back from
+        // the request: the editor repaints from this, and the two differ wherever
+        // a rule applied (a trimmed field, a dropped nameless row, a tag line
+        // re-joined from its tokens). Echoing the request would show the user
+        // their own typing and hide what was actually stored.
+        Ok(manifest.meta.unwrap_or_default().to_form_vm())
+    })
+    .await?
+}
+
+/// Mobile stubs for the Story 45.19 commands: recording is a desktop-only
+/// surface, so there is never a session manifest to read or rewrite.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    let _ = folder;
+    Ok(None)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_meta_update(
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let _ = (folder, participants, note, tags, custom);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recording metadata is desktop-only".to_owned(),
+    )))
+}
+
 /// How deep below a retitled session folder the prime walk descends.
 ///
 /// A session folder holds its segments and its `manifest.json`, and any nesting
@@ -9621,6 +9854,11 @@ fn destination_profile_vms(table: &DestinationProfileTable) -> Vec<RecordingProf
                 id: row.id.clone(),
                 name: row.name.clone(),
                 recordings_root: row.recordings_root.as_ref()?.to_string_lossy().into_owned(),
+                // The head, `?` for the same reason the root is: a row that
+                // cannot say where recordings live is not a destination, and one
+                // that named a root without a head would be a row this function
+                // had to invent half of.
+                subfolder: row.recordings_subfolder.clone()?,
             })
         })
         .collect()
@@ -12007,6 +12245,9 @@ mod tests {
             name: name.to_owned(),
             local_path: PathBuf::from(local),
             recordings_root: Some(PathBuf::from(local).join("recordings")),
+            // Spelled the same way the join above spells it, because this fixture
+            // is asserting that the pair agrees.
+            recordings_subfolder: Some("recordings".to_owned()),
             enabled: true,
             volume: None,
         }
@@ -12957,23 +13198,44 @@ mod tests {
     /// The picker's source: flagged AND enabled only, with the root RESOLVED here
     /// so no surface joins a local path and a subfolder. No engine ⇒ an empty
     /// list, never an error, so the card falls back to today's behaviour.
+    ///
+    /// Story 46.10: the row also carries the HEAD the root was joined from, and a
+    /// multi-segment one is carried verbatim — the Destination card shows and
+    /// edits it, so a truncated or re-normalised head would be a value the card
+    /// could not echo back to `sync_profile_save`.
     #[test]
     fn destination_profiles_lists_only_the_folders_that_hold_recordings() {
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
         unflagged.recordings_root = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
+        let mut nested = flagged_row("nest", "nested", "/Volumes/nest");
+        nested.recordings_subfolder = Some("40-media/recordings".to_owned());
+        nested.recordings_root = Some(PathBuf::from("/Volumes/nest/40-media/recordings"));
         let table = Ok(vec![
             flagged_row("tgd", "tgdrive", "/Volumes/tg"),
             unflagged,
             paused,
+            nested,
         ]);
 
         let offered = destination_profile_vms(&table);
-        assert_eq!(offered.len(), 1, "only one folder holds recordings");
+        assert_eq!(offered.len(), 2, "only two folders hold recordings");
         assert_eq!(offered[0].id, "tgd");
         assert_eq!(offered[0].name, "tgdrive");
         assert_eq!(offered[0].recordings_root, "/Volumes/tg/recordings");
+        assert_eq!(
+            offered[0].subfolder, "recordings",
+            "the head the root was composed from, beside it"
+        );
+        assert_eq!(
+            offered[1].recordings_root, "/Volumes/nest/40-media/recordings",
+            "a nested head resolves to a nested root"
+        );
+        assert_eq!(
+            offered[1].subfolder, "40-media/recordings",
+            "a multi-segment head is carried whole, not reduced to its last part"
+        );
 
         assert!(
             destination_profile_vms(&Err("git is not available".to_owned())).is_empty(),
@@ -16376,8 +16638,14 @@ mod tests {
         assert_eq!(fm.as_string("participants"), Some("Ada, Grace"));
         assert_eq!(
             fm.as_list("tags"),
-            Some(vec!["standup".to_owned(), "eng".to_owned()]),
-            "tags are carried as stored — 42.5 owns resolving them"
+            Some(vec![
+                "standup".to_owned(),
+                "eng".to_owned(),
+                "recordings".to_owned()
+            ]),
+            "the session's own tags are carried as stored and keep their order — 42.5 owns \
+             resolving them — and story 43.2 appends the one keeper owns, last, because the \
+             head of a truncated property row should be the tag the writer chose"
         );
         assert_eq!(
             fm.as_string("session"),
@@ -16393,10 +16661,25 @@ mod tests {
         // presence rather than value — the composer's own tests fix the format.
         assert!(fm.as_string("end").is_some(), "the end time is recorded");
         assert!(fm.as_string("duration").is_some());
+        // Story 44.2: the body opens as the recording. Both closed segments are
+        // embedded, in the ledger's order, BELOW the heading — `manifest.json`
+        // is in `files:` and is not embedded. Asserted here as well as in the
+        // composer's own tests because this is the seam that decides what the
+        // paths actually look like: they are whatever `stub_files` made
+        // relative to the anchor, and nothing joined a root back onto them.
         assert_eq!(
             &source[body..],
-            "\n# Weekly sync\n\n",
-            "the body offset is exact and the prose is byte-identical"
+            concat!(
+                "\n# Weekly sync\n",
+                "\n",
+                "![[keeper-rec session/screen-0000.mov]]\n",
+                "![[keeper-rec session/screen-0001.mov]]\n",
+                "\n",
+            ),
+            "the WHOLE body, so nothing can be reordered without failing here: the body \
+             offset is exact, the prose is byte-identical, and the heading is still the \
+             first line. An embed above it would become the note's displayed title, \
+             because `note_title` falls back to the body's first line"
         );
 
         // AC4, at the seam where an absolute path could actually get in: the
@@ -16603,7 +16886,14 @@ mod tests {
             .expect("an untitled session still gets a named stub");
         let (fm, body) = Frontmatter::parse(&source);
         assert_eq!(fm.as_string("title"), Some("2026-01-02"));
-        assert_eq!(&source[body..], "\n# 2026-01-02\n\n");
+        // The whole body, not a substring: the heading must stay the FIRST line,
+        // because `notes_vault::note_title` falls back to it and an embed above
+        // it would become the note's displayed name (story 44.2). The embed is
+        // here because `drive_synthetic_session` closes a real `.mov`.
+        assert_eq!(
+            &source[body..],
+            "\n# 2026-01-02\n\n![[keeper-rec 2026-01-02 10.00.00/screen-0000.mov]]\n\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -16706,7 +16996,16 @@ mod tests {
             "the head is keeper's block plus its separator: {head:?}"
         );
         let body = &stub.contents[head.len()..];
-        assert_eq!(body, "# Weekly sync\n\n");
+        // Story 44.2: the one closed segment is embedded under the heading, and
+        // the blank line after it is the line the surface's caret lands on —
+        // `setSelectionRange(value.length, …)` on exactly this string. Which is
+        // why the sentence appended below goes UNDER the recording rather than
+        // shoving it down the page.
+        assert_eq!(
+            body, "# Weekly sync\n\n![[keeper-rec session/screen-0000.mov]]\n\n",
+            "the WHOLE body: heading first, then the recording, then the blank line the \
+             caret lands on. An embed above the heading would become the note's title"
+        );
 
         recording_note_stub_save(folder_arg.clone(), format!("{head}{body}Ship on Friday.\n"))
             .await
@@ -17084,7 +17383,7 @@ mod tests {
     fn browsing_recordings_with_no_archive_yields_no_rows_and_no_error() {
         let data_dir = scan_temp_dir("rec-42-3-no-archive");
 
-        let rows = search_recordings_in(
+        let found = search_recordings_in(
             &data_dir,
             &data_dir.join("Movies"),
             RecordingFilterVm {
@@ -17100,7 +17399,11 @@ mod tests {
         )
         .expect("an absent archive is an empty answer, never an error");
 
-        assert!(rows.is_empty());
+        assert!(found.rows.is_empty());
+        assert_eq!(
+            found.total, 0,
+            "no archive is zero sessions, said as a number (Story 44.11)"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -17129,22 +17432,29 @@ mod tests {
         let missing = search_recordings_in(&data_dir, &destination_root, filter("retrospective"))
             .expect("browse the archive");
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "01DEVICE-01STANDUP");
-        assert_eq!(rows[0].duration_ms, Some(60_000));
-        assert_eq!(rows[0].total_bytes, 4_096);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.total, 1,
+            "the count travels with the page (Story 44.11)"
+        );
+        assert_eq!(rows.rows[0].session_id, "01DEVICE-01STANDUP");
+        assert_eq!(rows.rows[0].duration_ms, Some(60_000));
+        assert_eq!(rows.rows[0].total_bytes, 4_096);
         let expected_folder = destination_root.join("2026").join("Standup");
         let expected_file = expected_folder
             .join("screen-0000.mov")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(rows[0].absolute_path, expected_folder.to_string_lossy());
         assert_eq!(
-            rows[0].playable_path.as_deref(),
+            rows.rows[0].absolute_path,
+            expected_folder.to_string_lossy()
+        );
+        assert_eq!(
+            rows.rows[0].playable_path.as_deref(),
             Some(expected_file.as_str())
         );
         assert!(
-            missing.is_empty(),
+            missing.rows.is_empty(),
             "a filter that matches nothing is an empty list, not an error"
         );
         let _ = std::fs::remove_dir_all(&base);

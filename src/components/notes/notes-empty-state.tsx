@@ -57,18 +57,32 @@ const COPY: Record<NotesEmptyKind, { message: string; action: string }> = {
  * The chips stay on screen above this — they are not cleared to make room for
  * it — because the fastest way out of "nothing matches" is removing the one chip
  * that went too far, and that is only possible if the chips are still there.
+ *
+ * `detail` names the terms that are narrowing the list (Story 43.3). It is a
+ * second line rather than a longer message because it is the *changing* part:
+ * the sentence above it is a fixed fact about the state, and folding a live list
+ * of terms into it would make the copy unreadable at four chips. An exclusion is
+ * the term that needs it most — an inclusion that went too far leaves a list you
+ * can see is wrong, while an exclusion leaves the same empty pane whether it
+ * removed one note or nine hundred.
  */
 export function NotesEmptyState({
   kind,
+  detail,
   onAction,
 }: {
   kind: NotesEmptyKind;
+  /** The active terms, said in words; `null` when nothing is narrowing. */
+  detail?: string | null;
   onAction: () => void;
 }) {
   const { message, action } = COPY[kind];
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
       <p className="max-w-[36ch] text-center text-muted-foreground text-sm">{message}</p>
+      {detail !== null && detail !== undefined && (
+        <p className="max-w-[36ch] text-center text-muted-foreground text-xs">{detail}</p>
+      )}
       <Button type="button" variant="outline" size="sm" onClick={onAction}>
         {action}
       </Button>

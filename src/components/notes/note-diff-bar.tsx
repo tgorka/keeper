@@ -18,8 +18,8 @@ import { notesMarkRead } from "@/lib/ipc/client";
 import {
   acceptPending,
   keepMine,
-  notesEditorStore,
-  useNotesEditorStore,
+  readNoteDocument,
+  useNoteDocument,
 } from "@/lib/stores/notes-editor";
 
 /**
@@ -32,10 +32,12 @@ import {
  * rev handed to Rust is the one the body stream delivered — never a timestamp
  * and never a guess.
  */
-function acceptAndAcknowledge(): void {
-  const { pending, vaultId, noteId } = notesEditorStore.getState();
-  acceptPending();
-  if (pending === null || vaultId === null || noteId === null) {
+function acceptAndAcknowledge(vaultId: string, noteId: string): void {
+  // Read before accepting: accepting is what clears `pending`, and the rev the
+  // acknowledgement carries is the one that just arrived.
+  const { pending } = readNoteDocument(vaultId, noteId);
+  acceptPending(vaultId, noteId);
+  if (pending === null) {
     return;
   }
   notesMarkRead(vaultId, noteId, pending.rev).catch(() => {
@@ -46,6 +48,15 @@ function acceptAndAcknowledge(): void {
 }
 
 export interface NoteDiffBarProps {
+  /**
+   * Which note's bar this is (Story 46.12).
+   *
+   * Props rather than "whatever the store has open", because two panels may
+   * each have a bar up over a different note, and an Accept in one of them
+   * must not take the other note's arriving revision.
+   */
+  vaultId: string;
+  noteId: string;
   /** Open the full diff. Absent surfaces simply omit the affordance. */
   onShowChanges?: () => void;
   /** Open conflict resolution; only offered when the hunks overlapped. */
@@ -84,9 +95,9 @@ function summarise(added: number, removed: number): string {
   return parts.length === 0 ? "no line changes" : parts.join(", ");
 }
 
-export function NoteDiffBar({ onShowChanges, onResolve }: NoteDiffBarProps) {
-  const pending = useNotesEditorStore((state) => state.pending);
-  const base = useNotesEditorStore((state) => state.base);
+export function NoteDiffBar({ vaultId, noteId, onShowChanges, onResolve }: NoteDiffBarProps) {
+  const pending = useNoteDocument(vaultId, noteId, (document) => document.pending);
+  const base = useNoteDocument(vaultId, noteId, (document) => document.base);
 
   if (pending === null) {
     return null;
@@ -116,10 +127,10 @@ export function NoteDiffBar({ onShowChanges, onResolve }: NoteDiffBarProps) {
           Resolve
         </Button>
       ) : null}
-      <Button size="sm" variant="ghost" onClick={keepMine}>
+      <Button size="sm" variant="ghost" onClick={() => keepMine(vaultId, noteId)}>
         Keep mine
       </Button>
-      <Button size="sm" onClick={acceptAndAcknowledge}>
+      <Button size="sm" onClick={() => acceptAndAcknowledge(vaultId, noteId)}>
         {overlapped ? "Take theirs" : "Accept"}
       </Button>
     </div>

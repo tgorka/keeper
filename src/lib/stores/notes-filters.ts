@@ -12,11 +12,19 @@
  *
  * Two rules this file exists to keep true:
  *
- *   - **Tags intersect.** Two chips mean "both", never "either" — the Apple
- *     Notes contract, and the one people already expect from a chip bar.
+ *   - **Tag terms intersect.** Two chips mean "both", never "either" — the Apple
+ *     Notes contract, and the one people already expect from a chip bar. Since
+ *     Story 43.3 a chip is three-state (off, include, exclude) and an exclusion
+ *     intersects the same way: `client/acme` AND not `draft`.
  *   - **A filter change is a filter.** Nothing here touches the selection or the
  *     open note (UX-DR41). The note under the cursor survives every chip, and
  *     the pane keeps it open even when the new filter would exclude its row.
+ *
+ * A tag appears in {@link NotesFiltersState.tagTerms} at most once, which is the
+ * whole of how "include and exclude the same tag" is made impossible rather than
+ * resolved by precedence (FR-148, UX-DR54): there is one entry per tag, the
+ * cycle rewrites it in place, and {@link noteQueryFor} ships it as a map keyed by
+ * tag so the wire cannot carry the contradiction either.
  *
  * `folder` scope is the one that does not go through {@link NoteQueryReq}: the
  * physical lens has its own command (`notes_tree`, FR-106) because a
@@ -25,62 +33,48 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
-import type { NoteQueryReq } from "@/lib/ipc/client";
+import type { NoteQueryReq, NoteTagTerm } from "@/lib/ipc/client";
 
 /**
  * What the list is scoped to — the sidebar row that is selected, or `all` when
  * none is. Every one of these is a filter and not a route (UX-DR41).
  *
- * "Today" is deliberately absent: the sidebar's Today row opens or creates
- * today's journal entry (FR-99), which is an action on one note rather than a
- * way of narrowing the list.
+ * **There are only two kinds of row, and one of them is a space** (Story 44.3,
+ * AD-79). Inbox, Journal, Pinned and Recordings used to be four more variants
+ * here, each with a hard-coded `is:` flag in a table below, and each therefore
+ * unteachable: no icon, no rename, no reorder, no edit. They are seeded notes
+ * under `spaces/` now, so their queries live in the vault where the user can
+ * read and change them, and this type stopped needing to know their names.
+ *
+ * "Today" is not here and no longer anywhere: the row never filtered anything
+ * (AD-80). Opening or creating today's journal entry is an action on one note,
+ * and it still lives on `⌘⌥J`, the tray and the palette.
  */
 export type NoteScope =
   | { readonly kind: "all" }
-  | { readonly kind: "inbox" }
-  | { readonly kind: "journal" }
-  | { readonly kind: "pinned" }
-  | { readonly kind: "recording" }
-  | { readonly kind: "space"; readonly id: string; readonly name: string }
+  | {
+      readonly kind: "space";
+      readonly id: string;
+      readonly name: string;
+      /**
+       * Which seeded default this space is, `null` for every other space.
+       *
+       * Carried on the scope so a surface can speak about *this* space without
+       * re-reading the space list or, worse, matching on its name — a default
+       * is renameable like any other, and a sentence that stopped appearing
+       * because someone called Recordings "Sessions" would be a bug nobody
+       * connects to the rename.
+       */
+      readonly defaultKey: string | null;
+    }
   | { readonly kind: "folder"; readonly path: string };
 
 /** The unscoped list — every note in the vault, in the vault's own order. */
 export const ALL_NOTES_SCOPE: NoteScope = { kind: "all" };
 
-/**
- * The `is:` flag each scope narrows by, or `null` where the scope is not a flag
- * at all. The strings are the closed enum `keeper_core::notes::query` parses, so
- * this table is the one place the two vocabularies meet.
- *
- * `inbox` maps to `untagged` — the honest home of the unfiled is the note no tag
- * has claimed, and `untagged` is what the index computes.
- *
- * `recording` maps to the flag the index sets from a note's `session:`
- * frontmatter (Story 42.4). That one key is the whole predicate, so the lens
- * costs nothing but a row: no second filtering path, no folder convention, and
- * a stub filed anywhere in the vault is still listed.
- */
-const SCOPE_FLAG: Record<NoteScope["kind"], string | null> = {
-  all: null,
-  inbox: "untagged",
-  journal: "journal",
-  pinned: "pinned",
-  recording: "recording",
-  space: null,
-  folder: null,
-};
-
 /** The chip label for a scope, as the bar renders it. */
 export function scopeLabel(scope: NoteScope): string {
   switch (scope.kind) {
-    case "inbox":
-      return "Inbox";
-    case "journal":
-      return "Journal";
-    case "pinned":
-      return "Pinned";
-    case "recording":
-      return "Recordings";
     case "space":
       return scope.name;
     case "folder":
@@ -113,14 +107,89 @@ function sameScope(a: NoteScope, b: NoteScope): boolean {
   return true;
 }
 
+/**
+ * What one tag chip is doing, as the control shows it (FR-148, UX-DR54).
+ *
+ * `off` is the UI's word for "not in {@link NotesFiltersState.tagTerms}", and it
+ * exists only on this side: a term that admits everything has no business on the
+ * wire, so {@link NoteTagTerm} — the Rust vocabulary — has two values and this
+ * has three.
+ */
+export type TagChipState = "off" | NoteTagTerm;
+
+/** One active tag chip: the tag, and which way it is pointing. */
+export interface TagChip {
+  readonly tag: string;
+  readonly term: NoteTagTerm;
+}
+
+/** The order one press walks. */
+const CYCLE: readonly TagChipState[] = ["off", "include", "exclude"];
+
+/**
+ * The state one press moves a chip to.
+ *
+ * Include before exclude, because including is what people do far more often
+ * and the common case has to be one press. Exported because the cycle order is
+ * the control's contract and two surfaces press it: the chip in the bar goes
+ * through {@link NotesFiltersState.cycleTag}, and a plain press in the tag tree
+ * has to read the next state *before* it clears the rest of the bar — a second
+ * definition of the order is a tree and a bar that disagree about what a press
+ * does.
+ */
+export function nextTagChipState(state: TagChipState): TagChipState {
+  return CYCLE[(CYCLE.indexOf(state) + 1) % CYCLE.length] ?? "off";
+}
+
+/**
+ * What `tag` is currently doing in a chip list, `off` when it is doing nothing.
+ *
+ * The one reader of {@link NotesFiltersState.tagTerms}' shape. The tag tree, the
+ * cycle and the space editor all ask this rather than each searching the array,
+ * so a node in the tree and the same tag's chip in the bar cannot end up drawing
+ * two different states.
+ */
+export function tagChipState(chips: readonly TagChip[], tag: string): TagChipState {
+  return chips.find((chip) => chip.tag === tag)?.term ?? "off";
+}
+
+/**
+ * The chip list with `tag` put into `term`, `off` removing it.
+ *
+ * The one mutation of the list, and the reason a tag cannot be included and
+ * excluded at once: an existing entry is rewritten **in place**, keeping the
+ * position the user first put it in, rather than appended beside itself. A
+ * push-and-filter would work too, right up until it did not — and the bug it
+ * would produce is a chip that jumps to the end of the bar every time you press
+ * it, which is the target moving under the cursor mid-cycle.
+ *
+ * Exported for the space editor (Story 43.4), whose draft term list is not this
+ * store's — editing a space must not re-filter the list behind the dialog — but
+ * must behave identically under the same presses.
+ */
+export function withTagTerm(
+  chips: readonly TagChip[],
+  tag: string,
+  term: TagChipState,
+): readonly TagChip[] {
+  if (term === "off") {
+    return chips.filter((chip) => chip.tag !== tag);
+  }
+  if (chips.some((chip) => chip.tag === tag)) {
+    return chips.map((chip) => (chip.tag === tag ? { tag, term } : chip));
+  }
+  return [...chips, { tag, term }];
+}
+
 export interface NotesFiltersState {
   /** The selected sidebar scope; `all` when none is. */
   scope: NoteScope;
   /**
-   * The active tag chips, in the order they were added. They INTERSECT: a note
-   * matches only when it carries every one of them.
+   * The active tag chips, in the order they were first pressed, at most one
+   * entry per tag. They INTERSECT: a note matches only when it carries every
+   * `include` and none of the `exclude`.
    */
-  tags: string[];
+  tagTerms: readonly TagChip[];
   /** The search field's text — a content scan, not a name match (FR-118). */
   text: string;
   /** The "Changed by agent" chip. */
@@ -137,9 +206,26 @@ export interface NotesFiltersState {
   searchNonce: number;
   /** Select a scope. Selecting the active one again clears it back to `all`. */
   setScope: (scope: NoteScope) => void;
-  /** Add a tag chip, or remove it when it is already in the intersection. */
-  toggleTag: (tag: string) => void;
-  /** Remove one tag chip, widening the intersection. */
+  /**
+   * Advance one tag chip: off → include → exclude → off. A chip that reaches
+   * `off` leaves the array, so the bar shows exactly the terms that are doing
+   * something.
+   */
+  cycleTag: (tag: string) => void;
+  /**
+   * Put one tag chip in a named state, `off` removing it. The explicit form the
+   * space editor (43.4) needs, and what {@link NotesFiltersState.cycleTag} is
+   * written in terms of, so there is one place a chip changes state.
+   */
+  setTagTerm: (tag: string, term: TagChipState) => void;
+  /**
+   * Take one tag chip off the bar outright, whichever state it was in.
+   *
+   * Not `setTagTerm(tag, "off")` at every call site: the chip's own dismiss
+   * affordance means "I am done with this tag", and spelling that as a state
+   * transition invites the next reader to wonder whether `off` is a fourth
+   * state a chip can sit in. It is not — it is the absence of one.
+   */
   removeTag: (tag: string) => void;
   /** Replace the search text. */
   setText: (text: string) => void;
@@ -150,8 +236,10 @@ export interface NotesFiltersState {
   /**
    * Drop the trailing chip, walking the bar down one press at a time (the Esc
    * contract). Resolves in reverse bar order — pinned, then origin, then the
-   * newest tag, then the scope — so repeated presses empty the bar from its end
-   * and land on an unfiltered list rather than a random one.
+   * newest tag term, then the scope — so repeated presses empty the bar from its
+   * end and land on an unfiltered list rather than a random one. A tag term
+   * leaves whole: Esc is an undo of the chip, not a step backwards through its
+   * cycle.
    */
   dropLastChip: () => void;
   /** Clear every chip and the search text. */
@@ -163,7 +251,7 @@ export interface NotesFiltersState {
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
   scope: ALL_NOTES_SCOPE,
-  tags: [],
+  tagTerms: [],
   text: "",
   agentOnly: false,
   pinnedOnly: false,
@@ -172,11 +260,16 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
     set((state) => ({
       scope: sameScope(state.scope, scope) ? ALL_NOTES_SCOPE : scope,
     })),
-  toggleTag: (tag) =>
+  cycleTag: (tag) =>
     set((state) => ({
-      tags: state.tags.includes(tag) ? state.tags.filter((t) => t !== tag) : [...state.tags, tag],
+      tagTerms: withTagTerm(
+        state.tagTerms,
+        tag,
+        nextTagChipState(tagChipState(state.tagTerms, tag)),
+      ),
     })),
-  removeTag: (tag) => set((state) => ({ tags: state.tags.filter((t) => t !== tag) })),
+  setTagTerm: (tag, term) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, term) })),
+  removeTag: (tag) => set((state) => ({ tagTerms: withTagTerm(state.tagTerms, tag, "off") })),
   setText: (text) => set({ text }),
   setAgentOnly: (agentOnly) => set({ agentOnly }),
   setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
@@ -188,8 +281,8 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
       if (state.agentOnly) {
         return { agentOnly: false };
       }
-      if (state.tags.length > 0) {
-        return { tags: state.tags.slice(0, -1) };
+      if (state.tagTerms.length > 0) {
+        return { tagTerms: state.tagTerms.slice(0, -1) };
       }
       if (state.scope.kind !== "all") {
         return { scope: ALL_NOTES_SCOPE };
@@ -197,7 +290,7 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
       return {};
     }),
   clearAll: () =>
-    set({ scope: ALL_NOTES_SCOPE, tags: [], text: "", agentOnly: false, pinnedOnly: false }),
+    set({ scope: ALL_NOTES_SCOPE, tagTerms: [], text: "", agentOnly: false, pinnedOnly: false }),
   requestSearchFocus: () => set((state) => ({ searchNonce: state.searchNonce + 1 })),
 }));
 
@@ -209,7 +302,7 @@ export const notesFiltersStore = createStore<NotesFiltersState>()((set) => ({
 export function isFiltered(state: NotesFiltersState): boolean {
   return (
     state.scope.kind !== "all" ||
-    state.tags.length > 0 ||
+    state.tagTerms.length > 0 ||
     state.text.trim() !== "" ||
     state.agentOnly ||
     state.pinnedOnly
@@ -227,7 +320,7 @@ export function isFiltered(state: NotesFiltersState): boolean {
  */
 export function isScopeOnly(state: NotesFiltersState): boolean {
   return (
-    state.tags.length === 0 && state.text.trim() === "" && !state.agentOnly && !state.pinnedOnly
+    state.tagTerms.length === 0 && state.text.trim() === "" && !state.agentOnly && !state.pinnedOnly
   );
 }
 
@@ -238,9 +331,13 @@ export function isScopeOnly(state: NotesFiltersState): boolean {
  * complete description of the window and not a patch — an omitted axis would
  * mean "unchanged" to a reader and "unfiltered" to Rust.
  *
- * Flags accumulate and intersect, exactly like tags: the Pinned scope and the
- * pinned-only chip resolve to the same flag, which is why this de-duplicates
- * rather than sending it twice.
+ * **No scope contributes a flag any more** (Story 44.3). A scope is a space or
+ * a folder, and a space's terms are its own DSL text in the vault, evaluated by
+ * Rust from `spaceId`. The table that mapped four hard-coded rows onto
+ * `untagged`/`journal`/`pinned`/`recording` is gone with the rows; those four
+ * strings now live where every other query term lives, in the note.
+ *
+ * `pinnedOnly` is the one flag left, and it is a chip rather than a scope.
  */
 export function noteQueryFor(
   state: NotesFiltersState,
@@ -248,17 +345,15 @@ export function noteQueryFor(
   limit: number,
 ): NoteQueryReq {
   const flags: string[] = [];
-  const scopeFlag = SCOPE_FLAG[state.scope.kind];
-  if (scopeFlag !== null) {
-    flags.push(scopeFlag);
-  }
-  if (state.pinnedOnly && !flags.includes("pinned")) {
+  if (state.pinnedOnly) {
     flags.push("pinned");
   }
   const text = state.text.trim();
   return {
     text: text === "" ? null : text,
-    tags: [...state.tags],
+    // Keyed by tag, so the request cannot say "include and exclude draft" — the
+    // same thing the three-state chip guarantees at this end (FR-148).
+    tags: Object.fromEntries(state.tagTerms.map((chip) => [chip.tag, chip.term])),
     spaceId: state.scope.kind === "space" ? state.scope.id : null,
     // The DSL's origin vocabulary: `agent` is a commit whose `Keeper-Source` is
     // `bot`. There is one chip because there is one question people ask of it.
@@ -267,6 +362,39 @@ export function noteQueryFor(
     offset,
     limit,
   };
+}
+
+/**
+ * The terms that are narrowing the list, in bar order, said in words — for the
+ * sentence an empty result shows (FR-148, UX-DR54). `null` when nothing is.
+ *
+ * An exclusion is the term a person cannot see the effect of. An inclusion that
+ * goes too far leaves a list that visibly does not contain what you wanted; an
+ * exclusion leaves the same empty pane whether it removed one note or nine
+ * hundred, and the chip that did it says only `−draft`. So the empty state names
+ * the terms rather than repeating "no notes match these filters", and it says
+ * "not draft" in words because a `−` glyph does not survive being read aloud.
+ *
+ * **This names every active term, not the one to blame.** Attributing an empty
+ * result to a single chip would mean re-running the query once per term, and
+ * that is a promise this surface cannot keep cheaply or honestly — two terms can
+ * each be innocent alone and empty the list together. What it can promise is
+ * that the term you have forgotten about is in the sentence.
+ */
+export function emptyFilterReason(state: NotesFiltersState): string | null {
+  const terms = [
+    state.scope.kind === "all" ? null : scopeLabel(state.scope),
+    ...state.tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
+    state.agentOnly ? "changed by agent" : null,
+    state.pinnedOnly ? "pinned only" : null,
+    state.text.trim() === "" ? null : `"${state.text.trim()}"`,
+  ].filter((term): term is string => term !== null);
+  if (terms.length === 0) {
+    return null;
+  }
+  const last = terms[terms.length - 1];
+  const phrase = terms.length === 1 ? last : `${terms.slice(0, -1).join(", ")} and ${last}`;
+  return `Narrowed by ${phrase}.`;
 }
 
 /**

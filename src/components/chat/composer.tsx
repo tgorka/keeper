@@ -38,6 +38,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { formatFileSize } from "@/lib/file-size";
 import {
   clearDraft,
   clearDraftMirror,
@@ -62,21 +63,6 @@ import { cn } from "@/lib/utils";
 /** Derive a chip display name for a pending attachment (its filename). */
 function chipLabel(attachment: PendingAttachment): string {
   return attachment.filename;
-}
-
-/** Format a byte count as a short human-readable size (e.g. `1.2 MB`). */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
 /** The display filename derived from an OS file path (its basename). */
@@ -840,7 +826,9 @@ export function Composer({
                 {chipLabel(attachment)}
               </span>
               {attachment.kind === "bytes" && (
-                <span className="text-muted-foreground text-xs">{formatSize(attachment.size)}</span>
+                <span className="text-muted-foreground text-xs">
+                  {formatFileSize(attachment.size)}
+                </span>
               )}
               <Button
                 type="button"

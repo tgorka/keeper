@@ -7,6 +7,12 @@ import type { AccountVm } from "@/lib/ipc/client";
 // the gate directly). Every other wrapper (e.g. the shell's connection-status
 // subscribe) keeps its real implementation.
 const mockEncryptionPosture = vi.hoisted(() => vi.fn());
+// The tray's open-note bridge (Story 44.6). Mocked here so the App suite can
+// assert that mounting the app SUBSCRIBES to it — the hook's own suite renders
+// the hook directly and therefore cannot tell a mounted listener from an
+// unmounted one, which is precisely how `listenNotesOpenNote` came to be
+// declared and called from nowhere for two epics.
+const mockListenNotesOpenNote = vi.hoisted(() => vi.fn(async () => () => {}));
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -23,6 +29,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // Drives the first-run at-rest-encryption gate (Story 2.6); each test sets
     // the resolved value. Defaults to "chosen off" so unrelated tests see login.
     encryptionPosture: mockEncryptionPosture,
+    listenNotesOpenNote: mockListenNotesOpenNote,
   };
 });
 
@@ -47,6 +54,7 @@ describe("App", () => {
     // Default: posture chosen (off) so the login screen shows past the gate.
     mockEncryptionPosture.mockReset();
     mockEncryptionPosture.mockResolvedValue(false);
+    mockListenNotesOpenNote.mockClear();
   });
 
   afterEach(() => {
@@ -155,5 +163,23 @@ describe("App", () => {
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
     expect(screen.queryByRole("main")).not.toBeInTheDocument();
     expect(wizardStore.getState().active).toBe(false);
+  });
+
+  /**
+   * Story 44.6, FR-160/FR-102. The tray creates a note, raises the window and
+   * emits `keeper://notes-open-note`; if nothing in the webview subscribed, the
+   * note exists and the user is never shown it. That is not a wrong behaviour
+   * with a failing assertion somewhere — it is an ABSENT one, which is why it
+   * survived two epics, and why the assertion has to live here rather than in
+   * the hook's own suite: `renderHook(() => useNotesOpenNote())` proves the hook
+   * works, never that anything mounts it.
+   *
+   * Asserted at the splash, before any account exists, because the tray is
+   * meant to work whatever is on screen (FR-102).
+   */
+  it("subscribes to the tray's open-note bridge as soon as the app mounts", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(mockListenNotesOpenNote).toHaveBeenCalledTimes(1));
   });
 });

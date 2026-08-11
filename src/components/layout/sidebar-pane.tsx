@@ -2,9 +2,12 @@ import {
   Archive,
   Film,
   FolderSync,
+  FolderTree,
   Inbox,
   MessageSquare,
   NotebookPen,
+  PanelLeftClose,
+  PanelLeftOpen,
   Radio,
   Settings,
   Video,
@@ -21,47 +24,64 @@ import { useShellOffline } from "@/lib/stores/account-status";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { usePendingDraftCount } from "@/lib/stores/drafts";
-import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
+import { type PrimaryView, primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
 
 interface SidebarView {
   label: string;
   icon: typeof MessageSquare;
+  /** The primary view this entry switches to.
+   *
+   * Carried on the entry rather than derived from `label` at the call site: the
+   * label-to-view mapping used to be a ten-deep nested ternary duplicated once
+   * for the click handler and once for `aria-current`, which meant every new
+   * surface had to be spelled in three places and a miss produced a nav row
+   * that highlighted the wrong entry. One field, one lookup, no ladder. */
+  view: PrimaryView;
 }
 
 /** The always-present nav entries, in order. The capability-gated Recording entry
- * (Story 16.3), Sync entry (Story 32.5) and Notes entry (Story 37.1) are spliced
- * in before Settings only when their capability is on — never a dead button on a
- * platform that cannot record (AD-27), a machine with no usable `git` (AD-41), or
- * a build with no folder sync to hold a vault (FR-122). */
+ * (Story 16.3), Sync + Files entries (Story 32.5, Story 43.8) and Notes entry
+ * (Story 37.1) are spliced in before Settings only when their capability is on —
+ * never a dead button on a platform that cannot record (AD-27), a machine with
+ * no usable `git` (AD-41), or a build with no folder sync to hold a vault
+ * (FR-122). */
 const BASE_VIEWS: SidebarView[] = [
-  { label: "Chats", icon: MessageSquare },
-  { label: "Archive", icon: Archive },
-  { label: "Approvals", icon: Inbox },
-  { label: "Bridges", icon: Radio },
+  { label: "Chats", icon: MessageSquare, view: "inbox" },
+  { label: "Archive", icon: Archive, view: "archive" },
+  { label: "Approvals", icon: Inbox, view: "approval" },
+  { label: "Bridges", icon: Radio, view: "bridges" },
 ];
 
 /** The capability-gated Recording nav entry (Story 16.3). */
-const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video };
+const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video, view: "recording" };
 
 /** The capability-gated Recordings browser entry (Story 42.3), sitting directly
  * after the capture surface it browses the output of and gated on the SAME
  * `recording` flag: a browser for recordings this build cannot make is a puzzle,
  * so it is absent rather than empty. Two entries because the epic calls it a
  * browser, and a browser buried under the capture settings is one nobody opens. */
-const RECORDINGS_VIEW: SidebarView = { label: "Recordings", icon: Film };
+const RECORDINGS_VIEW: SidebarView = { label: "Recordings", icon: Film, view: "recordings" };
 
 /** The capability-gated Sync nav entry (Story 32.5, AD-S1). */
-const SYNC_VIEW: SidebarView = { label: "Sync", icon: FolderSync };
+const SYNC_VIEW: SidebarView = { label: "Sync", icon: FolderSync, view: "sync" };
+
+/** The capability-gated Files nav entry (Story 43.8, FR-153), sitting directly
+ * after the Sync entry it browses the folders of and gated on the SAME `sync`
+ * flag: where folder sync cannot run there is no synced folder to browse, so
+ * the entry is absent rather than empty. Two entries because Sync answers "is
+ * this folder working" and Files answers "what is in it", and a browser folded
+ * into a diagnostics pane is a browser nobody finds. */
+const FILES_VIEW: SidebarView = { label: "Files", icon: FolderTree, view: "files" };
 
 /** The capability-gated Notes nav entry (Story 37.1, FR-122). Absent — not
  * disabled — where the capability is off: the iOS shell and any desktop build
  * without folder sync render no notes surface at all, because a greyed row that
  * answers "unsupported on this platform" is a worse answer than no row. */
-const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen };
+const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen, view: "notes" };
 
 /** Settings sits last, after every primary-view entry. */
-const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings };
+const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings, view: "settings" };
 
 /** The `--bridge-*` tint class for a rolled-up worst health (Story 6.5). */
 const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
@@ -72,6 +92,15 @@ const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
 
 interface SidebarPaneProps {
   collapsed: boolean;
+  /**
+   * Fold or unfold the whole menu, or `null` where the viewport has already
+   * decided.
+   *
+   * A nullable callback rather than a `foldable` boolean beside a handler: two
+   * fields that must agree is a state where "foldable and no handler" compiles,
+   * and the symptom is a button that does nothing.
+   */
+  onToggleFold: (() => void) | null;
 }
 
 /** Exact offline-pill copy (UX-DR18) — kept verbatim. Exported so the phone
@@ -85,7 +114,15 @@ export const OFFLINE_PILL_TEXT =
  * AD-34-3 exists to prevent. */
 export const SIDEBAR_WIDTH_CLASS = { collapsed: "w-12", expanded: "w-[260px]" } as const;
 
-export function SidebarPane({ collapsed }: SidebarPaneProps) {
+/** The id the fold control's `aria-controls` points at.
+ *
+ * A module constant rather than `useId`: the value has to be identical in the
+ * button's attribute and on the list, and only one element of each ever exists
+ * in a document (the drawer is unmounted on the phone tier). A generated id
+ * would be correct and would also make the relationship untestable by name. */
+const VIEWS_LIST_ID = "sidebar-views";
+
+export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
   // button opens it.
@@ -116,7 +153,10 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
     // `recording` flag together (Story 42.3): where recordings cannot be made
     // neither entry exists.
     ...(recording ? [RECORDING_VIEW, RECORDINGS_VIEW] : []),
-    ...(sync ? [SYNC_VIEW] : []),
+    // The folder's diagnostics and the browser over its contents ride the one
+    // `sync` flag together (Story 43.8), for the same reason the two recording
+    // entries do.
+    ...(sync ? [SYNC_VIEW, FILES_VIEW] : []),
     ...(notes ? [NOTES_VIEW] : []),
     SETTINGS_VIEW,
   ];
@@ -129,47 +169,51 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
         collapsed ? SIDEBAR_WIDTH_CLASS.collapsed : SIDEBAR_WIDTH_CLASS.expanded,
       )}
     >
+      {/* The fold control, above the views it folds (Story 45.20, UX-DR81).
+
+          A real `<button>` in the tab order with an accessible name that says
+          which way it goes, plus `aria-expanded` on the region it controls, so
+          the folded rail is navigable by keyboard and announced rather than
+          being a strip of glyphs. Absent — not disabled — where the viewport
+          has already folded the drawer, because there is nothing it could
+          honestly do at that width. */}
+      {onToggleFold !== null && (
+        <div className={cn("flex p-2 pb-0", collapsed ? "justify-center" : "justify-end")}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={collapsed ? "Expand menu" : "Collapse menu"}
+            aria-expanded={!collapsed}
+            aria-controls={VIEWS_LIST_ID}
+            data-slot="sidebar-fold"
+            className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            onClick={onToggleFold}
+          >
+            {collapsed ? (
+              <PanelLeftOpen aria-hidden="true" />
+            ) : (
+              <PanelLeftClose aria-hidden="true" />
+            )}
+          </Button>
+        </div>
+      )}
       <ScrollArea className="min-h-0 flex-1">
         {/* The primary views and both data-driven groups scroll as one, so the
             footer below stays reachable however many Spaces or Networks the user
             belongs to (AD-34-4). */}
         <div className="flex flex-col">
-          <ul className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}>
+          <ul
+            id={VIEWS_LIST_ID}
+            className={cn("flex flex-col gap-1 p-2", collapsed && "items-center")}
+          >
             {views.map((view) => {
               const Icon = view.icon;
               // Every entry switches the primary view — Settings included, since
-              // it stopped being a dialog.
-              const onClick =
-                view.label === "Settings"
-                  ? () => primaryViewStore.getState().setView("settings")
-                  : view.label === "Chats"
-                    ? () => primaryViewStore.getState().setView("inbox")
-                    : view.label === "Archive"
-                      ? () => primaryViewStore.getState().setView("archive")
-                      : view.label === "Approvals"
-                        ? () => primaryViewStore.getState().setView("approval")
-                        : view.label === "Bridges"
-                          ? () => primaryViewStore.getState().setView("bridges")
-                          : view.label === "Recording"
-                            ? () => primaryViewStore.getState().setView("recording")
-                            : view.label === "Recordings"
-                              ? () => primaryViewStore.getState().setView("recordings")
-                              : view.label === "Sync"
-                                ? () => primaryViewStore.getState().setView("sync")
-                                : view.label === "Notes"
-                                  ? () => primaryViewStore.getState().setView("notes")
-                                  : undefined;
-              // Reflect the active primary view on every entry.
-              const active =
-                (view.label === "Chats" && primaryView === "inbox") ||
-                (view.label === "Archive" && primaryView === "archive") ||
-                (view.label === "Approvals" && primaryView === "approval") ||
-                (view.label === "Bridges" && primaryView === "bridges") ||
-                (view.label === "Recording" && primaryView === "recording") ||
-                (view.label === "Recordings" && primaryView === "recordings") ||
-                (view.label === "Sync" && primaryView === "sync") ||
-                (view.label === "Notes" && primaryView === "notes") ||
-                (view.label === "Settings" && primaryView === "settings");
+              // it stopped being a dialog — and reflects it as `aria-current`.
+              const target = view.view;
+              const onClick = () => primaryViewStore.getState().setView(target);
+              const active = primaryView === target;
               // The Bridges entry carries the worst-state health roll-up dot (Story
               // 6.1): shown only when at least one bridge reports non-null health.
               const healthDot =
@@ -265,16 +309,24 @@ export function SidebarPane({ collapsed }: SidebarPaneProps) {
               );
             })}
           </ul>
-          {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces the
-              user belongs to, filtering the Unified Inbox. Rendered after the primary
-              views, before the footer. Hidden entirely when there are no Spaces, and
-              suppressed on the collapsed rail (it needs labels + names). */}
-          {!collapsed && <SpacesGroup />}
-          {/* NETWORKS group (Story 4.6): a single-select list of the distinct bridged
-              Networks connected across all accounts, filtering the Unified Inbox.
-              Rendered immediately after SPACES. Hidden entirely when there are no
-              bridged rooms, and suppressed on the collapsed rail (needs labels). */}
-          {!collapsed && <NetworksGroup />}
+          {/* SPACES group (Story 4.5): a single-select list of the Matrix Spaces
+              the user belongs to, filtering the Unified Inbox. Rendered after
+              the primary views, before the footer. Hidden entirely when there
+              are no Spaces.
+
+              **It renders folded now** (Story 45.20). It used to be suppressed
+              on the rail "because it needs labels + names", which is exactly
+              the outcome UX-DR81 refuses: folding the menu silently removed a
+              whole navigation surface rather than shrinking it, so a person who
+              folded the drawer lost their Spaces until they unfolded it again.
+              An avatar with an accessible name is a name; a missing row is not. */}
+          <SpacesGroup collapsed={collapsed} />
+          {/* NETWORKS group (Story 4.6): a single-select list of the distinct
+              bridged Networks connected across all accounts, filtering the
+              Unified Inbox. Rendered immediately after SPACES. Hidden entirely
+              when there are no bridged rooms, and folded rather than dropped on
+              the rail, for the reason above. */}
+          <NetworksGroup collapsed={collapsed} />
         </div>
       </ScrollArea>
       {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):

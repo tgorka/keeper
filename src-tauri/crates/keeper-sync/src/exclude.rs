@@ -156,9 +156,47 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
     // (entries are validated against a local inode number), rebuildable from
     // the folder itself, and committing them would sync a cache that is only
     // ever true on the machine that wrote it.
+    //
+    // With ONE carve-out: `*.toml` directly under it is the folder's own
+    // configuration and must reach the other machine (AD-100). That cannot be
+    // written as a pattern — globset has no negation, so a `!…` entry compiles
+    // as a literal glob beginning with a bang — so it lives in
+    // [`is_exempt_config_file`], consulted before this set is.
     ".keeper",
     "**/.keeper/**",
 ];
+
+/// The one path shape [`BUILTIN_EXCLUDES`] names and tier 0 still lets through:
+/// a folder's own configuration file (AD-100).
+///
+/// `<anything>/.keeper/<name>.toml`, and nothing else. Config that does not
+/// sync defeats the reason for putting it in the sync folder rather than in
+/// `~/.keeper/` — including `keeper.<host>.toml`, which syncs deliberately so
+/// one machine's settings can be edited from another.
+///
+/// Narrow on three axes, each of which is a way this could leak the cache it
+/// sits beside:
+///
+/// * **Depth.** Only a direct child. `.keeper/sub/x.toml` stays excluded —
+///   nothing keeper writes puts config a level down, so a `.toml` down there is
+///   something else's, and the trash tree is exactly the "something else" that
+///   would start syncing.
+/// * **Suffix.** Only `.toml`. `.keeper/index.json` is the cache this rule
+///   exists to keep excluded.
+/// * **Shape.** Files only. A *directory* named `x.toml` under `.keeper/` is
+///   still engine state, so this is asked only where the answer is known to be
+///   about a file — see [`ExcludeSet::is_excluded_directory`].
+///
+/// Takes the already-normalized match string rather than a `Path` so it reads
+/// the same `/`-joined frame the globs do, on every platform.
+fn is_exempt_config_file(candidate: &str) -> bool {
+    let Some((parent, name)) = candidate.rsplit_once('/') else {
+        // A bare `keeper.toml` at the profile root is an ordinary file the
+        // corpus never matched; it needs no exemption and gets none.
+        return false;
+    };
+    (parent == ".keeper" || parent.ends_with("/.keeper")) && name.ends_with(".toml")
+}
 
 /// The compiled tier-0 filter for one profile.
 ///
@@ -168,6 +206,51 @@ pub const BUILTIN_EXCLUDES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ExcludeSet {
     set: GlobSet,
+    /// The same corpus, read as a question about directories: every pattern
+    /// that excludes a *subtree* (`.git/**`, `**/node_modules/**`) contributes
+    /// the directory it is rooted at (`.git`, `**/node_modules`). Derived from
+    /// the one list in [`ExcludeSet::new`] — including the profile's own
+    /// patterns — so there is still exactly one place a path can be named.
+    dir_set: GlobSet,
+    /// The profile's own `extra` patterns, and only those, compiled a second
+    /// time. Not a second rule: the same strings, asked a narrower question —
+    /// *did the user write this rule, or did keeper?* See
+    /// [`ExcludeSet::verdict`] for why anything needs to know.
+    profile_set: GlobSet,
+    /// The directory form of the profile's own patterns, derived exactly as
+    /// [`Self::dir_set`] is.
+    profile_dir_set: GlobSet,
+}
+
+/// How a *browser* should treat a path the exclusion corpus matches (Story
+/// 44.17, FR-173).
+///
+/// The sync path only ever needs a boolean, and [`ExcludeSet::is_excluded`]
+/// stays that boolean for every caller that stages, queues or counts. A
+/// browser needs one distinction on top of it, and it needs it because of a
+/// specific failure: the Files tab used to drop every excluded entry silently,
+/// so a user who had written `*.psd` into their own profile saw their
+/// photoshop files simply *absent* from the folder they were looking at, with
+/// nothing on screen connecting that to the rule they typed. Marking them
+/// excluded is what turns a hole in a listing into an answer.
+///
+/// The built-in corpus gets the opposite treatment for the opposite reason.
+/// Nobody chose `.DS_Store`, `.git/**` or `*.crdownload`; showing them marked
+/// would fill every folder with rows about keeper's own housekeeping, which is
+/// the browser nobody scrolls twice that Story 43.8 exists to avoid.
+///
+/// A path both a profile pattern and the corpus match reads as
+/// [`Self::ProfilePattern`]. The user's own rule wins the naming, because a
+/// rule someone typed is a rule they are entitled to see working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcludeVerdict {
+    /// No pattern matches; the entry is ordinary content.
+    Included,
+    /// A pattern from this profile's own configuration matches. Show it, and
+    /// say why it will never sync.
+    ProfilePattern,
+    /// Only [`BUILTIN_EXCLUDES`] matches. Keeper's own noise; do not list it.
+    BuiltinNoise,
 }
 
 impl ExcludeSet {
@@ -179,20 +262,53 @@ impl ExcludeSet {
     /// startup path.
     pub fn new(extra: &[String]) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
-        for pattern in BUILTIN_EXCLUDES {
+        let mut dir_builder = GlobSetBuilder::new();
+        let mut profile_builder = GlobSetBuilder::new();
+        let mut profile_dir_builder = GlobSetBuilder::new();
+        let corpus = BUILTIN_EXCLUDES
+            .iter()
+            .copied()
+            .map(|pattern| (pattern, false))
+            .chain(extra.iter().map(|pattern| (pattern.as_str(), true)));
+        for (pattern, from_profile) in corpus {
             add_pattern(&mut builder, pattern)?;
+            // A `…/**` pattern is already anchored by its own `/`, so its
+            // directory form goes in verbatim rather than back through the
+            // basename rule.
+            let directory = pattern.trim().strip_suffix("/**");
+            if let Some(directory) = directory {
+                add_glob(&mut dir_builder, directory, pattern)?;
+            }
+            if from_profile {
+                add_pattern(&mut profile_builder, pattern)?;
+                if let Some(directory) = directory {
+                    add_glob(&mut profile_dir_builder, directory, pattern)?;
+                }
+            }
         }
-        for pattern in extra {
-            add_pattern(&mut builder, pattern)?;
-        }
-        let set = builder
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))?;
-        Ok(Self { set })
+        let build = |builder: GlobSetBuilder| {
+            builder
+                .build()
+                .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))
+        };
+        Ok(Self {
+            set: build(builder)?,
+            dir_set: build(dir_builder)?,
+            profile_set: build(profile_builder)?,
+            profile_dir_set: build(profile_dir_builder)?,
+        })
     }
 
     /// Whether `relative_path` — repository-relative, never absolute — is
     /// filtered out entirely.
+    ///
+    /// The **file** question, which is the only one the scan, the stager and
+    /// the watcher ever ask. [`is_exempt_config_file`] is answered here, before
+    /// the set is consulted, and this is the single place it is answered: the
+    /// directory question deliberately does not delegate to it, and
+    /// [`Self::verdict`] routes through this method rather than matching the
+    /// set itself, so the carve-out cannot apply in one of the three and not
+    /// the others.
     pub fn is_excluded(&self, relative_path: &Path) -> bool {
         let candidate = match_string(relative_path);
         if candidate.is_empty() {
@@ -200,7 +316,66 @@ impl ExcludeSet {
             // string against `**/…` patterns would be undefined-ish anyway.
             return false;
         }
+        if is_exempt_config_file(candidate.as_str()) {
+            return false;
+        }
         self.set.is_match(candidate.as_str())
+    }
+
+    /// Whether `relative_path`, known to be a **directory**, is one the corpus
+    /// excludes wholesale.
+    ///
+    /// A second question against the same rules, not a second rule set. The
+    /// scan path never needed it: the tree walk asks about files, and a file
+    /// under `.git/` is caught by `.git/**` on its own. A *browser* needs it,
+    /// because a directory whose every descendant is excluded is a folder that
+    /// can only ever open onto nothing — and `.git/` and `.keeper-sync/`, which
+    /// the corpus calls engine state and never user content, are exactly that.
+    /// Showing them would be the "browser nobody scrolls twice" this exists to
+    /// prevent.
+    ///
+    /// Directory-only on purpose. Applying the subtree rules to a *file* would
+    /// hide a plain file named `.git`, which the corpus deliberately does not
+    /// exclude — and, in the other direction, a directory named `x.toml` under
+    /// `.keeper/` is engine state like everything else in there, so this asks
+    /// the set directly rather than through [`Self::is_excluded`], whose
+    /// AD-100 carve-out is for files.
+    pub fn is_excluded_directory(&self, relative_path: &Path) -> bool {
+        let candidate = match_string(relative_path);
+        !candidate.is_empty()
+            && (self.set.is_match(candidate.as_str()) || self.dir_set.is_match(candidate.as_str()))
+    }
+
+    /// Which kind of exclusion, if any, applies to one browsed entry.
+    ///
+    /// `is_dir` selects the same question [`Self::is_excluded_directory`] asks,
+    /// so a browser gets one call rather than a branch it could get backwards.
+    /// The two halves stay in lockstep by construction: the profile sets are
+    /// built from the same strings, in the same loop, by the same two helpers,
+    /// and the excluded-at-all question is the very method each half exposes.
+    ///
+    /// A profile pattern is only ever *named* here, never applied: every
+    /// profile pattern is in `set` too, so nothing this returns
+    /// [`ExcludeVerdict::ProfilePattern`] for is anything the boolean questions
+    /// call included. That is what keeps a user's own `*.toml` rule from
+    /// marking a file the sync path is meanwhile committing (AD-100).
+    pub fn verdict(&self, relative_path: &Path, is_dir: bool) -> ExcludeVerdict {
+        let excluded = if is_dir {
+            self.is_excluded_directory(relative_path)
+        } else {
+            self.is_excluded(relative_path)
+        };
+        if !excluded {
+            return ExcludeVerdict::Included;
+        }
+        let candidate = match_string(relative_path);
+        let profile = self.profile_set.is_match(candidate.as_str())
+            || (is_dir && self.profile_dir_set.is_match(candidate.as_str()));
+        if profile {
+            ExcludeVerdict::ProfilePattern
+        } else {
+            ExcludeVerdict::BuiltinNoise
+        }
     }
 }
 
@@ -221,10 +396,22 @@ fn add_pattern(builder: &mut GlobSetBuilder, pattern: &str) -> Result<()> {
     } else {
         Cow::Owned(format!("**/{pattern}"))
     };
-    let glob = GlobBuilder::new(&effective)
+    add_glob(builder, &effective, pattern)
+}
+
+/// Compile and add one already-anchored pattern.
+///
+/// Split out from [`add_pattern`] because the directory question derives its
+/// patterns by stripping `/**`, and a stripped pattern must keep the anchoring
+/// the original had. Re-running `scratch/**`'s remainder through the basename
+/// rule would turn a profile's root-anchored pattern into "any `scratch` at any
+/// depth" — a rule the user never wrote, silently hiding their folders.
+/// `original` is named in the error so a user reads back the string they typed.
+fn add_glob(builder: &mut GlobSetBuilder, effective: &str, original: &str) -> Result<()> {
+    let glob = GlobBuilder::new(effective)
         .literal_separator(true)
         .build()
-        .map_err(|err| SyncError::Config(format!("invalid exclude pattern {pattern:?}: {err}")))?;
+        .map_err(|err| SyncError::Config(format!("invalid exclude pattern {original:?}: {err}")))?;
     builder.add(glob);
     Ok(())
 }
@@ -416,6 +603,152 @@ mod tests {
         for path in ["sub/.keeperrc", "keeper/index.json"] {
             assert!(!excluded(&set, path), "{path} is the user's file");
         }
+    }
+
+    /// AD-100: a folder's own `.keeper/*.toml` is the one thing in that
+    /// directory that has to reach the other machine. Config that does not sync
+    /// defeats the reason for putting it in the sync folder rather than in
+    /// `~/.keeper/`.
+    #[test]
+    fn a_folders_own_config_file_is_exempt_from_the_cache_exclusion() {
+        let set = default_set();
+        for path in [
+            ".keeper/keeper.toml",
+            ".keeper/keeper.mnemosyne.toml",
+            "sub/.keeper/keeper.toml",
+            "sub/deeper/.keeper/keeper.hesperia.toml",
+        ] {
+            assert!(
+                !excluded(&set, path),
+                "{path} is the folder's own configuration and must sync"
+            );
+        }
+    }
+
+    /// The machine-variant file syncs exactly like the shared one, and that is
+    /// the point of it: it is how one machine's settings are edited from
+    /// another. A future reader tempted to exclude it has this test to argue
+    /// with.
+    #[test]
+    fn the_machine_variant_config_file_syncs_like_the_shared_one() {
+        let set = default_set();
+        assert_eq!(
+            excluded(&set, ".keeper/keeper.toml"),
+            excluded(&set, ".keeper/keeper.hesperia.toml"),
+            "the per-machine file is not more local than the shared one"
+        );
+        assert!(!excluded(&set, ".keeper/keeper.hesperia.toml"));
+    }
+
+    /// The three ways the carve-out could leak the cache it sits beside. Each
+    /// row is a path a reading of the rule as "anything `.toml`-ish under
+    /// `.keeper/`" would let through.
+    #[test]
+    fn the_config_carve_out_leaks_neither_depth_suffix_nor_shape() {
+        let set = default_set();
+        // Deeper than one level: the trash tree lives down there, and a note
+        // called `notes.toml` in it must not start syncing out of the grave.
+        for path in [
+            ".keeper/sub/x.toml",
+            "sub/.keeper/trash/01JABCDEF/draft.toml",
+        ] {
+            assert!(
+                excluded(&set, path),
+                "{path} is deeper than a direct child and is not config"
+            );
+        }
+        // A non-`.toml` directly under it: this is the cache the whole rule
+        // exists to keep excluded.
+        for path in [".keeper/index.json", "sub/.keeper/index.json"] {
+            assert!(excluded(&set, path), "{path} is the cache, not config");
+        }
+        // A DIRECTORY named `x.toml`: the carve-out is answered on the file
+        // question only, so the directory question still hides it — and so does
+        // everything inside it.
+        assert!(
+            set.is_excluded_directory(Path::new(".keeper/x.toml")),
+            "a directory named x.toml under .keeper/ is still engine state"
+        );
+        assert!(
+            excluded(&set, ".keeper/x.toml/index.json"),
+            "nothing inside a directory named x.toml is exempt either"
+        );
+        // And the directory itself stays hidden, which is what makes the
+        // exemption an exemption rather than a relaxation.
+        assert!(set.is_excluded_directory(Path::new(".keeper")));
+        assert!(set.is_excluded_directory(Path::new("sub/.keeper")));
+    }
+
+    /// The carve-out is the corpus's, and it is absolute: a profile pattern is
+    /// only ever *named* by [`ExcludeSet::verdict`], never applied, so a user
+    /// who writes `*.toml` in their own excludes still gets their folder's
+    /// configuration synced rather than a file the browser marks excluded while
+    /// the engine commits it.
+    #[test]
+    fn a_profile_pattern_cannot_take_the_config_file_back() {
+        let set = ExcludeSet::new(&["*.toml".to_owned()]).expect("compiles");
+        assert!(!excluded(&set, ".keeper/keeper.toml"));
+        assert_eq!(
+            set.verdict(Path::new(".keeper/keeper.toml"), false),
+            ExcludeVerdict::Included
+        );
+        // The same rule over an ordinary file is untouched: it is the user's
+        // rule, so it applies and is named.
+        assert!(excluded(&set, "notes/pyproject.toml"));
+        assert_eq!(
+            set.verdict(Path::new("notes/pyproject.toml"), false),
+            ExcludeVerdict::ProfilePattern
+        );
+    }
+
+    /// The subtree rules read as a directory question (Story 43.8). `.git` and
+    /// `.keeper-sync` are named in the corpus only as `…/**`, so the file
+    /// question rightly says nothing about the directories themselves — and a
+    /// browser that asked only the file question would put both of them on
+    /// screen at the root of every synced folder.
+    #[test]
+    fn a_directory_whose_whole_subtree_is_excluded_is_excluded_as_a_directory() {
+        let set = default_set();
+        for path in [
+            ".git",
+            ".keeper-sync",
+            "sub/.git",
+            "node_modules",
+            ".keeper",
+        ] {
+            assert!(
+                set.is_excluded_directory(Path::new(path)),
+                "{path} opens onto nothing a browser may show"
+            );
+            // …and the file question is deliberately unchanged, which is the
+            // whole reason the directory question had to be added.
+            if path == ".git" || path == ".keeper-sync" || path == "sub/.git" {
+                assert!(
+                    !excluded(&set, path),
+                    "{path} must stay visible to the file question"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_ordinary_directory_is_not_excluded_by_the_directory_question() {
+        let set = default_set();
+        for path in ["Notes", "2026/Standup", "target", "build", "git"] {
+            assert!(
+                !set.is_excluded_directory(Path::new(path)),
+                "{path} is the user's folder"
+            );
+        }
+    }
+
+    /// A profile's own `foo/**` becomes a directory rule too, so the pair stays
+    /// derived from one list rather than from a second hard-coded one.
+    #[test]
+    fn a_profile_subtree_pattern_also_answers_the_directory_question() {
+        let set = ExcludeSet::new(&["scratch/**".to_owned()]).expect("compiles");
+        assert!(set.is_excluded_directory(Path::new("scratch")));
+        assert!(!set.is_excluded_directory(Path::new("sub/scratch")));
     }
 
     /// A segment being written is `<name>.<ext>.partial`, and the recordings

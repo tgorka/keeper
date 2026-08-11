@@ -24,19 +24,33 @@
  * a lie, and the number people want from this tree is "how much is under here",
  * not "how much survives what I have already narrowed to".
  *
- * Selecting a node sets that tag as the filter; ⇧-selecting adds it to the
- * intersection. Both are filters, never navigations (UX-DR41) — the open note
- * stays open even when the new intersection excludes its row.
+ * Selecting a node cycles that tag through the three states story 43.3 gave the
+ * chip — off, include, exclude — after clearing everything else; ⇧-selecting
+ * cycles it inside the existing intersection instead of replacing it. Both are
+ * filters, never navigations (UX-DR41) — the open note stays open even when the
+ * new intersection excludes its row.
+ *
+ * A node's state is on the node, not in a tooltip: `+`/`−` beside the count, a
+ * background for include and a struck-through destructive one for exclude, and
+ * the state spelled in the accessible name. The tree and the filter bar read the
+ * same {@link tagChipState}, so the two surfaces cannot disagree about what a
+ * tag is doing.
  *
  * The tree is unbounded, so it owns its own scroll container and pairs
  * `min-h-0 flex-1` with it (the AD-34-4 rule): however many tags a vault grows,
  * everything below this in the column stays reachable.
  */
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Minus, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
 import { notesTagTree } from "@/lib/ipc/client";
-import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
+import {
+  nextTagChipState,
+  notesFiltersStore,
+  type TagChip,
+  tagChipState,
+  useNotesFiltersStore,
+} from "@/lib/stores/notes-filters";
 import { cn } from "@/lib/utils";
 
 function TagNode({
@@ -45,7 +59,7 @@ function TagNode({
   posInSet,
   setSize,
   expanded,
-  activeTags,
+  tagTerms,
   onToggleExpanded,
 }: {
   node: NoteTagNodeVm;
@@ -53,12 +67,12 @@ function TagNode({
   posInSet: number;
   setSize: number;
   expanded: ReadonlySet<string>;
-  activeTags: readonly string[];
+  tagTerms: readonly TagChip[];
   onToggleExpanded: (path: string) => void;
 }) {
   const hasChildren = node.children.length > 0;
   const isOpen = expanded.has(node.path);
-  const active = activeTags.includes(node.path);
+  const term = tagChipState(tagTerms, node.path);
 
   return (
     <div
@@ -68,7 +82,7 @@ function TagNode({
       aria-posinset={posInSet}
       aria-setsize={setSize}
       aria-expanded={hasChildren ? isOpen : undefined}
-      aria-selected={active}
+      aria-selected={term === "include"}
     >
       <div className="flex items-center">
         {hasChildren ? (
@@ -91,25 +105,48 @@ function TagNode({
           // "items", not "notes": since Story 42.5 the number behind a node is
           // notes plus recordings, and a name that says otherwise is the exact
           // half-truth this story deleted.
-          aria-label={`Tag ${node.path}, ${node.count} items, filter`}
-          aria-pressed={active}
+          //
+          // The state and what a press will do are both in the name, because
+          // `aria-pressed` has two values and this control has three: a node
+          // reporting `pressed=false` while it is actively excluding notes would
+          // be worse than saying nothing.
+          aria-label={
+            term === "include"
+              ? `Tag ${node.path}, ${node.count} items: included. Exclude it instead.`
+              : term === "exclude"
+                ? `Tag ${node.path}, ${node.count} items: excluded. Stop filtering by it.`
+                : `Tag ${node.path}, ${node.count} items, filter`
+          }
           className={cn(
             "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-1 text-left outline-none",
             "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            active ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
+            term === "include" && "bg-accent text-accent-foreground",
+            term === "exclude" && "bg-destructive/15 text-destructive line-through",
+            term === "off" && "hover:bg-accent/50",
           )}
           onClick={(event) => {
             const filters = notesFiltersStore.getState();
             if (event.shiftKey) {
-              // Add to the intersection rather than replacing it: two chips mean
-              // both, which is the whole contract of this bar.
-              filters.toggleTag(node.path);
+              // Cycle inside the existing intersection rather than replacing it:
+              // several chips mean all of them, which is the contract of the bar.
+              filters.cycleTag(node.path);
               return;
             }
+            // A plain press is "show me this and nothing else", so the rest of
+            // the bar goes — but this node keeps advancing, so a second press
+            // excludes and a third clears. The next state is read BEFORE the
+            // clear; cycling after it would restart every press at include and
+            // leave exclude unreachable without the shift key.
+            const next = nextTagChipState(term);
             filters.clearAll();
-            filters.toggleTag(node.path);
+            filters.setTagTerm(node.path, next);
           }}
         >
+          {term !== "off" && (
+            <span aria-hidden="true" className="shrink-0">
+              {term === "exclude" ? <Minus className="size-3" /> : <Plus className="size-3" />}
+            </span>
+          )}
           <span className="min-w-0 truncate text-sm">{node.name}</span>
           <span aria-hidden="true" className="ml-auto shrink-0 text-muted-foreground text-xs">
             {node.count}
@@ -126,7 +163,7 @@ function TagNode({
               posInSet={index + 1}
               setSize={node.children.length}
               expanded={expanded}
-              activeTags={activeTags}
+              tagTerms={tagTerms}
               onToggleExpanded={onToggleExpanded}
             />
           ))}
@@ -139,7 +176,7 @@ function TagNode({
 export function TagTree({ vaultId }: { vaultId: string | null }) {
   const [nodes, setNodes] = useState<NoteTagNodeVm[]>([]);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
-  const activeTags = useNotesFiltersStore((s) => s.tags);
+  const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
 
   useEffect(() => {
     if (vaultId === null) {
@@ -181,7 +218,7 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
             posInSet={index + 1}
             setSize={nodes.length}
             expanded={expanded}
-            activeTags={activeTags}
+            tagTerms={tagTerms}
             onToggleExpanded={(path) =>
               setExpanded((live) => {
                 const next = new Set(live);

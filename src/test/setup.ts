@@ -1,5 +1,21 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/react";
 import { vi } from "vitest";
+
+// Testing Library's `findBy*` and `waitFor` default to a 1000 ms budget, which
+// is a wall-clock number in a suite that runs 217 files in parallel on three
+// throttled cores. A component that resolves an IPC promise and then waits for
+// a React commit can exceed it purely because the box is busy — and the failure
+// reads as "the element was never rendered", which sends the next reader
+// looking for a logic bug in code that is correct.
+//
+// Measured during epic 45's wave-2 gate: five `findByTestId` assertions in
+// document-viewer.test.tsx failed inside a full-suite run, and all 22 tests in
+// that file passed when it ran alone, twice, with nothing changed in between.
+//
+// Five seconds, because this number only has to exceed the worst scheduling
+// delay — a genuinely missing element still fails, five seconds later.
+configure({ asyncUtilTimeout: 5000 });
 
 // jsdom does not implement matchMedia; the shell hook and theme provider need it.
 if (!window.matchMedia) {
@@ -49,11 +65,29 @@ if (!globalThis.ResizeObserver) {
 //
 // The shim answers with one screen — and ONLY when the real answer is all
 // zeros, so any test that arranges a real geometry still sees its own numbers.
+//
+// It also stops at the edge of a CodeMirror editor, and that exclusion is
+// load-bearing rather than tidy. CodeMirror measures LINE heights with the same
+// call, so an unscoped shim tells it every line is 768px tall; it then decides a
+// seven-line note is taller than the screen and virtualises the middle away into
+// a `<div class="cm-gap" style="height: 3840px">`. The lines are not slow to
+// arrive, they are never rendered at all — so no timeout saves it, and the
+// failure reads as "the link decoration was never built".
+//
+// It was intermittent because the measurement runs on an animation frame: a test
+// that finished its assertions before that frame saw the whole document, and one
+// that lost the race to a busy box saw the gap. Measured at roughly one run in
+// six of `src/components/notes/` under a full-suite load; zero in eighteen after.
+// jsdom's honest zeros are what CodeMirror wants — with no height to exceed, it
+// renders the whole document, which is the behaviour every editor test assumes.
 const VIEWPORT = { width: 1024, height: 768 };
 const measure = Element.prototype.getBoundingClientRect;
 Element.prototype.getBoundingClientRect = function shimmedRect(this: Element): DOMRect {
   const real = measure.call(this);
   if (real.width !== 0 || real.height !== 0 || real.x !== 0 || real.y !== 0) {
+    return real;
+  }
+  if (this.closest(".cm-editor") !== null) {
     return real;
   }
   return {
@@ -67,17 +101,3 @@ Element.prototype.getBoundingClientRect = function shimmedRect(this: Element): D
     toJSON: () => ({}),
   } as DOMRect;
 };
-
-// The same absence, through the other door: `@tanstack/react-virtual` sizes its
-// window from the scroll element's `offsetWidth`/`offsetHeight`, and jsdom's
-// getters are hard-coded to 0 — so the list renders zero rows however generous
-// the bounding rect is. Defining them here (configurable, and only as a
-// fallback of last resort) is what makes a virtualised list assertable at all.
-for (const dimension of ["offsetWidth", "offsetHeight"] as const) {
-  Object.defineProperty(HTMLElement.prototype, dimension, {
-    configurable: true,
-    get(this: HTMLElement) {
-      return dimension === "offsetWidth" ? VIEWPORT.width : VIEWPORT.height;
-    },
-  });
-}

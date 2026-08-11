@@ -1,0 +1,272 @@
+{
+  "why": "Story 45.18, FR-196, AD-65. The pinning between keeper_core::vault_link and its TypeScript mirror src/lib/vault-link/rule.ts. The rule decides whether a synced file is a note and where a note's file sits in its profile; Rust owns the decision and TypeScript has to reach the same answer synchronously, because it decides whether an action EXISTS rather than what it does. The two never meet at runtime, so the only thing that can stop them drifting is this table, which both test suites load. 'vaults' is the whole configured world, deliberately holding more than one profile and a nested pair, because a one-vault table cannot tell a per-profile filter from an unconditional match and a flat one cannot tell longest-match from first-match. 'to_note' is the Files-to-Notes direction: a null vault_id means the file is in no vault, and the action must be ABSENT rather than present-and-failing. 'to_file' is the Notes-to-Files direction: a null relative_path means there is nothing to open. Every resolved to_note row is also round-tripped back through to_file by both suites, because a note opened in Files and reopened in Notes has to be the same note.",
+  "vaults": [
+    {
+      "vault_id": "v-merope",
+      "profile_id": "p-merope",
+      "subfolder": "notes"
+    },
+    {
+      "vault_id": "v-merope-journal",
+      "profile_id": "p-merope",
+      "subfolder": "notes/journal"
+    },
+    {
+      "vault_id": "v-atlas",
+      "profile_id": "p-atlas",
+      "subfolder": "Second Brain"
+    },
+    {
+      "vault_id": "v-taygeta",
+      "profile_id": "p-taygeta",
+      "subfolder": "Notes\\Daily/"
+    },
+    {
+      "vault_id": "v-unflagged",
+      "profile_id": "p-plain",
+      "subfolder": ""
+    },
+    {
+      "why": "the K is U+212A KELVIN SIGN, not an ASCII K. Rust folds ASCII only; JavaScript's toLowerCase folds Unicode and would call this the same folder as 'kelvin'. The to_note pair below is what stops the mirror reaching for toLowerCase.",
+      "vault_id": "v-kelvin",
+      "profile_id": "p-kelvin",
+      "subfolder": "\u212aELVIN"
+    }
+  ],
+  "to_note": [
+    {
+      "why": "the ordinary case: a note one folder down",
+      "profile_id": "p-merope",
+      "relative_path": "notes/inbox/idea.md",
+      "vault_id": "v-merope",
+      "vault_path": "inbox/idea.md",
+      "vault_dir": "inbox"
+    },
+    {
+      "why": "at the vault root, so vault_dir is empty and notes_tree lists the root",
+      "profile_id": "p-merope",
+      "relative_path": "notes/idea.md",
+      "vault_id": "v-merope",
+      "vault_path": "idea.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "two vaults hold this path and the innermost answers",
+      "profile_id": "p-merope",
+      "relative_path": "notes/journal/2026-01-01.md",
+      "vault_id": "v-merope-journal",
+      "vault_path": "2026-01-01.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "inside the inner vault and one folder further down",
+      "profile_id": "p-merope",
+      "relative_path": "notes/journal/2026/q1.md",
+      "vault_id": "v-merope-journal",
+      "vault_path": "2026/q1.md",
+      "vault_dir": "2026"
+    },
+    {
+      "why": "the vault directory itself is a folder and has no note",
+      "profile_id": "p-merope",
+      "relative_path": "notes",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "a sibling folder sharing the subfolder's first five characters is not in it",
+      "profile_id": "p-merope",
+      "relative_path": "notesy/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "beside the vault, inside the profile",
+      "profile_id": "p-merope",
+      "relative_path": "archive/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "a subfolder with a space and a capital, and a file whose extension is uppercase",
+      "profile_id": "p-atlas",
+      "relative_path": "Second Brain/a b/Meeting Notes.MD",
+      "vault_id": "v-atlas",
+      "vault_path": "a b/Meeting Notes.MD",
+      "vault_dir": "a b"
+    },
+    {
+      "why": "APFS reports the folder lowercased; the match ignores case and the answer keeps the dirent's own",
+      "profile_id": "p-atlas",
+      "relative_path": "second brain/lower.md",
+      "vault_id": "v-atlas",
+      "vault_path": "lower.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "a stored subfolder written with a backslash and a trailing slash still matches",
+      "profile_id": "p-taygeta",
+      "relative_path": "notes/daily/2026-02-02.md",
+      "vault_id": "v-taygeta",
+      "vault_path": "2026-02-02.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "only notes/daily is that profile's vault, so notes/ alone is outside it",
+      "profile_id": "p-taygeta",
+      "relative_path": "notes/2026-02-02.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "an unflagged profile projects an empty subfolder, which is no vault rather than a vault at the root",
+      "profile_id": "p-plain",
+      "relative_path": "anything.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "a profile with no vault row at all",
+      "profile_id": "p-unknown",
+      "relative_path": "notes/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "p-merope's layout means nothing in p-atlas: a path is only relative to its own profile",
+      "profile_id": "p-atlas",
+      "relative_path": "notes/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "a dot segment is refused rather than collapsed",
+      "profile_id": "p-merope",
+      "relative_path": "notes/../secrets.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "an absolute path is not a profile-relative one",
+      "profile_id": "p-merope",
+      "relative_path": "/notes/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "a backslash is a legal character in a Linux file name, not a separator",
+      "profile_id": "p-merope",
+      "relative_path": "notes/a\\b.md",
+      "vault_id": "v-merope",
+      "vault_path": "a\\b.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "nothing at all",
+      "profile_id": "p-merope",
+      "relative_path": "",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    },
+    {
+      "why": "the folder is spelled with the same U+212A the subfolder uses, so an ASCII-only fold still matches it",
+      "profile_id": "p-kelvin",
+      "relative_path": "\u212aELVIN/x.md",
+      "vault_id": "v-kelvin",
+      "vault_path": "x.md",
+      "vault_dir": ""
+    },
+    {
+      "why": "an ASCII 'kelvin' is a DIFFERENT folder from U+212A 'KELVIN'. JavaScript's toLowerCase would fold them together and resolve a file in a folder that is not the vault; Rust's to_ascii_lowercase does not, and neither may the mirror.",
+      "profile_id": "p-kelvin",
+      "relative_path": "kelvin/x.md",
+      "vault_id": null,
+      "vault_path": null,
+      "vault_dir": null
+    }
+  ],
+  "to_file": [
+    {
+      "why": "the ordinary case",
+      "vault_id": "v-merope",
+      "note_path": "inbox/idea.md",
+      "relative_path": "notes/inbox/idea.md"
+    },
+    {
+      "why": "at the vault root",
+      "vault_id": "v-merope",
+      "note_path": "idea.md",
+      "relative_path": "notes/idea.md"
+    },
+    {
+      "why": "a nested vault composes its whole subfolder, not its last component",
+      "vault_id": "v-merope-journal",
+      "note_path": "2026-01-01.md",
+      "relative_path": "notes/journal/2026-01-01.md"
+    },
+    {
+      "why": "spaces survive; nothing is escaped here, because this is a path and not a URL",
+      "vault_id": "v-atlas",
+      "note_path": "a b/Meeting Notes.MD",
+      "relative_path": "Second Brain/a b/Meeting Notes.MD"
+    },
+    {
+      "why": "the stored spelling is normalised in its separators and keeps its case",
+      "vault_id": "v-taygeta",
+      "note_path": "2026-02-02.md",
+      "relative_path": "Notes/Daily/2026-02-02.md"
+    },
+    {
+      "why": "a backslash in the note's own name is carried through unchanged",
+      "vault_id": "v-merope",
+      "note_path": "a\\b.md",
+      "relative_path": "notes/a\\b.md"
+    },
+    {
+      "why": "an unflagged profile has no vault directory to compose against",
+      "vault_id": "v-unflagged",
+      "note_path": "anything.md",
+      "relative_path": null
+    },
+    {
+      "why": "a note path that climbs would address a file beside the vault",
+      "vault_id": "v-merope",
+      "note_path": "../escape.md",
+      "relative_path": null
+    },
+    {
+      "why": "a single dot segment is refused rather than dropped",
+      "vault_id": "v-merope",
+      "note_path": "./x.md",
+      "relative_path": null
+    },
+    {
+      "why": "an absolute path is not a vault-relative one",
+      "vault_id": "v-merope",
+      "note_path": "/abs.md",
+      "relative_path": null
+    },
+    {
+      "why": "a Windows drive letter is absolute without a leading slash",
+      "vault_id": "v-merope",
+      "note_path": "C:/x.md",
+      "relative_path": null
+    },
+    {
+      "why": "a note with no path is not a file",
+      "vault_id": "v-merope",
+      "note_path": "",
+      "relative_path": null
+    }
+  ]
+}

@@ -2,10 +2,10 @@
  * One note row (Epic 37, Story 37.2, FR-113/FR-114/FR-119, AD-63).
  *
  * 64 px, matching chat-row density, and a pure projection of one
- * {@link NoteRowVm}: nothing here derives a fact, composes a sentence, or
- * decides an order. The one thing the row computes is the relative timestamp,
- * through the same formatter the approval pane uses, because a clock is a
- * rendering concern and Rust has no business shipping "2 hr ago" over IPC.
+ * {@link NoteRowVm}: nothing here derives a fact or decides an order. What the
+ * row does compute is presentation of facts Rust already settled — the relative
+ * timestamp, through the same formatter the approval pane uses, because a clock
+ * is a rendering concern and Rust has no business shipping "2 hr ago" over IPC.
  *
  * The second line is the interesting decision. On a read row it is the body
  * excerpt; on an UNREAD row it is replaced by the provenance line — "changed by
@@ -17,21 +17,72 @@
  * Bold means unread here exactly as it does in the chat list. Conflict and pin
  * are glyphs rather than colour, because colour alone is not a carrier
  * (UX-DR43) and a conflict has to read on a monochrome panel too.
+ *
+ * The `+n` beside the chips is a truncation, so AD-83 applies to it (Story
+ * 44.12): it opens the tags it is hiding rather than merely counting them. A
+ * row that says `+2` and cannot say which two is the same failure as a property
+ * cut with nowhere to read the rest, in a smaller box.
+ *
+ * The order (Story 44.5, AD-81) is shown beside the note because an ordering the
+ * reader cannot account for reads as randomness. It is the note's own frontmatter
+ * value, and the row never invents one: a note that stated no position shows the
+ * default it was given, dimmer, and a note whose `order` is not a number shows
+ * the default it fell back to plus a mark saying so. All three cases are named in
+ * the accessible label, because `aria-label` overrides the row's contents and a
+ * number only drawn is a number a screen reader user never receives.
  */
 import { AlertTriangle, Pin } from "lucide-react";
 import type { Ref } from "react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { formatDraftAge } from "@/lib/format-time";
-import type { NoteRowVm } from "@/lib/ipc/client";
+import type { NoteOrder, NoteRowVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** How many tag chips a row shows before it collapses the rest into `+n`. */
 const VISIBLE_TAGS = 3;
+
+/** The accessible name of the `+n` chip, suffixed with the count. Named so a
+ * test and a screen reader agree on what the affordance is. */
+export const NOTE_MORE_TAGS_LABEL = "More tags on this note:";
+
+/**
+ * The mark an order the note itself could not state carries, so the fallback has
+ * a carrier that is not colour (UX-DR43). `order: soon` is not a number; the note
+ * still sorts at the default, and the row has to say the file and the list
+ * disagree rather than showing a bare `0` nobody can account for.
+ */
+export const NOTE_ORDER_UNREADABLE_MARK = "?";
+
+/** The displayed order: the number, plus {@link NOTE_ORDER_UNREADABLE_MARK}
+ * where the note's own value could not be read. */
+export function formatNoteOrder(order: NoteOrder): string {
+  const value = `${order.value}`;
+  return order.source === "unreadable" ? `${value}${NOTE_ORDER_UNREADABLE_MARK}` : value;
+}
+
+/**
+ * How the order is announced. The row's `aria-label` overrides its contents for
+ * name computation, so a number rendered and not named here is a number a screen
+ * reader user never receives — and then the ordering is exactly as unaccountable
+ * for them as it was for everyone before this story.
+ */
+export function noteOrderLabel(order: NoteOrder): string {
+  switch (order.source) {
+    case "own":
+      return `order ${order.value}`;
+    case "default":
+      return `order ${order.value}, the default`;
+    default:
+      return `order ${order.value}, the default; this note's own order is not a number`;
+  }
+}
 
 export function NoteRow({
   row,
   selected,
   tabIndex,
   onSelect,
+  onSelectBeside,
   onToggleTag,
   ref,
 }: {
@@ -39,12 +90,15 @@ export function NoteRow({
   selected: boolean;
   tabIndex: number;
   onSelect: (row: NoteRowVm) => void;
+  /** Double click: open this note beside what is open (Story 46.12, AD-90). */
+  onSelectBeside: (row: NoteRowVm) => void;
   /** Clicking a tag chip filters by it; it never opens the note. */
   onToggleTag: (tag: string) => void;
   ref?: Ref<HTMLButtonElement>;
 }) {
   const shownTags = row.tags.slice(0, VISIBLE_TAGS);
-  const overflow = row.tags.length - shownTags.length;
+  const hiddenTags = row.tags.slice(VISIBLE_TAGS);
+  const overflow = hiddenTags.length;
   // The accessible name puts state before content, but only where state changes
   // what the row MEANS — which for an unread, agent-touched note it does.
   const label = [
@@ -55,6 +109,7 @@ export function NoteRow({
     row.conflict ? "conflicted" : null,
     row.pinned ? "pinned" : null,
     row.tags.length > 0 ? `${row.tags.length} tags` : null,
+    noteOrderLabel(row.order),
   ]
     .filter((part) => part !== null)
     .join(", ");
@@ -70,6 +125,11 @@ export function NoteRow({
       data-unread={row.unread ? "true" : undefined}
       data-conflict={row.conflict ? "true" : undefined}
       onClick={() => onSelect(row)}
+      // Story 46.12: the Files tree's pair. The single click that necessarily
+      // preceded this one is undone by the panel store, so the note that was
+      // showing comes back rather than being replaced by a second copy of this
+      // one — which is why no timer swallows the first click here either.
+      onDoubleClick={() => onSelectBeside(row)}
       className={cn(
         "flex h-16 w-full items-start gap-2 px-3 py-2 text-left outline-none",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
@@ -104,7 +164,25 @@ export function NoteRow({
               className="size-3 shrink-0 text-destructive"
             />
           )}
-          <span className="ml-auto shrink-0 text-muted-foreground text-xs">
+          {/* The number the sort actually used, beside the note it placed. An
+              ordering the reader cannot account for reads as randomness, and
+              this is the cheapest possible account of it (Story 44.5, AD-81). */}
+          <span
+            data-slot="note-order"
+            data-order-source={row.order.source}
+            className={cn(
+              "ml-auto shrink-0 text-xs tabular-nums",
+              row.order.source === "own" && "text-foreground",
+              // A note that never stated a position is dimmer than one that did:
+              // a column of identical defaults should read as "nobody ordered
+              // these", not as data.
+              row.order.source === "default" && "text-muted-foreground/60",
+              row.order.source === "unreadable" && "text-destructive",
+            )}
+          >
+            {formatNoteOrder(row.order)}
+          </span>
+          <span className="shrink-0 text-muted-foreground text-xs">
             {formatDraftAge(row.updatedMs)}
           </span>
         </span>
@@ -130,9 +208,46 @@ export function NoteRow({
             </button>
           ))}
           {overflow > 0 && (
-            <span className="shrink-0 text-[11px] text-muted-foreground leading-none">
-              +{overflow}
-            </span>
+            <Popover>
+              <PopoverTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`${NOTE_MORE_TAGS_LABEL} ${hiddenTags.join(", ")}`}
+                  className="shrink-0 rounded-full px-1 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={(event) => {
+                    // Same rule as a chip: this opens the tags, not the note.
+                    event.stopPropagation();
+                  }}
+                >
+                  +{overflow}
+                </button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="end"
+                className="w-56 gap-1"
+                // The trigger lives inside the row button, so a click landing on
+                // the panel must not travel back out and open the note.
+                onClick={(event) => event.stopPropagation()}
+              >
+                <p className="font-medium text-muted-foreground text-xs">{NOTE_MORE_TAGS_LABEL}</p>
+                <span className="flex max-h-40 flex-wrap gap-1 overflow-y-auto">
+                  {hiddenTags.map((tag) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      aria-label={`Tag ${tag}, on this note`}
+                      className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onToggleTag(tag);
+                      }}
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                </span>
+              </PopoverContent>
+            </Popover>
           )}
         </span>
       </span>

@@ -8,4 +8,15 @@ import type { NoteCadenceVm } from "./NoteCadenceVm";
  * reset it (AD-34-9): the request carries what the user changed, and everything
  * absent keeps the value already in force.
  */
-export type NoteVaultSettingsReq = { subfolder: string | null, journalTemplate: string | null, defaultTemplate: string | null, cadence: NoteCadenceVm | null, };
+export type NoteVaultSettingsReq = { subfolder: string | null, journalTemplate: string | null, defaultTemplate: string | null, 
+/**
+ * The template a quick capture starts from. An empty string clears it —
+ * "the user chose no template" and "the user never touched the field" are
+ * different requests, and only the first may unset what is stored.
+ */
+captureTemplate: string | null, 
+/**
+ * The tag every quick capture carries, as typed. keeper folds it to the
+ * canonical form before storing it, and an empty string clears it.
+ */
+captureTag: string | null, cadence: NoteCadenceVm | null, };

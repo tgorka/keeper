@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd"]
 
 [workspace.package]
-version = "0.6.5"
+version = "0.8.0"
 authors = ["Tomasz Gorka"]
 license = "Apache-2.0"
 repository = "https://github.com/tgorka/keeper"
@@ -101,15 +101,24 @@ keyring = { version = "3", features = ["apple-native"] }
 # build stay byte-identical. Consumed by the `keeper` crate under an iOS-only target table
 # to pin `AfterFirstUnlockThisDeviceOnly`. MIT/Apache — passes the cargo-deny license firewall.
 security-framework = "3"
-# iOS backup exclusion (Story 14.7, FR-65, AD-29). Catalog entries only — objc2 0.6 /
-# objc2-foundation 0.3 are already resolved in the lock transitively (tao/wry/muda), so no
-# new crate version is pulled; the only Cargo.lock change is the dependency edge on the
-# `keeper` crate. Consumed under an iOS-only target table for the single audited
-# `NSURLIsExcludedFromBackupKey` FFI behind `Platform::exclude_from_backup`. The feature
-# list names exactly the Foundation surfaces that call touches (NSURL + its NSError result,
-# NSString path, NSNumber value). MIT — passes the cargo-deny license firewall.
+# iOS backup exclusion (Story 14.7, FR-65, AD-29) and the macOS out-of-vault trash
+# (Story 46.14, AD-102, NFR-30). Catalog entries only — objc2 0.6 / objc2-foundation 0.3
+# are already resolved in the lock transitively (tao/wry/muda), so no new crate version is
+# pulled; the only Cargo.lock change is the dependency edge on the `keeper` crate (iOS-only
+# target table, the single audited `NSURLIsExcludedFromBackupKey` FFI behind
+# `Platform::exclude_from_backup`) and on `keeper-sync` (macOS-only target table,
+# `files_write::finder_trash`'s SAFE `NSFileManager trashItemAtURL:` binding — no unsafe).
+# The feature list names exactly the Foundation surfaces those two calls touch (NSURL + its
+# NSError result, NSString path, NSNumber value, NSFileManager). MIT — passes the cargo-deny
+# license firewall.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSURL", "NSError", "NSString", "NSValue"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSURL",
+    "NSError",
+    "NSString",
+    "NSValue",
+    "NSFileManager",
+] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
 # transitively; MIT — passes the cargo-deny license firewall.
@@ -198,3 +207,62 @@ bytes = "1"
 # direct dep pulls no new crate version. MIT OR Apache-2.0 — passes
 # `cargo deny check`.
 base64 = "0.22"
+# C-style unquoting for `.gitattributes` pattern fields (Story 46.1). A
+# gitattributes line whose pattern holds a space MUST be quoted — git decides
+# to unquote from the line's FIRST BYTE, so a backslash escape is read as an
+# attribute separator and the rule silently covers nothing. Reading such a line
+# back needs the inverse, and `gix-attributes` already unquotes with exactly
+# this crate, so keeper's idempotence check and gitoxide's parser agree by
+# construction rather than by two hand-rolled decoders. It has no encoder,
+# which is why `lfs::stage::quote_pattern` is written by hand against
+# `ansi_c::undo`. Already resolved in the lock as gix-attributes' own
+# dependency, so a direct dep pulls no new crate. MIT OR Apache-2.0 — passes
+# `cargo deny check`.
+gix-quote = "0.7.2"
+# ---------------------------------------------------------------------------
+# Document rendering (Story 45.8, FR-181, FR-182). Consumed by `keeper-core`
+# only: DOCX, PPTX and XLSX are a ZIP of XML, so keeper parses them in Rust and
+# ships a bounded view model rather than shipping a parser to the webview. The
+# rejected alternative was ~1.2 MB of SheetJS + mammoth in the JS bundle, paid
+# for by every user who never opens a spreadsheet.
+# ---------------------------------------------------------------------------
+# OOXML container reading. `default-features = false` because zip 4's defaults
+# pull aes-crypto, bzip2, deflate64, lzma, ppmd, xz and zstd — seven
+# compression stacks for a format that only ever uses two.
+#
+# The feature is `deflate-flate2`, NOT `deflate`. They are not synonyms: plain
+# `deflate` means `deflate-zopfli` + `deflate-flate2-zlib-rs`, which adds the
+# zopfli COMPRESSOR and a second zlib backend to the tree. keeper only ever
+# reads a document, so paying for a compressor — and pulling `zopfli`, the one
+# genuinely new package the wide feature would have added to Cargo.lock — buys
+# nothing. `deflate-flate2` is inflate through the flate2 already in the lock.
+# STORED entries need no feature at all.
+#
+# The crate itself is already compiled in every keeper build
+# (tauri-plugin-updater depends on it), so no new package enters Cargo.lock —
+# only zip's own dependency line gains `flate2`, itself already in the lock via
+# reqwest. MIT — passes `cargo deny check`.
+#
+# It does NOT bound decompression for us: `ZipFile` is a `Read` that will
+# happily inflate a 40 kB bomb into gigabytes. `keeper_core::document` caps both
+# the per-part and the total inflated size and treats the cap as a named
+# refusal. See that module's `read_part`.
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# OOXML part parsing — a pull parser, so a part is walked in constant memory
+# rather than built into a DOM whose size the document controls. Already
+# compiled in every keeper build (plist -> tauri-utils), so no new package
+# enters Cargo.lock. MIT — passes `cargo deny check`.
+#
+# Chosen partly BECAUSE it refuses to expand DTD entities: an unrecognised
+# entity is an error, not an expansion, so a billion-laughs `.docx` from a
+# colleague cannot be turned into gigabytes of text by parsing it. That is
+# load-bearing rather than incidental, so `keeper_core::document` has a test
+# that fails if a future version starts expanding them.
+quick-xml = "0.39"
+# Inflating a PDF's compressed object streams (Story 45.8). A PDF 1.5+ writer
+# packs the page tree into `/Type /ObjStm` streams, so a page count read only
+# from the uncompressed body is `None` for most documents a person actually
+# has. This is the same flate2 `zip` above resolves onto and the same one
+# reqwest already pulls into `keeper-core`, so the direct edge adds no package
+# to Cargo.lock. MIT OR Apache-2.0 — passes `cargo deny check`.
+flate2 = "1"
