@@ -66,15 +66,24 @@ import {
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
 } from "@/components/layout/files-pane";
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import {
   FILES_SYNC_MARK_LABEL,
   FILES_SYNC_MARK_TESTID,
 } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL } from "@/components/notes/attach-to-note-dialog";
 import { OVERFLOW_PANEL_LABEL, OVERFLOW_TRIGGER_LABEL } from "@/components/ui/overflow-value";
+import { COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
+import {
+  COLUMN_KEY_STEP,
+  COLUMN_WIDTH_COOKIE,
+  readColumnWidths,
+  SURFACE_COLUMNS,
+} from "@/lib/column-widths";
 import { formatFileSize } from "@/lib/file-size";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { COLUMN_FOLD_COOKIE, resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import {
   FILES_TREE_COOKIE,
   filesTreeCookie,
@@ -288,6 +297,13 @@ beforeEach(() => {
   resetFilesTreeForTest();
   // biome-ignore lint/suspicious/noDocumentCookie: the store persists through the document, so clearing it is part of resetting this suite
   document.cookie = `${FILES_TREE_COOKIE}=; path=/; max-age=0`;
+  // Story 48.1: the tree is a surface column, and its fold is a module-level
+  // store plus a cookie. Both halves, like the expansion above.
+  resetColumnFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: the store persists through the document, so clearing it is part of resetting this suite
+  document.cookie = `${COLUMN_FOLD_COOKIE}=; path=/; max-age=0`;
+  // biome-ignore lint/suspicious/noDocumentCookie: the width outlives a mount too
+  document.cookie = `${COLUMN_WIDTH_COOKIE}=; path=/; max-age=0`;
 });
 
 afterEach(() => {
@@ -2463,5 +2479,156 @@ describe("FilesPane — the tree stays where you left it", () => {
     await waitFor(() =>
       expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")])),
     );
+  });
+
+  /**
+   * Story 48.6 — the folder is re-read once, not twice.
+   *
+   * Two behaviours that are each correct met on the one path that runs both.
+   * `refresh` re-reads every open folder ("Refresh means ask again"), and the
+   * restore effect stays armed until it has a list Rust really answered — so
+   * after a failed first call, the Refresh that is the way back from it did
+   * BOTH: its own loop browsed every open folder, and then the newly-armed
+   * restore browsed every remembered folder again off the same store.
+   *
+   * Counted per key rather than in total, because the interesting failure is
+   * two calls for ONE folder and a total would also move if the fixture grew.
+   * On the owner's 91,000-file tree each of those calls is a directory read.
+   */
+  it("re-reads a remembered folder once when Refresh rescues a failed first list", async () => {
+    vaultTree();
+    syncProfiles.mockRejectedValueOnce(new Error("the sync engine is not running"));
+    remembered([nodeKey("01VAULT", ""), nodeKey("01VAULT", "Notes")]);
+    render(<FilesPane />);
+    await screen.findByText(FILES_NO_PROFILES_SENTENCE);
+    // Nothing has been browsed: there was no list to browse against.
+    expect(syncBrowse).not.toHaveBeenCalled();
+
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+    expect(await screen.findByRole("treeitem", { name: "Notes" })).toBeInTheDocument();
+
+    const asked = syncBrowse.mock.calls.map(([id, subpath]) => `${id}:${subpath}`);
+    expect(asked.filter((call) => call === "01VAULT:")).toHaveLength(1);
+    expect(asked.filter((call) => call === "01VAULT:Notes")).toHaveLength(1);
+  });
+
+  it("still re-reads on every later Refresh, because Refresh means ask again", async () => {
+    // The other half, and the reason the skip lives in the restore rather than
+    // in `load`: a cache check inside `load` would make Refresh a no-op, which
+    // is the one thing Refresh must never be.
+    vaultTree();
+    remembered([nodeKey("01VAULT", "")]);
+    render(<FilesPane />);
+    await screen.findByRole("treeitem", { name: "Notes" });
+    const before = syncBrowse.mock.calls.length;
+
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    expect(syncBrowse.mock.calls.length).toBe(before + 2);
+  });
+});
+
+/**
+ * Story 48.1 — the tree is a column of the shell, so it folds and it resizes.
+ *
+ * Against the real pane, because the defect this story fixes was a general
+ * mechanism (`useResizableColumn`, shipped in Story 44.12) wired to exactly one
+ * boundary in the whole app. What a folded column does is
+ * `surface-column.test.tsx`; that this pane HAS one is only assertable here.
+ *
+ * The refusals nearby are about a different set and are not overridden: Story
+ * 44.12's spec refuses seams INSIDE the tree, between a name and its size. This
+ * is the boundary between the tree and the panels beside it.
+ */
+describe("FilesPane — the tree is a column", () => {
+  const label = SURFACE_COLUMNS["files-tree"].label;
+
+  it("folds to a strip that keeps the pane named and the way back reachable", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    render(<FilesPane />);
+    expect(await screen.findByRole("treeitem", { name: "Vault" })).toBeInTheDocument();
+
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+
+    // No tree, no header, no Refresh — a folded column mounts none of it.
+    expect(screen.queryByRole("tree", { name: FILES_TREE_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: FILES_REFRESH_LABEL })).toBeNull();
+    // Still a named region, and still holding the control that undoes it.
+    expect(screen.getByRole("region", { name: FILES_PANE_TITLE })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).toBeInTheDocument();
+  });
+
+  it("comes back with the tree it had", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    render(<FilesPane />);
+    await screen.findByRole("treeitem", { name: "Vault" });
+
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+    await click(screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }));
+
+    expect(await screen.findByRole("treeitem", { name: "Vault" })).toBeInTheDocument();
+  });
+
+  it("carries a seam that remembers the width across a remount", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    const first = render(<FilesPane />);
+    await screen.findByRole("treeitem", { name: "Vault" });
+
+    const seam = screen.getByRole("separator", { name: `${COLUMN_RESIZER_LABEL} ${label}` });
+    fireEvent.keyDown(seam, { key: "ArrowRight" });
+    const wider = SURFACE_COLUMNS["files-tree"].defaultWidth + COLUMN_KEY_STEP;
+    expect(readColumnWidths(document.cookie)["files-tree"]).toBe(wider);
+
+    first.unmount();
+    render(<FilesPane />);
+
+    expect(await screen.findByRole("region", { name: FILES_PANE_TITLE })).toHaveStyle({
+      width: `${wider}px`,
+    });
+  });
+
+  /**
+   * The column's chrome does not move the tree's row window.
+   *
+   * Written because a sibling agent's gate run saw
+   * `FilesPane keyboard navigation › steps down and up one visible row at a
+   * time` fail once in six under three concurrent test runs, and the honest
+   * question was whether the fold or the seam could make the set of rendered
+   * rows disagree with the index the keyboard steps through. It cannot, and
+   * this is the assertion rather than the argument: fold, unfold, then step.
+   *
+   * The argument, for the record, is structural. `useWindowedRows` measures
+   * with `clientHeight` and never `getBoundingClientRect`, so `setup.ts`'s
+   * full-viewport rect shim does not reach it; a zero `clientHeight` falls back
+   * to `ASSUMED_VIEWPORT_HEIGHT` (640), which at a 32px row estimate is a
+   * twenty-row window over a two-row tree. And the chrome is a sibling ABOVE
+   * the scroll container while the seam is outside the `<section>` entirely,
+   * so neither is inside the box whose height is measured.
+   */
+  it("leaves the tree's keyboard stepping intact across a fold and an unfold", async () => {
+    syncProfiles.mockResolvedValue([
+      profile({ id: "01VAULT", name: "Vault" }),
+      profile({ id: "01FIELD", name: "Field" }),
+    ]);
+    render(<FilesPane />);
+    const tree = await screen.findByRole("tree", { name: FILES_TREE_LABEL });
+    expect(within(tree).getAllByRole("treeitem")).toHaveLength(2);
+
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+    await click(screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }));
+
+    // Both rows are back in the window, and the arrows still walk them.
+    const back = await screen.findByRole("tree", { name: FILES_TREE_LABEL });
+    expect(within(back).getAllByRole("treeitem")).toHaveLength(2);
+    const first = await screen.findByRole("treeitem", { name: "Vault" });
+    first.focus();
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement ?? first, { key: "ArrowDown" });
+      await Promise.resolve();
+    });
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Field");
   });
 });

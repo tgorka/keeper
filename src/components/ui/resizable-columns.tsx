@@ -23,10 +23,10 @@ import {
   COLUMN_KEY_STEP,
   COLUMN_KEY_STEP_COARSE,
   clampColumnWidth,
+  columnMinWidth,
   columnTemplate,
   columnWidthCookie,
   MAX_COLUMN_WIDTH,
-  MIN_COLUMN_WIDTH,
   readColumnWidths,
 } from "@/lib/column-widths";
 import { cn } from "@/lib/utils";
@@ -60,6 +60,23 @@ export interface ColumnResizerProps {
   onWidth: (width: number | null) => void;
   /** The grid container's left edge in viewport px, for reading a fitted width. */
   containerLeft: () => number;
+  /**
+   * The narrowest this column may be, in px — what a screen reader hears as
+   * `aria-valuemin`. Per column since Story 48.1: a whole surface column and a
+   * property key do not share a floor, and a slider that announces a minimum
+   * the drag will not honour is a slider that lies.
+   */
+  min: number;
+  /**
+   * Where the seam sits, for a host that is not the two-column grid.
+   *
+   * Defaults to the grid placement {@link columnTemplate}'s middle track was
+   * cut for. A surface column (Story 48.1) is a flex row instead, where the
+   * grid properties would be inert noise and the seam only needs to refuse to
+   * shrink — the zero-width box and the 8px hit strip straddling it are the
+   * same either way.
+   */
+  className?: string;
 }
 
 /**
@@ -97,7 +114,10 @@ export function useResizableColumn(id: string, label: string): ResizableColumn {
   const container = useRef<HTMLElement | null>(null);
 
   const onWidth = (next: number | null): void => {
-    setWidth(next === null ? null : clampColumnWidth(next));
+    // The column's own floor, which for a surface column (Story 48.1) is not
+    // the shared 72px. Clamped here as well as in the cookie so the number on
+    // screen during a drag is the number that will be remembered after it.
+    setWidth(next === null ? null : clampColumnWidth(next, columnMinWidth(id)));
     document.cookie = columnWidthCookie(document.cookie, id, next);
   };
 
@@ -119,6 +139,7 @@ export function useResizableColumn(id: string, label: string): ResizableColumn {
       label,
       width,
       onWidth,
+      min: columnMinWidth(id),
       // The grid's own left edge. Subtracted from the seam's to recover the
       // fitted width the layout engine produced — consulted only while the
       // column is still fitted, because once a width has been chosen that
@@ -137,7 +158,14 @@ export function useResizableColumn(id: string, label: string): ResizableColumn {
  * leaves the strip within a frame, and without capture the column stops
  * following the cursor exactly when the user is moving fastest.
  */
-export function ColumnResizer({ label, width, onWidth, containerLeft }: ColumnResizerProps) {
+export function ColumnResizer({
+  label,
+  width,
+  onWidth,
+  containerLeft,
+  min,
+  className,
+}: ColumnResizerProps) {
   const drag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>): void => {
@@ -194,13 +222,13 @@ export function ColumnResizer({ label, width, onWidth, containerLeft }: ColumnRe
       role="separator"
       aria-orientation="vertical"
       aria-label={`${COLUMN_RESIZER_LABEL} ${label}`}
-      aria-valuemin={MIN_COLUMN_WIDTH}
+      aria-valuemin={min}
       aria-valuemax={MAX_COLUMN_WIDTH}
       aria-valuenow={width ?? undefined}
       aria-valuetext={width === null ? COLUMN_FITTED_VALUE_TEXT : undefined}
       tabIndex={0}
       data-slot="column-resizer"
-      className="relative col-start-2 select-none [grid-row:1/-1]"
+      className={cn("relative select-none", className ?? "col-start-2 [grid-row:1/-1]")}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}

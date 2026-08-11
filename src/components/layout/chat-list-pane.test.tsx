@@ -1,5 +1,13 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
+import { COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
+import {
+  COLUMN_KEY_STEP,
+  COLUMN_WIDTH_COOKIE,
+  readColumnWidths,
+  SURFACE_COLUMNS,
+} from "@/lib/column-widths";
 import type {
   AccountVm,
   InboxBatch,
@@ -11,6 +19,11 @@ import type {
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { chatListFocusStore } from "@/lib/stores/chat-list-focus";
+import {
+  COLUMN_FOLD_COOKIE,
+  hydrateColumnFold,
+  resetColumnFoldForTest,
+} from "@/lib/stores/column-fold";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -125,6 +138,23 @@ function inboxRoom(
   };
 }
 
+/**
+ * The desktop viewport this suite runs at, and the phone one Story 48.1's last
+ * test needs. `useShellLayout` reads `matchMedia`, and the global setup answers
+ * every query `false` — which IS the desktop.
+ */
+const desktopMatchMedia = window.matchMedia;
+const phoneMatchMedia = ((query: string) => ({
+  matches: /max-width:\s*767px/.test(query),
+  media: query,
+  onchange: null,
+  addListener: () => {},
+  removeListener: () => {},
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  dispatchEvent: () => false,
+})) as unknown as typeof window.matchMedia;
+
 beforeEach(() => {
   accountsStore.getState().clear();
   accountsStore.setState({ filterAccountId: null });
@@ -158,6 +188,14 @@ beforeEach(() => {
   markRoomUnreadMock.mockClear();
   composerStore.setState({ focusNonce: 0 });
   chatListFocusStore.setState({ focusNonce: 0 });
+  // Story 48.1: the inbox is a surface column. Its fold is a module-level
+  // store plus a cookie, so one test's fold would be the next test's restore.
+  resetColumnFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranges
+  document.cookie = `${COLUMN_FOLD_COOKIE}=; path=/; max-age=0`;
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranges
+  document.cookie = `${COLUMN_WIDTH_COOKIE}=; path=/; max-age=0`;
+  window.matchMedia = desktopMatchMedia;
 });
 
 afterEach(() => {
@@ -1577,5 +1615,71 @@ describe("ChatListPane keyboard navigation (Story 9.2)", () => {
     await waitFor(() => {
       expect(rowButton("Alpha")).toHaveFocus();
     });
+  });
+});
+
+/**
+ * Story 48.1 — the inbox is a column of the shell, so it folds and it resizes.
+ *
+ * The phone arm is the one that can only be asserted here: `useSurfaceColumn`
+ * takes the flag, but nothing in the hook knows that `PhoneShell` mounts this
+ * pane in a single-pane stack. If this component stopped reading the viewport,
+ * the hook's own suite would still pass.
+ */
+describe("ChatListPane — the inbox is a column", () => {
+  const label = SURFACE_COLUMNS["chat-list"].label;
+
+  it("folds to a strip that still holds the way back", () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+
+    fireEvent.click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+
+    expect(screen.queryByLabelText("Loading conversations")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).toBeInTheDocument();
+  });
+
+  it("resizes and remembers it across a remount", () => {
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+    const first = render(<ChatListPane />);
+
+    fireEvent.keyDown(screen.getByRole("separator", { name: `${COLUMN_RESIZER_LABEL} ${label}` }), {
+      key: "ArrowRight",
+    });
+    const wider = SURFACE_COLUMNS["chat-list"].defaultWidth + COLUMN_KEY_STEP;
+    expect(readColumnWidths(document.cookie)["chat-list"]).toBe(wider);
+
+    first.unmount();
+    render(<ChatListPane />);
+    expect(
+      screen.getByLabelText("Loading conversations").closest("[id='column-chat-list']"),
+    ).toHaveStyle({ width: `${wider}px` });
+  });
+
+  it("offers neither control on the phone, and ignores a fold made on the desktop", () => {
+    // The phone stack shows one pane at a time. A fold there would hide the
+    // whole screen, and a remembered desktop fold must not follow the user
+    // onto an arrangement with no way to undo it.
+    hydrateColumnFold(`${COLUMN_FOLD_COOKIE}=${encodeURIComponent("chat-list:1")}`);
+    window.matchMedia = phoneMatchMedia;
+    subscribeInbox.mockResolvedValue(1);
+    accountsStore.getState().addAccount(account);
+
+    render(<ChatListPane />);
+
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("separator", { name: `${COLUMN_RESIZER_LABEL} ${label}` }),
+    ).not.toBeInTheDocument();
   });
 });

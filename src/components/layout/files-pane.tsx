@@ -99,6 +99,7 @@ import type {
   ReactNode,
 } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -174,6 +175,17 @@ export const FILES_PANE_TITLE = "Files";
 /** The one honest sentence under the heading: what this shows, and what it can change. */
 export const FILES_PANE_SUBTITLE =
   "Everything in the folders keeper syncs. Files in a notes vault can be created and deleted here; everything else is read-only.";
+
+/**
+ * The column the tree occupies (Story 48.1).
+ *
+ * `shrink-0` and a width from {@link useSurfaceColumn}, where it used to be
+ * `flex-1`. `flex-1` was never a decision — it was two panes carrying the same
+ * class — and it split the surface evenly between a folder list and the
+ * document that list opens. The strip beside it is the flexible one now, which
+ * is the arrangement Notes has had since Story 46.12.
+ */
+const FILES_COLUMN_CLASS = "flex min-w-0 shrink-0 flex-col border-border border-r bg-background";
 
 /** The accessible name of the tree (distinct from the pane's own name). */
 export const FILES_TREE_LABEL = "Synced folders";
@@ -561,6 +573,10 @@ export function FilesPane() {
   // the recordings row already use. A control that fails on activation is worse
   // than no control.
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
+  // The tree is a surface column: it folds away and it can be dragged wider
+  // (Story 48.1). Called before anything that can return, so the fold cannot
+  // change the hook order.
+  const tree = useSurfaceColumn("files-tree");
 
   const [profiles, setProfiles] = useState<SyncProfileVm[] | null>(null);
   // Which folders are open outlives this component (Story 46.3): the shell
@@ -678,6 +694,18 @@ export function FilesPane() {
   }, []);
 
   /**
+   * Every directory `load` has already asked Rust about since this pane
+   * mounted (Story 48.6).
+   *
+   * Consulted by ONE caller — the restore below — and by nothing else. `load`
+   * itself still always re-asks, because Refresh means "ask again" and a cache
+   * check in there would make it a no-op; this only lets the restore skip a
+   * folder that has already been asked for on this mount, which is the whole
+   * of the duplicate it was producing.
+   */
+  const requested = useRef<Set<string>>(new Set());
+
+  /**
    * Ask Rust for one directory.
    *
    * Always re-asks: the two callers are "expand for the first time" (which
@@ -686,6 +714,7 @@ export function FilesPane() {
    */
   const load = useCallback((profileId: string, subpath: string) => {
     const key = nodeKey(profileId, subpath);
+    requested.current.add(key);
 
     syncBrowse(profileId, subpath)
       .then((listing) => {
@@ -737,6 +766,14 @@ export function FilesPane() {
    * case: Sync is a different primary view, so reaching it unmounts this. A
    * list that arrives late, from a Refresh after a failed first call, is: the
    * effect stays armed until it has a real one.
+   *
+   * And a folder {@link load} has already been asked about on this mount is
+   * skipped (Story 48.6). "Stays armed until it has a real list" and "Refresh
+   * re-reads every open folder" were each correct and together they browsed
+   * every remembered folder TWICE on the one path that runs both: a first
+   * profile call that failed, then the Refresh that is the way back from it.
+   * The store is read live here, so by then it holds exactly the folders
+   * Refresh has just re-read.
    */
   const restored = useRef(false);
   useEffect(() => {
@@ -752,7 +789,7 @@ export function FilesPane() {
     const browsable = new Set(profiles.filter((p) => p.enabled).map((p) => p.id));
     for (const key of reachableNodeKeys(filesTreeStore.getState().expanded)) {
       const profileId = nodeKeyProfile(key);
-      if (browsable.has(profileId)) {
+      if (browsable.has(profileId) && !requested.current.has(key)) {
         load(profileId, nodeKeySubpath(key));
       }
     }
@@ -1743,18 +1780,35 @@ export function FilesPane() {
     </div>
   );
 
+  // Folded, the tree is its strip and the control that brings it back, and
+  // nothing else is mounted (Story 48.1). An early return rather than a
+  // conditional around the body, for the reason `PanelFrame` unmounts a folded
+  // panel's body: the tree's rows, its virtualiser and its overflow probes are
+  // exactly the cost the person reclaimed by folding it. Every hook above this
+  // line still runs, so the tree store stays current and unfolding shows what
+  // happened while it was away rather than a fresh scan.
+  if (tree.folded) {
+    return (
+      <>
+        <section aria-label={FILES_PANE_TITLE} {...tree.rootProps} className={FILES_COLUMN_CLASS}>
+          {tree.chrome}
+        </section>
+        {tree.seam}
+      </>
+    );
+  }
+
   return (
-    <section
-      aria-label={FILES_PANE_TITLE}
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
-    >
-      <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
-        <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">{FILES_PANE_TITLE}</h1>
-          <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {/* Delete acts on the SELECTION, which is why the count lives here
+    <>
+      <section aria-label={FILES_PANE_TITLE} {...tree.rootProps} className={FILES_COLUMN_CLASS}>
+        {tree.chrome}
+        <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
+          <div className="min-w-0">
+            <h1 className="font-heading font-medium text-lg">{FILES_PANE_TITLE}</h1>
+            <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {/* Delete acts on the SELECTION, which is why the count lives here
               rather than a Delete button living on every row (Story 45.3).
               A per-row button cannot answer "and the other four", and the
               confirmation's whole job is answering exactly that.
@@ -1762,22 +1816,22 @@ export function FilesPane() {
               Present only when something is selected that keeper may delete —
               a selection of read-only files offers no Delete, and each of those
               rows already carries its own reason. */}
-          {deletable.length > 0 && (
-            <>
-              <span data-testid={FILES_SELECTED_TESTID} className="text-muted-foreground text-xs">
-                {`${countLabel(deletable.length, ITEMS)} selected`}
-              </span>
-              <Button
-                type="button"
-                variant="destructive"
-                size="sm"
-                onClick={() => requestDelete(deletable)}
-              >
-                {FILES_DELETE_LABEL}
-              </Button>
-            </>
-          )}
-          {/* Story 45.13's entry point, on the SAME selection Delete acts on
+            {deletable.length > 0 && (
+              <>
+                <span data-testid={FILES_SELECTED_TESTID} className="text-muted-foreground text-xs">
+                  {`${countLabel(deletable.length, ITEMS)} selected`}
+                </span>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => requestDelete(deletable)}
+                >
+                  {FILES_DELETE_LABEL}
+                </Button>
+              </>
+            )}
+            {/* Story 45.13's entry point, on the SAME selection Delete acts on
               (Story 45.3) — there is one selection model in this pane and this
               does not add a second. Offered whenever files are selected and a
               vault is open, and never for a selection of only folders: a note
@@ -1787,132 +1841,134 @@ export function FilesPane() {
               keeper change this file", and attaching changes the NOTE, not the
               file — a read-only PDF on a paused drive is a perfectly good thing
               to put in a note. */}
-          {attachablePaths.length > 0 && activeVaultId !== null && (
-            <Button type="button" variant="outline" size="sm" onClick={() => setAttaching(true)}>
-              {ATTACH_TO_NOTE_LABEL}
+            {attachablePaths.length > 0 && activeVaultId !== null && (
+              <Button type="button" variant="outline" size="sm" onClick={() => setAttaching(true)}>
+                {ATTACH_TO_NOTE_LABEL}
+              </Button>
+            )}
+            <Button type="button" variant="outline" size="sm" onClick={refresh}>
+              {FILES_REFRESH_LABEL}
             </Button>
-          )}
-          <Button type="button" variant="outline" size="sm" onClick={refresh}>
-            {FILES_REFRESH_LABEL}
-          </Button>
-        </div>
-      </header>
+          </div>
+        </header>
 
-      {/* Rust's sentence for a write that was refused or only partly done.
+        {/* Rust's sentence for a write that was refused or only partly done.
           `role="alert"` because it is the answer to something the person just
           did, and it appears where they did it rather than in a toast that has
           gone by the time they look up. */}
-      {writeError !== null && (
-        <Alert variant="destructive" className="mx-4 mt-3 w-auto">
-          <AlertDescription data-testid={FILES_WRITE_ERROR_TESTID} role="alert">
-            {writeError}
-          </AlertDescription>
-        </Alert>
-      )}
+        {writeError !== null && (
+          <Alert variant="destructive" className="mx-4 mt-3 w-auto">
+            <AlertDescription data-testid={FILES_WRITE_ERROR_TESTID} role="alert">
+              {writeError}
+            </AlertDescription>
+          </Alert>
+        )}
 
-      <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="px-4 py-3">
-          {emptySentence !== null ? (
-            <Alert>
-              <AlertDescription>{emptySentence}</AlertDescription>
-            </Alert>
-          ) : (
-            <div
-              aria-label={FILES_TREE_LABEL}
-              aria-multiselectable="true"
-              role="tree"
-              className="relative w-full"
-              style={{ height: `${list.totalSize}px` }}
-            >
-              {list.rows.map((item) => {
-                const row = rows[item.index];
-                if (row === undefined) {
-                  return null;
-                }
-                return (
-                  // Presentational, so the tree still owns its `treeitem`s
-                  // directly: the window needs a box to position, and a box
-                  // between a tree and its items is a box with no role.
-                  <div key={row.key} role="presentation" {...list.rowProps(item)}>
-                    {row.kind === "node" && renderNode(row)}
-                    {row.kind === "create" && renderCreate(row)}
-                    {row.kind === "note" && (
-                      <p
-                        data-testid={row.plain === true ? undefined : FILES_STATE_DETAIL_TESTID}
-                        data-state={row.state ?? undefined}
-                        className={cn(
-                          "px-2 py-1 text-sm",
-                          row.state === null && row.text !== FILES_READING_SENTENCE
-                            ? "text-destructive"
-                            : "text-muted-foreground",
-                        )}
-                        style={{ paddingInlineStart: `${(row.level - 1) * 16 + 8}px` }}
-                      >
-                        {row.text}
-                      </p>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
+        <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
+          <div className="px-4 py-3">
+            {emptySentence !== null ? (
+              <Alert>
+                <AlertDescription>{emptySentence}</AlertDescription>
+              </Alert>
+            ) : (
+              <div
+                aria-label={FILES_TREE_LABEL}
+                aria-multiselectable="true"
+                role="tree"
+                className="relative w-full"
+                style={{ height: `${list.totalSize}px` }}
+              >
+                {list.rows.map((item) => {
+                  const row = rows[item.index];
+                  if (row === undefined) {
+                    return null;
+                  }
+                  return (
+                    // Presentational, so the tree still owns its `treeitem`s
+                    // directly: the window needs a box to position, and a box
+                    // between a tree and its items is a box with no role.
+                    <div key={row.key} role="presentation" {...list.rowProps(item)}>
+                      {row.kind === "node" && renderNode(row)}
+                      {row.kind === "create" && renderCreate(row)}
+                      {row.kind === "note" && (
+                        <p
+                          data-testid={row.plain === true ? undefined : FILES_STATE_DETAIL_TESTID}
+                          data-state={row.state ?? undefined}
+                          className={cn(
+                            "px-2 py-1 text-sm",
+                            row.state === null && row.text !== FILES_READING_SENTENCE
+                              ? "text-destructive"
+                              : "text-muted-foreground",
+                          )}
+                          style={{ paddingInlineStart: `${(row.level - 1) * 16 + 8}px` }}
+                        >
+                          {row.text}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
 
-      {/* The confirmation, and every word in it is Rust's (Story 45.3,
+        {/* The confirmation, and every word in it is Rust's (Story 45.3,
           UX-DR66). `question` names the one file or counts the many,
           `consequence` says whether they sync, `recovery` says a copy is kept,
           and `refusals` names anything keeper will not touch. Nothing here
           paraphrases: a confirmation composed in TypeScript from a count and a
           glyph would be a second reading of the engine's answer, in the one
           place a wrong reading costs a file. */}
-      <AlertDialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{pending?.plan.question}</AlertDialogTitle>
-            <AlertDialogDescription data-testid={FILES_CONFIRM_TESTID}>
-              {pending?.plan.consequence} {pending?.plan.recovery}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          {pending !== null && pending.plan.files.length > 1 && (
-            <ul className="max-h-40 overflow-y-auto text-muted-foreground text-sm">
-              {pending.plan.files.map((file) => (
-                <li key={file}>{file}</li>
-              ))}
-            </ul>
-          )}
-          {pending !== null && pending.plan.refusals.length > 0 && (
-            <ul className="text-destructive text-sm">
-              {pending.plan.refusals.map((refusal) => (
-                <li key={refusal.relativePath}>{refusal.reason}</li>
-              ))}
-            </ul>
-          )}
-          <AlertDialogFooter>
-            <AlertDialogCancel>{FILES_CANCEL_LABEL}</AlertDialogCancel>
-            {/* Absent, not disabled, when there is nothing left to delete: the
+        <AlertDialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{pending?.plan.question}</AlertDialogTitle>
+              <AlertDialogDescription data-testid={FILES_CONFIRM_TESTID}>
+                {pending?.plan.consequence} {pending?.plan.recovery}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {pending !== null && pending.plan.files.length > 1 && (
+              <ul className="max-h-40 overflow-y-auto text-muted-foreground text-sm">
+                {pending.plan.files.map((file) => (
+                  <li key={file}>{file}</li>
+                ))}
+              </ul>
+            )}
+            {pending !== null && pending.plan.refusals.length > 0 && (
+              <ul className="text-destructive text-sm">
+                {pending.plan.refusals.map((refusal) => (
+                  <li key={refusal.relativePath}>{refusal.reason}</li>
+                ))}
+              </ul>
+            )}
+            <AlertDialogFooter>
+              <AlertDialogCancel>{FILES_CANCEL_LABEL}</AlertDialogCancel>
+              {/* Absent, not disabled, when there is nothing left to delete: the
                 refusals above already say why, and a greyed-out Delete invites
                 a second click at the one thing that will not happen. */}
-            {pending !== null && pending.plan.files.length > 0 && (
-              <AlertDialogAction variant="destructive" onClick={confirmDelete}>
-                {FILES_DELETE_LABEL}
-              </AlertDialogAction>
-            )}
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+              {pending !== null && pending.plan.files.length > 0 && (
+                <AlertDialogAction variant="destructive" onClick={confirmDelete}>
+                  {FILES_DELETE_LABEL}
+                </AlertDialogAction>
+              )}
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
-      {/* Story 45.13. Mounted only while open, like the create row: it holds
+        {/* Story 45.13. Mounted only while open, like the create row: it holds
           a search and an outcome that belong to one gesture, and a person who
           closed it and selected different files must not find the old sentence
           waiting for them. */}
-      {attaching && activeVaultId !== null && (
-        <AttachToNoteDialog
-          vaultId={activeVaultId}
-          sources={attachablePaths}
-          onClose={() => setAttaching(false)}
-        />
-      )}
-    </section>
+        {attaching && activeVaultId !== null && (
+          <AttachToNoteDialog
+            vaultId={activeVaultId}
+            sources={attachablePaths}
+            onClose={() => setAttaching(false)}
+          />
+        )}
+      </section>
+      {tree.seam}
+    </>
   );
 }

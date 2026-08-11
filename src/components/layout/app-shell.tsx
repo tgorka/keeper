@@ -44,6 +44,7 @@ import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { hydrateColumnFold } from "@/lib/stores/column-fold";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { hydrateFilesTree } from "@/lib/stores/files-tree";
 import { hydratePanels } from "@/lib/stores/panels";
@@ -134,6 +135,15 @@ export function AppShell() {
   // something else. Idempotent, like the two above.
   useEffect(() => {
     hydrateFilesTree(document.cookie);
+  }, []);
+  // Restore which surface COLUMNS were folded (Story 48.1), for the fourth time
+  // and the same reason, doubled: the notes rail, the note list, the Files tree
+  // and the chat list live on three different primary views, and every one of
+  // them is unmounted whenever another is showing. Four hydration points would
+  // be four chances to forget one, and the forgotten one is invisible until
+  // somebody switches surfaces twice. Idempotent, like the three above.
+  useEffect(() => {
+    hydrateColumnFold(document.cookie);
   }, []);
   // The user's fold, and how it composes with the viewport's.
   //

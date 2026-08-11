@@ -310,6 +310,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import { NOTE_DELETE_CANCEL, NOTE_DELETE_CONFIRM } from "@/components/notes/note-delete-dialog";
 import {
   NEW_NOTE_LABEL,
@@ -318,14 +319,18 @@ import {
   NotesPane,
 } from "@/components/notes/notes-pane";
 import { RESTORE_DEFAULTS } from "@/components/notes/space-list";
+import { COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WINDOW_ROW_ATTR } from "@/components/ui/window-list";
+import { COLUMN_WIDTH_COOKIE, SURFACE_COLUMNS } from "@/lib/column-widths";
 import { notesCreate, notesDelete, notesDeletePlan } from "@/lib/ipc/client";
+import { COLUMN_FOLD_COOKIE, resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
 import {
   NOTES_RAIL_FOLD_COOKIE,
   notesRailFoldCookie,
+  readNotesRailFold,
   resetNotesRailFoldForTest,
 } from "@/lib/stores/notes-rail-fold";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
@@ -385,6 +390,14 @@ beforeEach(() => {
   primaryViewStore.getState().setView("notes");
 });
 
+/**
+ * Story 48.1: this pane's two fixed columns fold and resize. Both halves have
+ * to go between tests, like every other cookie-backed fold in this file.
+ */
+beforeEach(() => {
+  resetColumnFoldForTest();
+});
+
 afterEach(() => {
   resetNotesVaultsStoreForTest();
   resetNotesListStoreForTest();
@@ -394,6 +407,11 @@ afterEach(() => {
   // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranged
   document.cookie = `${NOTES_RAIL_FOLD_COOKIE}=; path=/; max-age=0`;
   primaryViewStore.getState().setView("inbox");
+  resetColumnFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranged
+  document.cookie = `${COLUMN_FOLD_COOKIE}=; path=/; max-age=0`;
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranged
+  document.cookie = `${COLUMN_WIDTH_COOKIE}=; path=/; max-age=0`;
 });
 
 /**
@@ -423,6 +441,90 @@ describe("NotesPane rail fold", () => {
     // Files unfolded, against its own default of shut — so this cannot pass on
     // a pane that ignored the cookie and fell back to the defaults.
     expect(screen.getByRole("button", { name: "Collapse Files" })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Story 48.1, and the reported defect: after Story 47.3 the owner wrote back
+ * "wciaz tylko pierwsza kolumna jest mozliwa do foldowania" — still only the
+ * first column folds. 47.3 folded the SECTIONS inside the rail, which is a
+ * different thing from the rail.
+ *
+ * Asserted against the real pane and not against `useSurfaceColumn`, because
+ * the whole defect was a mechanism that existed and was not wired to a column.
+ * `surface-column.test.tsx` proves what a folded column does; this proves this
+ * pane has two of them.
+ */
+describe("NotesPane columns", () => {
+  const railFold = `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`;
+  const listFold = `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-list"].label}`;
+
+  it("folds the rail without taking the list with it", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(screen.getByRole("button", { name: railFold }));
+
+    // The rail's contents are gone — the create button, the spaces — and the
+    // list beside it is untouched.
+    expect(screen.queryByRole("button", { name: NEW_NOTE_LABEL })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_EXPAND_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("folds the list without taking the rail with it", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(screen.getByRole("button", { name: listFold }));
+
+    expect(screen.queryByRole("button", { name: /Note, Pricing/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeInTheDocument();
+  });
+
+  it("puts a seam on each column, and takes the folded one's away", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+
+    expect(
+      screen.getByRole("separator", {
+        name: `${COLUMN_RESIZER_LABEL} ${SURFACE_COLUMNS["notes-rail"].label}`,
+      }),
+    ).toBeInTheDocument();
+    const listSeam = `${COLUMN_RESIZER_LABEL} ${SURFACE_COLUMNS["notes-list"].label}`;
+    expect(screen.getByRole("separator", { name: listSeam })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: listFold }));
+    expect(screen.queryByRole("separator", { name: listSeam })).not.toBeInTheDocument();
+  });
+
+  /**
+   * The two namespaces this story refused to share, proved rather than
+   * asserted: folding the COLUMN leaves the SECTIONS as the user left them, so
+   * unfolding gives back the rail they had rather than a default one.
+   */
+  it("does not disturb which rail sections are folded", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging the cookie is this test's subject
+    document.cookie = notesRailFoldCookie({ spaces: true, tags: false, files: false });
+    renderPane();
+    await waitForRows("Pricing");
+    expect(await screen.findByRole("button", { name: "Expand Spaces" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: railFold }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${COLUMN_EXPAND_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
+      }),
+    );
+
+    expect(await screen.findByRole("button", { name: "Expand Spaces" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
+    expect(readNotesRailFold(document.cookie).spaces).toBe(true);
   });
 });
 

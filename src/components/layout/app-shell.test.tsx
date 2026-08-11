@@ -1,7 +1,15 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
+import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  COLUMN_FOLD_COOKIE,
+  columnFoldCookie,
+  columnsUnfolded,
+  resetColumnFoldForTest,
+} from "@/lib/stores/column-fold";
 import { detailStore } from "@/lib/stores/detail-ui";
 import {
   FILES_TREE_COOKIE,
@@ -83,6 +91,11 @@ afterEach(() => {
   resetFilesTreeForTest();
   // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
   document.cookie = `${FILES_TREE_COOKIE}=; path=/; max-age=0`;
+  // Story 48.1's surface-column fold, for the same reason and with the same two
+  // halves: a module-level store and a cookie.
+  resetColumnFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${COLUMN_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("AppShell", () => {
@@ -509,5 +522,76 @@ describe("AppShell", () => {
     expect(screen.queryByRole("button", { name: "Collapse menu" })).not.toBeInTheDocument();
     // Still navigable, still named.
     expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
+  });
+
+  /**
+   * The surface columns come back folded (Story 48.1), asserted at the SHELL for
+   * the fourth time and the fourth instance of the same reason.
+   *
+   * `hydrateColumnFold` is mounted here and nowhere else, because the four
+   * columns live on three primary views that are each unmounted whenever
+   * another is showing. `column-fold.test.ts` calls the hydrate itself and
+   * would pass unchanged on a build where `AppShell` never did (DW-172) — which
+   * is exactly the defect Story 45.15 shipped one epic ago, a whole chain built
+   * and never mounted.
+   *
+   * The chat list is the column this test can reach: it is what the default
+   * "inbox" view renders.
+   */
+  it("brings the chat list back folded when the last run left it folded", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = columnFoldCookie({ ...columnsUnfolded(), "chat-list": true });
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const label = SURFACE_COLUMNS["chat-list"].label;
+    expect(
+      screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).toBeInTheDocument();
+    // The list itself is gone, and the conversation pane beside it is not.
+    expect(screen.queryByLabelText("Loading conversations")).not.toBeInTheDocument();
+    expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+
+  it("brings it back showing when the last run left it showing", async () => {
+    // The other arm: "folded" is the state a restore that did nothing could not
+    // produce, and "showing" is the state it could.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = columnFoldCookie(columnsUnfolded());
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["chat-list"].label}`,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("keeps offering the column folds below the sidebar's collapse breakpoint", async () => {
+    // The sidebar's own fold is WITHDRAWN under 1080px because the viewport has
+    // already forced it. A surface column is the opposite case: it is exactly
+    // where room is short that putting one away is worth offering, and nothing
+    // has decided it for the user.
+    mockViewportWidth(1000);
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("button", { name: "Collapse menu" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["chat-list"].label}`,
+      }),
+    ).toBeInTheDocument();
   });
 });

@@ -44,6 +44,7 @@
 import { FilePlus } from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { PanelStrip } from "@/components/layout/panel-strip";
+import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
@@ -112,6 +113,11 @@ export const NOTES_NOTICE_SLOT = "notes-create-notice";
 export const NOTES_PANEL_EMPTY_SENTENCE = "Nothing is open here yet. Click a note to open it.";
 
 export function NotesPane() {
+  // Both of this surface's fixed columns fold and resize (Story 48.1). The
+  // panel strip does not: it is the flexible one, and a surface where every
+  // column has a width is a surface with a gap in it.
+  const rail = useSurfaceColumn("notes-rail");
+  const list = useSurfaceColumn("notes-list");
   const vaults = useNotesVaultsStore((s) => s.vaults);
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
@@ -375,122 +381,136 @@ export function NotesPane() {
 
   return (
     <div className="flex min-h-0 flex-1">
-      {/* Pane 1 — the scope column. */}
+      {/* Pane 1 — the scope column (Story 48.1: it folds, and it resizes). */}
       <nav
         aria-label="Notes"
-        className="flex h-full min-h-0 w-[240px] shrink-0 flex-col border-border border-r bg-sidebar"
+        {...rail.rootProps}
+        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-sidebar"
       >
-        <div className="shrink-0 p-2">
-          <VaultSwitcher />
-        </div>
-        {/* The rail's own create (Story 44.6). At the head of the column and
-            not inside the Spaces group: this one makes a note in the vault,
-            which the default list shows, while the `+` on a space row makes a
-            note that space will list. Two different promises need two
-            different controls. */}
-        <div className="shrink-0 px-2 pb-2">
-          <button
-            type="button"
-            disabled={activeVaultId === null}
-            onClick={() => onCreate(null)}
-            className={cn(
-              "flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left text-sm outline-none",
-              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-              "disabled:pointer-events-none disabled:opacity-50",
-            )}
-          >
-            <FilePlus aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-            {NEW_NOTE_LABEL}
-          </button>
-        </div>
-        {/* Every group below is unbounded — spaces as much as tags, now that
-            the four fixed rows are spaces too — so they share one scroll
-            container and everything in it stays reachable at every size
-            (AD-34-4). */}
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
-          <SpaceList vaultId={activeVaultId} onNewNote={(space) => onCreate(space.id)} />
-          <TagTree vaultId={activeVaultId} />
-          <PhysicalTree vaultId={activeVaultId} />
-        </div>
+        {rail.chrome}
+        {!rail.folded && (
+          <>
+            <div className="shrink-0 p-2">
+              <VaultSwitcher />
+            </div>
+            {/* The rail's own create (Story 44.6). At the head of the column and
+                not inside the Spaces group: this one makes a note in the vault,
+                which the default list shows, while the `+` on a space row makes a
+                note that space will list. Two different promises need two
+                different controls. */}
+            <div className="shrink-0 px-2 pb-2">
+              <button
+                type="button"
+                disabled={activeVaultId === null}
+                onClick={() => onCreate(null)}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left text-sm outline-none",
+                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                  "disabled:pointer-events-none disabled:opacity-50",
+                )}
+              >
+                <FilePlus aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                {NEW_NOTE_LABEL}
+              </button>
+            </div>
+            {/* Every group below is unbounded — spaces as much as tags, now that
+                the four fixed rows are spaces too — so they share one scroll
+                container and everything in it stays reachable at every size
+                (AD-34-4). */}
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
+              <SpaceList vaultId={activeVaultId} onNewNote={(space) => onCreate(space.id)} />
+              <TagTree vaultId={activeVaultId} />
+              <PhysicalTree vaultId={activeVaultId} />
+            </div>
+          </>
+        )}
       </nav>
+      {rail.seam}
 
       {/* Pane 2 — the list. The primary surface (UX-DR37). */}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: the column hosts the Esc chip-walk so it works from a row as well as from the bar; every control inside stays independently operable. */}
       <div
         onKeyDown={onColumnKeyDown}
-        className="flex h-full min-h-0 w-[320px] shrink-0 flex-col border-border border-r bg-background"
+        {...list.rootProps}
+        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-background"
       >
-        {!noVault && <NoteFilterBar onSaveAsSpace={onSaveAsSpace} searchRef={searchRef} />}
-        {/* A cold scan in flight, under the chip bar (FR-96, AD-57). The list
-            stays interactive throughout — you can open the first note before the
-            last one is found — so this is a thin bar and not a blocking state.
-            A corrupt cache takes the same branch as an absent one: a rescan,
-            never an error message. */}
-        {scanning && (
-          <div
-            role="status"
-            aria-label="Reading this vault"
-            data-slot="notes-index-progress"
-            className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
-          >
-            <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
-          </div>
-        )}
-        {actionError !== null && (
-          <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
-            {actionError}
-          </p>
-        )}
-        {/* What Rust said about a create that could not be what the space asked
-            for. `status` and not `alert`: the note was written, and the only
-            thing wrong is where it is not. Each sentence is composed in Rust,
-            because the reason names query terms and this surface does not read
-            queries. */}
-        {notices.map((notice) => (
-          <p
-            key={notice}
-            role="status"
-            data-slot={NOTES_NOTICE_SLOT}
-            className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
-          >
-            {notice}
-          </p>
-        ))}
-        {/* How many notes this lens selects (Story 44.11, FR-166).
+        {list.chrome}
+        {!list.folded && (
+          <>
+            {!noVault && <NoteFilterBar onSaveAsSpace={onSaveAsSpace} searchRef={searchRef} />}
+            {/* A cold scan in flight, under the chip bar (FR-96, AD-57). The list
+                stays interactive throughout — you can open the first note before the
+                last one is found — so this is a thin bar and not a blocking state.
+                A corrupt cache takes the same branch as an absent one: a rescan,
+                never an error message. */}
+            {scanning && (
+              <div
+                role="status"
+                aria-label="Reading this vault"
+                data-slot="notes-index-progress"
+                className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
+              >
+                <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
+              </div>
+            )}
+            {actionError !== null && (
+              <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
+                {actionError}
+              </p>
+            )}
+            {/* What Rust said about a create that could not be what the space asked
+                for. `status` and not `alert`: the note was written, and the only
+                thing wrong is where it is not. Each sentence is composed in Rust,
+                because the reason names query terms and this surface does not read
+                queries. */}
+            {notices.map((notice) => (
+              <p
+                key={notice}
+                role="status"
+                data-slot={NOTES_NOTICE_SLOT}
+                className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
+              >
+                {notice}
+              </p>
+            ))}
+            {/* How many notes this lens selects (Story 44.11, FR-166).
 
-            Above the list rather than inside it, and a sibling of the empty
-            state rather than a child of `NoteList`, because an empty set has to
-            say zero. `NoteList` is not rendered at all when the vault or the
-            filter comes up empty, and a count that vanishes exactly when the
-            answer is "none" is a count that never answers the question anyone
-            asks it.
+                Above the list rather than inside it, and a sibling of the empty
+                state rather than a child of `NoteList`, because an empty set has to
+                say zero. `NoteList` is not rendered at all when the vault or the
+                filter comes up empty, and a count that vanishes exactly when the
+                answer is "none" is a count that never answers the question anyone
+                asks it.
 
-            `total` and never `rows.length`: the list is windowed and the page
-            is 200, so the array on screen is a screenful of a vault. */}
-        {!noVault && loaded && (
-          <p
-            role="status"
-            data-slot={NOTES_COUNT_SLOT}
-            className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
-          >
-            {countLabel(total, NOTES, { of: matched })}
-          </p>
-        )}
-        {emptyKind !== null ? (
-          <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
-        ) : (
-          <NoteList
-            rows={rows}
-            total={total}
-            selectedId={openNoteId}
-            onSelect={openRow}
-            onSelectBeside={openRowBeside}
-            onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
-            onVerb={runVerb}
-            onGrow={() => notesListStore.getState().growWindow()}
-          />
+                `total` and never `rows.length`: the list is windowed and the page
+                is 200, so the array on screen is a screenful of a vault. */}
+            {!noVault && loaded && (
+              <p
+                role="status"
+                data-slot={NOTES_COUNT_SLOT}
+                className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
+              >
+                {countLabel(total, NOTES, { of: matched })}
+              </p>
+            )}
+            {emptyKind !== null ? (
+              <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
+            ) : (
+              <NoteList
+                rows={rows}
+                total={total}
+                selectedId={openNoteId}
+                onSelect={openRow}
+                onSelectBeside={openRowBeside}
+                onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+                onVerb={runVerb}
+                onGrow={() => notesListStore.getState().growWindow()}
+              />
+            )}
+          </>
         )}
       </div>
+      {list.seam}
 
       {/* Pane 3 — the panels (Story 46.12).
 
