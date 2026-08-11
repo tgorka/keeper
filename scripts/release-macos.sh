@@ -88,8 +88,12 @@ export TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 # identity, builds, and then VERIFIES the designated requirement is identity-based
 # rather than a bare cdhash. That verification is the point: an ad-hoc signature
 # changes identity on every build, so TCC grants and keychain items stop matching.
-say "building (signed)"
-bash "$SCRIPT_DIR/build-macos-signed.sh"
+say "building (signed, app + dmg)"
+# The shared build defaults to `--bundles app` because that is what an install
+# wants; a release needs the disk image too and has to ask for it. Without this
+# the build succeeds, takes its full time, and the check below fails on an
+# artifact that was never requested.
+KEEPER_BUNDLES=app,dmg bash "$SCRIPT_DIR/build-macos-signed.sh"
 [ -f "$DMG" ] || fail "no dmg at $DMG"
 
 # --- The updater payload -----------------------------------------------------

@@ -69,14 +69,19 @@ echo "==> Bundle identifier: $BUNDLE_ID"
 # createUpdaterArtifacts is disabled for local builds: the updater's minisign
 # private key is a release-only secret, and without it Tauri fails the build
 # *after* bundling. Merged in as an overlay so the committed config stays clean.
-# `--bundles app` because nothing here wants a dmg: this path produces the app
-# that goes straight into /Applications, and building the disk image as well
-# adds minutes to every install for an artifact release-macos.sh owns.
+# Bundles: `app` by default because the install path wants the bundle that goes
+# straight into /Applications, and building the disk image as well adds minutes
+# to every install. `release-macos.sh` needs the dmg and asks for it through
+# `KEEPER_BUNDLES` — this used to be a comment claiming release-macos.sh "owns"
+# the dmg with no way for it to say so, and the release failed at the
+# `[ -f "$DMG" ]` check after a full signed build.
+KEEPER_BUNDLES="${KEEPER_BUNDLES:-app}"
+echo "==> Bundles: $KEEPER_BUNDLES"
 bash "$SCRIPT_DIR/build-keeper-rec.sh"
 bunx tauri build \
   --config src-tauri/crates/keeper/tauri.conf.json \
   --config '{"bundle":{"createUpdaterArtifacts":false}}' \
-  --bundles app
+  --bundles "$KEEPER_BUNDLES"
 
 # --- Verify the signature is actually stable -------------------------------
 keeper_require_stable_signature "$APP"
