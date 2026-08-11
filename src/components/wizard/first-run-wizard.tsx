@@ -149,7 +149,7 @@ function WelcomeStep() {
   return (
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-6 p-6">
       <div className="flex flex-col gap-2 text-center">
-        <h1 className="font-heading font-medium text-2xl">Welcome to keeper</h1>
+        <h1 className="font-heading text-display">Welcome to keeper</h1>
         <p className="text-muted-foreground text-sm">
           Let's get you connected. First sign in to a Matrix account, then bring your other chat
           networks in through bridges. You can skip any step and finish later.
@@ -245,7 +245,7 @@ function DiscoveryStep() {
   return (
     <div className="mx-auto flex w-full max-w-lg flex-1 flex-col gap-6 p-6">
       <div className="flex flex-col gap-2 text-center">
-        <h1 className="font-heading font-medium text-2xl">Connect your networks</h1>
+        <h1 className="font-heading text-display">Connect your networks</h1>
         <p className="text-muted-foreground text-sm">
           Connect a network to bring its chats into keeper. You can set these up later from the
           Bridges surface too.
@@ -348,7 +348,7 @@ function DoneStep({ onFinish }: { onFinish: () => void }) {
   return (
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-6 p-6 text-center">
       <div className="flex flex-col gap-2">
-        <h1 className="font-heading font-medium text-2xl">You're all set</h1>
+        <h1 className="font-heading text-display">You're all set</h1>
         <p className="text-muted-foreground text-sm">
           Your inbox is ready. You can add more accounts or set up more bridges any time from
           Settings.

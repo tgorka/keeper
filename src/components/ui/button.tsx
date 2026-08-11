@@ -4,8 +4,18 @@ import type * as React from "react";
 
 import { cn } from "@/lib/utils";
 
+// The focus ring is `ring-2 ring-ring` at FULL strength, and that is measured
+// rather than chosen. The shadcn default this replaced — `ring-3 ring-ring/50` —
+// blends to #96a880 over the light theme's card and measures 2.12:1 against it,
+// under the 3:1 that WCAG 2.4.11 requires of a focus indicator. It passed in dark
+// (3.14:1) and failed in light, which is the one-value-two-themes trap the palette
+// is full of. Full strength measures 5.61:1 light / 8.73:1 dark.
+//
+// This being wrong is why 58 call sites had each pasted `focus-visible:ring-2
+// focus-visible:ring-ring` over the top. They were not styling; they were patching
+// a broken default one component at a time. Fixed here, they are all redundant.
 const buttonVariants = cva(
-  "group/button inline-flex shrink-0 items-center justify-center rounded-md border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:not-aria-[haspopup]:translate-y-px disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "group/button inline-flex shrink-0 items-center justify-center rounded-md border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring active:not-aria-[haspopup]:translate-y-px disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {

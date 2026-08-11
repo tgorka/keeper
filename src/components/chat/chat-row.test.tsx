@@ -447,15 +447,40 @@ describe("ChatRow", () => {
     expect(screen.queryByLabelText(/network$/)).not.toBeInTheDocument();
   });
 
-  // --- Affected-row health dot (Story 6.5) ---------------------------------
+  // --- Affected-row health lamp (Story 6.5) --------------------------------
 
-  it("shows a health dot when the row's (accountId, networkId) session is unhealthy", () => {
+  it("shows a health lamp when the row's (accountId, networkId) session is unhealthy", () => {
     const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
     seedHealth(accountId, "whatsapp", "disconnected");
     render(<ChatRow room={room({ accountId, network: "WhatsApp", networkId: "whatsapp" })} />);
-    const dot = screen.getByTestId("bridge-health-dot");
-    expect(dot).toBeInTheDocument();
-    expect(dot).toHaveClass("bg-bridge-disconnected");
+    const lamp = screen.getByTestId("bridge-health-dot");
+    expect(lamp).toBeInTheDocument();
+    // Not a tint assertion. This row used to say "unreachable" in red and
+    // nothing else, which SC 1.4.1 forbids and which a screen reader never got
+    // at all. The state has to arrive as a shape AND as text; colour is the
+    // third channel and the least load-bearing of them.
+    expect(lamp).toHaveAttribute("data-state", "fault");
+    // Specifically the row's accessible NAME, not merely text somewhere in the
+    // DOM: the button carries an explicit `aria-label`, so `sr-only` text
+    // inside it is replaced rather than appended and would be announced to
+    // nobody. Asserting `toHaveTextContent` alone would pass over that.
+    expect(
+      screen.getByRole("button", { name: /Conversation with .*, Disconnected$/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("tells a degraded session apart from a disconnected one without colour", () => {
+    // Two unhealthy states on the same row. If a later change gives them one
+    // shape and leaves amber-versus-red to carry the difference, this fails.
+    const accountId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    seedHealth(accountId, "whatsapp", "degraded");
+    render(<ChatRow room={room({ accountId, network: "WhatsApp", networkId: "whatsapp" })} />);
+    const lamp = screen.getByTestId("bridge-health-dot");
+    expect(lamp).toHaveAttribute("data-state", "working");
+    expect(lamp.getAttribute("data-state")).not.toBe("fault");
+    expect(
+      screen.getByRole("button", { name: /Conversation with .*, Action needed$/ }),
+    ).toBeInTheDocument();
   });
 
   it("shows no health dot when the session is healthy", () => {

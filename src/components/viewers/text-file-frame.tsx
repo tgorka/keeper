@@ -226,8 +226,7 @@ export function TextFileFrame({
             <Button
               type="button"
               variant="outline"
-              size="sm"
-              className="h-6 px-2 text-xs"
+              size="xs"
               disabled={!dirty}
               title={dirty ? undefined : FILE_SAVE_CLEAN_TITLE}
               // The same call `Mod-s` makes, and the only one: the hook holds the

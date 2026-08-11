@@ -159,15 +159,15 @@ export function SyncGitRow({ open }: { open: boolean }) {
       <p className="font-medium">{SYNC_GIT_TITLE}</p>
       {/* The Rust-composed line, verbatim in both directions: it is the same
           sentence `keeper-syncd doctor` prints, so the two surfaces cannot word
-          one machine's state two different ways. */}
+          one machine's state two different ways. Verbatim is not the same as
+          terminal, so it is set in the room's voice; `figures` keeps the version
+          numbers in it from reflowing the line. */}
       {healthy
         ? report.summary !== null && (
-            <p className="font-mono text-muted-foreground text-xs">{report.summary}</p>
+            <p className="figures text-muted-foreground text-xs">{report.summary}</p>
           )
         : report.problem !== null && (
-            <p className="whitespace-pre-line font-mono text-destructive text-xs">
-              {report.problem}
-            </p>
+            <p className="figures whitespace-pre-line text-destructive text-xs">{report.problem}</p>
           )}
       <p className="text-muted-foreground text-xs">
         {healthy ? SYNC_GIT_OK_NOTE : SYNC_GIT_PROBLEM_NOTE}

@@ -88,7 +88,7 @@ export function VaultSwitcher() {
           type="button"
           variant="ghost"
           aria-label={active === null ? "Choose a vault" : `Vault ${active.name}`}
-          className="w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          className="w-full justify-start gap-2"
         >
           <NotebookPen aria-hidden="true" className="shrink-0" />
           <span className="min-w-0 truncate text-sm">{active?.name ?? "Choose a vault"}</span>

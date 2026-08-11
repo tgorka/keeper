@@ -419,7 +419,7 @@ export function PropertiesPanel({
           disk rather than rewriting them.
         </p>
         <div className="mt-1 flex items-start gap-1">
-          <pre className="min-w-0 flex-1 overflow-x-auto font-mono text-[11px]">{preview}</pre>
+          <pre className="min-w-0 flex-1 overflow-x-auto font-mono text-meta">{preview}</pre>
           {preview !== frontmatter && (
             <FullValueButton name={UNPARSED_BLOCK_LABEL} value={frontmatter} monospace />
           )}
@@ -558,7 +558,7 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
   // scrolled at all.
   if (entry.key === "id" || entry.key === SESSION_KEY) {
     return (
-      <div className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+      <div className="min-w-0 flex-1 text-meta text-muted-foreground">
         <OverflowValue name={entry.key} value={entry.text} monospace />
       </div>
     );
@@ -1133,7 +1133,7 @@ interface RecordingPathProps {
 function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) {
   return (
     <div className="flex min-w-0 items-center gap-1">
-      <div className="min-w-0 flex-1 text-[11px]">
+      <div className="min-w-0 flex-1 text-meta">
         <OverflowValue name={fileName(relativePath)} value={relativePath} monospace />
       </div>
       <DropdownMenu>

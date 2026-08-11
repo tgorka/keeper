@@ -49,7 +49,9 @@
  * of any live region. Stop/Restart/Dismiss are explicit focusable buttons —
  * `Esc` never stops or restarts a recording (no key handler exists here).
  */
+import { TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Lamp } from "@/components/ui/lamp";
 import { isLiveRecording } from "@/hooks/use-recording-session";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import type { RecordingDurabilityVm, RecordingStatusVm } from "@/lib/ipc/client";
@@ -167,13 +169,15 @@ export function ActiveRecordingBanner({
       >
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
-            {/* The error dot: recording-red (reserved for dot/edge/fill) and
-                ALWAYS steady — a failed session never pulses, reduced motion
-                or not. */}
-            <span
-              aria-hidden="true"
+            {/* The error lamp: the bitten disc, in recording-red (reserved for
+                dot/edge/fill) and ALWAYS steady — a failed session never
+                pulses, reduced motion or not. Silent to a screen reader
+                because "Recording failed" is spelled out beside it. */}
+            <Lamp
+              state="fault"
+              label={null}
               data-testid="recording-error-dot"
-              className="size-2.5 shrink-0 rounded-full bg-recording-red"
+              className="text-recording-red"
             />
             {/* The honest reason, announced assertively as a loss-risk event
                 (role="alert") — the single failed-note surface (the pane
@@ -255,17 +259,17 @@ export function ActiveRecordingBanner({
 
       <div className="flex items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
-          {/* The live record dot: steady (never pulsing) under reduced motion. */}
-          <span
-            aria-hidden="true"
+          {/* The live record lamp: a filled disc, steady (never pulsing) under
+              reduced motion. The word "Recording" sits beside it, so the lamp
+              itself stays silent rather than announcing the state twice. */}
+          <Lamp
+            state="live"
+            label={null}
             data-testid="recording-dot"
-            className={cn(
-              "size-2.5 shrink-0 rounded-full bg-recording-red",
-              !reducedMotion && "animate-pulse",
-            )}
+            className={cn("text-recording-red", !reducedMotion && "animate-pulse")}
           />
           <span className="font-medium text-sm">Recording</span>
-          <span className="truncate font-mono text-muted-foreground text-sm tabular-nums">
+          <span className="truncate font-mono text-muted-foreground text-sm">
             {`${elapsed ?? "0:00"} · segment ${segment} · ${formatSize(status.onDiskBytes)}`}
           </span>
         </div>
@@ -284,7 +288,11 @@ export function ActiveRecordingBanner({
           data-testid="recording-warning"
           className="mt-1.5 flex items-center gap-1.5 text-held text-xs"
         >
-          <span aria-hidden="true">⚠</span>
+          {/* This was a bare ⚠ — an emoji, hidden from assistive tech, which
+              left amber as the only thing separating a warning from a plain
+              note. The icon is the shape; the `sr-only` word is the state. */}
+          <TriangleAlert aria-hidden="true" className="size-3.5 shrink-0" />
+          <span className="sr-only">Warning</span>
           {warning}
         </p>
       )}
@@ -333,7 +341,7 @@ export function ActiveRecordingBanner({
               style={{ width: `${fraction * 100}%` }}
             />
           </div>
-          <span className="font-mono text-muted-foreground text-xs tabular-nums">
+          <span className="font-mono text-muted-foreground text-xs">
             {`segment ${segment} · ${usedMb} / ${status.segmentCapMb} MB`}
           </span>
         </div>

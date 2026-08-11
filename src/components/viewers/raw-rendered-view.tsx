@@ -207,7 +207,7 @@ function StructurePane({ structure }: { structure: JsonStructure }): React.React
               <li
                 key={windowed.key}
                 {...props}
-                className="flex gap-2 px-3 font-mono text-destructive text-xs"
+                className="flex gap-2 px-3 text-destructive text-xs"
               >
                 {errorSentence(item.error)}
               </li>
@@ -232,8 +232,11 @@ function StructurePane({ structure }: { structure: JsonStructure }): React.React
               {row.duplicate ? (
                 // A repeated key is not an error and is not dropped: it is a
                 // fact about the file, and the later one is the one every JSON
-                // reader downstream will keep.
-                <span className="shrink-0 text-destructive">repeated key — this one wins</span>
+                // reader downstream will keep. A sentence, so it leaves the
+                // column face the name/kind/value cells beside it are set in.
+                <span className="shrink-0 font-sans text-destructive">
+                  repeated key — this one wins
+                </span>
               ) : null}
             </li>
           );

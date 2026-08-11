@@ -763,7 +763,11 @@ describe("DeviceSection (Story 34.5)", () => {
     const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
     expect(field).toHaveValue("hesperia");
     // The id is in every trailer, so someone reading `git log` can find it here.
-    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+    // Asserted through the line rather than as one text node: the id is its own
+    // element (it is set in the mono face and the label beside it is not).
+    expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
+      `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
+    );
   });
 
   it("renames on request, keeps the id, and says the change is for later commits", async () => {
@@ -784,7 +788,9 @@ describe("DeviceSection (Story 34.5)", () => {
       expect(screen.getByLabelText(SYNC_DEVICE_NAME_LABEL)).toHaveValue("Studio Mac"),
     );
     expect(screen.getByText(SYNC_DEVICE_SAVED_SENTENCE)).toBeInTheDocument();
-    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+    expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
+      `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
+    );
   });
 
   it("reports a refused rename instead of showing a name nothing will use", async () => {

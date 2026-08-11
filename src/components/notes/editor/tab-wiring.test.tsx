@@ -118,7 +118,9 @@ function press(node: HTMLElement, key: string, options: { shift?: boolean } = {}
 describe("Tab, in the editor the user actually types into", () => {
   it("indents the caret's line rather than escaping to the web view", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    // The header's Actions trigger is a glyph since 48.9, so its arrival is
+    // waited for by the name it answers to rather than by text it no longer has.
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const node = await content();
 
     const claimed = press(node, "Tab");
@@ -134,7 +136,7 @@ describe("Tab, in the editor the user actually types into", () => {
 
   it("keeps the escape hatch: Escape then Tab leaves, and writes nothing", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const node = await content();
 
     press(node, "Escape");
@@ -147,7 +149,7 @@ describe("Tab, in the editor the user actually types into", () => {
 
   it("outdents on Shift-Tab", async () => {
     render(<NoteEditor vaultId="v1" noteId="n1" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const node = await content();
 
     press(node, "Tab");

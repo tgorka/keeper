@@ -25,8 +25,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { deleteMessage, type IpcError, roomNetworkLabel } from "@/lib/ipc/client";
 
-const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
-
 interface DeleteMessageDialogProps {
   /** The account whose message is being deleted. */
   accountId: string;
@@ -158,12 +156,9 @@ export function DeleteMessageDialog({
           </p>
         )}
         <AlertDialogFooter>
-          <AlertDialogCancel className={FOCUS_RING} disabled={deleting}>
-            Cancel
-          </AlertDialogCancel>
+          <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
-            className={FOCUS_RING}
             // Disabled while a dispatch is in flight, and withdrawn entirely after a
             // terminal (non-retriable) failure so a vanished target offers no futile
             // retry — only Cancel remains to dismiss.

@@ -603,7 +603,7 @@ export function RecordingSummaryCard({
         {/* The announced outcome: what was saved and where it is. Non-interactive
             by contract — see the editor note above. */}
         <div role="status" className="flex flex-col gap-3">
-          <p className="text-sm">{summaryLine(variant, effectiveCount, effectiveBytes)}</p>
+          <p className="figures text-sm">{summaryLine(variant, effectiveCount, effectiveBytes)}</p>
           <p
             className="break-all font-mono text-muted-foreground text-xs"
             data-testid={SUMMARY_FOLDER_TESTID}

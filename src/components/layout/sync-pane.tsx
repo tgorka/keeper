@@ -730,7 +730,7 @@ export function SyncPane() {
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">Sync</h1>
+          <h1 className="font-heading text-title">Sync</h1>
           <p className="text-muted-foreground text-sm">{SYNC_PANE_SUBTITLE}</p>
         </div>
         {profiles !== null && !empty && (
@@ -935,9 +935,11 @@ function SyncProfileCard({
                 </Badge>
               )}
             </div>
-            {/* Verbatim, never recomposed: the tray renders this same sentence. */}
+            {/* Verbatim, never recomposed: the tray renders this same sentence.
+                A sentence, though — so it is set in the room's voice. Mono is
+                for the things below it that line up. */}
             {status !== undefined && (
-              <span className="font-mono text-muted-foreground text-xs">{status.line}</span>
+              <span className="figures text-muted-foreground text-xs">{status.line}</span>
             )}
             {/* Where it lives and where it points, on one line: two stacked
                 muted lines under an already-muted status line read as one grey
@@ -1158,9 +1160,7 @@ function SyncActivityList({
       {/* The project's group-label treatment (the Bridges / Approvals panes and
           the sidebar groups): a quiet micro-label, so the card's own title
           stays the loudest thing in it. */}
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_ACTIVITY_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_ACTIVITY_TITLE}</h2>
       {rows === null ? (
         <p className="text-muted-foreground text-xs">{SYNC_LIST_LOADING_SENTENCE}</p>
       ) : rows.length === 0 ? (
@@ -1190,11 +1190,11 @@ function SyncActivityList({
                     claim the file was empty, and "unknown" is noise on a line
                     already busy answering when. */}
                 {row.sizeBytes !== null && (
-                  <span className="shrink-0 text-muted-foreground text-xs">
+                  <span className="shrink-0 font-mono text-muted-foreground text-xs">
                     {formatCopyBytes(row.sizeBytes)}
                   </span>
                 )}
-                <span className="shrink-0 text-muted-foreground text-xs">
+                <span className="figures shrink-0 text-muted-foreground text-xs">
                   {formatDraftAge(row.tsMs)}
                 </span>
                 <SyncDeliveryMark row={row} busy={busy} onRetry={onRetry} />
@@ -1293,7 +1293,10 @@ function SyncDeliveryMark({
             breaking while it is in fact doing the careful thing. That is the
             same mistake the engine used to make by reporting every deferred
             unit as a missing drive. */}
-        <p className={`font-mono text-xs [overflow-wrap:anywhere] ${state.tone}`}>{row.failure}</p>
+        {/* Sans, not mono: this is a sentence git or LFS wrote, and a sentence
+            set in the register's face is terminal cosplay. The face is for
+            things that line up. */}
+        <p className={`text-xs [overflow-wrap:anywhere] ${state.tone}`}>{row.failure}</p>
         {/* No Retry for a failed row: keeper has not stopped, and a button
             saying otherwise would invite a click that changes nothing. */}
         {row.delivery === "failed" && (
@@ -1329,9 +1332,7 @@ function SyncPendingList({
   const fold = useFold(rows);
   return (
     <div className="flex flex-col gap-2">
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_PENDING_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_PENDING_TITLE}</h2>
       {rows === null ? (
         <p className="text-muted-foreground text-xs">{SYNC_LIST_LOADING_SENTENCE}</p>
       ) : rows.length === 0 ? (
@@ -1397,9 +1398,7 @@ function SyncProblemsSection({
 
   return (
     <div className="flex flex-col gap-3">
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_PROBLEMS_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_PROBLEMS_TITLE}</h2>
       {/* The split AD-S5 draws, in the two treatments the app already has: an
           error needs a human before the folder can progress, so it gets the
           actionable destructive notice; a warning is passive, so it gets the
@@ -1411,13 +1410,18 @@ function SyncProblemsSection({
       )}
       {problems.warning !== null && (
         <p className="flex items-start gap-1.5 text-held text-xs">
-          <span aria-hidden="true">⚠</span>
+          {/* The tone was a bare ⚠ — an emoji, hidden from assistive tech, so
+              the only thing marking this line as a warning rather than a
+              statement was its amber. The icon carries the shape and the
+              `sr-only` word carries the state, as the delivery marks above do. */}
+          <TriangleAlert aria-hidden="true" className="mt-px size-3.5 shrink-0" />
+          <span className="sr-only">Warning</span>
           {problems.warning}
         </p>
       )}
       {problems.conflicts.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <h3 className="font-medium text-xs">{SYNC_CONFLICT_TITLE}</h3>
+          <h3 className="font-heading text-sm font-semibold">{SYNC_CONFLICT_TITLE}</h3>
           <p className="text-muted-foreground text-xs">{SYNC_CONFLICT_SENTENCE}</p>
           <ul
             aria-label={`${SYNC_CONFLICT_TITLE}: ${profile.name}`}
@@ -1434,7 +1438,7 @@ function SyncProblemsSection({
       )}
       {problems.unspellable.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <h3 className="font-medium text-xs">{SYNC_UNSPELLABLE_TITLE}</h3>
+          <h3 className="font-heading text-sm font-semibold">{SYNC_UNSPELLABLE_TITLE}</h3>
           <p className="text-muted-foreground text-xs">{SYNC_UNSPELLABLE_SENTENCE}</p>
           <ul
             aria-label={`${SYNC_UNSPELLABLE_TITLE}: ${profile.name}`}
@@ -1451,7 +1455,7 @@ function SyncProblemsSection({
                 </span>
                 {/* Not truncated and selectable: this is the line a person
                     copies, and half of a byte-exact name is worse than none. */}
-                <span className="select-all break-all font-mono text-[0.7rem] text-muted-foreground">
+                <span className="select-all break-all font-mono text-meta text-muted-foreground">
                   {name.escaped}
                 </span>
               </li>
@@ -1491,7 +1495,7 @@ function SyncProblemsSection({
                 <li key={unit.id} className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 flex-col gap-0.5">
                     <span className="text-xs">{summary}</span>
-                    <span className="font-mono text-destructive text-xs">
+                    <span className="text-destructive text-xs">
                       {unit.lastError ?? SYNC_PARKED_NO_ERROR_SENTENCE}
                     </span>
                   </div>
@@ -1787,9 +1791,7 @@ function CopyReport({ job }: { job: CopyJobVm }) {
   const groups = copyEntryGroups(job.entries);
   return (
     <div className="flex flex-col gap-3" data-testid={COPY_REPORT_TESTID}>
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {COPY_RESULT_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{COPY_RESULT_TITLE}</h2>
       {/* The job failing to run at all — never a file that could not be copied,
           which is an entry below and leaves the job finished. */}
       {job.error !== null && (
@@ -1832,7 +1834,7 @@ function CopyReportGroup({ group }: { group: ReturnType<typeof copyEntryGroups>[
   const note = COPY_OUTCOME_NOTES[group.outcome];
   return (
     <div className="flex flex-col gap-1.5">
-      <h3 className="font-medium text-xs">{title}</h3>
+      <h3 className="font-heading text-sm font-semibold">{title}</h3>
       {note !== undefined && <p className="text-muted-foreground text-xs">{note}</p>}
       <ul aria-label={title} className="flex flex-col gap-1">
         {fold.visible.map((entry) => (
@@ -1845,13 +1847,13 @@ function CopyReportGroup({ group }: { group: ReturnType<typeof copyEntryGroups>[
                             destination, and a byte count there would read as
                             how much did. */}
               {group.outcome !== "failed" && (
-                <span className="shrink-0 text-muted-foreground text-xs">
+                <span className="shrink-0 font-mono text-muted-foreground text-xs">
                   {formatCopyBytes(entry.bytes)}
                 </span>
               )}
             </div>
             {entry.reason !== null && (
-              <span className="font-mono text-destructive text-xs">{entry.reason}</span>
+              <span className="text-destructive text-xs">{entry.reason}</span>
             )}
           </li>
         ))}

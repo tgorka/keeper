@@ -408,7 +408,7 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
                       The absolute path is never on screen (FR-145) — this panel
                       does not even hold one, since it never acts on a file. */}
                   <span
-                    className="min-w-0 flex-1 truncate font-mono text-[11px]"
+                    className="min-w-0 flex-1 truncate font-mono text-meta"
                     title={relativePath}
                   >
                     {attachmentName(relativePath)}
@@ -466,7 +466,7 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
                       shows, which is the one the viewer opens and the export
                       carries. Still no absolute path (FR-145). */}
                   <span
-                    className="min-w-0 flex-1 truncate font-mono text-[11px]"
+                    className="min-w-0 flex-1 truncate font-mono text-meta"
                     title={relativePath}
                   >
                     {attachmentName(relativePath)}

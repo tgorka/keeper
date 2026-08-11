@@ -110,10 +110,13 @@ const SHEET_ROW_HEIGHT = 30;
  *  see `keeper_core::document::style_for` for why six would be a wall of
  *  near-identical text. */
 const BLOCK_CLASS: Record<WordBlockVm["style"], string> = {
-  title: "font-heading font-semibold text-xl",
-  heading1: "font-heading font-medium text-lg",
-  heading2: "font-heading font-medium text-base",
-  heading3: "font-heading font-medium text-sm",
+  title: "font-heading text-display",
+  heading1: "font-heading text-title",
+  // Below `title`, the levels separate by weight rather than by inventing more
+  // sizes: the scale is six steps, and a document's own hierarchy does not get
+  // to grow a seventh.
+  heading2: "font-heading text-sm font-semibold",
+  heading3: "font-heading text-xs font-semibold",
   listItem: "text-sm before:mr-2 before:content-['\\2022']",
   quote: "border-muted border-l-2 pl-3 text-muted-foreground text-sm italic",
   paragraph: "text-sm",
@@ -168,7 +171,7 @@ function Header({
   return (
     <header data-testid={DOCUMENT_HEADER_TESTID} className="flex flex-col gap-3 border-b p-4">
       <div className="min-w-0">
-        <h2 className="truncate font-heading font-medium text-base">{name}</h2>
+        <h2 className="truncate font-heading text-title">{name}</h2>
         {/* The relative path, which is the only path that may be rendered
             (FR-145). Empty for a file at the root of what is being browsed. */}
         {relativePath !== "" && (
@@ -278,8 +281,10 @@ function SlidesBody({ slides }: { slides: readonly SlideVm[] }) {
               className="flex flex-col gap-1 border-b py-3"
             >
               <div className="flex items-baseline gap-2">
-                <span className="shrink-0 text-muted-foreground text-xs">{slide.number}</span>
-                <span className="truncate font-heading font-medium text-sm">
+                <span className="figures shrink-0 text-muted-foreground text-xs">
+                  {slide.number}
+                </span>
+                <span className="truncate font-heading text-sm font-semibold">
                   {slide.title ?? ""}
                 </span>
               </div>

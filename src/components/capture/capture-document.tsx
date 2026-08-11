@@ -66,7 +66,7 @@ export function CaptureDocument({ vaultId, noteId, notices = NO_NOTICES }: Captu
       {notices.map((notice) => (
         // Keyed by the sentence: two notices come from two code paths and
         // cannot be identical, which is the property 44.6 keyed on too.
-        <p key={notice} role="status" className="border-b px-3 py-1 text-[11px]">
+        <p key={notice} role="status" className="border-b px-3 py-1 text-meta">
           {notice}
         </p>
       ))}

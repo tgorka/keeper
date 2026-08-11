@@ -156,7 +156,10 @@ export function ConfigSourceSection({ open }: { open: boolean }) {
             {layers.faults.map((fault) => (
               <li
                 key={`${fault.kind}:${fault.path}:${fault.summary}`}
-                className="min-w-0 break-all font-mono text-destructive text-xs"
+                // A sentence Rust wrote about a file, not the file's own path —
+                // so it is set in the room's voice. The path inside it is
+                // already quoted by the sentence.
+                className="min-w-0 break-all text-destructive text-xs"
               >
                 {fault.summary}
               </li>
@@ -175,7 +178,7 @@ export function ConfigSourceSection({ open }: { open: boolean }) {
                     document this list is about. */}
                 <span className="font-mono text-xs">{entry.key}</span>
                 <span className="text-muted-foreground text-xs">{entry.source}</span>
-                <span className="min-w-0 break-all font-mono text-[10px] text-muted-foreground">
+                <span className="min-w-0 break-all font-mono text-meta text-muted-foreground">
                   {entry.path}
                 </span>
               </li>

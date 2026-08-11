@@ -125,7 +125,7 @@ export function RecordingRow({ hit, canReveal, onReveal, onPlay }: RecordingRowP
     <div className="flex items-start justify-between gap-3 rounded-md border border-border px-3 py-2">
       <div className="flex min-w-0 flex-col gap-1">
         <span className="truncate font-medium text-foreground text-sm">{headline}</span>
-        <span className="text-muted-foreground text-xs">{meta}</span>
+        <span className="figures text-muted-foreground text-xs">{meta}</span>
         {hit.tags.length > 0 && (
           <div className="flex flex-wrap items-center gap-1">
             {hit.tags.map((tag) => (

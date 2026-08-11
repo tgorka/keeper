@@ -273,9 +273,9 @@ function ConflictSide({ label, text, active, onKeep }: ConflictSideProps) {
   return (
     <div className={`border-b px-2 py-1 last:border-b-0 ${active ? "bg-muted" : ""}`}>
       <div className="flex items-center gap-2">
-        <span className="flex-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-          {label}
-        </span>
+        {/* `text-muted-foreground`, not `text-faint`: this word is the only
+            thing telling the two otherwise identical blocks apart. */}
+        <span className="flex-1 label-caps text-muted-foreground">{label}</span>
         <Button size="sm" variant="ghost" onClick={onKeep}>
           Keep
         </Button>

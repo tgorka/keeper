@@ -97,8 +97,10 @@ afterEach(() => {
 async function mounted(): Promise<EditorView> {
   render(<NoteEditor vaultId="v1" noteId="n1" />);
   // The header's own always-present control, as a "the editor mounted" barrier.
-  // It used to be the word "Properties"; Story 46.5 moved that into this menu.
-  await screen.findByText(NOTE_ACTIONS_TEXT);
+  // It used to be the word "Properties"; Story 46.5 moved that into this menu,
+  // and 48.9 turned the trigger itself into a glyph — so the barrier is the
+  // name it answers to rather than text it no longer renders.
+  await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
   return await waitFor(() => {
     const node = document.querySelector<HTMLElement>(".cm-content");
     expect(node).not.toBeNull();
