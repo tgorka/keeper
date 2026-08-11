@@ -9,6 +9,7 @@
  * fires `onSelect`; filtering, scoring, and ordering stay authoritative in Rust
  * (AD-20).
  */
+import { Zap } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { CommandItem } from "@/components/ui/command";
 import { Kbd } from "@/components/ui/kbd";
@@ -38,7 +39,7 @@ export function PaletteChatRow({ chat, onSelect }: { chat: PaletteChatVm; onSele
   );
 }
 
-/** One action result row: ⚡ glyph, title, optional shortcut chip. */
+/** One action result row: an action glyph, title, optional shortcut chip. */
 export function PaletteActionRow({
   action,
   onSelect,
@@ -48,9 +49,13 @@ export function PaletteActionRow({
 }) {
   return (
     <CommandItem value={action.id} onSelect={onSelect}>
-      <span aria-hidden className="text-muted-foreground">
-        ⚡
-      </span>
+      {/* What kind of result this row is, as a glyph and as a word. It used to
+          be a bare ⚡, which is a picture a screen reader cannot see: in a list
+          that mixes chats with actions, the only thing separating the two was
+          decoration. A lucide icon carries the shape and the `sr-only` word
+          carries the meaning, the way the sync rows do it. */}
+      <Zap aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="sr-only">Action</span>
       <span className="truncate">{action.title}</span>
       {action.shortcut !== null && <Kbd className="ml-auto">{action.shortcut}</Kbd>}
     </CommandItem>

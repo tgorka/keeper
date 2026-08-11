@@ -1,25 +1,26 @@
 import {
   Archive,
+  Cable,
   Film,
   FolderSync,
   FolderTree,
-  Inbox,
   MessageSquare,
+  MonitorDot,
   NotebookPen,
   PanelLeftClose,
   PanelLeftOpen,
-  Radio,
   Settings,
-  Video,
+  Stamp,
   WifiOff,
 } from "lucide-react";
 import { AccountFooter } from "@/components/layout/account-footer";
 import { NetworksGroup } from "@/components/layout/networks-group";
 import { SpacesGroup } from "@/components/layout/spaces-group";
 import { Button } from "@/components/ui/button";
+import { Lamp } from "@/components/ui/lamp";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { BridgeHealth } from "@/lib/ipc/client";
+import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
 import { useShellOffline } from "@/lib/stores/account-status";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -49,12 +50,33 @@ interface SidebarView {
 const BASE_VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare, view: "inbox" },
   { label: "Archive", icon: Archive, view: "archive" },
-  { label: "Approvals", icon: Inbox, view: "approval" },
-  { label: "Bridges", icon: Radio, view: "bridges" },
+  // `Stamp`, not `Inbox`. Two things were wrong with the tray. Every other
+  // entry here names its CONTENT — messages, an archive, files, notes — while
+  // a tray names the box they arrive in, and approving is an act of consent
+  // rather than a container. And `inbox` is the view id of *Chats* two lines
+  // up, so the glyph and the route name were pointing at different rows.
+  { label: "Approvals", icon: Stamp, view: "approval" },
+  // `Cable`, not `Radio`. `Radio` was drawn twice in one window — here and on
+  // the NETWORKS group header — and one glyph standing for two concepts stands
+  // for neither. The header keeps it: arcs radiating from a point are a
+  // network's signal, and they survive the 14px that header draws them at.
+  // Bridges takes the connector, because a bridge is a link between two
+  // systems and up-or-down on that link is exactly what this row's health
+  // lamp reports.
+  { label: "Bridges", icon: Cable, view: "bridges" },
 ];
 
-/** The capability-gated Recording nav entry (Story 16.3). */
-const RECORDING_VIEW: SidebarView = { label: "Recording", icon: Video, view: "recording" };
+/** The capability-gated Recording nav entry (Story 16.3).
+ *
+ * `MonitorDot`, not `Video`. A camcorder in a messenger reads "video call", it
+ * says nothing about the SCREEN this feature records, and drawn next to
+ * Recordings' `Film` it was a rounded rectangle beside a rounded rectangle —
+ * a pair told apart at 16px by counting sprocket holes. The two now differ by
+ * KIND rather than by detail: a display in the act of capturing (the only
+ * glyph on this rail with a stand, plus the universal record dot) against the
+ * strip the captures end up on. It is also the same family as the `Monitor`
+ * the recording source picker draws for a whole-screen target. */
+const RECORDING_VIEW: SidebarView = { label: "Recording", icon: MonitorDot, view: "recording" };
 
 /** The capability-gated Recordings browser entry (Story 42.3), sitting directly
  * after the capture surface it browses the output of and gated on the SAME
@@ -82,13 +104,6 @@ const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen, view: "note
 
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings, view: "settings" };
-
-/** The `--bridge-*` tint class for a rolled-up worst health (Story 6.5). */
-const HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
-  healthy: "bg-bridge-healthy",
-  degraded: "bg-bridge-degraded",
-  disconnected: "bg-bridge-disconnected",
-};
 
 interface SidebarPaneProps {
   collapsed: boolean;
@@ -121,6 +136,25 @@ export const SIDEBAR_WIDTH_CLASS = { collapsed: "w-12", expanded: "w-[260px]" } 
  * in a document (the drawer is unmounted on the phone tier). A generated id
  * would be correct and would also make the relationship untestable by name. */
 const VIEWS_LIST_ID = "sidebar-views";
+
+/**
+ * Where a folded-rail indicator sits on the button it marks.
+ *
+ * One constant for the Bridges health lamp and the Approvals count dot,
+ * because they had drifted to `top-1.5 right-1.5` and `top-1 right-1` — two
+ * corners for one idea, on two rows a person sees at once.
+ *
+ * The offset is arithmetic rather than taste. A folded button is `size-9` with
+ * a 1px border, so its padding box is 34px and the 16px glyph centred in it
+ * occupies [10,26] on both axes. Both indicators are 6px — the lamp's own
+ * size, which the count dot was ignoring at `size-2`. At 1px from the corner
+ * one occupies [28,34] x [2,8]: clear of the glyph by 2px in x AND in y, where
+ * the shipped offsets overlapped its top-right corner by 3px in both. It also
+ * sits wholly inside the button's 7px `rounded-md` corner — 5.83px from that
+ * arc's centre against a 7px radius — so it nests in the corner rather than
+ * hanging off it.
+ */
+const RAIL_INDICATOR = "absolute top-px right-px";
 
 export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const offline = useShellOffline();
@@ -187,7 +221,6 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
             aria-expanded={!collapsed}
             aria-controls={VIEWS_LIST_ID}
             data-slot="sidebar-fold"
-            className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             onClick={onToggleFold}
           >
             {collapsed ? (
@@ -214,17 +247,22 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
               const target = view.view;
               const onClick = () => primaryViewStore.getState().setView(target);
               const active = primaryView === target;
-              // The Bridges entry carries the worst-state health roll-up dot (Story
-              // 6.1): shown only when at least one bridge reports non-null health.
+              // The Bridges entry carries the worst-state health roll-up lamp
+              // (Story 6.1): shown only when at least one bridge reports
+              // non-null health. The dot it replaces was `aria-hidden` AND
+              // hue-only, so the rolled-up health of every bridge reached a
+              // screen reader not at all and a dichromat as one of three
+              // near-identical tints. Shape carries it on screen; the word is
+              // spliced into the row's own name below.
+              const showHealthLamp = view.label === "Bridges" && bridgeHealth !== null;
+              const healthWord = bridgeHealth === null ? null : BRIDGE_HEALTH_LABEL[bridgeHealth];
               const healthDot =
-                view.label === "Bridges" && bridgeHealth !== null ? (
-                  <span
-                    aria-hidden="true"
+                showHealthLamp && bridgeHealth !== null ? (
+                  <Lamp
+                    state={BRIDGE_HEALTH_LAMP[bridgeHealth]}
+                    label={null}
                     data-slot="bridge-health-rollup"
-                    className={cn(
-                      "ml-auto size-2 shrink-0 rounded-full",
-                      HEALTH_DOT_CLASS[bridgeHealth],
-                    )}
+                    className="ml-auto"
                   />
                 ) : null;
               // The "Approvals" entry carries an amber count badge (Story 7.3): the
@@ -235,11 +273,25 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
                 <span
                   data-slot="approval-count"
                   aria-hidden="true"
-                  className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-held px-1.5 py-0.5 font-medium text-[11px] text-held-foreground leading-none"
+                  className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-held px-1.5 py-0.5 font-medium text-meta text-held-foreground leading-none"
                 >
                   {pendingDraftCount}
                 </span>
               ) : null;
+              // One name, both rail widths. Folded, the button's `aria-label`
+              // replaces its contents outright; unfolded, a name built from
+              // contents would concatenate "Bridges" and the lamp's word with
+              // no separator between them — the accessible-name algorithm
+              // trims each text node before joining, so no amount of padding
+              // inside the lamp fixes it and the row would announce
+              // "BridgesDisconnected". Naming the row here settles both.
+              const rowName = [
+                view.label,
+                showApprovalBadge ? `${pendingDraftCount} pending` : null,
+                showHealthLamp ? healthWord : null,
+              ]
+                .filter((part) => part !== null)
+                .join(", ");
               if (collapsed) {
                 return (
                   <li key={view.label}>
@@ -249,40 +301,35 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
                           type="button"
                           variant="ghost"
                           size="icon"
-                          aria-label={
-                            showApprovalBadge
-                              ? `${view.label}, ${pendingDraftCount} pending`
-                              : view.label
-                          }
+                          aria-label={rowName}
                           aria-current={active ? "page" : undefined}
-                          className={cn(
-                            "relative focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-                            active && "bg-accent text-accent-foreground",
-                          )}
+                          className={cn("relative", active && "bg-accent text-accent-foreground")}
                           onClick={onClick}
                         >
                           <Icon aria-hidden="true" />
-                          {healthDot !== null && (
-                            <span
-                              aria-hidden="true"
+                          {showHealthLamp && bridgeHealth !== null && (
+                            <Lamp
+                              state={BRIDGE_HEALTH_LAMP[bridgeHealth]}
+                              label={null}
                               data-slot="bridge-health-rollup"
-                              className={cn(
-                                "absolute top-1.5 right-1.5 size-2 rounded-full",
-                                bridgeHealth !== null && HEALTH_DOT_CLASS[bridgeHealth],
-                              )}
+                              className={RAIL_INDICATOR}
                             />
                           )}
                           {showApprovalBadge && (
                             <span
                               aria-hidden="true"
                               data-slot="approval-count"
-                              className="absolute top-1 right-1 size-2 rounded-full bg-held"
+                              className={cn(RAIL_INDICATOR, "size-1.5 rounded-full bg-held")}
                             />
                           )}
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent side="right">
-                        {showApprovalBadge ? `${view.label} (${pendingDraftCount})` : view.label}
+                        {showApprovalBadge
+                          ? `${view.label} (${pendingDraftCount})`
+                          : showHealthLamp && healthWord !== null
+                            ? `${view.label} — ${healthWord}`
+                            : view.label}
                       </TooltipContent>
                     </Tooltip>
                   </li>
@@ -293,9 +340,10 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
                   <Button
                     type="button"
                     variant="ghost"
+                    aria-label={rowName}
                     aria-current={active ? "page" : undefined}
                     className={cn(
-                      "w-full justify-start gap-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                      "w-full justify-start gap-2",
                       active && "bg-accent text-accent-foreground",
                     )}
                     onClick={onClick}

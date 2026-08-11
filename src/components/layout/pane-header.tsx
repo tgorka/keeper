@@ -233,7 +233,7 @@ export function PaneHeader({
         <span
           ref={statusRef}
           data-slot={PANE_HEADER_STATUS_SLOT}
-          className="relative grid shrink-0 justify-items-end text-[11px] text-muted-foreground tabular-nums"
+          className="figures relative grid shrink-0 justify-items-end text-meta text-muted-foreground"
         >
           {status.sizers.map((sizer) => (
             <span

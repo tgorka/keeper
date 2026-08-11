@@ -131,7 +131,7 @@ export function TemplateUpdateOffer({ vaultId, noteId, rev }: TemplateUpdateOffe
 
   if (failure !== null) {
     return (
-      <p role="status" className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+      <p role="status" className="border-b px-3 py-1 text-meta text-muted-foreground">
         {failure}
       </p>
     );
@@ -144,7 +144,7 @@ export function TemplateUpdateOffer({ vaultId, noteId, rev }: TemplateUpdateOffe
   // deciding to do nothing has to be distinguishable from keeper being broken.
   if (offer.declined !== null) {
     return (
-      <p role="status" className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+      <p role="status" className="border-b px-3 py-1 text-meta text-muted-foreground">
         {offer.declined}
       </p>
     );
@@ -154,7 +154,7 @@ export function TemplateUpdateOffer({ vaultId, noteId, rev }: TemplateUpdateOffe
   return (
     <>
       <div className="flex items-center gap-2 border-b px-3 py-1">
-        <p role="status" className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+        <p role="status" className="min-w-0 flex-1 truncate text-meta text-muted-foreground">
           {count === 1
             ? "1 note came from this template."
             : `${count} notes came from this template.`}
@@ -264,7 +264,7 @@ function TemplateUpdateDialog({ vaultId, offer, onClose }: DialogProps) {
         )}
 
         {failure === null ? null : (
-          <p role="status" className="text-[11px] text-muted-foreground">
+          <p role="status" className="text-meta text-muted-foreground">
             {failure}
           </p>
         )}
@@ -311,40 +311,43 @@ function NoteRow({ note, checked, onToggle }: NoteRowProps) {
           <label htmlFor={id} className="block truncate font-medium text-sm">
             {note.title}
           </label>
-          <p className="truncate text-[11px] text-muted-foreground">{note.path}</p>
+          <p className="truncate text-meta text-muted-foreground">{note.path}</p>
           {note.stalePath === null ? null : (
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-meta text-muted-foreground">
               This note records the template as {note.stalePath}; keeper matched it by the
               template's id instead, and is not rewriting the note's properties.
             </p>
           )}
           {note.blocked === null ? null : (
-            <p className="text-[11px] text-muted-foreground">{note.blocked}</p>
+            <p className="text-meta text-muted-foreground">{note.blocked}</p>
           )}
         </div>
       </div>
 
       <ul className="mt-2 flex flex-col gap-2">
         {note.changes.map((change) => (
-          <li key={change.index} className="font-mono text-[11px]">
+          <li key={change.index} className="text-meta">
             {change.skipped === null ? (
-              <p className="font-sans text-muted-foreground">
+              <p className="text-muted-foreground">
                 {change.atLine === null ? "Lands in this note" : `Lands at line ${change.atLine}`}
               </p>
             ) : (
-              <p className="font-sans text-muted-foreground">{change.skipped}</p>
+              <p className="text-muted-foreground">{change.skipped}</p>
             )}
+            {/* Mono lives on the diff lines themselves rather than on the row,
+                so the sentences above do not have to opt back out of it. A diff
+                is the one thing here that must line up column for column. */}
             {change.removed.map((line, at) => (
               // A diff line has no identity but its position, and two identical
               // lines in one hunk are a real and ordinary thing.
               // biome-ignore lint/suspicious/noArrayIndexKey: reason above.
-              <pre key={`-${at}`} className="whitespace-pre-wrap text-destructive">
+              <pre key={`-${at}`} className="whitespace-pre-wrap font-mono text-destructive">
                 {`- ${line}`}
               </pre>
             ))}
             {change.added.map((line, at) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: as above.
-              <pre key={`+${at}`} className="whitespace-pre-wrap">
+              <pre key={`+${at}`} className="whitespace-pre-wrap font-mono">
                 {`+ ${line}`}
               </pre>
             ))}
@@ -383,7 +386,7 @@ function TemplateUpdateResult({ vaultId, result }: ResultProps) {
         {result.updated.map((applied) => (
           <li key={applied.noteId} className="flex items-center gap-2">
             <span className="min-w-0 flex-1 truncate text-sm">{applied.title}</span>
-            <span className="text-[11px] text-muted-foreground">
+            <span className="text-meta text-muted-foreground">
               {applied.applied === 1 ? "1 change" : `${applied.applied} changes`}
             </span>
             <Button
@@ -405,14 +408,14 @@ function TemplateUpdateResult({ vaultId, result }: ResultProps) {
       {result.skipped.length === 0 ? null : (
         <ul className="mt-3 flex flex-col gap-1">
           {result.skipped.map((sentence) => (
-            <li key={sentence} className="text-[11px] text-muted-foreground">
+            <li key={sentence} className="text-meta text-muted-foreground">
               {sentence}
             </li>
           ))}
         </ul>
       )}
       {failure === null ? null : (
-        <p role="status" className="mt-2 text-[11px] text-muted-foreground">
+        <p role="status" className="mt-2 text-meta text-muted-foreground">
           {failure}
         </p>
       )}

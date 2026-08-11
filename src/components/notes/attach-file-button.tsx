@@ -51,6 +51,7 @@
  * other surfaces. Drag-drop is a good gesture and is deliberately not this story.
  */
 import { open as openFilePicker } from "@tauri-apps/plugin-dialog";
+import { Paperclip } from "lucide-react";
 import { useCallback, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -184,12 +185,22 @@ export function AttachFileButton({ vaultId, body, onInsert, onOutcome }: AttachF
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          {/* Still one `<button>` whose text is `ATTACH_FILE_LABEL`, so the
-              header's action group is still the two controls AD-104 leaves it
-              at, and still names itself the same way to a screen reader and to
-              speech input (WCAG 2.5.3). */}
-          <Button size="sm" variant="ghost" disabled={busy}>
-            {ATTACH_FILE_LABEL}
+          {/* Still one `<button>`, so the header's action group is still the
+              two controls AD-104 leaves it at — but a paperclip now, not the
+              sentence (Story 48.9). `ATTACH_FILE_LABEL` moves from the
+              control's text to its `aria-label` and its `title`, unchanged, so
+              a screen reader and speech input still hear and say the same words
+              (WCAG 2.5.3) and a pointer can still ask what the picture means.
+              The paperclip is the one glyph nothing else in this app spends. */}
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            aria-label={ATTACH_FILE_LABEL}
+            title={ATTACH_FILE_LABEL}
+            disabled={busy}
+          >
+            <Paperclip aria-hidden="true" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">

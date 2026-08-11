@@ -130,7 +130,8 @@ describe("a note that was just created", () => {
   it("opens focused, with the caret in an empty body and no block in the buffer", async () => {
     openOn("", null);
     render(<NoteEditor vaultId="v1" noteId="new-1" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    // The Actions trigger is a glyph since 48.9 — waited for by name, not text.
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const editor = await view("");
 
     // Focus, because the promise of New Note is that the next thing typed is
@@ -155,7 +156,7 @@ describe("a note that was just created", () => {
     const scaffolded = "# Standup\n\n## Agenda\n";
     openOn(scaffolded, null);
     render(<NoteEditor vaultId="v1" noteId="new-2" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const editor = await view(scaffolded);
 
     await waitFor(() => {
@@ -171,7 +172,7 @@ describe("a note that was just created", () => {
     const scaffolded = "# Standup\n\n## Agenda\n";
     openOn(scaffolded, 10);
     render(<NoteEditor vaultId="v1" noteId="new-3" />);
-    await screen.findByText(NOTE_ACTIONS_TEXT);
+    await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
     const editor = await view(scaffolded);
 
     await waitFor(() => {

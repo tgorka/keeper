@@ -215,9 +215,12 @@ export function MessageBubble({
         {time !== "" && (
           <time
             dateTime={new Date(item.timestamp).toISOString()}
+            // Full `text-primary-foreground` on an own bubble, not 70% of it:
+            // at 70% the clock measures 3.88:1 on the light accent, and a
+            // timestamp is a fact rather than a decoration.
             className={cn(
-              "block text-right text-[10px] leading-none",
-              isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+              "figures block text-right text-meta leading-none",
+              isOwn ? "text-primary-foreground" : "text-muted-foreground",
             )}
           >
             {time}
@@ -373,9 +376,11 @@ interface EditedCaptionProps {
  * way to fetch history).
  */
 function EditedCaption({ accountId, roomId, messageKey, isOwn }: EditedCaptionProps) {
+  // Full `text-primary-foreground` on an own bubble: this is a control's own
+  // label, and at 70% it measures 3.88:1 on the light accent.
   const tone = cn(
-    "text-[10px] leading-none",
-    isOwn ? "text-primary-foreground/70" : "text-muted-foreground",
+    "text-meta leading-none",
+    isOwn ? "text-primary-foreground" : "text-muted-foreground",
   );
   if (accountId == null || roomId == null) {
     return <span className={tone}>Edited</span>;
@@ -472,7 +477,7 @@ function ReactionPills({ reactions, isOwn, onToggle }: ReactionPillsProps) {
           )}
         >
           <span aria-hidden="true">{group.emoji}</span>
-          <span className="tabular-nums">{group.count}</span>
+          <span className="figures">{group.count}</span>
         </button>
       ))}
     </div>

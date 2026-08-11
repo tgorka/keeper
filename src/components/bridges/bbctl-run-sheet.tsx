@@ -25,7 +25,6 @@ import {
 import { useBbctlRun } from "@/hooks/use-bbctl-run";
 import { BBCTL_PHASE_LABEL } from "@/lib/bridges";
 import type { BbctlProgressVm } from "@/lib/ipc/client";
-import { cn } from "@/lib/utils";
 
 /** How long "Running ✓" shows before the Sheet auto-closes (ms). */
 const SUCCESS_AUTO_ADVANCE_MS = 1500;
@@ -151,7 +150,7 @@ function SuccessPanel({ networkName }: { networkName: string }) {
       className="flex flex-col items-center gap-2 py-8 text-center"
       data-slot="bbctl-run-success"
     >
-      <p className={cn("font-medium text-lg", "text-bridge-healthy")}>Running ✓</p>
+      <p className="font-heading text-title text-bridge-healthy">Running ✓</p>
       <p className="text-muted-foreground text-sm">{networkName} is running.</p>
     </div>
   );

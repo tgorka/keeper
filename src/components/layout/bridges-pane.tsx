@@ -34,7 +34,7 @@ export function BridgesPane() {
       className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
     >
       <header className="shrink-0 border-border border-b px-6 py-4">
-        <h1 className="font-heading font-medium text-lg">Bridges</h1>
+        <h1 className="font-heading text-title">Bridges</h1>
         <p className="text-muted-foreground text-sm">
           Connect a network to bring its chats into keeper.
         </p>
@@ -86,9 +86,10 @@ function AccountBridges({ account, catalog }: AccountBridgesProps) {
 
   return (
     <div className="flex flex-col gap-3">
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {account.userId}
-      </h2>
+      {/* Not `label-caps text-faint`: this heading's text is a Matrix user id.
+          Caps would render an identifier in the wrong case, and `faint` is for
+          labels that carry no fact — which an account id plainly does. */}
+      <h2 className="font-heading text-sm font-semibold">{account.userId}</h2>
 
       {error !== null ? (
         <div role="alert" className="flex flex-col items-start gap-2 text-sm">

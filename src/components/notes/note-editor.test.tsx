@@ -206,7 +206,7 @@ function shownWord(): string {
  * A caption with its digits flattened.
  *
  * Two captions with the same shape are the same width in the slot, because the
- * slot is `tabular-nums` and every digit there is as wide as every other. It is
+ * slot carries `figures` and every digit there is as wide as every other. It is
  * shape, not equality, that a reserved box has to cover: `Saved · 09:15` and
  * `Saved · 23:41` are different strings and identical widths.
  */
@@ -415,11 +415,23 @@ const WIDTHS: Record<string, number> = {
   status: 90,
 };
 
-/** Every verb the row is showing as a word, in the row's order. */
-function words(): string[] {
-  return Array.from(document.querySelectorAll("[data-priority-action]")).map(
-    (control) => control.textContent ?? "",
-  );
+/**
+ * Every verb the row is showing, by the name it answers to, in the row's order.
+ *
+ * The name and not the text: since 48.9 a promoted control is a glyph, so its
+ * text content is empty and the word a user reaches it by is its accessible
+ * name. Order is read off the DOM because the order is what these tests are
+ * about — the row degrades from the end, and a set would not notice if it
+ * stopped doing that.
+ */
+function names(): string[] {
+  return Array.from(document.querySelectorAll("[data-priority-action]")).map((control) => {
+    const name = control.getAttribute("aria-label") ?? "";
+    // The attribute finds the control; this proves the name is one a screen
+    // reader would compute, rather than an attribute nobody consumes.
+    expect(screen.getByRole("button", { name })).toBe(control);
+    return name;
+  });
 }
 
 /** Open the note's own actions menu, and hand back what is in it. */
@@ -456,7 +468,7 @@ describe("the header shows the verbs it has room for", () => {
     const resize = await openAtWidths();
 
     resize(1400);
-    expect(words()).toEqual([
+    expect(names()).toEqual([
       ATTACHMENTS_LABEL,
       PROPERTIES_LABEL,
       NOTE_HISTORY_LABEL,
@@ -464,27 +476,27 @@ describe("the header shows the verbs it has room for", () => {
     ]);
 
     resize(800);
-    expect(words()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL, NOTE_HISTORY_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL, NOTE_HISTORY_LABEL]);
 
     resize(700);
-    expect(words()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
 
     // What the 560px capture window is near: the two panels the owner reported
     // as missing are the last things to go, and Attachments is the last of all.
     resize(600);
-    expect(words()).toEqual([ATTACHMENTS_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL]);
 
     resize(500);
-    expect(words()).toEqual([]);
+    expect(names()).toEqual([]);
   });
 
   it("moves the first verb into the menu at exactly one width", async () => {
     const resize = await openAtWidths();
 
     resize(572);
-    expect(words()).toEqual([ATTACHMENTS_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL]);
     resize(571);
-    expect(words()).toEqual([]);
+    expect(names()).toEqual([]);
   });
 
   it("keeps Delete in the menu, and never in the row, at every width", async () => {
@@ -492,7 +504,7 @@ describe("the header shows the verbs it has room for", () => {
 
     for (const width of [1400, 800, 700, 600, 500, 0]) {
       resize(width);
-      expect(words()).not.toContain(NOTE_DELETE_LABEL);
+      expect(names()).not.toContain(NOTE_DELETE_LABEL);
       expect(menuItems()).toContain(NOTE_DELETE_LABEL);
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     }
@@ -514,7 +526,14 @@ describe("the header shows the verbs it has room for", () => {
         // The row and the menu partition the verbs; neither gets a copy of the
         // other's. A promoted control still in the menu is what the predicate
         // exists to prevent.
-        expect(screen.getAllByText(label)).toHaveLength(1);
+        //
+        // Counted across BOTH roles by name (48.9): promoted, a verb is a glyph
+        // with a name and no text; in the menu it is a word. A text query sees
+        // only the second and would pass over a duplicated control. `hidden`
+        // because Radix marks everything outside the open menu `aria-hidden`.
+        const asControl = screen.queryAllByRole("button", { hidden: true, name: label });
+        const asItem = screen.queryAllByRole("menuitem", { hidden: true, name: label });
+        expect(asControl.length + asItem.length).toBe(1);
       }
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     }
@@ -545,7 +564,7 @@ describe("the header shows the verbs it has room for", () => {
     restoreWidths = withActionWidths(WIDTHS);
     await openEditor();
 
-    expect(words()).toEqual([]);
+    expect(names()).toEqual([]);
     expect(menuItems()).toEqual([
       ATTACHMENTS_LABEL,
       PROPERTIES_LABEL,

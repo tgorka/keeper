@@ -40,7 +40,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -64,6 +63,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Lamp } from "@/components/ui/lamp";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
@@ -91,7 +91,6 @@ interface AccountFooterProps {
 }
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
-
 /** The homeserver host for a resolved homeserver URL, or the raw string when it
  * cannot be parsed as a URL. */
 function homeserverLabel(homeserverUrl: string): string {
@@ -159,7 +158,7 @@ function BeeperCoverageDialog({
         <BeeperCoverageDisclosure />
         <DialogFooter>
           <DialogClose asChild>
-            <Button type="button" variant="outline" className={FOCUS_RING}>
+            <Button type="button" variant="outline">
               Close
             </Button>
           </DialogClose>
@@ -289,7 +288,6 @@ function SignOutDialog({
             <>
               <AlertDialogAction
                 variant="destructive"
-                className={FOCUS_RING}
                 disabled={signingOut || !identityMatches}
                 onClick={(event) => {
                   event.preventDefault();
@@ -302,7 +300,6 @@ function SignOutDialog({
                 <Button
                   type="button"
                   variant="outline"
-                  className={FOCUS_RING}
                   disabled={signingOut}
                   onClick={() => {
                     // Reversible: return to the keep-archive choice in place.
@@ -313,14 +310,13 @@ function SignOutDialog({
                 >
                   Keep archive instead
                 </Button>
-                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
               </div>
             </>
           ) : (
             <>
               <AlertDialogAction
                 variant="destructive"
-                className={FOCUS_RING}
                 disabled={signingOut}
                 onClick={(event) => {
                   // Keep the dialog mounted while the async sign-out runs.
@@ -334,13 +330,12 @@ function SignOutDialog({
                 <Button
                   type="button"
                   variant="secondary"
-                  className={FOCUS_RING}
                   disabled={signingOut}
                   onClick={() => setArmed(true)}
                 >
                   …and delete this Account's archive
                 </Button>
-                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
               </div>
             </>
           )}
@@ -488,6 +483,9 @@ function GlobalDndToggle() {
   );
 }
 
+/** What an unverified device's lamp says, on the row trigger and in the menu. */
+const VERIFY_NEEDED_WORD = "Verification needed";
+
 function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
@@ -500,7 +498,13 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
   const showVerifyBadge = useShowVerifyBadgeForAccount(account.accountId);
   const userId = account.userId;
   const isBeeper = isBeeperAccount(account);
-  const menuLabel = `Account menu for ${userId}`;
+  // The unverified-device state has to ride the trigger's own name: the button
+  // carries an explicit `aria-label`, so anything inside it is overridden. It
+  // used to be an `aria-hidden` accent dot and nothing else — a security state
+  // announced to nobody, in the one colour the app uses for "this is fine".
+  const menuLabel = showVerifyBadge
+    ? `Account menu for ${userId}, ${VERIFY_NEEDED_WORD}`
+    : `Account menu for ${userId}`;
 
   const trigger = (
     <DropdownMenuTrigger asChild>
@@ -509,13 +513,15 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
         variant="ghost"
         size="icon-sm"
         aria-label={menuLabel}
-        className={cn("relative shrink-0", FOCUS_RING)}
+        className="relative shrink-0"
       >
         <MoreVertical aria-hidden="true" />
         {showVerifyBadge && (
-          <Badge
-            aria-hidden="true"
-            className="-top-0.5 -right-0.5 absolute size-2 rounded-full p-0"
+          <Lamp
+            state="working"
+            label={null}
+            data-slot="verify-badge"
+            className="-top-0.5 -right-0.5 absolute"
           />
         )}
       </Button>
@@ -534,11 +540,19 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
           trigger
         )}
         <DropdownMenuContent align="end" side="right">
-          <DropdownMenuItem onSelect={() => primaryViewStore.getState().setView("settings")}>
+          <DropdownMenuItem
+            // Named outright rather than left to the contents: a menu item's
+            // name is concatenated from its children with each text node
+            // trimmed first, so "Settings" and the lamp's word would arrive as
+            // "SettingsVerification needed" — one token, announced once, read
+            // by nobody as two facts.
+            aria-label={showVerifyBadge ? `Settings, ${VERIFY_NEEDED_WORD}` : undefined}
+            onSelect={() => primaryViewStore.getState().setView("settings")}
+          >
             <Settings aria-hidden="true" />
             Settings
             {showVerifyBadge && (
-              <Badge aria-hidden="true" className="ml-auto size-2 rounded-full p-0" />
+              <Lamp state="working" label={null} data-slot="verify-badge" className="ml-auto" />
             )}
           </DropdownMenuItem>
           {isBeeper && (
@@ -666,7 +680,6 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
               variant="ghost"
               size="icon"
               aria-label="Add account"
-              className={FOCUS_RING}
               onClick={openAddAccount}
             >
               <Plus aria-hidden="true" />
@@ -679,7 +692,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
           type="button"
           variant="ghost"
           aria-label="Add account"
-          className={cn("w-full justify-start gap-2", FOCUS_RING)}
+          className="w-full justify-start gap-2"
           onClick={openAddAccount}
         >
           <Plus aria-hidden="true" />

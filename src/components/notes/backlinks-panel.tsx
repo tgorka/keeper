@@ -56,9 +56,9 @@ export function BacklinksPanel({ vaultId, noteId, refreshKey, onOpen }: Backlink
 
   return (
     <section aria-label="Linked from" className="border-t px-3 py-2">
-      <h2 className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        Linked from ({rows.length})
-      </h2>
+      {/* `text-muted-foreground`, not `text-faint`: the label carries a count,
+          and a figure is a fact however label-shaped its surroundings are. */}
+      <h2 className="figures label-caps text-muted-foreground">Linked from ({rows.length})</h2>
       <ul className="mt-1 flex flex-col gap-0.5">
         {rows.map((row) => (
           <li key={row.id}>

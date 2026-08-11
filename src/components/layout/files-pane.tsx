@@ -91,7 +91,9 @@ import {
   FileType,
   Folder,
   FolderOpen,
+  ListChecks,
   NotebookPen,
+  RefreshCw,
 } from "lucide-react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
@@ -144,6 +146,7 @@ import {
   syncProfiles,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
   filesTreeStore,
   nodeKey,
@@ -192,6 +195,15 @@ export const FILES_TREE_LABEL = "Synced folders";
 
 /** The header control that re-reads every folder already on screen. */
 export const FILES_REFRESH_LABEL = "Refresh";
+
+/**
+ * The folded rail's way back to a selection (Story 48.1, second cut).
+ *
+ * "Selection" and not "Delete": what the strip hides is a selection, and the
+ * two things you can do to one — delete it, attach it to a note — are the
+ * header's, where the count that makes them safe to press is.
+ */
+export const FILES_SELECTION_LABEL = "Selection";
 
 /** What a folder with nothing in it says. The one place "empty" is the truth. */
 export const FILES_EMPTY_FOLDER_SENTENCE = "This folder is empty.";
@@ -573,10 +585,8 @@ export function FilesPane() {
   // the recordings row already use. A control that fails on activation is worse
   // than no control.
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
-  // The tree is a surface column: it folds away and it can be dragged wider
-  // (Story 48.1). Called before anything that can return, so the fold cannot
-  // change the hook order.
-  const tree = useSurfaceColumn("files-tree");
+  // The tree's own surface column is set up further down, once the selection and
+  // the refresh it puts on its folded rail exist (Story 48.1).
 
   const [profiles, setProfiles] = useState<SyncProfileVm[] | null>(null);
   // Which folders are open outlives this component (Story 46.3): the shell
@@ -1081,6 +1091,36 @@ export function FilesPane() {
   );
 
   /**
+   * The tree is a surface column: it folds away and it can be dragged wider
+   * (Story 48.1). Folded it keeps a rail, because the fold takes the header
+   * with the body and the header is where everything this pane can DO lives.
+   *
+   * Refresh is the one that works at 48px unchanged — it re-reads the folders
+   * into a store the folded pane is still subscribed to, and unfolding shows
+   * what it found. The selection entry is the other kind: Delete and Attach are
+   * asked about a selection this strip cannot show, so it says how many rows are
+   * still selected and gives them back their header. Without it a fold is a
+   * selection you can neither see nor act on and cannot even clear.
+   */
+  const tree = useSurfaceColumn("files-tree", {
+    rail: [
+      { id: "refresh", icon: RefreshCw, label: FILES_REFRESH_LABEL, onSelect: refresh },
+      ...(selection.length > 0
+        ? [
+            {
+              id: "selection",
+              icon: ListChecks,
+              label: FILES_SELECTION_LABEL,
+              detail: `${countLabel(selection.length, ITEMS)} selected`,
+              count: selection.length,
+              onSelect: () => columnFoldStore.getState().toggleColumn("files-tree"),
+            },
+          ]
+        : []),
+    ],
+  });
+
+  /**
    * Ask Rust what deleting these rows would do, then show its answer.
    *
    * Nothing is deleted here. The plan is a separate call from the delete on
@@ -1581,7 +1621,9 @@ export function FilesPane() {
           <span
             id={countId}
             data-slot={FILES_COUNT_SLOT}
-            className="shrink-0 text-muted-foreground text-xs tabular-nums"
+            // Mono, because this is a column: the counts are read down the tree
+            // against each other, and they only line up if a 1 is as wide as a 7.
+            className="shrink-0 font-mono text-muted-foreground text-xs"
           >
             {node.count}
           </span>
@@ -1601,7 +1643,9 @@ export function FilesPane() {
             id={sizeId}
             data-slot={FILES_SIZE_SLOT}
             title={`${entry.size.bytes} bytes. ${FILES_SIZE_BASE_NOTE}`}
-            className="shrink-0 text-muted-foreground text-xs tabular-nums"
+            // A column of sizes, set in the register's face for the same reason
+            // the count above it is.
+            className="shrink-0 font-mono text-muted-foreground text-xs"
           >
             {entry.size.label}
           </span>
@@ -1625,9 +1669,9 @@ export function FilesPane() {
           <Button
             type="button"
             variant="ghost"
-            size="sm"
+            size="xs"
             tabIndex={actionTabIndex}
-            className="h-6 shrink-0 px-2 text-xs"
+            className="shrink-0"
             onClick={() => {
               setWriteError(null);
               setCreateName("");
@@ -1643,7 +1687,7 @@ export function FilesPane() {
               <Button
                 type="button"
                 variant="ghost"
-                size="sm"
+                size="xs"
                 tabIndex={actionTabIndex}
                 // Says `Open`, answers to `Open in the default app` — see
                 // {@link FILES_OPEN_SHORT_LABEL}. The full verb is also the
@@ -1651,7 +1695,6 @@ export function FilesPane() {
                 // reader can find out about this control.
                 aria-label={FILES_OPEN_LABEL}
                 title={FILES_OPEN_LABEL}
-                className="h-6 px-2 text-xs"
                 onClick={() => {
                   void syncOpenEntry(node.profileId, entry.relativePath).catch(() => undefined);
                 }}
@@ -1663,9 +1706,8 @@ export function FilesPane() {
               <Button
                 type="button"
                 variant="ghost"
-                size="sm"
+                size="xs"
                 tabIndex={actionTabIndex}
-                className="h-6 px-2 text-xs"
                 onClick={() => {
                   void revealPath(entry.absolutePath).catch(() => undefined);
                 }}
@@ -1676,9 +1718,8 @@ export function FilesPane() {
             <Button
               type="button"
               variant="ghost"
-              size="sm"
+              size="xs"
               tabIndex={actionTabIndex}
-              className="h-6 px-2 text-xs"
               onClick={() => copyPath(entry.absolutePath)}
             >
               {copied === entry.absolutePath ? FILES_COPIED_LABEL : FILES_COPY_PATH_LABEL}
@@ -1759,8 +1800,7 @@ export function FilesPane() {
       <Button
         type="button"
         variant="outline"
-        size="sm"
-        className="h-6 px-2 text-xs"
+        size="xs"
         onClick={() => createFile(row.profileId, row.subpath)}
       >
         {FILES_CREATE_LABEL}
@@ -1768,8 +1808,7 @@ export function FilesPane() {
       <Button
         type="button"
         variant="ghost"
-        size="sm"
-        className="h-6 px-2 text-xs"
+        size="xs"
         onClick={() => {
           setCreatingIn(null);
           setWriteError(null);
@@ -1804,7 +1843,7 @@ export function FilesPane() {
         {tree.chrome}
         <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
           <div className="min-w-0">
-            <h1 className="font-heading font-medium text-lg">{FILES_PANE_TITLE}</h1>
+            <h1 className="font-heading text-title">{FILES_PANE_TITLE}</h1>
             <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">

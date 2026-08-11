@@ -8,7 +8,7 @@
 //! startup when the persisted setting is on.
 //!
 //! While a screen-recording session is live (Story 18.1), the same single tray
-//! flips to a `recording` rendering: a record-dot icon, a ~1 Hz-refreshed
+//! flips to a `recording` rendering: the mark's `live` glyph, a ~1 Hz-refreshed
 //! disabled status line (`Recording — 12:34 · segment 3, 412 MB`), and **Stop
 //! Recording** / **Open Recordings Folder** items ahead of Show/Quit. The tray
 //! is a pure renderer of the Rust-owned [`RecordingStatusVm`] snapshot (driven
@@ -158,64 +158,90 @@ struct NotesItems {
     labels: TrayNotesLabels,
 }
 
-/// The bundled record-dot menu-bar icon shown while a recording is live (Story
-/// 18.1; template rendering Story 21.4). Decoded per transition via
-/// [`tray_glyph`] — a decode failure just keeps the current icon.
+/// The bundled menu-bar glyph shown while a recording is live (Story 18.1;
+/// template rendering Story 21.4). Decoded per transition via [`tray_glyph`] — a
+/// decode failure just keeps the current icon.
 ///
-/// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha,
-/// the brand speech-bubble mark from the app icon): the menu bar colors them
-/// white/black per appearance and highlights them natively, so states must
-/// read from glyph SHAPE — bubble outline = idle, filled dot in the bubble =
-/// recording, filled bubble with a punched-out exclamation = error. Off macOS
-/// no tray host recolours anything, so [`tray_glyph`] repaints the same shape
-/// for the panel; the shape-not-colour rule holds on every platform.
-const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
-
-/// The bundled error badge shown while a failed session holds the tray (Story
-/// 18.4): the filled brand bubble carrying a punched-out exclamation mark, so
-/// the fault reads at a glance and stays visually distinct from the plain
-/// record dot. Same base dimensions as [`RECORDING_ICON_PNG`]; decoded per
-/// transition via [`Image::from_bytes`] — a decode failure just keeps the
-/// current icon.
-const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error-template.png");
-
-/// The idle (presence-only) template glyph — the brand speech-bubble outline.
-/// Replaces the colored app icon so the menu bar stays native (Story 21.4).
-const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
-
-/// The folder-sync glyph set (Story 29.2, AD-51), generated from the idle mark
-/// by `scripts/gen-tray-sync-icons.ts` so the brand outline is identical and
-/// only the interior differs.
+/// EVERY GLYPH BELOW IS THE SAME DRAWING. It is the keeper mark — an accession
+/// tag — and what changes between states is the ink inside its aperture, never
+/// the tag. The tag lands in identical pixels in all ten, which
+/// is the point: macOS centres a status-item image, so a family whose ink sits in
+/// different places would make the mark visibly jump the moment a sync started,
+/// and a person cannot tell a state change from a glitch. The menu bar should
+/// look like one instrument changing its readout.
 ///
-/// Template images again: the menu bar recolours them, so **state must read
-/// from SHAPE, never colour**. Armed is a static cycle in the bubble interior;
-/// the four transfer states carry a mark in the bottom-right corner instead —
-/// an arrow up, an arrow down, both, or circular arrows for work with nothing on
-/// the wire.
+/// The aperture carries the four states the lamp component carries — live, idle,
+/// working, fault — and the sync glyphs extend that vocabulary with the facts
+/// four states cannot hold: direction, paused, warning.
 ///
-/// These four replaced a four-frame rotating ring. The animation said "something
-/// is happening" and nothing about *what*, so a 40 GB upload and a directory scan
-/// drew the same picture; a direction says it without moving, which is also why
-/// the tray no longer advances a frame counter.
-const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template.png");
-const SYNC_UP_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-up-template.png");
-const SYNC_DOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-down-template.png");
-const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-template.png");
-const SYNC_REFRESH_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-refresh-template.png");
-const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
-const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
+/// These are macOS TEMPLATE images: monochrome black + alpha, which the menu bar
+/// recolours per appearance and inverts on highlight, so **state must read from
+/// SHAPE, never colour**. Off macOS no tray host recolours anything, so
+/// [`tray_glyph`] repaints the same shape for the panel; the rule holds
+/// everywhere.
+///
+/// The `@2x` file is what ships into the tray. 44px is the retina size of a 22pt
+/// menu-bar item, so handing the system the denser bitmap lets it downscale by
+/// exactly two. That is the whole reason the artwork is authored on a 44-unit
+/// grid with every coordinate even: 44 is 1:1 here and exactly half at 22px, so
+/// both files in the pair are whole-pixel and neither is a resample.
+/// The `@1x` file beside each one is the other half of the macOS template pair;
+/// `scripts/gen-mark-icons.test.ts` holds the pair to its contract, because
+/// that gate runs on every platform and this crate only builds on macOS.
+///
+/// All of them, and the app icon, are generated from `icons/mark.svg` by
+/// `bun run scripts/gen-mark-icons.ts`. Do not hand-edit the PNGs.
+const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-live-template@2x.png");
+
+/// Shown while a failed session holds the tray (Story 18.4): the aperture's
+/// `fault` state, a filled core with a bite taken out of its trailing edge. The
+/// bite is half the core's width because a smaller one is a single pixel at menu
+/// bar size, and a fault nobody can see is not a fault indicator.
+const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-fault-template@2x.png");
+
+/// The idle (presence-only) glyph: the aperture open and empty. keeper is here
+/// and nothing is happening (Story 21.4).
+const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template@2x.png");
+
+/// The folder-sync glyph set (Story 29.2, AD-51).
+///
+/// Armed is the aperture's core drawn hollow — configured, lit, nothing in
+/// flight. Active is the `working` state, a dashed aperture. The transfer states
+/// put an arrow in the aperture, and paused and warning put their own marks
+/// there.
+///
+/// The direction marks replaced a four-frame rotating ring. The animation said
+/// "something is happening" and nothing about *what*, so a 40 GB upload and a
+/// directory scan drew the same picture; a direction says it without moving,
+/// which is why the tray no longer advances a frame counter.
+///
+/// There is deliberately no separate "refresh" glyph any more. Active used to
+/// carry circular arrows meaning "something is happening", which is precisely
+/// what a dashed aperture already says — and at menu-bar size a redundant mark
+/// costs legibility it cannot repay.
+const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template@2x.png");
+const SYNC_ACTIVE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-working-template@2x.png");
+const SYNC_UP_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-up-template@2x.png");
+const SYNC_DOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-down-template@2x.png");
+const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-template@2x.png");
+const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template@2x.png");
+const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template@2x.png");
 
 /// The colour the authored glyph is repainted in on every platform that is not
-/// macOS — the keeper mark's bright tone, chosen because it separates from both
-/// a dark and a light panel.
+/// macOS — the accent, lichen, chosen because it separates from both a dark and a
+/// light panel.
+///
+/// This was `#3ecfae` until the identity landed, which is the teal the design
+/// explicitly rejects: it is fintech mint rather than a green, and it was a third
+/// unchosen green living outside the token file where no gate could see it.
 #[cfg(not(target_os = "macos"))]
-const PANEL_GLYPH_RGB: [u8; 3] = [0x3E, 0xCF, 0xAE];
+const PANEL_GLYPH_RGB: [u8; 3] = [0x8F, 0xC6, 0x59];
 
-/// The one-pixel contrast halo grown around the repainted glyph — the mark's
-/// deep tone. On a dark panel it disappears into the background; on a light one
-/// it is what stops the bright mark dissolving into white.
+/// The one-pixel contrast halo grown around the repainted glyph — the workroom's
+/// ground. On a dark panel it disappears into the background; on a light one it
+/// is what stops the bright mark dissolving into white.
 #[cfg(not(target_os = "macos"))]
-const PANEL_HALO_RGB: [u8; 3] = [0x06, 0x23, 0x1C];
+const PANEL_HALO_RGB: [u8; 3] = [0x0D, 0x12, 0x10];
 
 /// How opaque an authored pixel must be to grow a halo. Below this the glyph is
 /// already fading out and an outline would only thicken it.
@@ -948,7 +974,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
 }
 
 /// Render the recording state onto a present tray (Story 18.1): on the
-/// idle→recording transition swap in the record-dot icon + recording menu; on
+/// idle→recording transition swap in the `live` glyph + recording menu; on
 /// every later tick refresh only the disabled status line via `set_text` — no
 /// menu rebuild, no flicker, an open menu stays open.
 fn render_recording(
@@ -965,9 +991,9 @@ fn render_recording(
         }
         return;
     }
-    // idle → recording transition: record-dot icon + recording menu.
+    // idle → recording transition: the live glyph + recording menu.
     if !set_tray_glyph(tray, RECORDING_ICON_PNG) {
-        tracing::warn!("tray: could not install the record-dot glyph");
+        tracing::warn!("tray: could not install the live glyph");
     }
     // A menu build/install failure leaves `status_item` unset, so the next
     // tick simply retries the transition.
@@ -1330,14 +1356,14 @@ mod tests {
         assert_eq!(decide_presence(Failed, false, true, false), RestoreIdle);
     }
 
-    /// Story 18.4: the bundled error badge is a valid PNG that decodes through
-    /// the same `Image::from_bytes` path the tick uses, at the record-dot's
-    /// base dimensions — and it is not byte-identical to the record dot (the
-    /// two states must be distinguishable at a glance).
+    /// Story 18.4: the bundled fault glyph is a valid PNG that decodes through
+    /// the same `Image::from_bytes` path the tick uses, at the live glyph's base
+    /// dimensions — and it is not byte-identical to it (the two states must be
+    /// distinguishable at a glance).
     #[test]
-    fn error_badge_asset_decodes_at_the_record_dot_dimensions() {
-        let error = Image::from_bytes(ERROR_ICON_PNG).expect("tray-error.png decodes");
-        let recording = Image::from_bytes(RECORDING_ICON_PNG).expect("tray-recording.png decodes");
+    fn fault_asset_decodes_at_the_live_glyph_dimensions() {
+        let error = Image::from_bytes(ERROR_ICON_PNG).expect("tray-fault template decodes");
+        let recording = Image::from_bytes(RECORDING_ICON_PNG).expect("tray-live template decodes");
         assert_eq!(error.width(), recording.width());
         assert_eq!(error.height(), recording.height());
         assert_ne!(ERROR_ICON_PNG, RECORDING_ICON_PNG);
@@ -1432,7 +1458,7 @@ mod tests {
             SYNC_UP_ICON_PNG,
             SYNC_DOWN_ICON_PNG,
             SYNC_UPDOWN_ICON_PNG,
-            SYNC_REFRESH_ICON_PNG,
+            SYNC_ACTIVE_ICON_PNG,
             SYNC_PAUSED_ICON_PNG,
             SYNC_WARNING_ICON_PNG,
         ] {
@@ -1637,7 +1663,7 @@ mod tests {
     /// The epic's rule, unchanged: recording wins the icon and sync never forces
     /// presence. Durability is not an input to [`decide_presence`] at all — a
     /// refused push is not a session `error`, so it can neither build a tray, nor
-    /// drop one, nor swap the record dot for the error badge. The reduction is
+    /// drop one, nor swap the live glyph for the fault one. The reduction is
     /// confined to the status line.
     #[test]
     fn a_push_problem_never_changes_presence_or_the_recording_icon() {
@@ -1722,9 +1748,9 @@ const SYNC_STATUS_ID: &str = "tray-sync-status";
 ///
 /// Every state is one still asset, so the glyph is a function of state alone —
 /// the reason this no longer takes a frame. What used to be carried by motion is
-/// now carried by the corner mark, and carried better: an arrow says which way
-/// the bytes are going, where a spinning ring only said that something was.
-/// `Active` — scanning, committing, verifying — gets the circular arrows, which
+/// now carried by the aperture, and carried better: an arrow says which way the
+/// bytes are going, where a spinning ring only said that something was.
+/// `Active` — scanning, committing, verifying — gets the dashed aperture, which
 /// is the same "working" claim without the promise of a transfer.
 fn sync_glyph(state: TraySyncState) -> Option<&'static [u8]> {
     match state {
@@ -1733,7 +1759,7 @@ fn sync_glyph(state: TraySyncState) -> Option<&'static [u8]> {
         TraySyncState::Transferring => Some(SYNC_UPDOWN_ICON_PNG),
         TraySyncState::Uploading => Some(SYNC_UP_ICON_PNG),
         TraySyncState::Downloading => Some(SYNC_DOWN_ICON_PNG),
-        TraySyncState::Active => Some(SYNC_REFRESH_ICON_PNG),
+        TraySyncState::Active => Some(SYNC_ACTIVE_ICON_PNG),
         TraySyncState::Paused => Some(SYNC_PAUSED_ICON_PNG),
         TraySyncState::Armed => Some(SYNC_ARMED_ICON_PNG),
     }
@@ -2254,8 +2280,8 @@ mod sync_tray_tests {
     fn working_differs_from_both_armed_and_every_transfer() {
         // Scanning or committing is work, not transfer, so it must not draw as
         // one — but it must still differ from armed, or "busy" and "idle" become
-        // the same picture. Armed is the centred ring; this is the corner
-        // circular arrows.
+        // the same picture. Armed is the hollow core; this is the dashed
+        // aperture.
         let active = SyncGlyphId::of(sync_glyph(TraySyncState::Active).expect("active"));
         for other in [
             TraySyncState::Armed,
@@ -2285,7 +2311,7 @@ mod sync_tray_tests {
             SYNC_UP_ICON_PNG,
             SYNC_DOWN_ICON_PNG,
             SYNC_UPDOWN_ICON_PNG,
-            SYNC_REFRESH_ICON_PNG,
+            SYNC_ACTIVE_ICON_PNG,
         ] {
             let image = Image::from_bytes(bytes).expect("sync glyph decodes");
             assert_eq!(image.width(), idle.width());

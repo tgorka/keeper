@@ -256,7 +256,7 @@ export function RecordingsPane() {
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">{RECORDINGS_PANE_TITLE}</h1>
+          <h1 className="font-heading text-title">{RECORDINGS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{RECORDINGS_PANE_SUBTITLE}</p>
           {/* How many sessions the filter found (Story 44.11, FR-166).
 
@@ -269,7 +269,7 @@ export function RecordingsPane() {
             <p
               role="status"
               data-slot={RECORDINGS_COUNT_SLOT}
-              className="text-muted-foreground text-xs"
+              className="figures text-muted-foreground text-xs"
             >
               {countLabel(total, SESSIONS)}
             </p>

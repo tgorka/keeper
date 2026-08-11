@@ -261,13 +261,13 @@ export function AttachFromVaultDialog({
                       setFolder(item.relPath);
                     }}
                   >
-                    <span className="min-w-0 truncate font-mono text-[11px]">{item.name}/</span>
+                    <span className="min-w-0 truncate font-mono text-meta">{item.name}/</span>
                   </Button>
                 </li>
               ) : (
                 <li key={item.relPath} className="flex min-w-0 items-center gap-2 px-1 py-1">
                   <span
-                    className="min-w-0 flex-1 truncate font-mono text-[11px]"
+                    className="min-w-0 flex-1 truncate font-mono text-meta"
                     title={item.relPath}
                   >
                     {item.name}

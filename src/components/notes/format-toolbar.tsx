@@ -170,7 +170,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
           className="absolute top-full left-2 z-20 mt-1 flex items-end gap-2 rounded-md border bg-popover p-2 shadow-md"
         >
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-muted-foreground" htmlFor={`${ids}-rows`}>
+            <label className="text-meta text-muted-foreground" htmlFor={`${ids}-rows`}>
               Rows
             </label>
             <Input
@@ -183,7 +183,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-muted-foreground" htmlFor={`${ids}-columns`}>
+            <label className="text-meta text-muted-foreground" htmlFor={`${ids}-columns`}>
               Columns
             </label>
             <Input
@@ -202,7 +202,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
               checked={header}
               onChange={(event) => setHeader(event.target.checked)}
             />
-            <label className="text-[11px] text-muted-foreground" htmlFor={`${ids}-header`}>
+            <label className="text-meta text-muted-foreground" htmlFor={`${ids}-header`}>
               First row is a header
             </label>
           </div>

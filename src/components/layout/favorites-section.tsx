@@ -75,9 +75,10 @@ export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSec
         ) : (
           <ChevronDown aria-hidden="true" className="size-3 shrink-0 text-muted-foreground" />
         )}
-        <span className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-          Favorites
-        </span>
+        {/* `text-muted-foreground`, not `text-faint`: this is the visible name
+            of the control it sits inside, and a control's own name is held to
+            4.5:1 however label-like it looks. */}
+        <span className="label-caps text-muted-foreground">Favorites</span>
       </button>
       {!isCollapsed && (
         <ul aria-label="Favorite conversations" className="flex flex-col pb-1">

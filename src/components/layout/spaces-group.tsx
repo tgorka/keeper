@@ -79,7 +79,11 @@ export function SpacesGroup({ collapsed = false }: { collapsed?: boolean }) {
               aria-label={space.name}
               className={cn(
                 "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-                collapsed ? "justify-center p-1" : "w-full gap-2 px-2 py-1.5",
+                // `p-1.5` for the same reason NETWORKS uses it: the folded rail
+                // is a column of 36px controls (`size-9` nav buttons, `size-9`
+                // footer buttons), and a 24px avatar under `p-1` made this row
+                // 32px — a hover pill 4px narrower than its neighbour's.
+                collapsed ? "justify-center p-1.5" : "w-full gap-2 px-2 py-1.5",
                 isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
               )}
             >

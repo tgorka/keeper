@@ -105,7 +105,10 @@ export function FoldSection({
           aria-controls={id}
           data-slot="sidebar-group-fold"
           className={cn(
-            "h-auto py-1 font-medium text-muted-foreground text-xs uppercase tracking-wide focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+            // `text-muted-foreground`, not `text-faint`: this label is the
+            // visible name of a control, and a control's own name is held to
+            // 4.5:1 however label-like it looks.
+            "h-auto py-1 label-caps text-muted-foreground",
             collapsed ? "justify-center px-0" : "min-w-0 flex-1 justify-start gap-2 px-2",
           )}
           onClick={onToggle}

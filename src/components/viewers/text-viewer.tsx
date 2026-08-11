@@ -166,7 +166,7 @@ export function TextEditorSurface({
     <div className="flex h-full min-h-0 flex-col">
       {oversize ? (
         <p
-          className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+          className="border-b px-3 py-1 text-meta text-muted-foreground"
           data-testid="text-viewer-oversize"
         >
           {sizeLabel === undefined

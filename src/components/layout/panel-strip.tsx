@@ -24,6 +24,7 @@
  * surfaces wording the absent drive differently is how a user concludes they
  * are two different problems.
  */
+import { ChevronsLeftRight, ChevronsRightLeft, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
 import { PaneHeader } from "@/components/layout/pane-header";
@@ -328,20 +329,33 @@ function PanelFrame({
   emptySentence: string;
 }) {
   const name = panelName(panel.target);
+  // Folded, the tooltip and the accessible name are ONE string and it carries
+  // the panel's name, because a folded panel has nothing else on screen: a
+  // pointer that hovered a bare chevron would learn only that the strip folds,
+  // not which of four files this one is. Open, the panel names itself an inch
+  // to the left, so the control only has to say what it does. Whichever it is,
+  // `title` and `aria-label` are the same words — a control whose tooltip and
+  // whose spoken name disagree cannot be operated by anyone saying what they
+  // see (WCAG 2.5.3), and with the text gone the tooltip IS the visible label.
+  const foldName = panel.folded ? `${PANEL_UNFOLD_LABEL}: ${name}` : PANEL_FOLD_LABEL;
   const fold = (
     <Button
       type="button"
       variant="ghost"
-      size="sm"
+      size="icon-sm"
       // The name says which way the control goes; `aria-expanded` says where it
-      // is now. A folded panel shows nothing else, so the name it carries is the
-      // only thing on screen that identifies it to a pointer.
+      // is now.
       aria-expanded={!panel.folded}
-      title={panel.folded ? name : undefined}
-      className="h-6 shrink-0 px-2 text-xs"
+      aria-label={foldName}
+      title={foldName}
+      className="shrink-0"
       onClick={() => panelsStore.getState().toggleFold(panel.id)}
     >
-      {panel.folded ? PANEL_UNFOLD_LABEL : PANEL_FOLD_LABEL}
+      {panel.folded ? (
+        <ChevronsLeftRight aria-hidden="true" />
+      ) : (
+        <ChevronsRightLeft aria-hidden="true" />
+      )}
     </Button>
   );
   return (
@@ -363,14 +377,20 @@ function PanelFrame({
     >
       {panel.folded ? (
         // Folded: the control that undoes it, and nothing else. The panel is
-        // still named by the section's `aria-label`, so a reader moving between
-        // panels can still tell which one this is.
-        <header className="flex shrink-0 items-center border-border border-b px-1 py-2">
+        // still named by the section's `aria-label` and by the control's own,
+        // so neither a reader nor a pointer has to guess which one this is.
+        //
+        // `py-1` beside a 32px control, here and on the open header below,
+        // keeps both rows at DESIGN.md's 40px pane-header while the control
+        // itself keeps DESIGN.md's 32px hit target. The height used to come
+        // from `py-2` around a 24px button, which spent the same 40px on a
+        // target a third smaller.
+        <header className="flex shrink-0 items-center border-border border-b px-1 py-1">
           {fold}
         </header>
       ) : (
         <PaneHeader
-          className="border-border border-b px-3 py-2"
+          className="border-border border-b px-3 py-1"
           // Deliberately not a heading. The viewer inside draws the document's
           // own heading, and a second `h2` naming the same file would put two
           // entries in a screen reader's heading list for one document. The
@@ -395,11 +415,13 @@ function PanelFrame({
                 <Button
                   type="button"
                   variant="ghost"
-                  size="sm"
-                  className="h-6 shrink-0 px-2 text-xs"
+                  size="icon-sm"
+                  aria-label={PANEL_CLOSE_LABEL}
+                  title={PANEL_CLOSE_LABEL}
+                  className="shrink-0"
                   onClick={() => panelsStore.getState().closePanel(panel.id)}
                 >
-                  {PANEL_CLOSE_LABEL}
+                  <X aria-hidden="true" />
                 </Button>
               )}
             </>

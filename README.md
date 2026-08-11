@@ -1,3 +1,5 @@
+<img src="favicon.png" alt="" width="84" align="right">
+
 # Keeper
 
 An open-source, Beeper-style universal messenger client built on [Matrix](https://matrix.org).

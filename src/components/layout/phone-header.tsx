@@ -96,7 +96,7 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
                 variant="ghost"
                 size="icon"
                 aria-label="More"
-                className="size-11 shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                className="size-11 shrink-0"
               >
                 <Ellipsis aria-hidden="true" />
               </Button>

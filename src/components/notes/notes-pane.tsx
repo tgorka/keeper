@@ -41,10 +41,19 @@
  * cannot, the create still happens and the sentence Rust composed is shown
  * above the list. Nothing here parses a query; the surface sends a space id.
  */
-import { FilePlus } from "lucide-react";
+import {
+  FilePlus,
+  FilterX,
+  Folder,
+  Layers,
+  NotebookPen,
+  NotebookText,
+  Search,
+  Tags,
+} from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import { PanelStrip } from "@/components/layout/panel-strip";
-import { useSurfaceColumn } from "@/components/layout/surface-column";
+import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-column";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
@@ -57,6 +66,7 @@ import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-note
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
   emptyFilterReason,
   isFiltered,
@@ -66,7 +76,12 @@ import {
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
-import { hydrateNotesRailFold } from "@/lib/stores/notes-rail-fold";
+import {
+  hydrateNotesRailFold,
+  type NotesRailGroup,
+  notesRailFoldStore,
+  useNotesRailFold,
+} from "@/lib/stores/notes-rail-fold";
 import {
   ensureNotesVaultsHydrated,
   useActiveVault,
@@ -79,6 +94,13 @@ import { cn } from "@/lib/utils";
 
 /** What a failed verb reads as when the rejection carries no message. */
 const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
+
+/**
+ * What the folded list column's way into the notes reads as, and the carrier of
+ * the count while the list itself is unmounted. Not the column's own name —
+ * "Expand note list" is the fold; this is the notes.
+ */
+export const NOTES_RAIL_LIST_LABEL = "Note list";
 
 /** The name a saved space gets when it is promoted from the chip bar. */
 export const UNTITLED_SPACE_NAME = "Saved filter";
@@ -113,11 +135,6 @@ export const NOTES_NOTICE_SLOT = "notes-create-notice";
 export const NOTES_PANEL_EMPTY_SENTENCE = "Nothing is open here yet. Click a note to open it.";
 
 export function NotesPane() {
-  // Both of this surface's fixed columns fold and resize (Story 48.1). The
-  // panel strip does not: it is the flexible one, and a surface where every
-  // column has a width is a surface with a gap in it.
-  const rail = useSurfaceColumn("notes-rail");
-  const list = useSurfaceColumn("notes-list");
   const vaults = useNotesVaultsStore((s) => s.vaults);
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
@@ -134,6 +151,10 @@ export function NotesPane() {
   const total = useNotesListStore((s) => s.total);
   const matched = useNotesListStore((s) => s.matched);
   const loaded = useNotesListStore((s) => s.loaded);
+  // Which rail sections are folded (Story 47.3). Read here so the folded
+  // COLUMN's rail can open the section it names: unfolding the column into a
+  // section the user left folded would be a control that lands you nowhere.
+  const railGroups = useNotesRailFold((s) => s.groups);
   // The note this pane is showing: the active panel's target, when it is a note.
   const activeNote = usePanelsStore((s) => {
     const active = activePanel(s);
@@ -378,6 +399,104 @@ export function NotesPane() {
         notesFiltersStore.getState().clearAll();
     }
   };
+
+  /**
+   * What the scope column still offers with its body unmounted (Story 48.1,
+   * second cut). The order is the column's own, read top to bottom.
+   *
+   * The vault entry and the three sections are "unfold, and put me at the thing
+   * I named" — the honest behaviour for a switcher and three trees at 48px, and
+   * the section entries do the second half of it by opening a section the user
+   * had folded. New note is not: it makes a note in the active vault and opens
+   * it in the strip beside, which is exactly as true folded as unfolded.
+   *
+   * The three sections are DECLARED, not discovered. `TagTree` renders nothing
+   * for a vault with no tags and `PhysicalTree` nothing for a vault it cannot
+   * read, and the rail is not going to run a second tag read to find that out
+   * before offering the way in. Unfolding then shows what is actually there,
+   * which is the same answer the unfolded column gives — and the alternative,
+   * a rail whose controls appear and disappear as trees load, is a strip that
+   * changes shape under the cursor.
+   */
+  const openSection = (group: NotesRailGroup) => {
+    columnFoldStore.getState().toggleColumn("notes-rail");
+    if (railGroups[group]) {
+      notesRailFoldStore.getState().toggleGroup(group);
+    }
+  };
+  const railRail: SurfaceRail = [
+    {
+      id: "vault",
+      icon: NotebookPen,
+      label: "Vaults",
+      // Which vault is active is the first thing the strip hid. It rides the
+      // control that leads to the switcher rather than a caption of its own.
+      detail: activeVault?.name ?? null,
+      onSelect: () => columnFoldStore.getState().toggleColumn("notes-rail"),
+    },
+    {
+      id: "new-note",
+      icon: FilePlus,
+      label: NEW_NOTE_LABEL,
+      disabled: activeVaultId === null,
+      onSelect: () => onCreate(null),
+    },
+    { id: "spaces", icon: Layers, label: "Spaces", onSelect: () => openSection("spaces") },
+    { id: "tags", icon: Tags, label: "Tags", onSelect: () => openSection("tags") },
+    { id: "files", icon: Folder, label: "Files", onSelect: () => openSection("files") },
+  ];
+
+  /**
+   * What the list column still offers folded.
+   *
+   * The count is the fact a strip destroys most completely — folded, there is
+   * nothing on screen to say the lens holds forty notes or none — so it rides
+   * the entry into the list, as digits for the eye and as words in the name.
+   * Clear filters is on the rail because a filter you cannot see and cannot
+   * clear is worse than one you can: the chips are unmounted, and until this
+   * the only way back to an unfiltered list was to unfold first.
+   */
+  const listRail: SurfaceRail = [
+    {
+      id: "search",
+      icon: Search,
+      label: "Search notes",
+      // The pane already focuses the field on this nonce, for the palette's
+      // Search Notes. Unfolding and bumping it in one click lands the caret in
+      // the field the same render the field comes back.
+      onSelect: () => {
+        columnFoldStore.getState().toggleColumn("notes-list");
+        notesFiltersStore.getState().requestSearchFocus();
+      },
+    },
+    {
+      id: "notes",
+      icon: NotebookText,
+      label: NOTES_RAIL_LIST_LABEL,
+      detail: loaded && !noVault ? countLabel(total, NOTES, { of: matched }) : null,
+      count: total,
+      onSelect: () => columnFoldStore.getState().toggleColumn("notes-list"),
+    },
+    ...(filtered
+      ? [
+          {
+            id: "clear-filters",
+            icon: FilterX,
+            label: "Clear filters",
+            detail: filterReason === "" ? null : filterReason,
+            onSelect: () => notesFiltersStore.getState().clearAll(),
+          },
+        ]
+      : []),
+  ];
+
+  // Both of this surface's fixed columns fold and resize (Story 48.1). The
+  // panel strip does not: it is the flexible one, and a surface where every
+  // column has a width is a surface with a gap in it. Called here rather than
+  // at the top of the component because a column's rail is made of the same
+  // state its body is.
+  const rail = useSurfaceColumn("notes-rail", { rail: railRail });
+  const list = useSurfaceColumn("notes-list", { rail: listRail });
 
   return (
     <div className="flex min-h-0 flex-1">

@@ -161,7 +161,7 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           answer rather than re-deriving one. */}
       {entry.format === "markdown" && inVault !== null && (
         <div className="flex shrink-0 justify-end border-b px-2 py-1">
-          <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={openInNotes}>
+          <Button size="xs" variant="ghost" onClick={openInNotes}>
             {OPEN_IN_NOTES_LABEL}
           </Button>
         </div>
@@ -170,7 +170,7 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
         <p
           role="status"
           data-slot={TEXT_FILE_NOTICE_SLOT}
-          className="shrink-0 border-b px-3 py-1 text-[11px] text-muted-foreground"
+          className="shrink-0 border-b px-3 py-1 text-meta text-muted-foreground"
         >
           {notice}
         </p>

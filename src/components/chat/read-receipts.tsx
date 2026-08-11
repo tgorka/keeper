@@ -9,6 +9,8 @@
  * reader always renders the same chip. Shows up to three chips then a `+K`
  * overflow. Renders nothing when `readers` is empty.
  */
+import type { CSSProperties } from "react";
+import { accountHueVar, HUE_WHEEL_SIZE } from "@/lib/account-hue";
 import { cn } from "@/lib/utils";
 
 /** How many reader chips to show before collapsing the rest into a `+K` badge. */
@@ -35,19 +37,25 @@ function initialsOf(userId: string): string {
 }
 
 /**
- * Deterministic hue (0–359) from a user id, so a given reader always gets the same
- * chip color. A small, stable string hash — never a random per-render value.
+ * Deterministic hue INDEX (0–7) from a user id, so a given reader always gets the
+ * same chip colour. A small, stable string hash — never a random per-render value.
+ *
+ * This used to return degrees and be spent as `hsl(h 55% 45%)` inline, which put a
+ * colour value in a component and reinvented the wheel that already exists:
+ * `account-hue.ts` maps an index onto `--account-hue-0..7`, and its own doc says
+ * the frontend never hardcodes a colour. Free hue also meant free contrast — every
+ * chip picked its own lightness against whatever surface it landed on.
+ *
+ * Accumulate the hash in full 32-bit width and reduce ONCE at the end. Reducing on
+ * every step (as a prior version did) collapses the state space mid-accumulation,
+ * so long ids lose their prefix entropy and readers start sharing a colour.
  */
-function hueOf(userId: string): number {
-  // Accumulate the hash in full 32-bit width and reduce to a hue once at the end.
-  // Reducing modulo 360 on every step (as a prior version did) collapses the state
-  // space mid-accumulation, so long ids lose their prefix entropy and colors
-  // cluster — different readers then share a hue. `| 0` keeps 32-bit int math.
+function hueIndexOf(userId: string): number {
   let hash = 0;
   for (let i = 0; i < userId.length; i += 1) {
     hash = (hash * 31 + userId.charCodeAt(i)) | 0;
   }
-  return Math.abs(hash) % 360;
+  return Math.abs(hash) % HUE_WHEEL_SIZE;
 }
 
 export function ReadReceipts({ readers, isOwn = false }: ReadReceiptsProps) {
@@ -70,8 +78,8 @@ export function ReadReceipts({ readers, isOwn = false }: ReadReceiptsProps) {
           key={userId}
           title={userId}
           aria-hidden="true"
-          className="flex size-3.5 items-center justify-center rounded-full font-medium text-[7px] text-white leading-none"
-          style={{ backgroundColor: `hsl(${hueOf(userId)} 55% 45%)` }}
+          className="flex size-3.5 items-center justify-center rounded-full bg-(--chip) font-medium text-[7px] text-background leading-none"
+          style={{ "--chip": accountHueVar(hueIndexOf(userId)) } as CSSProperties}
         >
           {initialsOf(userId)}
         </span>

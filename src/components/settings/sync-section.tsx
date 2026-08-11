@@ -488,9 +488,11 @@ function SyncProfileRow({
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 flex-col gap-0.5">
           <p className="font-medium">{profile.name}</p>
-          {/* Verbatim, never recomposed: the tray renders this same sentence. */}
+          {/* Verbatim, never recomposed: the tray renders this same sentence.
+              A sentence is the room's voice; `figures` only keeps the counts in
+              it from reflowing as they tick. */}
           {status !== undefined && (
-            <span className="font-mono text-muted-foreground text-xs">{status.line}</span>
+            <span className="figures text-muted-foreground text-xs">{status.line}</span>
           )}
           <SyncFolderPath
             profile={profile}
@@ -595,7 +597,7 @@ function SyncProfileRow({
         ) : (
           <ul className="flex flex-col gap-0.5">
             {problems.map((problem) => (
-              <li key={problem} className="font-mono text-destructive text-xs">
+              <li key={problem} className="text-destructive text-xs">
                 {problem}
               </li>
             ))}
@@ -759,8 +761,11 @@ export function DeviceSection({ open }: { open: boolean }) {
       )}
       {deviceError !== null && <p className="text-destructive text-xs">{deviceError}</p>}
       {device !== null && (
-        <p className="font-mono text-muted-foreground text-xs">
-          {SYNC_DEVICE_ID_LABEL}: {device.id}
+        <p className="text-muted-foreground text-xs">
+          {/* The label is prose and the id is a hash: only the second half is
+              the register's, and setting the whole line in mono would say the
+              words were data too. */}
+          {SYNC_DEVICE_ID_LABEL}: <span className="font-mono">{device.id}</span>
         </p>
       )}
       {device !== null && <p className="text-muted-foreground text-xs">{SYNC_DEVICE_ID_NOTE}</p>}

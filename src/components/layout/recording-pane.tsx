@@ -199,7 +199,7 @@ export function RecordingPane() {
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="flex min-w-0 flex-col items-start gap-1">
           <div className="min-w-0">
-            <h1 className="font-heading font-medium text-lg">Recording</h1>
+            <h1 className="font-heading text-title">Recording</h1>
             <p className="text-muted-foreground text-sm">{RECORDING_SUBTITLE}</p>
           </div>
           {/* The way across to the notes side (Story 45.19, FR-197), present

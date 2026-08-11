@@ -1504,7 +1504,7 @@ export function ConversationPane({
                     roomId: selectedRoomId,
                   })
                 }
-                className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                className=""
               >
                 <Download aria-hidden="true" />
               </Button>
@@ -1517,7 +1517,7 @@ export function ConversationPane({
               aria-label="Toggle detail panel"
               aria-pressed={detailOpen}
               onClick={onToggleDetail}
-              className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              className="shrink-0"
             >
               <PanelRight aria-hidden="true" />
             </Button>

@@ -204,28 +204,47 @@ describe("SidebarPane primary view", () => {
 });
 
 describe("SidebarPane bridge-health roll-up", () => {
-  it("shows no roll-up dot when nothing is monitored", () => {
+  it("shows no roll-up lamp when nothing is monitored", () => {
     renderSidebar();
     expect(document.querySelector('[data-slot="bridge-health-rollup"]')).not.toBeInTheDocument();
   });
 
-  it("rolls the worst state up to the Bridges dot (disconnected beats degraded)", () => {
+  it("rolls the worst state up to the Bridges lamp (disconnected beats degraded)", () => {
     seedSession("telegram", "degraded");
     seedSession("whatsapp", "disconnected");
     seedSession("signal", "healthy");
     renderSidebar();
-    const dot = document.querySelector('[data-slot="bridge-health-rollup"]');
-    expect(dot).toBeInTheDocument();
-    // Worst state is disconnected → the disconnected tint.
-    expect(dot).toHaveClass("bg-bridge-disconnected");
+    const lamp = document.querySelector('[data-slot="bridge-health-rollup"]');
+    expect(lamp).toBeInTheDocument();
+    // Worst state is disconnected. Asserted as shape and word rather than as a
+    // tint: this roll-up used to be an `aria-hidden` coloured dot, so the
+    // health of every bridge at once reached a screen reader not at all, and a
+    // dichromat as one of three tints 1.03–1.52 apart in luminance.
+    expect(lamp).toHaveAttribute("data-state", "fault");
+    // The row's NAME, not just DOM text. The button is named outright rather
+    // than from its contents, because a computed name concatenates trimmed
+    // text nodes and would announce "BridgesDisconnected" as one token.
+    expect(screen.getByRole("button", { name: "Bridges, Disconnected" })).toBeInTheDocument();
   });
 
-  it("shows the degraded tint when the worst monitored state is degraded", () => {
+  it("shows a different shape, not just a different tint, when the worst state is degraded", () => {
     seedSession("telegram", "degraded");
     seedSession("signal", "healthy");
     renderSidebar();
-    const dot = document.querySelector('[data-slot="bridge-health-rollup"]');
-    expect(dot).toHaveClass("bg-bridge-degraded");
+    const lamp = document.querySelector('[data-slot="bridge-health-rollup"]');
+    expect(lamp).toHaveAttribute("data-state", "working");
+    expect(screen.getByRole("button", { name: "Bridges, Action needed" })).toBeInTheDocument();
+  });
+
+  it("puts the health into the folded rail's accessible name", () => {
+    // Folded, the Bridges button carries an explicit `aria-label`, which
+    // overrides everything inside it — so the lamp's own word is unreachable
+    // there and the state has to be spliced into the name instead. Before
+    // this, a folded rail announced plain "Bridges" whether every bridge was
+    // up or every bridge was down.
+    seedSession("whatsapp", "disconnected");
+    renderSidebar(true);
+    expect(screen.getByRole("button", { name: "Bridges, Disconnected" })).toBeInTheDocument();
   });
 });
 
@@ -673,5 +692,161 @@ describe("SidebarPane fold (Story 45.20, FR-198, UX-DR81)", () => {
 
     expect(readSidebarFold(document.cookie).groups).toEqual({ spaces: false, networks: true });
     expect(sidebarFoldStore.getState().groups.networks).toBe(true);
+  });
+});
+
+describe("SidebarPane glyphs", () => {
+  /** Everything the menu can show at once: both gated pairs, the Notes entry,
+   *  and both data-driven groups. A collision test that renders half the menu
+   *  cannot see a collision between the halves. */
+  function seedEverything() {
+    capabilitiesStore.setState({
+      capabilities: { ...DEFAULT_CAPABILITIES, recording: true, sync: true, notes: true },
+      hydrated: true,
+    });
+    spacesStore.getState().applySnapshot({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!a:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+    networksStore.getState().applySnapshot({ networks: [{ name: "Telegram" }] });
+  }
+
+  /** The `lucide-<name>` class every lucide glyph carries, for each svg in the
+   *  menu. The name is what the glyph MEANS to a reader, so two rows sharing
+   *  one is the defect this asserts against — not a detail of the markup. */
+  function glyphNames() {
+    const nav = screen.getByRole("navigation", { name: "Views" });
+    return [...nav.querySelectorAll("svg")]
+      .flatMap((svg) => [...svg.classList])
+      .filter((c) => c.startsWith("lucide-"));
+  }
+
+  it("draws no glyph twice anywhere in the menu", () => {
+    // The shipped set drew `Radio` on both the Bridges row and the NETWORKS
+    // header, and `Inbox` on Approvals while `inbox` was the view id of Chats.
+    // One glyph standing for two concepts stands for neither, and no test saw
+    // it because every test looked at one row at a time.
+    seedEverything();
+    renderSidebar(false);
+
+    const names = glyphNames();
+    const seen = new Set<string>();
+    const twice: string[] = [];
+    for (const name of names) {
+      if (seen.has(name)) {
+        twice.push(name);
+      }
+      seen.add(name);
+    }
+    expect(twice).toEqual([]);
+  });
+
+  it("gives Approvals a verb and the two recording rows different kinds", () => {
+    // Approvals is consent, not a container — and it must not wear the glyph
+    // whose name is the OTHER row's view id. Recording is a screen being
+    // captured; Recordings is the strip they end up on. `Video` and `Film`
+    // were both a rounded rectangle at 16px.
+    seedEverything();
+    renderSidebar(false);
+
+    const names = glyphNames();
+    expect(names).toContain("lucide-stamp");
+    expect(names).toContain("lucide-cable");
+    expect(names).toContain("lucide-monitor-dot");
+    expect(names).toContain("lucide-film");
+    expect(names).not.toContain("lucide-inbox");
+    expect(names).not.toContain("lucide-video");
+    // `Radio` survives, on the one row that means a network's signal.
+    expect(names).toContain("lucide-radio");
+  });
+});
+
+describe("SidebarPane rail geometry (the UI around the icons)", () => {
+  /** jsdom performs no layout — every rect is zero (see `priority-actions`).
+   *  So the proof is the classes that FIX the geometry, and the arithmetic they
+   *  stand for is spelled out in each assertion. */
+  function seedIndicators() {
+    seedSession("whatsapp", "disconnected");
+    draftsStore.getState().mark("a1", "!r1:x", true);
+    draftsStore.getState().mark("a1", "!r2:x", true);
+    draftsStore.getState().mark("a1", "!r3:x", true);
+  }
+
+  it("keeps the folded rail's lamp and count dot clear of the glyph they mark", () => {
+    // A folded button is `size-9` (36px) with a 1px border, so its padding box
+    // is 34px and the 16px glyph centred in it occupies [10,26] on both axes.
+    // A 6px indicator 1px from the corner occupies [28,34] x [2,8] — 2px clear
+    // in x and 2px clear in y. The shipped `top-1.5 right-1.5` lamp sat at
+    // [23,29] x [7,13] and the shipped 8px `top-1 right-1` dot at [23,31] x
+    // [5,13]: both overlapped the glyph's top-right corner by 3px in BOTH axes.
+    seedIndicators();
+    renderSidebar(true);
+
+    const lamp = document.querySelector('[data-slot="bridge-health-rollup"]');
+    const dot = document.querySelector('[data-slot="approval-count"]');
+    for (const el of [lamp, dot]) {
+      expect(el).toBeInTheDocument();
+      expect(el).toHaveClass("absolute", "top-px", "right-px");
+      expect(el).not.toHaveClass("top-1", "top-1.5", "right-1", "right-1.5");
+    }
+    // One indicator metric, not two: the count dot is 6px because that is the
+    // lamp's size (DESIGN.md → Shapes), where it used to be 8px.
+    expect(dot).toHaveClass("size-1.5");
+    expect(lamp?.querySelector("svg")).toHaveClass("size-1.5");
+  });
+
+  it("pushes the unfolded lamp and badge to the end of the row, away from the glyph", () => {
+    // Unfolded the row is a flex line: glyph, label, then `ml-auto` eats every
+    // spare pixel, so the indicator lands against the row's trailing padding
+    // and the glyph is the row's FIRST child. There is no width at which they
+    // can meet.
+    seedIndicators();
+    renderSidebar(false);
+
+    const bridges = screen.getByRole("button", { name: "Bridges, Disconnected" });
+    const approvals = screen.getByRole("button", { name: "Approvals, 3 pending" });
+    for (const [row, slot] of [
+      [bridges, "bridge-health-rollup"],
+      [approvals, "approval-count"],
+    ] as const) {
+      expect(row.firstElementChild?.tagName).toBe("svg");
+      const indicator = row.querySelector(`[data-slot="${slot}"]`);
+      expect(indicator).toHaveClass("ml-auto");
+      expect(row.lastElementChild).toBe(indicator);
+    }
+  });
+
+  it("draws every folded rail control at one width", () => {
+    // The rail is a 48px column. A `size-9` nav button centred in it leaves a
+    // 6px gutter; a 24px avatar under `p-1` made a Space or Network row 32px,
+    // so its hover and selected pill was 4px narrower than the pill directly
+    // above it. `p-1.5` is 24 + 6 + 6 = 36, and the column lines up.
+    spacesStore.getState().applySnapshot({
+      spaces: [
+        {
+          accountId: account.accountId,
+          spaceId: "!a:example.org",
+          name: "Design",
+          avatarUrl: null,
+        },
+      ],
+    });
+    networksStore.getState().applySnapshot({ networks: [{ name: "Telegram" }] });
+    renderSidebar(true);
+
+    expect(screen.getByRole("button", { name: "Chats" })).toHaveClass("size-9");
+    for (const name of ["Design", "Telegram"]) {
+      const row = screen.getByRole("button", { name });
+      expect(row, name).toHaveClass("p-1.5");
+      // `size="sm"` is the 24px avatar; the size itself is a variant class, so
+      // the honest assertion is the variant the row asked for.
+      expect(row.querySelector('[data-slot="avatar"]'), name).toHaveAttribute("data-size", "sm");
+    }
   });
 });

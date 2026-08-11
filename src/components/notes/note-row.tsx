@@ -166,23 +166,29 @@ export function NoteRow({
           )}
           {/* The number the sort actually used, beside the note it placed. An
               ordering the reader cannot account for reads as randomness, and
-              this is the cheapest possible account of it (Story 44.5, AD-81). */}
+              this is the cheapest possible account of it (Story 44.5, AD-81).
+              Set in the register's mono face: this is a column of figures read
+              down rather than across, and it only reads as a column if the
+              digits are the same width in every row. */}
           <span
             data-slot="note-order"
             data-order-source={row.order.source}
             className={cn(
-              "ml-auto shrink-0 text-xs tabular-nums",
+              "ml-auto shrink-0 font-mono text-xs",
               row.order.source === "own" && "text-foreground",
-              // A note that never stated a position is dimmer than one that did:
-              // a column of identical defaults should read as "nobody ordered
-              // these", not as data.
-              row.order.source === "default" && "text-muted-foreground/60",
+              // A note that never stated a position is quieter than one that
+              // did: a column of identical defaults should read as "nobody
+              // ordered these", not as data. Quieter is a step down the text
+              // ramp, not a step through it — this number is still the fact the
+              // sort used, so it stays at the 4.5:1 metadata tone rather than
+              // being faded below it.
+              row.order.source === "default" && "text-muted-foreground",
               row.order.source === "unreadable" && "text-destructive",
             )}
           >
             {formatNoteOrder(row.order)}
           </span>
-          <span className="shrink-0 text-muted-foreground text-xs">
+          <span className="figures shrink-0 text-muted-foreground text-xs">
             {formatDraftAge(row.updatedMs)}
           </span>
         </span>
@@ -197,7 +203,7 @@ export function NoteRow({
               key={tag}
               type="button"
               aria-label={`Tag ${tag}, on this note`}
-              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
               onClick={(event) => {
                 // The chip filters; the row opens. Without this the two fight.
                 event.stopPropagation();
@@ -213,7 +219,7 @@ export function NoteRow({
                 <button
                   type="button"
                   aria-label={`${NOTE_MORE_TAGS_LABEL} ${hiddenTags.join(", ")}`}
-                  className="shrink-0 rounded-full px-1 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                  className="shrink-0 rounded-full px-1 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={(event) => {
                     // Same rule as a chip: this opens the tags, not the note.
                     event.stopPropagation();
@@ -236,7 +242,7 @@ export function NoteRow({
                       key={tag}
                       type="button"
                       aria-label={`Tag ${tag}, on this note`}
-                      className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+                      className="rounded-full bg-muted px-1.5 py-0.5 text-meta text-muted-foreground leading-none outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
                       onClick={(event) => {
                         event.stopPropagation();
                         onToggleTag(tag);

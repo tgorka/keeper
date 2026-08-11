@@ -88,7 +88,9 @@ afterEach(() => {
 /** The real editor, once its lazy chunk has landed. */
 async function mounted(): Promise<EditorView> {
   render(<NoteEditor vaultId="v1" noteId="n1" />);
-  await screen.findByText(NOTE_ACTIONS_TEXT);
+  // The header's Actions trigger is a glyph since 48.9, so its arrival is
+  // waited for by the name it answers to rather than by text it no longer has.
+  await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_TEXT}`) });
   return await waitFor(() => {
     const node = document.querySelector<HTMLElement>(".cm-content");
     expect(node).not.toBeNull();

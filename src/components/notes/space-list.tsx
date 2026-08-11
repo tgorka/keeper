@@ -32,6 +32,7 @@ import { FoldSection } from "@/components/layout/sidebar-group";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { SpaceEditor } from "@/components/notes/space-editor";
 import { spaceIcon } from "@/components/notes/space-icons";
+import { Lamp } from "@/components/ui/lamp";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
 import {
@@ -246,14 +247,22 @@ export function SpaceList({
                   })
                 }
               >
-                <span
-                  aria-hidden="true"
-                  data-slot="space-dot"
-                  className={cn(
-                    "mt-1.5 size-2 shrink-0 rounded-full",
-                    broken ? "bg-bridge-degraded" : "bg-transparent",
-                  )}
-                />
+                {/* A Space whose query keeper cannot read is a fault, and it
+                    gets the fault lamp; a healthy one gets a spacer of the same
+                    width so the glyph column below does not shuffle sideways.
+                    The failure is already in the row's accessible name
+                    (UX-DR43), so the lamp stays silent rather than saying it
+                    twice. It used to be an amber dot and nothing else, which is
+                    the colour-only status this vocabulary exists to end. */}
+                {broken ? (
+                  <Lamp state="fault" label={null} data-slot="space-dot" className="mt-1.5" />
+                ) : (
+                  <span
+                    aria-hidden="true"
+                    data-slot="space-dot"
+                    className="mt-1.5 size-1.5 shrink-0"
+                  />
+                )}
                 <Glyph
                   aria-hidden="true"
                   data-slot="space-icon"

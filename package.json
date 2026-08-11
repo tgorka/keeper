@@ -1,7 +1,7 @@
 {
   "name": "keeper",
   "private": true,
-  "version": "0.8.2",
+  "version": "0.8.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,6 +17,7 @@
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",
+    "check:design": "node scripts/check-design.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:rust": "cargo nextest run --manifest-path src-tauri/Cargo.toml",
@@ -43,6 +44,8 @@
     "@codemirror/legacy-modes": "^6.5.3",
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.36.4",
+    "@fontsource-variable/instrument-sans": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@lezer/markdown": "^1.4.2",
     "@tailwindcss/vite": "^4.3.2",
     "@tauri-apps/api": "^2",

@@ -74,16 +74,92 @@ export const TABLE_RAGGED_CLASS = "cm-md-table-ragged";
 /** What the control group is announced as. */
 export const TABLE_CONTROLS_LABEL = "Table";
 
+/** `createElementNS` needs it; `createElement` would make an unrendered HTML
+ *  element called "svg". */
+const SVG_NS = "http://www.w3.org/2000/svg";
+
 /** A structural edit. Every one of them rewrites the whole block through
  *  {@link alignedTable}, so none can leave the delimiter row behind. */
 export type TableOp = "add-column" | "remove-column" | "add-row" | "remove-row";
 
-/** The controls, in the order they are drawn, in the words a user reads. */
-export const TABLE_CONTROLS: readonly { readonly op: TableOp; readonly label: string }[] = [
-  { op: "add-column", label: "Add column" },
-  { op: "remove-column", label: "Remove column" },
-  { op: "add-row", label: "Add row" },
-  { op: "remove-row", label: "Remove row" },
+/**
+ * One node of an SVG icon: a tag and its attributes, which is exactly the
+ * shape `lucide-react` compiles each of its icons to.
+ *
+ * Copied as data rather than imported because this control is built with
+ * `document.createElement` inside a CodeMirror `WidgetType` — there is no React
+ * here to render a `<Paperclip />` into, and `lucide-react` publishes its icon
+ * nodes only through the React components. Four glyphs of geometry is a
+ * smaller and more honest cost than mounting a React root per table.
+ */
+type IconNode = readonly (readonly [string, Readonly<Record<string, string>>])[];
+
+/**
+ * The controls, in the order they are drawn, in the words a user reads and the
+ * glyph they now read instead.
+ *
+ * The words did not go anywhere: each is the control's `aria-label` and its
+ * `title`, so speech input can still say what an eye sees (WCAG 2.5.3) and the
+ * suite finds these by accessible name.
+ *
+ * The four glyphs are two axes crossed with two directions, taken verbatim from
+ * lucide (`between-vertical-start`, `fold-horizontal`, `between-horizontal-
+ * start`, `fold-vertical`) so they sit beside the format toolbar's lucide marks
+ * without looking hand-drawn. Arrows pushing OUT between two blocks insert;
+ * arrows folding IN toward a dashed seam remove. Axis is in the glyph as well
+ * as in the word, so the pair cannot be told apart only by position.
+ */
+export const TABLE_CONTROLS: readonly {
+  readonly op: TableOp;
+  readonly label: string;
+  readonly icon: IconNode;
+}[] = [
+  {
+    op: "add-column",
+    label: "Add column",
+    icon: [
+      ["rect", { width: "7", height: "13", x: "3", y: "8", rx: "1" }],
+      ["path", { d: "m15 2-3 3-3-3" }],
+      ["rect", { width: "7", height: "13", x: "14", y: "8", rx: "1" }],
+    ],
+  },
+  {
+    op: "remove-column",
+    label: "Remove column",
+    icon: [
+      ["path", { d: "M2 12h6" }],
+      ["path", { d: "M22 12h-6" }],
+      ["path", { d: "M12 2v2" }],
+      ["path", { d: "M12 8v2" }],
+      ["path", { d: "M12 14v2" }],
+      ["path", { d: "M12 20v2" }],
+      ["path", { d: "m19 9-3 3 3 3" }],
+      ["path", { d: "m5 15 3-3-3-3" }],
+    ],
+  },
+  {
+    op: "add-row",
+    label: "Add row",
+    icon: [
+      ["rect", { width: "13", height: "7", x: "8", y: "3", rx: "1" }],
+      ["path", { d: "m2 9 3 3-3 3" }],
+      ["rect", { width: "13", height: "7", x: "8", y: "14", rx: "1" }],
+    ],
+  },
+  {
+    op: "remove-row",
+    label: "Remove row",
+    icon: [
+      ["path", { d: "M12 22v-6" }],
+      ["path", { d: "M12 8V2" }],
+      ["path", { d: "M4 12H2" }],
+      ["path", { d: "M10 12H8" }],
+      ["path", { d: "M16 12h-2" }],
+      ["path", { d: "M22 12h-2" }],
+      ["path", { d: "m15 19-3-3-3 3" }],
+      ["path", { d: "m15 5-3 3-3-3" }],
+    ],
+  },
 ];
 
 /** One GFM table found in the document. */
@@ -443,16 +519,41 @@ class TableWidget extends WidgetType {
     controls.className = "cm-md-table-controls";
     controls.setAttribute("role", "group");
     controls.setAttribute("aria-label", TABLE_CONTROLS_LABEL);
-    for (const { op, label } of TABLE_CONTROLS) {
+    for (const { op, label, icon } of TABLE_CONTROLS) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = TABLE_CONTROL_CLASS;
-      button.textContent = label;
+      // The word leaves the surface and stays everywhere it was load-bearing:
+      // the accessible name, and the tooltip a pointer gets. A refusal is
+      // appended to the tooltip rather than replacing it, so a disabled control
+      // still says WHICH control it is before it says why it will not act.
+      button.setAttribute("aria-label", label);
       const refusal = tableRefusal(this.hit, op);
       if (refusal !== null) {
         button.disabled = true;
-        button.title = refusal;
+        button.title = `${label} — ${refusal}`;
+      } else {
+        button.title = label;
       }
+      const svg = document.createElementNS(SVG_NS, "svg");
+      // lucide's own defaults, which is what makes these read as the same
+      // family as the format toolbar's marks rather than as four odd drawings.
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      svg.setAttribute("stroke-width", "2");
+      svg.setAttribute("stroke-linecap", "round");
+      svg.setAttribute("stroke-linejoin", "round");
+      // The picture says nothing the `aria-label` has not already said.
+      svg.setAttribute("aria-hidden", "true");
+      for (const [tag, attrs] of icon) {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [name, value] of Object.entries(attrs)) {
+          node.setAttribute(name, value);
+        }
+        svg.append(node);
+      }
+      button.append(svg);
       // 44.9's rule for every control that is not a text field: the press must
       // not take the caret out of the note it is about to edit.
       button.addEventListener("mousedown", (event) => {
@@ -596,24 +697,75 @@ const tableTheme = EditorView.baseTheme({
     // is not everything that is written. Said in the margin rather than fixed.
     borderStyle: "dashed",
   },
+  // # Why this cluster is styled here and not in Tailwind (Story 48.9)
+  //
+  // These four are `document.createElement("button")` inside a CodeMirror
+  // `WidgetType`. A widget's DOM is built by hand and handed to CodeMirror —
+  // there is no JSX here, so `<Button size="icon-sm" variant="ghost">` is not
+  // reachable, and a Tailwind class written on the element would be a class
+  // this project's build never sees in a scanned file. Until now the
+  // consequence was visible: transparent background, a 1px currentColor border
+  // and inherited type, which is what a browser default button looks like
+  // sitting next to shadcn ones, and it is what the owner photographed.
+  //
+  // So the design system is restated here DELIBERATELY, value for value,
+  // against the same tokens `button.tsx` spends: 32px square (DESIGN.md's
+  // load-bearing control height, which `size="icon-sm"` also draws),
+  // `min(var(--radius-md), 10px)` radius, a transparent border that becomes
+  // `--ring` on focus, `--muted` on hover, a 2px `--ring` shadow for the focus
+  // indicator, and a 16px glyph. Every number is the one `buttonVariants`
+  // produces; none is a fresh opinion. If `Button` changes, this has to change
+  // with it, and that is the price of a control CodeMirror owns.
+  //
+  // The focus ring is written out rather than inherited because these are NOT
+  // our `Button` — nothing here passes through `buttonVariants`, so the base
+  // that serves 58 other call sites cannot reach them.
   ".cm-md-table-controls": {
     display: "flex",
-    gap: "0.25em",
+    // 4px, DESIGN.md's spacing unit. Icon-only controls in a row need a seam
+    // an eye can find: with the words gone, the gap is the only thing saying
+    // these are four controls rather than one strip.
+    gap: "4px",
     marginTop: "0.25em",
   },
   [`.${TABLE_CONTROL_CLASS}`]: {
+    alignItems: "center",
     background: "transparent",
-    border: "1px solid currentColor",
-    borderColor: "color-mix(in srgb, currentColor 25%, transparent)",
-    borderRadius: "0.25em",
+    border: "1px solid transparent",
+    borderRadius: "min(var(--radius-md), 10px)",
+    color: "inherit",
     cursor: "pointer",
-    font: "inherit",
-    fontSize: "0.75em",
-    padding: "0.1em 0.4em",
+    display: "inline-flex",
+    flexShrink: "0",
+    height: "32px",
+    justifyContent: "center",
+    outline: "none",
+    padding: "0",
+    transition: "all 150ms",
+    width: "32px",
+  },
+  [`.${TABLE_CONTROL_CLASS} svg`]: {
+    height: "16px",
+    pointerEvents: "none",
+    width: "16px",
+  },
+  [`.${TABLE_CONTROL_CLASS}:hover:not(:disabled)`]: {
+    background: "var(--muted)",
+    color: "var(--foreground)",
+  },
+  [`.${TABLE_CONTROL_CLASS}:focus-visible`]: {
+    borderColor: "var(--ring)",
+    boxShadow: "0 0 0 2px var(--ring)",
+  },
+  [`.${TABLE_CONTROL_CLASS}:active:not(:disabled)`]: {
+    transform: "translateY(1px)",
   },
   [`.${TABLE_CONTROL_CLASS}:disabled`]: {
     cursor: "not-allowed",
-    opacity: "0.4",
+    // `Button`'s own disabled opacity. It dims the whole control — glyph and
+    // border together — so it is not the text-colour opacity DESIGN.md bans.
+    opacity: "0.5",
+    pointerEvents: "none",
   },
 });
 

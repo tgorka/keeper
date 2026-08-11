@@ -9,8 +9,8 @@
  * - Leading: an avatar `button` (the drawer trigger) that opens the leading
  *   `Sheet` (the reused `SidebarPane`). It renders the active account-filter
  *   account's hue-initials avatar when a filter is set, else a neutral
- *   all-accounts avatar, with a worst-state bridge-health dot `AvatarBadge`
- *   overlay shown only for `degraded`/`disconnected` (hidden on `healthy`/`null`).
+ *   all-accounts avatar, with a worst-state bridge-health lamp overlaid on it,
+ *   shown only for `degraded`/`disconnected` (hidden on `healthy`/`null`).
  * - Trailing: an amber Approval chip shown only when the pending-Draft count is
  *   > 0 (deep-links to the Approval Pane), a magnifier (opens the merged
  *   full-screen Search surface, Story 13.4), and a compose button.
@@ -20,11 +20,12 @@
  */
 import { Pencil, Search, Users } from "lucide-react";
 import type { Ref } from "react";
-import { Avatar, AvatarBadge, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { Lamp } from "@/components/ui/lamp";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
-import { BRIDGE_HEALTH_DOT_CLASS, BRIDGE_HEALTH_LABEL } from "@/lib/bridges";
+import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
 import { usePendingDraftCount } from "@/lib/stores/drafts";
@@ -35,7 +36,6 @@ import { searchSurfaceStore } from "@/lib/stores/search-surface";
 import { cn } from "@/lib/utils";
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
-
 interface PhoneInboxHeaderProps {
   /** Forwarded to the avatar drawer button so the shell can focus it on close (UX-DR28). */
   drawerButtonRef?: Ref<HTMLButtonElement>;
@@ -54,6 +54,13 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
   const showHealthDot = bridgeHealth === "degraded" || bridgeHealth === "disconnected";
   // The pending-draft count (Story 7.3): the amber Approval chip shows only > 0.
   const pendingDraftCount = usePendingDraftCount();
+  // A lamp inside a button with an explicit `aria-label` is mute: the label
+  // replaces the contents rather than joining them. So the health rides the
+  // button's own name, and the lamp beside it carries the shape.
+  const drawerLabel =
+    showHealthDot && bridgeHealth !== null
+      ? `Open navigation, ${BRIDGE_HEALTH_LABEL[bridgeHealth]}`
+      : "Open navigation";
 
   return (
     // Safe-area top inset (Story 13.5, FR-59): the notch/status-bar band pads
@@ -63,7 +70,7 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
       <button
         ref={drawerButtonRef}
         type="button"
-        aria-label="Open navigation"
+        aria-label={drawerLabel}
         onClick={() => leadingDrawerStore.getState().open()}
         className={cn("flex size-11 shrink-0 items-center justify-center rounded-full", FOCUS_RING)}
       >
@@ -81,13 +88,19 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
             </AvatarFallback>
           )}
           {showHealthDot && bridgeHealth !== null && (
-            <AvatarBadge
+            /* The roll-up lamp, sitting where the avatar badge sat. That badge
+               was a tint plus a bare `aria-label` on a role-less `<span>`,
+               which has nothing to hang a name on and went unannounced. The
+               lamp itself stays silent here for a different reason — the
+               button's own `aria-label` overrides everything inside it — so the
+               word rides the button name above and the shape rides this glyph.
+               The background disc is what the hollow and dashed states show
+               through, and it keeps the lamp legible against the avatar. */
+            <Lamp
+              state={BRIDGE_HEALTH_LAMP[bridgeHealth]}
+              label={null}
               data-slot="bridge-health-dot"
-              aria-label={BRIDGE_HEALTH_LABEL[bridgeHealth]}
-              className={cn(
-                "bg-blend-normal ring-background",
-                BRIDGE_HEALTH_DOT_CLASS[bridgeHealth],
-              )}
+              className="absolute right-0 bottom-0 z-10 rounded-full bg-background p-px ring-2 ring-background"
             />
           )}
         </Avatar>
@@ -114,7 +127,7 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
           size="icon"
           aria-label="Search"
           onClick={() => searchSurfaceStore.getState().open()}
-          className={cn("size-11 shrink-0", FOCUS_RING)}
+          className="size-11 shrink-0"
         >
           <Search aria-hidden="true" />
         </Button>
@@ -124,7 +137,7 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
           size="icon"
           aria-label="New chat"
           onClick={() => newChatStore.getState().open()}
-          className={cn("size-11 shrink-0", FOCUS_RING)}
+          className="size-11 shrink-0"
         >
           <Pencil aria-hidden="true" />
         </Button>

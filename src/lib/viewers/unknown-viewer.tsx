@@ -98,8 +98,8 @@ export function unknownViewerSentence(entry: ViewerEntry): string {
 function Fact({ label, slot, value }: { label: string; slot: string; value: string }) {
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
-      <dt className="text-muted-foreground text-xs uppercase tracking-wide">{label}</dt>
-      <dd data-testid={slot} className="truncate text-sm">
+      <dt className="label-caps text-faint">{label}</dt>
+      <dd data-testid={slot} className="figures truncate text-sm">
         {value}
       </dd>
     </div>
@@ -143,7 +143,7 @@ export function UnknownViewer({ file, entry, reason }: UnknownViewerProps) {
       className="flex min-w-0 flex-col gap-4 p-6"
     >
       <div className="min-w-0">
-        <h2 className="truncate font-heading font-medium text-base">{file.name}</h2>
+        <h2 className="truncate font-heading text-title">{file.name}</h2>
         {/* The relative path, which is the only path that may be rendered
             (FR-145). Empty for a file at the root of what is being browsed, in
             which case the name above has already said everything. */}

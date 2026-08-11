@@ -1,9 +1,13 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { Star } from "lucide-react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COLUMN_COLLAPSE_PREFIX,
   COLUMN_EXPAND_PREFIX,
+  COLUMN_RAIL_SLOT,
   SURFACE_COLUMN_FOLDED_WIDTH,
+  type SurfaceRail,
+  type SurfaceRailControl,
   useSurfaceColumn,
 } from "@/components/layout/surface-column";
 import { COLUMN_FITTED_VALUE_TEXT, COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
@@ -31,14 +35,41 @@ import {
  * on screen in `notes-pane.test.tsx`, `files-pane.test.tsx`,
  * `chat-list-pane.test.tsx` and `app-shell.test.tsx`. What is here is the
  * behaviour those four share, and it is parametrised over the real id set so a
- * fifth column cannot be added with a floor nobody chose.
+ * fifth column cannot be added with a floor nobody chose — or, since the second
+ * cut of Story 48.1, with a folded strip nobody filled.
  */
 
 /** The body a folded column must not be rendering. */
 const BODY = "the column body";
 
-function Host({ id, enabled }: { id: SurfaceColumnId; enabled?: boolean }) {
-  const column = useSurfaceColumn(id, { enabled });
+/**
+ * What the host contributes to its folded rail.
+ *
+ * Every column has one, because every column must: a strip with nothing but the
+ * way back on it is the defect this suite now refuses, and the host is the one
+ * place that gets to hand over the empty array to prove it.
+ */
+const RAIL_LABEL = "Host control";
+
+function Host({
+  id,
+  enabled,
+  rail,
+  onRail = () => {},
+}: {
+  id: SurfaceColumnId;
+  enabled?: boolean;
+  rail?: readonly SurfaceRailControl[];
+  onRail?: () => void;
+}) {
+  const column = useSurfaceColumn(id, {
+    enabled,
+    // Cast, because a non-empty tuple is the whole point of the type and one
+    // test below has to get past it the way a future caller would.
+    rail: (rail ?? [
+      { id: "host", icon: Star, label: RAIL_LABEL, onSelect: onRail },
+    ]) as SurfaceRail,
+  });
   return (
     <div className="flex">
       <div {...column.rootProps} data-testid="column">
@@ -100,6 +131,76 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
 
     fireEvent.click(back);
     expect(screen.getByText(BODY)).toBeInTheDocument();
+  });
+
+  /**
+   * The regression the owner hit, at the level every column shares it.
+   *
+   * A fold suspends a WIDTH, never a CAPABILITY: the body goes — that is what
+   * folding reclaims, and the assertion above says so — and what the body could
+   * DO stays, one icon button per thing, in the strip.
+   */
+  it("folds to a rail that still offers what the body did", () => {
+    const onRail = vi.fn();
+    render(<Host id={id} onRail={onRail} />);
+    // Not a second copy of the body: while the column is showing, the rail is
+    // not on screen at all.
+    expect(screen.queryByRole("button", { name: RAIL_LABEL })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: collapse }));
+
+    const strip = document.querySelector(`[data-slot="${COLUMN_RAIL_SLOT}"]`);
+    expect(strip).not.toBeNull();
+    // The way back AND what is inside. One button is the strip this story was
+    // opened about: 48px offering nothing but its own undo.
+    expect(strip?.querySelectorAll("button").length).toBeGreaterThan(1);
+
+    const control = screen.getByRole("button", { name: RAIL_LABEL });
+    control.focus();
+    expect(control).toHaveFocus();
+    fireEvent.click(control);
+    expect(onRail).toHaveBeenCalledTimes(1);
+    // A rail control does what it says. It does not smuggle an unfold in with
+    // it — the ones that mean "unfold and take me there" ask for that outright.
+    expect(screen.queryByText(BODY)).not.toBeInTheDocument();
+  });
+
+  it("names a rail control by its word first and its detail after", () => {
+    // The word the tooltip shows leads the accessible name, so "click Notes"
+    // names this control (WCAG 2.5.3); the count follows rather than replacing
+    // it. The digits in the corner are `aria-hidden`, which is why the words
+    // have to be in the name at all.
+    render(
+      <Host
+        id={id}
+        rail={[
+          {
+            id: "count",
+            icon: Star,
+            label: "Notes",
+            detail: "40 notes",
+            count: 40,
+            onSelect: () => {},
+          },
+          {
+            id: "many",
+            icon: Star,
+            label: "Chats",
+            detail: "250 unread",
+            count: 250,
+            onSelect: () => {},
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: collapse }));
+
+    expect(screen.getByRole("button", { name: "Notes, 40 notes" })).toBeInTheDocument();
+    expect(screen.getByText("40")).toBeInTheDocument();
+    // A three-digit badge would be wider than the strip. The words still say it.
+    expect(screen.getByRole("button", { name: "Chats, 250 unread" })).toBeInTheDocument();
+    expect(screen.getByText("99+")).toBeInTheDocument();
   });
 
   it("comes back folded after a reload", () => {
@@ -230,6 +331,28 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     expect(screen.queryByRole("button", { name: expand })).not.toBeInTheDocument();
     expect(screen.queryByRole("separator", { name: seam })).not.toBeInTheDocument();
     expect(screen.getByText(BODY)).toBeInTheDocument();
+  });
+
+  it("does not ask for a rail where the column cannot fold", () => {
+    // Nothing folds on the phone, so there is no strip and nothing has to stand
+    // in for a body that never goes away. The refusal below is about columns
+    // that CAN fold.
+    render(<Host id={id} enabled={false} rail={[]} />);
+
+    expect(screen.getByText(BODY)).toBeInTheDocument();
+  });
+
+  /**
+   * The defect, refused where it can be refused for every column at once.
+   *
+   * The owner folded both Notes columns and got two 48px strips holding their
+   * own undo and nothing else. {@link SurfaceRail} makes that unwritable — this
+   * is what happens to the caller that gets past a type, and it fires while the
+   * column is still SHOWING, because a strip nobody filled is a defect from the
+   * moment the column exists rather than from the moment a user finds it.
+   */
+  it("refuses a column that would fold to an empty strip", () => {
+    expect(() => render(<Host id={id} rail={[]} />)).toThrow(/empty strip/);
   });
 
   it("shows the body on the phone even when the desktop left this column folded", () => {

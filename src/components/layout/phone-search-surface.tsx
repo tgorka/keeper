@@ -23,6 +23,7 @@
  * radix restores focus to the opener (magnifier / overflow item) on close. Every
  * tappable target is ≥44pt with an accessible name; there is no bottom tab bar.
  */
+import { ChevronLeft } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { dispatchPaletteAction } from "@/components/command-palette/actions";
@@ -209,9 +210,9 @@ export function PhoneSearchSurface() {
                 aria-label="Close search"
                 className="flex size-11 shrink-0 items-center justify-center rounded-full text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
               >
-                <span aria-hidden className="text-lg">
-                  ←
-                </span>
+                {/* The phone shell's own back glyph, not a `←` character at a
+                    size the type scale does not have: an icon is an icon. */}
+                <ChevronLeft className="size-5" aria-hidden="true" />
               </button>
             </DialogPrimitive.Close>
             <div

@@ -476,10 +476,7 @@ export function SpaceEditor({
               </div>
               {iconGroups.map((group) => (
                 <div key={group.label} className="flex flex-col gap-1">
-                  <span
-                    id={`space-icon-group-${group.label}`}
-                    className="font-medium text-muted-foreground text-xs uppercase tracking-wide"
-                  >
+                  <span id={`space-icon-group-${group.label}`} className="label-caps text-faint">
                     {group.label}
                   </span>
                   {/* `group` + `aria-labelledby`, so a screen reader reading the
@@ -634,7 +631,10 @@ export function SpaceEditor({
                     <li
                       key={row.key}
                       data-slot="frozen-term"
-                      className="rounded-md bg-muted px-2 py-1 font-mono text-xs"
+                      // Sans: a term is a word the owner wrote, and the same word
+                      // is set in the room's voice as an editable chip two
+                      // branches below. Freezing it must not change its face.
+                      className="rounded-md bg-muted px-2 py-1 text-xs"
                     >
                       {row.term}
                     </li>

@@ -179,14 +179,14 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
                 onClick={() => setSelected(revision.rev)}
               >
                 <span className="block truncate">{revision.subject}</span>
-                <span className="block truncate text-[11px] text-muted-foreground">
+                <span className="block truncate text-meta text-muted-foreground">
                   {revision.device} · {revision.origin} · {revision.source}
                 </span>
               </button>
             </li>
           ))}
         </ul>
-        <div className="min-w-0 flex-1 overflow-auto px-3 py-2 font-mono text-[11px]">
+        <div className="min-w-0 flex-1 overflow-auto px-3 py-2 font-mono text-meta">
           {diff === null
             ? null
             : diff.hunks.map((hunk) => (

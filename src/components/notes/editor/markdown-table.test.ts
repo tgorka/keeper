@@ -18,6 +18,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { syntaxTree } from "@codemirror/language";
 import { EditorSelection, EditorState, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { within } from "@testing-library/dom";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { withRangeRects } from "@/test/layout";
 import { alignedTable, gfmTable } from "./format-commands";
@@ -26,7 +27,6 @@ import {
   splitTableRow,
   TABLE_BLOCK_CLASS,
   TABLE_CELL_CLASS,
-  TABLE_CONTROL_CLASS,
   TABLE_RAGGED_CLASS,
   tableAfter,
   tableCellText,
@@ -256,12 +256,20 @@ describe("a table in the note editor", () => {
     view.dispatch(view.state.replaceSelection(text), { userEvent: "input.type" });
   }
 
-  /** A control by the word on it. Absent controls are an error, not a skip. */
+  /**
+   * A control by the name it answers to.
+   *
+   * By ROLE AND ACCESSIBLE NAME since 48.9, not by class and `textContent`.
+   * These controls draw a glyph now, so their text content is empty and the
+   * old query found nothing — but the thing that broke was the query, not the
+   * control: what a user reaches these by is their name, and that is what
+   * `getByRole` computes. A class is an implementation detail; a name is the
+   * promise. Absent controls are an error, not a skip — `getByRole` throws.
+   */
   function control(view: EditorView, label: string): HTMLButtonElement {
-    const buttons = [...view.contentDOM.querySelectorAll(`.${TABLE_CONTROL_CLASS}`)];
-    const found = buttons.find((button) => button.textContent === label);
+    const found = within(view.contentDOM).getByRole("button", { name: label });
     if (!(found instanceof HTMLButtonElement)) {
-      throw new Error(`no "${label}" control: found ${buttons.length} controls`);
+      throw new Error(`"${label}" is a ${found.tagName}, not a button`);
     }
     return found;
   }
@@ -348,6 +356,29 @@ describe("a table in the note editor", () => {
   });
 
   // --- Structure ---------------------------------------------------------
+
+  it("draws every control as a named glyph rather than as a word", () => {
+    const view = open(`${ALIGNED}\n`);
+
+    // The row a user sees is four pictures. What they can SAY is still four
+    // phrases: `getByRole` computes the accessible name, so this passes only
+    // while every control keeps one (Story 48.9, WCAG 2.5.3).
+    for (const label of ["Add column", "Remove column", "Add row", "Remove row"]) {
+      const button = control(view, label);
+      // The word is gone from the surface — that is the change — and is still
+      // on the tooltip, which is the only thing a pointer has left to read.
+      expect(button.textContent).toBe("");
+      expect(button.title).toBe(label);
+      // One glyph, and it says nothing the name has not: a picture announced
+      // beside its own label is the label read twice.
+      const svg = button.querySelector("svg");
+      expect(svg).not.toBeNull();
+      expect(svg?.getAttribute("aria-hidden")).toBe("true");
+      // `createElementNS`, not `createElement`: an HTML element called "svg"
+      // renders nothing and would leave a control with no glyph at all.
+      expect(svg?.namespaceURI).toBe("http://www.w3.org/2000/svg");
+    }
+  });
 
   it("widens every row including the delimiter row when a column is added", () => {
     const view = open(`${ALIGNED}\n`);

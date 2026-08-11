@@ -29,7 +29,7 @@ export function SettingsPane() {
       {/* Same header shape as the Bridges pane, so the primary views read as one
           family rather than as four separately-designed screens. */}
       <header className="flex shrink-0 flex-col gap-0.5 border-border border-b px-4 py-3">
-        <h1 className="font-heading font-medium text-lg">{SETTINGS_PANE_TITLE}</h1>
+        <h1 className="font-heading text-title">{SETTINGS_PANE_TITLE}</h1>
         <p className="text-muted-foreground text-xs">{SETTINGS_PANE_SUBTITLE}</p>
       </header>
       <ScrollArea className="min-h-0 flex-1">

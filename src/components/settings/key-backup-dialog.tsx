@@ -254,7 +254,9 @@ function RestoreBody() {
 
   if (phase === "restored") {
     return (
-      <p className="text-sm text-emerald-600 dark:text-emerald-400">
+      // The app's `ok` tint under its original name, replacing a raw Tailwind
+      // palette green — see the note in `device-verification-dialog.tsx`.
+      <p className="text-bridge-healthy text-sm">
         Key backup restored. Encrypted history is unlocking now.
       </p>
     );

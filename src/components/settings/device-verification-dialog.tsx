@@ -112,9 +112,11 @@ function VerificationBody({ flow }: { flow: ReturnType<typeof useVerificationFlo
       return <p className="text-sm text-muted-foreground">{VERIFY_WAITING_TEXT}</p>;
     case "done":
       return (
-        <p className="text-sm text-emerald-600 dark:text-emerald-400">
-          This device is now verified.
-        </p>
+        // The app's `ok` tint under its original name. This was a raw Tailwind
+        // palette default — a third green nobody chose, ΔE 23.0 from the accent
+        // and 17.5 apart under deuteranopia, close enough to read as a near-miss
+        // of the brand rather than a colour of its own.
+        <p className="text-bridge-healthy text-sm">This device is now verified.</p>
       );
     case "cancelled":
       return <p className="text-sm text-muted-foreground">Verification cancelled.</p>;
@@ -212,7 +214,7 @@ function Comparing({
             <span className="text-2xl" aria-hidden="true">
               {emoji.symbol}
             </span>
-            <span className="font-mono text-[10px] text-muted-foreground">{emoji.name}</span>
+            <span className="text-meta text-muted-foreground">{emoji.name}</span>
           </li>
         ))}
       </ul>

@@ -281,7 +281,9 @@ export function SearchPanel({
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex flex-col gap-1">
-          <h2 className="text-sm font-semibold text-foreground">Searching your local archive</h2>
+          <h2 className="font-heading text-sm font-semibold text-foreground">
+            Searching your local archive
+          </h2>
           <p className="text-xs text-muted-foreground">
             Search works fully offline against your local archive on this Mac.
           </p>
