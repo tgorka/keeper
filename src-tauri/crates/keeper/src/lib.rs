@@ -973,6 +973,7 @@ pub fn run() {
         notes_ipc::notes_capture_open,
         notes_ipc::notes_capture_close,
         notes_ipc::notes_capture_set_locked,
+        notes_ipc::notes_capture_set_always_on_top,
         notes_ipc::notes_capture_windows,
         notes_ipc::notes_reveal,
         notes_ipc::notes_open_file,
@@ -994,6 +995,7 @@ pub fn run() {
         ipc::notes_capture_open,
         ipc::notes_capture_close,
         ipc::notes_capture_set_locked,
+        ipc::notes_capture_set_always_on_top,
         ipc::notes_capture_windows,
         ipc::notes_reveal,
         ipc::notes_open_file,
@@ -1034,16 +1036,23 @@ pub fn run() {
         // crash-free force-quit and a click on another app are all ways a
         // window's last position and size become final without anybody pressing
         // anything.
+        //
+        // Since Story 48.2 a *locked* window's blur writes nothing: what it
+        // reports is keeper's own normalised geometry, and merging that over
+        // the row was how a lock followed by one click elsewhere destroyed the
+        // size the person had chosen. `geometry_of` reads who produced the
+        // geometry along with the geometry, and `remember_placement` refuses
+        // it — the rule itself lives in `keeper_core::capture`.
         if matches!(event, WindowEvent::Focused(false))
             && keeper_core::capture::is_capture_label(window.label())
         {
             let app = window.app_handle();
             if let Some(key) = notes_window::key_for_label(window.label()) {
-                let geometry = notes_window::geometry_of(app, &key);
+                let live = notes_window::geometry_of(app, &key);
                 notes_ipc::remember_placement(
                     app.state::<ipc::AppState>().platform.as_ref(),
                     &key,
-                    geometry,
+                    live,
                 );
             }
         }

@@ -4535,6 +4535,14 @@ pub async fn notes_capture_close(
 /// and jumps to another the next time it opens — the same surprise, delivered
 /// later and unattached to the click that caused it. The remembered size is
 /// kept, so unlocking restores it.
+///
+/// **Story 48.2 made that last sentence true.** This command used to build the
+/// placement inline, merging `live.size.or(stored.size)` on both transitions —
+/// so on the *unlock* click, where the live window is the 560×340 the *lock*
+/// just normalised it to, it wrote keeper's own size over the user's a moment
+/// before anything could restore it. There is no geometry logic left here:
+/// [`keeper_core::capture::Placement::relocked`] decides what is written, in
+/// the crate that compiles everywhere, and this reads, calls, writes, applies.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn notes_capture_set_locked(
@@ -4547,11 +4555,7 @@ pub async fn notes_capture_set_locked(
     let stored = keeper_core::registry::get_capture_placement(&data_dir, &key)
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
     let live = crate::notes_window::geometry_of(&app, &key);
-    let placement = keeper_core::capture::Placement {
-        locked,
-        position: live.position.or(stored.position),
-        size: live.size.or(stored.size),
-    };
+    let placement = stored.relocked(live, locked);
     keeper_core::registry::set_capture_placement(&data_dir, &key, &placement)
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
     crate::notes_window::adopt_placement(&app, &key, placement);
@@ -4574,9 +4578,7 @@ pub async fn notes_capture_windows(
 ) -> Result<Vec<keeper_core::capture::CaptureWindowVm>, IpcError> {
     let data_dir = capture_data_dir(state.platform.as_ref())?;
     Ok(crate::notes_window::list(&app, &|key| {
-        keeper_core::registry::get_capture_placement(&data_dir, key)
-            .unwrap_or_default()
-            .locked
+        keeper_core::registry::get_capture_placement(&data_dir, key).unwrap_or_default()
     }))
 }
 
@@ -4592,24 +4594,36 @@ pub async fn notes_capture_windows(
 /// still gets its size remembered, because the two are independent facts and
 /// discarding the readable one would make an unrelated platform quirk look like
 /// a bug in the resize. Neither known is nothing to write.
+///
+/// **And since Story 48.2 a locked window writes nothing at all.** This is the
+/// path that made the lock a discard button without anybody pressing the
+/// padlock twice: blur fires when a person clicks another app, and a locked
+/// window's live geometry is keeper's own — the normalised 560×340, at whatever
+/// coordinate the last hotkey press placed it (Story 47.5, DW-198). Merging
+/// that over the row wiped both halves of what the user had chosen, so one
+/// click elsewhere after locking was enough to lose them for good.
+/// [`keeper_core::capture::Placement::observing`] holds the rule, so this path
+/// and the lock toggle cannot come to different conclusions about it.
 #[cfg(desktop)]
 pub(crate) fn remember_placement(
     platform: &dyn keeper_core::platform::Platform,
     key: &str,
-    geometry: crate::notes_window::Geometry,
+    live: keeper_core::capture::Observed,
 ) {
-    if geometry.position.is_none() && geometry.size.is_none() {
+    if live.position.is_none() && live.size.is_none() {
         return;
     }
     let Ok(data_dir) = platform.data_dir() else {
         return;
     };
     let stored = keeper_core::registry::get_capture_placement(&data_dir, key).unwrap_or_default();
-    let placement = keeper_core::capture::Placement {
-        locked: stored.locked,
-        position: geometry.position.or(stored.position),
-        size: geometry.size.or(stored.size),
-    };
+    let placement = stored.observing(live);
+    // Nothing learned, nothing written. A locked window lands here on every
+    // blur, and a settings write that restates the row it just read is a
+    // transaction bought with no information.
+    if placement == stored {
+        return;
+    }
     if let Err(error) = keeper_core::registry::set_capture_placement(&data_dir, key, &placement) {
         tracing::warn!(%error, %key, "notes: could not remember the capture window's geometry");
     }
@@ -4625,6 +4639,54 @@ fn capture_data_dir(
     platform
         .data_dir()
         .map_err(|error| notes_error(NotesError::Name(error.to_string())))
+}
+
+/// Pin or un-pin the capture window `key` (Story 48.4).
+///
+/// The third button on the chrome strip, beside the lock, and deliberately the
+/// same shape of command: read the stored placement, write the one field back,
+/// then apply it to the live window so the toggle takes effect without a
+/// reopen.
+///
+/// # Why this is a Rust command and not `getCurrentWindow().setAlwaysOnTop()`
+///
+/// The webview could not do it. `quick-capture.json` grants no `core:window`
+/// permissions at all, so the call would be denied — and denied *quietly*, as
+/// a rejected promise inside a click handler nobody awaits. That is Story
+/// 46.15's argument for `set_resizable` verbatim, and the reason this story
+/// adds no capability: the flag is persisted state that outlives the document,
+/// so it has to be written in Rust regardless, and once it is, applying it
+/// there too costs one line and removes a whole class of silent failure.
+///
+/// # Why the geometry is not touched
+///
+/// Unlike the lock, this changes nothing about where or how big the window is,
+/// so it must not snapshot or re-assert either. Reading the live geometry here
+/// would re-introduce Story 48.2's defect on a new path: the live window's size
+/// is whatever it is at this instant, and merging it over the stored one is how
+/// a remembered size gets overwritten by a normalised one.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn notes_capture_set_always_on_top(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+    always_on_top: bool,
+) -> Result<(), IpcError> {
+    let data_dir = capture_data_dir(state.platform.as_ref())?;
+    let stored = keeper_core::registry::get_capture_placement(&data_dir, &key)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    let placement = keeper_core::capture::Placement {
+        always_on_top,
+        ..stored
+    };
+    keeper_core::registry::set_capture_placement(&data_dir, &key, &placement)
+        .map_err(|error| notes_error(NotesError::Name(error.to_string())))?;
+    crate::notes_window::set_always_on_top(&app, &key, always_on_top);
+    // The chrome reads its pressed state out of the window list, so the list
+    // has to be re-announced or the button springs back on the next hydrate.
+    crate::notes_window::announce(&app);
+    Ok(())
 }
 
 /// Reveal a note's real path in the OS file manager (UX-DR38).
