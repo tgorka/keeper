@@ -238,6 +238,28 @@ pub struct ProblemReport {
     pub parked: Vec<ParkedUnit>,
     /// Conflict copies still sitting in the working tree, repository-relative.
     pub conflicts: Vec<String>,
+    /// Tracked files whose names are not valid UTF-8 (Story 47.2).
+    ///
+    /// **Reported because the alternative is silence.** git carries such a file
+    /// perfectly well — it stores path bytes and never decodes them — so it
+    /// commits, pushes and clones like any other, and nothing else in keeper
+    /// has any reason to mention it. What keeper cannot do is *name* it: every
+    /// surface renders it lossily, so the Files pane shows a row of
+    /// substitution characters and no action keyed on that row works. The only
+    /// way an owner found one was to go looking with `ls`, which is not a
+    /// report.
+    ///
+    /// **Not an error and not a failure.** Nothing is stuck, nothing is
+    /// parked, nothing needs retrying; the honest sentence is "this is here,
+    /// this is what it looks like, and keeper cannot act on it by name". It
+    /// sits on this report rather than getting a surface of its own because
+    /// this is already the list of things about a folder a person should know
+    /// and has no other way to learn (AD-S3).
+    ///
+    /// Read from the index, so it covers files committed long ago that no
+    /// status walk would mention. Untracked ones are on the pending list
+    /// instead, and once the first sync carries them they appear here.
+    pub unspellable: Vec<crate::names::UnspellableName>,
 }
 
 /// Units claimed from the journal per profile per tick.
@@ -5150,11 +5172,34 @@ impl Engine {
         .await
         .map_err(|err| SyncError::Journal(format!("conflict scan task failed: {err}")))?;
 
+        // Read from the index, in the same blocking pool the conflict scan uses
+        // and for the same reason: it is filesystem work on a file that may be
+        // tens of megabytes on a large repository, and this endpoint is polled.
+        //
+        // A folder that is not a repository yet has no index and nothing to
+        // say. An index that will not open is not this report's problem to
+        // raise — `sync_once` will fail on it loudly and land in `error` above —
+        // so it degrades to "nothing to add" rather than failing a call that
+        // has three other answers to deliver.
+        let repo_path = profile.local_path.clone();
+        let removable = profile.removable;
+        let unspellable = tokio::task::spawn_blocking(move || {
+            if !repo_path.join(".git").exists() {
+                return Vec::new();
+            }
+            git::repo::open(&repo_path, removable)
+                .and_then(|repo| git::repo::unspellable_tracked_paths(&repo))
+                .unwrap_or_default()
+        })
+        .await
+        .map_err(|err| SyncError::Journal(format!("index name scan task failed: {err}")))?;
+
         Ok(ProblemReport {
             warning: snapshot.as_ref().and_then(|s| s.warning.clone()),
             error: snapshot.and_then(|s| s.error),
             parked,
             conflicts,
+            unspellable,
         })
     }
 
@@ -8398,6 +8443,176 @@ mod tests {
         );
     }
 
+    /// Story 47.2 — the Files pane and the commit path must not disagree about
+    /// a file whose name is not valid UTF-8, and the folder must not be silent
+    /// about it.
+    ///
+    /// The owner's report was "one file whose name is not valid UTF-8, which
+    /// probably would not make it to the remote anyway". The second half is
+    /// wrong and this test is where that is written down: git stores path
+    /// bytes and never decodes them, so the file commits like any other. What
+    /// was broken was that no surface ever said the file existed in a form a
+    /// person could act on, and that the two surfaces which *did* see it could
+    /// not be shown to be talking about the same file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_files_pane_and_the_commit_path_agree_about_a_name_neither_can_spell() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // Built from raw bytes. A string literal cannot express this name, and
+        // a test that faked it with valid UTF-8 would pass over the bug.
+        let odd_name = std::ffi::OsString::from_vec(b"doc-\xffepuap.txt".to_vec());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let odd_path = p.local_path.join(&odd_name);
+        if crate::names::create_unspellable(&p.local_path, b"doc-\xffepuap.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        std::fs::write(&odd_path, b"a scan of a form").expect("write the odd one");
+        std::fs::write(p.local_path.join("ordinary.txt"), b"x").expect("write the ordinary one");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+
+        // 1. The engine's own answer to "what has this folder not synced yet".
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let engine_paths: Vec<&str> = pending.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            engine_paths.contains(&"doc-\u{FFFD}epuap.txt"),
+            "the engine must not drop it either; got {engine_paths:?}"
+        );
+
+        // 2. The Files pane, joined to that same answer.
+        let view = crate::browse::PendingView::Known(
+            pending
+                .iter()
+                .map(|f| (f.path.clone(), f.reason.clone()))
+                .collect(),
+        );
+        let crate::browse::BrowseListing::Listed(listed) = crate::browse::browse(
+            &p,
+            "",
+            &ExcludeSet::new(&p.excludes).expect("excludes"),
+            &view,
+        )
+        .expect("no refusal") else {
+            panic!("expected a listing");
+        };
+        let shown = listed
+            .entries
+            .iter()
+            .find(|e| e.unspellable.is_some())
+            .expect("the pane lists it and marks it");
+
+        // THE AGREEMENT. Not "both surfaces mention something odd" — the same
+        // file, reached the same way, in the same state. `absolute_path` is the
+        // undecoded handle, so this compares bytes, not renderings.
+        assert_eq!(
+            shown.absolute_path,
+            odd_path.canonicalize().expect("canonical"),
+            "the pane's row and the file on disk are the same bytes"
+        );
+        assert!(
+            matches!(
+                shown.sync,
+                crate::browse::EntrySyncStatus::Waiting {
+                    reason: Some(PendingReason::Untracked)
+                }
+            ),
+            "the pane must say what the engine says; got {:?}",
+            shown.sync
+        );
+
+        // 3. The commit path selects the same file, by its real bytes.
+        //
+        // Two passes: the completeness gate needs one observation to open the
+        // settling episode and a second, after the window, to close it. The
+        // first must stage nothing — a file whose name is odd is not a file
+        // that skips the gate.
+        assert!(
+            engine.collect_stable_changes(&p).expect("scan").is_empty(),
+            "the gate applies to this file like any other"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let staged = engine.collect_stable_changes(&p).expect("scan");
+        assert!(
+            staged.added.iter().any(|rela| rela.as_os_str() == odd_name),
+            "the commit walk must stage the real name, not a rendering; got {:?}",
+            staged.added
+        );
+
+        // A `Stable` verdict retires the gate's episode, so the scan above
+        // consumed it and `commit_local`'s own scan would find nothing. One
+        // more observation re-opens it. Spelled out rather than folded away
+        // because the alternative — deleting the assertion above and trusting
+        // the tree check below — would drop the direct evidence that the walk
+        // stages the *real* bytes rather than a rendering that happens to work.
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        // 4. And it lands. The owner's guess that it "would not make it" was
+        //    wrong, so nothing here tries to make it syncable — it already is.
+        engine
+            .commit_local(&p, SyncSource::Manual, None)
+            .expect("a name that is not text is still a file git can carry");
+        let repo = engine.open_repo(&p).expect("open");
+        let tree = repo
+            .head_commit()
+            .expect("a commit exists")
+            .tree()
+            .expect("tree");
+        assert!(
+            tree.iter()
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.filename() == b"doc-\xffepuap.txt".as_slice()),
+            "git stores path bytes; the raw name must be in the tree"
+        );
+
+        // 5. Now that it is carried, it is *reported* — which is the whole
+        //    story. Before this, a committed file with an unspellable name was
+        //    invisible: clean status, nothing pending, nothing on any list, and
+        //    the only way to find it was `ls`.
+        let problems = engine.problems(&p.id).await.expect("problems");
+        assert_eq!(
+            problems
+                .unspellable
+                .iter()
+                .map(|n| n.escaped.as_str())
+                .collect::<Vec<_>>(),
+            vec!["doc-\\xffepuap.txt"],
+            "the report must name it byte-exactly, and must not name the ordinary file"
+        );
+        assert_eq!(
+            problems.unspellable[0].display, "doc-\u{FFFD}epuap.txt",
+            "and carry the rendering a person reads in a row"
+        );
+        // Not an error and not a failure: nothing is stuck.
+        assert!(problems.error.is_none(), "a carried file is not a fault");
+        assert!(problems.parked.is_empty());
+
+        // 6. It stays reported once it is old news. This is the case the owner
+        //    actually hit — a file committed long ago, clean in status, that no
+        //    walk would ever mention again.
+        assert!(
+            engine.pending(&p.id).await.expect("pending").is_empty(),
+            "the file is committed, so nothing is pending"
+        );
+        assert_eq!(
+            engine
+                .problems(&p.id)
+                .await
+                .expect("problems")
+                .unspellable
+                .len(),
+            1,
+            "the index is read, not the status walk, so a clean tree still reports"
+        );
+    }
+
     /// Story 41.3: while a rotation is in flight the destination holds a
     /// growing `<name>.mov.partial` beside the segments already closed. The
     /// in-progress one has to be invisible everywhere at once — the pending
@@ -8668,10 +8883,28 @@ mod tests {
                 last_error: Some("401".to_owned()),
             }],
             conflicts: vec!["a.sync-conflict-x.md".to_owned()],
+            unspellable: vec![
+                crate::names::UnspellableName::of_bytes(b"doc-\xffepuap.txt")
+                    .expect("not valid UTF-8"),
+            ],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains(r#""lastError":"401""#), "got: {json}");
         assert!(json.contains(r#""attempts":3"#), "got: {json}");
+        // Both renderings cross the wire: the lossy one is what a row shows,
+        // the escaped one is what makes the report actionable. A frontend given
+        // only `display` could not tell two reported files apart.
+        // `serde_json` writes U+FFFD as the character itself, not as a `\u`
+        // escape, so this has to be a real replacement character rather than
+        // the six letters that spell one.
+        assert!(
+            json.contains("\"display\":\"doc-\u{FFFD}epuap.txt\""),
+            "got: {json}"
+        );
+        assert!(
+            json.contains(r#""escaped":"doc-\\xffepuap.txt""#),
+            "got: {json}"
+        );
 
         let row = ActivityRow {
             ts_ms: 1,

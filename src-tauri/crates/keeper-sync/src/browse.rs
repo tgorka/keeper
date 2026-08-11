@@ -120,6 +120,24 @@ pub struct BrowseEntry {
     pub size_bytes: Option<u64>,
     /// What sync knows about this entry right now (Story 44.17, FR-173).
     pub sync: EntrySyncStatus,
+    /// Set when the entry's own name is not valid UTF-8 (Story 47.2).
+    ///
+    /// **`Some` means [`Self::name`] and [`Self::relative_path`] are renderings
+    /// rather than names.** They are still filled in, because a hole in a
+    /// browser is worse than a mangled row and the user has to be told the file
+    /// is there at all — that silence is the whole reported defect. But they no
+    /// longer address anything: [`plain_segments`] refuses to join a subpath
+    /// carrying the replacement character, so feeding [`Self::relative_path`]
+    /// back returns [`BrowseRefusal::Unspellable`] instead of expanding, and
+    /// [`crate::files_write`] refuses through the same rule.
+    ///
+    /// [`Self::absolute_path`] is the exception and the only handle that still
+    /// works: it is the `OsString` `read_dir` produced, never decoded, so
+    /// reveal-in-Finder and open-with keep working on a file nobody can spell.
+    ///
+    /// `None` for every ordinary entry, so a surface that ignores this field
+    /// behaves exactly as it did before it existed.
+    pub unspellable: Option<crate::names::UnspellableName>,
 }
 
 /// What the engine's own state says about one browsed entry.
@@ -293,6 +311,29 @@ pub enum BrowseRefusal {
         /// The OS's own words, which are the most useful thing to show.
         reason: String,
     },
+    /// The subpath contains `U+FFFD`, so it may be this module's own lossy
+    /// rendering of a name that is not valid UTF-8 rather than a name (Story
+    /// 47.2).
+    ///
+    /// **Refused because joining it can reach a different, real file.** A
+    /// listing renders `a\xFF.txt` as `a<FFFD>.txt`; if the same folder also
+    /// holds a file genuinely named `a<FFFD>.txt` — three ordinary UTF-8 bytes,
+    /// a name a user can type — then joining the rendering back onto the root
+    /// does not fail, it succeeds at the wrong file. That was measured before
+    /// this variant existed, and [`crate::files_write`] shares the join, so the
+    /// wrong file could be deleted.
+    ///
+    /// **Both cases are refused, and that is the right way round.** Nothing can
+    /// tell a rendering apart from a real `U+FFFD` name, so the choice is
+    /// between refusing a file that is almost certainly not there and silently
+    /// acting on a file the user did not pick. A user who really does own a
+    /// file with `U+FFFD` in its name loses the ability to expand it from this
+    /// surface; a user who does not, keeps the file the browser would otherwise
+    /// have eaten. See [`crate::names`].
+    Unspellable {
+        /// The offending subpath, verbatim.
+        subpath: String,
+    },
 }
 
 impl std::fmt::Display for BrowseRefusal {
@@ -307,6 +348,12 @@ impl std::fmt::Display for BrowseRefusal {
                 "\"{subpath}\" resolves outside this folder, so it will not be listed"
             ),
             Self::Unreadable { reason } => write!(f, "this folder could not be read: {reason}"),
+            Self::Unspellable { subpath } => write!(
+                f,
+                "\"{subpath}\" holds the replacement character, so it may be a rendering of a \
+                 name that is not text rather than a name; keeper will not act on it, because \
+                 doing so could reach a different file"
+            ),
         }
     }
 }
@@ -387,12 +434,30 @@ pub fn lexical_join(root: &Path, subpath: &str) -> Result<PathBuf, BrowseRefusal
 /// segment — a leading, trailing or doubled `/` — is refused, because tolerating
 /// it would make `"a//b"` and `"a/b"` two spellings of one request and make
 /// `"/"` a second spelling of the root.
+///
+/// # Why `U+FFFD` is refused here and not somewhere more specific
+///
+/// This function is the single place a root and a caller-supplied subpath meet
+/// (AD-65), which is why [`crate::files_write`] borrows it rather than writing
+/// its own loop. That makes it the only place a rule can be added once and hold
+/// for looking *and* for writing. A subpath carrying the replacement character
+/// may be [`list_resolved`]'s own lossy rendering of a name that is not valid
+/// UTF-8, and joining a rendering can land on a different real file — so the
+/// refusal belongs at the join, not at the listing. See
+/// [`BrowseRefusal::Unspellable`] and [`crate::names`].
 pub fn plain_segments(subpath: &str) -> Result<Vec<&OsStr>, BrowseRefusal> {
     let escapes = || BrowseRefusal::Escapes {
         subpath: subpath.to_owned(),
     };
     if subpath.is_empty() {
         return Ok(Vec::new());
+    }
+    // Before the component walk, because this is a property of the whole
+    // string and refusing it early keeps the per-segment loop about escapes.
+    if crate::names::is_lossy_rendering(subpath) {
+        return Err(BrowseRefusal::Unspellable {
+            subpath: subpath.to_owned(),
+        });
     }
     let mut out = Vec::new();
     for segment in subpath.split('/') {
@@ -518,12 +583,23 @@ fn list_resolved(
             // with one broken entry is still a folder worth browsing.
             continue;
         };
-        // Lossy rather than skipped. On macOS — the only platform this surface
-        // renders on — the filesystem APIs guarantee UTF-8, so the substitution
-        // branch is unreachable there; anywhere else a mangled name is still
-        // better than a hole in a browser, and every action on it is re-resolved
-        // in Rust, where it will honestly refuse rather than open the wrong file.
-        let name = entry.file_name().to_string_lossy().into_owned();
+        // Lossy rather than skipped, and now *marked* lossy (Story 47.2).
+        //
+        // This comment used to claim that "every action on it is re-resolved in
+        // Rust, where it will honestly refuse rather than open the wrong file".
+        // That was false, and the counter-example is a test in this module: a
+        // folder holding both `a\xFF.txt` and a file genuinely named
+        // `a<FFFD>.txt` rendered the first as the second's name, and resolving
+        // that string reached the second file. `plain_segments` refuses it now,
+        // so the sentence is true — but it is true because of a rule, not
+        // because of a hope, which is why the rule is at the join.
+        //
+        // Still not skipped: an entry nobody can name is the one the owner
+        // needed told about, and dropping it is the silence this story is
+        // about. It is listed, marked, and unactionable-by-name.
+        let raw_name = entry.file_name();
+        let unspellable = crate::names::UnspellableName::of(&raw_name);
+        let name = raw_name.to_string_lossy().into_owned();
         let relative_path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -567,6 +643,7 @@ fn list_resolved(
             is_dir,
             size_bytes,
             sync,
+            unspellable,
         });
     }
 
@@ -1558,5 +1635,153 @@ mod tests {
             matches!(refusal, Err(BrowseRefusal::Unreadable { .. })),
             "expected an unreadable refusal, got {refusal:?}"
         );
+    }
+
+    // ---- Story 47.2: names keeper cannot spell -------------------------
+
+    // The fixtures below are built from raw bytes by
+    // `crate::names::create_unspellable`, never from a string literal:
+    // `"a\u{FFFD}.txt"` is a perfectly ordinary UTF-8 filename and a test
+    // using it would pass over this bug rather than through it. That helper
+    // also answers None where the filesystem refuses the bytes, which is
+    // every macOS volume — see its doc comment for why that does not make
+    // the defect theoretical.
+
+    /// The reported defect: a file keeper cannot name is a file the owner is
+    /// never told about.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_listed_and_marked_rather_than_dropped() {
+        let root = tempfile::tempdir().expect("temp");
+        if crate::names::create_unspellable(root.path(), b"doc-\xffepuap.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        std::fs::write(root.path().join("ordinary.txt"), "x").expect("file");
+
+        let BrowseListing::Listed(dir) = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal") else {
+            panic!("expected a listing");
+        };
+
+        assert_eq!(dir.entries.len(), 2, "neither file may be dropped");
+        let odd = dir
+            .entries
+            .iter()
+            .find(|e| e.unspellable.is_some())
+            .expect("the unspellable entry is marked");
+        let marker = odd.unspellable.as_ref().expect("marked");
+        // Named well enough to go and find: the lossy rendering for the row,
+        // and the byte-exact one so `ls | cat -v` matches.
+        assert_eq!(marker.display, "doc-\u{FFFD}epuap.txt");
+        assert_eq!(marker.escaped, "doc-\\xffepuap.txt");
+        // The one handle that still reaches the file is the undecoded one.
+        assert!(odd.absolute_path.exists());
+
+        let ordinary = dir
+            .entries
+            .iter()
+            .find(|e| e.name == "ordinary.txt")
+            .expect("the ordinary entry");
+        assert_eq!(
+            ordinary.unspellable, None,
+            "an ordinary name must not be reported, or every file is a finding"
+        );
+    }
+
+    /// The bug that led this story: a lossy rendering that reaches a **real,
+    /// different** file.
+    ///
+    /// Before this story, `list_resolved` claimed in a comment that "every
+    /// action on it is re-resolved in Rust, where it will honestly refuse
+    /// rather than open the wrong file". This is the folder where that was
+    /// false. `a\xFF.txt` renders as `a<FFFD>.txt`, which is *also* the real
+    /// name of the second file here, so handing the row's `relative_path` back
+    /// resolved — successfully — to the wrong one. [`crate::files_write`]
+    /// shares the same join, so a delete confirmed against one row removed the
+    /// other.
+    #[cfg(unix)]
+    #[test]
+    fn a_lossy_rendering_is_refused_rather_than_resolved_to_a_different_file() {
+        let root = tempfile::tempdir().expect("temp");
+        if crate::names::create_unspellable(root.path(), b"a\xff.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        // A file whose name really is U+FFFD: three ordinary UTF-8 bytes, a
+        // name a person can type. This is the decoy.
+        std::fs::write(root.path().join("a\u{FFFD}.txt"), "a different file").expect("decoy");
+
+        let BrowseListing::Listed(dir) = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &nothing_pending(),
+        )
+        .expect("no refusal") else {
+            panic!("expected a listing");
+        };
+        let clicked = dir
+            .entries
+            .iter()
+            .find(|e| e.unspellable.is_some())
+            .expect("the mangled row");
+
+        // The two rows are indistinguishable by the string the surface carries
+        // — which is exactly why the string may not be used to reach anything.
+        assert_eq!(
+            dir.entries
+                .iter()
+                .filter(|e| e.relative_path == clicked.relative_path)
+                .count(),
+            2,
+            "the renderings collide, so a resolve on one of them is a coin toss"
+        );
+
+        let resolved = resolve(root.path(), &clicked.relative_path);
+        assert!(
+            matches!(resolved, Err(BrowseRefusal::Unspellable { .. })),
+            "a rendering must be refused, never resolved; got {resolved:?}"
+        );
+        // And the refusal is total over the join, so the write surface inherits
+        // it without a rule of its own (AD-65).
+        assert!(matches!(
+            lexical_join(root.path(), &clicked.relative_path),
+            Err(BrowseRefusal::Unspellable { .. })
+        ));
+        assert!(matches!(
+            plain_segments("notes/a\u{FFFD}.txt"),
+            Err(BrowseRefusal::Unspellable { .. })
+        ));
+    }
+
+    /// The refusal is about the replacement character and nothing else.
+    #[test]
+    fn ordinary_names_still_join_including_non_ascii_ones() {
+        // Non-ASCII is not non-UTF-8. A Polish or Japanese filename is text and
+        // a rule that refused it would break far more than it fixed.
+        for subpath in ["notes/zaświadczenie.pdf", "議事録/2026.md", "plain.txt"] {
+            assert!(
+                plain_segments(subpath).is_ok(),
+                "{subpath} is ordinary text and must still resolve"
+            );
+        }
+    }
+
+    /// The refusal sentence has to say what to do about it, not only that it
+    /// happened — this string is rendered verbatim by the shell.
+    #[test]
+    fn the_unspellable_refusal_says_why_it_will_not_act() {
+        let said = BrowseRefusal::Unspellable {
+            subpath: "a\u{FFFD}.txt".to_owned(),
+        }
+        .to_string();
+        assert!(said.contains("a\u{FFFD}.txt"), "got: {said}");
+        assert!(said.contains("could reach a different file"), "got: {said}");
     }
 }

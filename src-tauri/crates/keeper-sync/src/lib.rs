@@ -48,6 +48,7 @@ pub mod file_serve;
 pub mod files_write;
 pub mod git;
 pub mod lfs;
+pub mod names;
 pub mod platform;
 pub mod profile;
 pub mod progress;
@@ -68,6 +69,7 @@ pub use engine::{
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
+pub use names::{ForDisplay, UnspellableName};
 pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

@@ -304,6 +304,12 @@ impl From<BrowseRefusal> for WriteRefusal {
             BrowseRefusal::Escapes { subpath }
             | BrowseRefusal::EscapesAfterResolution { subpath } => Self::Escapes { subpath },
             BrowseRefusal::Unreadable { reason } => Self::Unreadable { reason },
+            // Story 47.2: a segment carrying U+FFFD may be a *rendering* of a
+            // non-UTF-8 name rather than the name, and joining it can reach a
+            // different real file — so a delete confirmed against one row would
+            // remove another. `Escapes` rather than a new variant, because that
+            // is exactly what it is: not a path in this folder.
+            BrowseRefusal::Unspellable { subpath } => Self::Escapes { subpath },
         }
     }
 }
