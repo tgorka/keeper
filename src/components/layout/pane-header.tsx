@@ -58,8 +58,19 @@
  * header with nothing to report renders two groups, not an empty reserved box:
  * a zero-width slot in a `gap-2` row is 8px of space reserved for nothing, and
  * "there is no status here" is a different claim from "the status is empty".
+ *
+ * # When group 3 does not fit (Story 48.5)
+ *
+ * 46.5's ruling — everything into a `⋯` menu and one control beside it — is
+ * right at 560px and wrong at 1400px, and this header is mounted at both. A
+ * caller that passes a FUNCTION for {@link PaneHeaderProps.actions} is handed
+ * the pixels the row can spare for group 3 and decides for itself how many
+ * controls that buys; `PriorityActions` is the one that does. The measuring
+ * lives here because only the row knows what the two groups before it have
+ * taken, and the deciding lives there because only the surface knows which of
+ * its verbs matters most.
  */
-import type { ReactNode } from "react";
+import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 /** The group that absorbs every pixel of slack in the row. */
@@ -70,6 +81,57 @@ export const PANE_HEADER_STATUS_SLOT = "pane-header-status";
 
 /** The controls, last, and the only group allowed to be squeezed. */
 export const PANE_HEADER_ACTIONS_SLOT = "pane-header-actions";
+
+/**
+ * The gap between two adjacent members of the row, in pixels.
+ *
+ * `gap-2` as a number, because the actions group's overflow arithmetic has to
+ * spend it and a Tailwind class cannot be read from JavaScript. The class on
+ * the row below and this constant are one fact written twice, and they MUST
+ * change together.
+ */
+export const PANE_HEADER_GAP_PX = 8;
+
+/**
+ * Pixels the identity group keeps, whatever else in the row wants them.
+ *
+ * Group 1's basis is zero, so left to the flexbox alone it would surrender
+ * every pixel an action control asked for, and the pane would end up saying
+ * what can be done to a note without saying which note. This is a reservation
+ * and not a breakpoint: nothing asks "is the window narrower than N", it asks
+ * "once the title has this much, what is left". Roughly twenty characters at
+ * the header's 13px type — a title recognisable, not a sentence readable.
+ */
+export const PANE_HEADER_IDENTITY_MIN_PX = 160;
+
+/**
+ * Pixels group 3 may occupy: the row, less what the groups before it are owed,
+ * less the gaps between them.
+ *
+ * Pure, because it is the half of the measurement with a decision in it.
+ * `header` is the row's CONTENT width — its padding already gone, which is
+ * what a `ResizeObserver` entry reports — and `status` is the reserved slot's
+ * whole box, or null for a row that has no status group and therefore no gap
+ * for one either. Never negative: "no room" is a smaller and truer claim than
+ * "minus forty pixels of room".
+ */
+export function paneHeaderActionsBudget({
+  header,
+  status,
+  identityMin = PANE_HEADER_IDENTITY_MIN_PX,
+  gap = PANE_HEADER_GAP_PX,
+}: {
+  header: number;
+  status: number | null;
+  identityMin?: number;
+  gap?: number;
+}): number {
+  if (!Number.isFinite(header)) {
+    return 0;
+  }
+  const owed = identityMin + gap + (status === null || !Number.isFinite(status) ? 0 : status + gap);
+  return Math.max(0, header - owed);
+}
 
 export interface PaneHeaderStatus {
   /**
@@ -97,9 +159,20 @@ export interface PaneHeaderProps {
   /** What the pane wants to say about itself, or `null` when it has nothing to
    *  say — see the module doc for why that is not the same as `caption: ""`. */
   status?: PaneHeaderStatus | null;
-  /** The controls. May themselves appear and disappear; that is what the group
-   *  is for. */
-  actions: ReactNode;
+  /**
+   * The controls. May themselves appear and disappear; that is what the group
+   * is for.
+   *
+   * **A function instead, for a group that manages its own overflow.** It is
+   * handed the pixels the row can spare for it (see
+   * {@link paneHeaderActionsBudget}) and is then expected not to exceed them,
+   * which is why that form also makes the group `shrink-0`. 46.4 left this
+   * group squeezable on the ruling that a squeezed cluster beats a control
+   * pushed off the edge; a group that drops its own last item needs neither,
+   * and a control squeezed until its word is clipped is worse than one fewer
+   * control. The node form keeps 46.4's behaviour exactly.
+   */
+  actions: ReactNode | ((budget: number) => ReactNode);
   /** The header element's own padding and border, which differ per surface. */
   className?: string;
 }
@@ -110,8 +183,43 @@ export function PaneHeader({
   actions,
   className,
 }: PaneHeaderProps): React.ReactElement {
+  const rowRef = useRef<HTMLElement>(null);
+  const statusRef = useRef<HTMLSpanElement>(null);
+  const managed = typeof actions === "function";
+  const [budget, setBudget] = useState(0);
+
+  // Zero until the row has been observed, and that is the safe direction: a
+  // group with no budget renders the 560px shape, so the worst a missing
+  // observation can do is leave the header as 46.5 shipped it. The observer is
+  // the only source of the number — measuring once on mount as well would be a
+  // second path to the same fact, and the callback arrives before the first
+  // paint anyway.
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!managed || row === null || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      if (entry === undefined) {
+        return;
+      }
+      // The status group is read from the DOM rather than observed: its width
+      // is a constant by construction (that is what group 2 IS), so the only
+      // moment it can change is one where the row changed too.
+      setBudget(
+        paneHeaderActionsBudget({
+          header: entry.contentRect.width,
+          status: statusRef.current?.getBoundingClientRect().width ?? null,
+        }),
+      );
+    });
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [managed]);
+
   return (
-    <header className={cn("flex shrink-0 items-center gap-2", className)}>
+    <header ref={rowRef} className={cn("flex shrink-0 items-center gap-2", className)}>
       {/* Group 1 — identity. `flex-1` off a zero basis: its width is whatever
           the row has left over, and it contributes nothing to the row's own
           content width. */}
@@ -123,6 +231,7 @@ export function PaneHeader({
            and are what set its width, and the word itself is out of flow and so
            cannot change it, however long a sentence a failure hands back. */
         <span
+          ref={statusRef}
           data-slot={PANE_HEADER_STATUS_SLOT}
           className="relative grid shrink-0 justify-items-end text-[11px] text-muted-foreground tabular-nums"
         >
@@ -143,11 +252,16 @@ export function PaneHeader({
           </span>
         </span>
       )}
-      {/* Group 3 — actions. NOT `shrink-0`: if these outgrow the window the row
-          squeezes them rather than pushing the last one off the edge. Safe only
-          because the group before it has a constant width. */}
-      <div data-slot={PANE_HEADER_ACTIONS_SLOT} className="flex items-center gap-2">
-        {actions}
+      {/* Group 3 — actions. Squeezable when it is a node, because 46.4 ruled
+          that squeezing beats pushing the last control off the edge; `shrink-0`
+          when it manages its own overflow, because such a group never asks for
+          more than the budget above and would rather drop a control than clip
+          one. */}
+      <div
+        data-slot={PANE_HEADER_ACTIONS_SLOT}
+        className={cn("flex items-center gap-2", managed && "shrink-0")}
+      >
+        {typeof actions === "function" ? actions(budget) : actions}
       </div>
     </header>
   );

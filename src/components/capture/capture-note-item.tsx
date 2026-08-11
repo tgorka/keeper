@@ -12,15 +12,48 @@
  *
  * # One item, rendered by somebody else's menu
  *
- * It lives in Story 45.17's `NoteActions`, beside Export and above Delete,
- * rather than in a header button or a context menu of its own. Three stories
- * each inventing a home for one per-note verb is how a surface ends up with the
- * verb in three places and the discoverable one in none.
+ * It lives in Story 45.17's `NoteActions`, rather than in a header button or a
+ * context menu of its own. Three stories each inventing a home for one per-note
+ * verb is how a surface ends up with the verb in three places and the
+ * discoverable one in none.
+ *
+ * Where in that menu is `note-editor.tsx`'s, and Story 48.3 moved it: 45.15
+ * proposed "beside Export and above Delete", which was a description of a menu
+ * that then held only those two. Story 46.5 filled the menu and gave its
+ * separator a meaning — above it shows the note, below it acts on the note —
+ * and a capture window only shows it. So the item sits above the separator now,
+ * between History and Show in Files.
+ *
+ * **It took until Story 48.3 to be rendered at all.** 45.15 listed this
+ * component as a deliverable, never named `note-editor.tsx` among its touched
+ * files, and signed off a gate check — "open a note's actions menu → Open in a
+ * capture window" — that could not have passed on any build it produced. The
+ * component's only importer for three epics was its own test, and every
+ * assertion that test made was true. That is the shape to remember: a component
+ * test cannot see that nothing mounts the component, which is why the end-to-end
+ * test in `capture-in-the-note-editor.test.tsx` drives the real editor's own
+ * trigger instead.
  *
  * Exactly one `DropdownMenuItem` and no wrapper: a wrapping element breaks
  * Radix's typeahead and its arrow-key roving, so the item would render and stop
  * being reachable by keyboard — which on a menu is most of the way to not
  * existing.
+ *
+ * # Already open, and the one label
+ *
+ * `notes_window::open` derives one window label per note (`quick-capture-` plus
+ * a hash of `capture_key`) and raises the window that is already there, so this
+ * item is idempotent by identity: pressing it twice is one window with focus,
+ * never two windows holding one note.
+ *
+ * There is deliberately **no second label** for that case, and no reading of
+ * `captureWindowsStore` here. The label names the OUTCOME — this note is open
+ * in a capture window — which is true whether the window was created or raised.
+ * A state-dependent label would have to come from the main window's mirror of
+ * the window list, and the main window does not keep one (see
+ * `capture-windows.ts`); a label fed by a mirror that goes stale the moment a
+ * window is closed from the OS would lie about which of two things a press
+ * does, and one honest label beats two labels one of which is sometimes wrong.
  *
  * # The gate
  *

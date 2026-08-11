@@ -26,8 +26,11 @@
  * which is a promise a remount could not keep.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
 import { PaneHeader } from "@/components/layout/pane-header";
+import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
+import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
@@ -73,6 +76,80 @@ export const LINK_NOTICE_SLOT = "note-link-notice";
 
 /** What the editor pane is showing. */
 type EditorMode = "edit" | "history" | "conflict";
+
+/** Test id for the sentence a panel leaves behind when the pane's mode is
+ *  wrong for it (Story 48.5). */
+export const PANEL_UNAVAILABLE_SLOT = "note-panel-unavailable";
+
+/** The way back to the mode where the panel exists. */
+export const PANEL_BACK_LABEL = "Back to the note";
+
+/**
+ * Why a panel the user just asked for is not on screen — or null, when it is
+ * (Story 48.5).
+ *
+ * Both panels used to be `showX && mode === "edit"`, so a person who pressed
+ * Properties while reading history got nothing at all: no panel, no sentence,
+ * no hint that the mode was the reason. That is half of a 0.8.1 report about
+ * tags on a recording note, which work, behind Properties, which does not open
+ * in two of the pane's three modes. The other half was that Properties was a
+ * menu item nobody found, which the header above now fixes; a control that is
+ * findable and then silently does nothing would be the same report again with
+ * a shorter path to it.
+ *
+ * Explained rather than rendered read-only, deliberately. `PropertiesPanel`
+ * takes a null `subscriptionId` to mean "editing disabled", and what that does
+ * is drop the write on the floor: the fields stay enabled, the chips stay
+ * removable, and nothing says why the edit did not take. Between a panel that
+ * lies about being editable and a sentence that says when it will be, the
+ * sentence is the honest one.
+ */
+export function panelUnavailableReason(panel: string, mode: EditorMode): string | null {
+  if (mode === "edit") {
+    return null;
+  }
+  if (mode === "history") {
+    return `${panel} belong to the note as it is now, and you are reading an older version of it. Go back to the note to see and change them.`;
+  }
+  return `${panel} are unavailable while you resolve this conflict — two versions of this note carry two sets of them. Resolve it, or abandon it, and they come back.`;
+}
+
+/**
+ * The sentence, and — in history only — the press that resolves it.
+ *
+ * No way out is offered from a conflict. `leaveMode` abandons the resolution
+ * as well as returning to the note, and a control called "Back to the note"
+ * that quietly threw away a merge in progress would be a far worse defect than
+ * the silence this replaces. The resolver draws its own two exits, both named
+ * for what they do.
+ */
+function PanelUnavailable({
+  panel,
+  mode,
+  onBack,
+}: {
+  panel: string;
+  mode: EditorMode;
+  onBack: () => void;
+}) {
+  const reason = panelUnavailableReason(panel, mode);
+  if (reason === null) {
+    return null;
+  }
+  return (
+    <div
+      data-slot={PANEL_UNAVAILABLE_SLOT}
+      className="flex items-center gap-2 border-b px-3 py-1 text-[11px] text-muted-foreground"
+    >
+      <span className="min-w-0 flex-1">{reason}</span>
+      {mode === "history" ? (
+        <Button size="sm" variant="ghost" className="shrink-0" onClick={onBack}>
+          {PANEL_BACK_LABEL}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
 
 /**
  * The handful of operations the surface needs from the lazily loaded editor.
@@ -592,6 +669,49 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
     setMode("edit");
   }, []);
 
+  /**
+   * Story 48.5's priority order: what the header shows first when it has the
+   * room, and what it gives back to the ⋯ menu first when it does not.
+   *
+   * The order is a product decision and this is the argument for it. Against
+   * 0.8.1 the owner reported three things as missing that all shipped and all
+   * live in that menu — "I still see no way to delete notes", "I don't see
+   * attachments", and editing tags on a recording note, which works and lives
+   * behind Properties. Two of the three are the first two here, and the third
+   * is Delete, which is never promoted at all: a destructive verb does not
+   * belong in a toolbar (46.5's ruling, unchanged) and it is findable because
+   * the menu is now the SHORT list rather than the list of everything.
+   *
+   * History and Show in Files come after because both are journeys away from
+   * the note rather than things about it — and Show in Files is last of the
+   * four because it is the only one with a second home: the Files pane can
+   * reach the same file without this header at all.
+   *
+   * `Show in Files` is absent rather than disabled when there is nothing to
+   * show, exactly as 45.18 left it — the vault list has not arrived, the note
+   * has no path yet, or the profile carries no vault subfolder.
+   * `filePathForNote` answers "may this be offered" and `showNoteInFiles`
+   * answers "do it": the same pure rule twice, because a control whose presence
+   * and whose effect came from different rules is one that can be present and
+   * fail. Arriving late is why the group is keyed by id — the width of an item
+   * that appears an instant after the vault list is measured when it appears.
+   */
+  const headerActions = useMemo<readonly PriorityAction[]>(() => {
+    const acts: PriorityAction[] = [
+      { id: "attachments", label: ATTACHMENTS_LABEL, onSelect: toggleAttachments },
+      { id: "properties", label: PROPERTIES_LABEL, onSelect: toggleProperties },
+      { id: "history", label: NOTE_HISTORY_LABEL, onSelect: openHistory },
+    ];
+    if (vault !== null && path !== null && filePathForNote(vault, path) !== null) {
+      acts.push({
+        id: "show-in-files",
+        label: SHOW_IN_FILES_LABEL,
+        onSelect: () => showNoteInFiles(vault, path),
+      });
+    }
+    return acts;
+  }, [vault, path, toggleAttachments, toggleProperties, openHistory]);
+
   // Story 46.4: read once, because the header both shows this word and hangs it
   // on a `title` — an error is the one caption that can outgrow its slot.
   const saveWord = saveStateWord({ saving: body.saving, dirty: body.dirty, savedAtMs, error });
@@ -638,77 +758,91 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
         // Group 2 — status. One box for all three captions, reserved from the
         // strings this machine's own clock produces, so a save cannot widen it.
         status={{ sizers: SAVE_CAPTION_SIZERS, caption: saveWord }}
-        // Group 3 — actions. Two controls, which is AD-104's rule of two for
-        // this row: the one verb that starts outside keeper, and the menu that
-        // holds the note's own verbs. What belongs in here is Story 46.5's
-        // decision, not the wrapper's.
-        actions={
-          <>
-            {/* Story 45.13. Beside Attachments rather than inside it: the panel
-                lists what THIS note already has, and this brings in what it does
-                not — including for a note that has no `files:` key and therefore
-                no panel worth opening. */}
-            <AttachFileButton
-              vaultId={vaultId}
-              body={body.text}
-              onInsert={insertAtCursor}
-              onOutcome={setAttachOutcome}
-            />
-            {/* Story 46.5. Everything in this menu opens a panel, a surface or a
-                dialog; none of them is a per-keystroke verb, and six controls
-                plus two spans do not fit the 560px quick-capture window. So they
-                are menu items, the header keeps the one control that starts
-                outside keeper (`AttachFileButton`, above), and the menu becomes
-                the note's one obvious home for its own verbs — which is what
-                makes Delete findable, structurally rather than by relabelling it.
+        // Group 3 — actions, and how many of them there are (Story 48.5). The
+        // function form is handed the pixels this row can spare; `budget` is
+        // zero until a `ResizeObserver` has answered, and zero renders exactly
+        // the shape 46.5 shipped, so the worst a machine with no observer can
+        // do is leave the header as it was. What belongs in the group is still
+        // 46.5's decision; how much of it is on screen is now the window's.
+        actions={(budget) => (
+          <PriorityActions
+            budget={budget}
+            items={headerActions}
+            // Story 45.13, and never in the menu. Beside Attachments rather
+            // than inside it: the panel lists what THIS note already has, and
+            // this brings in what it does not — including for a note with no
+            // `files:` key and therefore no panel worth opening. It is also the
+            // one verb here that starts outside keeper, which is why 46.5 kept
+            // it out when it put everything else away.
+            leading={
+              <AttachFileButton
+                vaultId={vaultId}
+                body={body.text}
+                onInsert={insertAtCursor}
+                onOutcome={setAttachOutcome}
+              />
+            }
+            // The menu is the row's overflow in the row's own order, and then
+            // the verbs that never leave it. One rule, so nothing has to reason
+            // about where an item lands when the list above it changes length:
+            // what came back comes back in priority order, and what was always
+            // here is always below it. `NoteActions` draws the last rule and
+            // puts Delete under it.
+            menu={(inMenu) => (
+              <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
+                {headerActions.map((act) =>
+                  inMenu(act.id) ? (
+                    <DropdownMenuItem key={act.id} onSelect={act.onSelect}>
+                      {act.label}
+                    </DropdownMenuItem>
+                  ) : null,
+                )}
+                {/* Story 45.15's second door, mounted at last (Story 48.3,
+                    FR-191).
 
-                This reverses 45.17's "everything to the left changes what this
-                pane SHOWS, and the menu acts on the note itself" and 45.18's
-                "burying a one-press navigation in a dropdown is a regression".
-                Both were right about the taxonomy and wrong about the budget:
-                the row does not wrap, this cluster is its last child, and the
-                cost of keeping them out here was paid by the item at the end.
-                Order is preserved — panel, panel, surface, navigation — then a
-                rule, then the note-level acts. */}
-            <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
-              <DropdownMenuItem onSelect={toggleAttachments}>{ATTACHMENTS_LABEL}</DropdownMenuItem>
-              <DropdownMenuItem onSelect={toggleProperties}>{PROPERTIES_LABEL}</DropdownMenuItem>
-              <DropdownMenuItem onSelect={openHistory}>{NOTE_HISTORY_LABEL}</DropdownMenuItem>
-              {/* Story 45.18: from a note, its file (FR-196, UX-DR79).
+                    This one line is the whole of the owner's "nie mozna miec
+                    wiecej niz jednej notatki" and "nie widze mozliwosci
+                    otworzenia istniejacych notatek jak quick capture". 45.15
+                    built the component, `openNoteAsCapture`,
+                    `notes_capture_open` and `notes_window::open`, and rendered
+                    the component nowhere: its only importer in the repository
+                    was its own test. So the only capture window obtainable was
+                    the prewarmed draft, which is one window holding one note —
+                    two reports, one absent child.
 
-                  Absent rather than disabled when there is nothing to show — the
-                  vault list has not arrived, the note has no path yet, or the
-                  profile carries no vault subfolder. `filePathForNote` answers
-                  "may this be offered" and `showNoteInFiles` answers "do it";
-                  the same pure rule twice, deliberately, because a control whose
-                  presence and whose effect came from different rules is a
-                  control that can be present and fail.
+                    ABOVE the separator, and not "beside Export" as 45.15's own
+                    note proposed. The rule below separates what ACTS on the
+                    note from what only SHOWS it, and a capture window only
+                    shows it — it is a way of looking at a note, not a thing
+                    done to one. Last among the things that show it rather than
+                    between History and Show in Files, which is where 48.3 put
+                    it: the four above are now a list whose length the window
+                    decides, and an item interleaved into it would need a second
+                    ordering rule for the widths at which its neighbours are not
+                    there.
 
-                  Inside the menu since 46.5, which makes its absence harder to
-                  assert honestly: a menu item that is not there because the menu
-                  is shut looks exactly like one the predicate refused. The three
-                  tests in `note-file-links.test.tsx` that read this absence open
-                  the menu first, for that reason. */}
-              {vault !== null && path !== null && filePathForNote(vault, path) !== null && (
-                <DropdownMenuItem
-                  onSelect={() => {
-                    showNoteInFiles(vault, path);
-                  }}
-                >
-                  {SHOW_IN_FILES_LABEL}
-                </DropdownMenuItem>
-              )}
-              {/* Story 45.21: Export is a note-level act, and putting it here
-                  rather than on the panel frame means a note open in a panel has
-                  one Export and not two — the panel's could not flush this
-                  buffer before Rust reads the file. The rule above it separates
-                  what acts on the note from what only shows it; `NoteActions`
-                  draws the second rule, above Delete. */}
-              <DropdownMenuSeparator />
-              <ExportNoteItem vaultId={vaultId} noteId={noteId} />
-            </NoteActions>
-          </>
-        }
+                    Offered in every host that mounts this header, including a
+                    capture window's own document, and that is deliberate rather
+                    than unconsidered. `notes_window::open` is idempotent by
+                    identity — one label per note — so from a note's capture
+                    window the verb raises the window you are in, and from the
+                    prewarmed draft panel it promotes the quick note into a
+                    window of its own that Escape does not hide. Both are true
+                    readings of one label, which is why there is no second label
+                    and no host test here. */}
+                <CaptureNoteItem vaultId={vaultId} noteId={noteId} />
+                {/* Story 45.21: Export is a note-level act, and putting it here
+                    rather than on the panel frame means a note open in a panel
+                    has one Export and not two — the panel's could not flush this
+                    buffer before Rust reads the file. The rule above it
+                    separates what acts on the note from what only shows it;
+                    `NoteActions` draws the second rule, above Delete. */}
+                <DropdownMenuSeparator />
+                <ExportNoteItem vaultId={vaultId} noteId={noteId} />
+              </NoteActions>
+            )}
+          />
+        )}
       />
 
       <NoteDiffBar
@@ -763,14 +897,18 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           note is a template whose text changed in this session. */}
       {mode === "edit" ? <TemplateUpdateOffer vaultId={vaultId} noteId={noteId} rev={rev} /> : null}
 
-      {showProperties && mode === "edit" ? (
-        <PropertiesPanel
-          frontmatter={frontmatter}
-          body={body.text}
-          subscriptionId={subscriptionId}
-          baseRev={rev}
-          onSaved={adoptPanelWrite}
-        />
+      {showProperties ? (
+        mode === "edit" ? (
+          <PropertiesPanel
+            frontmatter={frontmatter}
+            body={body.text}
+            subscriptionId={subscriptionId}
+            baseRev={rev}
+            onSaved={adoptPanelWrite}
+          />
+        ) : (
+          <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />
+        )
       ) : null}
 
       {/* Below the properties, because that is the order of the question it
@@ -778,13 +916,17 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           of them in the body. Unmounted rather than hidden — unlike the editor
           it holds no state worth keeping, and its `files:` reading is a
           function of the props it is given each time. */}
-      {showAttachments && mode === "edit" ? (
-        <AttachmentsPanel
-          vaultId={vaultId}
-          frontmatter={frontmatter}
-          body={body.text}
-          onInsert={insertAtCursor}
-        />
+      {showAttachments ? (
+        mode === "edit" ? (
+          <AttachmentsPanel
+            vaultId={vaultId}
+            frontmatter={frontmatter}
+            body={body.text}
+            onInsert={insertAtCursor}
+          />
+        ) : (
+          <PanelUnavailable panel={ATTACHMENTS_LABEL} mode={mode} onBack={leaveMode} />
+        )
       ) : null}
 
       {/* Directly over the text it formats, and unmounted outside edit mode:
