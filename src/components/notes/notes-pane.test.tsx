@@ -310,12 +310,18 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
-import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
+import {
+  COLUMN_COLLAPSE_PREFIX,
+  COLUMN_EXPAND_PREFIX,
+  COLUMN_RAIL_CONTROL_SLOT,
+} from "@/components/layout/surface-column";
 import { NOTE_DELETE_CANCEL, NOTE_DELETE_CONFIRM } from "@/components/notes/note-delete-dialog";
+import { NOTES_SEARCH_PLACEHOLDER } from "@/components/notes/note-filter-bar";
 import {
   NEW_NOTE_LABEL,
   NOTES_COUNT_SLOT,
   NOTES_NOTICE_SLOT,
+  NOTES_RAIL_LIST_LABEL,
   NotesPane,
 } from "@/components/notes/notes-pane";
 import { RESTORE_DEFAULTS } from "@/components/notes/space-list";
@@ -465,9 +471,14 @@ describe("NotesPane columns", () => {
 
     fireEvent.click(screen.getByRole("button", { name: railFold }));
 
-    // The rail's contents are gone — the create button, the spaces — and the
-    // list beside it is untouched.
-    expect(screen.queryByRole("button", { name: NEW_NOTE_LABEL })).not.toBeInTheDocument();
+    // The rail's rows are gone — the spaces, the trees, the switcher — and what
+    // the rail could DO is on the strip instead. New note is the SAME control at
+    // 48px, which is why it is still findable by the words a user reads; before
+    // the second cut of this story it was simply absent, which is the defect.
+    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toHaveAttribute(
+      "data-slot",
+      COLUMN_RAIL_CONTROL_SLOT,
+    );
     expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Note, Pricing/ })).toBeInTheDocument();
     expect(
@@ -525,6 +536,109 @@ describe("NotesPane columns", () => {
     expect(await screen.findByRole("button", { name: "Expand Spaces" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
     expect(readNotesRailFold(document.cookie).spaces).toBe(true);
+  });
+
+  /**
+   * The owner's own words, after 0.8.4 shipped: "foldowane kolumny - te puste
+   * pomysl co zrobic zeby jednak elementy z wewnatrz byly osiagalne" — the
+   * folded columns are empty, work out how to make what is inside reachable.
+   *
+   * So: nothing that was reachable unfolded is unreachable folded. The rail is
+   * not a second body — the spaces, the trees and the list are unmounted, and
+   * `surface-column.test.tsx` holds that line — it is the way to each of them.
+   */
+  it("leaves the scope column offering the vault, the create and every section", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(screen.getByRole("button", { name: railFold }));
+
+    // Which vault is active is a fact the strip would otherwise destroy, so it
+    // rides the control that leads back to the switcher.
+    expect(screen.getByRole("button", { name: `Vaults, ${VAULT_A.name}` })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: NEW_NOTE_LABEL })).toBeEnabled();
+    for (const section of ["Spaces", "Tags", "Files"]) {
+      expect(screen.getByRole("button", { name: section })).toBeInTheDocument();
+    }
+  });
+
+  it("makes a note from the folded rail without spending the fold", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+    fireEvent.click(screen.getByRole("button", { name: railFold }));
+
+    fireEvent.click(screen.getByRole("button", { name: NEW_NOTE_LABEL }));
+
+    // The create is the one rail control that does its whole job at 48px: the
+    // note is written and opened in the strip beside, and the column the user
+    // put away stays away.
+    await waitFor(() => expect(notesCreate).toHaveBeenCalled());
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_EXPAND_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the section the rail names, including one the user had folded", async () => {
+    // Spaces folded AND the column folded: a control that only unfolded the
+    // column would land the user on a section still put away, which is a way in
+    // that goes nowhere.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging the cookie is this test's subject
+    document.cookie = notesRailFoldCookie({ spaces: true, tags: false, files: false });
+    renderPane();
+    await waitForRows("Pricing");
+    fireEvent.click(screen.getByRole("button", { name: railFold }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Spaces" }));
+
+    expect(await screen.findByRole("button", { name: "Inbox" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse Spaces" })).toBeInTheDocument();
+  });
+
+  it("leaves the list column offering the search, the count and the way out of a filter", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+
+    fireEvent.click(screen.getByRole("button", { name: listFold }));
+
+    // The count is what a 48px strip destroys most completely: folded, nothing
+    // on screen said whether the lens held four notes or none.
+    expect(
+      screen.getByRole("button", { name: new RegExp(`^${NOTES_RAIL_LIST_LABEL}, .*notes?$`) }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Search notes" })).toBeInTheDocument();
+    // Nothing is filtered, so there is nothing to clear and no control for it.
+    expect(screen.queryByRole("button", { name: /^Clear filters/ })).not.toBeInTheDocument();
+  });
+
+  it("unfolds the list and lands the caret in the search field", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+    fireEvent.click(screen.getByRole("button", { name: listFold }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Search notes" }));
+
+    // "Unfold and put me where I asked to be", in one press. The pane already
+    // answered this nonce for the palette; the rail reuses it rather than
+    // growing a second focus path.
+    const field = await screen.findByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER });
+    expect(field).toHaveFocus();
+  });
+
+  it("clears a filter from the folded list rail", async () => {
+    renderPane();
+    await waitForRows("Pricing");
+    fireEvent.change(screen.getByRole("searchbox", { name: NOTES_SEARCH_PLACEHOLDER }), {
+      target: { value: "pricing" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: listFold }));
+
+    // A filter you can neither see nor clear is worse than one you can: the
+    // chips are unmounted with the body, so the strip carries the way out.
+    fireEvent.click(screen.getByRole("button", { name: /^Clear filters/ }));
+
+    expect(notesFiltersStore.getState().text).toBe("");
   });
 });
 

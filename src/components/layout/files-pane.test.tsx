@@ -58,6 +58,7 @@ import {
   FILES_REVEAL_LABEL,
   FILES_ROLE_SLOT,
   FILES_SELECTED_TESTID,
+  FILES_SELECTION_LABEL,
   FILES_SIZE_BASE_NOTE,
   FILES_SIZE_SLOT,
   FILES_STATE_DETAIL_TESTID,
@@ -66,7 +67,11 @@ import {
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
 } from "@/components/layout/files-pane";
-import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
+import {
+  COLUMN_COLLAPSE_PREFIX,
+  COLUMN_EXPAND_PREFIX,
+  COLUMN_RAIL_CONTROL_SLOT,
+} from "@/components/layout/surface-column";
 import {
   FILES_SYNC_MARK_LABEL,
   FILES_SYNC_MARK_TESTID,
@@ -2551,9 +2556,18 @@ describe("FilesPane — the tree is a column", () => {
 
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
 
-    // No tree, no header, no Refresh — a folded column mounts none of it.
+    // No tree and no header: a folded column mounts none of the body. Refresh
+    // is the deliberate exception and this assertion changed with the second cut
+    // of the story — it used to say Refresh was gone too, which was true and was
+    // the defect. It re-reads folders into a store the folded pane is still
+    // subscribed to, so it is the one header control that means the same thing at
+    // 48px, and it now lives on the strip's rail.
     expect(screen.queryByRole("tree", { name: FILES_TREE_LABEL })).toBeNull();
-    expect(screen.queryByRole("button", { name: FILES_REFRESH_LABEL })).toBeNull();
+    expect(screen.getByRole("button", { name: FILES_REFRESH_LABEL })).toHaveAttribute(
+      "data-slot",
+      COLUMN_RAIL_CONTROL_SLOT,
+    );
+    expect(screen.queryByRole("heading", { name: FILES_PANE_TITLE })).toBeNull();
     // Still a named region, and still holding the control that undoes it.
     expect(screen.getByRole("region", { name: FILES_PANE_TITLE })).toBeInTheDocument();
     expect(
@@ -2630,5 +2644,59 @@ describe("FilesPane — the tree is a column", () => {
       await Promise.resolve();
     });
     expect(document.activeElement?.getAttribute("aria-label")).toBe("Field");
+  });
+
+  it("re-reads the folders from the folded rail", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    render(<FilesPane />);
+    await screen.findByRole("treeitem", { name: "Vault" });
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+    const before = syncProfiles.mock.calls.length;
+
+    await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    // The whole point of keeping it: the read happens now, and unfolding shows
+    // what it found rather than what was there when the column went away.
+    expect(syncProfiles.mock.calls.length).toBe(before + 1);
+    expect(
+      screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).toBeInTheDocument();
+  });
+
+  /**
+   * The selection is the capability a fold destroyed most completely: Delete and
+   * Attach are asked about it, they live in the header, and the header goes with
+   * the body. Folded, a person had a selection they could not see, could not act
+   * on and could not clear.
+   */
+  it("says how many rows are still selected, and gives them back their header", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [entry("a.md", "file"), entry("b.md", "file")]),
+    );
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await click(await screen.findByRole("treeitem", { name: "a.md" }));
+    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+
+    const held = screen.getByRole("button", { name: `${FILES_SELECTION_LABEL}, 1 item selected` });
+    expect(held).toBeInTheDocument();
+    // And it is a way back to what can be done about it, not a Delete at 48px:
+    // the count that makes deleting safe to press is in the header.
+    await click(held);
+    expect(screen.getByRole("button", { name: FILES_DELETE_LABEL })).toBeInTheDocument();
+    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+  });
+
+  it("offers no selection control when nothing is selected", async () => {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    render(<FilesPane />);
+    await screen.findByRole("treeitem", { name: "Vault" });
+
+    await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
+
+    expect(screen.queryByRole("button", { name: new RegExp(FILES_SELECTION_LABEL) })).toBeNull();
   });
 });
