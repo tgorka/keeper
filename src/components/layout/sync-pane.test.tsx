@@ -78,6 +78,8 @@ import {
   SYNC_RETRY_LABEL,
   SYNC_SETTLING_NOTE,
   SYNC_SETTLING_SENTENCE,
+  SYNC_UNSPELLABLE_SENTENCE,
+  SYNC_UNSPELLABLE_TITLE,
   SyncPane,
   syncParkedSummary,
   syncPendingReason,
@@ -267,7 +269,7 @@ function progressVm(over: Partial<SyncProgressVm> = {}): SyncProgressVm {
 }
 
 function problemsVm(over: Partial<SyncProblemsVm> = {}): SyncProblemsVm {
-  return { warning: null, error: null, parked: [], conflicts: [], ...over };
+  return { warning: null, error: null, parked: [], conflicts: [], unspellable: [], ...over };
 }
 
 /**
@@ -1490,6 +1492,71 @@ describe("SyncPane problems", () => {
       within(list).getByText("notes/shared.sync-conflict-20260727-air.md"),
     ).toBeInTheDocument();
     expect(screen.getByText(SYNC_CONFLICT_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("reports a name that is not text, in both the readable and the byte-exact form", async () => {
+    // DW-200. The engine finds these; before this they reached no surface, so
+    // keeper knew about a file it never mentioned. Two entries whose LOSSY
+    // renderings are identical — which is the whole hazard: `a\xff.txt` and
+    // `a\xfe.txt` read the same to a person and are two different files.
+    // React only *warns* about duplicate keys, so the row count below cannot
+    // catch a pane keyed on the lossy `display`. Captured and restored around
+    // the render, and asserted after, so a failure here never leaves the rest
+    // of the file with a muted console.
+    const complaints: string[] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => complaints.push(args.map(String).join(" ")));
+    mockProblems.mockResolvedValue(
+      problemsVm({
+        unspellable: [
+          { display: "a\uFFFD.txt", escaped: "a\\xff.txt" },
+          { display: "a\uFFFD.txt", escaped: "a\\xfe.txt" },
+        ],
+      }),
+    );
+    let list: HTMLElement;
+    try {
+      await renderPane();
+      list = await screen.findByRole("list", { name: `${SYNC_UNSPELLABLE_TITLE}: tgdrive` });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    // The byte-exact form is what makes the row actionable — a person can paste
+    // it into a shell. Without it the two rows above are indistinguishable.
+    expect(within(list).getByText("a\\xff.txt")).toBeInTheDocument();
+    expect(within(list).getByText("a\\xfe.txt")).toBeInTheDocument();
+    // …and the readable form is still shown, because `a\uFFFD.txt` is what the
+    // person will recognise in their file manager.
+    expect(within(list).getAllByText("a\uFFFD.txt")).toHaveLength(2);
+    expect(screen.getByText(SYNC_UNSPELLABLE_SENTENCE)).toBeInTheDocument();
+    // The rows must be KEYED on the byte-exact name, and this is the assertion
+    // that says so. A mutation that keyed on `display` SURVIVED until this line
+    // existed, because React renders duplicate-keyed siblings and only warns.
+    // It is not pedantry: this list is the one place in the app where two
+    // entries routinely share a `display`, so a duplicate key here is a real
+    // reconciliation hazard the moment the list changes.
+    expect(complaints.filter((line) => line.includes("same key"))).toEqual([]);
+  });
+
+  it("says nothing about names when every name in the folder is text", async () => {
+    // The section must not appear on the overwhelmingly common folder, and
+    // "Problems" with an empty body is a worry with no cause (AD-S5).
+    //
+    // The folder has a DIFFERENT problem, deliberately: with nothing at all
+    // wrong the whole Problems section is absent and this test would pass
+    // against a name list rendered unconditionally. Asked this way it pins the
+    // one conditional it is about.
+    mockProblems.mockResolvedValue(problemsVm({ warning: "Large files are missing." }));
+    await renderPane();
+    await screen.findByText("Large files are missing.");
+
+    expect(screen.queryByText(SYNC_UNSPELLABLE_TITLE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_UNSPELLABLE_SENTENCE)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("list", { name: `${SYNC_UNSPELLABLE_TITLE}: tgdrive` }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the live warning and error the engine reported", async () => {

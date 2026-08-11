@@ -487,6 +487,13 @@ development_status:
   46-15-a-capture-window-you-can-resize: review
   46-16-start-a-recording-from-the-tray: review
   epic-46-retrospective: optional
+  epic-47: in-progress
+  47-1-repair-the-lines-the-old-writer-broke: review
+  47-2-a-name-keeper-cannot-spell: review
+  47-3-every-rail-section-folds: review
+  47-4-a-name-keeper-claimed-and-labels-that-follow: review
+  47-5-the-small-tail: review
+  epic-47-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in

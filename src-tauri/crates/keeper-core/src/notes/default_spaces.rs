@@ -1,5 +1,6 @@
-//! The spaces keeper seeds into a vault, and the rule for when it may
-//! (Story 44.3, Story 45.20, FR-156, FR-198, AD-79, AD-80).
+//! The spaces keeper seeds into a vault, the names it claims doing so, and the
+//! rule for when it may
+//! (Story 44.3, Story 45.20, Story 47.4, FR-156, FR-198, AD-79, AD-80).
 //!
 //! Inbox, Journal, Pinned and Recordings used to be hard-coded rows above the
 //! Spaces group — saved filters that nobody could edit, reorder, rename or give
@@ -16,6 +17,12 @@
 //! decided by [`plan`], which takes what is on disk and what the ledger
 //! remembers and returns a list — so both can be proved on a host where the
 //! shell crate does not even build (AD-55, AD-56).
+//!
+//! **The ledger is a list of NAMES CLAIMED, not of notes written** (Story 47.4,
+//! DW-191). A default keeper stood down for is recorded exactly like one it
+//! created, because otherwise the protection is backwards: keeper's own spaces
+//! stay deleted and the user's do not. See [`seed`] for what that costs and
+//! [`claimed`] for the rule.
 //!
 //! **The queries are the ones the deleted rows ran, not new ones.** Inbox is
 //! `is:untagged` — the honest home of the unfiled is the note no tag has
@@ -193,7 +200,7 @@ pub enum SeedMode {
 
 /// Which defaults to write, in [`DEFAULT_SPACES`] order.
 ///
-/// `offered` is the ledger: the keys this vault has already been given.
+/// `offered` is the ledger: **the names keeper has claimed in this vault**.
 /// `None` means keeper could not read it — a file that is there and does not
 /// parse. That is deliberately NOT the same as an absent file. An absent ledger
 /// is a vault that has never been seeded and gets the four; an unreadable one is
@@ -202,11 +209,8 @@ pub enum SeedMode {
 /// cost of resurrecting four the user deleted is keeper editing their vault
 /// behind their back.
 ///
-/// A default is *present* when a space carries its key, or when a space is
-/// already called what it would be called. The name comparison is
-/// [`naming::slug`]'s fold, so `Inbox`, `inbox` and `  INBOX  ` are one name —
-/// the same folding that decides two notes cannot share a filename, and the
-/// reason two rows both saying "Inbox" never appear in the rail.
+/// A default is skipped when the ledger names it, or when it is [`claimed`] —
+/// present in the vault under its key or its name.
 pub fn plan(
     mode: SeedMode,
     existing: &[ExistingSpace],
@@ -218,6 +222,35 @@ pub fn plan(
         // Unreadable ledger, automatic run: keeper stays out.
         (SeedMode::FirstRun, None) => return Vec::new(),
     };
+    let present = claimed(existing);
+    DEFAULT_SPACES
+        .iter()
+        .filter(|space| !ledger.is_some_and(|keys| keys.contains(space.key)))
+        .filter(|space| !present.contains(space.key))
+        .collect()
+}
+
+/// The default keys this vault has taken, whoever took them (Story 47.4,
+/// DW-191).
+///
+/// The two ways a default can be present, and the reason this is one function
+/// rather than a filter inside [`plan`]: [`seed`] records exactly this set, so
+/// "which defaults did keeper stand down for" and "which defaults will keeper
+/// skip" have to be one answer. Two spellings of the presence rule would drift,
+/// and the symptom is a name recorded as claimed that the planner still writes,
+/// or the reverse.
+///
+/// - **By key.** `keeper.default` in the note's frontmatter, which survives a
+///   rename: an Inbox someone renamed to "Unfiled" is still the inbox default.
+/// - **By name.** [`naming::slug`]'s fold, so `Inbox`, `inbox` and `  INBOX  `
+///   are one name — the same folding that decides two notes cannot share a
+///   filename, and the reason two rows both saying "Inbox" never appear in the
+///   rail. This is the case that is not hypothetical: a person who wanted an
+///   Inbox before keeper shipped one built it themselves.
+///
+/// Only keys in [`DEFAULT_SPACES`] can come out, so a note carrying a
+/// `keeper.default` this build does not know contributes nothing.
+pub fn claimed(existing: &[ExistingSpace]) -> BTreeSet<String> {
     let taken_keys: BTreeSet<&str> = existing
         .iter()
         .filter_map(|space| space.default_key.as_deref())
@@ -228,9 +261,10 @@ pub fn plan(
         .collect();
     DEFAULT_SPACES
         .iter()
-        .filter(|space| !ledger.is_some_and(|keys| keys.contains(space.key)))
-        .filter(|space| !taken_keys.contains(space.key))
-        .filter(|space| !taken_names.contains(&naming::slug(space.name)))
+        .filter(|space| {
+            taken_keys.contains(space.key) || taken_names.contains(&naming::slug(space.name))
+        })
+        .map(|space| space.key.to_owned())
         .collect()
 }
 
@@ -274,6 +308,14 @@ pub enum SeedOutcome {
     /// Wrote these vault-relative paths, in [`DEFAULT_SPACES`] order.
     Wrote(Vec<String>),
     /// The vault already has every default this run would have offered.
+    ///
+    /// It writes no space note. It MAY still have recorded a claim, on the one
+    /// run that upgrades a pre-DW-191 ledger to the names keeper stood down for
+    /// (Story 47.4) — which is why the sentence below says "wrote no spaces"
+    /// rather than "wrote nothing". Not a fifth variant: the shell matches this
+    /// enum exhaustively and a claim is bookkeeping about a decision already
+    /// made, not an outcome of the run. Like every other ledger write here it is
+    /// best effort ([`keys_recorded`]) and reports nothing of its own.
     AlreadySatisfied,
     /// Wrote nothing, deliberately, because something could not be read. The
     /// string is the sentence for the log. Nothing is recorded, so the next
@@ -329,7 +371,7 @@ impl SeedOutcome {
             ),
             Self::AlreadySatisfied => (
                 REPORT_FLOOR,
-                "default spaces already settled for this vault; wrote nothing".to_owned(),
+                "default spaces already settled for this vault; wrote no spaces".to_owned(),
             ),
             Self::Blocked(why) => (
                 tracing::Level::WARN,
@@ -366,6 +408,23 @@ impl SeedOutcome {
 /// The first version of this got the second case wrong in the other direction —
 /// it swallowed the listing error and read it as "no spaces" — which on a
 /// sleeping USB volume is a duplicate rail. Both now decline and say so.
+///
+/// **The ledger records the names keeper CLAIMED, not the notes it wrote**
+/// (Story 47.4, DW-191). A default keeper stood down for — because the vault
+/// already had a space of that name — is recorded exactly like one it created.
+/// Recording only what it wrote left the user's own space unprotected by the
+/// mechanism that protects keeper's: delete an Inbox you made yourself, and the
+/// next run saw a name absent from the vault AND absent from the ledger and put
+/// keeper's Inbox in its place. You deleted your space and a different one came
+/// back, which is the surprise 44.7 refused for templates and AD-79 refuses
+/// here.
+///
+/// It costs the case where a name is freed deliberately: rename your own
+/// "Journal" to "Diary" and keeper will not offer its Journal, because it
+/// already stood down for that name once. That is the asymmetry this module
+/// already chose — not offering a space is one menu item away (Restore ignores
+/// the ledger, which is its entire job), and writing into somebody's vault
+/// uninvited is not undoable at all.
 pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
     let offered = match read_ledger(vault) {
         Ok(offered) => offered,
@@ -383,8 +442,32 @@ pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
         Err(reason) => return SeedOutcome::Blocked(reason),
     };
 
+    // Whether the ledger was READABLE, kept before `offered` is consumed. On an
+    // automatic run an unreadable one has already returned `Blocked`; on a
+    // Restore it means keeper is looking at a file it could not parse, and it
+    // may not invent a ledger over one — a newer build's, whose defaults this
+    // one would then re-offer.
+    let readable = offered.is_some();
     let planned = plan(mode, &existing, offered.as_ref());
+
+    // The names this run claims: what the ledger already held, plus every
+    // default that is present — whether keeper wrote it or the user did.
+    let mut keys: BTreeSet<String> = offered.unwrap_or_default();
+    let known = keys.len();
+    keys.extend(claimed(&existing));
+    // `extend` only adds, so a changed length is a new claim.
+    let newly_claimed = keys.len() != known;
+
     if planned.is_empty() {
+        // The upgrade write, and the only run that touches the ledger without
+        // writing a note: a vault whose ledger predates DW-191 holds the keys
+        // keeper WROTE, and the names it stood down for are missing from it.
+        // Gated on an actual change so a settled vault does not rewrite this
+        // file on every refresh — it is synced content, and a rewrite per launch
+        // is a commit per launch.
+        if newly_claimed && readable {
+            keys_recorded(vault, &keys);
+        }
         return SeedOutcome::AlreadySatisfied;
     }
 
@@ -394,7 +477,6 @@ pub fn seed(vault: &mut dyn SeedVault, mode: SeedMode) -> SeedOutcome {
         .iter()
         .map(|space| space.filename.clone())
         .collect();
-    let mut keys: BTreeSet<String> = offered.unwrap_or_default();
     let mut written = Vec::new();
     for space in planned {
         let filename = naming::note_filename(space.name, &vault.today(), &taken);
@@ -438,8 +520,9 @@ fn keys_recorded(vault: &mut dyn SeedVault, keys: &BTreeSet<String>) {
 pub enum DeleteRecord {
     /// The key is in the ledger now; the seeder will not offer it again.
     Recorded(String),
-    /// The ledger already named it, which is the ordinary case: keeper seeded
-    /// the space, so it recorded the key when it wrote the note.
+    /// The ledger already named it, which is the ordinary case: keeper claims a
+    /// default's key the first time it seeds or stands down for it, so by the
+    /// time anyone can delete the space the key is recorded.
     AlreadyRecorded(String),
     /// The note was not a default space. The ledger has nothing to say about a
     /// space a person wrote, and nothing would re-create it.
@@ -478,21 +561,29 @@ impl DeleteRecord {
 /// it back (Story 45.17, FR-195).
 ///
 /// **This invents no tombstone, because the ledger already is one.** `offered`
-/// is the set of keys this vault has been given, and [`plan`] skips every key
-/// in it on a `FirstRun`. So "deleted on purpose" and "already offered" are the
-/// same fact from the seeder's side, and the deletion's whole job is to make
+/// is the set of keys keeper has claimed in this vault, and [`plan`] skips every
+/// key in it on a `FirstRun`. So "deleted on purpose" and "already claimed" are
+/// the same fact from the seeder's side, and the deletion's whole job is to make
 /// sure the key is in that set. A second file saying "and this one is deleted"
 /// would be a second answer to one question, and the two would disagree the
 /// first time somebody restored a vault from a backup that had one and not the
 /// other.
 ///
-/// It is not a no-op, and the case that makes it load-bearing is the one that
-/// looks impossible: `seed` records only the keys it WROTE. A default it stood
-/// down because a space of the user's own already carried that name never
-/// reaches the ledger — so deleting *that* space, without this, hands the next
-/// refresh a vault with no `inbox` key, no space named Inbox and no space
-/// carrying the marker, and keeper writes one. That is the AD-79 failure with
-/// extra steps.
+/// It is not a no-op, and the case that makes it load-bearing is a ledger write
+/// that FAILED: [`keys_recorded`] is best effort, so a full disk or a read-only
+/// `.keeper-spaces.json` leaves a vault with keeper's spaces on disk and nothing
+/// recorded. Deleting one of them then has to record it, because nothing did,
+/// and the next automatic run would otherwise write it straight back.
+///
+/// **What this cannot do, and Story 47.4 had to fix in [`seed`] instead.** Until
+/// DW-191 this comment claimed the load-bearing case was a default keeper stood
+/// down for because the user already had a space of that name. It never was:
+/// that space is the *user's*, it carries no `keeper.default`, so
+/// [`default_key_of`] answers `None` and this returns [`DeleteRecord::NotADefault`]
+/// — correctly, because the ledger has nothing to say about a space a person
+/// wrote. The name was left unclaimed and keeper's version arrived in its place
+/// on the next refresh. That is closed one layer up, where the stand-down
+/// happens, by [`claimed`].
 ///
 /// `source` is the note's text, read before the bytes move. An unreadable
 /// ledger blocks rather than being overwritten, exactly as it does in [`seed`]:
@@ -1878,5 +1969,247 @@ mod tests {
         assert_eq!(level, tracing::Level::WARN);
         assert!(message.contains(LEDGER_REL), "{message}");
         assert!(message.contains("permission denied"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The names keeper claims (Story 47.4, DW-191)
+    // -----------------------------------------------------------------------
+
+    /// The presence rule, on its own, in both of its two forms.
+    ///
+    /// [`plan`] and [`seed`] read this one function — the planner to decide what
+    /// to skip, the seeder to decide what to record — so a drift between "stood
+    /// down for" and "claimed" is not expressible. That is the whole reason it
+    /// is a function and not a filter written twice.
+    #[test]
+    fn a_default_is_claimed_by_its_key_or_by_its_name_and_by_nothing_else() {
+        assert!(
+            claimed(&[]).is_empty(),
+            "an empty vault claims no name for keeper"
+        );
+
+        // By key, surviving a rename: the marker is the identity (AD-79).
+        assert_eq!(
+            claimed(&[existing("Unfiled", Some("inbox"))]),
+            ledger(&["inbox"])
+        );
+
+        // By name, folded the way `naming::slug` folds it, so the three
+        // spellings of one name are one claim and not three misses.
+        for spelling in ["Inbox", "inbox", "  INBOX  "] {
+            assert_eq!(
+                claimed(&[existing(spelling, None)]),
+                ledger(&["inbox"]),
+                "{spelling:?} is the Inbox name"
+            );
+        }
+
+        // A name that is nobody's default, and a marker this build does not
+        // know, each claim nothing — an unrecognised `keeper.default` must not
+        // become a key that stops a real default from ever being offered.
+        assert!(claimed(&[existing("Clients", None)]).is_empty());
+        assert!(claimed(&[existing("Clients", Some("archive"))]).is_empty());
+
+        // The set, not the first hit: a vault mid-seed claims every one present.
+        assert_eq!(
+            claimed(&[
+                existing("Inbox", None),
+                existing("Sessions", Some("recordings")),
+                existing("Clients", None),
+            ]),
+            ledger(&["inbox", "recordings"])
+        );
+    }
+
+    /// **DW-191, on disk, end to end.** The user wrote their own Inbox before
+    /// keeper shipped one. keeper stands down for the name — and now records it.
+    /// They delete their Inbox. Nothing arrives in its place.
+    ///
+    /// Without the claim, the next run sees a name absent from the vault AND
+    /// absent from the ledger and writes keeper's Inbox: you delete your space
+    /// and a different one comes back. [`record_deleted`] cannot catch it —
+    /// their note carries no `keeper.default`, so the deletion is correctly
+    /// `NotADefault` and records nothing, which is asserted here rather than
+    /// assumed.
+    #[test]
+    fn a_default_stood_down_for_a_name_the_user_took_is_claimed_and_their_space_stays_gone() {
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-08-inbox.md", "Inbox", "tag:unfiled");
+
+        let outcome = seed(&mut vault, SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            SeedOutcome::Wrote(vec![
+                "spaces/2026-08-09-journal.md".to_owned(),
+                "spaces/2026-08-09-pinned.md".to_owned(),
+                "spaces/2026-08-09-recordings.md".to_owned(),
+                "spaces/2026-08-09-templates.md".to_owned(),
+            ]),
+            "keeper still stands down rather than writing a second Inbox"
+        );
+        assert!(
+            recorded(&vault).contains(&"inbox".to_owned()),
+            "the name keeper stood down for is claimed: {:?}",
+            recorded(&vault)
+        );
+
+        // Their space, deleted the way the shell deletes one. The ledger has
+        // nothing to add — it is not keeper's space — and does not need to.
+        assert_eq!(
+            delete_space(&mut vault, "spaces/2026-08-08-inbox.md"),
+            DeleteRecord::NotADefault,
+        );
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied,
+            "the name is claimed, so nothing is planned for it"
+        );
+        let names = names_on_disk(&vault);
+        assert!(
+            !names.contains(&"Inbox".to_owned()),
+            "the user deleted their Inbox and keeper's must not arrive instead: {names:?}"
+        );
+        assert_eq!(
+            names,
+            ["Journal", "Pinned", "Recordings", "Templates"],
+            "and nothing else moved"
+        );
+
+        // …until they ask. Restore ignores the ledger, which is its entire job,
+        // so the escape hatch from a claim is still one menu item away.
+        assert_eq!(
+            seed(&mut vault, SeedMode::Restore),
+            SeedOutcome::Wrote(vec!["spaces/2026-08-09-inbox.md".to_owned()])
+        );
+    }
+
+    /// **The upgrade path**, which is the part of DW-191 that is a product call
+    /// rather than a bug fix: vaults already exist with a ledger written under
+    /// the old meaning, holding the keys keeper WROTE and not the names it stood
+    /// down for.
+    ///
+    /// The decision, made here and not left to hope: the first run after the
+    /// change reconciles. It writes no space note — nothing is missing — and it
+    /// records the claims the old ledger could not have held. The alternative,
+    /// waiting until a run happens to write something, leaves the defect live on
+    /// exactly the vaults that already have it, which is every installed one.
+    ///
+    /// The old state is built by hand rather than by running the old code,
+    /// because the old code is gone: keeper's four notes on disk, the user's own
+    /// Inbox beside them, and a ledger naming only the four.
+    #[test]
+    fn a_ledger_written_under_the_old_meaning_is_reconciled_by_the_first_run_after_it() {
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-08-inbox.md", "Inbox", "tag:unfiled");
+        for space in DEFAULT_SPACES.iter().filter(|space| space.key != "inbox") {
+            let filename = format!("2026-08-08-{}.md", naming::slug(space.name));
+            vault
+                .write(
+                    &format!("{SPACES_DIR}/{filename}"),
+                    &render_note(space, "01OLD", "2026-08-08T09:00:00+02:00"),
+                )
+                .expect("plant one of keeper's own");
+        }
+        let old = ledger(&["journal", "pinned", "recordings", "templates"]);
+        vault
+            .write(LEDGER_REL, &render_ledger(&old))
+            .expect("plant the old ledger");
+        assert_eq!(
+            recorded(&vault),
+            vec!["journal", "pinned", "recordings", "templates"],
+            "the premise: the old ledger holds only what keeper wrote"
+        );
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied,
+            "nothing is missing, so no space note is written"
+        );
+        assert_eq!(
+            recorded(&vault),
+            vec!["inbox", "journal", "pinned", "recordings", "templates"],
+            "…and the name keeper stood down for years ago is claimed now"
+        );
+
+        // The upgrade is what makes the deletion stick. Without it this vault
+        // still hands the next refresh an unclaimed `inbox`.
+        assert_eq!(
+            delete_space(&mut vault, "spaces/2026-08-08-inbox.md"),
+            DeleteRecord::NotADefault,
+        );
+        assert_eq!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::AlreadySatisfied
+        );
+        let names = names_on_disk(&vault);
+        assert!(
+            !names.contains(&"Inbox".to_owned()),
+            "an upgraded vault protects the user's space too: {names:?}"
+        );
+    }
+
+    /// The reconciliation writes ONCE. A ledger rewritten on every refresh is a
+    /// synced file modified on every launch, which is a commit per launch in
+    /// somebody's vault history — the sync engine cannot tell keeper's
+    /// bookkeeping from a real edit.
+    ///
+    /// Asserted against every write the run attempted, not against the bytes:
+    /// identical content rewritten still moves an mtime and still stages.
+    #[test]
+    fn a_settled_vault_touches_nothing_at_all_on_the_runs_after_the_upgrade() {
+        let mut vault = temp_vault();
+        put_space(&vault, "2026-08-08-inbox.md", "Inbox", "tag:unfiled");
+        assert!(matches!(
+            seed(&mut vault, SeedMode::FirstRun),
+            SeedOutcome::Wrote(_)
+        ));
+
+        for run in 0..3 {
+            vault.attempted.clear();
+            assert_eq!(
+                seed(&mut vault, SeedMode::FirstRun),
+                SeedOutcome::AlreadySatisfied
+            );
+            assert!(
+                vault.attempted.is_empty(),
+                "run {run} after the claim rewrote {:?}",
+                vault.attempted
+            );
+        }
+    }
+
+    /// A Restore over a ledger keeper cannot parse, with nothing to restore,
+    /// must not invent one — [`seed`]'s standing rule that a file that is there
+    /// and is not keeper's may be a newer build's, and replacing it re-offers
+    /// that build's defaults.
+    ///
+    /// This is the one path where the claim write could have reached an
+    /// unreadable ledger: an automatic run has already returned `Blocked` before
+    /// it gets here.
+    #[test]
+    fn a_restore_with_nothing_to_restore_does_not_write_a_ledger_over_one_it_could_not_read() {
+        let mut vault = temp_vault();
+        for space in &DEFAULT_SPACES {
+            let filename = format!("2026-08-08-{}.md", naming::slug(space.name));
+            vault
+                .write(
+                    &format!("{SPACES_DIR}/{filename}"),
+                    &render_note(space, "01OLD", "2026-08-08T09:00:00+02:00"),
+                )
+                .expect("plant one of keeper's own");
+        }
+        let theirs = "{\"version\":99,\"written-by\":\"a keeper from the future\"}\n";
+        vault.write(LEDGER_REL, theirs).expect("plant the ledger");
+
+        assert_eq!(
+            seed(&mut vault, SeedMode::Restore),
+            SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(
+            vault.read(LEDGER_REL).expect("ledger"),
+            theirs,
+            "keeper must not replace a ledger it could not read"
+        );
     }
 }

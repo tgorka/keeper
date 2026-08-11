@@ -88,6 +88,28 @@ describe("readSidebarFold", () => {
       expect(decodeURIComponent(written)).toContain(`${group}:0`);
     }
   });
+
+  /**
+   * Story 47.3 moved this parser onto a core shared with the notes rail's fold.
+   * A cookie is a wire format with a year on it, so the byte string a browser
+   * is already holding from the pre-47.3 build has to keep meaning what it
+   * meant — and the writer has to keep emitting the same bytes, or the next
+   * build after this one is the one that breaks it.
+   *
+   * The literal is what Story 45.20's writer produced, spelled out rather than
+   * composed, so a change to the composer cannot quietly change the fixture too.
+   */
+  it("still reads, and still writes, the exact cookie the pre-47.3 build left behind", () => {
+    const legacy = `${SIDEBAR_FOLD_COOKIE}=menu%3A1%7Cspaces%3A0%7Cnetworks%3A1`;
+
+    expect(readSidebarFold(`theme=dark; ${legacy}; sidebar_state=true`)).toEqual({
+      menu: true,
+      groups: { spaces: false, networks: true },
+    });
+    expect(sidebarFoldCookie({ menu: true, groups: { spaces: false, networks: true } })).toBe(
+      `${legacy}; path=/; max-age=${60 * 60 * 24 * 365}`,
+    );
+  });
 });
 
 describe("the fold store", () => {

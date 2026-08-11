@@ -317,11 +317,17 @@ import {
   NOTES_NOTICE_SLOT,
   NotesPane,
 } from "@/components/notes/notes-pane";
+import { RESTORE_DEFAULTS } from "@/components/notes/space-list";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WINDOW_ROW_ATTR } from "@/components/ui/window-list";
 import { notesCreate, notesDelete, notesDeletePlan } from "@/lib/ipc/client";
 import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 import { resetNotesListStoreForTest } from "@/lib/stores/notes-list";
+import {
+  NOTES_RAIL_FOLD_COOKIE,
+  notesRailFoldCookie,
+  resetNotesRailFoldForTest,
+} from "@/lib/stores/notes-rail-fold";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -372,6 +378,10 @@ beforeEach(() => {
   // panel behind and the next one starts with two documents on screen. It was
   // safe to omit while the pane could only ever retarget the one note panel.
   resetPanelsStoreForTest();
+  // Story 47.3: the rail's fold is a cookie AND a module-level "already
+  // restored" latch, so one test's fold would otherwise be the next test's
+  // restore. Both halves have to go.
+  resetNotesRailFoldForTest();
   primaryViewStore.getState().setView("notes");
 });
 
@@ -380,7 +390,40 @@ afterEach(() => {
   resetNotesListStoreForTest();
   resetNotesFiltersStoreForTest();
   resetPanelsStoreForTest();
+  resetNotesRailFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state this suite arranged
+  document.cookie = `${NOTES_RAIL_FOLD_COOKIE}=; path=/; max-age=0`;
   primaryViewStore.getState().setView("inbox");
+});
+
+/**
+ * Story 47.3, and the DW-172 shape again.
+ *
+ * The restore is `hydrateNotesRailFold`, and the only thing that can fail is
+ * the pane not calling it. A store-level test cannot see that: it calls the
+ * hydrate itself and passes over a pane that never does. So this one arranges
+ * a real cookie, mounts the real pane, and asserts the rail came up the way
+ * the cookie says — which is false the moment the call is dropped.
+ *
+ * Tags is absent here on purpose: this suite's vault has no tags, so the Tags
+ * section does not render at all. Its fold is covered in `rail-fold.test.tsx`.
+ */
+describe("NotesPane rail fold", () => {
+  it("comes up folded the way the cookie left it", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging the cookie is this test's subject
+    document.cookie = notesRailFoldCookie({ spaces: true, tags: true, files: false });
+
+    renderPane();
+    await waitForRows("Pricing");
+
+    // Spaces folded: the rows are gone, the way back is not.
+    expect(await screen.findByRole("button", { name: "Expand Spaces" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: RESTORE_DEFAULTS })).toBeInTheDocument();
+    // Files unfolded, against its own default of shut — so this cannot pass on
+    // a pane that ignored the cookie and fell back to the defaults.
+    expect(screen.getByRole("button", { name: "Collapse Files" })).toBeInTheDocument();
+  });
 });
 
 describe("NotesPane filters", () => {

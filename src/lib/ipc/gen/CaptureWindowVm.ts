@@ -24,4 +24,16 @@ locked: boolean,
 /**
  * Whether it is on screen. A hidden draft window is still a window.
  */
-visible: boolean, };
+visible: boolean, 
+/**
+ * The gap, in **logical CSS pixels**, the window's own resize border needs
+ * on the chrome strip's top and right edges right now (Story 47.5,
+ * DW-199) — `0` on every platform and in every state but one.
+ *
+ * Decided in Rust and carried, because the frontend cannot decide it: this
+ * app reads the platform nowhere (`src/test/no-user-agent-gating.test.ts`
+ * enforces that), and the number is a function of the backend, the lock,
+ * the maximized state and the monitor's scale factor. See
+ * [`chrome_edge_inset`].
+ */
+chromeInset: number, };

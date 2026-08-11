@@ -2918,7 +2918,8 @@ reason: `seed` writes a ledger entry for each default space it CREATES, and 45.1
   has claimed", and it changes them for vaults that already exist. That is a product call about
   an upgrade path, not a bug fix inside a story about deleting things, which is why it is here
   rather than in 45.17.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.4 — `seed` records a default's key whether it was written or stood down for a name collision, so deleting the user's own space no longer brings keeper's back. The same defect in `templates.rs` was found while fixing this one and fixed in the same story.
 
 ### DW-192: `notes_capture_impact`, the two recording commands and the capture rung are wired but have never been exercised by a running app.
 
@@ -2964,7 +2965,8 @@ reason: 46.1 stops keeper EMITTING an unquoted pattern; it does not repair the o
   carve-out.
   Whoever picks this up should decide it as a product question first: repair silently, repair
   with a one-line notice, or leave them and let the correctly spelled rule be added alongside.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.1 — `ensure_attributes` repairs the lines git itself rejects, below the managed header only, and collapses duplicates keeping the LAST copy because git applies matching lines in order.
 
 ### DW-194: An exact-path `.gitattributes` pattern leaves glob metacharacters live, so a real filename containing `[` gets a rule that matches everything except that file.
 
@@ -2999,7 +3001,8 @@ reason: the exact-path branch spells a filename as a gitattributes PATTERN, and 
   folded into a story about blanks.
   Note the extension branch is not affected: `pattern_for_extension` emits `*.<ext>` where the
   `*` is intended, and `engine.rs:1802` already refuses an extension holding `/` or whitespace.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.1 — `* ? [ \\` escaped in the literal half of both producer branches, applied before quoting because git strips them in that order.
 
 ### DW-195: The tray's notes section still hand-types its labels, so a registry retitle that now reaches four surfaces still misses the three notes verbs in the menu bar.
 
@@ -3026,7 +3029,8 @@ reason: 46.16 made the tray project `keeper_core::palette` for the recording ver
   order has to stay the tray's own or a registry reshuffle would move labels onto the wrong
   handles. `notes-open` / `notes-search` are registered and deliberately absent from the tray,
   which is the other reason the id list stays explicit rather than "the whole Notes section".
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.4 — the tray's notes labels project `keeper_core::palette`, pinned by two source-scan assertions rather than by value, because duplication is a fact about source text.
 
 ### DW-196: `DestinationProfileRow` now carries the recordings root and the head it was joined from as two independent `Option`s, so a row that says one without the other is representable.
 
@@ -3057,7 +3061,8 @@ reason: 46.10 needed the profile-relative subfolder on the destination picker's 
   `ipc.rs`, and it is mechanical: introduce the struct, add a `recordings_root()` accessor so the
   five existing readers keep their one-line shape, and rewrite the six fixture mutations to
   `row.recordings = None`.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the pair became one `Option<RecordingsPlace>`, so it cannot be half-set.
 
 ### DW-197: `WriteScope::file` survived AD-102 with no production caller left, and it is the pre-fork mental model sitting in the module as a trap.
 
@@ -3085,7 +3090,8 @@ fix: delete `WriteScope::file`; migrate each test above to `directory` where it 
   component-by-component vault match or the create refusal, and to `owner` where it is asserting
   the escape / vault-root / is-a-directory refusals. `vault_relative` stays — it is the shared
   core of `directory` and `classify`. No production line changes.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.5 — `WriteScope::file` deleted, its seven tests migrated to `directory` or `owner`, proven by compilation.
 
 ### DW-198: the hotkey path re-centres the draft capture window on every press, and story 46.15 made that asymmetry visible.
 
@@ -3113,7 +3119,8 @@ fix: adopt the position the same way the size is adopted — once, at boot, in `
   person wants is exactly what the lock already says — locked follows the pointer, unlocked
   stays put — so the shape is: at boot, if the stored placement is unlocked and carries a
   position, apply it; on every `show`, do what `reveal(None)` does today. Needs the macOS gate.
-status: open
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the hotkey no longer re-centres a window the user placed. Departs from this entry's literal fix text and implements its reasoning; the reason is in the story's spec §1.
 
 ### DW-199: on GTK, an unlocked capture window's own 5 px resize border sits over the chrome buttons.
 
@@ -3138,4 +3145,35 @@ fix: on a Linux desktop, unlock a capture window and click the top-right two pix
   button. If it resizes instead of closing, give the strip a right/top inset of one resize border
   when unlocked (the same conditional the drag region already uses), sized from what is measured
   rather than from tao's constant. No Rust change; no capability change.
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the inset is computed in Rust from tao's real rule (`scale_factor() * 5`, zero when locked, maximized or non-GTK) and carried to the webview as a number, so the frontend still reads nothing about the platform.
+
+### DW-200: A legacy `.gitattributes` line whose only defect is a live glob metacharacter is not repaired, because a line git accepts is evidence of nothing.
+
+origin: story 47.1, 2026-08-11 — named by the repair's own boundary rule rather than found afterwards
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `ensure_attributes`'s repair candidacy
+reason: 47.1 repairs a line only when git itself REJECTS it, because that is the one case where the
+  original intent is recoverable by construction. A line the old writer emitted for a file named
+  `report [final].pdf` parses fine — as a character class — so it silently over-matches, and there
+  is no way to tell it apart from a hand-added recursive glob a person meant literally. The measured
+  cost is that the stale class keeps resolving `reportf` through LFS beside the new correct line,
+  with empty stderr and nothing to notice.
+  Closing it needs a version marker in `MANAGED_HEADER` so the repair can know which of its own
+  spellings wrote a line — which is a file-format change and wants its own decision, not a
+  widening of a boundary that is currently provable.
+  Same entry covers the backslash-in-extension variant: `*.a\b` is read as `*.ab`.
+status: open
+
+### DW-201: `pattern_for` normalises a backslash to a slash before escaping, so a literal backslash in a filename is destroyed at the separator step.
+
+origin: story 47.1, 2026-08-11
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `pattern_for`
+reason: a backslash is a legal character in a Linux filename, and the separator normalisation runs
+  before the glob escaping, so an oversized `a\b` is routed by the pattern `/a/b` — a path that
+  names a different file, or no file. Nobody has reported it because the filename is rare, but it
+  is the same shape as story 47.2's finding: a rendering standing in for the bytes, and the
+  rendering reaching a different file than the one it came from.
+  Adjacent to 47.2's non-UTF-8 path work and probably belongs with it — that story established the
+  rule (refuse rather than resolve when the rendering is not reversible) and this is a second place
+  it applies.
 status: open

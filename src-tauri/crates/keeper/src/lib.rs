@@ -421,6 +421,15 @@ pub fn run() {
                     keeper_core::capture::DRAFT_CAPTURE_KEY,
                     placement,
                 );
+                // …and where it was, once, here (Story 47.5, DW-198). Beside
+                // the size rather than inside `adopt_placement`, because that
+                // one also runs on the lock toggle and a padlock click is not a
+                // request to move a window.
+                notes_window::adopt_position(
+                    app.handle(),
+                    keeper_core::capture::DRAFT_CAPTURE_KEY,
+                    placement,
+                );
             }
 
             // Store the app handle for the desktop notifier port (Story 10.1) so

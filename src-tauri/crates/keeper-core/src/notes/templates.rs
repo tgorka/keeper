@@ -820,15 +820,12 @@ pub struct JournalNote {
 /// Which shipped templates to write, in [`DEFAULT_TEMPLATES`] order.
 ///
 /// The same three-way rule the space seeder uses, for the same reasons
-/// ([`crate::notes::default_spaces::plan`]): the ledger says what this vault has
-/// already been offered, `existing` says what is on disk right now, and an
-/// unreadable ledger on an automatic run means keeper writes nothing.
+/// ([`crate::notes::default_spaces::plan`]): the ledger says what names this
+/// vault has already had claimed, `existing` says what is on disk right now, and
+/// an unreadable ledger on an automatic run means keeper writes nothing.
 ///
-/// `existing` is the file names already inside [`TEMPLATES_DIR`]. A default is
-/// present when a file is already called what it would be called, folded through
-/// [`naming::slug`] — the same fold that decides two notes cannot share a
-/// filename, so `Journal entry.md` and `journal-entry.md` are one template and
-/// the seed does not write a second.
+/// `existing` is the file names already inside [`TEMPLATES_DIR`]; presence is
+/// [`claimed_templates`].
 pub fn plan_templates(
     mode: default_spaces::SeedMode,
     existing: &[String],
@@ -840,14 +837,40 @@ pub fn plan_templates(
         // Unreadable ledger, automatic run: keeper stays out of the vault.
         (default_spaces::SeedMode::FirstRun, None) => return Vec::new(),
     };
+    let present = claimed_templates(existing);
+    DEFAULT_TEMPLATES
+        .iter()
+        .filter(|template| !ledger.is_some_and(|keys| keys.contains(template.key)))
+        .filter(|template| !present.contains(template.key))
+        .collect()
+}
+
+/// The shipped-template keys this vault has taken, whoever wrote the file
+/// (Story 47.4, DW-191).
+///
+/// A template is present when a file is already called what it would be called,
+/// folded through [`naming::slug`] — the same fold that decides two notes cannot
+/// share a filename, so `Journal entry.md` and `journal-entry.md` are one
+/// template and the seed does not write a second.
+///
+/// **Not [`crate::notes::default_spaces::claimed`], and this is the one sentence
+/// that stops the next reader merging them.** A space is claimed by its
+/// `keeper.default` marker OR its name, because a space note carries an identity
+/// that survives a rename. A template carries no marker at all — AD-82 makes a
+/// template an ordinary note with an ordinary tag, so there is nothing on it
+/// that says "this is keeper's Journal entry" — and its only identity is its
+/// filename. One rule reads two fields, the other reads one; the file FORMAT is
+/// shared (`default_spaces::parse_ledger`) because parsing genuinely is one rule,
+/// and the presence rule is not.
+pub fn claimed_templates(existing: &[String]) -> BTreeSet<String> {
     let taken: BTreeSet<String> = existing
         .iter()
         .map(|file| naming::slug(file.strip_suffix(".md").unwrap_or(file)))
         .collect();
     DEFAULT_TEMPLATES
         .iter()
-        .filter(|template| !ledger.is_some_and(|keys| keys.contains(template.key)))
-        .filter(|template| !taken.contains(&naming::slug(template.name)))
+        .filter(|template| taken.contains(&naming::slug(template.name)))
+        .map(|template| template.key.to_owned())
         .collect()
 }
 
@@ -864,6 +887,20 @@ pub fn plan_templates(
 /// A read that fails is never an empty answer — an unlistable `templates/` is a
 /// directory keeper cannot see, and writing three notes on that basis is how a
 /// vault gets two of each.
+///
+/// **The ledger records the names keeper CLAIMED, not the notes it wrote**
+/// (Story 47.4, DW-191). This is the same defect the space seeder had, one file
+/// over, and the same fix: a shipped template keeper stood down for — because
+/// the vault already held a `journal-entry.md` the user wrote — is recorded
+/// exactly like one it created. Recording only what it wrote left the user's own
+/// file unprotected by the mechanism that protects keeper's: delete your own
+/// journal entry and the next run saw a name absent from `templates/` and absent
+/// from the ledger and wrote keeper's scaffold in its place. You delete your file
+/// and a different one comes back — which is the exact surprise 44.7 refused for
+/// templates in prose while this went on doing it.
+///
+/// The cost is the same and so is the escape hatch: a name freed deliberately is
+/// not re-offered, and "Restore default templates" ignores the ledger.
 pub fn seed_templates(
     vault: &mut dyn default_spaces::SeedVault,
     mode: default_spaces::SeedMode,
@@ -892,13 +929,35 @@ default templates are already there: {error}"
         }
     };
 
+    // Whether the ledger was READABLE, kept before `offered` is consumed. An
+    // automatic run with an unreadable one has already returned `Blocked`; a
+    // Restore may not invent a ledger over a file it could not parse, which may
+    // be a newer build's and whose defaults this one would then re-offer.
+    let readable = offered.is_some();
     let plan = plan_templates(mode, &existing, offered.as_ref());
+
+    let mut written = Vec::new();
+    // What the ledger already held, plus every shipped template that is present
+    // — whether keeper wrote it or the user did.
+    let mut seeded: BTreeSet<String> = offered.unwrap_or_default();
+    let known = seeded.len();
+    seeded.extend(claimed_templates(&existing));
+    // `extend` only adds, so a changed length is a new claim.
+    let newly_claimed = seeded.len() != known;
+
     if plan.is_empty() {
+        // The upgrade write, and the only run that touches the ledger without
+        // writing a note: a vault whose ledger predates DW-191 holds the keys
+        // keeper WROTE, and the names it stood down for are missing from it.
+        // Gated on an actual change so a settled vault does not rewrite this
+        // file on every refresh — it is synced content, and a rewrite per launch
+        // is a commit per launch.
+        if newly_claimed && readable {
+            record_template_ledger(vault, &seeded);
+        }
         return default_spaces::SeedOutcome::AlreadySatisfied;
     }
 
-    let mut written = Vec::new();
-    let mut seeded: BTreeSet<String> = offered.unwrap_or_default();
     for template in plan {
         let id = vault.new_id();
         let now = vault.now_local();
@@ -1573,6 +1632,12 @@ mod tests {
         unlistable: BTreeSet<String>,
         /// Paths whose write fails, so a half-finished seed can be driven.
         unwritable: BTreeSet<String>,
+        /// Every `write` the run attempted, in order, whether or not it landed.
+        ///
+        /// The ledger's bytes cannot answer "did this run touch the file": a
+        /// rewrite with identical content is invisible in the map and very
+        /// visible to the sync engine, which stages an mtime.
+        attempted: Vec<String>,
         next_id: usize,
     }
 
@@ -1611,6 +1676,7 @@ mod tests {
         }
 
         fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()> {
+            self.attempted.push(rel.to_owned());
             if self.unwritable.contains(rel) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -2316,5 +2382,201 @@ space that offered it (Inbox is `is:untagged`) may be the one space the note can
         assert_eq!(fm.as_string("title"), None);
         assert!(note.text.contains("# 2026-08-09"), "{}", note.text);
         assert!(note.text.contains("Slept:"), "{}", note.text);
+    }
+
+    // -----------------------------------------------------------------------
+    // The names keeper claims (Story 47.4, DW-191, one file over)
+    // -----------------------------------------------------------------------
+
+    /// The presence rule on its own. Read by [`plan_templates`] to decide what
+    /// to skip and by [`seed_templates`] to decide what to record, so "stood
+    /// down for" and "claimed" cannot become two answers.
+    #[test]
+    fn a_shipped_template_is_claimed_by_its_filename_and_by_nothing_else() {
+        assert!(claimed_templates(&[]).is_empty());
+
+        // Folded through `naming::slug`, so the three spellings of one name are
+        // one claim: the same fold that already decided the seed does not write
+        // a second `Journal entry.md` beside a `journal-entry.md`.
+        for spelling in ["Journal entry.md", "journal-entry.md", "JOURNAL ENTRY.md"] {
+            assert_eq!(
+                claimed_templates(&[spelling.to_owned()]),
+                ["journal"].iter().map(|k| (*k).to_owned()).collect(),
+                "{spelling:?} is the journal template's name"
+            );
+        }
+
+        // A file that is nobody's shipped template claims nothing.
+        assert!(claimed_templates(&["Meeting notes.md".to_owned()]).is_empty());
+
+        // The set, not the first hit.
+        assert_eq!(
+            claimed_templates(&[
+                "journal-entry.md".to_owned(),
+                "Inbox note.md".to_owned(),
+                "whatever.md".to_owned(),
+            ]),
+            ["inbox", "journal"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect()
+        );
+    }
+
+    /// **DW-191, in `templates.rs`.** The user wrote their own journal-entry
+    /// scaffold before keeper shipped one. keeper stands down for the name — and
+    /// now records it. They delete their file. Nothing arrives in its place.
+    ///
+    /// This is the surprise 44.7 refused for templates in prose while
+    /// `plan_templates` went on producing it: you delete your own file and
+    /// keeper's version comes back wearing its name.
+    #[test]
+    fn a_template_stood_down_for_a_name_the_user_took_is_claimed_and_their_file_stays_gone() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            default_spaces::SeedOutcome::Wrote(vec![
+                "templates/inbox-note.md".to_owned(),
+                "templates/recording-notes.md".to_owned(),
+            ]),
+            "keeper still stands down rather than writing over their scaffold"
+        );
+        assert_eq!(
+            vault.files["templates/journal-entry.md"], "# my own scaffold\n",
+            "and it did not touch the file it stood down for"
+        );
+        let ledger = default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL])
+            .expect("the ledger parses");
+        assert!(
+            ledger.contains("journal"),
+            "the name keeper stood down for is claimed: {ledger:?}"
+        );
+
+        // They throw their own scaffold away.
+        vault.files.remove("templates/journal-entry.md");
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert!(
+            !vault.files.contains_key("templates/journal-entry.md"),
+            "the user deleted their scaffold and keeper's must not arrive instead"
+        );
+
+        // …until they ask. Restore ignores the ledger, so the claim is escapable.
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::Restore),
+            default_spaces::SeedOutcome::Wrote(vec!["templates/journal-entry.md".to_owned()])
+        );
+    }
+
+    /// **The upgrade path.** A vault seeded by a build before this change holds
+    /// a ledger of what keeper WROTE, with the names it stood down for missing.
+    /// The first run after the change reconciles: no template note is written —
+    /// nothing is missing — and the claim is recorded.
+    ///
+    /// Built by hand rather than by running the old code, because the old code
+    /// is gone.
+    #[test]
+    fn a_template_ledger_written_under_the_old_meaning_is_reconciled_by_the_next_run() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+        for shipped in DEFAULT_TEMPLATES.iter().filter(|t| t.key != "journal") {
+            vault.files.insert(
+                template_rel(shipped),
+                render_template_note(shipped, "01OLD", "2026-08-08T09:00:00+02:00"),
+            );
+        }
+        let old: BTreeSet<String> = ["inbox", "recording"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        vault
+            .files
+            .insert(TEMPLATE_LEDGER_REL.to_owned(), render_template_ledger(&old));
+
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied,
+            "nothing is missing, so no template note is written"
+        );
+        let ledger = default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL])
+            .expect("the ledger parses");
+        assert!(
+            ledger.contains("journal"),
+            "…and the name keeper stood down for is claimed now: {ledger:?}"
+        );
+
+        // Which is what makes the deletion stick.
+        vault.files.remove("templates/journal-entry.md");
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert!(!vault.files.contains_key("templates/journal-entry.md"));
+    }
+
+    /// The reconciliation writes ONCE. `.keeper-templates.json` is synced
+    /// content, and a rewrite on every launch is a commit per launch in
+    /// somebody's vault history.
+    #[test]
+    fn a_settled_template_vault_touches_nothing_on_the_runs_after_the_upgrade() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+        seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+
+        for run in 0..3 {
+            vault.attempted.clear();
+            assert_eq!(
+                seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+                default_spaces::SeedOutcome::AlreadySatisfied
+            );
+            assert!(
+                vault.attempted.is_empty(),
+                "run {run} after the claim rewrote {:?}",
+                vault.attempted
+            );
+        }
+    }
+
+    /// A Restore with nothing to restore must not invent a ledger over one
+    /// keeper could not read: it may be a newer build's, and replacing it
+    /// re-offers that build's templates. The only path where the claim write
+    /// could reach an unreadable ledger — an automatic run has already returned
+    /// `Blocked`.
+    #[test]
+    fn a_template_restore_with_nothing_to_restore_leaves_an_unreadable_ledger_alone() {
+        let mut vault = FakeVault::default();
+        for shipped in &DEFAULT_TEMPLATES {
+            vault.files.insert(
+                template_rel(shipped),
+                render_template_note(shipped, "01OLD", "2026-08-08T09:00:00+02:00"),
+            );
+        }
+        let theirs = "{\"version\":99,\"written-by\":\"a keeper from the future\"}\n";
+        vault
+            .files
+            .insert(TEMPLATE_LEDGER_REL.to_owned(), theirs.to_owned());
+
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::Restore),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(
+            vault.files[TEMPLATE_LEDGER_REL], theirs,
+            "keeper must not replace a ledger it could not read"
+        );
     }
 }

@@ -4,13 +4,16 @@
 //!
 //! The **draft** window is declared statically in `tauri.conf.json`, created
 //! hidden at startup and never destroyed. That is the whole of NFR-27: the
-//! hotkey path is `set_position` → `show` → `set_focus` — three synchronous
-//! calls plus one compositor frame — with no webview construction, no bundle
-//! load, no React mount and no IPC round trip before the panel is visible.
+//! hotkey path is `is_resizable` → `set_position` → `show` → `set_focus` — at
+//! most four synchronous calls plus one compositor frame, and no settings read
+//! — with no webview construction, no bundle load, no React mount and no IPC
+//! round trip before the panel is visible.
 //! Because the window never unmounts, its editor stays focused while hidden, so
 //! `show()` reveals an already-focused live DOM node rather than racing an
 //! effect, and a keystroke typed 50 ms after the hotkey has nowhere to go but
-//! the buffer. Story 45.15 changes none of that.
+//! the buffer. Stories 45.15 and 47.5 change none of that: 47.5's addition is
+//! the `is_resizable` read, a window attribute rather than a query, and it
+//! *removes* the `set_position` for an unlocked window.
 //!
 //! Every **other** capture window is created on demand, one per note, labelled
 //! by [`keeper_core::capture::capture_label`]. They are ordinary windows: they
@@ -49,27 +52,49 @@
 //! unlocked, the strip becomes a `data-tauri-drag-region` and the *compositor*
 //! moves the window, and the window becomes `set_resizable(true)` so its edges
 //! answer a drag. Both work everywhere including Wayland, and for the same
-//! reason — neither is a request to put a surface at a coordinate. What is
-//! still not promised is the restore: putting the window back *there* next time
-//! is a `set_position`, which is exactly the call UX-DR43 says may be refused.
-//! So the controls are worded for what they can deliver ("so it can be moved
-//! and resized", "where it is") and never "remembers", and a compositor that
-//! declines leaves a window the person can still put wherever they like, every
-//! time, rather than a promise that quietly fails.
+//! reason — neither is a request to put a surface at a coordinate.
 //!
-//! The **size**, unlike the position, does survive a restart, and that is not a
-//! contradiction: it is stored under the same key and restored with the same
-//! best-effort `set_size`, but a compositor that honours a size request is the
-//! ordinary case rather than the exception a position request is. When it
-//! declines, the person has a window at keeper's size and can resize it again —
-//! the same recovery, one gesture long.
+//! The **size** survives a restart: adopted once at boot by [`adopt_placement`]
+//! and never re-asserted on the hot path, so nothing undoes it.
+//!
+//! Since Story 47.5 the **position** survives one the same way (DW-198), and
+//! the two halves are both needed: [`adopt_position`] puts an unlocked window
+//! back at boot, and [`reveal`] stops re-centring it on every later hotkey
+//! press. Before that, keeper remembered how big you made the panel and threw
+//! away where you put it.
+//!
+//! **The restore is attempted and still not promised, and that gap is
+//! deliberate.** Applying a stored position is `set_position`, which is exactly
+//! the call UX-DR43 says a compositor may refuse, so the controls stay worded
+//! for what the platform can deliver ("so it can be moved and resized", "where
+//! it is") and never "remembers". A compositor that declines leaves a window
+//! the person can still put wherever they like, every time, rather than a
+//! promise that quietly fails. Which of the two behaviours a person gets is
+//! decided by the lock and nothing else — locked follows the pointer between
+//! monitors, unlocked stays put — because the lock is already the control that
+//! asks that question.
+//!
+//! # The window's own resize border sits over the chrome
+//!
+//! On its GTK backend tao hit-tests an undecorated window's resize edges
+//! *inside* the surface — `scale_factor() * 5` logical pixels along each edge,
+//! guarded by `is_resizable() && !is_maximized()` — and the webview never sees
+//! a click that lands there. The capture chrome's close button is flush into
+//! the top-right corner, where two of those strips overlap, so an unlocked GTK
+//! window turns part of that button into a resize handle (DW-199).
+//!
+//! [`edge_inset`] is the one place that number is worked out, and it is worked
+//! out here rather than in the webview because the webview reads the platform
+//! nowhere. The chrome renders an inset it is handed and still knows nothing
+//! about GTK.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 
 use keeper_core::capture::{
-    capture_label, is_capture_label, CaptureTargetVm, CaptureWindowVm, Placement,
-    CAPTURE_DEFAULT_SIZE, CAPTURE_MIN_SIZE, DRAFT_CAPTURE_KEY, DRAFT_CAPTURE_LABEL,
+    capture_label, chrome_edge_inset, is_capture_label, plan_show_position, CaptureTargetVm,
+    CaptureWindowVm, EdgeResize, Placement, ShowPosition, CAPTURE_DEFAULT_SIZE, CAPTURE_MIN_SIZE,
+    DRAFT_CAPTURE_KEY, DRAFT_CAPTURE_LABEL,
 };
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Runtime, WebviewUrl,
@@ -157,14 +182,17 @@ pub fn is_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
     window(app, DRAFT_CAPTURE_KEY).is_some_and(|window| window.is_visible().unwrap_or(false))
 }
 
-/// Position, show and focus the draft panel — the hotkey and tray path
+/// Show and focus the draft panel — the hotkey and tray path
 /// (`notes_capture_show`).
 ///
 /// Kept as a no-argument entry point because its two callers are an OS shortcut
 /// handler and a tray menu handler, neither of which has a placement to hand
-/// in. It shows the panel where keeper last knew to put it; a *remembered*
-/// placement arrives through [`open`], which the frontend calls with one read
-/// from the settings table.
+/// in. A *remembered* placement arrives through [`open`], which the frontend
+/// calls with one read from the settings table.
+///
+/// Since Story 47.5 it places the panel only when the panel is keeper's to
+/// place — see [`reveal`] for the whole of that decision and why it costs the
+/// hot path no settings read.
 pub fn show<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = window(app, DRAFT_CAPTURE_KEY) else {
         return;
@@ -356,6 +384,7 @@ pub fn list(app: &AppHandle, locked: &dyn Fn(&str) -> bool) -> Vec<CaptureWindow
                 key,
                 target,
                 visible: window.is_visible().unwrap_or(false),
+                chrome_inset: edge_inset(&window),
             })
         })
         .collect();
@@ -363,6 +392,39 @@ pub fn list(app: &AppHandle, locked: &dyn Fn(&str) -> bool) -> Vec<CaptureWindow
     // order would reshuffle itself every time anything changed.
     windows.sort_by(|a, b| a.key.cmp(&b.key));
     windows
+}
+
+/// How much room this window's own resize border needs on the chrome strip
+/// (Story 47.5, DW-199).
+///
+/// **This function is the platform test, and it is here so that no other one
+/// exists.** The webview reads the platform nowhere — `src/test/
+/// no-user-agent-gating.test.ts` enforces that — so the chrome cannot decide
+/// its own inset from a user agent, and it must not: the number is
+/// `scale_factor() * 5`, and a CSS constant of 5 would be exactly half the
+/// border on a 2× display and a phantom gap in the two states where tao does
+/// not hit-test at all. The webview gets a number and still knows nothing about
+/// GTK. [`chrome_edge_inset`] holds the arithmetic and its four states are
+/// asserted in `keeper-core`, on a machine this crate does not build on.
+///
+/// `inside_client_area` is a compile-time fact and never a runtime probe: tao
+/// hit-tests inside the surface only on its GTK backend.
+///
+/// Every read is best-effort in the direction that keeps the control clickable:
+/// a window that will not say whether it is resizable is treated as locked (no
+/// border to dodge, so no gap over nothing), and one that will not name a scale
+/// factor gets one border's worth rather than none.
+fn edge_inset<R: Runtime>(window: &WebviewWindow<R>) -> u32 {
+    chrome_edge_inset(EdgeResize {
+        inside_client_area: cfg!(all(unix, not(target_os = "macos"))),
+        resizable: window.is_resizable().unwrap_or(false),
+        maximized: window.is_maximized().unwrap_or(false),
+        // Rounded UP, and through `f64`, because under-insetting leaves part of
+        // the close button on a resize handle and over-insetting costs a pixel
+        // of padding. GTK's own scale factor is an integer, so on the platform
+        // this number is for the rounding never fires.
+        scale: window.scale_factor().unwrap_or(1.0).ceil().max(1.0) as u32,
+    })
 }
 
 /// Tell every window that the set of capture windows changed.
@@ -423,6 +485,17 @@ fn other_windows_visible(app: &AppHandle, key: &str) -> bool {
 /// resizability and size were already set — at boot by [`adopt_placement`], and
 /// on every toggle by the lock command — and re-asserting a default over them
 /// would silently relock and shrink a window the user unlocked and resized.
+///
+/// **And since Story 47.5 it may change nothing at all** (DW-198). A caller
+/// with nothing to say used to re-centre the panel unconditionally, so the size
+/// a person chose survived every hotkey press and the position they chose
+/// survived none: "it remembers how big I made it but not where I put it". The
+/// answer is the lock's, because the lock is already the setting that asks this
+/// question — locked follows the pointer, unlocked stays put — and it is read
+/// off `is_resizable()`, the very attribute [`apply_resizability`] writes at
+/// boot and on every toggle. One window-attribute read, no sqlite, so the hot
+/// path is still three synchronous calls (NFR-27). A window that will not say
+/// is placed, which is exactly what it did before this change.
 fn reveal<R: Runtime>(
     app: &AppHandle<R>,
     window: &WebviewWindow<R>,
@@ -431,7 +504,12 @@ fn reveal<R: Runtime>(
 ) {
     match placement {
         Some(placement) => apply_placement(window, placement),
-        None => position(window),
+        None => {
+            let unlocked = window.is_resizable().unwrap_or(false);
+            if plan_show_position(unlocked) == ShowPosition::Place {
+                position(window);
+            }
+        }
     }
     if let Err(error) = window.show() {
         tracing::warn!(%error, %key, "notes: could not show the capture panel");
@@ -466,6 +544,33 @@ pub fn adopt_placement<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Pla
     };
     apply_resizability(&window, placement);
     apply_size(&window, placement);
+}
+
+/// Put the prewarmed panel back where its stored placement says, once, at boot
+/// (Story 47.5, DW-198).
+///
+/// **Separate from [`adopt_placement`] because it has one caller and that is the
+/// point.** `adopt_placement` also runs on every lock toggle, and applying a
+/// stored position there would make *unlocking* teleport a window the person is
+/// looking at: the panel is wherever the last hotkey press put it, the row
+/// holds wherever they dragged it to before they locked it, and a click on a
+/// padlock is not a request to move a window.
+///
+/// Best-effort exactly as [`apply_placement`]'s position arm is: `set_position`
+/// is the one call UX-DR43 says a compositor may refuse, so a refusal is logged
+/// at debug and the person keeps a window they can still put where they like.
+/// [`Placement::adopted_position`] decides *whether* there is anything to ask
+/// for — this converts units and asks.
+pub fn adopt_position<R: Runtime>(app: &AppHandle<R>, key: &str, placement: Placement) {
+    let Some((x, y)) = placement.adopted_position() else {
+        return;
+    };
+    let Some(window) = window(app, key) else {
+        return;
+    };
+    if let Err(error) = window.set_position(PhysicalPosition::new(x, y)) {
+        tracing::debug!(%error, %key, "notes: the compositor placed the capture panel itself");
+    }
 }
 
 /// Put a window where its placement says — or where keeper would put it — at

@@ -228,50 +228,191 @@ fn a_path_with_a_space_is_one_pattern_that_git_resolves() {
 
     stage::ensure_attributes(root, &[spaced, versioned, "*.mp4".into()]).expect("write");
 
-    let out = std::process::Command::new("git")
-        .args([
-            "check-attr",
-            // NUL-separated, so a path with a blank in it is not re-quoted on
-            // the way out and this test is not parsing git's own quoting.
-            "-z",
-            "filter",
-            "--",
+    let (resolved, stderr) = resolved_filters(
+        root,
+        &[
             "2021 holiday/clip",
             "notes/v1.2 final draft",
             "a.mp4",
             "2021",
-        ])
-        .current_dir(root)
-        .output()
-        .expect("check-attr");
+        ],
+    );
     assert!(
-        out.stderr.is_empty(),
-        "git complained about the file keeper wrote:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.is_empty(),
+        "git complained about the file keeper wrote:\n{stderr}"
     );
+    let filter = |path: &str| resolved.get(path).map(String::as_str);
 
-    let text = std::str::from_utf8(&out.stdout).expect("check-attr -z output is utf-8");
-    let resolved: std::collections::BTreeMap<&str, &str> = text
-        .split('\0')
-        .collect::<Vec<_>>()
-        .chunks_exact(3)
-        .map(|triple| (triple[0], triple[2]))
-        .collect();
-
+    assert_eq!(filter("2021 holiday/clip"), Some("lfs"), "{resolved:?}");
     assert_eq!(
-        resolved.get("2021 holiday/clip"),
-        Some(&"lfs"),
-        "{resolved:?}"
-    );
-    assert_eq!(
-        resolved.get("notes/v1.2 final draft"),
-        Some(&"lfs"),
+        filter("notes/v1.2 final draft"),
+        Some("lfs"),
         "{resolved:?}"
     );
     // The quoting must not have cost the ordinary case anything.
-    assert_eq!(resolved.get("a.mp4"), Some(&"lfs"), "{resolved:?}");
+    assert_eq!(filter("a.mp4"), Some("lfs"), "{resolved:?}");
     // The prefix the unquoted line used to convert into a rule of its own.
-    assert_eq!(resolved.get("2021"), Some(&"unspecified"), "{resolved:?}");
+    assert_eq!(filter("2021"), Some("unspecified"), "{resolved:?}");
+}
+
+/// What the real `git` binary resolves `filter` to for each path, and what it
+/// grumbled about on the way.
+///
+/// `-z` so a path holding a blank is not re-quoted on the way out and this is
+/// not parsing git's own quoting. stderr is returned rather than ignored
+/// because it is the only witness that matters for a malformed
+/// `.gitattributes` line: git exits 0 and resolves the rule to nothing, so an
+/// exit-status assertion passes against the bug.
+fn resolved_filters(
+    root: &Path,
+    paths: &[&str],
+) -> (std::collections::BTreeMap<String, String>, String) {
+    let mut args = vec!["check-attr", "-z", "filter", "--"];
+    args.extend_from_slice(paths);
+    let out = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .expect("check-attr");
+    let text = std::str::from_utf8(&out.stdout).expect("check-attr -z output is utf-8");
+    let resolved = text
+        .split('\0')
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+        .map(|triple| (triple[0].to_owned(), triple[2].to_owned()))
+        .collect();
+    (resolved, String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// DW-194: a glob metacharacter in a real filename is a literal, and git is
+/// the witness.
+///
+/// Quoting cannot reach this layer — unquoting *produces* the pattern and
+/// wildmatch interprets it afterwards — so a merely-quoted
+/// `"/report [final]"` resolves the real file to `unspecified` and `reportf`
+/// to `lfs`, which is exactly backwards. The decoys below are the paths that
+/// unescaped character class actually matched.
+#[test]
+fn a_glob_metacharacter_in_a_real_name_is_a_literal_that_git_resolves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+
+    // `report [final].pdf` has an extension, so `pattern_for` covers it with
+    // `*.pdf` and the bracket never reaches a pattern from that name. The
+    // exact-path branch is where it does, and a bracket in a parent directory
+    // reaches it alongside a blank — both escapes on one line. All three are
+    // asserted, because the acceptance the owner sees is the file resolving.
+    let with_extension = stage::pattern_for(Path::new("report [final].pdf"));
+    let exact = stage::pattern_for(Path::new("report [final]"));
+    let in_a_parent = stage::pattern_for(Path::new("2021 [q4]/clip"));
+    assert_eq!(with_extension, "*.pdf");
+    assert_eq!(exact, "/report \\[final]");
+    assert_eq!(in_a_parent, "/2021 \\[q4]/clip");
+
+    stage::ensure_attributes(root, &[with_extension, exact, in_a_parent]).expect("write");
+
+    let (resolved, stderr) = resolved_filters(
+        root,
+        &[
+            "report [final].pdf",
+            "report [final]",
+            "2021 [q4]/clip",
+            "reportf",
+            "reporti",
+            "2021 q/clip",
+            "2021 4/clip",
+        ],
+    );
+    assert!(
+        stderr.is_empty(),
+        "git complained about the file keeper wrote:\n{stderr}"
+    );
+    let filter = |path: &str| resolved.get(path).map(String::as_str);
+
+    assert_eq!(filter("report [final].pdf"), Some("lfs"), "{resolved:?}");
+    assert_eq!(filter("report [final]"), Some("lfs"), "{resolved:?}");
+    assert_eq!(filter("2021 [q4]/clip"), Some("lfs"), "{resolved:?}");
+    // Everything the live character class used to swallow instead.
+    for decoy in ["reportf", "reporti", "2021 q/clip", "2021 4/clip"] {
+        assert_eq!(filter(decoy), Some("unspecified"), "{resolved:?}");
+    }
+}
+
+/// DW-193: the lines already on disk are repaired, and git goes quiet.
+///
+/// The owner's file, reproduced: fifty-nine copies of one rule the pre-46.1
+/// writer emitted unquoted, because the reader of the day tokenised its own
+/// output the same way the bug did and so never recognised it. git does not
+/// fail on them — it exits 0 — it prints `holiday/clip is not a valid
+/// attribute name` on stderr for every operation and resolves the rule to
+/// nothing. Both halves are asserted, before and after.
+#[test]
+fn the_broken_lines_already_on_disk_are_repaired_and_git_stops_complaining() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    init_repo(root);
+
+    // Let keeper write its own marker rather than duplicating the constant
+    // here; the fixture this test is about is the bytes BELOW it, which are
+    // spelled out literally because that is what is on the owner's disk.
+    stage::ensure_attributes(root, &["*.mp4".into()]).expect("marker");
+    let mut seed = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+    for _ in 0..59 {
+        seed.push_str("/2021 holiday/clip filter=lfs diff=lfs merge=lfs -text\n");
+    }
+    std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+    let (before, complaint) = resolved_filters(root, &["2021 holiday/clip", "2021"]);
+    assert!(
+        complaint.contains("is not a valid attribute name"),
+        "the fixture must actually reproduce the defect, got:\n{complaint}"
+    );
+    assert_eq!(
+        before.get("2021 holiday/clip").map(String::as_str),
+        Some("unspecified"),
+        "the rule those fifty-nine lines were meant to express does not work"
+    );
+    assert_eq!(
+        before.get("2021").map(String::as_str),
+        Some("unspecified"),
+        "an INVALID attribute name voids the whole line: unlike the `/a b` case \
+         in Story 46.1's matrix, where `b` is a legal name and really is set on \
+         `/a`, `holiday/clip` holds a slash, so git discards the rule entirely \
+         and even the prefix it silently became gets nothing"
+    );
+
+    let pattern = stage::pattern_for(Path::new("2021 holiday/clip"));
+    assert!(stage::ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+
+    let after = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+    assert_eq!(
+        after.matches("2021 holiday/clip").count(),
+        1,
+        "fifty-nine copies collapse to one:\n{after}"
+    );
+    assert!(
+        after.contains("*.mp4 filter=lfs"),
+        "the correct line above them survives:\n{after}"
+    );
+
+    let (resolved, stderr) = resolved_filters(root, &["2021 holiday/clip", "2021", "a.mp4"]);
+    assert!(
+        stderr.is_empty(),
+        "git must have nothing left to complain about:\n{stderr}"
+    );
+    let filter = |path: &str| resolved.get(path).map(String::as_str);
+    assert_eq!(filter("2021 holiday/clip"), Some("lfs"), "{resolved:?}");
+    assert_eq!(filter("2021"), Some("unspecified"), "{resolved:?}");
+    assert_eq!(filter("a.mp4"), Some("lfs"), "{resolved:?}");
+
+    // FR-137: the repaired line is coverage, so the next session writes
+    // nothing at all.
+    assert!(!stage::ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+        after
+    );
 }
 
 /// The same rule twice is one line, and the second run writes nothing.

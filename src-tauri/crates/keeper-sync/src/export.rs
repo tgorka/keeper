@@ -156,6 +156,11 @@ impl From<BrowseRefusal> for ExportRefusal {
             BrowseRefusal::Escapes { subpath }
             | BrowseRefusal::EscapesAfterResolution { subpath } => Self::Escapes { subpath },
             BrowseRefusal::Unreadable { reason } => Self::Unreadable { reason },
+            // An export names its files by the subpath the caller handed in, so
+            // a name that is only a rendering has nothing to export *to*.
+            // Same verdict as an escape, and the sentence `BrowseRefusal`
+            // already writes is the one the reader needs (Story 47.2).
+            BrowseRefusal::Unspellable { subpath } => Self::Escapes { subpath },
         }
     }
 }

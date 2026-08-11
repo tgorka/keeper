@@ -304,6 +304,12 @@ impl From<BrowseRefusal> for WriteRefusal {
             BrowseRefusal::Escapes { subpath }
             | BrowseRefusal::EscapesAfterResolution { subpath } => Self::Escapes { subpath },
             BrowseRefusal::Unreadable { reason } => Self::Unreadable { reason },
+            // Story 47.2: a segment carrying U+FFFD may be a *rendering* of a
+            // non-UTF-8 name rather than the name, and joining it can reach a
+            // different real file — so a delete confirmed against one row would
+            // remove another. `Escapes` rather than a new variant, because that
+            // is exactly what it is: not a path in this folder.
+            BrowseRefusal::Unspellable { subpath } => Self::Escapes { subpath },
         }
     }
 }
@@ -402,34 +408,11 @@ impl<'a> WriteScope<'a> {
 
     /// The vault-relative path of a directory keeper may create a file in.
     ///
-    /// The vault root is allowed here and refused by [`Self::file`]: a person
+    /// The vault root is allowed here and refused by [`Self::owner`]: a person
     /// may put a note at the top of their vault, and nobody may delete the
     /// vault.
     pub fn directory(&self, subpath: &str) -> Result<String, WriteRefusal> {
         self.vault_relative(subpath)
-    }
-
-    /// The vault-relative path of a file keeper may change or remove.
-    ///
-    /// `is_dir` comes from the dirent, never from the name, for the reason
-    /// `FilesEntryVm::new` gives: a directory called `notes.md` exists, and a
-    /// delete that classified by extension would offer to trash a folder.
-    pub fn file(&self, subpath: &str, is_dir: bool) -> Result<String, WriteRefusal> {
-        let relative = self.vault_relative(subpath)?;
-        if relative.is_empty() {
-            // The subpath IS the vault directory. Reported as the vault rather
-            // than as "a folder", because the next step differs: one is "use
-            // Finder", the other is "no, not this one".
-            return Err(WriteRefusal::VaultRoot {
-                subfolder: self.subfolder.clone().unwrap_or_default(),
-            });
-        }
-        if is_dir {
-            return Err(WriteRefusal::IsDirectory {
-                name: last_segment(subpath).to_owned(),
-            });
-        }
-        Ok(relative)
     }
 
     /// Where a new file called `name` in the directory `dir_subpath` would
@@ -471,8 +454,8 @@ impl<'a> WriteScope<'a> {
     /// 1. **Containment and existence first, through [`resolve_existing`].** It
     ///    refuses `..`, an absolute path, a platform separator and a symlink
     ///    whose canonical form leaves the profile root — *before* the vault
-    ///    question is asked, which is the part that matters: [`Self::file`]'s
-    ///    `vault_relative` tests for a vault before it tests the path, so in a
+    ///    question is asked, which is the part that matters: `vault_relative`
+    ///    tests for a vault before it tests the path, so in a
     ///    profile holding no vault it answers `NoVault` to `../etc`, and a
     ///    fall-through would then route a traversal to the plain writer.
     ///    Ordering, not a second check: a duplicate `plain_segments` call here
@@ -1090,13 +1073,18 @@ mod tests {
     }
 
     /// The whole of the "outside a vault cannot be written" rule: a profile
-    /// with no vault refuses everything, and says which folder it is refusing
-    /// about rather than "not allowed".
+    /// with no vault has nowhere keeper may *create* a note, and says which
+    /// profile it is refusing about rather than "not allowed".
+    ///
+    /// AD-102 is the other half and it is asserted here so the two cannot
+    /// drift: the same profile does not refuse an *existing* file any more, it
+    /// routes it to the second writer. `directory` is the create path and
+    /// still answers `NoVault`; `owner` answers `Unmanaged`.
     #[test]
     fn a_profile_with_no_vault_refuses_every_path_and_names_itself() {
         let none = WriteScope::new("Field", None);
         assert!(!none.holds_vault());
-        let refusal = none.file("clip.mov", false).expect_err("no vault");
+        let refusal = none.directory("clip.mov").expect_err("no vault");
         assert_eq!(
             refusal,
             WriteRefusal::NoVault {
@@ -1106,21 +1094,34 @@ mod tests {
         assert!(refusal.to_string().contains("Field holds no notes vault"));
         assert!(none.directory("").is_err());
         assert!(none.create("", "x.md").is_err());
+        assert_eq!(
+            none.owner("clip.mov", false),
+            Ok(WriteOwner::Unmanaged),
+            "AD-102: no vault is no longer a refusal for an existing file"
+        );
     }
 
     /// A sibling whose name merely *starts with* the vault's is not in the
-    /// vault. A `starts_with` over the raw string would have written into it.
+    /// vault. A `starts_with` over the raw string would have written into it —
+    /// and post-AD-102 it would have sent a neighbour's file down the *vault*
+    /// writer, so the component match is asserted through both surfaces that
+    /// depend on it.
     #[test]
     fn a_folder_whose_name_extends_the_vaults_is_not_inside_the_vault() {
         let scope = scope();
-        assert_eq!(scope.file("10-notes/a.md", false), Ok("a.md".to_owned()));
+        assert_eq!(scope.directory("10-notes/a.md"), Ok("a.md".to_owned()));
         let refusal = scope
-            .file("10-notes-archive/a.md", false)
+            .directory("10-notes-archive/a.md")
             .expect_err("neighbour");
         assert!(matches!(refusal, WriteRefusal::OutsideVault { .. }));
         assert!(
             refusal.to_string().contains("outside Vault's notes vault"),
             "{refusal}"
+        );
+        assert_eq!(scope.owner("10-notes/a.md", false), Ok(WriteOwner::Vault));
+        assert_eq!(
+            scope.owner("10-notes-archive/a.md", false),
+            Ok(WriteOwner::Unmanaged)
         );
     }
 
@@ -1149,9 +1150,9 @@ mod tests {
     fn a_nested_vault_subfolder_is_matched_one_component_at_a_time() {
         let deep = WriteScope::new("Vault", Some("a/b"));
         assert_eq!(deep.directory("a/b"), Ok(String::new()));
-        assert_eq!(deep.file("a/b/c/d.md", false), Ok("c/d.md".to_owned()));
+        assert_eq!(deep.directory("a/b/c/d.md"), Ok("c/d.md".to_owned()));
         assert!(matches!(
-            deep.file("a/c/d.md", false),
+            deep.directory("a/c/d.md"),
             Err(WriteRefusal::OutsideVault { .. })
         ));
         assert!(matches!(
@@ -1169,7 +1170,7 @@ mod tests {
         for spelling in ["10-notes", "10-notes/", "/10-notes", "\\10-notes"] {
             let scope = WriteScope::new("Vault", Some(spelling));
             assert_eq!(
-                scope.file("10-notes/a.md", false),
+                scope.directory("10-notes/a.md"),
                 Ok("a.md".to_owned()),
                 "{spelling}"
             );
@@ -1177,7 +1178,7 @@ mod tests {
         for spelling in ["a/b", "a//b", "a\\b", "/a/b/"] {
             let scope = WriteScope::new("Vault", Some(spelling));
             assert_eq!(
-                scope.file("a/b/c.md", false),
+                scope.directory("a/b/c.md"),
                 Ok("c.md".to_owned()),
                 "{spelling}"
             );
@@ -1185,7 +1186,7 @@ mod tests {
         // The sentence names the normalised form, so two profiles configured
         // with two spellings of one folder read the same to a person.
         let refusal = WriteScope::new("Vault", Some("10-notes/"))
-            .file("other/a.md", false)
+            .directory("other/a.md")
             .expect_err("outside");
         assert_eq!(
             refusal,
@@ -1213,7 +1214,7 @@ mod tests {
             "10-notes//a.md",
             "10-notes/a.md/",
         ] {
-            let refusal = scope.file(subpath, false).expect_err(subpath);
+            let refusal = scope.owner(subpath, false).expect_err(subpath);
             assert_eq!(
                 refusal,
                 WriteRefusal::Escapes {
@@ -1228,7 +1229,7 @@ mod tests {
     /// folder it is refusing to remove.
     #[test]
     fn the_vault_directory_itself_cannot_be_deleted() {
-        let refusal = scope().file("10-notes", true).expect_err("vault root");
+        let refusal = scope().owner("10-notes", true).expect_err("vault root");
         assert_eq!(
             refusal,
             WriteRefusal::VaultRoot {
@@ -1245,7 +1246,7 @@ mod tests {
     #[test]
     fn a_directory_is_refused_as_a_folder_whatever_it_is_named() {
         let refusal = scope()
-            .file("10-notes/notes.md", true)
+            .owner("10-notes/notes.md", true)
             .expect_err("directory");
         assert_eq!(
             refusal,
@@ -1256,8 +1257,8 @@ mod tests {
         assert!(refusal.to_string().contains("notes.md is a folder"));
         // The same path with the dirent saying file is perfectly writable.
         assert_eq!(
-            scope().file("10-notes/notes.md", false),
-            Ok("notes.md".to_owned())
+            scope().owner("10-notes/notes.md", false),
+            Ok(WriteOwner::Vault)
         );
     }
 

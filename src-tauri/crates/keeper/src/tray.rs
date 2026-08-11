@@ -42,7 +42,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use keeper_core::palette::{
-    tray_recording_verbs, TrayMenu, RECORDING_OPEN_FOLDER_ID, RECORDING_START_ID, RECORDING_STOP_ID,
+    tray_notes_labels, tray_recording_verbs, TrayMenu, TrayNotesLabels, TrayNotesState,
+    RECORDING_OPEN_FOLDER_ID, RECORDING_START_ID, RECORDING_STOP_ID,
 };
 use keeper_core::vm::{
     RecordingDurabilityState, RecordingDurabilityVm, RecordingStatusVm, RecordingUiState,
@@ -137,11 +138,16 @@ pub struct NotesTray {
     pub hotkey_registered: bool,
 }
 
-/// The retained notes menu items, held so their labels can be mutated.
+/// The retained notes menu items, held so their labels can be mutated, plus the
+/// registry's own word for each of the three verbs.
 ///
 /// `set_text` and `set_enabled` only — never `set_menu` (AD-61). Cloned handles
 /// are cheap and the mutation dispatches to the main thread internally, which is
 /// why the tray lock is never held across one.
+///
+/// `labels` is the projection, taken once when the menu is built and reused on
+/// every paint: the registry is static, and re-projecting per tick would ask the
+/// same question five times a second (Story 47.4, DW-195).
 #[derive(Clone)]
 struct NotesItems {
     new_note: MenuItem<Wry>,
@@ -149,6 +155,7 @@ struct NotesItems {
     journal: MenuItem<Wry>,
     recent: Vec<MenuItem<Wry>>,
     unread: MenuItem<Wry>,
+    labels: TrayNotesLabels,
 }
 
 /// The bundled record-dot menu-bar icon shown while a recording is live (Story
@@ -520,25 +527,32 @@ fn add_recording_verbs<'a>(
 
 /// Build the notes section's items, or `None` when the capability is off.
 ///
-/// Built once per menu and then only mutated (AD-61). Every label starts at its
-/// empty-state wording rather than blank, so a tray built before the first index
-/// publish reads correctly instead of showing five unexplained gaps.
+/// Built once per menu and then only mutated (AD-61). The three verbs start at
+/// the registry's bare word — what a settled vault reads — rather than at an
+/// empty state a tray built before the first index publish has no grounds to
+/// claim, and the recent slots start at their empty marker rather than blank, so
+/// the menu reads correctly instead of showing five unexplained gaps.
+///
+/// The words are [`tray_notes_labels`]', not this file's (Story 47.4, DW-195).
+/// A label spelled here is a label a registry retitle does not reach — which is
+/// what happened to the recording verbs until Story 46.16, and what UX-DR42
+/// forbids across the palette, the cheat sheet, the native menu and the tray.
 fn build_notes_items(app: &AppHandle, enabled: bool) -> Option<NotesItems> {
-    if !enabled {
-        // Omitted at build time on a build where notes is absent, which is
-        // correct — and, because the menu is built once, omitted forever.
-        return None;
-    }
+    // `None` on a build where notes is absent, which is correct — and, because
+    // the menu is built once, omitted forever. The capability gate is the
+    // registry's own, so the tray cannot disagree with the other three surfaces.
+    let labels = tray_notes_labels(enabled)?;
     let recent: Vec<MenuItem<Wry>> = NOTE_RECENT_IDS
         .iter()
         .map(|id| menu_item(app, id, NOTE_EMPTY_SLOT, false))
         .collect::<Option<Vec<_>>>()?;
     Some(NotesItems {
-        new_note: menu_item(app, NOTE_NEW_ID, "New Note", true)?,
-        capture: menu_item(app, NOTE_CAPTURE_ID, "Quick Capture", true)?,
-        journal: menu_item(app, NOTE_JOURNAL_ID, "Today\u{2019}s Journal", true)?,
+        new_note: menu_item(app, NOTE_NEW_ID, &labels.new_note, true)?,
+        capture: menu_item(app, NOTE_CAPTURE_ID, &labels.capture, true)?,
+        journal: menu_item(app, NOTE_JOURNAL_ID, &labels.journal, true)?,
         recent,
         unread: menu_item(app, NOTE_UNREAD_ID, NOTE_NO_UNREAD, false)?,
+        labels,
     })
 }
 
@@ -2070,9 +2084,17 @@ fn paint_notes(items: &NotesItems, model: &NotesTray) {
     // With no vault the two create verbs stay ENABLED: choosing them opens
     // Settings → Sync, because the action is achievable and a disabled row that
     // explains nothing is worse than a row that takes you where you need to go.
-    set_label(&items.new_note, &new_note_label(model));
-    set_label(&items.capture, &capture_label(model));
-    set_label(&items.journal, &journal_label(model));
+    // The wording is therefore the only thing carrying the state, and it is
+    // composed in `keeper-core` where it can be tested (Story 47.4, DW-195) —
+    // this file cannot be compiled on two of the three hosts keeper is written
+    // on, so a sentence assembled here is a sentence nobody can check.
+    let labels = items.labels.painted(TrayNotesState {
+        vault: model.vault_id.is_some(),
+        hotkey_registered: model.hotkey_registered,
+    });
+    set_label(&items.new_note, &labels.new_note);
+    set_label(&items.capture, &labels.capture);
+    set_label(&items.journal, &labels.journal);
 
     for (slot, item) in items.recent.iter().enumerate() {
         match model.recent.get(slot) {
@@ -2100,33 +2122,6 @@ fn set_label(item: &MenuItem<Wry>, label: &str) {
 fn set_enabled(item: &MenuItem<Wry>, enabled: bool) {
     if let Err(error) = item.set_enabled(enabled) {
         tracing::warn!(%error, "tray: could not update a notes menu item's state");
-    }
-}
-
-/// `New Note`, or the honest wording when there is nowhere to put one yet.
-fn new_note_label(model: &NotesTray) -> String {
-    if model.vault_id.is_some() {
-        "New Note".to_owned()
-    } else {
-        "New Note\u{2026} (no vault yet)".to_owned()
-    }
-}
-
-/// `Quick Capture`, carrying the registration failure in words when the global
-/// shortcut did not take (UX-DR43): the truth belongs where the user is.
-fn capture_label(model: &NotesTray) -> String {
-    if model.hotkey_registered {
-        "Quick Capture".to_owned()
-    } else {
-        "Quick Capture \u{2014} hotkey unavailable".to_owned()
-    }
-}
-
-fn journal_label(model: &NotesTray) -> String {
-    if model.vault_id.is_some() {
-        "Today\u{2019}s Journal".to_owned()
-    } else {
-        "Today\u{2019}s Journal\u{2026} (no vault yet)".to_owned()
     }
 }
 

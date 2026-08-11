@@ -110,6 +110,16 @@ pub struct CaptureWindowVm {
     pub locked: bool,
     /// Whether it is on screen. A hidden draft window is still a window.
     pub visible: bool,
+    /// The gap, in **logical CSS pixels**, the window's own resize border needs
+    /// on the chrome strip's top and right edges right now (Story 47.5,
+    /// DW-199) — `0` on every platform and in every state but one.
+    ///
+    /// Decided in Rust and carried, because the frontend cannot decide it: this
+    /// app reads the platform nowhere (`src/test/no-user-agent-gating.test.ts`
+    /// enforces that), and the number is a function of the backend, the lock,
+    /// the maximized state and the monitor's scale factor. See
+    /// [`chrome_edge_inset`].
+    pub chrome_inset: u32,
 }
 
 /// The storage and lookup key for a capture target.
@@ -444,6 +454,139 @@ impl Placement {
         };
         Some(clamp_size(wanted, work_area))
     }
+
+    /// The position to give this window at boot, in physical pixels, or `None`
+    /// for "keeper places it" (Story 47.5, DW-198).
+    ///
+    /// **The exact mirror of [`Self::window_size`], and that symmetry is the
+    /// whole fix.** Before this, the size was adopted once at boot and survived
+    /// every hotkey press while the position was re-centred on each one, so a
+    /// person who unlocked the draft panel and dragged it somewhere found that
+    /// keeper remembered how big they made it and not where they put it.
+    ///
+    /// - **Locked → `None`.** A locked panel is keeper's to place, and
+    ///   following the pointer between monitors is the whole of what that
+    ///   means. Adopting a stored position here would make a locked window stop
+    ///   following the pointer, which is the cost DW-198 names and the reason
+    ///   the answer is the lock's rather than a new setting's.
+    /// - **Unlocked with a remembered position → that position.**
+    /// - **Unlocked with nothing remembered → `None`**: never moved, so keeper
+    ///   places it exactly as it always did.
+    ///
+    /// **This is a request and not a promise, and the UI is worded for the
+    /// promise.** Applying it is a `set_position`, the one call UX-DR43 says a
+    /// Wayland compositor may refuse, so the lock's label still says "so it can
+    /// be moved and resized" and never "remembers". A compositor that declines
+    /// leaves a window the person can still put wherever they like — the same
+    /// recovery as before, one gesture long — rather than a promise that
+    /// quietly fails.
+    #[must_use]
+    pub fn adopted_position(&self) -> Option<(i32, i32)> {
+        match (self.locked, self.position) {
+            (false, position) => position,
+            (true, _) => None,
+        }
+    }
+}
+
+/// What a `show` that has read no settings must do about a window's position
+/// (Story 47.5, DW-198).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowPosition {
+    /// Place the panel on the monitor under the pointer, as keeper always has.
+    Place,
+    /// Touch the position not at all — leave the window where the person put
+    /// it.
+    Leave,
+}
+
+/// Whether the hotkey and tray path re-places the draft panel, given only
+/// whether that window is unlocked right now (Story 47.5, DW-198).
+///
+/// **Takes the live window attribute, not a stored placement, and that is what
+/// keeps NFR-27 intact.** `show` is the hotkey path: `set_position` → `show` →
+/// `set_focus`, three synchronous calls with no settings read in front of them.
+/// `unlocked` is the shell's `is_resizable()` — the same attribute
+/// `apply_resizability` writes at boot and on every lock toggle, read back off
+/// the window rather than out of sqlite. One source of truth, no query, no
+/// second copy of the lock to drift.
+///
+/// [`Placement::adopted_position`] is the other half: it puts an unlocked
+/// window back at boot, and this stops every later hotkey press from undoing
+/// it. Without both, either half alone changes nothing a person would notice.
+#[must_use]
+pub fn plan_show_position(unlocked: bool) -> ShowPosition {
+    if unlocked {
+        ShowPosition::Leave
+    } else {
+        ShowPosition::Place
+    }
+}
+
+/// The resize border tao hit-tests INSIDE an undecorated window's client area,
+/// in logical pixels **per unit of scale factor**.
+///
+/// Read off tao 0.35.3, not guessed: `platform_impl/linux/event_loop.rs` does
+/// `let border = window.scale_factor() * 5;` in both the motion handler (line
+/// 501) and the button-press handler (line 531), and feeds it to
+/// `crate::window::hit_test` as both `border_x` and `border_y`. The comparison
+/// is against GDK window coordinates, which on GTK3 are already logical, so the
+/// strip is 5 logical pixels on a 1× display and **10 on a 2× one**. A CSS
+/// constant of 5 would be exactly half of what a HiDPI GTK window needs, which
+/// is the failure mode of fixing this with a number typed into a stylesheet.
+pub const TAO_EDGE_BORDER: u32 = 5;
+
+/// The three facts tao's edge hit test actually reads, plus the one platform
+/// fact that decides whether it runs at all (Story 47.5, DW-199).
+///
+/// A struct rather than four positional arguments because every field is a
+/// condition in tao's own guard and swapping two booleans at a call site would
+/// produce a plausible-looking wrong number rather than a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeResize {
+    /// Whether this backend hit-tests the resize edge inside the client area,
+    /// so the webview never sees a click that lands in it.
+    ///
+    /// True on GTK/tao. On macOS and Windows the resize border lives outside
+    /// the client area, so the chrome needs no inset there and must not get
+    /// one — moving a control on three platforms to fix one is the other way
+    /// to get this wrong.
+    pub inside_client_area: bool,
+    /// Whether the window is resizable right now. tao's guard is
+    /// `… && window.is_resizable() && …`, so a LOCKED capture window has no
+    /// resize border at all and its close button is already reachable to its
+    /// own edge.
+    pub resizable: bool,
+    /// Whether the window is maximized. tao's guard is `&& !is_maximized()`:
+    /// edge dragging is off while maximized, so the border is not there either.
+    pub maximized: bool,
+    /// The window's scale factor as tao multiplies by it. `0` and `1` both mean
+    /// an unscaled display; a platform that will not answer costs the chrome
+    /// one border's worth of inset, never a hidden control.
+    pub scale: u32,
+}
+
+/// How much of the chrome strip's top and right edges the window's own resize
+/// border is sitting on, in logical CSS pixels (Story 47.5, DW-199).
+///
+/// **The geometry, not the symptom.** The capture chrome's close button is
+/// flush against the top-right corner, which is where two of tao's edge strips
+/// overlap, so on GTK an unlocked window turns the top and right few pixels of
+/// the close button into a resize handle — aim at close, get a drag, and tao's
+/// own FIXME means the cursor does not even change to warn you. The fix is to
+/// keep the controls out of the strip, and the strip's width is
+/// [`TAO_EDGE_BORDER`] × scale.
+///
+/// **Zero in every state where tao does not hit-test**, which is most of them:
+/// a locked window (not resizable), a maximized one, and every non-GTK
+/// backend. That is what keeps this from being a padding that moves a control
+/// on three platforms to solve a problem on one.
+#[must_use]
+pub fn chrome_edge_inset(edge: EdgeResize) -> u32 {
+    if !edge.inside_client_area || !edge.resizable || edge.maximized {
+        return 0;
+    }
+    TAO_EDGE_BORDER * edge.scale.max(1)
 }
 
 /// Fit a wanted size inside what the screen can actually show.
@@ -896,6 +1039,137 @@ mod tests {
         );
     }
 
+    /// DW-198: the position must answer the same shape of question the size
+    /// does, because the whole complaint was that the two disagreed — "it
+    /// remembers how big I made it but not where I put it".
+    #[test]
+    fn an_unlocked_window_is_put_back_and_a_locked_one_still_follows_the_pointer() {
+        // Locked with nothing remembered: keeper places it, as it always has.
+        assert_eq!(Placement::default().adopted_position(), None);
+
+        // Locked but carrying a position — unlock, drag, lock again. The
+        // position is KEPT (locking is not a discard button) and deliberately
+        // NOT adopted: a locked panel follows the pointer between monitors, and
+        // that is the cost DW-198 weighs and the lock's own promise.
+        assert_eq!(
+            Placement {
+                locked: true,
+                position: Some((120, -40)),
+                size: None,
+            }
+            .adopted_position(),
+            None
+        );
+
+        // Unlocked and never moved: keeper places it. "Never moved" is not
+        // "moved to the default", exactly as it is not for the size.
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: None,
+                size: Some((900, 600)),
+            }
+            .adopted_position(),
+            None
+        );
+
+        // Unlocked and moved: back where the person put it, negative
+        // coordinates included — a second monitor to the left of the primary
+        // one is an ordinary desk.
+        assert_eq!(
+            Placement {
+                locked: false,
+                position: Some((-1_400, 220)),
+                size: None,
+            }
+            .adopted_position(),
+            Some((-1_400, 220))
+        );
+    }
+
+    /// DW-198's other half. Adopting the position at boot buys nothing if the
+    /// next hotkey press re-centres the window, so `show` has to stop placing
+    /// an unlocked one — and it decides that from the live window attribute,
+    /// with no settings read in front of the hot path (NFR-27).
+    #[test]
+    fn the_hotkey_leaves_an_unlocked_window_alone_and_still_places_a_locked_one() {
+        assert_eq!(plan_show_position(true), ShowPosition::Leave);
+        assert_eq!(plan_show_position(false), ShowPosition::Place);
+    }
+
+    /// DW-199: the inset is a number the platform decides, and it is `0` in
+    /// every state where tao does not hit-test an edge. All four states, because
+    /// a test that only checked unlocked-GTK would ship a permanent gutter on
+    /// macOS — a control moved on three platforms to fix a problem on one.
+    #[test]
+    fn the_chrome_is_inset_only_where_the_resize_border_actually_is() {
+        let gtk = EdgeResize {
+            inside_client_area: true,
+            resizable: true,
+            maximized: false,
+            scale: 1,
+        };
+
+        // Unlocked GTK window: tao hit-tests a 5 px strip and the close button
+        // is flush into the corner where two of them overlap.
+        assert_eq!(chrome_edge_inset(gtk), TAO_EDGE_BORDER);
+
+        // …and 10 on a 2× display, which is the whole reason this is not a CSS
+        // constant. `scale_factor() * 5`, straight out of tao.
+        assert_eq!(
+            chrome_edge_inset(EdgeResize { scale: 2, ..gtk }),
+            2 * TAO_EDGE_BORDER
+        );
+
+        // Locked: tao's guard is `&& is_resizable()`, so there is no border and
+        // an inset would be a gap over nothing.
+        assert_eq!(
+            chrome_edge_inset(EdgeResize {
+                resizable: false,
+                ..gtk
+            }),
+            0
+        );
+
+        // Maximized: tao's guard is `&& !is_maximized()`. Same reasoning, and
+        // it is the state a person is most likely to be in when they reach for
+        // close.
+        assert_eq!(
+            chrome_edge_inset(EdgeResize {
+                maximized: true,
+                ..gtk
+            }),
+            0
+        );
+
+        // macOS and Windows: the resize border is OUTSIDE the client area, so
+        // the webview owns every pixel of its own corner.
+        assert_eq!(
+            chrome_edge_inset(EdgeResize {
+                inside_client_area: false,
+                ..gtk
+            }),
+            0
+        );
+        assert_eq!(
+            chrome_edge_inset(EdgeResize {
+                inside_client_area: false,
+                resizable: true,
+                maximized: false,
+                scale: 2,
+            }),
+            0,
+            "a retina Mac is the case a scale-only rule would get wrong"
+        );
+
+        // A platform that will not name a scale factor costs one border, never
+        // a hidden control: `0` and `1` mean the same unscaled display.
+        assert_eq!(
+            chrome_edge_inset(EdgeResize { scale: 0, ..gtk }),
+            TAO_EDGE_BORDER
+        );
+    }
+
     /// A window restored wider than the screen has its close button past the
     /// far edge, and a capture window is in no dock and no task switcher — so
     /// there is nothing left to click. The clamp is the whole of the answer.
@@ -1041,10 +1315,16 @@ mod tests {
             },
             locked: false,
             visible: true,
+            chrome_inset: chrome_edge_inset(EdgeResize {
+                inside_client_area: true,
+                resizable: true,
+                maximized: false,
+                scale: 2,
+            }),
         };
         assert_eq!(
             serde_json::to_string(&vm).expect("serialize window"),
-            r#"{"key":"note:vault-a/note-1","target":{"kind":"note","vaultId":"vault-a","noteId":"note-1"},"locked":false,"visible":true}"#
+            r#"{"key":"note:vault-a/note-1","target":{"kind":"note","vaultId":"vault-a","noteId":"note-1"},"locked":false,"visible":true,"chromeInset":10}"#
         );
         assert_eq!(
             serde_json::to_string(&CaptureTargetVm::Draft).expect("serialize draft"),

@@ -169,12 +169,23 @@ impl LfsPolicy {
 /// one; see [`quote_pattern`]. Keeping it out of here is what lets the
 /// idempotence check compare like with like, and it keeps `ensure_lfs_rule`'s
 /// log line readable.
+///
+/// Glob escaping is the mirror case and belongs **here**, for the same reason:
+/// `\[` is not another spelling of `[`, it is a different pattern, and the
+/// pattern is what both the idempotence check and the log line are about. See
+/// [`escape_globs`].
 pub fn pattern_for(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if !ext.is_empty() => pattern_for_extension(ext),
-        // Escape nothing: a leading `/` anchors the pattern at the repository
-        // root, which is what an exact-path rule means in gitattributes.
-        _ => format!("/{}", path.to_string_lossy().replace('\\', "/")),
+        // A leading `/` anchors the pattern at the repository root, which is
+        // what an exact-path rule means in gitattributes. Separators are
+        // normalised BEFORE escaping — `replace` run afterwards would eat the
+        // backslashes `escape_globs` had just added and turn each of them into
+        // a path component.
+        _ => {
+            let rela = path.to_string_lossy().replace('\\', "/");
+            format!("/{}", escape_globs(&rela))
+        }
     }
 }
 
@@ -190,8 +201,74 @@ pub fn pattern_for(path: &Path) -> String {
 ///
 /// `ext` is bare (`mp4`), and a leading dot is tolerated because half the
 /// world's APIs return one.
+///
+/// The leading `*` is the wildcard this rule is made of and stays live; the
+/// extension behind it is a literal and is escaped, so an oversized
+/// `session.a[1]` is covered by its own extension rather than by `a1` and
+/// `ab`.
 pub fn pattern_for_extension(ext: &str) -> String {
-    format!("*.{}", ext.trim().trim_start_matches('.'))
+    format!("*.{}", escape_globs(ext.trim().trim_start_matches('.')))
+}
+
+/// `literal` spelled so wildmatch reads every one of its bytes as itself.
+///
+/// # Two layers, in this order
+///
+/// A `.gitattributes` line is read in two passes, and they are not the same
+/// pass. First, if the line begins with `"`, the field is C-unquoted — that is
+/// what *produces* the pattern. Only then is the pattern handed to wildmatch,
+/// which reads `*`, `?`, `[` and `\` as syntax. The two escapes therefore
+/// compose rather than cancel, and each has to be applied in the order git
+/// strips it off: glob-escape the literal first (that makes the pattern), then
+/// [`quote_pattern`] it (that makes the line). Reversed, the quoting would be
+/// escaped instead of the path — its own `"` delimiters and its `\001` octal
+/// escapes would each collect a backslash they must not have.
+///
+/// Both layers are visible in the line keeper writes for `report [final].pdf`:
+///
+/// ```text
+/// "/report \\[final].pdf" filter=lfs …    the LINE
+///  C-unquotes to      /report \[final].pdf    the PATTERN
+///  wildmatch reads    /report [final].pdf     the PATH, literally
+/// ```
+///
+/// Measured against git 2.53.0: that line resolves `report [final].pdf` to
+/// `lfs` and `reportf.pdf` to `unspecified`, while the merely-quoted
+/// `"/report [final].pdf"` gets both of those exactly backwards — quoting
+/// alone does not touch this layer.
+///
+/// # Which bytes, and which deliberately not
+///
+/// `*`, `?` and `[` are wildmatch's operators, and `\` is its escape, so a
+/// literal backslash needs one of its own. `]` does not: a `]` can only close
+/// a character class, every `[` here is escaped, so no class is ever open and
+/// a bare `]` stands for itself. Escaping it anyway would spell a correct
+/// pattern in a way keeper does not, and the repair in
+/// [`repair_managed_block`] would then have a second spelling to recognise.
+///
+/// A pattern carrying an escape always ends up quoted, because `\` is one of
+/// the bytes [`needs_quotes`] forces on. That is the property the repair
+/// relies on: no bare line keeper ever wrote can already contain an escape, so
+/// re-escaping one cannot double it.
+fn escape_globs(literal: &str) -> Cow<'_, str> {
+    if !literal.bytes().any(is_glob_meta) {
+        return Cow::Borrowed(literal);
+    }
+    let mut out = String::with_capacity(literal.len() + 4);
+    for ch in literal.chars() {
+        if ch.is_ascii() && is_glob_meta(ch as u8) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    Cow::Owned(out)
+}
+
+/// Is `b` wildmatch syntax rather than a byte of a filename?
+///
+/// See [`escape_globs`] for why `]` is absent.
+fn is_glob_meta(b: u8) -> bool {
+    matches!(b, b'*' | b'?' | b'[' | b'\\')
 }
 
 /// `pattern` spelled so a `.gitattributes` line reads back as `pattern`.
@@ -284,6 +361,48 @@ fn needs_quotes(pattern: &str) -> bool {
             .any(|b| b <= b' ' || b == 0x7f || b == b'"' || b == b'\\')
 }
 
+/// The pattern field of `line`, decoded, or `None` if the line has none this
+/// can read.
+///
+/// One decoder for the two questions asked of a line — "is this coverage for
+/// `pattern`?" ([`attribute_pattern_matches`]) and "which rule is this?"
+/// ([`repair_managed_block`]'s deduplication key) — because two would be free
+/// to disagree about a spelling, and a disagreement here would not read as a
+/// wrong answer. It would read as a rule that is present to one caller and
+/// absent to the other.
+///
+/// Bytes rather than `&str`: [`gix_quote::ansi_c::undo`] may legitimately
+/// produce a sequence that is not UTF-8 (`"\377"` is a spelling a user can
+/// write by hand), and a lossy conversion would make two different patterns
+/// compare equal.
+///
+/// Two shapes answer `None`: malformed quoting, and a quoted field that does
+/// not end where its closing quote does (`"a"b filter=lfs`). Neither is
+/// something keeper wrote.
+fn pattern_field(line: &str) -> Option<Cow<'_, [u8]>> {
+    if !line.starts_with('"') {
+        return line
+            .split_whitespace()
+            .next()
+            .map(|field| Cow::Borrowed(field.as_bytes()));
+    }
+    let Ok((unquoted, consumed)) = gix_quote::ansi_c::undo(gix::bstr::BStr::new(line.as_bytes()))
+    else {
+        return None;
+    };
+    if !line
+        .as_bytes()
+        .get(consumed)
+        .is_none_or(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    Some(match unquoted {
+        Cow::Borrowed(bytes) => Cow::Borrowed(bytes.as_ref()),
+        Cow::Owned(bytes) => Cow::Owned(bytes.into()),
+    })
+}
+
 /// Is the pattern field of `line` exactly `pattern`?
 ///
 /// This is the half of [`ensure_attributes`] that decides a rule is already
@@ -301,27 +420,211 @@ fn needs_quotes(pattern: &str) -> bool {
 /// a bare line written by an older keeper, by `git lfs track`, or by the user
 /// must keep counting as coverage.
 ///
-/// Two shapes answer "absent": malformed quoting, and a quoted field that does
-/// not end where its closing quote does (`"a"b filter=lfs`). Neither is
-/// something keeper wrote. Both cost one appended rule and never a missing one,
-/// which is the direction to fail in.
+/// A line [`pattern_field`] cannot read answers "absent", which costs one
+/// appended rule and never a missing one — the direction to fail in.
 fn attribute_pattern_matches(line: &str, pattern: &str) -> bool {
-    if !line.starts_with('"') {
-        return line.split_whitespace().next() == Some(pattern);
+    pattern_field(line).is_some_and(|field| field.as_ref() == pattern.as_bytes())
+}
+
+/// The `.gitattributes` line keeper writes for `pattern`.
+///
+/// One function so the writer and [`repair_managed_block`] cannot drift: a
+/// repaired line is not a line that was patched, it is `pattern` re-emitted
+/// through the call a fresh write would have used. That is what makes repair a
+/// fixpoint rather than a rewrite that has to be argued about.
+fn keeper_line(pattern: &str) -> String {
+    format!("{} {ATTRIBUTE_SUFFIX}", quote_pattern(pattern))
+}
+
+/// `line` without its ending, whichever ending it has.
+fn managed_body(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// The ending `line` carries, so a rewritten line keeps the file's own rather
+/// than converting a CRLF `.gitattributes` a line at a time.
+fn line_ending(line: &str) -> &'static str {
+    if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
     }
-    let Ok((unquoted, consumed)) = gix_quote::ansi_c::undo(gix::bstr::BStr::new(line.as_bytes()))
-    else {
-        return false;
-    };
-    if !line
-        .as_bytes()
-        .get(consumed)
-        .is_none_or(u8::is_ascii_whitespace)
-    {
-        return false;
+}
+
+/// The raw pattern field of a line carrying keeper's exact attributes.
+///
+/// This is [`keeper_line`]'s `format!` read backwards, and the direction
+/// matters: `strip_suffix` takes the **last** occurrence, so a path literally
+/// named `x filter=lfs diff=lfs merge=lfs -text` recovers the whole `raw` the
+/// writer held rather than a truncation of it. The single blank is required
+/// for the same reason — the writer emits exactly one, and a line with two is
+/// a `raw` ending in a space, which is a path keeper can be asked to track.
+fn keeper_rule_raw(body: &str) -> Option<&str> {
+    let raw = body.strip_suffix(ATTRIBUTE_SUFFIX)?.strip_suffix(' ')?;
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// The rule `body` states, if `body` carries keeper's exact attributes.
+///
+/// The deduplication key. Restricting it to [`ATTRIBUTE_SUFFIX`] is what makes
+/// dropping a repeat safe: two such lines assign the identical set to the
+/// identical pattern, so one of them is unreachable noise. A line assigning
+/// anything else is not a duplicate of anything.
+fn keeper_rule_pattern(body: &str) -> Option<Cow<'_, [u8]>> {
+    keeper_rule_raw(body).and_then(|_| pattern_field(body))
+}
+
+/// The spelling this version writes for a line keeper's older writer broke, or
+/// `None` to leave the line's bytes exactly as they are.
+///
+/// See [`repair_managed_block`] for the four conditions and why the last one
+/// is narrower than "a line this version would spell differently".
+fn repaired_rule(body: &str) -> Option<String> {
+    let raw = keeper_rule_raw(body)?;
+    // The two shapes `pattern_for` and `pattern_for_extension` can produce,
+    // split at the point where the pattern stops being syntax and starts being
+    // a literal: `*.`'s star is the wildcard the rule is made of, and must not
+    // be escaped along with the extension behind it.
+    let pattern = raw
+        .strip_prefix('/')
+        .map(|rest| format!("/{}", escape_globs(rest)))
+        .or_else(|| {
+            raw.strip_prefix("*.")
+                .map(|ext| format!("*.{}", escape_globs(ext)))
+        })?;
+    // Only a line git itself rejects is repaired. A bare field reads back as
+    // itself unless it holds a blank, so this is exactly the set of lines that
+    // say something other than what they were written to say.
+    if !raw.bytes().any(|b| b.is_ascii_whitespace() || b == 0x0b) {
+        return None;
     }
-    let unquoted: &[u8] = &unquoted;
-    unquoted == pattern.as_bytes()
+    let repaired = keeper_line(&pattern);
+    (repaired != body).then_some(repaired)
+}
+
+/// Repair the broken lines keeper itself wrote, and collapse their duplicates.
+///
+/// Returns the new text, or `None` when there is nothing to do — the common
+/// case, and the one that must stay free: a file with no managed block, or a
+/// managed block already spelled the way this version spells it, is not
+/// rewritten at all and so is byte-identical afterwards.
+///
+/// # What is repaired, and how a line is known to be keeper's
+///
+/// Before Story 46.1 the writer emitted `format!("{raw} {ATTRIBUTE_SUFFIX}")`
+/// with `raw` unquoted. When `raw` held a blank, the line git ended up reading
+/// was a different rule entirely: `/2021 holiday/clip filter=lfs …` sets an
+/// attribute *named* `holiday/clip` on the pattern `/2021`, and git prints
+/// `holiday/clip is not a valid attribute name` on every operation touching
+/// the repository. 46.1 stopped those being written; it did not remove the
+/// ones already on disk, of which one real repository holds fifty-nine. This
+/// is what removes them.
+///
+/// Four conditions, all required:
+///
+/// 1. **Below [`MANAGED_HEADER`].** Above it is the user's file. A line up
+///    there broken in precisely this way is left broken, because a tool that
+///    silently rewrites a hand-edited file is worse than the bug it fixes.
+/// 2. **It ends with [`ATTRIBUTE_SUFFIX`] after exactly one blank** — see
+///    [`keeper_rule_raw`], which is that `format!` read backwards.
+/// 3. **`raw` begins `/` or `*.`**, the only two shapes [`pattern_for`] and
+///    [`pattern_for_extension`] can produce. Anything else below the header is
+///    hand-added or comes from a version this one does not know, and is left
+///    alone rather than "repaired" into something this version prefers. An
+///    already-quoted line begins `"` and so is excluded by this condition too,
+///    which is what stops the repair quoting its own output.
+/// 4. **`raw` holds a blank**, i.e. the bare line provably does not say `raw`.
+///    This is the whole boundary, and it is deliberately narrower than "a line
+///    this version would spell differently". A line git parses exactly as
+///    written is evidence of nothing: `/media/** filter=lfs …` below the
+///    header may be a hand-added recursive glob or a file literally named
+///    `**`, and nothing in the file distinguishes them, so it stays. A line
+///    git *rejects* has one reading only — nobody writes an unparseable rule
+///    on purpose — and the `raw` behind it is recoverable by construction,
+///    which is what makes the repair reversible in meaning rather than a
+///    guess.
+///
+/// The repair is then not a patch applied to the line: it is `raw` re-emitted
+/// through [`keeper_line`]. That is what makes it a fixpoint — a second call
+/// re-derives identical bytes and reports no change — and it is why the repair
+/// picks up [`escape_globs`] for free, which it must. A repaired line that
+/// skipped the glob layer would not be the line the writer produces for the
+/// same path, so the next run would append a second copy and the duplicate
+/// this function exists to collapse would come straight back.
+///
+/// # Duplicates
+///
+/// Repair alone would leave the owner's fifty-nine lines all parsing and all
+/// saying the same thing: git goes quiet and the file is still absurd. So
+/// every rule a later line repeats is dropped.
+///
+/// **The LAST copy is kept**, and that direction is load-bearing rather than
+/// arbitrary. git applies every matching line in order with the later winning,
+/// so removing an *earlier* line that a later one repeats provably cannot
+/// change what any path resolves to — everything it set is set again below it.
+/// Removing the later one can: a hand-added `*.mp4 -filter` sitting between
+/// two copies of keeper's rule is today overridden by the second copy, and
+/// keeping the first instead would silently flip that path out of LFS.
+///
+/// The key is the **decoded pattern**, so a duplicate that is not
+/// byte-identical still collapses — `*.mp4 …` and `"*.mp4" …` are one rule
+/// written twice, and after repair so are `/a b …` and `"/a b" …`. Lines that
+/// do not carry keeper's exact [`ATTRIBUTE_SUFFIX`] are not candidates at all;
+/// see [`keeper_rule_pattern`].
+fn repair_managed_block(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let header = lines
+        .iter()
+        .position(|line| managed_body(line) == MANAGED_HEADER)?;
+    let managed = &lines[header + 1..];
+
+    let repaired: Vec<Option<String>> = managed
+        .iter()
+        .map(|line| repaired_rule(managed_body(line)))
+        .collect();
+
+    // Walked backwards, because the copy that survives is the last one. A
+    // linear scan rather than a set: a managed block is tens of lines, and the
+    // keys are bytes already in hand.
+    let mut keep = vec![true; managed.len()];
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for index in (0..managed.len()).rev() {
+        let body = repaired[index]
+            .as_deref()
+            .unwrap_or_else(|| managed_body(managed[index]));
+        let Some(pattern) = keeper_rule_pattern(body) else {
+            continue;
+        };
+        if seen.iter().any(|earlier| earlier == pattern.as_ref()) {
+            keep[index] = false;
+        } else {
+            seen.push(pattern.into_owned());
+        }
+    }
+
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in &lines[..=header] {
+        out.push_str(line);
+    }
+    for (index, line) in managed.iter().enumerate() {
+        if !keep[index] {
+            changed = true;
+            continue;
+        }
+        match &repaired[index] {
+            Some(body) => {
+                changed = true;
+                out.push_str(body);
+                out.push_str(line_ending(line));
+            }
+            None => out.push_str(line),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Ensure `.gitattributes` contains a rule for every pattern.
@@ -335,6 +638,13 @@ fn attribute_pattern_matches(line: &str, pattern: &str) -> bool {
 /// [`quote_pattern`] and read back through [`attribute_pattern_matches`], so a
 /// pattern holding a space is one line that git can parse and that this
 /// function recognises as its own on the next run.
+///
+/// Lines an older keeper wrote and broke are repaired, and their duplicates
+/// collapsed, before anything else is decided — see [`repair_managed_block`]
+/// for the boundary that keeps that off the user's own lines. Repair runs
+/// **first** because a broken line about to become coverage for one of
+/// `patterns` must not also be appended: doing it the other way round would
+/// leave the file holding both the repaired rule and a fresh copy of it.
 pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
     let file = root.join(".gitattributes");
     let existing = match std::fs::read_to_string(&file) {
@@ -342,24 +652,37 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(SyncError::io("read .gitattributes", file, err)),
     };
+    let repaired = repair_managed_block(&existing);
 
     let mut wanted: Vec<&String> = Vec::new();
     for pattern in patterns {
-        let already = existing.lines().any(|line| {
-            let line = line.trim();
-            !line.starts_with('#')
-                && attribute_pattern_matches(line, pattern)
-                && line.contains("filter=lfs")
-        });
+        let already = repaired
+            .as_deref()
+            .unwrap_or(&existing)
+            .lines()
+            .any(|line| {
+                let line = line.trim();
+                !line.starts_with('#')
+                    && attribute_pattern_matches(line, pattern)
+                    && line.contains("filter=lfs")
+            });
         if !already && !wanted.contains(&pattern) {
             wanted.push(pattern);
         }
     }
-    if wanted.is_empty() {
-        return Ok(false);
-    }
 
-    let mut out = existing;
+    let mut out = match repaired {
+        Some(text) => text,
+        None if wanted.is_empty() => return Ok(false),
+        None => existing,
+    };
+    if wanted.is_empty() {
+        // Repair only. Written back exactly as the repair produced it, so a
+        // file that never ended in a newline does not silently acquire one.
+        std::fs::write(&file, out)
+            .map_err(|err| SyncError::io("write .gitattributes", file, err))?;
+        return Ok(true);
+    }
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
@@ -371,9 +694,7 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
         out.push('\n');
     }
     for pattern in wanted {
-        out.push_str(&quote_pattern(pattern));
-        out.push(' ');
-        out.push_str(ATTRIBUTE_SUFFIX);
+        out.push_str(&keeper_line(pattern));
         out.push('\n');
     }
     std::fs::write(&file, out).map_err(|err| SyncError::io("write .gitattributes", file, err))?;
@@ -1103,6 +1424,393 @@ mod tests {
         assert!(ensure_attributes(root, &["*.bin".into()]).expect("add"));
         let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert!(text.contains("*.bin filter=lfs"));
+    }
+
+    /// DW-194: a glob metacharacter in a real filename is neutralised.
+    ///
+    /// Escaped rather than quoted away, because quoting cannot reach it: the
+    /// unquoting pass *produces* the pattern and wildmatch reads it
+    /// afterwards, so the two layers compose. `escape_globs` says which bytes
+    /// and why.
+    #[test]
+    fn glob_metacharacters_in_a_real_name_are_escaped_in_both_branches() {
+        // Exact-path branch: the whole name is a literal.
+        assert_eq!(
+            pattern_for(Path::new("report [final]")),
+            "/report \\[final]"
+        );
+        assert_eq!(pattern_for(Path::new("a/b*c")), "/a/b\\*c");
+        assert_eq!(pattern_for(Path::new("who?")), "/who\\?");
+        // Extension branch: the leading star is the rule, the extension behind
+        // it is a literal, and only the literal is escaped.
+        assert_eq!(pattern_for(Path::new("v1.a[b]")), "*.a\\[b]");
+        assert_eq!(pattern_for_extension("a?b"), "*.a\\?b");
+        // `]` stands for itself: every `[` is escaped, so no character class
+        // is ever open for it to close.
+        assert_eq!(pattern_for(Path::new("a]b")), "/a]b");
+        // And the no-churn rule quoting already follows: a name holding no
+        // wildmatch syntax comes back byte-identical.
+        for path in [
+            "media/clip.mp4",
+            "a/b/archive.tar.gz",
+            "bin/blob",
+            "my media/blob",
+            "archive/café.mp4",
+        ] {
+            let pattern = pattern_for(Path::new(path));
+            assert!(!pattern.contains('\\'), "{path} was escaped into {pattern}");
+        }
+    }
+
+    /// The two escapes are different layers, and they compose in one order.
+    ///
+    /// Glob-escaping makes the pattern; quoting makes the line. Applied the
+    /// other way round the quoting itself would be escaped. The reader has to
+    /// arrive back at the PATTERN — `\[` intact — not at the path, or the
+    /// idempotence check compares a pattern against a filename and never
+    /// matches.
+    #[test]
+    fn the_glob_escape_and_the_quoting_compose_in_that_order() {
+        let pattern = pattern_for(Path::new("2021 [q4]/clip"));
+        assert_eq!(pattern, "/2021 \\[q4]/clip");
+        // The escape forces quoting on its own — which is the property the
+        // repair leans on: no bare line keeper wrote can hold a backslash, so
+        // re-escaping one can never double it.
+        assert!(needs_quotes(&pattern));
+        let line = keeper_line(&pattern);
+        assert_eq!(line, format!("\"/2021 \\\\[q4]/clip\" {ATTRIBUTE_SUFFIX}"));
+        let field = pattern_field(&line).expect("readable");
+        assert_eq!(field.as_ref(), pattern.as_bytes());
+    }
+
+    /// gitoxide resolves the escaped pattern the same way git does.
+    ///
+    /// Not decoration. `is_false_modification` asks `routed_through_lfs`,
+    /// which resolves attributes through gitoxide's stack, and
+    /// `gix-attributes` hands the unquoted field straight to
+    /// `gix_glob::Pattern::from_bytes` with these exact flags. A `\[` gitoxide
+    /// did not understand would leave keeper writing a rule git honours and
+    /// keeper itself cannot see — the same divergence
+    /// `quoting_is_the_exact_inverse_of_the_decoder_git_and_gitoxide_use`
+    /// exists to pin one layer up.
+    #[test]
+    fn gitoxide_reads_the_escaped_pattern_as_the_literal_name() {
+        let pattern = pattern_for(Path::new("report [final]"));
+        let glob = gix::glob::Pattern::from_bytes(pattern.as_bytes()).expect("pattern");
+        let matches = |path: &str| {
+            glob.matches_repo_relative_path(
+                gix::bstr::BStr::new(path.as_bytes()),
+                path.rfind('/').map(|slash| slash + 1),
+                Some(false),
+                gix::glob::pattern::Case::Sensitive,
+                gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
+            )
+        };
+        assert!(matches("report [final]"), "the real file");
+        // What the unescaped character class matched instead.
+        assert!(!matches("reportf"));
+        assert!(!matches("reporti"));
+    }
+
+    /// DW-193, and the whole of it: the owner's file, repaired.
+    ///
+    /// Fifty-nine copies of one rule, because the old reader tokenised the old
+    /// writer's line the same way the bug did and so never recognised its own
+    /// output. After this they are one line, that line parses, and the rule it
+    /// was always trying to express is finally in force.
+    #[test]
+    fn the_broken_lines_the_old_writer_left_are_repaired_and_collapsed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let mut seed = format!("*.txt text\n\n{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n");
+        for _ in 0..59 {
+            seed.push_str(&format!("/2021 holiday/clip {ATTRIBUTE_SUFFIX}\n"));
+        }
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        let pattern = pattern_for(Path::new("2021 holiday/clip"));
+        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+
+        let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+        assert_eq!(
+            text,
+            format!(
+                "*.txt text\n\n{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n\
+                 \"/2021 holiday/clip\" {ATTRIBUTE_SUFFIX}\n"
+            ),
+            "fifty-nine broken copies become one correct line, and nothing else moves"
+        );
+        // The repaired line is coverage, so the pattern is not appended on top
+        // of it, and a second call is a no-op. Repair is a fixpoint because it
+        // re-emits through the writer rather than patching the line.
+        assert!(!ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            text
+        );
+    }
+
+    /// The boundary, in one file: the same brokenness on both sides of the
+    /// marker, and only the line below it moves.
+    ///
+    /// Above the marker is the user's file. A tool that silently rewrites a
+    /// hand-edited file is worse than the bug it fixes, and "it was broken
+    /// anyway" is exactly the reasoning that makes that tool.
+    #[test]
+    fn a_broken_line_above_the_managed_header_is_never_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "/my notes/draft {ATTRIBUTE_SUFFIX}\n{MANAGED_HEADER}\n/my media/clip {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!(
+                "/my notes/draft {ATTRIBUTE_SUFFIX}\n{MANAGED_HEADER}\n\
+                 \"/my media/clip\" {ATTRIBUTE_SUFFIX}\n"
+            )
+        );
+    }
+
+    /// A line below the marker that keeper would not have written stays put.
+    ///
+    /// Three shapes at once: a comment, a rule that parses exactly as written
+    /// and whose intent is therefore unknowable (`/media/**` may be a
+    /// hand-added recursive glob or a file literally named `**`), and a rule
+    /// assigning a different set of attributes. None of them is repaired into
+    /// something this version prefers; the one genuinely broken line beside
+    /// them is.
+    #[test]
+    fn a_line_below_the_header_that_keeper_did_not_write_is_left_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "{MANAGED_HEADER}\n# added by hand\n/media/** {ATTRIBUTE_SUFFIX}\n\
+             *.psd filter=lfs\n/my clip {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!(
+                "{MANAGED_HEADER}\n# added by hand\n/media/** {ATTRIBUTE_SUFFIX}\n\
+                 *.psd filter=lfs\n\"/my clip\" {ATTRIBUTE_SUFFIX}\n"
+            )
+        );
+    }
+
+    /// A file keeper has never written to is not touched, at all.
+    ///
+    /// No marker means no managed block, so even two lines broken in exactly
+    /// the way the repair exists to fix are the user's — and the file comes
+    /// back byte for byte, CRLF endings and missing final newline included,
+    /// because nothing is written.
+    #[test]
+    fn a_file_with_no_keeper_lines_is_byte_identical_afterwards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "# mine\r\n*.psd filter=lfs\r\n/my notes/draft {ATTRIBUTE_SUFFIX}\r\n*.txt text"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(!ensure_attributes(root, &["*.psd".into()]).expect("run"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            seed
+        );
+    }
+
+    /// Deduplication keeps the LAST copy, and the direction is load-bearing.
+    ///
+    /// git applies every matching line in order with the later winning, so
+    /// dropping an earlier duplicate provably cannot change what a path
+    /// resolves to. Dropping the later one can: the hand-added override
+    /// between these two copies is currently beaten by the second, and keeping
+    /// the first instead would silently flip `*.mp4` out of LFS.
+    #[test]
+    fn deduplication_keeps_the_last_copy_so_an_override_between_them_still_loses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n*.mp4 -filter\n*.mp4 {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[]).expect("dedup"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!("{MANAGED_HEADER}\n*.mp4 -filter\n*.mp4 {ATTRIBUTE_SUFFIX}\n"),
+            "the surviving copy must stay BELOW the override it was overriding"
+        );
+    }
+
+    /// A duplicate that is not byte-identical collapses too.
+    ///
+    /// The key is the decoded pattern, so a quoted and a bare spelling of one
+    /// rule are one rule — and after repair, so are the broken and the correct
+    /// spelling of a spaced one.
+    #[test]
+    fn a_duplicate_spelled_differently_still_collapses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "{MANAGED_HEADER}\n\"*.mp4\" {ATTRIBUTE_SUFFIX}\n*.mp4 {ATTRIBUTE_SUFFIX}\n\
+             /a b {ATTRIBUTE_SUFFIX}\n\"/a b\" {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[]).expect("dedup"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!("{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n\"/a b\" {ATTRIBUTE_SUFFIX}\n")
+        );
+    }
+
+    /// Two rules that are NOT the same rule must not collapse into one, even
+    /// when nothing but a non-UTF-8 byte tells them apart.
+    ///
+    /// The deduplication key is bytes, and this is why. `undo` decodes
+    /// `"\377"` and `"\376"` to two different single-byte patterns; a lossy
+    /// `String` conversion renders both as U+FFFD, they compare equal, and one
+    /// of the user's rules is **deleted**. Same shape as the browse defect
+    /// Story 47.2 found — two distinct names rendering to one string, and the
+    /// code acting on the render rather than on the bytes.
+    ///
+    /// keeper's own writer never emits an octal escape above `\177`; these
+    /// lines are hand-written, which is exactly the case where deleting one
+    /// costs the most.
+    #[test]
+    fn two_rules_differing_only_in_a_non_utf8_byte_are_not_one_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!(
+            "{MANAGED_HEADER}\n\"/\\377\" {ATTRIBUTE_SUFFIX}\n\"/\\376\" {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(
+            !ensure_attributes(root, &[]).expect("run"),
+            "neither line is broken and they are not duplicates, so nothing is written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            seed
+        );
+        // And the decoder really is telling them apart, rather than the file
+        // surviving because the lines were never candidates.
+        let first = keeper_rule_pattern(&format!("\"/\\377\" {ATTRIBUTE_SUFFIX}"))
+            .expect("candidate")
+            .into_owned();
+        let second = keeper_rule_pattern(&format!("\"/\\376\" {ATTRIBUTE_SUFFIX}"))
+            .expect("candidate")
+            .into_owned();
+        assert_eq!(first, b"/\xff");
+        assert_eq!(second, b"/\xfe");
+        assert_ne!(first, second);
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second),
+            "the two patterns are indistinguishable once rendered, which is the \
+             whole reason the key must not be a rendering"
+        );
+    }
+
+    /// The pattern is recovered from the RIGHT, so a path may spell keeper's
+    /// own attributes and still come back whole.
+    #[test]
+    fn a_broken_rule_is_recovered_from_the_right_hand_end() {
+        let pattern = pattern_for(Path::new(&format!("odd {ATTRIBUTE_SUFFIX}")));
+        assert_eq!(pattern, format!("/odd {ATTRIBUTE_SUFFIX}"));
+        assert_eq!(
+            repaired_rule(&format!("{pattern} {ATTRIBUTE_SUFFIX}")).expect("broken"),
+            keeper_line(&pattern)
+        );
+        // Two blanks before the attributes is a pattern that ends in one,
+        // which is a path keeper can be asked to track.
+        assert_eq!(
+            repaired_rule(&format!("/trailing  {ATTRIBUTE_SUFFIX}")).expect("broken"),
+            format!("\"/trailing \" {ATTRIBUTE_SUFFIX}")
+        );
+    }
+
+    /// Both shapes the old writer could emit are repaired, and in each of them
+    /// only the literal half is escaped.
+    ///
+    /// The extension branch is the one it is easy to get wrong: escaping the
+    /// whole field would turn `*.2 final draft` into a rule matching a file
+    /// literally called `*`, which is a working line that covers nothing —
+    /// the same class of silent miss the story exists to end.
+    #[test]
+    fn both_pattern_shapes_are_repaired_and_only_their_literal_half_is_escaped() {
+        // Exact-path branch.
+        assert_eq!(
+            repaired_rule(&format!("/my holiday {ATTRIBUTE_SUFFIX}")).expect("broken"),
+            format!("\"/my holiday\" {ATTRIBUTE_SUFFIX}")
+        );
+        // Extension branch — `Path::extension` splits at the LAST dot, so a
+        // version-numbered name puts the blank inside the "extension".
+        assert_eq!(
+            repaired_rule(&format!("*.2 final draft {ATTRIBUTE_SUFFIX}")).expect("broken"),
+            format!("\"*.2 final draft\" {ATTRIBUTE_SUFFIX}")
+        );
+        // …and its leading star survives as the wildcard it is, while a
+        // metacharacter inside the extension does not.
+        assert_eq!(
+            repaired_rule(&format!("*.2 fin[a]l {ATTRIBUTE_SUFFIX}")).expect("broken"),
+            format!("\"*.2 fin\\\\[a]l\" {ATTRIBUTE_SUFFIX}")
+        );
+        // Neither shape: a line keeper's writer could not have produced is not
+        // repaired, however broken it looks.
+        assert!(repaired_rule(&format!("my holiday {ATTRIBUTE_SUFFIX}")).is_none());
+        assert!(repaired_rule(&format!("\"/my holiday\" {ATTRIBUTE_SUFFIX}")).is_none());
+    }
+
+    /// A CRLF file stays a CRLF file, one repaired line at a time.
+    #[test]
+    fn a_repaired_line_keeps_the_ending_the_file_uses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!("{MANAGED_HEADER}\r\n/my clip {ATTRIBUTE_SUFFIX}\r\n");
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!("{MANAGED_HEADER}\r\n\"/my clip\" {ATTRIBUTE_SUFFIX}\r\n")
+        );
+    }
+
+    /// Repair picks up the glob escape, and it has to.
+    ///
+    /// A repaired line that skipped that layer would not be the line the
+    /// writer produces for the same path, so the very next run would append a
+    /// second copy — and the duplicate the repair exists to collapse would
+    /// come straight back. The second call asserts exactly that.
+    #[test]
+    fn repair_applies_the_glob_escape_so_it_converges_with_the_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let seed = format!("{MANAGED_HEADER}\n/2021 [q4]/clip {ATTRIBUTE_SUFFIX}\n");
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        let pattern = pattern_for(Path::new("2021 [q4]/clip"));
+        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+        let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+        assert_eq!(
+            text,
+            format!("{MANAGED_HEADER}\n\"/2021 \\\\[q4]/clip\" {ATTRIBUTE_SUFFIX}\n")
+        );
+
+        assert!(!ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            text
+        );
     }
 
     #[test]

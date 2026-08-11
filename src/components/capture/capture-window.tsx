@@ -100,6 +100,10 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
   // drag region over the strip for one frame and let a click that was aiming
   // at the close button move the window instead.
   const locked = window?.locked ?? true;
+  // …and unknown reads as no inset, for the same reason and with the same
+  // direction of error: a gap that appears a frame late is invisible, where a
+  // gap that appears on a window with no resize border is a permanent gutter.
+  const chromeInset = window?.chromeInset ?? 0;
 
   useEffect(() => {
     void hydrateCaptureWindows();
@@ -134,6 +138,25 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
       // be a label rather than a fact.
       {...(locked ? {} : { "data-tauri-drag-region": true })}
       data-testid="capture-window-chrome"
+      // The window's OWN resize border, kept off the buttons (DW-199). On GTK,
+      // tao hit-tests an undecorated resizable window's resize edges INSIDE the
+      // surface and the webview never sees a click that lands there — and the
+      // close button is flush into the top-right corner, where the top and
+      // right strips overlap. So aiming at close starts a resize, with the
+      // arrow cursor still showing (tao's own FIXME).
+      //
+      // The NUMBER comes from Rust and is never worked out here. It is
+      // `scale_factor() * 5`, so a hard-coded 5 would be half the border on a
+      // 2x display, and it is zero while locked, while maximized and on every
+      // non-GTK backend. This app reads the platform nowhere
+      // (`src/test/no-user-agent-gating.test.ts`), so the only honest shape is
+      // to render a number the shell measured: see `notes_window::edge_inset`
+      // and `keeper_core::capture::chrome_edge_inset`.
+      style={
+        chromeInset > 0
+          ? { paddingTop: chromeInset, paddingRight: `calc(0.25rem + ${chromeInset}px)` }
+          : undefined
+      }
       className={`flex h-8 shrink-0 items-center justify-end gap-1 border-b px-1 ${
         locked ? "" : "cursor-grab active:cursor-grabbing"
       }`}

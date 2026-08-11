@@ -1125,6 +1125,14 @@ pub fn ensure_remote(repo: &gix::Repository, remote_url: &str) -> Result<bool> {
 /// Used to find checked-out LFS pointers that still need materializing: only a
 /// tracked path can hold one, so this bounds that scan to the index rather than
 /// walking the whole worktree.
+///
+/// **Byte-exact.** This used to build each path with `BStr::to_string`, which
+/// is a lossy UTF-8 decode: a tracked file whose name is not valid UTF-8 came
+/// back as a path with `U+FFFD` in it, which names a different file or no file
+/// at all — so the materialization scan silently skipped it, or, in a folder
+/// that also held a file genuinely named with `U+FFFD`, stat'd and rewrote the
+/// wrong one. [`gix::path::from_bstr`] is the conversion [`to_path`] already
+/// uses for status output and it keeps the bytes (Story 47.2).
 pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
     let index = repo
         .index_or_empty()
@@ -1132,8 +1140,39 @@ pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
     Ok(index
         .entries()
         .iter()
-        .map(|entry| PathBuf::from(entry.path(&index).to_string()))
+        .map(|entry| to_path(entry.path(&index)))
         .collect())
+}
+
+/// Tracked paths git is carrying that keeper cannot spell (Story 47.2).
+///
+/// The index is the only complete inventory of a repository that costs no
+/// filesystem walk — it is already resident — and it is the one place a file
+/// that was committed long ago and has not changed since can still be seen. A
+/// status walk cannot answer this: a tracked, unmodified file is exactly the
+/// case that reports nothing, and it was the case the owner hit.
+///
+/// Allocates only for the offenders. [`crate::names::UnspellableName::of_bytes`]
+/// answers `None` after a UTF-8 validation and nothing else, so a repository
+/// with a hundred thousand ordinary paths pays one scan of the index's own
+/// bytes and builds no strings at all.
+pub fn unspellable_tracked_paths(
+    repo: &gix::Repository,
+) -> Result<Vec<crate::names::UnspellableName>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let mut out: Vec<crate::names::UnspellableName> = index
+        .entries()
+        .iter()
+        .filter_map(|entry| crate::names::UnspellableName::of_bytes(entry.path(&index)))
+        .collect();
+    // The index is sorted by raw path bytes, which is not the order the
+    // escaped renderings sort in; a report that reshuffles between polls reads
+    // as churn. Dedup because one path can hold several unmerged stages.
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Re-stat `paths` and write the refreshed index.
@@ -1944,5 +1983,102 @@ mod tests {
             Some(false),
             "clone must leave the sparse index disabled in .git/config"
         );
+    }
+
+    /// Story 47.2 — the index scan must keep path bytes, not decode them.
+    ///
+    /// `tracked_paths` used to build each path with `BStr::to_string`, a lossy
+    /// UTF-8 decode. The resulting `PathBuf` names a different file or no file
+    /// at all, and its one caller is the LFS materialization scan, which
+    /// `lstat`s and rewrites what it is given.
+    #[cfg(unix)]
+    #[test]
+    fn the_index_scan_keeps_the_bytes_of_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        // Raw bytes, because no string literal can express this name.
+        let odd = std::ffi::OsString::from_vec(b"doc-\xffepuap.txt".to_vec());
+        if crate::names::create_unspellable(dir.path(), b"doc-\xffepuap.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        std::fs::write(dir.path().join("ordinary.txt"), b"x").expect("write");
+
+        let status = status_paths(&repo).expect("status");
+        let changes = crate::git::commit::StagedChange {
+            added: status.untracked.clone(),
+            ..Default::default()
+        };
+        crate::git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &crate::provenance::Provenance::new(
+                "p",
+                "dev",
+                "01",
+                "host",
+                crate::provenance::SyncSource::Manual,
+            ),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("git carries path bytes, so this commits");
+
+        let tracked = tracked_paths(&repo).expect("tracked");
+        assert!(
+            tracked.iter().any(|p| p.as_os_str() == odd),
+            "the path must come back byte-identical; got {tracked:?}"
+        );
+        // The specific way it used to be wrong: the lossy form is a path that
+        // reaches nothing, and a caller that stats it silently does nothing.
+        assert!(
+            !dir.path().join("doc-\u{FFFD}epuap.txt").exists(),
+            "the lossy rendering names no file, which is why decoding lost it"
+        );
+
+        // And the same index answers the report question, for the ordinary
+        // file too — an inventory that flagged everything would be useless.
+        let found = unspellable_tracked_paths(&repo).expect("scan");
+        assert_eq!(
+            found.iter().map(|n| n.escaped.as_str()).collect::<Vec<_>>(),
+            vec!["doc-\\xffepuap.txt"]
+        );
+    }
+
+    /// A repository of ordinary names has nothing to report, and a folder that
+    /// is not a repository yet has no index to read.
+    #[test]
+    fn an_ordinary_repository_reports_no_unspellable_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        // Non-ASCII but perfectly valid UTF-8: this must NOT be reported, or
+        // every user outside ASCII gets a permanent warning about their files.
+        std::fs::write(dir.path().join("zaświadczenie.pdf"), b"x").expect("write");
+        let status = status_paths(&repo).expect("status");
+        crate::git::commit::stage_and_commit(
+            &repo,
+            &crate::git::commit::StagedChange {
+                added: status.untracked.clone(),
+                ..Default::default()
+            },
+            &crate::provenance::Provenance::new(
+                "p",
+                "dev",
+                "01",
+                "host",
+                crate::provenance::SyncSource::Manual,
+            ),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit");
+
+        assert!(unspellable_tracked_paths(&repo).expect("scan").is_empty());
     }
 }

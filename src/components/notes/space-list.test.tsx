@@ -225,7 +225,10 @@ describe("SpaceList rows", () => {
             !label.startsWith("Edit space ") &&
             !label.startsWith(`${DELETE_SPACE} `),
         )
-        .filter((label) => label !== RESTORE_DEFAULTS),
+        // The section's own disclosure (Story 47.3) is a header control, not a
+        // row, and it is the first button in the section — filtered by name so
+        // this test keeps saying what it is about, which is row ORDER.
+        .filter((label) => label !== RESTORE_DEFAULTS && label !== "Collapse Spaces"),
     ).toEqual(["Zebra", "Apple", "Mango"]);
   });
 });

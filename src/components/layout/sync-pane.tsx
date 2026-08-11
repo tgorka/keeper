@@ -215,6 +215,22 @@ export const SYNC_PARKED_SENTENCE =
 export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
 
 /**
+ * Unspellable-name copy (Story 47.2, DW-200).
+ *
+ * The sentence has one job that is easy to get wrong: say what keeper WILL NOT
+ * do, so the reader stops waiting for it. keeper carries the file's bytes
+ * perfectly — git stores the raw name — but it cannot address the file from a
+ * pane, because the only rendering a pane can show is lossy and two different
+ * files can share it. That is why every row prints the escaped form beside the
+ * readable one: the escaped form is the one a person can act on.
+ */
+export const SYNC_UNSPELLABLE_TITLE = "Names that are not text";
+export const SYNC_UNSPELLABLE_SENTENCE =
+  "These files have names that are not valid text. keeper syncs them normally — nothing is lost — but it will not open, edit or delete them from this app, because the name it can show you is not the name on disk and two different files can look identical here.";
+export const SYNC_UNSPELLABLE_NOTE =
+  "The second line of each row is the name byte for byte, safe to paste into a terminal. Rename the file there and it will behave like any other.";
+
+/**
  * The fold control's labels.
  *
  * "Show all N" and not "Show more": the unfolded size is a fixed setting, so the
@@ -1373,6 +1389,7 @@ function SyncProblemsSection({
     (problems.error === null &&
       problems.warning === null &&
       problems.parked.length === 0 &&
+      problems.unspellable.length === 0 &&
       problems.conflicts.length === 0)
   ) {
     return null;
@@ -1413,6 +1430,34 @@ function SyncProblemsSection({
             ))}
           </ul>
           <p className="text-muted-foreground text-xs">{SYNC_CONFLICT_NOTE}</p>
+        </div>
+      )}
+      {problems.unspellable.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <h3 className="font-medium text-xs">{SYNC_UNSPELLABLE_TITLE}</h3>
+          <p className="text-muted-foreground text-xs">{SYNC_UNSPELLABLE_SENTENCE}</p>
+          <ul
+            aria-label={`${SYNC_UNSPELLABLE_TITLE}: ${profile.name}`}
+            className="flex flex-col gap-1.5"
+          >
+            {/* Keyed on `escaped`, never on `display`: `display` is lossy and
+                non-injective, so two genuinely different files in this list
+                collide on it — which is the defect itself, showing up as a
+                duplicate React key and one row silently not rendering. */}
+            {problems.unspellable.map((name) => (
+              <li key={name.escaped} className="flex min-w-0 flex-col">
+                <span className="truncate font-mono text-xs" title={name.display}>
+                  {name.display}
+                </span>
+                {/* Not truncated and selectable: this is the line a person
+                    copies, and half of a byte-exact name is worse than none. */}
+                <span className="select-all break-all font-mono text-[0.7rem] text-muted-foreground">
+                  {name.escaped}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-muted-foreground text-xs">{SYNC_UNSPELLABLE_NOTE}</p>
         </div>
       )}
       {problems.parked.length > 0 && (

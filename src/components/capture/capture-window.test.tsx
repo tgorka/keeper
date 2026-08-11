@@ -69,6 +69,8 @@ const FIRST: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n1" },
   locked: true,
   visible: true,
+  // Locked, so tao hit-tests no resize edge and there is no border to dodge.
+  chromeInset: 0,
 };
 
 const SECOND: CaptureWindowVm = {
@@ -76,6 +78,8 @@ const SECOND: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n2" },
   locked: false,
   visible: true,
+  // Unlocked on a 2x GTK display: `scale_factor() * 5`.
+  chromeInset: 10,
 };
 
 beforeEach(() => {
@@ -134,6 +138,34 @@ describe("CaptureWindowChrome", () => {
     rerender(<CaptureWindowChrome captureKey="note:v1/n2" onClose={() => {}} />);
     await screen.findByRole("button", { name: CAPTURE_LOCK_LABEL });
     expect(screen.getByTestId("capture-window-chrome")).toHaveAttribute("data-tauri-drag-region");
+  });
+
+  it("keeps the buttons out of the window's own resize border, by the number Rust measured", async () => {
+    // DW-199. On GTK an unlocked undecorated window's resize edges are
+    // hit-tested inside the surface, and the close button is flush into the
+    // corner where two of those strips overlap — so aiming at close starts a
+    // resize. The strip is inset by exactly what the shell measured, and by
+    // nothing when there is no border there.
+    const { rerender } = render(<CaptureWindowChrome captureKey="note:v1/n1" onClose={() => {}} />);
+    await screen.findByRole("button", { name: CAPTURE_UNLOCK_LABEL });
+    // Locked: no inset at all, not "an inset of zero pixels" — a gutter on a
+    // window with no resize border is a control moved for nothing.
+    expect(screen.getByTestId("capture-window-chrome")).not.toHaveAttribute("style");
+
+    rerender(<CaptureWindowChrome captureKey="note:v1/n2" onClose={() => {}} />);
+    await screen.findByRole("button", { name: CAPTURE_LOCK_LABEL });
+    const strip = screen.getByTestId("capture-window-chrome");
+    // 10, not 5: the number is `scale_factor() * 5` and this fixture is a 2x
+    // display. A component that hard-coded the constant would pass a 1x test
+    // and leave half the border over the close button on the owner's hardware.
+    expect(strip).toHaveStyle({ paddingTop: "10px" });
+    // Added to the strip's existing `px-1` rather than replacing it, so the
+    // buttons clear the border AND keep the padding they always had. Matched
+    // on the terms rather than on the string: the CSSOM reorders `calc`
+    // operands, and which side of the plus each lands on is not the contract.
+    expect(strip.style.paddingRight).toMatch(/^calc\(/);
+    expect(strip.style.paddingRight).toContain("0.25rem");
+    expect(strip.style.paddingRight).toContain("10px");
   });
 
   it("behaves as locked before Rust has answered", async () => {
