@@ -363,6 +363,31 @@ pub struct SyncParkedVm {
     pub last_error: Option<String>,
 }
 
+/// A file whose name is not text, as the Problems pane shows it (Story 47.2,
+/// DW-200).
+///
+/// The shell-side shape of `keeper_sync::UnspellableName`, for the same reason
+/// [`SyncParkedVm`] is the shell-side shape of a parked unit: the engine type
+/// is not a view model and does not derive [`TS`].
+///
+/// **Both renderings, and neither alone is enough.** `display` is what a person
+/// reads and it is LOSSY and non-injective — two different files can produce
+/// one `display`, which is the whole defect story 47.2 closed. `escaped` is
+/// byte-exact ASCII, and it is what makes the row actionable: a person can
+/// paste it into a shell and find the file. A row carrying only the lossy
+/// rendering names a file the reader cannot then locate; one carrying only the
+/// escaped form is unreadable.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncUnspellableVm {
+    /// `U+FFFD`-substituted rendering: what the row reads as.
+    pub display: String,
+    /// Byte-exact ASCII, `\xNN` per byte outside printable ASCII: what the row
+    /// can be acted on with.
+    pub escaped: String,
+}
+
 /// Everything currently wrong with one profile.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -374,6 +399,14 @@ pub struct SyncProblemsVm {
     /// Conflict copies still on disk. A copy the user has already dealt with
     /// and deleted is resolved, so it leaves this list on its own.
     pub conflicts: Vec<String>,
+    /// Files in this folder whose names are not text (Story 47.2, DW-200).
+    ///
+    /// Reported rather than silent. Before this, keeper rendered such a name
+    /// lossily and said nothing, and the rendering could be joined back to a
+    /// *different real file* — so a delete confirmed against one row removed
+    /// another. `browse::plain_segments` now refuses the rendering; this list is
+    /// how the person finds out the file exists at all.
+    pub unspellable: Vec<SyncUnspellableVm>,
 }
 
 /// Fields a caller may set when creating or updating a profile.
@@ -1072,6 +1105,17 @@ pub async fn sync_problems(
             })
             .collect(),
         conflicts: report.conflicts,
+        // Hand-projected like every field above it, so a field added to
+        // `ProblemReport` reaches the pane by someone deciding it should rather
+        // than by inheriting a derive (Story 47.2, DW-200).
+        unspellable: report
+            .unspellable
+            .into_iter()
+            .map(|name| SyncUnspellableVm {
+                display: name.display,
+                escaped: name.escaped,
+            })
+            .collect(),
     })
 }
 

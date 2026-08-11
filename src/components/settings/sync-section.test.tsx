@@ -25,7 +25,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncActivity: vi.fn(() => Promise.resolve([])),
   syncPending: vi.fn(() => Promise.resolve([])),
   syncProblems: vi.fn(() =>
-    Promise.resolve({ warning: null, error: null, parked: [], conflicts: [] }),
+    Promise.resolve({ warning: null, error: null, parked: [], conflicts: [], unspellable: [] }),
   ),
 }));
 

@@ -7222,20 +7222,15 @@ struct DestinationProfileRow {
     /// The synced folder itself. A plain destination anywhere inside it would be
     /// committed by this profile, which is the ambiguity the setter refuses.
     local_path: PathBuf,
-    /// The profile's RESOLVED recordings root
-    /// ([`keeper_sync::SyncProfile::recordings_root`]), or `None` when it does
-    /// not say it holds recordings (Story 41.1's `recordings` block absent).
-    recordings_root: Option<PathBuf>,
-    /// The profile-relative subfolder [`Self::recordings_root`] was joined FROM,
-    /// carried rather than sliced back out of the root (Story 46.10).
+    /// Where this profile's recordings live, or `None` when it does not say it
+    /// holds them (Story 41.1's `recordings` block absent).
     ///
-    /// `Some` exactly when `recordings_root` is: [`destination_profile_row`] is
-    /// the one place either is built and builds both from the same `recordings`
-    /// block. Recovering it from the root instead would be string surgery that
-    /// normalises — `20-media//sessions` and `20-media/sessions` join to one root
-    /// and are two different stored values — and only the stored one may be
-    /// echoed back to `sync_profile_save` by an edit box.
-    recordings_subfolder: Option<String>,
+    /// **One field and not two** — see [`RecordingsPlace`]. Story 46.10 shipped
+    /// the resolved root and the head it was joined from as two independent
+    /// `Option`s that agreed only by construction; a row that named one without
+    /// the other was representable and a reader consulting the head first would
+    /// have read a head for a folder that holds no recordings (DW-196).
+    recordings: Option<RecordingsPlace>,
     /// Whether watch mode is armed. A paused profile is neither a destination nor
     /// a collision — see [`enclosing_destination_profile`].
     enabled: bool,
@@ -7249,6 +7244,41 @@ struct DestinationProfileRow {
     /// folder, never an `exists()` on the mountpoint, which cannot tell an absent
     /// drive from a foreign one and cannot follow a stick re-mounted elsewhere.
     volume: Option<DestinationVolume>,
+}
+
+/// Where one profile's recordings live: the resolved root, and the
+/// profile-relative head it was joined from (Story 46.10, collapsed in 47.5).
+///
+/// **The two travel together because they are one fact about one `recordings`
+/// block.** [`destination_profile_row`] is the only place either is built and
+/// it builds both from the same block; making that a single value is what stops
+/// a later reader — or a later fixture — writing down a root with no head, or a
+/// head for a profile that holds no recordings.
+///
+/// **The head is CARRIED, never recovered from the root.** A `strip_prefix` back
+/// out of the resolved root would come back component-normalised, and
+/// `20-media//sessions` and `20-media/sessions` are one root but two different
+/// stored values. Only the stored one may be echoed back to `sync_profile_save`
+/// by the Destination card's edit box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingsPlace {
+    /// The RESOLVED recordings root, exactly as
+    /// [`keeper_sync::SyncProfile::recordings_root`] composes it — asked of
+    /// `keeper-sync` once and never reimplemented here.
+    root: PathBuf,
+    /// The profile-relative subfolder [`Self::root`] was joined FROM, trimmed
+    /// exactly as the join trims, so what the card shows is what the join used.
+    subfolder: String,
+}
+
+impl DestinationProfileRow {
+    /// The resolved recordings root, for the readers that only ask *where*.
+    ///
+    /// Borrowing, so asking the question costs nothing and cannot hand a caller
+    /// a root separated from its head.
+    fn recordings_root(&self) -> Option<&Path> {
+        self.recordings.as_ref().map(|place| place.root.as_path())
+    }
 }
 
 /// A destination profile's removable volume: what it is called, and whether it
@@ -7485,7 +7515,7 @@ fn resolve_recording_destination(
         );
         return folder;
     }
-    let Some(root) = row.recordings_root else {
+    let Some(place) = row.recordings else {
         tracing::warn!(
             profile = %id,
             "the chosen synced folder no longer says it holds recordings; recording into the plain folder instead"
@@ -7500,7 +7530,7 @@ fn resolve_recording_destination(
     // `recording_start` refuses on it — the resolution stays total, and the card
     // keeps naming the folder the owner actually chose.
     RecordingDestination {
-        root,
+        root: place.root,
         kind: RecordingDestinationKind::Profile,
         profile_id: Some(row.id),
         profile_name: Some(row.name),
@@ -7536,7 +7566,7 @@ fn default_recording_destination(
         }
     };
     let mut flagged = rows.into_iter().filter_map(|row| {
-        let root = row.recordings_root.filter(|_| row.enabled)?;
+        let root = row.recordings.filter(|_| row.enabled)?.root;
         Some((row.id, row.name, root, row.volume))
     });
     let Some((id, name, root, volume)) = flagged.next() else {
@@ -7628,15 +7658,17 @@ fn destination_profile_row(profile: &keeper_sync::SyncProfile) -> DestinationPro
         id: profile.id.clone(),
         name: profile.name.clone(),
         local_path: profile.local_path.clone(),
-        recordings_root: profile.recordings_root(),
-        // The head the root above was composed from, taken from the SAME block, so
-        // the pair cannot describe two different profiles (Story 46.10). Trimmed
-        // exactly as `recordings_root` trims before joining, so what the card
-        // shows is what the join used.
-        recordings_subfolder: profile
-            .recordings
-            .as_ref()
-            .map(|recordings| recordings.subfolder.trim().to_owned()),
+        // The root and the head it was composed from, taken from the SAME block
+        // in one expression, so the pair cannot describe two different profiles
+        // and cannot be half-written (Story 46.10, DW-196). The join itself stays
+        // `keeper-sync`'s: `recordings_root()` is the one definition of it.
+        recordings: profile
+            .recordings_root()
+            .zip(profile.recordings.as_ref())
+            .map(|(root, recordings)| RecordingsPlace {
+                root,
+                subfolder: recordings.subfolder.trim().to_owned(),
+            }),
         enabled: profile.enabled,
         // Only a profile that says it is on removable media is scanned. For every
         // ordinary folder this is the whole cost of the feature: one boolean.
@@ -9759,7 +9791,7 @@ fn destination_choice(
             if !row.enabled {
                 return Err(DestinationRefusal::PausedProfile(row.name.clone()).into_error());
             }
-            if row.recordings_root.is_none() {
+            if row.recordings.is_none() {
                 return Err(DestinationRefusal::NotRecordingsProfile(row.name.clone()).into_error());
             }
             Ok(DestinationChoice::Profile(id.to_owned()))
@@ -9788,7 +9820,7 @@ fn destination_choice(
             };
             let folder = Path::new(submitted);
             match enclosing_destination_profile(&rows, folder) {
-                Some(row) if row.recordings_root.as_deref() == Some(folder) => {
+                Some(row) if row.recordings_root() == Some(folder) => {
                     tracing::info!(
                         profile = %row.id,
                         "recording settings: the chosen folder IS a synced folder's recordings root, so it is stored as that choice"
@@ -9797,7 +9829,7 @@ fn destination_choice(
                 }
                 Some(row) => Err(DestinationRefusal::InsideSyncedFolder {
                     profile: row.name.clone(),
-                    offers_recordings: row.recordings_root.is_some(),
+                    offers_recordings: row.recordings.is_some(),
                 }
                 .into_error()),
                 None => Ok(DestinationChoice::Folder(submitted.to_owned())),
@@ -9850,15 +9882,15 @@ fn destination_profile_vms(table: &DestinationProfileTable) -> Vec<RecordingProf
     rows.iter()
         .filter(|row| row.enabled)
         .filter_map(|row| {
+            // One `?` on one field, because a row that cannot say where its
+            // recordings live is not a destination — and since DW-196 there is
+            // no way for it to name a root without the head beside it.
+            let place = row.recordings.as_ref()?;
             Some(RecordingProfileVm {
                 id: row.id.clone(),
                 name: row.name.clone(),
-                recordings_root: row.recordings_root.as_ref()?.to_string_lossy().into_owned(),
-                // The head, `?` for the same reason the root is: a row that
-                // cannot say where recordings live is not a destination, and one
-                // that named a root without a head would be a row this function
-                // had to invent half of.
-                subfolder: row.recordings_subfolder.clone()?,
+                recordings_root: place.root.to_string_lossy().into_owned(),
+                subfolder: place.subfolder.clone(),
             })
         })
         .collect()
@@ -12244,10 +12276,12 @@ mod tests {
             id: id.to_owned(),
             name: name.to_owned(),
             local_path: PathBuf::from(local),
-            recordings_root: Some(PathBuf::from(local).join("recordings")),
-            // Spelled the same way the join above spells it, because this fixture
-            // is asserting that the pair agrees.
-            recordings_subfolder: Some("recordings".to_owned()),
+            // The root and the head spelled the same way the production join
+            // spells them, because this fixture stands in for a real row.
+            recordings: Some(RecordingsPlace {
+                root: PathBuf::from(local).join("recordings"),
+                subfolder: "recordings".to_owned(),
+            }),
             enabled: true,
             volume: None,
         }
@@ -12369,7 +12403,7 @@ mod tests {
         let plain = plain_answer(&dir);
 
         let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
         paused.enabled = false;
 
@@ -12460,7 +12494,7 @@ mod tests {
         let before = read_with(&dir, tgdrive_table());
 
         let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
         paused.enabled = false;
 
@@ -12567,7 +12601,7 @@ mod tests {
         // The same collision with a folder that does NOT hold recordings cannot
         // offer that choice, so it names the other way out instead.
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let table = Ok(vec![unflagged]);
         let inside = folder_request(&dir, "/Users/x/work/screencasts");
         let error = write_recording_settings(&dir, &inside, false, &|_| table.clone())
@@ -12711,7 +12745,7 @@ mod tests {
 
         // Exactly one flagged folder, beside decoys that are not destinations.
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
         let one = Ok(vec![
@@ -13019,7 +13053,7 @@ mod tests {
             )
         };
         let mut unflagged = absent();
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = absent();
         paused.enabled = false;
 
@@ -13206,12 +13240,14 @@ mod tests {
     #[test]
     fn destination_profiles_lists_only_the_folders_that_hold_recordings() {
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
         let mut nested = flagged_row("nest", "nested", "/Volumes/nest");
-        nested.recordings_subfolder = Some("40-media/recordings".to_owned());
-        nested.recordings_root = Some(PathBuf::from("/Volumes/nest/40-media/recordings"));
+        nested.recordings = Some(RecordingsPlace {
+            root: PathBuf::from("/Volumes/nest/40-media/recordings"),
+            subfolder: "40-media/recordings".to_owned(),
+        });
         let table = Ok(vec![
             flagged_row("tgd", "tgdrive", "/Volumes/tg"),
             unflagged,
@@ -13284,7 +13320,7 @@ mod tests {
         let mut profile =
             keeper_sync::SyncProfile::new("tgd", "tgdrive", "/Volumes/tg", "https://example/r.git");
         assert_eq!(
-            destination_profile_row(&profile).recordings_root,
+            destination_profile_row(&profile).recordings,
             None,
             "a profile that has not said it holds recordings is not a destination"
         );
@@ -13295,7 +13331,7 @@ mod tests {
         assert_eq!(row.name, "tgdrive");
         assert_eq!(row.local_path, PathBuf::from("/Volumes/tg"));
         assert_eq!(
-            row.recordings_root,
+            row.recordings_root().map(Path::to_path_buf),
             profile.recordings_root(),
             "one definition of the recordings root, and it is keeper-sync's"
         );

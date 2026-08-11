@@ -135,7 +135,13 @@ beforeEach(() => {
   mockStatuses.mockResolvedValue([]);
   mockActivity.mockResolvedValue([]);
   mockPending.mockResolvedValue([]);
-  mockProblems.mockResolvedValue({ warning: null, error: null, parked: [], conflicts: [] });
+  mockProblems.mockResolvedValue({
+    warning: null,
+    error: null,
+    parked: [],
+    conflicts: [],
+    unspellable: [],
+  });
   // The default keychain answer: a folder with nothing stored. Every edit form
   // reads this as it opens (Story 34.12), so every test that renders one needs
   // an answer here or the read resolves to nothing at all.

@@ -42,6 +42,7 @@ const DRAFT: CaptureWindowVm = {
   target: { kind: "draft" },
   locked: true,
   visible: true,
+  chromeInset: 0,
 };
 
 const FIRST_NOTE: CaptureWindowVm = {
@@ -49,6 +50,7 @@ const FIRST_NOTE: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n1" },
   locked: false,
   visible: true,
+  chromeInset: 0,
 };
 
 const SECOND_NOTE: CaptureWindowVm = {
@@ -56,6 +58,7 @@ const SECOND_NOTE: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n2" },
   locked: true,
   visible: true,
+  chromeInset: 0,
 };
 
 beforeEach(() => {
