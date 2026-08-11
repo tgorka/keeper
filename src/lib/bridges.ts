@@ -7,6 +7,7 @@
  * inventing status text. Risk-tier badges and ack copy still come only from the
  * backend catalog data — nothing here duplicates that.
  */
+import type { LampState } from "@/components/ui/lamp";
 import type { BbctlPhase, BridgeHealth, BridgeLoginPhase, BridgeStatus } from "@/lib/ipc/client";
 
 /**
@@ -67,9 +68,17 @@ export const BRIDGE_HEALTH_LABEL: Record<BridgeHealth, string> = {
   disconnected: "Disconnected",
 };
 
-/** The `--bridge-*` dot tint for each live {@link BridgeHealth} (Story 6.5). */
-export const BRIDGE_HEALTH_DOT_CLASS: Record<BridgeHealth, string> = {
-  healthy: "bg-bridge-healthy",
-  degraded: "bg-bridge-degraded",
-  disconnected: "bg-bridge-disconnected",
+/**
+ * The lamp state for each live {@link BridgeHealth} (Story 6.5).
+ *
+ * Three states, three shapes, three hues — replacing the hue-only dot this map
+ * used to hold, which failed WCAG SC 1.4.1 (see `lamp.tsx` for the
+ * measurements). `degraded` is the dashed ring rather than a second solid disc
+ * precisely so that no two health states can be told apart by colour alone:
+ * connected is whole, degraded is intermittent, disconnected is bitten.
+ */
+export const BRIDGE_HEALTH_LAMP: Record<BridgeHealth, LampState> = {
+  healthy: "live",
+  degraded: "working",
+  disconnected: "fault",
 };

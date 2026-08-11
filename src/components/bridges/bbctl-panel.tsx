@@ -100,7 +100,7 @@ export function BbctlPanel({ accountId, onBridgeAdded }: BbctlPanelProps) {
 function SectionHeading() {
   return (
     <div className="flex flex-col gap-0.5">
-      <h3 className="font-medium text-sm">Run your own bridge</h3>
+      <h3 className="font-heading text-sm font-semibold">Run your own bridge</h3>
       <p className="text-muted-foreground text-xs">
         Self-host a bridge for a network Beeper doesn't run for you.
       </p>

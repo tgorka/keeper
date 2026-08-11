@@ -61,11 +61,17 @@ const MARK_ICON: Record<FilesSyncStatusVm, LucideIcon> = {
  * answer about is the one that wants a person's attention. Nothing here is the
  * only carrier of a distinction — remove every class and the marks are still
  * five different shapes with five different names.
+ *
+ * The recessive tone is `faint`, which is the token held to 3:1 for exactly this
+ * job. It used to be `text-muted-foreground/60`, and that measured 2.45:1 in the
+ * light theme: an opacity modifier discards the contrast its token was verified
+ * at, and a graphic nobody can see is not quiet emphasis, it is an absent mark.
+ * Non-text graphics have a floor too (SC 1.4.11), even when they carry a label.
  */
 const MARK_TONE: Record<FilesSyncStatusVm, string> = {
-  synced: "text-muted-foreground/60",
+  synced: "text-faint",
   waiting: "text-primary",
-  excluded: "text-muted-foreground/60",
+  excluded: "text-faint",
   notInRepository: "text-muted-foreground",
   unknown: "text-destructive",
 };
