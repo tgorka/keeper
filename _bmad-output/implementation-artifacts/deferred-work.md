@@ -3177,3 +3177,45 @@ reason: a backslash is a legal character in a Linux filename, and the separator 
   rule (refuse rather than resolve when the rendering is not reversible) and this is a second place
   it applies.
 status: open
+
+### DW-202: The summon hotkey shows the inbox without unfolding the column it lives in.
+
+origin: story 48.1, 2026-08-11
+location: the summon-hotkey focus target vs `useSurfaceColumn`'s folded state
+reason: 48.1 gave four surface columns a fold. A hotkey that focuses something inside a folded
+  column focuses a thing nobody can see — the keystroke appears to do nothing. Not a regression
+  (the fold is new), but it is the first of a class: every existing "focus this" path now has a
+  column that may be shut in front of it. The fix is one unfold call at the summon path; the
+  reason it is deferred is that the same question applies to every other focus path and answering
+  it once, deliberately, is better than four unfolds added as each is noticed.
+status: open
+
+### DW-203: Two resize hosts reach the same column through one className hinge.
+
+origin: story 48.1, 2026-08-11
+location: `src/components/ui/resizable-columns.tsx`, `src/lib/column-widths.ts`
+reason: the seam and the column root both write width through a shared className path, so the
+  two hosts are coupled by a string rather than by a type. It works and is tested; it is the
+  shape that breaks quietly when a third host appears.
+status: open
+
+### DW-204: `columnTemplate`'s fitted branch hard-codes `MIN_COLUMN_WIDTH`.
+
+origin: story 48.1, 2026-08-11
+location: `src/lib/column-widths.ts`
+reason: 48.1 gave each surface column its own floor, justified per column, because the 72px
+  constant was chosen for a property KEY whose escape hatch is an overflow trigger. The fitted
+  branch of `columnTemplate` still bakes the 72 in, so a fitted column ignores the floor its
+  own id declares. No live consumer hits it today; the next one will.
+status: open
+
+### DW-205: A note's editor refcount cannot span a capture window.
+
+origin: story 48.3, 2026-08-11
+location: `src/lib/stores/notes-editor.ts`, against `keeper::notes_window`
+reason: 46.12 made two panels on one note share a document by refcount. A capture window is a
+  separate webview, so a separate JS realm and a separate module registry — the refcount cannot
+  reach it, and a note open in a panel AND in a capture window has two independent buffers. Today
+  each saves through the same Rust writer and last-write-wins, which is the pre-46.12 behaviour
+  and not a new defect; it becomes one the moment either side grows an unsaved-state promise.
+status: open

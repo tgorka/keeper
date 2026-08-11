@@ -31,7 +31,7 @@
  * storing it per-document in a document that is destroyed when the window
  * closes.
  */
-import { Lock, LockOpen, X } from "lucide-react";
+import { Lock, LockOpen, Pin, PinOff, X } from "lucide-react";
 import { useCallback, useEffect } from "react";
 import { CaptureDocument } from "@/components/capture/capture-document";
 import { Button } from "@/components/ui/button";
@@ -42,6 +42,7 @@ import {
   captureWindowFor,
   closeCaptureWindow,
   hydrateCaptureWindows,
+  setCaptureWindowAlwaysOnTop,
   setCaptureWindowLocked,
   useCaptureWindowsStore,
 } from "@/lib/stores/capture-windows";
@@ -72,6 +73,27 @@ export const CAPTURE_UNLOCK_LABEL = "Unlock this window so it can be moved and r
  */
 export const CAPTURE_LOCK_LABEL = "Lock this window where it is";
 
+/**
+ * The accessible name of the pin, when the window floats above other apps.
+ *
+ * Names the STATE it moves to, exactly as the lock's pair does, because that is
+ * what a person reads before pressing. "Stop floating" and not "unpin": the
+ * window is not pinned to anything, it is held above everything, and the only
+ * word for what the user gets back is the ordinary behaviour of every other
+ * window.
+ *
+ * What this deliberately does NOT promise is that it will work. A window
+ * manager may decline the request — most tiling ones do — so the label says
+ * what is being asked for, and the button's pressed state reports what the
+ * compositor actually did. See `notes_window::set_always_on_top`.
+ */
+export const CAPTURE_UNPIN_LABEL = "Stop this window floating above other apps";
+
+/**
+ * The accessible name of the pin, when the window is an ordinary window.
+ */
+export const CAPTURE_PIN_LABEL = "Keep this window floating above other apps";
+
 export interface CaptureWindowChromeProps {
   /**
    * Which window this is, in Rust's vocabulary.
@@ -100,6 +122,11 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
   // drag region over the strip for one frame and let a click that was aiming
   // at the close button move the window instead.
   const locked = window?.locked ?? true;
+  // …and unknown reads as on-top, which is what every capture window has been
+  // since the panel existed. Same direction of error as the lock: assume the
+  // behaviour the window already has, so the frame before Rust answers is not
+  // a frame in which the button offers to undo something that never happened.
+  const alwaysOnTop = window?.alwaysOnTop ?? true;
   // …and unknown reads as no inset, for the same reason and with the same
   // direction of error: a gap that appears a frame late is invisible, where a
   // gap that appears on a window with no resize border is a permanent gutter.
@@ -161,6 +188,23 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
         locked ? "" : "cursor-grab active:cursor-grabbing"
       }`}
     >
+      {/*
+       * Left of the lock, so the close button stays flush in the top-right
+       * corner where DW-199's inset protects it — the corner geometry 47.5
+       * measured is unchanged by adding a third button on the far side.
+       * `justify-end gap-1` needs no layout work for it.
+       */}
+      <Button
+        variant="ghost"
+        size="icon"
+        aria-label={alwaysOnTop ? CAPTURE_UNPIN_LABEL : CAPTURE_PIN_LABEL}
+        aria-pressed={alwaysOnTop}
+        onClick={() => {
+          void setCaptureWindowAlwaysOnTop(captureKey, !alwaysOnTop);
+        }}
+      >
+        {alwaysOnTop ? <Pin aria-hidden="true" /> : <PinOff aria-hidden="true" />}
+      </Button>
       <Button
         variant="ghost"
         size="icon"

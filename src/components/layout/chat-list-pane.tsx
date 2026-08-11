@@ -18,6 +18,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
+import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -53,6 +54,14 @@ import { usePrimaryView } from "@/lib/stores/primary-view";
 import { effectiveIsUnread, roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
 
+/**
+ * The column the inbox occupies (Story 48.1). The width is no longer a
+ * `w-[320px]` here — it is a remembered number on the element, which is what
+ * lets it be dragged.
+ */
+const CHAT_LIST_COLUMN_CLASS =
+  "flex h-full shrink-0 flex-col border-border border-r bg-background outline-none";
+
 export function ChatListPane() {
   // Key the subscription on the set of account ids: an add/sign-out re-subscribes
   // the merged inbox so it covers exactly the live accounts.
@@ -72,6 +81,11 @@ export function ChatListPane() {
   // Phone tier (Story 13.1): opening a Chat on the phone must not auto-focus the
   // composer (UX-DR22) — the row-open Enter handler gates its focus request on this.
   const { phone } = useShellLayout();
+  // The inbox is a surface column: it folds and it resizes (Story 48.1), but
+  // only where there is a row of columns to fold within. On the phone the
+  // stack shows one pane at a time, so a fold would hide the whole screen and
+  // a seam would be a drag target with nothing beside it to trade width with.
+  const column = useSurfaceColumn("chat-list", { enabled: !phone });
   // Account switcher filter (Story 2.5): a pure display filter over the already-
   // merged, Rust-ordered rooms — it hides non-matching rows without touching the
   // merged subscription or the sort. `null` shows every account.
@@ -579,109 +593,134 @@ export function ChatListPane() {
     "No conversations yet."
   );
 
+  // Folded, the inbox is its strip and the control that brings it back
+  // (Story 48.1). Early-returned rather than gated inside, so a folded list
+  // mounts no rows — the same rule `PanelFrame` folds a panel by. The
+  // subscriptions above this line keep running: the unread counts they feed
+  // are read elsewhere, and a fold is "put this away", not "stop listening".
+  if (column.folded) {
+    return (
+      <>
+        <div {...column.rootProps} className={CHAT_LIST_COLUMN_CLASS}>
+          {column.chrome}
+        </div>
+        {column.seam}
+      </>
+    );
+  }
+
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears all active filters before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive.
-    <div
-      ref={containerRef}
-      // `tabIndex={-1}` makes the container programmatically focusable so the global
-      // summon-hotkey fallback (empty inbox) can land focus here (Story 9.4). It is not
-      // a tab stop for normal keyboard nav — the roving rows own that.
-      tabIndex={-1}
-      className="flex h-full w-[320px] shrink-0 flex-col border-border border-r bg-background outline-none"
-      onKeyDown={onListKeyDown}
-    >
-      {/* Dismissible filter chips (Story 4.5 + 4.6): shown above the list when a
+    <>
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: container-level Esc handler clears all active filters before focus moves (UX-DR); rows stay independently keyboard-operable, so this is additive. */}
+      <div
+        ref={containerRef}
+        // `tabIndex={-1}` makes the container programmatically focusable so the global
+        // summon-hotkey fallback (empty inbox) can land focus here (Story 9.4). It is not
+        // a tab stop for normal keyboard nav — the roving rows own that.
+        tabIndex={-1}
+        {...column.rootProps}
+        className={CHAT_LIST_COLUMN_CLASS}
+        onKeyDown={onListKeyDown}
+      >
+        {column.chrome}
+        {/* Dismissible filter chips (Story 4.5 + 4.6): shown above the list when a
           Space and/or Network filter is active (AND composition — both chips
           render). Each chip's ✕ clears ONLY its own dimension (the other filter
           stays active); Esc clears ALL active filters and restores the inbox. */}
-      {anyFilterActive && (
-        <div className="flex shrink-0 flex-wrap gap-1 border-border border-b px-3 py-2">
-          {spaceFilterActive && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
-              {activeSpaceName ?? "Space"}
-              <button
-                type="button"
-                onClick={clearSpaceFilter}
-                aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
-                className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X aria-hidden="true" className="size-3" />
-              </button>
-            </span>
-          )}
-          {networkFilterActive && activeNetwork !== null && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
-              {activeNetwork}
-              <button
-                type="button"
-                onClick={clearNetworkFilter}
-                aria-label={`Clear ${activeNetwork} filter`}
-                className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X aria-hidden="true" className="size-3" />
-              </button>
-            </span>
-          )}
-        </div>
-      )}
-      {showPins && (
-        <PinsStrip
-          pins={visiblePins}
-          onSelect={selectRoom}
-          selected={selected}
-          reorderable={filterAccountId === null}
-        />
-      )}
-      {showFavorites && (
-        <FavoritesSection favorites={visibleFavorites} onSelect={selectRoom} selected={selected} />
-      )}
-      {errored ? (
-        <div className="flex flex-1 items-center justify-center p-4">
-          <p className="text-center text-muted-foreground text-sm">
-            Couldn't start syncing. Check your connection and try again.
-          </p>
-        </div>
-      ) : visibleRooms.length > 0 ? (
-        <ScrollArea className="flex-1">
-          <ul aria-label="Conversations" className="flex flex-col">
-            {visibleRooms.map((room, index) => (
-              <li key={`${room.accountId}:${room.roomId}`}>
-                <ChatRow
-                  ref={(el) => {
-                    rowRefs.current[index] = el;
-                  }}
-                  room={room}
-                  onSelect={selectRoom}
-                  selected={
-                    selected?.roomId === room.roomId && selected?.accountId === room.accountId
-                  }
-                  // Roving tabindex (Story 9.2): the keyboard-focused row is `0` so a
-                  // single Tab lands on it; every other row is `-1`. Before any row is
-                  // keyboard-focused — or when the focused row has left the window — the
-                  // first row is the tab stop, so the list always has exactly one.
-                  tabIndex={(resolvedFocusIdx >= 0 ? resolvedFocusIdx : 0) === index ? 0 : -1}
-                />
-              </li>
-            ))}
-          </ul>
-        </ScrollArea>
-      ) : !activeLoaded ? (
-        <div role="status" aria-label="Loading conversations" className="flex flex-col gap-1 p-3">
-          {[0, 1, 2, 3, 4].map((i) => (
-            <div key={i} className="flex h-16 items-center gap-3">
-              <Skeleton className="size-10 shrink-0 rounded-full" />
-              <div className="flex min-w-0 flex-1 flex-col gap-2">
-                <Skeleton className="h-4 w-3/4" />
-                <Skeleton className="h-3 w-1/2" />
+        {anyFilterActive && (
+          <div className="flex shrink-0 flex-wrap gap-1 border-border border-b px-3 py-2">
+            {spaceFilterActive && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
+                {activeSpaceName ?? "Space"}
+                <button
+                  type="button"
+                  onClick={clearSpaceFilter}
+                  aria-label={`Clear ${activeSpaceName ?? "Space"} filter`}
+                  className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </button>
+              </span>
+            )}
+            {networkFilterActive && activeNetwork !== null && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-accent px-2 py-0.5 text-accent-foreground text-xs">
+                {activeNetwork}
+                <button
+                  type="button"
+                  onClick={clearNetworkFilter}
+                  aria-label={`Clear ${activeNetwork} filter`}
+                  className="rounded-full outline-none hover:bg-background/40 focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <X aria-hidden="true" className="size-3" />
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+        {showPins && (
+          <PinsStrip
+            pins={visiblePins}
+            onSelect={selectRoom}
+            selected={selected}
+            reorderable={filterAccountId === null}
+          />
+        )}
+        {showFavorites && (
+          <FavoritesSection
+            favorites={visibleFavorites}
+            onSelect={selectRoom}
+            selected={selected}
+          />
+        )}
+        {errored ? (
+          <div className="flex flex-1 items-center justify-center p-4">
+            <p className="text-center text-muted-foreground text-sm">
+              Couldn't start syncing. Check your connection and try again.
+            </p>
+          </div>
+        ) : visibleRooms.length > 0 ? (
+          <ScrollArea className="flex-1">
+            <ul aria-label="Conversations" className="flex flex-col">
+              {visibleRooms.map((room, index) => (
+                <li key={`${room.accountId}:${room.roomId}`}>
+                  <ChatRow
+                    ref={(el) => {
+                      rowRefs.current[index] = el;
+                    }}
+                    room={room}
+                    onSelect={selectRoom}
+                    selected={
+                      selected?.roomId === room.roomId && selected?.accountId === room.accountId
+                    }
+                    // Roving tabindex (Story 9.2): the keyboard-focused row is `0` so a
+                    // single Tab lands on it; every other row is `-1`. Before any row is
+                    // keyboard-focused — or when the focused row has left the window — the
+                    // first row is the tab stop, so the list always has exactly one.
+                    tabIndex={(resolvedFocusIdx >= 0 ? resolvedFocusIdx : 0) === index ? 0 : -1}
+                  />
+                </li>
+              ))}
+            </ul>
+          </ScrollArea>
+        ) : !activeLoaded ? (
+          <div role="status" aria-label="Loading conversations" className="flex flex-col gap-1 p-3">
+            {[0, 1, 2, 3, 4].map((i) => (
+              <div key={i} className="flex h-16 items-center gap-3">
+                <Skeleton className="size-10 shrink-0 rounded-full" />
+                <div className="flex min-w-0 flex-1 flex-col gap-2">
+                  <Skeleton className="h-4 w-3/4" />
+                  <Skeleton className="h-3 w-1/2" />
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <ul aria-label="Conversations" className="flex flex-1 items-center justify-center p-4">
-          <li className="text-center text-muted-foreground text-sm">{emptyState}</li>
-        </ul>
-      )}
-    </div>
+            ))}
+          </div>
+        ) : (
+          <ul aria-label="Conversations" className="flex flex-1 items-center justify-center p-4">
+            <li className="text-center text-muted-foreground text-sm">{emptyState}</li>
+          </ul>
+        )}
+      </div>
+      {column.seam}
+    </>
   );
 }

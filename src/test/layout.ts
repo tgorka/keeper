@@ -22,6 +22,8 @@
  * the ellipsis is applied at all, and whether the real font makes a real value
  * overflow a real pane. Those are browser facts and this is not a browser.
  */
+import { PANE_HEADER_STATUS_SLOT } from "@/components/layout/pane-header";
+import { PRIORITY_ACTION_ATTR, PRIORITY_ACTIONS_SLOT } from "@/components/layout/priority-actions";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 
 /** Every glyph is this wide. A monospace font, in a world with one font. */
@@ -233,6 +235,119 @@ export function withListGeometry(sizes: { viewport: number; row: number }): List
           Object.defineProperty(Element.prototype, name, descriptor);
         }
       }
+    },
+  };
+}
+
+/**
+ * A width for every element a priority-overflow header measures, and nothing
+ * else (Story 48.5).
+ *
+ * The header decides how many of its controls fit by measuring three kinds of
+ * thing: each candidate control, the two wrappers that hold what never moves,
+ * and the reserved status slot. jsdom measures none of them — `src/test/
+ * setup.ts` answers one whole viewport for every zero-sized element, so an
+ * unaided suite sees a 1024px trigger beside a 1024px button in a 1024px row
+ * and the arithmetic is meaningless. This answers a width the caller DECLARED
+ * for exactly those elements and leaves every other element to the suite's own
+ * shim, so a header test states its geometry instead of inheriting one.
+ *
+ * Keys are {@link PRIORITY_ACTION_ATTR} values, plus `leading`, `menu` and
+ * `status`. The two wrappers are found by their position in the group rather
+ * than by an attribute added to the product for this file's benefit.
+ *
+ * Returns the undo, which the caller MUST run — `Element.prototype` is shared
+ * with every other test in the file.
+ *
+ * What it cannot prove is the only thing it invents: whether the real font in
+ * the real 560px window produces widths anything like these.
+ */
+export function withActionWidths(widths: Record<string, number>): () => void {
+  const real = Element.prototype.getBoundingClientRect;
+  const box = (width: number): DOMRect =>
+    ({
+      width,
+      height: TEST_LINE_PX * 2,
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: TEST_LINE_PX * 2,
+      toJSON: () => ({}),
+    }) as DOMRect;
+
+  Element.prototype.getBoundingClientRect = function declared(this: Element): DOMRect {
+    const action = this.getAttribute(PRIORITY_ACTION_ATTR);
+    if (action !== null && widths[action] !== undefined) {
+      return box(widths[action]);
+    }
+    if (this.getAttribute("data-slot") === PANE_HEADER_STATUS_SLOT && widths.status !== undefined) {
+      return box(widths.status);
+    }
+    const group = this.parentElement;
+    if (group?.getAttribute("data-slot") === PRIORITY_ACTIONS_SLOT) {
+      if (this === group.lastElementChild && widths.menu !== undefined) {
+        return box(widths.menu);
+      }
+      if (this === group.firstElementChild && widths.leading !== undefined) {
+        return box(widths.leading);
+      }
+    }
+    return real.call(this);
+  };
+  return () => {
+    Element.prototype.getBoundingClientRect = real;
+  };
+}
+
+/**
+ * A `ResizeObserver` that fires when the test says so and never otherwise
+ * (Story 48.5).
+ *
+ * `src/test/setup.ts` installs one that records nothing and delivers nothing,
+ * because Radix's popper only needs the constructor to exist. That is exactly
+ * why an unaided jsdom leaves a self-sizing header at its narrowest shape — and
+ * why a suite that wants to see the header at 1400px has to deliver the
+ * observation itself.
+ *
+ * `resize` reaches only the observations taken on a `<header>`: Radix observes
+ * elements too, and handing its callback an invented entry would be a test of
+ * Radix. Callers wrap the call in `act`.
+ */
+export function withHandFiredResize(): {
+  resize: (width: number) => void;
+  undo: () => void;
+} {
+  const seen: { target: Element; callback: ResizeObserverCallback }[] = [];
+  const previous = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class implements ResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      seen.push({ target, callback: this.callback });
+    }
+    unobserve(): void {}
+    disconnect(): void {}
+  };
+  return {
+    resize: (width: number) => {
+      for (const { target, callback } of seen) {
+        if (target.tagName !== "HEADER") {
+          continue;
+        }
+        callback(
+          [
+            {
+              target,
+              contentRect: { width, height: TEST_LINE_PX * 2 } as DOMRectReadOnly,
+            } as ResizeObserverEntry,
+          ],
+          {} as ResizeObserver,
+        );
+      }
+    },
+    undo: () => {
+      globalThis.ResizeObserver = previous;
     },
   };
 }

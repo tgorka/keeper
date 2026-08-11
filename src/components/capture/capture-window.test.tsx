@@ -20,6 +20,7 @@ const notesCaptureWindows = vi.fn<() => Promise<CaptureWindowVm[]>>();
 const notesCaptureOpen = vi.fn<(target: unknown) => Promise<void>>();
 const notesCaptureClose = vi.fn<(key: string) => Promise<void>>();
 const notesCaptureSetLocked = vi.fn<(key: string, locked: boolean) => Promise<void>>();
+const notesCaptureSetAlwaysOnTop = vi.fn<(key: string, alwaysOnTop: boolean) => Promise<void>>();
 const listenNotesCaptureWindows = vi.fn<(onChanged: () => void) => Promise<() => void>>();
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -27,6 +28,8 @@ vi.mock("@/lib/ipc/client", () => ({
   notesCaptureOpen: (target: unknown) => notesCaptureOpen(target),
   notesCaptureClose: (key: string) => notesCaptureClose(key),
   notesCaptureSetLocked: (key: string, locked: boolean) => notesCaptureSetLocked(key, locked),
+  notesCaptureSetAlwaysOnTop: (key: string, alwaysOnTop: boolean) =>
+    notesCaptureSetAlwaysOnTop(key, alwaysOnTop),
   listenNotesCaptureWindows: (onChanged: () => void) => listenNotesCaptureWindows(onChanged),
 }));
 
@@ -57,7 +60,9 @@ vi.mock("@/components/capture/capture-document", () => ({
 import {
   CAPTURE_CLOSE_LABEL,
   CAPTURE_LOCK_LABEL,
+  CAPTURE_PIN_LABEL,
   CAPTURE_UNLOCK_LABEL,
+  CAPTURE_UNPIN_LABEL,
   CaptureNoteWindow,
   CaptureWindowChrome,
   useCaptureDismissKeys,
@@ -69,6 +74,9 @@ const FIRST: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n1" },
   locked: true,
   visible: true,
+  // On top, which every capture window was before Story 48.4 and which this
+  // fixture keeps so the toggle's two states are both live in one list.
+  alwaysOnTop: true,
   // Locked, so tao hit-tests no resize edge and there is no border to dodge.
   chromeInset: 0,
 };
@@ -78,6 +86,7 @@ const SECOND: CaptureWindowVm = {
   target: { kind: "note", vaultId: "v1", noteId: "n2" },
   locked: false,
   visible: true,
+  alwaysOnTop: false,
   // Unlocked on a 2x GTK display: `scale_factor() * 5`.
   chromeInset: 10,
 };
@@ -88,6 +97,7 @@ beforeEach(() => {
   notesCaptureWindows.mockResolvedValue([FIRST, SECOND]);
   notesCaptureClose.mockResolvedValue(undefined);
   notesCaptureSetLocked.mockResolvedValue(undefined);
+  notesCaptureSetAlwaysOnTop.mockResolvedValue(undefined);
   saveNote.mockResolvedValue(true);
   listenNotesCaptureWindows.mockResolvedValue(() => {});
 });
@@ -123,6 +133,72 @@ describe("CaptureWindowChrome", () => {
     await screen.findByRole("button", { name: CAPTURE_LOCK_LABEL });
     fireEvent.click(screen.getByRole("button", { name: CAPTURE_LOCK_LABEL }));
     expect(notesCaptureSetLocked).toHaveBeenCalledWith("note:v1/n2", true);
+  });
+
+  it("names the always-on-top state it moves to, in both states", async () => {
+    // Story 48.4. The accessible name IS the affordance here: the icon alone
+    // cannot say which way the toggle goes, and a name that stated the CURRENT
+    // state would tell a screen-reader user the opposite of what pressing does.
+    // Both states out of one fixture list, so a component that hard-coded
+    // either label fails on the other window rather than passing everywhere.
+    const { rerender } = render(<CaptureWindowChrome captureKey="note:v1/n1" onClose={() => {}} />);
+    // FIRST is on top, so the control offers to stop it.
+    const pinned = await screen.findByRole("button", { name: CAPTURE_UNPIN_LABEL });
+    expect(pinned).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("button", { name: CAPTURE_PIN_LABEL })).toBeNull();
+    // The icon too, and not only the name. The report asked for an *ikonke* —
+    // an icon — and a sighted user reads nothing else on this button. Because
+    // the glyph is `aria-hidden`, every accessible-name assertion above passes
+    // just as happily with the two icons swapped, which is a real defect for
+    // everyone who is not using a screen reader. `classList.contains` and not
+    // a substring match: "lucide-pin-off" contains "lucide-pin".
+    expect(pinned.querySelector("svg")?.classList.contains("lucide-pin")).toBe(true);
+
+    rerender(<CaptureWindowChrome captureKey="note:v1/n2" onClose={() => {}} />);
+    const unpinned = await screen.findByRole("button", { name: CAPTURE_PIN_LABEL });
+    expect(unpinned).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByRole("button", { name: CAPTURE_UNPIN_LABEL })).toBeNull();
+    expect(unpinned.querySelector("svg")?.classList.contains("lucide-pin-off")).toBe(true);
+  });
+
+  it("pins the window it belongs to, with the value it is toggling to", async () => {
+    // Both arguments asserted, following the lock's test: a toggle that passes
+    // the CURRENT value presses and changes nothing, and one that passes the
+    // first row's key pins somebody else's window.
+    const { rerender } = render(<CaptureWindowChrome captureKey="note:v1/n1" onClose={() => {}} />);
+    await screen.findByRole("button", { name: CAPTURE_UNPIN_LABEL });
+    fireEvent.click(screen.getByRole("button", { name: CAPTURE_UNPIN_LABEL }));
+    expect(notesCaptureSetAlwaysOnTop).toHaveBeenCalledWith("note:v1/n1", false);
+
+    rerender(<CaptureWindowChrome captureKey="note:v1/n2" onClose={() => {}} />);
+    await screen.findByRole("button", { name: CAPTURE_PIN_LABEL });
+    fireEvent.click(screen.getByRole("button", { name: CAPTURE_PIN_LABEL }));
+    expect(notesCaptureSetAlwaysOnTop).toHaveBeenLastCalledWith("note:v1/n2", true);
+    expect(notesCaptureSetAlwaysOnTop).toHaveBeenCalledTimes(2);
+    // And pinning is not locking: the two controls are independent, and a
+    // handler wired to the wrong store action would be invisible here without
+    // this line.
+    expect(notesCaptureSetLocked).not.toHaveBeenCalled();
+  });
+
+  it("keeps the close button last, so DW-199's corner inset still protects it", async () => {
+    // 47.5 inset the strip's top and right edges because GTK hit-tests an
+    // undecorated resizable window's resize border INSIDE the surface, and the
+    // close button sits where the top and right strips overlap. A third button
+    // is safe only while it does not take that corner.
+    render(<CaptureWindowChrome captureKey="note:v1/n2" onClose={() => {}} />);
+    await screen.findByRole("button", { name: CAPTURE_PIN_LABEL });
+    const names = screen.getAllByRole("button").map((button) => button.getAttribute("aria-label"));
+    expect(names).toEqual([CAPTURE_PIN_LABEL, CAPTURE_LOCK_LABEL, CAPTURE_CLOSE_LABEL]);
+  });
+
+  it("behaves as on-top before Rust has answered", async () => {
+    // Same direction of error as the lock's unknown state: assume what the
+    // window already is. Offering to "keep this window floating" over a window
+    // that is already floating would make the first press a no-op.
+    notesCaptureWindows.mockReturnValue(new Promise<CaptureWindowVm[]>(() => {}));
+    render(<CaptureWindowChrome captureKey="note:v1/n1" onClose={() => {}} />);
+    expect(screen.getByRole("button", { name: CAPTURE_UNPIN_LABEL })).toBeInTheDocument();
   });
 
   it("makes the strip a drag region only while the window is unlocked", async () => {

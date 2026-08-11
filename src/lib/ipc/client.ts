@@ -4614,6 +4614,25 @@ export async function notesCaptureSetLocked(key: string, locked: boolean): Promi
 }
 
 /**
+ * Pin or un-pin the capture window `key` (Story 48.4). Desktop only.
+ *
+ * The third control on the chrome strip, beside the lock. Persisted per window
+ * and applied to the live window, so the toggle takes effect without a reopen
+ * and survives a restart.
+ *
+ * A Rust command rather than `getCurrentWindow().setAlwaysOnTop()` because a
+ * capture window has no `core:window:allow-set-always-on-top` grant and never
+ * will: the webview's call would be denied, and denied quietly. The flag is
+ * persisted state that outlives the document, so it has to be written in Rust
+ * regardless.
+ *
+ * Rejects with: `unsupported` (non-desktop), `internal`.
+ */
+export async function notesCaptureSetAlwaysOnTop(key: string, alwaysOnTop: boolean): Promise<void> {
+  await invoke<void>("notes_capture_set_always_on_top", { key, alwaysOnTop });
+}
+
+/**
  * Every capture window open right now (Story 45.15, FR-191).
  *
  * One command for two readers: the main window renders the list, and a capture

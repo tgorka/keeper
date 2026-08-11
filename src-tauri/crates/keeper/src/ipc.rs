@@ -1535,6 +1535,16 @@ pub fn notes_capture_set_locked(key: String, locked: bool) -> Result<(), IpcErro
     )))
 }
 
+/// Mobile twin of `notes_capture_set_always_on_top` (Story 48.4).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_set_always_on_top(key: String, always_on_top: bool) -> Result<(), IpcError> {
+    let _ = (key, always_on_top);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
 /// Mobile twin of `notes_capture_windows` (Story 45.15).
 ///
 /// An empty list rather than a refusal, and that is the one twin here that is

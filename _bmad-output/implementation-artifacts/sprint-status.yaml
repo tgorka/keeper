@@ -494,6 +494,14 @@ development_status:
   47-4-a-name-keeper-claimed-and-labels-that-follow: review
   47-5-the-small-tail: review
   epic-47-retrospective: optional
+  epic-48: in-progress
+  48-1-every-column-folds-and-resizes: review
+  48-2-locking-stops-discarding-your-size: review
+  48-3-open-any-note-as-a-capture-window: review
+  48-4-always-on-top-beside-the-lock: review
+  48-5-the-header-stops-hiding-everything: review
+  48-6-a-remembered-folder-is-re-read-once: review
+  epic-48-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in

@@ -52,15 +52,102 @@ export const COLUMN_KEY_STEP = 8;
 /** How far a shifted arrow-key press moves it. Coarse pass, then fine pass. */
 export const COLUMN_KEY_STEP_COARSE = 32;
 
+/**
+ * A column of a surface, as opposed to a column inside a panel (Story 48.1).
+ *
+ * The four here are the ones a person sees beside each other in the shell: the
+ * notes rail and the note list on Notes, the tree on Files, the chat list on
+ * Inbox. Every one of them used to be a hand-written `w-[240px]` or `w-[320px]`
+ * on the element itself, which is why until this story none of them could be
+ * folded or dragged: a Tailwind literal is not a number anything can remember.
+ *
+ * One registry rather than a constant per surface, because the fold store keys
+ * its cookie on exactly this id set. Two lists would agree until the day a
+ * column is added to one of them.
+ */
+export interface SurfaceColumnSpec {
+  /**
+   * What the fold and the seam are named after, mid-sentence and lowercase:
+   * "Collapse note list", "Resize note list". The label is the column, not the
+   * surface — "Resize Notes" would name two different columns on one screen.
+   */
+  label: string;
+  /** The width it occupies until somebody drags it, in px. */
+  defaultWidth: number;
+  /**
+   * The narrowest it may be dragged, in px, decided per column rather than
+   * shared. {@link MIN_COLUMN_WIDTH} is a floor for a property KEY, where 72px
+   * still shows an ellipsis and the overflow trigger that reads the rest. A
+   * surface column has no overflow trigger — what is past its edge is simply
+   * gone — so its floor is the width of the narrowest row that is still worth
+   * reading, per column and stated per column below.
+   */
+  minWidth: number;
+}
+
+/** Every surface column, in no particular order — ids, not positions. */
+export const SURFACE_COLUMN_IDS = ["notes-rail", "notes-list", "files-tree", "chat-list"] as const;
+
+export type SurfaceColumnId = (typeof SURFACE_COLUMN_IDS)[number];
+
+export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
+  // 240 is what the rail has been since Story 37.1. The floor is the New note
+  // button: a 16px icon, a gap, the words, and the 8px padding either side —
+  // under about 180 the label it exists to advertise starts being clipped, and
+  // a space row's trailing `+` lands on top of the space's name.
+  "notes-rail": { label: "notes rail", defaultWidth: 240, minWidth: 180 },
+  // 320 is what the list has been since Story 37.1. The floor holds a row's two
+  // lines — a title and a meta line of tag chips — plus the filter bar's search
+  // field above them. Narrower and the chips wrap one per line, which makes the
+  // list taller rather than narrower and helps nobody.
+  "notes-list": { label: "note list", defaultWidth: 320, minWidth: 240 },
+  // The tree used to be `flex-1`, splitting the surface evenly with the panel
+  // strip. That was never a decision — it was two panes with the same class —
+  // and it gave half the window to a folder list while the document it opened
+  // got the other half. 360 because a tree row indents 16px per level and a
+  // path four deep still has to show a filename; the floor keeps three levels
+  // and a short name, which is the point past which the tree stops being
+  // navigable rather than merely tight.
+  "files-tree": { label: "file tree", defaultWidth: 360, minWidth: 220 },
+  // 320 is what the inbox has been since the first shell. A chat row is a 40px
+  // avatar, a name, a preview line and a timestamp; the floor is where the
+  // timestamp would start eating the name.
+  "chat-list": { label: "chat list", defaultWidth: 320, minWidth: 240 },
+};
+
+/**
+ * The floor `id` is held to.
+ *
+ * Consulted on read as well as on write, so a width recorded by a build with a
+ * lower floor — or by a hand-edited jar — comes back inside today's range
+ * rather than being enforced at one call site and leaked at the next. An id
+ * that is not a surface column — the Properties key column is the only other
+ * one — keeps the shared {@link MIN_COLUMN_WIDTH}.
+ */
+export function columnMinWidth(id: string): number {
+  // `id` is a plain string because the Properties key column is one too. The
+  // cast widens the key type for the lookup and nothing else; the `undefined`
+  // in it is the honest result for a key the record does not hold, which is
+  // what the fallback below is for.
+  const table = SURFACE_COLUMNS as Record<string, SurfaceColumnSpec | undefined>;
+  return table[id]?.minWidth ?? MIN_COLUMN_WIDTH;
+}
+
 /** Ids are ours, so they are constrained rather than escaped. */
 const ID = /^[a-z][a-z0-9-]*$/;
 
-/** Hold a width inside the range a column is allowed to occupy. */
-export function clampColumnWidth(px: number): number {
+/**
+ * Hold a width inside the range a column is allowed to occupy.
+ *
+ * `min` defaults to the shared floor and is overridden per surface column
+ * ({@link columnMinWidth}): a whole column and a property key are both columns
+ * and they are not both readable at 72px.
+ */
+export function clampColumnWidth(px: number, min: number = MIN_COLUMN_WIDTH): number {
   if (!Number.isFinite(px)) {
-    return MIN_COLUMN_WIDTH;
+    return min;
   }
-  return Math.round(Math.min(MAX_COLUMN_WIDTH, Math.max(MIN_COLUMN_WIDTH, px)));
+  return Math.round(Math.min(MAX_COLUMN_WIDTH, Math.max(min, px)));
 }
 
 /**
@@ -86,7 +173,7 @@ export function readColumnWidths(cookie: string): Record<string, number> {
       const id = entry.slice(0, colon);
       const px = Number.parseInt(entry.slice(colon + 1), 10);
       if (ID.test(id) && Number.isFinite(px)) {
-        widths[id] = clampColumnWidth(px);
+        widths[id] = clampColumnWidth(px, columnMinWidth(id));
       }
     }
   }
@@ -106,7 +193,7 @@ export function columnWidthCookie(cookie: string, id: string, px: number | null)
   if (px === null) {
     delete widths[id];
   } else {
-    widths[id] = clampColumnWidth(px);
+    widths[id] = clampColumnWidth(px, columnMinWidth(id));
   }
   const value = Object.entries(widths)
     .map(([key, width]) => `${key}:${width}`)

@@ -229,9 +229,17 @@ describe("the quick-capture capability", () => {
     // asserted rather than assumed. `set-position` in particular: Rust places
     // these windows, and a webview that could place itself could place itself
     // off screen.
+    //
+    // `set-always-on-top` joins them for Story 48.4, and its absence is load
+    // bearing rather than incidental: the pin button goes through the Rust
+    // command `notes_capture_set_always_on_top` precisely BECAUSE the webview
+    // cannot make this call. Granting it here would offer a second, quieter
+    // path that skips the persistence — the flag would survive until the
+    // window closed and no longer.
     for (const permission of [
       "core:window:allow-set-position",
       "core:window:allow-set-size",
+      "core:window:allow-set-always-on-top",
       "deep-link:default",
       "global-shortcut:default",
     ]) {

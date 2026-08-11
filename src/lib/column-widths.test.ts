@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   COLUMN_WIDTH_COOKIE,
   clampColumnWidth,
+  columnMinWidth,
   columnTemplate,
   columnWidthCookie,
   MAX_COLUMN_WIDTH,
   MIN_COLUMN_WIDTH,
   readColumnWidths,
+  SURFACE_COLUMN_IDS,
+  SURFACE_COLUMNS,
 } from "@/lib/column-widths";
 
 /**
@@ -80,5 +83,57 @@ describe("column width persistence", () => {
       `minmax(${MIN_COLUMN_WIDTH}px, fit-content(50%)) 0px minmax(0, 1fr)`,
     );
     expect(columnTemplate(180)).toBe("180px 0px minmax(0, 1fr)");
+  });
+});
+
+/**
+ * A surface column's floor is its own (Story 48.1).
+ *
+ * {@link MIN_COLUMN_WIDTH} was chosen for a property KEY, where 72px still
+ * shows an ellipsis and the overflow trigger that reads the rest. A whole
+ * column has no overflow trigger, so each one states its own floor and the
+ * codec has to hold it everywhere a width can enter — a drag, a write, and a
+ * jar written by a build that had a different one.
+ */
+describe("surface column floors", () => {
+  it("holds each column to its own floor and leaves other ids on the shared one", () => {
+    expect(columnMinWidth("notes-rail")).toBe(SURFACE_COLUMNS["notes-rail"].minWidth);
+    expect(columnMinWidth("chat-list")).toBe(SURFACE_COLUMNS["chat-list"].minWidth);
+    // The Properties key column, which is the only other resizable column.
+    expect(columnMinWidth("properties-key")).toBe(MIN_COLUMN_WIDTH);
+  });
+
+  it("gives every surface column a floor above the shared one and below its default", () => {
+    // Not decoration: a floor at or below 72 would mean nobody decided, and a
+    // floor above the default would mean the column starts out of range.
+    for (const id of SURFACE_COLUMN_IDS) {
+      const spec = SURFACE_COLUMNS[id];
+      expect(spec.minWidth).toBeGreaterThan(MIN_COLUMN_WIDTH);
+      expect(spec.minWidth).toBeLessThan(spec.defaultWidth);
+      expect(spec.defaultWidth).toBeLessThanOrEqual(MAX_COLUMN_WIDTH);
+    }
+  });
+
+  it("clamps a drag to the column's floor, not to the shared one", () => {
+    expect(clampColumnWidth(80, columnMinWidth("notes-rail"))).toBe(
+      SURFACE_COLUMNS["notes-rail"].minWidth,
+    );
+    expect(clampColumnWidth(Number.NaN, columnMinWidth("notes-rail"))).toBe(
+      SURFACE_COLUMNS["notes-rail"].minWidth,
+    );
+  });
+
+  it("lifts a width recorded below today's floor on the way back in", () => {
+    // The read path and the write path both, because a floor enforced on write
+    // alone leaks the moment a build lowers one — or a person edits the jar.
+    const jar = `${COLUMN_WIDTH_COOKIE}=notes-rail:80|properties-key:80`;
+
+    expect(readColumnWidths(jar)).toEqual({
+      "notes-rail": SURFACE_COLUMNS["notes-rail"].minWidth,
+      "properties-key": 80,
+    });
+    expect(readColumnWidths(columnWidthCookie(jar, "chat-list", 100))["chat-list"]).toBe(
+      SURFACE_COLUMNS["chat-list"].minWidth,
+    );
   });
 });

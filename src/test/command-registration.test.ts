@@ -58,16 +58,45 @@ const invoked = [
 ].sort();
 
 /**
- * Every `path::name` mentioned in the shell's entry point. Deliberately not
- * scoped to the `generate_handler!` literal: the desktop commands are spliced
- * in at the macro's call site through `$($extra,)*`, so a literal-only scan
- * would report ninety perfectly-registered commands as missing and teach the
- * next reader to disbelieve this file. The trailing comma is optional because
- * the last entry in a list does not have one.
+ * The names registered on a given target.
+ *
+ * **Scoped per target, and that is the whole point of this function.** The
+ * shell registers commands in three places: the shared `generate_handler!`
+ * literal inside `macro_rules! keeper_with_commands`, a `#[cfg(desktop)]` call
+ * site that splices in the desktop-only commands, and a `#[cfg(not(desktop))]`
+ * call site that splices in `Unsupported` iOS twins so the handler list is the
+ * same shape on every target (AD-27, AD-33).
+ *
+ * A scan that reads the whole file and keeps only the `name` half of
+ * `path::name` cannot tell those apart, because the desktop entry is
+ * `notes_ipc::foo` and its twin is `ipc::foo` — same captured name. Story 48.4
+ * proved that empirically: deleting a command's DESKTOP registration left this
+ * suite green, because the iOS twin satisfied the check. The guard was
+ * answering "is this command registered somewhere" when the question it exists
+ * to ask is "is it registered on the target that implements it".
+ *
+ * So each call site is read separately and the shared literal is added to both.
  */
-const registered = new Set(
-  [...SHELL_LIB.matchAll(/(?:^|\s)[a-z_]+::([a-z0-9_]+)\s*(?:,|\n\s*\])/g)].map(([, name]) => name),
-);
+function registeredOn(target: "desktop" | "mobile"): Set<string> {
+  const cfg = target === "desktop" ? "#[cfg(desktop)]" : "#[cfg(not(desktop))]";
+  const at = SHELL_LIB.indexOf(`${cfg}\n    let builder = keeper_with_commands!(`);
+  if (at < 0) {
+    throw new Error(`no ${cfg} keeper_with_commands! call site — the shell's shape changed`);
+  }
+  const open = SHELL_LIB.indexOf("(", SHELL_LIB.indexOf("keeper_with_commands!", at));
+  const close = SHELL_LIB.indexOf("\n    );", open);
+  const spliced = SHELL_LIB.slice(open, close);
+  // The shared literal: everything the macro body registers on every target.
+  const body = SHELL_LIB.indexOf("tauri::generate_handler![");
+  const shared = SHELL_LIB.slice(body, SHELL_LIB.indexOf("\n            ]", body));
+  return new Set(
+    [...`${shared}\n${spliced}`.matchAll(/(?:^|\s)[a-z_]+::([a-z0-9_]+)\s*(?:,|\n)/g)].map(
+      ([, name]) => name,
+    ),
+  );
+}
+
+const registered = registeredOn("desktop");
 
 describe("the commands the frontend invokes", () => {
   it("come from client.ts and nowhere else, so reading one file is complete", () => {
@@ -78,10 +107,35 @@ describe("the commands the frontend invokes", () => {
     expect(bridges).toHaveLength(1);
   });
 
-  it("are each registered on the builder", () => {
+  it("are each registered on the DESKTOP builder", () => {
     // Named rather than counted: a count tells you something is wrong, a list
     // tells you which command stopped working and which story owns it.
+    //
+    // "Desktop" is load-bearing. Until story 48.4 this read the whole file and
+    // an iOS `Unsupported` twin could satisfy it for a command whose desktop
+    // registration had been deleted — a feature dead on the only platform that
+    // ships, with a green tree. That is the exact class this file exists to
+    // stop, and it survived here for two epics.
     expect(invoked.filter((command) => !registered.has(command))).toEqual([]);
+  });
+
+  it("keeps the two targets' handler lists the same shape", () => {
+    // AD-27/AD-33: iOS carries `Unsupported` twins so the list is identical on
+    // every target and `cargo check --target aarch64-apple-ios` stays green.
+    // Asserted rather than assumed, because it is what makes the scan above
+    // meaningful: if the twins stopped mirroring, a desktop-only reading would
+    // start reporting commands iOS never had.
+    const mobile = registeredOn("mobile");
+    // A scan-sanity floor, not a target. It is lower than the desktop side's
+    // because iOS carries twins for only the commands a phone can reach at
+    // all — measured at 192 when this was written, and the number exists to
+    // catch a regex that stopped matching, not to pin a count that will move.
+    expect(mobile.size).toBeGreaterThan(150);
+    // Every twin names a command the desktop also registers. The reverse is
+    // deliberately not asserted — desktop-only commands with no twin are the
+    // normal case (`CapabilitiesVm.notes` is false on iOS, so nothing calls
+    // them) and requiring a twin for each would be a different, wrong rule.
+    expect([...mobile].filter((name) => !registered.has(name))).toEqual([]);
   });
 
   it("is a list long enough that a broken scan would be obvious", () => {

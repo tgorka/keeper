@@ -22,6 +22,17 @@ target: CaptureTargetVm,
  */
 locked: boolean, 
 /**
+ * Whether the window floats above other applications (Story 48.4).
+ *
+ * Carried on the view model rather than read back from the live window by
+ * the chrome, because the chrome cannot read it: a webview may not ask its
+ * own window whether it is on top, and `quick-capture.json` deliberately
+ * grants no window permissions at all. This is the same reason `locked`
+ * rides here — the toggle's pressed state has to come from the same list
+ * the lock's does, or the two buttons could disagree.
+ */
+alwaysOnTop: boolean, 
+/**
  * Whether it is on screen. A hidden draft window is still a window.
  */
 visible: boolean, 

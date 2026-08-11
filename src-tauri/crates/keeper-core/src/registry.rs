@@ -2852,11 +2852,13 @@ mod tests {
             // that round-trips the position and drops the size would look
             // correct here without one of these fields.
             size: Some((900, 600)),
+            always_on_top: true,
         };
         let pinned = Placement {
             locked: true,
             position: Some((-15, 900)),
             size: None,
+            always_on_top: true,
         };
         set_capture_placement(&dir, "draft", &dragged).expect("place draft");
         assert_eq!(

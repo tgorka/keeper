@@ -9,13 +9,28 @@
  * anything — a store that kept its own idea of which windows exist would
  * disagree with the compositor the first time one was closed from the OS.
  *
- * **One store, read by two different kinds of window.** The main window renders
- * the list (so "open this note as a capture window" can raise the one that is
- * already there instead of asking for a second). A capture window finds *its
- * own* row in the same list, by its own key, and reads its lock state out of
- * it. A second "what am I?" command would be a second answer to one question,
- * and the two would disagree the moment a window closed while another was
- * reading.
+ * **One store, and today exactly one kind of window reads it.** A capture
+ * window finds *its own* row in the list, by its own key, and reads its lock
+ * state out of it. A second "what am I?" command would be a second answer to
+ * one question, and the two would disagree the moment a window closed while
+ * another was reading.
+ *
+ * The **main window does not mirror this list at all**, and this doc claimed
+ * for three epics that it did — "the main window renders the list, so 'open
+ * this note as a capture window' can raise the one that is already there
+ * instead of asking for a second". It does not: `hydrateCaptureWindows` and
+ * `listenNotesCaptureWindows` are called from one place in the repository,
+ * `capture-window.tsx`'s chrome effect, which only ever runs inside a capture
+ * window's own document. So in the main window `windows` is `null` and
+ * {@link captureWindowFor} answers `null` for every key.
+ *
+ * Story 48.3 left it that way on purpose rather than adding a main-window
+ * subscription. Nothing needs it: raising rather than duplicating is
+ * `notes_window::open`'s own property, decided from the window label, where it
+ * cannot go stale — a mirror could only be used to change a LABEL, and a mirror
+ * that misses a window closed from the OS would change it wrongly. The claim is
+ * corrected here rather than deleted because a doc that described a consumer
+ * nobody had written is most of why Story 45.15 read as finished.
  *
  * **Keys are Rust's.** Every row carries the key `keeper_core::capture` built;
  * a caller compares keys and never constructs one. `captureKey` exists in
@@ -29,6 +44,7 @@ import {
   type CaptureWindowVm,
   notesCaptureClose,
   notesCaptureOpen,
+  notesCaptureSetAlwaysOnTop,
   notesCaptureSetLocked,
   notesCaptureWindows,
 } from "@/lib/ipc/client";
@@ -106,6 +122,22 @@ export async function closeCaptureWindow(key: string): Promise<void> {
 /** Lock or unlock the capture window `key`, then re-read. */
 export async function setCaptureWindowLocked(key: string, locked: boolean): Promise<void> {
   await notesCaptureSetLocked(key, locked);
+  await hydrateCaptureWindows();
+}
+
+/**
+ * Pin or un-pin the capture window `key`, then re-read (Story 48.4).
+ *
+ * The re-read is not optional bookkeeping: the chrome's pressed state comes
+ * from the row, and the row reports what the WINDOW MANAGER did rather than
+ * what was asked for. A compositor that refuses the request leaves the button
+ * where it was, which is the truth.
+ */
+export async function setCaptureWindowAlwaysOnTop(
+  key: string,
+  alwaysOnTop: boolean,
+): Promise<void> {
+  await notesCaptureSetAlwaysOnTop(key, alwaysOnTop);
   await hydrateCaptureWindows();
 }
 
