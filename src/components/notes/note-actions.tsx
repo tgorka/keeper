@@ -11,13 +11,20 @@
  * true. Everything that opens a panel or a dialog now lives in here; the
  * header keeps one control beside it. Children render above Delete.
  *
- * **The trigger is a word, not an icon.** It stood among five text buttons as a
- * bare `⋯`, and an icon among words reads as decoration. `bridge-card.tsx:266`
- * is the house's other object-level dropdown sitting in a row of words and it
- * spells its trigger "Manage"; this one spells "Actions". The visible text is a
- * prefix of the accessible name rather than a different word, because a control
- * whose label and whose accessible name disagree cannot be operated by anyone
- * saying what they see (WCAG 2.5.3).
+ * **The trigger is an icon again, and for the same reason it stopped being one
+ * (Story 48.9).** 46.5's ruling was not "words beat icons": it was that a bare
+ * `⋯` STANDING AMONG FIVE TEXT BUTTONS reads as decoration. The row it stands
+ * in is now four icons and a paperclip, and a word among pictures reads exactly
+ * as badly as a picture among words did — so the rule holds and the answer
+ * flips. `MoreHorizontal` and not some new glyph: `properties-panel.tsx`'s
+ * `NOTE_PATH_ACTIONS_LABEL` is the same affordance over a different object and
+ * already draws it, and this trigger's label was worded after that one.
+ *
+ * {@link NOTE_ACTIONS_TEXT} is therefore no longer rendered as text — it is the
+ * `title` a pointer gets, and the prefix of the accessible name, which still
+ * carries the note's title after it. A control whose spoken name does not
+ * contain the word its tooltip shows cannot be operated by anyone saying what
+ * they see (WCAG 2.5.3).
  *
  * Destructive last, and behind a separator: nothing has to reason about
  * position, the item under the cursor when the menu opens is never the one that
@@ -27,6 +34,7 @@
  * reader walking a workspace with several note panels open would otherwise hear
  * the same control in each of them.
  */
+import { MoreHorizontal } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { Button } from "@/components/ui/button";
@@ -46,9 +54,10 @@ import {
 export const NOTE_ACTIONS_LABEL = "Actions for";
 
 /**
- * The word ON the trigger. A prefix of `NOTE_ACTIONS_LABEL`, deliberately: the
- * accessible name is the visible label plus the note's title, so speech input
- * and a screen reader and an eye all name the same control.
+ * The word FOR the trigger: its tooltip, and the prefix of
+ * `NOTE_ACTIONS_LABEL`. Not rendered as text since 48.9 — the trigger draws
+ * `MoreHorizontal` — but still the one word this control answers to, so speech
+ * input, a screen reader, a tooltip and a test all name it the same way.
  */
 export const NOTE_ACTIONS_TEXT = "Actions";
 
@@ -85,8 +94,18 @@ export function NoteActions({
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button size="sm" variant="ghost" aria-label={`${NOTE_ACTIONS_LABEL} ${title}`}>
-            {NOTE_ACTIONS_TEXT}
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
+            // The name carries the note's title so a workspace with several
+            // note panels open does not announce the same control in each of
+            // them; the tooltip carries only the word, because the title is
+            // already on screen an inch to the left.
+            aria-label={`${NOTE_ACTIONS_LABEL} ${title}`}
+            title={NOTE_ACTIONS_TEXT}
+          >
+            <MoreHorizontal aria-hidden="true" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">

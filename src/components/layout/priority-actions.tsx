@@ -52,6 +52,15 @@
  * group back into a measuring pass for one commit and then re-plans. That is
  * why the map is keyed by {@link PriorityAction.id} rather than by index.
  *
+ * **A promoted control is an icon, so the widths this walks over are the
+ * icon's** (Story 48.9). The measurement did not change shape when the labels
+ * came off — it is still "render every candidate, read the box the browser
+ * gave it" — but the boxes are now a square rather than a word, and the same
+ * arithmetic therefore promotes more of them. That is the point, and it is why
+ * no number in here was touched to get it: a hardcoded icon width would be the
+ * declared table this section exists to refuse, and it would be wrong on the
+ * first machine whose focus ring, border or user text-size disagreed.
+ *
  * # What this component does not decide
  *
  * The order, the labels, and what the menu holds. Priority is a product
@@ -61,6 +70,7 @@
  * keep its own separator rules. The one thing the caller must honour is the
  * predicate: an item the group promoted must not also be put in the menu.
  */
+import type { LucideIcon } from "lucide-react";
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { PANE_HEADER_GAP_PX } from "./pane-header";
@@ -79,8 +89,18 @@ export interface PriorityAction {
    * item that comes and goes is measured once and not once per appearance.
    */
   readonly id: string;
-  /** The word, on the control and in the menu item. Its width IS the measurement. */
+  /**
+   * The word. Not on the control any more — the control is its icon — but
+   * still its accessible name and its tooltip, and still the words in the
+   * menu item when it does not promote.
+   */
   readonly label: string;
+  /**
+   * The glyph the promoted control draws. Required rather than optional: an
+   * icon-only row with one word in it reads as a mistake, and an optional icon
+   * is an invitation to ship that row.
+   */
+  readonly icon: LucideIcon;
   /** What the control and the menu item both do. One handler, so they cannot drift. */
   readonly onSelect: () => void;
 }
@@ -243,7 +263,7 @@ export function PriorityActions({
           {leading}
         </div>
       )}
-      {items.slice(0, promoted).map((item) => (
+      {items.slice(0, promoted).map(({ icon: Icon, ...item }) => (
         <Button
           key={item.id}
           ref={(node) => {
@@ -254,12 +274,20 @@ export function PriorityActions({
             }
           }}
           {...{ [PRIORITY_ACTION_ATTR]: item.id }}
-          size="sm"
+          type="button"
+          size="icon-sm"
           variant="ghost"
+          // The word is gone from the surface and from nowhere else. `title`
+          // is what a pointer gets on a hover; `aria-label` is the whole
+          // visible word rather than a description of it, so speech input can
+          // say what an eye reads even though the eye reads a picture
+          // (WCAG 2.5.3). An icon with no name is a control nobody can ask for.
+          aria-label={item.label}
+          title={item.label}
           className="shrink-0"
           onClick={item.onSelect}
         >
-          {item.label}
+          <Icon aria-hidden="true" />
         </Button>
       ))}
       <div ref={menuRef} className="flex shrink-0 items-center">

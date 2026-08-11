@@ -25,6 +25,7 @@
  * the editor stays alive behind them so Escape returns to the caret it left,
  * which is a promise a remount could not keep.
  */
+import { Files, FolderSearch, History, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
@@ -139,7 +140,7 @@ function PanelUnavailable({
   return (
     <div
       data-slot={PANEL_UNAVAILABLE_SLOT}
-      className="flex items-center gap-2 border-b px-3 py-1 text-[11px] text-muted-foreground"
+      className="flex items-center gap-2 border-b px-3 py-1 text-meta text-muted-foreground"
     >
       <span className="min-w-0 flex-1">{reason}</span>
       {mode === "history" ? (
@@ -281,8 +282,8 @@ const SIZER_HALF_DAY_MS = 12 * 60 * 60 * 1000;
  *
  * Produced by `saveStateWord` rather than written out, so a change to the
  * wording cannot change what the caption shows without also changing what the
- * slot reserves. The digits need no entry of their own: the slot is
- * `tabular-nums`, so every digit is exactly as wide as every other one.
+ * slot reserves. The digits need no entry of their own: the slot carries
+ * `figures`, so every digit is exactly as wide as every other one.
  *
  * The error string is deliberately absent, and it is the one caption that
  * cannot be reserved for — it is Rust's message verbatim, so it is unbounded.
@@ -695,17 +696,35 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
    * and whose effect came from different rules is one that can be present and
    * fail. Arriving late is why the group is keyed by id — the width of an item
    * that appears an instant after the vault list is measured when it appears.
+   *
+   * # The glyphs (Story 48.9)
+   *
+   * Each is picked to be unclaimed elsewhere in this app, because two controls
+   * drawn the same are two controls a hand learns as one. `Files` is a stack of
+   * documents — what this note HAS — against the paperclip beside it, which is
+   * how one more gets in. `SlidersHorizontal` is the note's settable fields and
+   * deliberately not the gear, which the nav already spends on the app's own
+   * settings. `History` is the clock that runs backwards. `FolderSearch` is a
+   * folder being looked into, which is literally the act: reveal this file
+   * where it lies. None of the four appears in `sidebar-pane.tsx`'s nav or in
+   * `format-toolbar.tsx`'s marks.
    */
   const headerActions = useMemo<readonly PriorityAction[]>(() => {
     const acts: PriorityAction[] = [
-      { id: "attachments", label: ATTACHMENTS_LABEL, onSelect: toggleAttachments },
-      { id: "properties", label: PROPERTIES_LABEL, onSelect: toggleProperties },
-      { id: "history", label: NOTE_HISTORY_LABEL, onSelect: openHistory },
+      { id: "attachments", label: ATTACHMENTS_LABEL, icon: Files, onSelect: toggleAttachments },
+      {
+        id: "properties",
+        label: PROPERTIES_LABEL,
+        icon: SlidersHorizontal,
+        onSelect: toggleProperties,
+      },
+      { id: "history", label: NOTE_HISTORY_LABEL, icon: History, onSelect: openHistory },
     ];
     if (vault !== null && path !== null && filePathForNote(vault, path) !== null) {
       acts.push({
         id: "show-in-files",
         label: SHOW_IN_FILES_LABEL,
+        icon: FolderSearch,
         onSelect: () => showNoteInFiles(vault, path),
       });
     }
@@ -741,18 +760,20 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           it. The capture window mounts this exact header, so one structure
           answers both hosts. */}
       <PaneHeader
-        className="border-b px-3 py-1.5"
+        // `py-1` around the row's 32px controls is DESIGN.md's 40px pane-header
+        // exactly. It was `py-1.5` around controls that were already 32px, so
+        // the row has been 44px since 46.4 — four pixels the capture window
+        // spends on nothing, in the one host that has none to spare.
+        className="border-b px-3 py-1"
         // Group 1 — identity. The only member of the row allowed to give
         // ground; see the component's doc for why that is a property of the
         // wrapper and not of these two elements.
         identity={
           <>
-            <h1 className="min-w-0 flex-1 truncate font-medium text-sm">
+            <h1 className="min-w-0 flex-1 truncate font-heading text-title">
               {deriveTitle(body.text)}
             </h1>
-            <span className="truncate font-mono text-[11px] text-muted-foreground">
-              {path ?? ""}
-            </span>
+            <span className="truncate font-mono text-meta text-muted-foreground">{path ?? ""}</span>
           </>
         }
         // Group 2 — status. One box for all three captions, reserved from the
@@ -856,7 +877,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
       />
 
       {conflictCopy === null ? null : (
-        <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+        <p className="border-b px-3 py-1 text-meta text-muted-foreground">
           keeper kept the version that was on disk as {conflictCopy} before writing yours.
         </p>
       )}
@@ -865,7 +886,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           which were already in this note. `role="status"` because it answers
           something the person just did and they may not be looking here. */}
       {attachOutcome === null ? null : (
-        <p role="status" className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+        <p role="status" className="border-b px-3 py-1 text-meta text-muted-foreground">
           {attachOutcome}
         </p>
       )}
@@ -879,14 +900,14 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
         <p
           role="status"
           data-slot={LINK_NOTICE_SLOT}
-          className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+          className="border-b px-3 py-1 text-meta text-muted-foreground"
         >
           {linkNotice}
         </p>
       )}
 
       {body.gone ? (
-        <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">
+        <p className="border-b px-3 py-1 text-meta text-muted-foreground">
           This note isn't on disk any more. Your text is still here and saving writes it back.
         </p>
       ) : null}

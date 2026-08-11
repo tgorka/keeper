@@ -222,22 +222,24 @@ describe("deleting the open note, from the editor's own header", () => {
  * test that claimed to measure them would be lying about jsdom.
  */
 describe("finding the destructive verb", () => {
-  it("puts a word on the trigger, and the word is part of the name it answers to", async () => {
+  it("puts the trigger's word in the name it answers to and on its tooltip", async () => {
     openOn("# Standup\n");
     render(<NoteEditor vaultId="v1" noteId="note-7" />);
 
     const trigger = await screen.findByRole("button", {
       name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
     });
-    // The whole report, in one assertion: an icon among words reads as
-    // decoration. A trigger whose only child is an SVG has no text content at
-    // all, which is what this was.
-    expect(trigger).toHaveTextContent(NOTE_ACTIONS_TEXT);
-    // And the eye and the screen reader are naming the same control (WCAG
-    // 2.5.3): speech input asks for what it can see, so a visible label that
-    // is not part of the accessible name is a control nobody can say.
+    // 46.5's report was that an icon among five WORDS reads as decoration. The
+    // row is icons now, so the trigger is one too (48.9) — and the word it used
+    // to render is still the word it answers to. The eye reads the tooltip, a
+    // screen reader reads the name, speech input says either: all three are the
+    // same words (WCAG 2.5.3).
+    expect(trigger).toHaveAttribute("title", NOTE_ACTIONS_TEXT);
     const spoken = trigger.getAttribute("aria-label") ?? "";
-    expect(spoken.startsWith(trigger.textContent ?? "")).toBe(true);
+    expect(spoken.startsWith(NOTE_ACTIONS_TEXT)).toBe(true);
+    // The name carries the note as well as the act, so a workspace with two
+    // note panels open does not announce one control twice.
+    expect(spoken).toContain("Standup");
   });
 
   it("leaves two controls in the header, so its last one is not the one off the screen", async () => {
@@ -255,11 +257,14 @@ describe("finding the destructive verb", () => {
       `[data-slot="${PANE_HEADER_ACTIONS_SLOT}"]`,
     );
     expect(actions).not.toBeNull();
-    const labels = Array.from(
-      (actions as HTMLElement).querySelectorAll("button"),
-      (button) => button.textContent,
+    // By accessible name, not by text: both controls are glyphs since 48.9, so
+    // their text content is empty and the identities this asserts live in the
+    // names. `within(...).getByRole` would not preserve the row's ORDER, which
+    // is the half of this that says the menu is still last.
+    const labels = Array.from((actions as HTMLElement).querySelectorAll("button"), (button) =>
+      button.getAttribute("aria-label"),
     );
-    expect(labels).toEqual([ATTACH_FILE_LABEL, NOTE_ACTIONS_TEXT]);
+    expect(labels).toEqual([ATTACH_FILE_LABEL, `${NOTE_ACTIONS_LABEL} Standup`]);
   });
 
   it("still offers every verb the header used to carry, by name, from that one menu", async () => {

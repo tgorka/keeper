@@ -25,6 +25,14 @@
  * font in the real 560px window produces the widths this file invents.
  */
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import {
+  Files,
+  FolderSearch,
+  History,
+  MoreHorizontal,
+  Paperclip,
+  SlidersHorizontal,
+} from "lucide-react";
 import { afterEach, describe, expect, it } from "vitest";
 import { Button } from "@/components/ui/button";
 import {
@@ -201,10 +209,25 @@ const picked: string[] = [];
 
 /** The note header's four candidates, in its declared priority order. */
 const ITEMS: readonly PriorityAction[] = [
-  { id: "attachments", label: "Attachments", onSelect: () => picked.push("attachments") },
-  { id: "properties", label: "Properties", onSelect: () => picked.push("properties") },
-  { id: "history", label: "History", onSelect: () => picked.push("history") },
-  { id: "files", label: "Show in Files", onSelect: () => picked.push("files") },
+  {
+    id: "attachments",
+    label: "Attachments",
+    icon: Files,
+    onSelect: () => picked.push("attachments"),
+  },
+  {
+    id: "properties",
+    label: "Properties",
+    icon: SlidersHorizontal,
+    onSelect: () => picked.push("properties"),
+  },
+  { id: "history", label: "History", icon: History, onSelect: () => picked.push("history") },
+  {
+    id: "files",
+    label: "Show in Files",
+    icon: FolderSearch,
+    onSelect: () => picked.push("files"),
+  },
 ];
 
 /** A verb that never leaves the menu, whatever the row can afford. */
@@ -243,16 +266,16 @@ function Harness(): React.ReactElement {
         <PriorityActions
           budget={budget}
           leading={
-            <Button size="sm" variant="ghost">
-              Attach a file
+            <Button size="icon-sm" variant="ghost" aria-label="Attach a file" title="Attach a file">
+              <Paperclip aria-hidden="true" />
             </Button>
           }
           items={ITEMS}
           menu={(inMenu) => (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="ghost">
-                  Actions
+                <Button size="icon-sm" variant="ghost" aria-label="Actions" title="Actions">
+                  <MoreHorizontal aria-hidden="true" />
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
@@ -273,11 +296,25 @@ function Harness(): React.ReactElement {
   );
 }
 
-/** Every label that is a control in the row right now, in the row's order. */
+/**
+ * Every control in the row right now, by the name it answers to, in the row's
+ * order.
+ *
+ * The name and not the text content: a promoted control has been a glyph since
+ * 48.9, so its text content is empty and the word it is reachable by lives in
+ * its accessible name. Order comes off the DOM because the ORDER is half of
+ * what this suite asserts — a prefix walk that reordered itself would still
+ * satisfy a set comparison.
+ */
 function promoted(): string[] {
-  return Array.from(document.querySelectorAll(`[${PRIORITY_ACTION_ATTR}]`)).map(
-    (control) => control.textContent ?? "",
-  );
+  return Array.from(document.querySelectorAll(`[${PRIORITY_ACTION_ATTR}]`)).map((control) => {
+    const name = control.getAttribute("aria-label") ?? "";
+    // The attribute is only the handle; this is the assertion that the name is
+    // a REAL one — `getByRole` computes it the way a screen reader would, and
+    // throws if the glyph left the control anonymous.
+    expect(screen.getByRole("button", { name })).toBe(control);
+    return name;
+  });
 }
 
 /** Open the menu and hand back what is in it, in its own order. */
@@ -366,7 +403,17 @@ describe("the header row at several widths", () => {
       for (const item of ITEMS) {
         // Once as a control or once as a menu item — the row and the menu
         // partition the list, they do not each get a copy.
-        expect(screen.getAllByText(item.label)).toHaveLength(1);
+        //
+        // Counted across BOTH roles by name, because a promoted control is a
+        // glyph and its menu twin is a word: a text query would see only half
+        // the partition and pass while the row rendered a duplicate.
+        //
+        // `hidden: true` because the menu is open: Radix marks everything
+        // outside an open menu `aria-hidden`, so the default role query cannot
+        // see the very controls this assertion is counting.
+        const asControl = screen.queryAllByRole("button", { hidden: true, name: item.label });
+        const asItem = screen.queryAllByRole("menuitem", { hidden: true, name: item.label });
+        expect(asControl.length + asItem.length).toBe(1);
       }
       expect(screen.getAllByText(DELETE_LABEL)).toHaveLength(1);
       expect(screen.getAllByText(CAPTURE_LABEL)).toHaveLength(1);

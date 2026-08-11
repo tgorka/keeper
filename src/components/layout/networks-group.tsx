@@ -24,6 +24,13 @@
  * Each row keeps the Network's name as its accessible name in both renderings,
  * and the mute context menu rides along unchanged — a folded row is the same
  * control, drawn narrower.
+ *
+ * **`Radio` is this group's glyph and nothing else's.** It used to be drawn
+ * twice in one window: here, and on the Bridges nav row six rows up. One glyph
+ * standing for two concepts stands for neither, so Bridges took `Cable` — a
+ * bridge is a link between two systems — and the arcs radiating from a point
+ * stayed here, where they mean a network's signal and where they still read at
+ * the 14px the folded header draws them at.
  */
 
 import { BellOff, Radio } from "lucide-react";
@@ -125,7 +132,14 @@ function NetworkRow({
           aria-label={muted === true ? `${network.name}, muted` : network.name}
           className={cn(
             "flex items-center rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-            collapsed ? "justify-center p-1" : "w-full gap-2 px-2 py-1.5",
+            // `p-1.5`, not `p-1`, and the 6px is measured. The folded rail is
+            // one column of 36px controls: `size-9` on every nav button and on
+            // the footer's, each centred in a `w-12` rail for a 6px gutter. A
+            // 24px avatar under `p-1` made this row 32px, so a Network's hover
+            // and selected pill were 4px narrower than the pill on the row
+            // directly above it — concentric, and visibly ragged at the edges.
+            // 24 + 6 + 6 is 36, and the column lines up.
+            collapsed ? "justify-center p-1.5" : "w-full gap-2 px-2 py-1.5",
             isActive ? "bg-accent text-accent-foreground" : "hover:bg-accent",
             // Long-press target (Story 13.6): suppress the native callout and
             // selection on the phone tier only.
