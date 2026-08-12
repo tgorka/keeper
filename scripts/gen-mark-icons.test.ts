@@ -33,35 +33,29 @@ const GLYPHS = [
 ];
 
 /**
- * The hex-bot's cell interior: one enclosed hole, with the eyes and mouth ink as
- * islands inside it. Extra ink only ever ADDS holes (the armed ring's core makes
- * more), so one is the floor for all ten glyphs — below it the cell has broken
- * open or filled in, which is the failure a bounding box cannot see.
- */
-const MARK_HOLES = 1;
-
-/**
- * Partial pixels at 22px, per glyph, pinned EXACTLY — the same numbers the
- * generator pins, restated here against the committed bytes.
+ * The pinned rasters, per glyph at 22px — the same numbers the generator pins,
+ * restated here against the committed bytes.
  *
- * On the rectilinear tag this pin was zero. A hexagon owns four diagonals, and a
- * diagonal cannot land on whole pixels at any size — but every diagonal in the
- * cell is slope exactly 1:2, so the rasteriser's fringe is deterministic: 56
- * partial pixels for the ring in every glyph, plus 12 for an arrowhead's own
- * diagonals. Exact equality keeps the property the zero-gate had: an edge that
- * drifts off the even grid changes a count and fails.
+ * On the rectilinear tag the partial-pixel pin was zero. The hex-bot owns four
+ * 1:2 diagonals, rounded corners and a round face — the owner's approved comp —
+ * so zero is not available; determinism is enforced by EXACT pinned counts
+ * instead, and an edge that drifts off the authored geometry still changes a
+ * number and fails. Holes: a closed cell keeps its interior enclosed (1); a
+ * badge glyph's cell is deliberately bitten open by the halo (0), except armed,
+ * whose badge ring encloses its own core. The ink box is pinned per glyph: face
+ * glyphs stay in the cell's box, badge glyphs reach into the canvas corner.
  */
-const EXPECTED_PARTIAL: Record<string, number> = {
-  "tray-idle-template": 56,
-  "tray-live-template": 56,
-  "tray-working-template": 56,
-  "tray-fault-template": 56,
-  "tray-sync-template": 56,
-  "tray-sync-up-template": 68,
-  "tray-sync-down-template": 68,
-  "tray-sync-updown-template": 56,
-  "tray-sync-paused-template": 56,
-  "tray-sync-warning-template": 56,
+const EXPECTED: Record<string, { partial: number; holes: number; box: string }> = {
+  "tray-idle-template": { partial: 72, holes: 1, box: "3,3,18,18" },
+  "tray-live-template": { partial: 82, holes: 1, box: "3,3,18,18" },
+  "tray-working-template": { partial: 90, holes: 1, box: "3,3,18,18" },
+  "tray-fault-template": { partial: 84, holes: 1, box: "3,3,18,18" },
+  "tray-sync-template": { partial: 98, holes: 1, box: "1,3,18,20" },
+  "tray-sync-up-template": { partial: 87, holes: 0, box: "2,3,18,20" },
+  "tray-sync-down-template": { partial: 87, holes: 0, box: "2,3,18,20" },
+  "tray-sync-updown-template": { partial: 83, holes: 0, box: "1,3,18,20" },
+  "tray-sync-paused-template": { partial: 60, holes: 1, box: "3,3,18,18" },
+  "tray-sync-warning-template": { partial: 84, holes: 0, box: "3,3,18,20" },
 };
 
 describe("the tray template family", () => {
@@ -72,7 +66,7 @@ describe("the tray template family", () => {
     expect([at1x.width, at1x.height]).toEqual([POINTS, POINTS]);
     expect([at2x.width, at2x.height]).toEqual([RETINA, RETINA]);
     // Exactly double, so the downscale macOS performs is a clean halving rather
-    // than a resample — the whole reason the artwork sits on an even grid.
+    // than a resample.
     expect(at2x.width).toBe(at1x.width * 2);
   });
 
@@ -85,50 +79,33 @@ describe("the tray template family", () => {
     expect(nonBlackPixels(readPng(`${ICON_DIR}/${name}@2x.png`))).toBe(0);
   });
 
-  it.each(GLYPHS)("%s keeps the cell enclosed at the menu-bar size", (name) => {
-    // The mark's identity is the contrast between its cell wall and what is kept
-    // inside it. If the ring breaks open the interior drains into the background
-    // and the face becomes line noise at exactly the size where that is all
-    // anyone sees.
-    expect(enclosedHoles(readPng(`${ICON_DIR}/${name}.png`)).length).toBeGreaterThanOrEqual(
-      MARK_HOLES,
-    );
+  it.each(GLYPHS)("%s rasterises at its pinned counts", (name) => {
+    const png = readPng(`${ICON_DIR}/${name}.png`);
+    const m = measure(png);
+    const want = EXPECTED[name] as (typeof EXPECTED)[string];
+    expect(
+      { partial: m.partial, holes: enclosedHoles(png).length, box: m.box.join(",") },
+      name,
+    ).toEqual(want);
   });
 
-  it.each(GLYPHS)("%s rasterises at its pinned partial-pixel count", (name) => {
-    // THE GATE THE 44-UNIT GRID EXISTS FOR, re-based for a silhouette that owns
-    // diagonals. Every horizontal and vertical edge in the artwork is even, so it
-    // lands whole at 22px; the ring's four 1:2 diagonals antialias in one
-    // deterministic pattern. The pinned count is that pattern's exact cost — a
-    // coordinate moved off the grid, a thickened wall, a mouth glyph nudged a
-    // unit all change the number and fail here.
-    const { partial } = measure(readPng(`${ICON_DIR}/${name}.png`));
-    expect(partial).toBe(EXPECTED_PARTIAL[name]);
-  });
-
-  it("puts the head in identical pixels in every glyph", () => {
-    // macOS centres a status-item image, so if the states put their ink in
-    // different places the head visibly JUMPS the moment a sync starts and a
-    // person cannot tell a state change from a glitch. This failed for real on an
-    // earlier family whose direction marks sat in a reserved corner below the
-    // head, which is why every state lives in the mouth now.
-    const byBox = new Map<string, string[]>();
+  it("keeps the cell in identical pixels in every glyph", () => {
+    // The face states change the mouth and eyes, the transport states change the
+    // corner — but the cell's top band belongs to no slot, so its pixels must be
+    // bit-identical across all ten glyphs. If this fails the cell has moved in
+    // the canvas, and since macOS centres the bitmap, a moved cell is a head
+    // that jumps in the menu bar the moment a state changes.
+    const bands = new Set<string>();
     for (const name of GLYPHS) {
-      const box = measure(readPng(`${ICON_DIR}/${name}@2x.png`)).box.join(",");
-      byBox.set(box, [...(byBox.get(box) ?? []), name]);
+      const { width, pixels } = readPng(`${ICON_DIR}/${name}@2x.png`);
+      // Rows 6..9: the top band, above the eyes and beside no badge.
+      bands.add(Buffer.from(pixels.subarray(6 * width * 4, 10 * width * 4)).toString("base64"));
     }
-    // The cell occupies canvas units x 6..38 and y 6..38, which at 44px are
-    // inclusive pixel indices 6..37 both ways. Pinned rather than merely
-    // "identical", so a family that moved together still fails.
-    expect(Object.fromEntries(byBox)).toHaveProperty(["6,6,37,37"]);
-    expect(byBox.size, `the head moved between glyphs: ${JSON.stringify([...byBox])}`).toBe(1);
+    expect(bands.size).toBe(1);
   });
 
   it("draws all ten states differently", () => {
     // Two states that rasterise identically are a status indicator that lies.
-    // This failed for real on an earlier family: a warning mark composed over the
-    // fault state filled the fault's own gap back in, and two states shipped as
-    // one picture.
     const owner = new Map<string, string>();
     for (const name of GLYPHS) {
       const key = Buffer.from(readPng(`${ICON_DIR}/${name}.png`).pixels).toString("base64");
@@ -162,41 +139,36 @@ describe("the mark on its own grid", () => {
   const at = (size: number) => readPng(join(work, `${size}x${size}.png`));
 
   it.each([
-    [POINTS, 16, 16, 56],
-    [RETINA, 32, 32, 112],
-  ])("fills %ix its box at %ix%i with its pinned fringe", (size, w, h, partial) => {
+    [POINTS, 16, 16, 72],
+    [RETINA, 32, 32, 200],
+  ])("fills its box at %ipx (%ix%i) with its pinned fringe", (size, w, h, partial) => {
     // The bbox proves the geometry still fills the box the grid promises; the
-    // pinned partial count proves every straight edge is still even and the
-    // diagonals still run at 1:2. Together they are the re-based form of the
-    // tag's zero-mush gate — see EXPECTED_PARTIAL above for why zero is not
-    // available to a hexagon.
+    // pinned partial count proves the authored geometry — even horizontal bands,
+    // 1:2 diagonals, the comp's rounded corners and round face — has not
+    // drifted. See EXPECTED above for why zero is not available to this mark.
     const m = measure(at(size));
     expect(m.partial).toBe(partial);
     expect([m.box[2] - m.box[0] + 1, m.box[3] - m.box[1] + 1]).toEqual([w, h]);
   });
 
-  it.each([POINTS, RETINA])("keeps the cell interior enclosed at %ipx", (size) => {
-    // One hole, and its proportions pinned: the interior spans the inner hex's
-    // 24x24-unit box. "At least one hole" alone would pass a cell whose interior
-    // had half filled in; the box says the whole room is still there.
+  it.each([
+    [POINTS, 12, 12],
+    [RETINA, 22, 24],
+  ])("keeps the cell interior enclosed at %ipx", (size, w, h) => {
+    // One hole, its box pinned: the interior of the cell, shaved by the rounded
+    // corners and the eyes. "At least one hole" alone would pass a cell whose
+    // interior had half filled in; the box says the whole room is still there.
     const holes = enclosedHoles(at(size));
-    expect(holes).toHaveLength(MARK_HOLES);
-    const scale = size / RETINA;
-    expect(holes.map((x) => [x.box[2] - x.box[0] + 1, x.box[3] - x.box[1] + 1])).toEqual([
-      [24 * scale, 24 * scale],
-    ]);
+    expect(holes).toHaveLength(1);
+    expect(holes.map((x) => [x.box[2] - x.box[0] + 1, x.box[3] - x.box[1] + 1])).toEqual([[w, h]]);
   });
 
   it("still reads as the cell at 16px, where no grid can save it", () => {
     // 16px is where DESIGN.md's vendor comparison lives, and it is measured
     // rather than ignored — but what is asserted is SHAPE, not sharpness: the
-    // mark keeps its full bounding box and the cell stays enclosed. Its edges are
-    // grey, and no arrangement of even coordinates on a 44 grid can make them
-    // otherwise (44/16 = 0.3636; nothing lands whole).
-    //
-    // Deliberately not a mush ceiling. Every edge is already fractional here, so
-    // a coordinate moved to an odd unit barely moves this number. The 22px pin
-    // above catches that mutation instantly.
+    // mark keeps its full bounding box and the cell stays enclosed. Its edges
+    // are grey, and nothing on a 44 grid can make them otherwise at 16
+    // (44/16 = 0.3636; nothing lands whole).
     const png = at(16);
     const m = measure(png);
     expect([m.box[2] - m.box[0] + 1, m.box[3] - m.box[1] + 1]).toEqual([12, 12]);

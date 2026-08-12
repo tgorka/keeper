@@ -268,17 +268,17 @@ Four constraints shaped it, and three of them are hard:
    pointedly not a pair of feelers. Silhouette, count and grammar all differ.
 3. **A mark dies as mush along its edges, so it is authored on the grid it is worn on.** The
    viewBox is **44 units**: 44 → 44px is 1:1 and 44 → 22px is exactly 0.5, and 22px is what macOS
-   renders a menu-bar template at. Every horizontal and vertical edge sits on an even coordinate
-   and lands on whole pixels at both tray sizes.
+   renders a menu-bar template at. The cell's horizontal bands sit on even coordinates and land on
+   whole pixels at both tray sizes; the four diagonals run at slope exactly 1:2, so their fringe
+   is one deterministic repeating pattern — a crisp angle, not mush.
 
-   A hexagon owns four diagonals, and a diagonal has no whole-pixel form — this is the one trade
-   the hex-bot makes that the rectilinear tag did not, and it is made in the open: every diagonal
-   runs at slope exactly 1:2, so the antialiasing fringe is one deterministic repeating pattern —
-   a crisp angle, not mush — and its exact per-glyph pixel cost (56, +12 per arrowhead) is
-   **pinned** in the generator and its test. The zero-gate did not relax; it re-based. Everything
-   inside the ring — eyes, mouth states, sync ink — is axis-aligned on even units and stays
-   whole-pixel: the information is crisp, and only the containing silhouette spends antialiasing,
-   identically in all ten glyphs.
+   The rest of the face is **round, because the approved comp is round** — rounded cell corners,
+   round eyes, round mouth ink. A first revision squared all of that off chasing whole-pixel
+   purity, and the owner rejected it in the menu bar: the identity is the comp, not the raster
+   arithmetic. What the whole-pixel doctrine actually defended — determinism — is kept in full:
+   every glyph's partial-pixel count, enclosed-hole count and ink box at 22px is **pinned
+   exactly** in the generator and its test, so any drift off the authored geometry still changes
+   a number and fails. The zero-gate did not relax; it re-based onto the comp.
 
    16px cannot also be served (44/16 lands nothing whole; no grid serves 16 and 22 at once, and
    nothing ships a 16px alpha-only template). The 16px number is still measured and printed,
@@ -288,20 +288,24 @@ Four constraints shaped it, and three of them are hard:
    what it keeps inside** — a cell with things kept in it rather than a tag with holes punched
    out, which is, after all, the product. A mark whose idea is its colour (Mistral) dies at 16px
    even when its geometry survives.
-4. **The mouth is a state display**, at the same four states as the lamp: filled (`live` — a solid
-   mouth, on the record), hollow (`idle` — calm, empty), dashed (`working` — three dots, the
-   "typing…" idiom, which a messenger gets to claim as its own), broken (`fault` — an exclamation
-   grounded on the chin). The eyes are the identity and are open in every state; they never carry
-   information. So the mark, the macOS tray template family, the bot list and the sync indicator
-   speak one vocabulary instead of four unrelated drawings — which is what makes the mark
-   functional instead of decorative.
+4. **The face and its corners are a slotted state display.** The mouth speaks the lamp's four
+   states: filled (`live` — a solid dot, on the record), hollow (`idle` — calm, empty), dashed
+   (`working` — three dots, the "typing…" idiom, which a messenger gets to claim as its own),
+   broken (`fault` — an exclamation grounded on the chin). The eyes are the identity and never
+   carry information — with one earned exception: they close to two lids for `paused`, because a
+   resting bot is what paused means. The **bottom-left corner** is the transport slot: a badge
+   seated in the canvas corner the hexagon's cut leaves free, with a halo bitten out of the ring
+   so it reads as a token pinned beside the cell — a hollow ring for sync armed, arrows for
+   direction (up / down / both), an exclamation for sync warning. The **top-right corner** is
+   reserved for the unread-messages dot and its `set_title` count (approved, not yet wired in
+   `tray.rs`). The cell sits at a fixed translate in a fixed 44-unit canvas and macOS centres the
+   bitmap, so a corner badge cannot move the head.
 
-   **"One vocabulary" is a claim about the visual language, not a budget of four files.** The tray
-   legitimately ships more glyphs than the lamp has states, because it carries facts the lamp does
-   not: sync direction (up / down / both) and paused-versus-warning, all drawn on the same mouth
-   field. Those are shipped, tested behaviour and collapsing them would delete information the
-   menu bar currently tells the truth about. The rule is one silhouette, one mouth, one state
-   grammar — a vocabulary having more words than four is what makes it a vocabulary.
+   So the mark, the macOS tray template family, the bot list and the sync indicator speak one
+   vocabulary instead of four unrelated drawings — one silhouette, one face, two corner slots,
+   one state grammar. A vocabulary having more words than the lamp's four is what makes it a
+   vocabulary: sync direction and paused-versus-warning are shipped, tested behaviour, and
+   collapsing them would delete information the menu bar currently tells the truth about.
 
 **The face is the mark's, and only the mark's.** The smile exists on the coloured app icon alone —
 in the menu bar the mouth is an instrument and must be empty at rest. No emoji in chrome, no
@@ -311,10 +315,10 @@ instrument, and it wears the same cell.
 Every asset is cut from `src-tauri/crates/keeper/icons/mark.svg` by
 `bun run scripts/gen-mark-icons.ts` — app icons, ten tray templates, the iOS AppIcon set, and
 `favicon.png` plus `favicon.svg` in the repo root. The coloured tile is the owner's approved
-comp: the mark in night ink (dark `--background`) on the healthy-hive green (light
+comp: the mark in paper (light `--background`) on the healthy-hive green (light
 `--bridge-healthy` — keeper's original brand green, which is where that colour now lives in the
-palette), with neighbour cells ghosted in the same ink at low opacity. Both colours are read from
-`src/index.css`, so a retheme moves the icon with it. Do not hand-edit the PNGs.
+palette), with neighbour cells ghosted in the dark ground at low opacity. All three colours are
+read from `src/index.css`, so a retheme moves the icon with it. Do not hand-edit the PNGs.
 
 ## Do's and Don'ts
 

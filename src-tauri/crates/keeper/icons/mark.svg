@@ -4,115 +4,135 @@
     THE KEEPER MARK. A honeycomb cell with a face: the hex-bot. keeper -> beekeeper -> the hive.
     A hive is many cells kept as one structure, which is literally what this product is — many
     networks bridged into one kept archive — and the keeper is the one who tends it. The face is
-    the owner's decision, made deliberately against the earlier no-face draft: the eyes are what
-    make the mark a SOMEONE in the menu bar rather than another rectangle, and the mouth is what
-    makes it an instrument — it is the state display.
+    the owner's decision, approved from comps and HELD TO here: rounded cell corners, round eyes,
+    round mouth ink. An earlier revision of this file squared all of that off chasing whole-pixel
+    purity, and the owner rejected the result in the menu bar — rightly: the identity is the comp,
+    not the raster arithmetic. macOS renders retina templates through greyscale alpha; a curve is
+    a first-class citizen there, and determinism is still enforced, by PINNED per-glyph partial
+    counts in `gen-mark-icons.ts` and its test, so any drift off the authored geometry changes a
+    number and fails. The gate survives; the aesthetic serves the comp.
 
     Why this is not a bugdroid problem: Android's trademark is a dome head with two thin antennae
     and two dot eyes. This mark is a flat-topped hexagon, it wears NO antenna in any template
-    (the antenna exists only on the coloured app icon, where it is a single stem tipped with a
-    smaller hexagon — self-similar, not a feeler), and its mouth carries a state vocabulary no
+    (the antenna exists only on the coloured app icon, where it is a single short stem tipped
+    with a smaller hexagon — self-similar, not a feeler), and its face carries a state grammar no
     character mascot has. Silhouette, count and grammar all differ.
 
-    THE GRID IS 44 UNITS, AND EVERY TEMPLATE COORDINATE IS EVEN. 44 -> 44px is 1:1 and
-    44 -> 22px is exactly 0.5, and 22px is what macOS renders a menu-bar template at. Every
-    horizontal and vertical edge here is a whole pixel at both tray sizes.
+    THE GRID IS 44 UNITS: 1:1 with the @2x tray raster, halved exactly at 22px. The cell's
+    horizontal bands still land on even whole pixels (y 6..10 and 34..38); the four diagonals run
+    at slope exactly 1:2 so their fringe is one repeating pattern; everything else is allowed to
+    be round, because the comp is round.
 
-    A hexagon has diagonals, and a diagonal cannot land on whole pixels — this is the one trade
-    this mark makes that the rectilinear tag it replaces did not, and it is made with open eyes:
+    THE FACE AND ITS SLOTS — the state grammar, shared with the lamp component and, in the two
+    corner slots, with the approved combination scheme (messages top-right, transport
+    bottom-left). Everything is additive over the base; the ring is never re-cut except by the
+    BADGE HALO, a deliberate bite that separates a corner badge from the cell wall:
 
-      - All four diagonal edges have slope exactly 1:2 (8 across, 16 down), so the rasteriser
-        antialiases them in one repeating two-row pattern instead of an irregular stagger. A
-        consistent fringe reads as a crisp angle; an inconsistent one reads as mush.
-      - Everything INSIDE the ring — eyes, mouth states, the sync ink the generator adds — is
-        axis-aligned on even units and stays whole-pixel. The information is crisp; only the
-        containing silhouette spends antialiasing, and it spends it identically in all glyphs.
-      - The partial-pixel counts are still measured and PINNED in the generator and its test,
-        per glyph. The budget is exact equality with the authored geometry, so an edge that
-        drifts off the grid still fails the run — the gate did not relax, it re-based.
-
-    The ring is 4 units thick on its horizontal bands (2px at 22) and ~3.6 on the diagonals —
-    the perpendicular thinning of a parallel-offset 1:2 line, left uncorrected because a whole
-    optical correction would cost the even grid on the inner contour.
-
-    The face:
-
-      - EYES, 4x4 at y14..18, symmetric about x22 with a 4-unit gap. 2x2px at 22 — the smallest
-        crisp feature, same floor as the tag's eyelet. They are ink islands inside the cell, in
-        every glyph, always open: they are the identity, not a state.
-      - MOUTH, the state display, on the field x14..30 y22..34. It speaks the lamp's vocabulary:
-        filled (live: a solid 8x6 mouth — recording, on the record), empty (idle: calm), dashed
-        (working: three 4x4 dots — the "typing…" idiom, thinking), broken (fault: an exclamation,
-        its point grounded on the chin). The generator drops sync facts onto the same field.
-
-    The interior is ONE enclosed hole (two while the armed ring is up) and the eyes and mouth are
-    islands in it. The identity still lives in the contrast between ink and hole; it is simply a
-    cell with things kept inside it rather than a tag with holes punched out — which is, after
-    all, the product.
+      - EYES, r 2.8 at (17,19)/(27,19): always open, always present — the identity, never a
+        state. The one exception is `paused`, where they close to two lids: the bot is resting,
+        which is what paused means.
+      - MOUTH, centred under the eyes: live = a filled round dot (recording, on the record),
+        idle = empty (calm), working = three dots (the "typing…" idiom), fault = an exclamation.
+      - BOTTOM-LEFT BADGE, centred (8,36) in the canvas corner the hexagon's cut leaves free:
+        the transport facts. A hollow ring = sync armed; up / down / paired arrows = direction;
+        an exclamation = sync warning. The halo (#bl-halo) knocks the ring open around it so the
+        badge reads as a token pinned NEXT to the cell, not a growth on it. The cell sits at a
+        fixed translate in a fixed 44-unit canvas, so the badge cannot move the head: macOS
+        centres the bitmap, and the bitmap never changes size or layout.
+      - TOP-RIGHT: reserved for the unread-messages dot + `set_title` count (not yet wired in
+        tray.rs; the slot is part of the approved grammar and deliberately kept empty here).
   -->
   <defs>
     <!--
-      The base mark, which is also the `idle` state: the hexagonal cell wall cut as an even-odd
-      ring, and the two eyes. Outer hex 14,6 30,6 38,22 30,38 14,38 6,22 — 32x32, centred on the
-      44 canvas at (0,0) translate. Inner hex offset 4 on the horizontals, same 1:2 slopes.
+      The cell wall: a stroked hexagon on the centerline path, 4 units of stroke, joins rounded —
+      the comp's soft corners. Centerline vertices are the midpoints of the old outer/inner
+      contours, so the horizontal bands cover exactly y 6..10 and 34..38 as before and the
+      silhouette's bbox is still 6..38 square.
     -->
-    <g id="mark-base">
-      <path fill-rule="evenodd"
-            d="M14 6H30L38 22L30 38H14L6 22Z M16 10H28L34 22L28 34H16L10 22Z"/>
-      <rect x="16" y="14" width="4" height="4"/>
-      <rect x="24" y="14" width="4" height="4"/>
+    <path id="cell" d="M15 8H29L36 22L29 36H15L8 22Z" fill="none" stroke="currentColor"
+          stroke-width="4" stroke-linejoin="round"/>
+
+    <g id="eyes">
+      <circle cx="17" cy="19" r="2.8" fill="currentColor"/>
+      <circle cx="27" cy="19" r="2.8" fill="currentColor"/>
     </g>
 
-    <!--
-      live — the mouth as a solid 8x6 core, the lamp's filled state. 4x3px at 22, dead centre,
-      2 units clear of everything: a hex-bot with its mouth open on the record.
-    -->
-    <rect id="mouth-live" x="18" y="24" width="8" height="6"/>
+    <!-- paused: the lids. Same width as the open eyes, so the face does not narrow. -->
+    <g id="eyes-closed">
+      <rect x="14.1" y="17.9" width="5.8" height="2.2" rx="1.1" fill="currentColor"/>
+      <rect x="24.1" y="17.9" width="5.8" height="2.2" rx="1.1" fill="currentColor"/>
+    </g>
 
-    <!--
-      working — three 4x4 dots across the mouth field, the lamp's dashed state and the oldest
-      idiom in messaging: "typing…". The outer dots sit 1 unit off the inner diagonals at their
-      lower corners; that unit is antialiased fringe, not a merge, and the pinned raster proves it.
-    -->
+    <circle id="mouth-live" cx="22" cy="27.5" r="3.6" fill="currentColor"/>
+
     <g id="mouth-working">
-      <rect x="14" y="24" width="4" height="4"/>
-      <rect x="20" y="24" width="4" height="4"/>
-      <rect x="26" y="24" width="4" height="4"/>
+      <circle cx="16" cy="27.5" r="2.1" fill="currentColor"/>
+      <circle cx="22" cy="27.5" r="2.1" fill="currentColor"/>
+      <circle cx="28" cy="27.5" r="2.1" fill="currentColor"/>
+    </g>
+
+    <!-- fault: the exclamation, its point grounded on the chin. -->
+    <g id="mouth-fault">
+      <rect x="20.6" y="22.5" width="2.8" height="7.5" rx="1.4" fill="currentColor"/>
+      <circle cx="22" cy="32.8" r="1.6" fill="currentColor"/>
     </g>
 
     <!--
-      fault — an exclamation: a 4x6 bar, a 2-unit gap, and a 4x4 point grounded on the chin
-      (y30..34 ends exactly on the inner bottom edge, so the point is ink joined to the wall
-      rather than a third island). The gap is the glyph: 1px at 22 between bar and point is what
-      separates "!" from a stroke, and the grounded point is what separates fault from live.
+      The badge halo: applied to the base mark in every badge-wearing glyph. The bite means those
+      glyphs' cell is deliberately NOT a closed loop — the generator pins hole counts per glyph,
+      so the open ring is a checked fact rather than an accident.
     -->
-    <g id="mouth-fault">
-      <rect x="20" y="22" width="4" height="6"/>
-      <rect x="20" y="30" width="4" height="4"/>
+    <mask id="bl-halo">
+      <rect x="0" y="0" width="44" height="44" fill="white"/>
+      <circle cx="8" cy="36" r="8" fill="black"/>
+    </mask>
+
+    <circle id="badge-ring" cx="8" cy="36" r="4" fill="none" stroke="currentColor"
+            stroke-width="2.2"/>
+
+    <g id="badge-up">
+      <path d="M8 30L4 36.5H12Z" fill="currentColor"/>
+      <rect x="6.9" y="36.5" width="2.2" height="5" fill="currentColor"/>
     </g>
+
+    <g id="badge-down">
+      <rect x="6.9" y="30.5" width="2.2" height="5" fill="currentColor"/>
+      <path d="M4 35.5H12L8 42Z" fill="currentColor"/>
+    </g>
+
+    <g id="badge-updown">
+      <path d="M5 31.5L2.4 35.8H7.6Z" fill="currentColor"/>
+      <rect x="4.2" y="35.8" width="1.6" height="4.5" fill="currentColor"/>
+      <rect x="10.2" y="31.5" width="1.6" height="4.5" fill="currentColor"/>
+      <path d="M8.4 36H13.6L11 40.5Z" fill="currentColor"/>
+    </g>
+
+    <g id="badge-alert">
+      <rect x="6.9" y="29.5" width="2.2" height="7" rx="1.1" fill="currentColor"/>
+      <circle cx="8" cy="39.5" r="1.7" fill="currentColor"/>
+    </g>
+
+    <g id="mark-base"><use href="#cell"/><use href="#eyes"/></g>
 
     <g id="mark-idle"><use href="#mark-base"/></g>
     <g id="mark-live"><use href="#mark-base"/><use href="#mouth-live"/></g>
     <g id="mark-working"><use href="#mark-base"/><use href="#mouth-working"/></g>
     <g id="mark-fault"><use href="#mark-base"/><use href="#mouth-fault"/></g>
+    <g id="mark-paused"><use href="#cell"/><use href="#eyes-closed"/></g>
 
     <!--
-      hero — the coloured-icon face, NEVER a template: the idle mark plus the three things that
-      would be spent pixels at 22 and are personality at 64+. A smile (the menu bar's mouth is a
-      state display and must be empty at rest; the app icon is not a status indicator, so it may
-      be pleased to see you). An antenna: a 2-unit stem rising from the cell wall. And the stem's
-      tip: a smaller hexagon — the mark broadcasting itself, self-similarity instead of ornament,
-      and pointedly not a pair of feelers (see the bugdroid note above).
-
-      Curves and off-grid coordinates are allowed here and only here: the hero ships exclusively
-      through antialiased colour rasters (32px and up), where the whole-pixel doctrine does not
-      apply.
+      hero — the coloured-icon face, NEVER a template: the idle mark plus a smile (the menu bar's
+      mouth is a state display and must be empty at rest; the app icon is not a status indicator,
+      so it may be pleased to see you) and the antenna: a short, thick stem rising from the wall,
+      tipped with a smaller hexagon — the mark broadcasting itself. Short and tucked close on the
+      owner's instruction: the tip clears the cell by ~5 units, so the icon reads as one compact
+      creature rather than a mast on a hut.
     -->
     <g id="mark-hero">
       <use href="#mark-idle"/>
-      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z"/>
-      <rect x="21" y="-4" width="2" height="10"/>
-      <path d="M20.2 -10.1L23.8 -10.1L25.6 -7L23.8 -3.9L20.2 -3.9L18.4 -7Z"/>
+      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z" fill="currentColor"/>
+      <rect x="20.6" y="1" width="2.8" height="6" fill="currentColor"/>
+      <path d="M20.4 -4.57L23.6 -4.57L25.2 -1.8L23.6 0.97L20.4 0.97L18.8 -1.8Z" fill="currentColor"/>
     </g>
   </defs>
 
@@ -121,5 +141,5 @@
     icon's hero is built from: calm, eyes open, mouth empty — present and keeping, reporting
     nothing, which is the only state an icon with no way to stay current should claim.
   -->
-  <use href="#mark-idle" fill="#000"/>
+  <g style="color:#000"><use href="#mark-idle"/></g>
 </svg>

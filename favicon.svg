@@ -1,65 +1,93 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><title>keeper — the hex-bot</title><defs>
     <!--
-      The base mark, which is also the `idle` state: the hexagonal cell wall cut as an even-odd
-      ring, and the two eyes. Outer hex 14,6 30,6 38,22 30,38 14,38 6,22 — 32x32, centred on the
-      44 canvas at (0,0) translate. Inner hex offset 4 on the horizontals, same 1:2 slopes.
+      The cell wall: a stroked hexagon on the centerline path, 4 units of stroke, joins rounded —
+      the comp's soft corners. Centerline vertices are the midpoints of the old outer/inner
+      contours, so the horizontal bands cover exactly y 6..10 and 34..38 as before and the
+      silhouette's bbox is still 6..38 square.
     -->
-    <g id="mark-base">
-      <path fill-rule="evenodd"
-            d="M14 6H30L38 22L30 38H14L6 22Z M16 10H28L34 22L28 34H16L10 22Z"/>
-      <rect x="16" y="14" width="4" height="4"/>
-      <rect x="24" y="14" width="4" height="4"/>
+    <path id="cell" d="M15 8H29L36 22L29 36H15L8 22Z" fill="none" stroke="currentColor"
+          stroke-width="4" stroke-linejoin="round"/>
+
+    <g id="eyes">
+      <circle cx="17" cy="19" r="2.8" fill="currentColor"/>
+      <circle cx="27" cy="19" r="2.8" fill="currentColor"/>
     </g>
 
-    <!--
-      live — the mouth as a solid 8x6 core, the lamp's filled state. 4x3px at 22, dead centre,
-      2 units clear of everything: a hex-bot with its mouth open on the record.
-    -->
-    <rect id="mouth-live" x="18" y="24" width="8" height="6"/>
+    <!-- paused: the lids. Same width as the open eyes, so the face does not narrow. -->
+    <g id="eyes-closed">
+      <rect x="14.1" y="17.9" width="5.8" height="2.2" rx="1.1" fill="currentColor"/>
+      <rect x="24.1" y="17.9" width="5.8" height="2.2" rx="1.1" fill="currentColor"/>
+    </g>
 
-    <!--
-      working — three 4x4 dots across the mouth field, the lamp's dashed state and the oldest
-      idiom in messaging: "typing…". The outer dots sit 1 unit off the inner diagonals at their
-      lower corners; that unit is antialiased fringe, not a merge, and the pinned raster proves it.
-    -->
+    <circle id="mouth-live" cx="22" cy="27.5" r="3.6" fill="currentColor"/>
+
     <g id="mouth-working">
-      <rect x="14" y="24" width="4" height="4"/>
-      <rect x="20" y="24" width="4" height="4"/>
-      <rect x="26" y="24" width="4" height="4"/>
+      <circle cx="16" cy="27.5" r="2.1" fill="currentColor"/>
+      <circle cx="22" cy="27.5" r="2.1" fill="currentColor"/>
+      <circle cx="28" cy="27.5" r="2.1" fill="currentColor"/>
+    </g>
+
+    <!-- fault: the exclamation, its point grounded on the chin. -->
+    <g id="mouth-fault">
+      <rect x="20.6" y="22.5" width="2.8" height="7.5" rx="1.4" fill="currentColor"/>
+      <circle cx="22" cy="32.8" r="1.6" fill="currentColor"/>
     </g>
 
     <!--
-      fault — an exclamation: a 4x6 bar, a 2-unit gap, and a 4x4 point grounded on the chin
-      (y30..34 ends exactly on the inner bottom edge, so the point is ink joined to the wall
-      rather than a third island). The gap is the glyph: 1px at 22 between bar and point is what
-      separates "!" from a stroke, and the grounded point is what separates fault from live.
+      The badge halo: applied to the base mark in every badge-wearing glyph. The bite means those
+      glyphs' cell is deliberately NOT a closed loop — the generator pins hole counts per glyph,
+      so the open ring is a checked fact rather than an accident.
     -->
-    <g id="mouth-fault">
-      <rect x="20" y="22" width="4" height="6"/>
-      <rect x="20" y="30" width="4" height="4"/>
+    <mask id="bl-halo">
+      <rect x="0" y="0" width="44" height="44" fill="white"/>
+      <circle cx="8" cy="36" r="8" fill="black"/>
+    </mask>
+
+    <circle id="badge-ring" cx="8" cy="36" r="4" fill="none" stroke="currentColor"
+            stroke-width="2.2"/>
+
+    <g id="badge-up">
+      <path d="M8 30L4 36.5H12Z" fill="currentColor"/>
+      <rect x="6.9" y="36.5" width="2.2" height="5" fill="currentColor"/>
     </g>
+
+    <g id="badge-down">
+      <rect x="6.9" y="30.5" width="2.2" height="5" fill="currentColor"/>
+      <path d="M4 35.5H12L8 42Z" fill="currentColor"/>
+    </g>
+
+    <g id="badge-updown">
+      <path d="M5 31.5L2.4 35.8H7.6Z" fill="currentColor"/>
+      <rect x="4.2" y="35.8" width="1.6" height="4.5" fill="currentColor"/>
+      <rect x="10.2" y="31.5" width="1.6" height="4.5" fill="currentColor"/>
+      <path d="M8.4 36H13.6L11 40.5Z" fill="currentColor"/>
+    </g>
+
+    <g id="badge-alert">
+      <rect x="6.9" y="29.5" width="2.2" height="7" rx="1.1" fill="currentColor"/>
+      <circle cx="8" cy="39.5" r="1.7" fill="currentColor"/>
+    </g>
+
+    <g id="mark-base"><use href="#cell"/><use href="#eyes"/></g>
 
     <g id="mark-idle"><use href="#mark-base"/></g>
     <g id="mark-live"><use href="#mark-base"/><use href="#mouth-live"/></g>
     <g id="mark-working"><use href="#mark-base"/><use href="#mouth-working"/></g>
     <g id="mark-fault"><use href="#mark-base"/><use href="#mouth-fault"/></g>
+    <g id="mark-paused"><use href="#cell"/><use href="#eyes-closed"/></g>
 
     <!--
-      hero — the coloured-icon face, NEVER a template: the idle mark plus the three things that
-      would be spent pixels at 22 and are personality at 64+. A smile (the menu bar's mouth is a
-      state display and must be empty at rest; the app icon is not a status indicator, so it may
-      be pleased to see you). An antenna: a 2-unit stem rising from the cell wall. And the stem's
-      tip: a smaller hexagon — the mark broadcasting itself, self-similarity instead of ornament,
-      and pointedly not a pair of feelers (see the bugdroid note above).
-
-      Curves and off-grid coordinates are allowed here and only here: the hero ships exclusively
-      through antialiased colour rasters (32px and up), where the whole-pixel doctrine does not
-      apply.
+      hero — the coloured-icon face, NEVER a template: the idle mark plus a smile (the menu bar's
+      mouth is a state display and must be empty at rest; the app icon is not a status indicator,
+      so it may be pleased to see you) and the antenna: a short, thick stem rising from the wall,
+      tipped with a smaller hexagon — the mark broadcasting itself. Short and tucked close on the
+      owner's instruction: the tip clears the cell by ~5 units, so the icon reads as one compact
+      creature rather than a mast on a hut.
     -->
     <g id="mark-hero">
       <use href="#mark-idle"/>
-      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z"/>
-      <rect x="21" y="-4" width="2" height="10"/>
-      <path d="M20.2 -10.1L23.8 -10.1L25.6 -7L23.8 -3.9L20.2 -3.9L18.4 -7Z"/>
+      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z" fill="currentColor"/>
+      <rect x="20.6" y="1" width="2.8" height="6" fill="currentColor"/>
+      <path d="M20.4 -4.57L23.6 -4.57L25.2 -1.8L23.6 0.97L20.4 0.97L18.8 -1.8Z" fill="currentColor"/>
     </g>
-  </defs><clipPath id="tile-4-13"><rect x="4" y="4" width="56" height="56" rx="13"/></clipPath><rect x="4" y="4" width="56" height="56" rx="13" fill="#0f6e5c"/><g clip-path="url(#tile-4-13)" fill="none" stroke="#0d1210" stroke-opacity="0.3" stroke-width="2"><path d="M0.5 -2.257999999999999L13.5 -2.257999999999999L20 9L13.5 20.258L0.5 20.258L-6 9Z"/><path d="M50.5 44.742000000000004L63.5 44.742000000000004L70 56L63.5 67.258L50.5 67.258L44 56Z"/></g><use href="#mark-hero" fill="#0d1210" transform="translate(10 18)"/></svg>
+  </defs><clipPath id="tile-4-13"><rect x="4" y="4" width="56" height="56" rx="13"/></clipPath><rect x="4" y="4" width="56" height="56" rx="13" fill="#0f6e5c"/><g clip-path="url(#tile-4-13)" fill="none" stroke="#0d1210" stroke-opacity="0.3" stroke-width="2"><path d="M0.5 -2.257999999999999L13.5 -2.257999999999999L20 9L13.5 20.258L0.5 20.258L-6 9Z"/><path d="M50.5 44.742000000000004L63.5 44.742000000000004L70 56L63.5 67.258L50.5 67.258L44 56Z"/></g><g style="color:#f4f2ec"><use href="#mark-hero" transform="translate(10 15.5)"/></g></svg>
