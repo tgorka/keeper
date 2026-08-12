@@ -644,6 +644,135 @@ pub fn tree(root_id: &str, session_id: &str) -> Option<(String, Vec<RawEntry>, b
     Some((row.path, out, budget == 0))
 }
 
+/// One markdown file a session's references were read from.
+pub struct RefSource {
+    /// Session-relative path, as a row reports it: `README.md`,
+    /// `refs/inputs.md`. This is the "where it was written" a reader needs to
+    /// go and fix a broken pointer, so it is carried rather than derived.
+    pub rel: String,
+    /// The file's text, already read — the scan parses it, so reading it twice
+    /// would double the one cost this walk actually has.
+    pub text: String,
+}
+
+/// What [`ref_sources`] found.
+///
+/// A named struct rather than the triple it started as: three anonymous fields
+/// where two are strings is a call site that reads `.0` and `.2` and means
+/// nothing to the next person.
+pub struct RefSources {
+    /// The session's zone-relative folder, e.g. `active/2026-08-10-keeper` —
+    /// the prefix a relative reference is resolved against.
+    pub path: String,
+    /// The markdown to scan, in reading order.
+    pub files: Vec<RefSource>,
+    /// Whether the byte budget stopped the scan before every file was read.
+    pub truncated: bool,
+}
+
+/// Every pointer written in one session's markdown, with the file it was
+/// written in (FR-255, AD-118).
+///
+/// **Which files.** The README and every `.md` under `refs/` and `prompts/`,
+/// in that order — the README first because it is the record, and `refs/` next
+/// because the zone's own contract says that is where inputs worth keeping are
+/// listed. `artifacts/` is deliberately excluded: promoted output is a
+/// deliverable, and a reference inside it is a reference from the artifact,
+/// not from the session. `workspace/` is excluded because it is scratch that
+/// dies with the session (AD-113) — a broken pointer in a file nobody keeps is
+/// not something to report.
+///
+/// **A byte budget, not an entry budget.** The tree's budget counts dirents
+/// because that is what a `node_modules` inflates; here the cost is parsing
+/// markdown, so the ceiling is total bytes read. A `refs/` somebody filled with
+/// a crawl stops the scan and says so.
+pub fn ref_sources(root_id: &str, session_id: &str) -> Option<RefSources> {
+    let row = row_of(root_id, session_id)?;
+    let zone = zone_of(root_id)?;
+    let (files, truncated) = read_ref_sources(&zone.join(&row.path), REF_SCAN_BUDGET);
+    Some(RefSources {
+        path: row.path,
+        files,
+        truncated,
+    })
+}
+
+/// The most markdown one session's reference scan reads, in bytes. Ten
+/// megabytes of prose is far past any session a person writes and far under
+/// anything that would be felt.
+const REF_SCAN_BUDGET: usize = 10 * 1024 * 1024;
+
+/// Where references are read from, after the README, in reading order.
+const REF_DIRS: [&str; 2] = ["refs", "prompts"];
+
+/// [`ref_sources`] over a plain directory — the half that is about files rather
+/// than about which session, so a test can hand it a folder.
+fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool) {
+    let mut out: Vec<RefSource> = Vec::new();
+    let mut budget = budget;
+
+    let mut take = |rel: String, path: &Path, budget: &mut usize| {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            // Unreadable or not UTF-8 — a binary in `refs/` is ordinary, and a
+            // file keeper cannot read is a file with no references, not an
+            // error worth failing the whole widget over.
+            return;
+        };
+        if text.len() > *budget {
+            *budget = 0;
+            return;
+        }
+        *budget -= text.len();
+        out.push(RefSource { rel, text });
+    };
+
+    take(README.to_owned(), &dir.join(README), &mut budget);
+    for section in REF_DIRS {
+        let Ok(entries) = std::fs::read_dir(dir.join(section)) else {
+            continue;
+        };
+        // Name order inside a section: `prompts/` is numbered by the zone's own
+        // convention (`01-…`, `02-…`), and mtime order would scramble it.
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.') && name.to_lowercase().ends_with(".md"))
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        for name in names {
+            if budget == 0 {
+                break;
+            }
+            let rel = format!("{section}/{name}");
+            let path = dir.join(&rel);
+            take(rel, &path, &mut budget);
+        }
+    }
+
+    (out, budget == 0)
+}
+
+/// Whether a profile-relative path is inside a session folder of this root,
+/// and what that session is called — the [`keeper_core::sessions::refs::RefProbe`]
+/// question a path answers only against the zone.
+///
+/// Asked of the scanned rows rather than of the filesystem: the board already
+/// knows every session in the zone by folder path, and a second definition of
+/// "is this a session" is exactly the drift
+/// [`keeper_core::sessions::model::classify`] exists to prevent.
+pub fn session_at(root_id: &str, zone_relative: &str) -> Option<String> {
+    let rows = rows(root_id)?;
+    rows.iter()
+        .filter(|row| {
+            zone_relative == row.path || zone_relative.starts_with(&format!("{}/", row.path))
+        })
+        // The deepest match wins, so a path inside a session names that
+        // session rather than an ancestor that happens to share its prefix.
+        .max_by_key(|row| row.path.len())
+        .map(|row| row.title.clone())
+}
+
 /// The recursive half. `budget` counts down across the whole walk, so one
 /// enormous section cannot starve the ones after it silently — it exhausts the
 /// budget, and `truncated` says so.
@@ -933,5 +1062,71 @@ mod tests {
         let (clipped, truncated) = walk(session, 4);
         assert_eq!(clipped.len(), 4);
         assert!(truncated, "the caller is told the walk stopped");
+    }
+
+    /// The reference scan reads the record and the inputs, and deliberately
+    /// does NOT read the deliverables or the scratch (FR-255).
+    #[test]
+    fn references_are_read_from_the_record_and_the_inputs_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["refs", "prompts", "artifacts", "workspace"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("README.md", "the record");
+        write("refs/inputs.md", "the inputs");
+        // `prompts/` is numbered by the zone's own convention, so 02 must not
+        // sort before 10 by mtime or by anything else.
+        write("prompts/10-later.md", "later");
+        write("prompts/02-earlier.md", "earlier");
+        write("refs/.hidden.md", "furniture");
+        write("refs/clip.m4a", "not markdown");
+        write("artifacts/report.md", "the deliverable's own references");
+        write("workspace/iter-3.md", "scratch that dies with the session");
+
+        let (files, truncated) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert!(!truncated);
+        let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(
+            read,
+            vec![
+                "README.md",
+                "refs/inputs.md",
+                "prompts/02-earlier.md",
+                "prompts/10-later.md",
+            ],
+            "record, then inputs, then prompts in the zone's own numbering — \
+             artifacts and workspace are not the session's references, and a \
+             dotfile and a media file are not markdown"
+        );
+        assert_eq!(
+            files[0].text, "the record",
+            "the text is carried, not re-read"
+        );
+    }
+
+    /// The budget is bytes, because the cost here is parsing markdown — and an
+    /// exhausted budget is reported rather than handed back as a prefix.
+    #[test]
+    fn the_reference_budget_counts_bytes_and_says_when_it_runs_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("refs")).expect("mkdir");
+        std::fs::write(session.join("README.md"), "x".repeat(40)).expect("write");
+        std::fs::write(session.join("refs/big.md"), "y".repeat(400)).expect("write");
+
+        let (files, truncated) = read_ref_sources(session, 100);
+        assert_eq!(
+            files.len(),
+            1,
+            "the README fits; the file that would blow the budget is not read"
+        );
+        assert!(
+            truncated,
+            "and the caller is told, rather than shown a prefix"
+        );
     }
 }

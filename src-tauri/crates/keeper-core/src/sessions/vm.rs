@@ -220,6 +220,67 @@ pub struct SessionTreeVm {
     pub truncated: bool,
 }
 
+/// One thing a session points at (FR-255, AD-118).
+///
+/// The tree says what a session *holds*; this says what it *names*. The zone's
+/// own rule is that the two differ on purpose — big files live in their zone
+/// and a session references them by repo-root-relative path — so the pointer is
+/// what breaks, and this is the row that says so.
+///
+/// **Not [`SessionRefVm`]**, which is a handle *to* a session (the `NoteRefVm`
+/// shape, returned by the mutating commands). This is a reference *from* one,
+/// and spelling both `Ref` would make two unrelated things one grep.
+///
+/// Every field was decided in Rust. `kind` is six resolvers' answers, not a
+/// guess from a file extension; `panelTarget` is the one file target (AD-109)
+/// already composed, so a click is `setActiveTarget(row.panelTarget)` and the
+/// frontend joins nothing (AD-65).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReferenceVm {
+    /// `"note"`, `"recording"`, `"file"`, `"session"`, `"external"` or
+    /// `"missing"` — [`crate::sessions::refs::RefKind::as_str`]. A string
+    /// rather than a union because the set grows the way the index's `flags`
+    /// grow, and `missing` is the product's existing word for the last one.
+    pub kind: String,
+    /// The target **as the author spelled it**, which is what makes a missing
+    /// row findable in the file it was written in — the export receipt's rule.
+    pub target: String,
+    /// What to call it: the resolved title, else the link's own words, else
+    /// the target.
+    pub label: String,
+    /// Session-relative path of the file this was written in (`README.md`,
+    /// `refs/inputs.md`) — where to go to fix it.
+    pub source: String,
+    /// What clicking opens, or `None` for a missing row and nothing to open.
+    /// External URLs are not panel targets: they open in the system browser,
+    /// so [`Self::url`] carries them instead.
+    pub panel_target: Option<crate::panels::PanelTargetVm>,
+    /// The `http(s)` address of an external row, `None` for every other kind.
+    pub url: Option<String>,
+    /// Why a missing row is missing, naming the paths keeper looked in —
+    /// [`crate::notes::embed::not_found_notice`]'s acceptance criterion, in a
+    /// session's frame. `None` for everything that resolved.
+    pub notice: Option<String>,
+}
+
+/// Everything one session points at (FR-255), missing first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReferencesVm {
+    /// The rows, shell-ordered: broken pointers first, then document order.
+    pub refs: Vec<SessionReferenceVm>,
+    /// How many of them are missing — the number the widget's heading states,
+    /// counted in Rust so two surfaces cannot count it differently.
+    pub missing: u32,
+    /// The scan hit its budget. A session whose `refs/` somebody filled with a
+    /// crawl is the one way here, and a list that silently showed a prefix
+    /// would be a list that lies about being complete — the tree's own rule.
+    pub truncated: bool,
+}
+
 /// One user-tier frontmatter field of the session README, for the detail's
 /// properties widget (FR-227): keeper-owned keys and `tags` are projected
 /// elsewhere on the header, so what remains here is exactly "yours".

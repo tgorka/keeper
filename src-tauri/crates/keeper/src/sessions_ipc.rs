@@ -249,6 +249,178 @@ pub fn sessions_tree(root_id: String, session_id: String) -> Result<(), IpcError
     Err(unsupported())
 }
 
+/// What one session points at (FR-255, AD-118) — the other half of "a session
+/// folder is a small workspace".
+///
+/// [`sessions_tree`] lists what a session *holds*. This lists what it *names*,
+/// which is a different set on purpose: the zone's own contract says big files
+/// live in their zone and a session references them by repo-root-relative path,
+/// so the thing that breaks is the pointer, and until now nothing said so.
+///
+/// **Six kinds, six existing resolvers, asked rather than restated.** A note is
+/// what [`keeper_core::notes::index::IndexSnapshot::resolve_link`] answers —
+/// the same function backlinks are built from, so a link cannot open one note
+/// here and appear under another there. A recording is a note whose frontmatter
+/// carries `session:` ([`keeper_core::notes::recording_note::is_recording_note`],
+/// as the vault's own `recording` flag is computed) and **never** a media file
+/// extension: a loose `.m4a` in a session is a file. A file exists on disk. A
+/// session is a file that turned out to be another session's folder, asked of
+/// the board's own rows. External is `http(s)`, opened by the system browser
+/// and never probed — keeper does not make network requests to colour a row.
+/// Missing is what is left, and the word is the export receipt's.
+///
+/// **The vault is asked only when the target could name a note.** A sessions
+/// root and a notes vault are both the profile (AD-90, AD-107), and the zone
+/// and the vault can never overlap ([`keeper_sync::SessionsConfig`]'s own
+/// validation), so a `60-sessions/…` path is structurally not a note. Asking
+/// anyway would let a stem match answer for an unrelated file.
+///
+/// Rejects with: `internal` (unknown root or session), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_refs(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+) -> Result<keeper_core::sessions::vm::SessionReferencesVm, IpcError> {
+    use keeper_core::panels::PanelTargetVm;
+    use keeper_core::sessions::refs::{self, NoteHit, RefKind, RefProbe, RefTarget, SessionHit};
+    use keeper_core::sessions::vm::{SessionReferenceVm, SessionReferencesVm};
+
+    let sources =
+        crate::sessions_root::ref_sources(&root_id, &session_id).ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("no such session: {session_id}"),
+            account_id: None,
+            retriable: false,
+        })?;
+
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let prefix = format!("{zone}/{}", sources.path);
+
+    /// The three questions, answered from the registries that already hold
+    /// them. The pure half took a trait rather than a filesystem, so this is
+    /// the only place any of them touches disk.
+    struct Probe<'a> {
+        root_id: &'a str,
+        zone: &'a str,
+        local_path: &'a std::path::Path,
+        snapshot: Option<std::sync::Arc<keeper_core::notes::index::IndexSnapshot>>,
+    }
+
+    impl RefProbe for Probe<'_> {
+        fn note(&self, target: &str) -> Option<NoteHit> {
+            let snapshot = self.snapshot.as_ref()?;
+            let entry = snapshot.resolve_link(target)?;
+            Some(NoteHit {
+                note_id: entry.id.clone(),
+                title: entry.title.clone(),
+                // The vault's own `recording` flag, as `notes_vault` computes
+                // it from `is_recording_note` — not a second predicate here.
+                recording: entry.flags.iter().any(|flag| flag == "recording"),
+            })
+        }
+
+        fn exists(&self, subpath: &str) -> bool {
+            // A profile-relative path, joined against the profile root and
+            // nowhere else: `..` in a link would otherwise probe outside the
+            // synced folder, and a reference widget is not a filesystem prober.
+            if subpath.split('/').any(|part| part == "..") {
+                return false;
+            }
+            self.local_path.join(subpath).exists()
+        }
+
+        fn session(&self, subpath: &str) -> Option<SessionHit> {
+            let inside = subpath.strip_prefix(&format!("{}/", self.zone))?;
+            crate::sessions_root::session_at(self.root_id, inside).map(|title| SessionHit { title })
+        }
+    }
+
+    let probe = Probe {
+        root_id: &root_id,
+        zone: &zone,
+        local_path: &profile.local_path,
+        // A profile that is not also a vault answers no notes, which is the
+        // honest answer rather than an error: a sessions zone in a folder with
+        // no vault flag has files and no note index (AD-90).
+        snapshot: crate::notes_vault::snapshot(&profile.id),
+    };
+
+    let found: Vec<(String, refs::RawRef)> = sources
+        .files
+        .iter()
+        .flat_map(|source| {
+            refs::scan(&source.text)
+                .into_iter()
+                .map(move |raw| (source.rel.clone(), raw))
+        })
+        .collect();
+
+    let rows: Vec<SessionReferenceVm> = refs::plan(&found, &prefix, &probe)
+        .into_iter()
+        .map(|row| {
+            let (panel_target, url, notice) = match &row.open {
+                RefTarget::Note { note_id } => (
+                    Some(PanelTargetVm::Note {
+                        // A vault id IS the profile id (AD-90) — composed here,
+                        // where that identity is known, rather than in the pure
+                        // module, which should not be asserting it.
+                        vault_id: profile.id.clone(),
+                        note_id: note_id.clone(),
+                    }),
+                    None,
+                    None,
+                ),
+                RefTarget::File { subpath } => (
+                    Some(PanelTargetVm::File {
+                        profile_id: profile.id.clone(),
+                        relative_path: subpath.clone(),
+                    }),
+                    None,
+                    None,
+                ),
+                RefTarget::External { url } => (None, Some(url.clone()), None),
+                RefTarget::Missing { looked } => {
+                    (None, None, Some(refs::missing_notice(&row.target, looked)))
+                }
+            };
+            SessionReferenceVm {
+                kind: row.kind.as_str().to_owned(),
+                target: row.target,
+                label: row.label,
+                source: row.source,
+                panel_target,
+                url,
+                notice,
+            }
+        })
+        .collect();
+
+    let missing = rows
+        .iter()
+        .filter(|row| row.kind == RefKind::Missing.as_str())
+        .count() as u32;
+
+    Ok(SessionReferencesVm {
+        refs: rows,
+        missing,
+        truncated: sources.truncated,
+    })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_refs(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle verbs (FR-238..FR-248, AD-111, AD-112)
 // ---------------------------------------------------------------------------

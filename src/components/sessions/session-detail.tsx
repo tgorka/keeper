@@ -22,11 +22,22 @@
  */
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { SESSION_REFS_HEADING, SessionRefs } from "@/components/sessions/session-refs";
 import { SessionTree } from "@/components/sessions/session-tree";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import type { SessionDetailVm, SessionEntryVm, SessionTreeVm } from "@/lib/ipc/client";
-import { listenSessionsChanged, sessionsDetail, sessionsTree } from "@/lib/ipc/client";
+import type {
+  SessionDetailVm,
+  SessionEntryVm,
+  SessionReferencesVm,
+  SessionTreeVm,
+} from "@/lib/ipc/client";
+import {
+  listenSessionsChanged,
+  sessionsDetail,
+  sessionsRefs,
+  sessionsTree,
+} from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 
 /** The way back to the board. */
@@ -74,6 +85,7 @@ export interface SessionDetailProps {
 export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionDetailProps) {
   const [detail, setDetail] = useState<SessionDetailVm | null>(null);
   const [tree, setTree] = useState<SessionTreeVm | null>(null);
+  const [refs, setRefs] = useState<SessionReferencesVm | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Read on mount and re-read on the changed event — an agent's write on
@@ -108,6 +120,23 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
         () => {
           if (live) {
             setTree(null);
+          }
+        },
+      );
+      // A third read, for the same reason the tree is a second one (FR-255):
+      // the reference scan parses every markdown file in the session and asks
+      // the vault index about each target, and a log re-read should not pay for
+      // that. Its failure is as local as the tree's — a session whose refs
+      // could not be scanned still has a log and files worth reading.
+      sessionsRefs(rootId, sessionId).then(
+        (vm) => {
+          if (live) {
+            setRefs(vm);
+          }
+        },
+        () => {
+          if (live) {
+            setRefs(null);
           }
         },
       );
@@ -273,6 +302,20 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               entries={tree?.entries ?? []}
               truncated={tree?.truncated ?? false}
               onOpen={openFile}
+            />
+          </section>
+
+          {/* What the session points at (FR-255) — after the files, because it
+              is the same question asked the other way: what it holds, then what
+              it names. */}
+          <section aria-label={SESSION_REFS_HEADING} className="flex flex-col gap-1">
+            <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              {SESSION_REFS_HEADING}
+            </h3>
+            <SessionRefs
+              refs={refs?.refs ?? []}
+              missing={refs?.missing ?? 0}
+              truncated={refs?.truncated ?? false}
             />
           </section>
         </div>

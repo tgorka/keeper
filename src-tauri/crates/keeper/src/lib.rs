@@ -929,6 +929,7 @@ pub fn run() {
         sessions_ipc::sessions_rescan,
         sessions_ipc::sessions_detail,
         sessions_ipc::sessions_tree,
+        sessions_ipc::sessions_refs,
         sessions_ipc::sessions_patterns,
         sessions_ipc::sessions_create,
         sessions_ipc::sessions_log_today,

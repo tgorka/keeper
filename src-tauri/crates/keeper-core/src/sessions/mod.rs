@@ -28,6 +28,7 @@ pub mod model;
 pub mod pattern;
 pub mod plan;
 pub mod promote;
+pub mod refs;
 pub mod vm;
 
 /// Everything the sessions domain can refuse to do.

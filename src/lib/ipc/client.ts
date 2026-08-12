@@ -209,6 +209,8 @@ export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
+export type { SessionReferencesVm } from "./gen/SessionReferencesVm";
+export type { SessionReferenceVm } from "./gen/SessionReferenceVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
 export type { SessionRowVm } from "./gen/SessionRowVm";
@@ -342,6 +344,7 @@ import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
@@ -4871,6 +4874,32 @@ export async function sessionsDetail(rootId: string, sessionId: string): Promise
  */
 export async function sessionsTree(rootId: string, sessionId: string): Promise<SessionTreeVm> {
   return await invoke<SessionTreeVm>("sessions_tree", { rootId, sessionId });
+}
+
+/**
+ * What one session points at (FR-255) — the other half of {@link sessionsTree}.
+ *
+ * The tree lists what a session *holds*; this lists what it *names*, which the
+ * zone's own contract makes a different set on purpose: big files live in their
+ * own zone and a session references them by repo-root-relative path. So the
+ * thing that breaks is the pointer, and `missing` is the count that says so.
+ *
+ * Every row is already resolved in Rust against the resolver that owns the
+ * question — the vault index for a note, the frontmatter `session:` key for a
+ * recording, the disk for a file, the board's rows for a session — and carries
+ * a ready `panelTarget` (AD-109) or a `url` for the system browser. Nothing
+ * here is classified from a file extension and nothing here joins a path.
+ *
+ * A missing row carries `notice`: what keeper looked for, named, so a moved
+ * file is one `mv` away rather than a search of the whole drive.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsRefs(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionReferencesVm> {
+  return await invoke<SessionReferencesVm>("sessions_refs", { rootId, sessionId });
 }
 
 /**

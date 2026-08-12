@@ -138,6 +138,43 @@ Sessions are bounded by their own contract, so the whole tree is read in one pas
 than one call per folder. A workspace somebody let a package manager into can still
 outgrow that: the tree then stops and says so rather than showing a prefix of itself.
 
+## What the session points at
+
+The tree lists what a session *holds*. **References** lists what it *names* — a different
+set on purpose, because the zone's own rule is that big files stay in their zone and a
+session points at them by path. So the thing that goes wrong is the pointer, and this is
+the only place that would ever say so.
+
+Keeper reads the session's README and everything in `refs/` and `prompts/`, and reports
+one row per distinct target — six kinds, each with a real test behind it:
+
+- **note** — the target resolves in the vault index, the same resolution a wikilink in a
+  note gets.
+- **recording** — a note whose frontmatter carries a `session:` key. That is what makes a
+  recording a recording; a loose `.m4a` sitting in the session is a *file*, and calling it
+  a recording because of its extension would be a guess.
+- **file** — a path that exists, looked for beside the session first and then from the
+  drive root, so `artifacts/notes.md` and `40-media/clip.mov` both work as written.
+- **session** — a path that lands inside another session in the same zone.
+- **link** — an external URL, reported without being fetched. Keeper does not know whether
+  a website is up, and a red row that only means "no internet" is worse than no row.
+- **missing** — the path resolves to nothing.
+
+**Missing sorts first and says what keeper looked for.** "Keeper could not find it" sends
+somebody searching four hundred folders; naming both paths it tried usually shows the file
+is one `mv` away. The heading states the count, so a session with nothing broken says so
+in a sentence instead of making a person read thirty good rows to conclude it.
+
+Pressing a row opens it where that thing belongs: a note or a file in the panel beside the
+board, a link in the system browser. A missing row is not a button — there is nothing to
+open, and the fix is an edit in the file named on the row.
+
+Two directories are deliberately not scanned. `artifacts/` is a deliverable, so a
+reference inside it is the artifact's business, not the session's. `workspace/` is scratch
+that dies with the session, and a broken pointer in a file nobody keeps is not worth
+reporting. The scan is bounded by total text rather than by file count — the cost here is
+parsing markdown — and says so when it stops early.
+
 ## Editing
 
 Opening a session opens its README in the same editor every other keeper surface uses —
@@ -164,6 +201,11 @@ refusal is the fence working, not a fault.
 remaining steps; every step is idempotent, and the folder move is always last.
 
 **A deleted session is gone.** It is not: `<zone>/.keeper/trash/<session id>/`.
+
+**A reference says missing and the file is right there.** Read the two paths on the row —
+they are what keeper tried. A path written from the drive root (`40-media/clip.mov`)
+resolves against the synced folder, not against your home directory, and a path with `..`
+in it is refused rather than followed out of the folder.
 
 ## What is not here yet
 
