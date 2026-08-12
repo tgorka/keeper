@@ -314,7 +314,16 @@ export function AppShell() {
                 // Phase 7: the board over the sessions zones sync holds, gated
                 // on the same construction as notes — a stale "sessions"
                 // primary-view can never show a board this build cannot fill.
-                <SessionsPane />
+                //
+                // The panel strip sits beside it exactly as it does beside
+                // Files (Story 45.1): the board is the browser and the strip
+                // is the document area, so opening a session's README is a
+                // click into the same editor every other surface uses
+                // (AD-109, UX-DR91).
+                <>
+                  <SessionsPane />
+                  <PanelStrip />
+                </>
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

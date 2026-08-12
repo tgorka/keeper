@@ -2113,6 +2113,17 @@ fn vault_and_scope(profile: &SyncProfile) -> (Option<crate::notes_vault::Vault>,
     let scope = WriteScope::new(
         &profile.name,
         vault.as_ref().map(|vault| vault.config.subfolder.as_str()),
+    )
+    // The workspace fence (Phase 7, AD-113): with the sessions zone named,
+    // the scope refuses every write under a session's `workspace/` — scratch
+    // keeper reads and never touches. From the stored profile rather than the
+    // registry, because the fence must hold even while the sessions registry
+    // is still starting: an unregistered zone widens nothing.
+    .with_sessions(
+        profile
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.subfolder.as_str()),
     );
     (vault, scope)
 }

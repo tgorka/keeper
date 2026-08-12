@@ -197,6 +197,17 @@ pub enum WriteRefusal {
         relative_path: String,
         reason: String,
     },
+    /// The path is inside a session's `workspace/` — scratch keeper reads and
+    /// never writes (Phase 7, AD-113, FR-237).
+    ///
+    /// A refusal by construction rather than a UI convention: the zone's own
+    /// contract says the workspace is unversioned and dies with the session,
+    /// so a keeper write there would put bytes in the one subtree whose loss
+    /// is designed in. The sentence is the zone's own words.
+    SessionWorkspace {
+        /// The path that was asked for, profile-relative.
+        subpath: String,
+    },
 }
 
 impl std::fmt::Display for WriteRefusal {
@@ -276,6 +287,12 @@ impl std::fmt::Display for WriteRefusal {
                 relative_path,
                 reason,
             } => write!(f, "keeper could not delete {relative_path}: {reason}"),
+            Self::SessionWorkspace { subpath } => write!(
+                f,
+                "{subpath} is inside a session's workspace — scratch that is not versioned, \
+                 not synced, and dies with the session. keeper reads it but never writes \
+                 there; promote the file into the session's artifacts instead."
+            ),
             Self::NoSystemTrash { reason } => write!(
                 f,
                 "keeper could not find this computer's trash ({reason}), and it will not \
@@ -329,6 +346,17 @@ pub struct CreateTarget {
     pub profile_relative: String,
 }
 
+/// One configured subfolder spelling, `/`-joined with empty parts dropped —
+/// the normalisation [`WriteScope::new`] documents, shared with the sessions
+/// fence so the two cannot disagree about what a subfolder string means.
+fn normalise_subfolder(configured: &str) -> String {
+    configured
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Where one profile's Files surface may write.
 ///
 /// Constructed per call from the vault the shell can actually reach, so this
@@ -339,6 +367,12 @@ pub struct WriteScope<'a> {
     /// The live vault's subfolder inside the profile, normalised, or `None`
     /// when this profile holds no reachable vault.
     subfolder: Option<String>,
+    /// The sessions zone's subfolder inside the profile, normalised, or `None`
+    /// when this profile holds no sessions zone (Phase 7, AD-113). What it
+    /// fences is narrow and absolute: any path under a session's `workspace/`
+    /// refuses every write, because the zone's own contract makes that subtree
+    /// scratch keeper reads and never touches.
+    sessions_subfolder: Option<String>,
 }
 
 impl<'a> WriteScope<'a> {
@@ -360,14 +394,20 @@ impl<'a> WriteScope<'a> {
     pub fn new(profile_name: &'a str, subfolder: Option<&str>) -> Self {
         Self {
             profile_name,
-            subfolder: subfolder.map(|configured| {
-                configured
-                    .split(['/', '\\'])
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            }),
+            subfolder: subfolder.map(normalise_subfolder),
+            sessions_subfolder: None,
         }
+    }
+
+    /// The same scope, aware of the profile's sessions zone (Phase 7, AD-113).
+    ///
+    /// A builder step rather than a third constructor argument so the many
+    /// call sites that predate sessions read unchanged — a scope built without
+    /// this refuses nothing new, which is exactly the compatibility a fence
+    /// must have: absent knowledge widens nothing.
+    pub fn with_sessions(mut self, sessions_subfolder: Option<&str>) -> Self {
+        self.sessions_subfolder = sessions_subfolder.map(normalise_subfolder);
+        self
     }
 
     /// Whether anything in this profile can be written at all.
@@ -521,7 +561,38 @@ impl<'a> WriteScope<'a> {
 
     /// The fork itself. Everything above it is arguments; everything below it
     /// is consequences.
+    /// Whether a profile-relative path sits inside a session's `workspace/`
+    /// (Phase 7, AD-113): `<zone>/active/<session>/workspace/**` or
+    /// `<zone>/archive/<year>/<session>/workspace/**`. Component-wise against
+    /// the normalised zone subfolder, exactly as the vault test is.
+    fn in_session_workspace(&self, subpath: &str) -> bool {
+        let Some(zone) = self.sessions_subfolder.as_deref() else {
+            return false;
+        };
+        let Some(rest) = subpath
+            .strip_prefix(zone)
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            return false;
+        };
+        let parts: Vec<&str> = rest.split('/').collect();
+        match parts.first() {
+            // active/<session>/workspace/...
+            Some(&"active") => parts.get(2) == Some(&"workspace") && parts.len() > 3,
+            // archive/<year>/<session>/workspace/...
+            Some(&"archive") => parts.get(3) == Some(&"workspace") && parts.len() > 4,
+            _ => false,
+        }
+    }
+
     fn classify(&self, subpath: &str, is_dir: bool) -> Result<Owned, WriteRefusal> {
+        // The workspace fence first (AD-113): scratch refuses every write, on
+        // the zone's own contract, before any question about vaults is asked.
+        if self.in_session_workspace(subpath) {
+            return Err(WriteRefusal::SessionWorkspace {
+                subpath: subpath.to_owned(),
+            });
+        }
         // With no vault, `vault_relative` tests for one before it tests the
         // path, so an escape must already have been refused by the caller —
         // `route` does it by resolving, `owner`'s caller by having read the
@@ -1070,6 +1141,73 @@ mod tests {
 
     fn scope() -> WriteScope<'static> {
         WriteScope::new("Vault", Some("10-notes"))
+    }
+
+    /// The workspace fence (Phase 7, AD-113): under a session's `workspace/`
+    /// every write refuses, in both zone layouts, and the fence is exactly as
+    /// narrow as the contract — the session's other subtrees, the zone's own
+    /// furniture, and a folder merely NAMED workspace elsewhere all pass.
+    #[test]
+    fn a_session_workspace_refuses_writes_and_nothing_beside_it_does() {
+        let scope = WriteScope::new("tgdrive", Some("10-notes")).with_sessions(Some("60-sessions"));
+        let refused = |subpath: &str| {
+            matches!(
+                scope.classify(subpath, false),
+                Err(WriteRefusal::SessionWorkspace { .. })
+            )
+        };
+        // Inside the fence, both lifecycle locations, any depth.
+        assert!(refused(
+            "60-sessions/active/2026-08-10-keeper/workspace/iter.md"
+        ));
+        assert!(refused(
+            "60-sessions/active/2026-08-10-keeper/workspace/deep/scratch.csv"
+        ));
+        assert!(refused(
+            "60-sessions/archive/2025/2025-03-01-taxes/workspace/x.md"
+        ));
+        // Outside it: the record subtrees are ordinary writable paths.
+        assert!(!refused("60-sessions/active/2026-08-10-keeper/README.md"));
+        assert!(!refused(
+            "60-sessions/active/2026-08-10-keeper/artifacts/report.md"
+        ));
+        assert!(!refused(
+            "60-sessions/active/2026-08-10-keeper/prompts/01-scope.md"
+        ));
+        // The bare `workspace` directory name is the container, not a file in
+        // it; a directory refusal is `IsDirectory`'s business, not the fence's.
+        assert!(!refused("60-sessions/active/2026-08-10-keeper/workspace"));
+        // A folder named workspace ANYWHERE else is somebody's own folder.
+        assert!(!refused("30-work/project/workspace/notes.md"));
+        assert!(
+            !refused("60-sessions/_template/workspace/.gitkeep") || {
+                // The template's workspace is not under active/ or archive/, so
+                // the fence does not claim it — the template is user data.
+                false
+            }
+        );
+        // A scope that never learned about sessions refuses nothing new.
+        let unaware = WriteScope::new("tgdrive", Some("10-notes"));
+        assert!(!matches!(
+            unaware.classify("60-sessions/active/x/workspace/y.md", false),
+            Err(WriteRefusal::SessionWorkspace { .. })
+        ));
+    }
+
+    /// The refusal's sentence speaks the zone's own words — the promote path
+    /// is the answer, not a generic "not allowed".
+    #[test]
+    fn the_workspace_refusal_names_the_path_and_points_at_promotion() {
+        let refusal = WriteRefusal::SessionWorkspace {
+            subpath: "60-sessions/active/x/workspace/draft.md".to_owned(),
+        };
+        let sentence = refusal.to_string();
+        assert!(sentence.contains("workspace"), "{sentence}");
+        assert!(sentence.contains("promote"), "{sentence}");
+        assert!(
+            sentence.contains("60-sessions/active/x/workspace/draft.md"),
+            "{sentence}"
+        );
     }
 
     /// The whole of the "outside a vault cannot be written" rule: a profile

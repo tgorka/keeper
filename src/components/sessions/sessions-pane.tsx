@@ -26,8 +26,8 @@ import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { SessionRowVm } from "@/lib/ipc/client";
-import { revealPath, sessionsRescan } from "@/lib/ipc/client";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { sessionsRescan } from "@/lib/ipc/client";
+import { panelsStore } from "@/lib/stores/panels";
 import {
   filterRows,
   type SessionsStatusFilter,
@@ -68,7 +68,6 @@ const STATUS_CHOICES: { value: SessionsStatusFilter; label: string }[] = [
 ];
 
 export function SessionsPane() {
-  const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
   const roots = useSessionsRootsStore((s) => s.roots);
   const activeRoot = useActiveSessionsRoot();
   const setActiveRootId = useSessionsRootsStore((s) => s.setActiveRootId);
@@ -95,15 +94,24 @@ export function SessionsPane() {
   const filtered = rows === null ? [] : filterRows(rows, { text, status, pinnedOnly, unreadOnly });
   const anyFilter = text.trim() !== "" || status !== "all" || pinnedOnly || unreadOnly;
 
-  // Opening a session this story means revealing its folder — the detail panel
-  // is the next story's surface, and a dead click is worse than an honest one.
+  // Opening a session opens its README in the panel strip — the SAME file
+  // target the Files pane sets and the SAME editor behind it (AD-109,
+  // UX-DR91): the target is `(profileId, relativePath)`, the profile id IS
+  // the root id (AD-107), and the path is the zone subfolder joined with the
+  // session's folder. Everything downstream — the markdown editor, live
+  // external changes, the raw/rendered toggle — is Epic 45/46 machinery,
+  // reused rather than rebuilt.
   const openRow = useCallback(
     (row: SessionRowVm) => {
-      if (activeRoot !== null && canReveal) {
-        void revealPath(`${activeRoot.root}/${row.path}`);
+      if (activeRoot !== null) {
+        panelsStore.getState().setActiveTarget({
+          kind: "file",
+          profileId: activeRoot.id,
+          relativePath: `${activeRoot.subfolder}/${row.path}/README.md`,
+        });
       }
     },
-    [activeRoot, canReveal],
+    [activeRoot],
   );
 
   return (
