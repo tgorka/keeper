@@ -7,7 +7,11 @@
          RELATIVE: Vite has no publicDir here, so `/favicon.png` would be passed
          through untouched and 404 in dev and in the bundle alike. A relative href
          is resolved as a build asset and emitted into dist. This replaced a link
-         to `/vite.svg`, a scaffold leftover that has never existed in this repo. -->
+         to `/vite.svg`, a scaffold leftover that has never existed in this repo.
+         The SVG is listed first — a browser that understands both prefers the
+         later-listed match, but every modern engine takes the vector; the PNG
+         stays as the fallback and as the raster GitHub and file browsers read. -->
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="icon" type="image/png" href="./favicon.png" />
     <!-- viewport-fit=cover exposes env(safe-area-inset-*) for edge-to-edge phone
          rendering (Story 13.5, FR-59); interactive-widget=resizes-content resizes

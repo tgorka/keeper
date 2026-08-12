@@ -1,137 +1,125 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">
-  <title>keeper — the accession tag</title>
+  <title>keeper — the hex-bot</title>
   <!--
-    THE KEEPER MARK. The accession tag: the punched, ruled label a museum keeper ties to every
-    object in a collection so the thing and its record never come apart. That is what keeper is
-    for, so that is what the mark says. It is also the only silhouette in a menu bar full of
-    rectangles that is not one — the tag's head is a step, not a corner, and a stepped outline is
-    findable in peripheral vision in a way a rounded box is not.
+    THE KEEPER MARK. A honeycomb cell with a face: the hex-bot. keeper -> beekeeper -> the hive.
+    A hive is many cells kept as one structure, which is literally what this product is — many
+    networks bridged into one kept archive — and the keeper is the one who tends it. The face is
+    the owner's decision, made deliberately against the earlier no-face draft: the eyes are what
+    make the mark a SOMEONE in the menu bar rather than another rectangle, and the mouth is what
+    makes it an instrument — it is the state display.
 
-    Three holes, in the order a tag is read: the EYELET it hangs by, the RULE the accession number
-    is written on, and the APERTURE, which is the entry that is still being kept and therefore the
-    one that carries live state.
+    Why this is not a bugdroid problem: Android's trademark is a dome head with two thin antennae
+    and two dot eyes. This mark is a flat-topped hexagon, it wears NO antenna in any template
+    (the antenna exists only on the coloured app icon, where it is a single stem tipped with a
+    smaller hexagon — self-similar, not a feeler), and its mouth carries a state vocabulary no
+    character mascot has. Silhouette, count and grammar all differ.
 
-    THE GRID IS 44 UNITS, AND EVERY COORDINATE IS EVEN. This is the whole reason the file was
-    re-authored, so it is worth being exact about what it buys.
+    THE GRID IS 44 UNITS, AND EVERY TEMPLATE COORDINATE IS EVEN. 44 -> 44px is 1:1 and
+    44 -> 22px is exactly 0.5, and 22px is what macOS renders a menu-bar template at. Every
+    horizontal and vertical edge here is a whole pixel at both tray sizes.
 
-      44 -> 44px is 1:1 and 44 -> 22px is exactly 0.5, and 22px is the size macOS renders a menu-bar
-      template at. So an even coordinate here is a whole pixel at BOTH tray sizes, and the
-      rasteriser never has to average across an edge.
+    A hexagon has diagonals, and a diagonal cannot land on whole pixels — this is the one trade
+    this mark makes that the rectilinear tag it replaces did not, and it is made with open eyes:
 
-      44 -> 16px is 0.3636 and nothing lands whole there. That is accepted, not overlooked: no
-      alpha-only 16px template ships. The 16px raster is a colour app icon on a tile, where
-      antialiasing is correct. It is measured and reported by `gen-mark-icons.ts` anyway, because
-      the number is worth knowing even when it cannot be the one optimised for.
+      - All four diagonal edges have slope exactly 1:2 (8 across, 16 down), so the rasteriser
+        antialiases them in one repeating two-row pattern instead of an irregular stagger. A
+        consistent fringe reads as a crisp angle; an inconsistent one reads as mush.
+      - Everything INSIDE the ring — eyes, mouth states, the sync ink the generator adds — is
+        axis-aligned on even units and stays whole-pixel. The information is crisp; only the
+        containing silhouette spends antialiasing, and it spends it identically in all glyphs.
+      - The partial-pixel counts are still measured and PINNED in the generator and its test,
+        per glyph. The budget is exact equality with the authored geometry, so an edge that
+        drifts off the grid still fails the run — the gate did not relax, it re-based.
 
-      There is no grid that is exact at both. A coordinate c on a grid G lands whole at 16px and at
-      22px only if c*16/G and c*22/G are both integers; gcd(16,22) = 2, so that forces c to be a
-      multiple of G/2 — the corners and the centre, and nothing else. One of the two sizes has to
-      be chosen, and 22px is the one that ships.
+    The ring is 4 units thick on its horizontal bands (2px at 22) and ~3.6 on the diagonals —
+    the perpendicular thinning of a parallel-offset 1:2 line, left uncorrected because a whole
+    optical correction would cost the even grid on the inner contour.
 
-    THE 44 IS ALSO THE CANVAS. `gen-mark-icons.ts` composes every tray glyph on a 44-unit square,
-    so authoring here at 44 means the mark is drawn at the size it is worn: the translate into the
-    tray canvas is (0, 0) and the drawing is 1:1 with the pixels the menu bar gets. The previous
-    32-unit grid is what made the mark SMALL — a 28x26 drawing centred in a 44 canvas is 14x13 px
-    of the 22 available, with 8 units of margin on each side that nobody chose. The tag is 32x36
-    here, which is 16x18 px at 22, and the recovered room is what the aperture spends.
+    The face:
 
-    The contract that separates marks which survive small from marks which mush is that the outer
-    contour is ONE filled shape and the identity lives in the holes. A mark whose idea is its
-    colour fails alpha-only rasterisation even when its geometry survives, because alpha is all a
-    menu-bar template image gets to keep. So all three holes are holes, never highlights.
+      - EYES, 4x4 at y14..18, symmetric about x22 with a 4-unit gap. 2x2px at 22 — the smallest
+        crisp feature, same floor as the tag's eyelet. They are ink islands inside the cell, in
+        every glyph, always open: they are the identity, not a state.
+      - MOUTH, the state display, on the field x14..30 y22..34. It speaks the lamp's vocabulary:
+        filled (live: a solid 8x6 mouth — recording, on the record), empty (idle: calm), dashed
+        (working: three 4x4 dots — the "typing…" idiom, thinking), broken (fault: an exclamation,
+        its point grounded on the chin). The generator drops sync facts onto the same field.
 
-    There are no curves. Not a style choice: an arc's tangent points are the only places this
-    drawing could leave the pixel grid, and the 32-unit mark's four 2-unit rounded corners were
-    exactly the three partial pixels it still had at 22px.
+    The interior is ONE enclosed hole (two while the armed ring is up) and the eyes and mouth are
+    islands in it. The identity still lives in the contrast between ink and hole; it is simply a
+    cell with things kept inside it rather than a tag with holes punched out — which is, after
+    all, the product.
   -->
   <defs>
     <!--
-      The base mark, which is also the `idle` aperture state: the tag's contour with its three
-      holes cut as even-odd subpaths.
-
-      The contour steps at x 24 / y 14, so the head is 18x10 and the punched-out corner beside it
-      is 14x10. The step is nearly half the drawing's width, which is what makes it read as a tag
-      rather than as a rectangle with a chip out of it.
-
-      The EYELET is centred in the head and the two written entries — RULE and APERTURE — are
-      left-aligned on x 10, a 4-unit margin in from the tag's edge. That is how a real tag is
-      made: the punch is centred in the reinforced tab because that is where the load is, and
-      what is written on the tag is ranged left against a margin. An eyelet dragged onto the
-      same left margin was tried and reads as a hole that missed.
-
-      THE RULE ENDS AT 28, PAST THE STEP AT 24, and that is the one number here chosen by eye
-      rather than derived. Ending it flush with the step made the rule read as the head's
-      UNDERLINE — one shape with a line under it — and the whole right half of the tag went
-      solid. Crossing the step by 4 breaks that alignment, and the tag reads in the order it is
-      built: punched head, line of writing, entry. Running it the full width of the aperture was
-      also tried and turns the tag into two stacked slots.
-
-      HOLE SIZES ARE DELIBERATELY EVENED OUT — by their THINNEST DIMENSION, which is what decides
-      what survives a downscale, not by area. On the 32-unit grid the eyelet was 4 units across —
-      2px at 16 and a smeared 2.75px at 22 — a speck sitting next to a 160-unit slot, and it was
-      the first thing to go at every size. Here the three thinnest dimensions are 6, 4 and 12, so
-      the smallest feature in the mark is a crisp 3x3 px square at 22px. Enlarging the small
-      holes was the right use of the extra grid; adding a fourth hole would not have been.
+      The base mark, which is also the `idle` state: the hexagonal cell wall cut as an even-odd
+      ring, and the two eyes. Outer hex 14,6 30,6 38,22 30,38 14,38 6,22 — 32x32, centred on the
+      44 canvas at (0,0) translate. Inner hex offset 4 on the horizontals, same 1:2 slopes.
     -->
-    <path id="mark-base" fill-rule="evenodd"
-          d="M6 4H24V14H38V40H6Z M12 6H18V12H12Z M10 16H28V20H10Z M10 24H34V36H10Z"/>
-
-    <!--
-      THE APERTURE IS A STATE DISPLAY, at the four states the lamp carries: live, idle, working,
-      fault. One vocabulary, agreed with the lamp component rather than invented twice.
-
-      Every state below is the base mark PLUS ink dropped into the open aperture — never the
-      contour re-cut. Additive states need no mask and no second copy of the contour, so the
-      silhouette provably cannot drift between the four, and a reader can see at a glance that
-      only the hole changes.
-
-      The aperture is 24x12, which is 12x6 px at 22px. The 32-unit mark's was 16x10, which is
-      8x5 px — and 8x5 is why its `live` and `fault` glyphs differed by THREE pixels in the
-      shipped menu bar. Everything the tray has to say happens inside this rectangle, so its size
-      is not a proportion decision, it is the bandwidth.
-    -->
-
-    <!--
-      live — a solid core, inset 2 units so a ring of aperture survives all the way round it. That
-      ring is 1px at 22px, and crisp rather than grey because both of its edges are even. Filled,
-      exactly as the lamp's live state is a filled disc.
-    -->
-    <rect id="aperture-live" x="12" y="26" width="20" height="8"/>
-
-    <!--
-      working — two bridges across the aperture, breaking the 24-unit slot into 6/4/6. This is the
-      dashed state: the lamp dashes its ring, and the mark dashes the hole the tag's own walls
-      already ring. The bridges span the aperture's full height, so they are ink joined to the
-      contour rather than islands floating in the hole.
-    -->
-    <g id="aperture-working">
-      <rect x="16" y="24" width="4" height="12"/>
-      <rect x="24" y="24" width="4" height="12"/>
+    <g id="mark-base">
+      <path fill-rule="evenodd"
+            d="M14 6H30L38 22L30 38H14L6 22Z M16 10H28L34 22L28 34H16L10 22Z"/>
+      <rect x="16" y="14" width="4" height="4"/>
+      <rect x="24" y="14" width="4" height="4"/>
     </g>
 
     <!--
-      fault — the live core with a bite out of its trailing (right) edge, vertically centred on the
-      core. Right rather than left because the lamp bites its disc on the right, and because the
-      left is the margin every hole is aligned to.
-
-      The bite is 10 wide and 4 deep — half the core's width and half its height — and it is sized
-      by the menu bar rather than by taste. It is 5x2 px at 22px, so `fault` and `live` differ by
-      ten pixels where the shipped pair differed by three. Three is a difference nobody sees on a
-      glyph they are not already staring at, and a status glyph is by definition one you are not.
+      live — the mouth as a solid 8x6 core, the lamp's filled state. 4x3px at 22, dead centre,
+      2 units clear of everything: a hex-bot with its mouth open on the record.
     -->
-    <path id="aperture-fault" d="M12 26H32V28H22V32H32V34H12Z"/>
+    <rect id="mouth-live" x="18" y="24" width="8" height="6"/>
 
-    <g id="mark-live"><use href="#mark-base"/><use href="#aperture-live"/></g>
+    <!--
+      working — three 4x4 dots across the mouth field, the lamp's dashed state and the oldest
+      idiom in messaging: "typing…". The outer dots sit 1 unit off the inner diagonals at their
+      lower corners; that unit is antialiased fringe, not a merge, and the pinned raster proves it.
+    -->
+    <g id="mouth-working">
+      <rect x="14" y="24" width="4" height="4"/>
+      <rect x="20" y="24" width="4" height="4"/>
+      <rect x="26" y="24" width="4" height="4"/>
+    </g>
+
+    <!--
+      fault — an exclamation: a 4x6 bar, a 2-unit gap, and a 4x4 point grounded on the chin
+      (y30..34 ends exactly on the inner bottom edge, so the point is ink joined to the wall
+      rather than a third island). The gap is the glyph: 1px at 22 between bar and point is what
+      separates "!" from a stroke, and the grounded point is what separates fault from live.
+    -->
+    <g id="mouth-fault">
+      <rect x="20" y="22" width="4" height="6"/>
+      <rect x="20" y="30" width="4" height="4"/>
+    </g>
+
     <g id="mark-idle"><use href="#mark-base"/></g>
-    <g id="mark-working"><use href="#mark-base"/><use href="#aperture-working"/></g>
-    <g id="mark-fault"><use href="#mark-base"/><use href="#aperture-fault"/></g>
+    <g id="mark-live"><use href="#mark-base"/><use href="#mouth-live"/></g>
+    <g id="mark-working"><use href="#mark-base"/><use href="#mouth-working"/></g>
+    <g id="mark-fault"><use href="#mark-base"/><use href="#mouth-fault"/></g>
+
+    <!--
+      hero — the coloured-icon face, NEVER a template: the idle mark plus the three things that
+      would be spent pixels at 22 and are personality at 64+. A smile (the menu bar's mouth is a
+      state display and must be empty at rest; the app icon is not a status indicator, so it may
+      be pleased to see you). An antenna: a 2-unit stem rising from the cell wall. And the stem's
+      tip: a smaller hexagon — the mark broadcasting itself, self-similarity instead of ornament,
+      and pointedly not a pair of feelers (see the bugdroid note above).
+
+      Curves and off-grid coordinates are allowed here and only here: the hero ships exclusively
+      through antialiased colour rasters (32px and up), where the whole-pixel doctrine does not
+      apply.
+    -->
+    <g id="mark-hero">
+      <use href="#mark-idle"/>
+      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z"/>
+      <rect x="21" y="-4" width="2" height="10"/>
+      <path d="M20.2 -10.1L23.8 -10.1L25.6 -7L23.8 -3.9L20.2 -3.9L18.4 -7Z"/>
+    </g>
   </defs>
 
   <!--
-    Standalone, the file renders the plain open aperture. That is the canonical mark and the one
-    the app icon carries: it is the state with the largest single hole, so it is the state that
-    reads from furthest away, and an app icon should say "keeper" rather than report a status the
-    icon has no way to keep current.
+    Standalone, the file renders the idle face. That is the canonical mark and the state the app
+    icon's hero is built from: calm, eyes open, mouth empty — present and keeping, reporting
+    nothing, which is the only state an icon with no way to stay current should claim.
   -->
   <use href="#mark-idle" fill="#000"/>
 </svg>

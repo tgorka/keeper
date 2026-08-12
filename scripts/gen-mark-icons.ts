@@ -1,23 +1,22 @@
 #!/usr/bin/env bun
 /**
  * Generates every raster the keeper mark is shipped as: the app icon set Tauri bundles, the macOS
- * tray TEMPLATE family the menu bar tints, the iOS AppIcon set, and `favicon.png` in the repo root.
+ * tray TEMPLATE family the menu bar tints, the iOS AppIcon set, `favicon.png` in the repo root —
+ * and `favicon.svg` beside it, the one vector consumers that can read a vector should prefer.
  *
  * `src-tauri/crates/keeper/icons/mark.svg` is the only source of geometry. Nothing here knows the
- * shape of the head — this file places the mark, drops extra ink into its aperture, and hands the
- * result to a rasteriser. Every number below is DERIVED from the mark's own boxes rather than
+ * shape of the head — this file places the mark, drops extra ink into its mouth field, and hands
+ * the result to a rasteriser. Every number below is DERIVED from the mark's own boxes rather than
  * measured off a render, so editing the mark moves the family with it.
  *
  * That is the specific mistake this file exists not to repeat. It replaces `gen-tray-sync-icons.ts`,
- * which derived the sync family from the shipped idle PNG and carried constants — a bubble centre
- * at 21.5/18.5, a ring radius of 6.2, a badge at 34.2/37.2 — measured off the OLD brand, a speech
- * bubble. Those numbers were correct, and became meaningless the day the silhouette changed, with
- * nothing in the file able to notice.
+ * which derived the sync family from the shipped idle PNG and carried constants measured off a
+ * brand two brands ago. Those numbers were correct, and became meaningless the day the silhouette
+ * changed, with nothing in the file able to notice.
  *
- * RASTERISER: `tauri icon`, from the `@tauri-apps/cli` devDependency, which embeds resvg. It is the
- * official path, it takes SVG directly, and it is the only rasteriser on this Linux box — there is
- * no rsvg-convert, inkscape, ImageMagick, sharp or cairosvg here. It is deterministic, which is
- * what makes the committed PNGs reviewable in a diff.
+ * RASTERISER: `tauri icon`, from the `@tauri-apps/cli` devDependency, which embeds resvg. It is
+ * the official path, it takes SVG directly, and it is deterministic, which is what makes the
+ * committed PNGs reviewable in a diff.
  *
  * Run: bun run scripts/gen-mark-icons.ts
  */
@@ -50,67 +49,62 @@ const TAURI_CLI = "./node_modules/.bin/tauri";
 
 /**
  * The mark's viewBox: 44 units, which is the tray canvas, halves to 22px exactly
- * and is 1:1 at 44px. Both tray sizes therefore land on whole pixels.
- *
- * It does NOT halve to 16px (44/16 = 0.3636), and that is a chosen trade rather
- * than an oversight — see mark.svg, which proves no grid can serve both. Nothing
- * ships a 16px alpha-only template; 16px is a colour app icon on a tile, where
- * antialiasing is correct. The run still measures and prints 16px, because a
- * number you have stopped looking at is a number you have stopped defending.
+ * and is 1:1 at 44px. Both tray sizes therefore land on whole pixels for every
+ * horizontal and vertical edge. The hexagon's four diagonals cannot land whole at
+ * any size — see mark.svg for the trade and why every diagonal is slope 1:2 —
+ * so partial pixels are not gated at zero here. They are gated at EXACT PINNED
+ * COUNTS per glyph instead: the antialiasing the authored geometry produces is
+ * deterministic, so any drift off the grid still changes a number and fails.
  */
 const MARK_GRID = 44;
-/** The tag's bounding box — x 6..38 by y 4..40, so 32 wide by 36 tall. */
-const MARK_BOX = { x0: 6, y0: 4, x1: 38, y1: 40 } as const;
-/** The aperture: the mark's state hole, and the surface every glyph's extra ink is drawn on. */
-const APERTURE = { x0: 10, y0: 24, x1: 34, y1: 36 } as const;
+/** The cell's bounding box — x 6..38 by y 6..38, so 32 by 32. */
+const MARK_BOX = { x0: 6, y0: 6, x1: 38, y1: 38 } as const;
 /**
- * Eyelet, rule, aperture — the three holes the tag's identity lives in, and the
- * floor every glyph is held to. Extra ink can only ADD holes (the dashed
- * aperture makes five, the armed ring four); dropping below three means a hole
- * has filled in or leaked into the outside, which is the failure a bounding box
- * cannot see.
+ * The hero's bounding box: the cell plus the antenna above it (stem to y -4,
+ * tip hexagon to y -10.1, held as -10). Only the coloured tiles use it; no
+ * template ever wears the antenna.
  */
-const MARK_HOLES = 3;
+const HERO_BOX = { x0: 6, y0: -10, x1: 38, y1: 38 } as const;
+/**
+ * The cell interior is ONE enclosed hole, and the eyes and mouth ink are islands
+ * inside it. The armed ring adds a second. Below one means the ring has broken
+ * open or the interior has filled in — the failure a bounding box cannot see.
+ */
+const MARK_HOLES = 1;
 
 const MARK_W = MARK_BOX.x1 - MARK_BOX.x0;
 const MARK_H = MARK_BOX.y1 - MARK_BOX.y0;
 
-/** The four aperture states, in the vocabulary shared with the lamp component. */
+/** The four face states, in the vocabulary shared with the lamp component. */
 type State = "live" | "idle" | "working" | "fault";
 
 /**
- * The drawable field inside the aperture, inset far enough that ink dropped here
- * never touches the aperture walls. The margin is what keeps a state readable as
- * something INSIDE a hole rather than as the hole changing shape — and at 2 units
- * it is a whole pixel at both tray sizes.
+ * The mouth field: the drawable region inside the cell the sync facts are drawn
+ * on, the same surface the face states use. Its corners clear the inner
+ * diagonals by at least a unit at every y it spans (verified in mark.svg's
+ * comments edge by edge), so ink on this field reads as something IN the mouth
+ * rather than the cell changing shape.
  */
-const FIELD_INSET = 2;
-const FIELD = {
-  x0: APERTURE.x0 + FIELD_INSET,
-  y0: APERTURE.y0 + FIELD_INSET,
-  x1: APERTURE.x1 - FIELD_INSET,
-  y1: APERTURE.y1 - FIELD_INSET,
-} as const;
+const FIELD = { x0: 14, y0: 22, x1: 30, y1: 32 } as const;
 const FIELD_CX = (FIELD.x0 + FIELD.x1) / 2;
 
 // ---------------------------------------------------------------------------
 // Tray canvas and placement.
 //
-// 44 units, because that is the @2x size of a 22pt menu-bar item — and now also
-// the mark's own grid, so the mark is authored at the size it is worn and the
-// placement below comes out at (0, 0). That is the point of the re-author rather
-// than a coincidence to be tidied away: while the artwork was 32 units and the
-// canvas was 44, the mark was drawn 27% smaller than the surface it ships on and
-// nothing in either file said so. The translate is kept, and asserted, so a
+// 44 units, because that is the @2x size of a 22pt menu-bar item — and also the
+// mark's own grid, so the mark is authored at the size it is worn and the
+// placement below comes out at (0, 0). The translate is kept, and asserted, so a
 // future edit to MARK_BOX still lands somewhere legal.
 //
 // THE HEAD IS CENTRED AND IDENTICAL IN ALL TEN GLYPHS, and that is a hard
 // requirement rather than tidiness. macOS centres a status-item image, so a glyph
-// whose ink sits high renders high; if the bare states and the sync states put
-// their ink in different places, the head visibly JUMPS the moment a sync starts,
-// and a user cannot tell a state change from a glitch. Reserving an external
-// corner for badges is what causes that, so the badges went inside the aperture
-// instead — where, by the previous author's own measurement, they are also bigger.
+// whose ink sits high renders high; if the states put their ink in different
+// places the head visibly JUMPS the moment a sync starts, and a user cannot tell
+// a state change from a glitch. This is also why the sync facts live in the
+// mouth rather than in a corner badge: a badge outside the cell but inside its
+// box has at most 2 units of room (the cell's cut corners are that thin), and a
+// badge outside the box moves the head. The mouth is where the room is — the
+// same conclusion the previous tag reached about its aperture.
 // ---------------------------------------------------------------------------
 
 const CANVAS = 44;
@@ -120,8 +114,8 @@ const DY = (CANVAS - MARK_H) / 2 - MARK_BOX.y0;
 /**
  * The whole-pixel rule, asserted rather than commented. A half-unit or odd
  * translate would put every even coordinate in the artwork onto a half pixel at
- * 22px, which is the exact failure the 44-unit grid exists to remove — and it
- * would do it silently, because the glyph would still look right at 44px.
+ * 22px — and it would do it silently, because the glyph would still look right
+ * at 44px.
  */
 for (const [name, v] of [
   ["DX", DX],
@@ -137,12 +131,13 @@ for (const [name, v] of [
 }
 
 // ---------------------------------------------------------------------------
-// Aperture ink.
+// Mouth ink for the sync facts.
 //
 // Everything below is drawn in the MARK's coordinate space and rides the same
 // translate as the head, so these numbers can be read straight against mark.svg.
-// All of it is additive: the base mark is never re-cut, so the silhouette cannot
-// drift between glyphs.
+// All of it is additive over the idle face: the base mark is never re-cut, so
+// the silhouette cannot drift between glyphs — and the eyes stay open in every
+// one of them, because the eyes are the identity, not a state.
 // ---------------------------------------------------------------------------
 
 function rect(x: number, y: number, w: number, h: number): string {
@@ -150,97 +145,63 @@ function rect(x: number, y: number, w: number, h: number): string {
 }
 
 /**
- * A vertical arrow filling the field: `dir` -1 points up, +1 points down. The
- * head stops 2 units short of the tail and a stem fills the rest.
- *
- * The triangle's diagonals are the only edges in the whole family that do not
- * land on the pixel grid, which is why these two glyphs are the only two that
- * report any partial pixels at all. A diagonal has to be antialiased or it has
- * to be a staircase, and at 3px tall a staircase is not a diagonal.
- *
- * The head is 16 units across on a 20-unit field — 8px at 22px, where the
- * 32-unit mark's was 6px. An arrowhead is the one glyph in the family that is
- * read by its ANGLE rather than by its area, and a wider base is a shallower,
- * more obviously directional angle at the same 3px of height.
+ * A vertical arrow on the mouth field: `dir` -1 points up, +1 points down. A
+ * 16-wide head — read by its ANGLE, so as wide as the field allows — and a 4x4
+ * stem. The head's diagonals are the only mouth ink in the family that is not
+ * axis-aligned; they ride on top of the ring's own pinned antialiasing.
  */
 function arrow(dir: -1 | 1): string {
   const apexY = dir === -1 ? FIELD.y0 : FIELD.y1;
-  const tailY = dir === -1 ? FIELD.y1 : FIELD.y0;
-  const baseY = tailY + dir * 2;
+  const baseY = dir === -1 ? FIELD.y0 + 6 : FIELD.y1 - 6;
+  const stemY = dir === -1 ? baseY : baseY - 4;
   return (
-    `<path d="M${FIELD_CX} ${apexY}L${FIELD_CX - 8} ${baseY}L${FIELD_CX + 8} ${baseY}Z"/>` +
-    rect(FIELD_CX - 2, Math.min(baseY, tailY), 4, 2)
+    `<path d="M${FIELD_CX} ${apexY}L${FIELD.x0} ${baseY}L${FIELD.x1} ${baseY}Z"/>` +
+    rect(FIELD_CX - 2, stemY, 4, 4)
   );
 }
 
 /**
- * Armed — sync is configured and healthy with nothing in flight: the core drawn
- * HOLLOW, a 2-unit ring with the ground showing through it. The lamp's own idle
- * is a hollow ring for the same reason, so this is the vocabulary rather than a
- * new picture: present, lit, nothing happening.
- *
- * Static on purpose. The rotating frames this family used to carry said
- * "something is happening" and nothing about what, which is why the tray stopped
- * advancing a frame counter.
+ * Armed — sync configured and healthy with nothing in flight: a hollow 12x8
+ * rectangle, a 2-unit wall with the mouth showing through it. The lamp's own
+ * idle is a hollow ring for the same reason: present, lit, nothing happening.
  */
-const ARMED = `<path fill-rule="evenodd" d="M${FIELD.x0} ${FIELD.y0}H${FIELD.x1}V${FIELD.y1}H${FIELD.x0}Z M${FIELD.x0 + 2} ${FIELD.y0 + 2}H${FIELD.x1 - 2}V${FIELD.y1 - 2}H${FIELD.x0 + 2}Z"/>`;
+const ARMED = `<path fill-rule="evenodd" d="M16 24H28V32H16Z M18 26H26V30H18Z"/>`;
 
 /**
- * Paused — two bars, the universal pause: 6 wide, the field's full height, with a
- * 4-unit gap. Every edge even, so it is crisp at both sizes. The bars sit 2 in
- * from the field's ends rather than flush to them, because a pause read as two
- * bars needs the gap between them to be narrower than the bars, and flush bars on
- * a 20-unit field put the gap at 8.
+ * Paused — two 4x8 bars with a 4-unit gap, the universal pause, filling the
+ * mouth the way the live core does so the two read as the same MASS in two
+ * states: running solid, held apart.
  */
-const PAUSED = rect(FIELD.x0 + 2, FIELD.y0, 6, 8) + rect(FIELD.x1 - 8, FIELD.y0, 6, 8);
+const PAUSED = rect(16, 24, 4, 8) + rect(24, 24, 4, 8);
 
 /**
- * Warning — the core broken into a long piece and a short one. It is an
- * exclamation laid along the aperture, and more usefully it is the only state
- * whose ink is INTERRUPTED asymmetrically, so it cannot be confused with paused
- * (two equal bars) or with fault (one solid core with a bite).
- *
- * 10 + gap 6 + 4, not 12 + 4 + 4. The gap is the ONLY thing that distinguishes
- * warning from live, so the gap is the glyph: at 4 units it was 8 differing
- * pixels against `live` at 22px and the weakest pair in the family; at 6 it is 12
- * and it is not.
+ * Warning — the mouth broken into a long piece and a short one: an exclamation
+ * laid on its side. The 4-unit gap is the glyph: it is the only thing that
+ * separates warning from live, and at 2px in the menu bar it is the widest gap
+ * the field can afford while keeping the short piece 4 units.
  */
-const WARNING = rect(FIELD.x0, FIELD.y0, 10, 8) + rect(FIELD.x1 - 4, FIELD.y0, 4, 8);
+const WARNING = rect(14, 24, 8, 6) + rect(26, 24, 4, 6);
 
 /**
- * Transferring both ways — two blocks passing each other, one flush to the top of
- * the field and one flush to the bottom, offset so neither shares a column.
- *
- * NOT two arrows, and that was measured rather than preferred. Half-width arrows
- * put a 5px-wide triangle in the menu bar, which rasterises to a smear of partial
- * pixels that reads as noise rather than as two directions — the previous author
- * hit the same floor and said so about the corner badges. Two offset blocks carry
- * the same idea (two things moving, opposite ways) on even edges, so they are
- * crisp instead of grey, and the pair is rotationally symmetric, which is what
- * "both ways" looks like when there is no room to draw an arrowhead.
+ * Transferring both ways — two 6x4 blocks passing each other, rotationally
+ * symmetric about the field's centre (22, 27). NOT two arrows: half-width
+ * arrowheads at this size rasterise to smear, a floor two previous authors hit
+ * independently. Two offset blocks carry the idea — two things moving, opposite
+ * ways — on even edges.
  */
-const TRANSFER = rect(FIELD.x0, FIELD.y0, 8, 4) + rect(FIELD.x1 - 8, FIELD.y1 - 4, 8, 4);
+const TRANSFER = rect(16, 22, 6, 4) + rect(22, 28, 6, 4);
 
 // ---------------------------------------------------------------------------
 // The shipped family.
 //
-// The aperture carries the lamp state; the extra ink carries the fact the four
-// states cannot express. One silhouette and one hole cover ten menu-bar
+// The mouth carries the lamp state; the extra ink carries the fact the four
+// states cannot express. One silhouette, one face, one field cover ten menu-bar
 // conditions without any of them losing information: sync direction and
 // paused-versus-warning still have their own pictures, they just no longer need
 // their own brand.
-//
-// `Active` deliberately has no extra ink. It used to get a circular-arrows badge
-// meaning "something is happening", which is precisely what a dashed aperture
-// already says, and a redundant mark at this size costs legibility for nothing.
 // ---------------------------------------------------------------------------
 
-/**
- * `diagonals` marks the glyphs whose ink cannot be whole-pixel. Exactly two carry
- * it, and they carry it because an arrowhead IS a diagonal — everything else in
- * the family is axis-aligned on even units and is gated at zero mush.
- */
-type Glyph = { name: string; state: State; ink?: string; diagonals?: true; note: string };
+type Glyph = { name: string; state: State; ink?: string; note: string };
 
 const GLYPHS: Glyph[] = [
   { name: "tray-idle-template", state: "idle", note: "presence only, no sync configured" },
@@ -248,20 +209,8 @@ const GLYPHS: Glyph[] = [
   { name: "tray-working-template", state: "working", note: "sync active, nothing on the wire" },
   { name: "tray-fault-template", state: "fault", note: "a failed session holds the tray" },
   { name: "tray-sync-template", state: "idle", ink: ARMED, note: "sync armed" },
-  {
-    name: "tray-sync-up-template",
-    state: "idle",
-    ink: arrow(-1),
-    diagonals: true,
-    note: "uploading",
-  },
-  {
-    name: "tray-sync-down-template",
-    state: "idle",
-    ink: arrow(1),
-    diagonals: true,
-    note: "downloading",
-  },
+  { name: "tray-sync-up-template", state: "idle", ink: arrow(-1), note: "uploading" },
+  { name: "tray-sync-down-template", state: "idle", ink: arrow(1), note: "downloading" },
   {
     name: "tray-sync-updown-template",
     state: "idle",
@@ -272,6 +221,27 @@ const GLYPHS: Glyph[] = [
   { name: "tray-sync-warning-template", state: "idle", ink: WARNING, note: "sync warning" },
 ];
 
+/**
+ * Partial pixels at 22px, PER GLYPH, pinned exactly. The ring's four 1:2
+ * diagonals antialias identically in every glyph; the two arrows add their own
+ * head diagonals on top. Exact equality — not a ceiling — so a coordinate that
+ * drifts off the even grid changes a count and fails, which is the same defect
+ * the old zero-gate caught, re-based onto a silhouette that legitimately owns
+ * diagonals. Filled in from the measured run; a mismatch prints both numbers.
+ */
+const EXPECTED_PARTIAL: Record<string, number> = {
+  "tray-idle-template": 56,
+  "tray-live-template": 56,
+  "tray-working-template": 56,
+  "tray-fault-template": 56,
+  "tray-sync-template": 56,
+  "tray-sync-up-template": 68,
+  "tray-sync-down-template": 68,
+  "tray-sync-updown-template": 56,
+  "tray-sync-paused-template": 56,
+  "tray-sync-warning-template": 56,
+};
+
 // ---------------------------------------------------------------------------
 // SVG composition. mark.svg's <defs> block is lifted verbatim, so the geometry is
 // never restated here — only referenced.
@@ -280,7 +250,7 @@ const GLYPHS: Glyph[] = [
 const markSource = readFileSync(MARK_SVG, "utf8");
 const defs = /<defs>[\s\S]*<\/defs>/.exec(markSource)?.[0];
 if (!defs) throw new Error(`${MARK_SVG} has no <defs> block to compose from`);
-for (const state of ["live", "idle", "working", "fault"] as State[]) {
+for (const state of ["live", "idle", "working", "fault", "hero"] as const) {
   if (!defs.includes(`id="mark-${state}"`)) {
     throw new Error(`${MARK_SVG} defines no #mark-${state}; the state vocabulary has drifted`);
   }
@@ -292,76 +262,97 @@ function svg(viewBox: string, body: string): string {
 }
 
 /**
- * The app icon: the mark in lichen on the workroom's ground. An icon has a
- * container whether or not the design draws one, and drawing it is what stops the
- * mark floating in the dock.
+ * The icon's colours are READ from `src/index.css` rather than repeated here.
  *
- * `inset` and `rx` differ by platform and both differences are required rather
- * than stylistic. Desktop draws its own rounded tile with clear space around it,
- * because macOS and Windows show the bitmap as authored. iOS gets a FULL-BLEED
- * square with square corners: the system applies its own superellipse mask, so a
- * rounded tile inside it reads as a rounded icon pasted on another rounded icon —
- * and, more bluntly, an iOS app icon may carry no alpha at all, which a rounded
- * tile's antialiased corners violate by construction.
- *
- * The mark is placed at 1:1 rather than scaled. On the 32-unit grid it had to be
- * blown up 1.25x to fill a 64-unit tile, and that scale was the one place in this
- * file that left the whole-pixel grid. A 44-unit tag on a 64-unit tile needs no
- * scale at all: 32x36 inside a 56x56 inner tile is already the proportion an app
- * icon wants, and every edge stays on an integer at every size the set is cut to.
+ * This is not tidiness. `tray.rs` once shipped a hardcoded teal as the
+ * Linux/Windows tray repaint colour, because a copy of the palette in native
+ * code has no way of hearing that the palette changed. A generator that
+ * hardcodes a colour is the same bug with a longer fuse.
  */
-/**
- * The icon's two colours are READ from `src/index.css` rather than repeated here.
- *
- * This is not tidiness. `tray.rs` shipped `#3ecfae` — the teal DESIGN.md rejects
- * by name — as the Linux/Windows tray repaint colour, because a copy of the
- * palette in native code has no way of hearing that the palette changed. A
- * generator that hardcodes the accent is the same bug with a longer fuse: the
- * next person to retheme the app would change the CSS, rebuild, and ship an icon
- * still wearing the old green.
- *
- * The dark theme is the source: the icon is a lit mark on a dark tile in both
- * appearances, because an app icon has no theme — it sits on whatever the user's
- * dock or Finder happens to be.
- */
-function tokenFromCss(name: string): string {
+function tokenFromCss(name: string, block: ":root {" | ".dark {"): string {
   const css = readFileSync("src/index.css", "utf8");
-  const darkBlock = css.slice(css.indexOf(".dark {"));
-  const match = darkBlock.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{3,8})\\s*;`));
+  const scope = css.slice(css.indexOf(block));
+  const match = scope.match(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{3,8})\\s*;`));
   if (!match) {
-    throw new Error(`--${name} is not defined in the .dark block of src/index.css`);
+    throw new Error(`--${name} is not defined in the ${block.slice(0, -2)} block of src/index.css`);
   }
   return match[1];
 }
 
-const ACCENT = tokenFromCss("primary");
-const GROUND = tokenFromCss("background");
+/**
+ * The tile is GREEN and the mark is night-ground ink — the owner's approved
+ * comps, held to.
+ *
+ * The green is the light theme's `--bridge-healthy`, and that is a reading of
+ * the palette rather than a raid on it: the tile is a hive cell, and the one
+ * thing this product's icon should radiate is "bridged, healthy, kept". It is
+ * also keeper's original brand green, which the state palette inherited — so
+ * the token is where that colour now lives, and the icon follows the token.
+ * The mark is the dark theme's ground: the workroom's own near-black, the ink
+ * tone the whole identity is drawn against. The ghosted neighbour cells are
+ * the same ink at low opacity, which reads as a deeper green on the tile.
+ */
+const TILE_BG = tokenFromCss("bridge-healthy", ":root {");
+const MARK_INK = tokenFromCss("background", ".dark {");
+/** The neighbour cells' opacity: quiet shadow-cells, not a second colour. */
+const LINE_OPACITY = 0.3;
 const TILE = 64;
 const TILE_INSET = 4;
-const APP_SCALE = 1;
 /**
  * `favicon.png` in the REPO ROOT — the same coloured tile as the desktop icon,
- * cut once, large.
- *
- * 1024 because it is the only size that is a DOWNSCALE for every consumer that
- * reads it. The repo's largest existing raster is `icons/icon.png` at 512, a file
- * browser's biggest thumbnail is 256, and GitHub's social-preview slot is
- * 1280x640 with a 640x320 floor — so a 512 square, the obvious choice, would be
- * the one that has to be enlarged, and enlarging hard flat edges fringes them.
- * 1024 is exactly twice the set's existing top size rather than a new scale.
+ * cut once, large. 1024 because it is the only size that is a DOWNSCALE for
+ * every consumer that reads it (512 is the set's next largest icon, 256 a file
+ * browser's biggest thumbnail, 640 the floor of GitHub's social-preview slot).
+ * `favicon.svg` is the same drawing as a vector, for consumers that can.
  */
 const FAVICON = "favicon.png";
+const FAVICON_SVG = "favicon.svg";
 const FAVICON_SIZE = 1024;
 
+/**
+ * A flat-topped hexagon path, for the tile's neighbour cells. Decorative and
+ * colour-rastered only, so off-grid coordinates are fine here.
+ */
+function hexPath(cx: number, cy: number, r: number): string {
+  const h = r * 0.866;
+  return (
+    `M${cx - r / 2} ${cy - h}L${cx + r / 2} ${cy - h}L${cx + r} ${cy}` +
+    `L${cx + r / 2} ${cy + h}L${cx - r / 2} ${cy + h}L${cx - r} ${cy}Z`
+  );
+}
+
+/**
+ * The app icon: the hex-bot hero in night ink on the healthy green, with two
+ * neighbour cells ghosted behind it — the hive the cell belongs to: many
+ * networks, one kept structure. An icon has a container whether or not the
+ * design draws one, and drawing it is what stops the mark floating in the dock.
+ *
+ * `inset` and `rx` differ by platform and both differences are required rather
+ * than stylistic. Desktop draws its own rounded tile with clear space around it,
+ * because macOS and Windows show the bitmap as authored. iOS gets a FULL-BLEED
+ * square with square corners: the system applies its own superellipse mask, and
+ * an iOS app icon may carry no alpha at all, which a rounded tile's antialiased
+ * corners violate by construction.
+ *
+ * The hero is placed at 1:1 — a 32-wide cell plus antenna on a 64 tile needs no
+ * scale, and every template-relevant edge stays on the unit grid.
+ */
 function appIcon(inset: number, rx: number): string {
-  const tx = TILE / 2 - APP_SCALE * (MARK_BOX.x0 + MARK_W / 2);
-  const ty = TILE / 2 - APP_SCALE * (MARK_BOX.y0 + MARK_H / 2);
+  const heroW = HERO_BOX.x1 - HERO_BOX.x0;
+  const heroH = HERO_BOX.y1 - HERO_BOX.y0;
+  const tx = TILE / 2 - (HERO_BOX.x0 + heroW / 2);
+  const ty = TILE / 2 - (HERO_BOX.y0 + heroH / 2);
+  const clipId = `tile-${inset}-${rx}`;
   return svg(
     `0 0 ${TILE} ${TILE}`,
-    `<rect x="${inset}" y="${inset}" width="${TILE - inset * 2}" ` +
-      `height="${TILE - inset * 2}" rx="${rx}" fill="${GROUND}"/>` +
-      `<use href="#mark-idle" fill="${ACCENT}" ` +
-      `transform="translate(${tx} ${ty}) scale(${APP_SCALE})"/>`,
+    `<clipPath id="${clipId}"><rect x="${inset}" y="${inset}" ` +
+      `width="${TILE - inset * 2}" height="${TILE - inset * 2}" rx="${rx}"/></clipPath>` +
+      `<rect x="${inset}" y="${inset}" width="${TILE - inset * 2}" ` +
+      `height="${TILE - inset * 2}" rx="${rx}" fill="${TILE_BG}"/>` +
+      `<g clip-path="url(#${clipId})" fill="none" stroke="${MARK_INK}" ` +
+      `stroke-opacity="${LINE_OPACITY}" stroke-width="2">` +
+      `<path d="${hexPath(7, 9, 13)}"/><path d="${hexPath(57, 56, 13)}"/></g>` +
+      `<use href="#mark-hero" fill="${MARK_INK}" transform="translate(${tx} ${ty})"/>`,
   );
 }
 
@@ -405,14 +396,27 @@ for (const entry of readdirSync(desktopSet, { withFileTypes: true })) {
   if (entry.isDirectory() || entry.name === "64x64.png") continue;
   copyFileSync(join(desktopSet, entry.name), `${ICON_DIR}/${entry.name}`);
 }
-console.log(`app icon set  <- ${MARK_SVG}, mark ${APP_SCALE}x in ${ACCENT} on ${GROUND}`);
+console.log(`app icon set  <- ${MARK_SVG}, hero 1:1 in ${MARK_INK} on ${TILE_BG}`);
 
-// --- favicon.png, in the repo root ------------------------------------------
+// --- favicon.svg and favicon.png, in the repo root ---------------------------
 //
-// Cut from the SAME desktop tile source rather than drawn again. The owner asked
-// for the project to be identifiable at a glance in a file browser and on GitHub;
-// a second drawing of the mark to satisfy that is precisely how the retired
-// `gen-ios-icons.swift` drifted from this file without anything noticing.
+// Both cut from the SAME desktop tile source rather than drawn again. The owner
+// asked for the project to be identifiable at a glance in a file browser, on
+// GitHub, and in every tool that opens the repo; a second drawing of the mark to
+// satisfy that is precisely how generators drift.
+// The `<title>` is both the accessible name and what Biome's a11y lint requires
+// of any SVG in the tree; the raster pipeline strips it, so only the vector pays
+// the bytes.
+writeFileSync(
+  FAVICON_SVG,
+  `${appIcon(TILE_INSET, 13).replace(">", "><title>keeper — the hex-bot</title>")}\n`,
+);
+check(
+  readFileSync(FAVICON_SVG, "utf8").includes(TILE_BG),
+  `${FAVICON_SVG} does not carry the tile green ${TILE_BG}`,
+);
+console.log(`${FAVICON_SVG}  the desktop tile as a vector — for tools that prefer one`);
+
 const faviconDir = join(work, "favicon");
 rasterise(desktopSvg, [FAVICON_SIZE], faviconDir);
 copyFileSync(join(faviconDir, `${FAVICON_SIZE}x${FAVICON_SIZE}.png`), FAVICON);
@@ -425,24 +429,24 @@ check(
 // other PNG this script writes is a pure-black template or an opaque RGB tile,
 // and cutting the favicon from the wrong one would produce a file that looks
 // plausible in a diff and is invisible on a dark GitHub page.
-const accentRgb = [1, 3, 5].map((i) => Number.parseInt(ACCENT.slice(i, i + 2), 16));
-let accentPixels = 0;
+const tileRgb = [1, 3, 5].map((i) => Number.parseInt(TILE_BG.slice(i, i + 2), 16));
+let tilePixels = 0;
 for (let i = 0; i < favicon.pixels.length; i += 4) {
   if (
-    favicon.pixels[i] === accentRgb[0] &&
-    favicon.pixels[i + 1] === accentRgb[1] &&
-    favicon.pixels[i + 2] === accentRgb[2] &&
+    favicon.pixels[i] === tileRgb[0] &&
+    favicon.pixels[i + 1] === tileRgb[1] &&
+    favicon.pixels[i + 2] === tileRgb[2] &&
     favicon.pixels[i + 3] === 255
   ) {
-    accentPixels++;
+    tilePixels++;
   }
 }
 check(
-  accentPixels > 0,
-  `${FAVICON} carries no ${ACCENT} pixel — it was cut from a template, not from the coloured tile`,
+  tilePixels > 0,
+  `${FAVICON} carries no ${TILE_BG} pixel — it was cut from a template, not from the green tile`,
 );
 console.log(
-  `${FAVICON}  ${FAVICON_SIZE}px, the desktop tile, ${accentPixels} px of ${ACCENT} ` +
+  `${FAVICON}  ${FAVICON_SIZE}px, the desktop tile, ${tilePixels} px of ${TILE_BG} ` +
     `— referenced by index.html and README.md`,
 );
 
@@ -455,19 +459,14 @@ console.log(
 const iosSvg = join(work, "app-icon-ios.svg");
 writeFileSync(iosSvg, appIcon(0, 0));
 const iosSet = join(work, "ios");
-execFileSync(TAURI_CLI, ["icon", iosSvg, "-o", iosSet, "--ios-color", GROUND], {
+execFileSync(TAURI_CLI, ["icon", iosSvg, "-o", iosSet, "--ios-color", TILE_BG], {
   stdio: ["ignore", "ignore", "pipe"],
 });
 
 // The filenames and pixel sizes are fixed by `AppIcon.appiconset/Contents.json`,
-// and the CLI emits exactly that set — which is what retired
-// `gen-ios-icons.swift`, a second, hand-coded CoreGraphics drawing of the mark
-// that only ran on macOS and could drift from this one without anything noticing.
-//
-// The one thing that script did which the CLI does not: it rendered into an RGB
-// context so the files carry NO ALPHA CHANNEL. Apple rejects an app icon for
-// HAVING that channel, not for using it, so a fully opaque RGBA icon still fails
-// — which makes the re-encode below a contract this set had before and must keep.
+// and the CLI emits exactly that set. Apple rejects an app icon for HAVING an
+// alpha channel, not for using it, so a fully opaque RGBA icon still fails —
+// which makes the re-encode below a contract this set had before and must keep.
 let iosCount = 0;
 for (const entry of readdirSync(join(iosSet, "ios"))) {
   const rendered = readPng(join(iosSet, "ios", entry));
@@ -484,15 +483,15 @@ for (const entry of readdirSync(join(iosSet, "ios"))) {
   );
   iosCount++;
 }
-console.log(`iOS AppIcon set  ${iosCount} files on ${GROUND}, RGB with no alpha channel`);
+console.log(`iOS AppIcon set  ${iosCount} files on ${TILE_BG}, RGB with no alpha channel`);
 
 // --- the tray template family ----------------------------------------------
 const RETINA = CANVAS;
 const POINTS = CANVAS / 2;
 console.log(
   `\ntray templates  ${POINTS}px @1x / ${RETINA}px @2x  ` +
-    `head x${MARK_BOX.x0 + DX}..${MARK_BOX.x1 + DX} y${MARK_BOX.y0 + DY}..${MARK_BOX.y1 + DY}  ` +
-    `field x${FIELD.x0}..${FIELD.x1} y${FIELD.y0}..${FIELD.y1} (mark space)\n`,
+    `cell x${MARK_BOX.x0 + DX}..${MARK_BOX.x1 + DX} y${MARK_BOX.y0 + DY}..${MARK_BOX.y1 + DY}  ` +
+    `mouth x${FIELD.x0}..${FIELD.x1} y${FIELD.y0}..${FIELD.y1} (mark space)\n`,
 );
 
 const report: string[][] = [];
@@ -520,8 +519,8 @@ for (const g of GLYPHS) {
     ),
   );
   rasterise(source, [POINTS, RETINA], dir);
-  // A copy rather than a rename: the scratch dir is under /tmp, which is a
-  // different device here, and rename cannot cross one.
+  // A copy rather than a rename: the scratch dir is under /tmp, which can be a
+  // different device, and rename cannot cross one.
   copyFileSync(join(dir, `${POINTS}x${POINTS}.png`), `${ICON_DIR}/${g.name}.png`);
   copyFileSync(join(dir, `${RETINA}x${RETINA}.png`), `${ICON_DIR}/${g.name}@2x.png`);
 
@@ -538,24 +537,13 @@ for (const g of GLYPHS) {
   check(
     holes.length >= MARK_HOLES,
     `${g.name} @1x has ${holes.length} enclosed holes at ${POINTS}px, expected at least ` +
-      `${MARK_HOLES} — a hole has filled in or leaked into the outside`,
+      `${MARK_HOLES} — the cell has broken open or filled in`,
   );
-  // Zero partial pixels, because on the 44-unit grid 22px is an exact half and
-  // every coordinate is even. The two arrows are exempt BY NAME rather than by a
-  // relaxed threshold: a triangle has diagonals, diagonals cannot be whole
-  // pixels, and a cap that let any glyph mush a little would let all of them.
-  if (g.diagonals) {
-    check(
-      m.partial <= 12,
-      `${g.name} @1x has ${m.partial} partial pixels; its arrowhead's diagonals should cost at most 12`,
-    );
-  } else {
-    check(
-      m.partial === 0,
-      `${g.name} @1x has ${m.partial} partial pixels at ${POINTS}px, expected none — ` +
-        `some edge is not on an even unit`,
-    );
-  }
+  check(
+    m.partial === EXPECTED_PARTIAL[g.name],
+    `${g.name} @1x has ${m.partial} partial pixels at ${POINTS}px, pinned at ` +
+      `${EXPECTED_PARTIAL[g.name]} — some edge moved off the authored geometry`,
+  );
   // The head must land in exactly the same pixels in every glyph, or it jumps in
   // the menu bar when the state changes.
   sharedBox ??= box;
@@ -571,14 +559,14 @@ for (const g of GLYPHS) {
     g.ink ? "yes" : "-",
     `${holes.length}`,
     `${holes[0]?.area ?? 0}`,
-    `${((m.partial / m.all) * 100).toFixed(1)}%`,
+    `${m.partial}`,
     g.note,
   ]);
 }
 
-const cols = [13, 8, 5, 5, 5, 6];
+const cols = [13, 8, 5, 5, 5, 7];
 for (const row of [
-  ["glyph", "aperture", "ink", "holes", "hole", "mush", "shown when"],
+  ["glyph", "mouth", "ink", "holes", "hole", "partial", "shown when"],
   ...report,
 ]) {
   console.log(row.map((c, i) => c.padEnd(cols[i] ?? 0)).join(" "));
@@ -590,8 +578,8 @@ console.log(
 // --- no two glyphs may rasterise the same -----------------------------------
 //
 // Distinctness is not enough on its own, so the WEAKEST pair is printed rather
-// than just asserted non-zero. On the 32-unit mark this family passed the
-// non-zero test while `live` and `fault` differed by three pixels out of 484 —
+// than just asserted non-zero. An earlier mark in this repo passed the non-zero
+// test while `live` and `fault` differed by three pixels out of 484 —
 // technically distinct, and indistinguishable to anyone not already staring at
 // the menu bar. A number on screen is what makes that visible next time.
 const pairs: { pair: string; differing: number }[] = [];
@@ -616,57 +604,54 @@ console.log(
       .join(", "),
 );
 
-// --- the whole-pixel proof, and the 16px report -----------------------------
+// --- the pinned-raster proof, and the 16px report ----------------------------
 //
 // Run on mark.svg itself rather than on a tray glyph, because mark.svg is the
 // source every other file in this run is cut from. A tray glyph would only prove
 // the composition still centres; the artwork is where a coordinate leaves the
 // grid.
 //
-// 22 AND 44 ARE GATED AT ZERO PARTIAL PIXELS. The grid divides both exactly, so
-// zero is the only correct answer and anything else is geometry that has left the
-// grid. This gate is new, and it is the one this whole re-author is for: the old
-// run asserted a whole-pixel BBOX, which the 32-unit mark passed at 16px and 32px
-// while rendering 21.7% mush at 22px — the size it is actually worn at — because
-// nothing ever rasterised it there. A bounding box cannot see the inside of a
-// drawing.
+// 22 AND 44 ARE GATED AT PINNED PARTIAL-PIXEL COUNTS. On the rectilinear tag the
+// pin was zero; a hexagon owns four diagonals and cannot be zero, so the pin is
+// the exact count the authored 1:2 slopes produce. Exact equality keeps the
+// property the zero-gate had: an edge that drifts off the even grid changes the
+// count and fails. Filled in from the measured run.
 //
-// 16 IS REPORTED, NOT GATED, and that is a decision rather than an omission.
-// 44/16 = 0.3636 and nothing lands whole; mark.svg shows why no grid can serve 16
-// and 22 at once, and 22 is the one that ships. The number is still printed
-// because DESIGN.md rates this mark against vendor marks measured at 16px
-// alpha-only, and a benchmark nobody prints is a benchmark nobody meets.
+// 16 IS REPORTED, NOT GATED. 44/16 = 0.3636 and nothing lands whole; nothing
+// ships a 16px alpha-only template. The number is still printed because DESIGN.md
+// rates this mark against vendor marks measured at 16px alpha-only, and a
+// benchmark nobody prints is a benchmark nobody meets.
+const EXPECTED_MARK_PARTIAL: Record<number, number> = { 22: 56, 44: 112 };
 const proofDir = join(work, "proof");
 const proofSizes = [16, POINTS, RETINA];
 rasterise(MARK_SVG, proofSizes, proofDir);
-console.log("\nmark.svg alpha-only (no colour, no tile)   * = gated, the grid divides it exactly");
+console.log("\nmark.svg alpha-only (no colour, no tile)   * = gated, pinned counts");
 for (const size of proofSizes) {
-  // Every coordinate in the artwork is even, so the finest edge it can carry is
-  // 2 units; the raster is whole-pixel exactly when 2 units is a whole pixel.
-  const wholePixel = (2 * size) % MARK_GRID === 0;
+  const gated = size === POINTS || size === RETINA;
   const png = readPng(join(proofDir, `${size}x${size}.png`));
   const m = measure(png);
   const holes = enclosedHoles(png);
   const w = m.box[2] - m.box[0] + 1;
   const h = m.box[3] - m.box[1] + 1;
   console.log(
-    `  ${wholePixel ? "*" : " "} ${String(size).padStart(2)}px  ` +
-      `mush ${((m.partial / m.all) * 100).toFixed(1)}% of all / ` +
-      `${((m.partial / m.ink) * 100).toFixed(1)}% of inked  (${m.partial} partial, ${m.ink} inked)  ` +
+    `  ${gated ? "*" : " "} ${String(size).padStart(2)}px  ` +
+      `partial ${m.partial} (${((m.partial / m.ink) * 100).toFixed(1)}% of inked ${m.ink})  ` +
       `bbox ${w}x${h}  holes ${holes.length}  ` +
       `[${holes.map((x) => `${x.box[2] - x.box[0] + 1}x${x.box[3] - x.box[1] + 1}=${x.area}px`).join(" ") || "NONE"}]`,
   );
-  if (!wholePixel) continue;
-  check(m.partial === 0, `at ${size}px the mark has ${m.partial} partial pixels, expected none`);
+  if (!gated) continue;
+  check(
+    m.partial === EXPECTED_MARK_PARTIAL[size],
+    `at ${size}px the mark has ${m.partial} partial pixels, pinned at ${EXPECTED_MARK_PARTIAL[size]}`,
+  );
   check(
     holes.length === MARK_HOLES,
-    `at ${size}px the mark has ${holes.length} enclosed holes, expected ${MARK_HOLES} ` +
-      `(eyelet, rule, aperture)`,
+    `at ${size}px the mark has ${holes.length} enclosed holes, expected ${MARK_HOLES} (the cell)`,
   );
   check(
     w === (MARK_W * size) / MARK_GRID && h === (MARK_H * size) / MARK_GRID,
     `at ${size}px the mark's bbox is ${w}x${h}, not the grid's ` +
-      `${(MARK_W * size) / MARK_GRID}x${(MARK_H * size) / MARK_GRID} — geometry has left whole pixels`,
+      `${(MARK_W * size) / MARK_GRID}x${(MARK_H * size) / MARK_GRID} — geometry has left the box`,
   );
 }
 
@@ -677,6 +662,4 @@ if (failures.length) {
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-console.log(
-  "\nall checks passed: pure black + alpha, holes intact, whole-pixel geometry, head fixed",
-);
+console.log("\nall checks passed: pure black + alpha, cell enclosed, pinned rasters, head fixed");
