@@ -202,6 +202,9 @@ export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
+export type { SessionRefVm } from "./gen/SessionRefVm";
+export type { SessionRootVm } from "./gen/SessionRootVm";
+export type { SessionRowVm } from "./gen/SessionRowVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
 export type { SlidesVm } from "./gen/SlidesVm";
@@ -329,6 +332,8 @@ import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
+import type { SessionRootVm } from "./gen/SessionRootVm";
+import type { SessionRowVm } from "./gen/SessionRowVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
@@ -4761,5 +4766,59 @@ export async function listenNotesCaptureShown(onShown: () => void): Promise<() =
 export async function listenNotesCaptureWindows(onChanged: () => void): Promise<() => void> {
   return await listen<null>(NOTES_CAPTURE_WINDOWS_EVENT, () => {
     onChanged();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (Phase 7, AD-114)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every registered sessions root — a sessions-flagged sync profile whose zone
+ * exists on disk (FR-222, FR-224, AD-107). The root list IS a filter over the
+ * profile list, so there is nothing else to read and no second registry.
+ *
+ * Rejects with: `unsupported` (mobile), `internal`.
+ */
+export async function sessionsRoots(): Promise<SessionRootVm[]> {
+  return await invoke<SessionRootVm[]>("sessions_roots");
+}
+
+/**
+ * The board rows for one root (FR-228): active before archived, pinned first
+ * within status, then newest record change first. A registered-but-unscanned
+ * root answers `[]` — its `SessionRootVm.indexed` says why.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsList(rootId: string): Promise<SessionRowVm[]> {
+  return await invoke<SessionRowVm[]>("sessions_list", { rootId });
+}
+
+/**
+ * Ask one root to rescan its zone now — the sessions "Rebuild index" verb
+ * (FR-225). Resolves when the request is queued; the result arrives as a
+ * {@link SESSIONS_CHANGED_EVENT} like every other change.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsRescan(rootId: string): Promise<void> {
+  await invoke<void>("sessions_rescan", { rootId });
+}
+
+/**
+ * "This root's session set changed — re-read it." The payload is the root id
+ * and nothing else: the listener re-reads through {@link sessionsList} rather
+ * than trusting a payload, which at zone scale costs one list read and cannot
+ * drift (AD-114).
+ */
+export const SESSIONS_CHANGED_EVENT = "keeper://sessions-changed";
+
+/** Subscribe to the sessions-changed event; the callback gets the root id. */
+export async function listenSessionsChanged(
+  onChanged: (rootId: string) => void,
+): Promise<() => void> {
+  return await listen<string>(SESSIONS_CHANGED_EVENT, (event) => {
+    onChanged(event.payload);
   });
 }

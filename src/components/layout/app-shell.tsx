@@ -19,6 +19,7 @@ import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPane } from "@/components/notes/notes-pane";
 import { RecordingsPane } from "@/components/recordings/recordings-pane";
 import { SearchOverlay } from "@/components/search/search-overlay";
+import { SessionsPane } from "@/components/sessions/sessions-pane";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -185,6 +186,8 @@ export function AppShell() {
   // A notes vault is a folder keeper already syncs (AD-54, FR-122): same rule, so
   // a stale "notes" primary-view can never show the pane where no vault can exist.
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
+  // A sessions root is the same construction (AD-107, FR-223): same rule again.
+  const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
   // Where the platform floats the window controls over the webview (desktop macOS,
   // via the macOS-only `titleBarStyle`/`hiddenTitle` keys) the app owes the window
   // its own drag region; under a real title bar the same band would be empty space
@@ -307,6 +310,11 @@ export function AppShell() {
                 </>
               ) : notes && primaryView === "notes" ? (
                 <NotesPane />
+              ) : sessions && primaryView === "sessions" ? (
+                // Phase 7: the board over the sessions zones sync holds, gated
+                // on the same construction as notes — a stale "sessions"
+                // primary-view can never show a board this build cannot fill.
+                <SessionsPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (
