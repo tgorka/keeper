@@ -944,6 +944,7 @@ pub async fn sync_statuses(
 /// Create or update a profile, returning the stored result.
 #[tauri::command]
 pub async fn sync_profile_save(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     req: SyncProfileReq,
 ) -> Result<SyncProfileVm, IpcError> {
@@ -962,6 +963,11 @@ pub async fn sync_profile_save(
     engine
         .upsert_profile(&profile)
         .map_err(|e| sync_ipc_error(&e))?;
+    // The sessions flag rides this save (FR-222), and the root registry is a
+    // filter over the profile list (AD-107) — so the registry re-reads here,
+    // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
+    // when nothing sessions-shaped changed.
+    crate::sessions_root::refresh(&app);
     Ok(SyncProfileVm::from(&profile))
 }
 

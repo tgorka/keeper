@@ -37,6 +37,9 @@ mod recorder;
 // embedded in notes a desktop syncs.
 #[cfg(desktop)]
 mod recording_protocol;
+mod sessions_ipc;
+#[cfg(desktop)]
+mod sessions_root;
 #[cfg(desktop)]
 mod sync;
 #[cfg(desktop)]
@@ -642,6 +645,13 @@ pub fn run() {
             #[cfg(desktop)]
             notes_vault::start(app.handle());
 
+            // Build the sessions-root registry beside it (Phase 7, AD-107/108):
+            // the same construction over the same engine tap, and the same quiet
+            // return where no engine exists — `CapabilitiesVm.sessions` is
+            // already false there.
+            #[cfg(desktop)]
+            sessions_root::start(app.handle());
+
             Ok(())
         });
 
@@ -912,6 +922,9 @@ pub fn run() {
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,
+        sessions_ipc::sessions_roots,
+        sessions_ipc::sessions_list,
+        sessions_ipc::sessions_rescan,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,
