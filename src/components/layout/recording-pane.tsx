@@ -194,7 +194,9 @@ export function RecordingPane() {
   return (
     <section
       aria-label="Recording"
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // Last child of the shell row, so the trailing edge cancels; see
+      // DESIGN.md → Elevation & Depth.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="flex min-w-0 flex-col items-start gap-1">

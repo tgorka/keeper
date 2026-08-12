@@ -27,7 +27,8 @@
  * still in the same place after a save, in a resized quick-capture window.
  * See `spec-46-4-save-does-not-move-the-toolbar.md`.
  */
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteVaultVm, NoteWriteVm } from "@/lib/ipc/client";
 
@@ -61,6 +62,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import {
   PANE_HEADER_ACTIONS_SLOT,
+  PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
 } from "@/components/layout/pane-header";
@@ -133,8 +135,9 @@ function seedVault(): void {
   notesVaultsStore.getState().setVaults([vault]);
 }
 
-/** Mount the editor on a note, and let its opening `Reset` land. */
-async function openEditor(): Promise<void> {
+/** Mount the editor on a note, and let its opening `Reset` land. `frame` is
+ *  the holding surface's own controls, which only a panel has. */
+async function openEditor(frame?: ReactNode): Promise<void> {
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
       kind: "reset",
@@ -146,7 +149,7 @@ async function openEditor(): Promise<void> {
     });
     return "sub-1";
   });
-  render(<NoteEditor vaultId="v1" noteId="n1" />);
+  render(<NoteEditor vaultId="v1" noteId="n1" frame={frame} />);
   await act(async () => {
     await Promise.resolve();
   });
@@ -434,12 +437,30 @@ function names(): string[] {
   });
 }
 
-/** Open the note's own actions menu, and hand back what is in it. */
-function menuItems(): string[] {
+/**
+ * Every item in the note's actions menu, in DOM order.
+ *
+ * Two roles, not one. Since Story 49 the two verbs that open a panel are
+ * `menuitemcheckbox` down here rather than `menuitem`: the state the promoted
+ * control carries as `aria-expanded` has to survive the demotion, and a menu's
+ * word for "this one is on" is a checkbox item. A query for the single role
+ * would have quietly stopped seeing half of this menu.
+ */
+const MENU_ITEM_SELECTOR = '[role="menuitem"],[role="menuitemcheckbox"]';
+
+/** Open the note's own actions menu. */
+function openNoteActions(): void {
   const trigger = screen.getByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
   fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
   fireEvent.click(trigger);
-  return screen.getAllByRole("menuitem").map((item) => item.textContent ?? "");
+}
+
+/** Open the note's own actions menu, and hand back what is in it. */
+function menuItems(): string[] {
+  openNoteActions();
+  return Array.from(document.querySelectorAll(MENU_ITEM_SELECTOR)).map(
+    (item) => item.textContent ?? "",
+  );
 }
 
 describe("the header shows the verbs it has room for", () => {
@@ -532,7 +553,10 @@ describe("the header shows the verbs it has room for", () => {
         // only the second and would pass over a duplicated control. `hidden`
         // because Radix marks everything outside the open menu `aria-hidden`.
         const asControl = screen.queryAllByRole("button", { hidden: true, name: label });
-        const asItem = screen.queryAllByRole("menuitem", { hidden: true, name: label });
+        const asItem = [
+          ...screen.queryAllByRole("menuitem", { hidden: true, name: label }),
+          ...screen.queryAllByRole("menuitemcheckbox", { hidden: true, name: label }),
+        ];
         expect(asControl.length + asItem.length).toBe(1);
       }
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
@@ -574,6 +598,187 @@ describe("the header shows the verbs it has room for", () => {
       NOTE_DELETE_LABEL,
     ]);
   });
+
+  /**
+   * Story 49: the two panel verbs say whether their panel is open.
+   *
+   * `showProperties` and `showAttachments` have been `useState` booleans with
+   * toggle handlers since 45.x, rendered as plain actions with no state on them
+   * in either direction — so the only way to learn whether Properties was
+   * already open was to look down the pane and recognise the panel. Asserted
+   * through `expanded` on a role+name query rather than through a class,
+   * because the claim is about what the control reports, not about how it is
+   * painted.
+   */
+  it("says whether the panel it opens is open, and does not resize the row saying it", async () => {
+    const resize = await openAtWidths();
+    resize(1400);
+
+    const before = names();
+    expect(before).toContain(PROPERTIES_LABEL);
+    // Closed, and saying so.
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: false })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+
+    const open = screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: true });
+    // And it names what it opened, rather than leaving a screen reader to guess
+    // which of the strips below this header appeared because of this press.
+    const region = document.getElementById(open.getAttribute("aria-controls") ?? "");
+    expect(region).not.toBeNull();
+    expect(
+      within(region as HTMLElement).getByRole("region", { name: PROPERTIES_LABEL }),
+    ).toBeInTheDocument();
+
+    // The row did not change shape. Promotion is decided from one measurement
+    // per candidate, so a pressed treatment with a width — a border, a ring, a
+    // longer name — would make how many verbs are on screen a function of which
+    // panels are open, and the header would reflow when somebody opened one.
+    expect(names()).toEqual(before);
+
+    // The same control closes it. It was a toggle all along; now it says so.
+    fireEvent.click(open);
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: false })).toBeVisible();
+  });
+
+  it("keeps that state when the verb is too narrow to promote and falls into the menu", async () => {
+    // The zero-budget shape: everything is in the menu, which is exactly where
+    // a state carried only by the promoted control would have disappeared.
+    seedVault();
+    restoreWidths = withActionWidths(WIDTHS);
+    await openEditor();
+
+    openNoteActions();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }));
+
+    openNoteActions();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL, checked: true }),
+    ).toBeInTheDocument();
+    // And the verb that discloses nothing is still a plain item, so the menu
+    // does not grow a column of empty tick-boxes beside History and Export.
+    expect(screen.getByRole("menuitem", { name: NOTE_HISTORY_LABEL })).toBeInTheDocument();
+  });
+});
+
+/**
+ * One row for a note in a panel, and the panel's controls in it (Story 50.1).
+ *
+ * The owner's report is "merge 2 pierwsze linijki note w jedna". A note open in
+ * a panel drew TWO 40px bands: the panel's, whose entire content was the word
+ * `Note` and its fold and close, and this header underneath it. The word says
+ * nothing the note's own title does not say better, so the panel gives up its
+ * row and hands its two controls down here.
+ *
+ * What the merge can break is the arithmetic. Group 3 decides how many verbs
+ * are on screen from the pixels the row can spare, and two controls that were
+ * not in this row before are 80px it can no longer spare. `panel-strip.test.
+ * tsx` proves the panel stopped drawing a row; these prove that the row it
+ * stopped drawing arrived here intact, and that group 3 was told.
+ */
+describe("a note in a panel: one row, carrying the panel's own controls", () => {
+  const FOLD_LABEL = "Fold panel";
+  const CLOSE_LABEL = "Close panel";
+
+  /** What a panel hands down. Plain buttons, because what these are is
+   *  `panel-strip.tsx`'s decision and this file's claim is only about where
+   *  the header puts whatever it is given. */
+  const PANEL_CONTROLS = (
+    <>
+      <button type="button">{FOLD_LABEL}</button>
+      <button type="button">{CLOSE_LABEL}</button>
+    </>
+  );
+
+  /** The same geometry as the suite above, plus the frame group: two 32px
+   *  controls and the 8px between them. */
+  const FRAMED_WIDTHS: Record<string, number> = { ...WIDTHS, frame: 72 };
+
+  let restoreWidths: (() => void) | null = null;
+  let observer: { resize: (width: number) => void; undo: () => void } | null = null;
+
+  afterEach(() => {
+    restoreWidths?.();
+    restoreWidths = null;
+    observer?.undo();
+    observer = null;
+  });
+
+  async function openFramed(): Promise<(width: number) => void> {
+    seedVault();
+    restoreWidths = withActionWidths(FRAMED_WIDTHS);
+    observer = withHandFiredResize();
+    await openEditor(PANEL_CONTROLS);
+    const { resize } = observer;
+    return (width) => {
+      act(() => resize(width));
+    };
+  }
+
+  it("draws one header, with the panel's controls last and outside the verbs", async () => {
+    await openFramed();
+
+    const row = headerRow();
+    // One row and not two: the whole point of the merge. The editor's header
+    // is the only `<header>` this mount produces, and the panel's controls are
+    // in it rather than in a band above it.
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(Array.from(row.children).map((child) => child.getAttribute("data-slot"))).toEqual([
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+      PANE_HEADER_ACTIONS_SLOT,
+      PANE_HEADER_FRAME_SLOT,
+    ]);
+    const frame = row.querySelector<HTMLElement>(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`);
+    expect(within(frame as HTMLElement).getByRole("button", { name: FOLD_LABEL })).toBeVisible();
+    expect(within(frame as HTMLElement).getByRole("button", { name: CLOSE_LABEL })).toBeVisible();
+  });
+
+  it("keeps the way out of the panel out of the note's overflow at every width", async () => {
+    const resize = await openFramed();
+
+    for (const width of [1400, 800, 600, 400, 0]) {
+      resize(width);
+      // Fold and close are the panel's, not the note's, and a verb that acts on
+      // the frame must not be findable only by opening the surface's menu — the
+      // 0.8.1 reports behind Story 48.5 are what that costs. They are controls
+      // at every width, including the one where the note has promoted nothing.
+      expect(screen.getByRole("button", { name: FOLD_LABEL })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: CLOSE_LABEL })).toBeInTheDocument();
+      const promoted = names();
+      expect(promoted).not.toContain(FOLD_LABEL);
+      expect(promoted).not.toContain(CLOSE_LABEL);
+      // Opened once and read once: the trigger goes `aria-hidden` while the
+      // menu is up, so a second `menuItems()` in the same breath cannot find
+      // the control it needs to press.
+      const inMenu = menuItems();
+      expect(inMenu).not.toContain(FOLD_LABEL);
+      expect(inMenu).not.toContain(CLOSE_LABEL);
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    }
+  });
+
+  it("charges the row for them, so one fewer verb promotes at the same width", async () => {
+    const resize = await openFramed();
+
+    // 800px unframed promotes three — the suite above asserts exactly that at
+    // exactly this width. Framed, group 3 is owed 80px more (72 for the two
+    // controls, 8 for the seam beside them): 800 - 160 - 8 - 90 - 8 - 72 - 8 =
+    // 454, and 454 less the 198 the leading control and the trigger reserve
+    // buys the 108 and the 100 but not the 74 behind them.
+    resize(800);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
+
+    // And the row is still a row that grows: the frame group is a constant
+    // subtraction, not a cap.
+    resize(1400);
+    expect(names()).toEqual([
+      ATTACHMENTS_LABEL,
+      PROPERTIES_LABEL,
+      NOTE_HISTORY_LABEL,
+      SHOW_IN_FILES_LABEL,
+    ]);
+  });
 });
 
 /**
@@ -592,12 +797,13 @@ describe("a panel that will not open in this mode", () => {
     return document.querySelector<HTMLElement>(`[data-slot="${PANEL_UNAVAILABLE_SLOT}"]`);
   }
 
-  /** Press an item in the note's actions menu. */
+  /** Press an item in the note's actions menu, whichever kind of item it is. */
   function pick(label: string): void {
-    const trigger = screen.getByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
-    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
-    fireEvent.click(trigger);
-    fireEvent.click(screen.getByRole("menuitem", { name: label }));
+    openNoteActions();
+    const item =
+      screen.queryByRole("menuitem", { name: label }) ??
+      screen.getByRole("menuitemcheckbox", { name: label });
+    fireEvent.click(item);
   }
 
   it("explains itself in history mode, and comes back with one press", async () => {

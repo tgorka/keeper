@@ -149,6 +149,55 @@ describe("AccountFooter", () => {
     expect(accountsStore.getState().filterAccountId).toBeNull();
   });
 
+  /**
+   * Story 49, and the trap in the request.
+   *
+   * The owner asked for the `⋮` to go and the avatar to open the menu. The
+   * avatar is not a picture — it is the inbox account filter, pinned by the
+   * test above — so a menu on its click would have deleted one-click filtering
+   * to buy back one glyph. What went instead is the `⋮`'s PERMANENCE: it is
+   * still a button, still named, still in the tab order, and on the folded rail
+   * it no longer costs a second storey under every avatar. This asserts the two
+   * controls are still two, which is the part a hover class could silently
+   * undo.
+   */
+  it("keeps the avatar as the filter toggle and the menu as a separate control", () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+
+    const filter = screen.getByRole("button", {
+      name: `Filter inbox to ${alice.userId}`,
+      pressed: false,
+    });
+    const menu = screen.getByRole("button", { name: `Account menu for ${alice.userId}` });
+    expect(menu).not.toBe(filter);
+    // The menu trigger is not a toggle and must not claim to be one.
+    expect(menu).not.toHaveAttribute("aria-pressed");
+
+    // Pressing the avatar filters. It does not open a menu.
+    fireEvent.click(filter);
+    expect(accountsStore.getState().filterAccountId).toBe(alice.accountId);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `Clear filter for ${alice.userId}`, pressed: true }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the collapsed row's menu reachable from the keyboard even though it is quiet", () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter(true);
+
+    // Folded, the `⋮` is painted only on hover/focus — but "quiet" is opacity,
+    // not absence: it is in the accessible tree, it is not `aria-hidden`, and
+    // it takes focus. A `hidden`-scoped query would pass on a control that had
+    // been removed from the tree, so this asserts the default (visible-only)
+    // query still finds it and that focus lands on it.
+    const menu = screen.getByRole("button", { name: `Account menu for ${alice.userId}` });
+    expect(menu).not.toHaveAttribute("aria-hidden");
+    menu.focus();
+    expect(document.activeElement).toBe(menu);
+  });
+
   it("the row menu opens the keep-archive sign-out dialog and confirming signs out", async () => {
     accountsStore.getState().hydrateAll([alice, bob]);
     renderFooter();
@@ -358,5 +407,28 @@ describe("AccountFooter", () => {
     await waitFor(() => {
       expect(dndSetGlobal).toHaveBeenCalledWith(true);
     });
+  });
+
+  it("Do not disturb reports its state as a checked menu item, not as a drawn tick", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter();
+    await openRowMenu(alice.userId);
+
+    // An app-wide switch that silences every notification on every account used
+    // to say which way it was set with a tick glyph and nothing else — a
+    // picture, and so nothing at all to anyone not looking at this menu.
+    const dnd = await screen.findByRole("menuitemcheckbox", {
+      name: "Do not disturb",
+      checked: false,
+    });
+    fireEvent.click(dnd);
+
+    await waitFor(() => {
+      expect(dndSetGlobal).toHaveBeenCalledWith(true);
+    });
+    // The menu stays open and the item now says it is on, in place.
+    expect(
+      await screen.findByRole("menuitemcheckbox", { name: "Do not disturb", checked: true }),
+    ).toBeInTheDocument();
   });
 });

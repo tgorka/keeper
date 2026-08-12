@@ -31,7 +31,9 @@ export function BridgesPane() {
   return (
     <section
       aria-label="Bridges"
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // Last child of the shell row, so the trailing edge cancels; see
+      // DESIGN.md → Elevation & Depth.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="shrink-0 border-border border-b px-6 py-4">
         <h1 className="font-heading text-title">Bridges</h1>

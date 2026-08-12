@@ -103,6 +103,31 @@ export interface PriorityAction {
   readonly icon: LucideIcon;
   /** What the control and the menu item both do. One handler, so they cannot drift. */
   readonly onSelect: () => void;
+  /**
+   * For a candidate that DISCLOSES something rather than doing something:
+   * whether the region it names is open right now. Rendered as
+   * `aria-expanded`, and deliberately not `aria-pressed` — pressed says "this
+   * control is on", expanded says "the thing this control names is open", and
+   * Properties and Attachments are the second one. `panel-strip.tsx`'s fold
+   * makes the same call for the same reason. Absent on a plain verb, which is
+   * what keeps the state off the half of this row that discloses nothing.
+   *
+   * **A disclosure state must not change the control's width.** Promotion is
+   * decided from one measurement per candidate, taken once and remembered by
+   * id, so a treatment that added a border or a ring would make how many
+   * controls are on screen a function of which panels are open — the header
+   * reflowing because somebody opened Properties. The visual is the `ghost`
+   * variant's own `aria-expanded:bg-muted`, a background, which costs no
+   * pixels; {@link label} is constant across both states for the same reason.
+   */
+  readonly expanded?: boolean;
+  /**
+   * The id of the region {@link expanded} describes, while that region is on
+   * screen. Omitted when it is closed rather than left pointing at an id
+   * nothing owns: a dangling `aria-controls` is a promise to a screen reader
+   * that the app cannot keep.
+   */
+  readonly controls?: string;
 }
 
 export interface PriorityPlanInput {
@@ -284,6 +309,14 @@ export function PriorityActions({
           // (WCAG 2.5.3). An icon with no name is a control nobody can ask for.
           aria-label={item.label}
           title={item.label}
+          // Undefined on a plain verb, so the attribute is absent rather than
+          // false: a control that discloses nothing must not report a closed
+          // region. The `ghost` variant already paints `aria-expanded:bg-muted`,
+          // so the open panel is visible here without a class of our own — and
+          // without a pixel of width, which is what keeps promotion a function
+          // of the window rather than of what is open.
+          aria-expanded={item.expanded}
+          aria-controls={item.controls}
           className="shrink-0"
           onClick={item.onSelect}
         >

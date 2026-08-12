@@ -45,6 +45,7 @@ import {
   FILES_CREATE_LABEL,
   FILES_DELETE_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
+  FILES_NAME_FLOOR_PX,
   FILES_NAME_LABEL,
   FILES_NEW_FILE_LABEL,
   FILES_NEW_FILE_NAME_LABEL,
@@ -52,7 +53,7 @@ import {
   FILES_OPEN_BESIDE_LABEL,
   FILES_OPEN_HERE_LABEL,
   FILES_OPEN_LABEL,
-  FILES_OPEN_SHORT_LABEL,
+  FILES_PANE_SUBTITLE,
   FILES_PANE_TITLE,
   FILES_REFRESH_LABEL,
   FILES_REVEAL_LABEL,
@@ -66,6 +67,8 @@ import {
   FILES_UNBUILT_CONTROL_LABELS,
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
+  filesRowActionsBudget,
+  filesSelectionSentence,
 } from "@/components/layout/files-pane";
 import {
   COLUMN_COLLAPSE_PREFIX,
@@ -582,13 +585,25 @@ describe("FilesPane", () => {
     await click(within(row).getByRole("button", { name: FILES_REVEAL_LABEL }));
     expect(revealPath).toHaveBeenCalledWith("/Users/alice/Vault/clip.mov");
 
-    await click(within(row).getByRole("button", { name: FILES_COPY_PATH_LABEL }));
-    expect(writeText).toHaveBeenCalledWith("/Users/alice/Vault/clip.mov");
-
     // Open goes through the profile-rooted command, by id and relative subpath —
     // never by handing an absolute path to an opener.
     await click(within(row).getByRole("button", { name: FILES_OPEN_LABEL }));
     expect(syncOpenEntry).toHaveBeenCalledWith("01VAULT", "clip.mov");
+
+    // Copy path last, and from the MENU: a 360px column promotes two of the
+    // three verbs, so this one is only in the menu at this width. Same handler
+    // either way, which is the property worth pinning — the row's cluster and
+    // its menu are built from one list.
+    await act(async () => {
+      fireEvent.contextMenu(row);
+      await Promise.resolve();
+    });
+    await click(
+      within(await screen.findByRole("menu")).getByRole("menuitem", {
+        name: FILES_COPY_PATH_LABEL,
+      }),
+    );
+    expect(writeText).toHaveBeenCalledWith("/Users/alice/Vault/clip.mov");
   });
 
   it("offers no Reveal where the platform has no file manager", async () => {
@@ -796,8 +811,10 @@ describe("FilesPane keyboard navigation", () => {
     const file = await screen.findByRole("treeitem", { name: "readme.md" });
 
     // Not the focused row yet: its actions are out of the tab order, so Tab
-    // does not walk every action of every row in the tree.
-    expect(within(file).getByRole("button", { name: FILES_COPY_PATH_LABEL })).toHaveAttribute(
+    // does not walk every action of every row in the tree. Reveal rather than
+    // Copy path because the default 360px column promotes two of a file's three
+    // verbs and the third is in the row's menu — see the budget suite below.
+    expect(within(file).getByRole("button", { name: FILES_REVEAL_LABEL })).toHaveAttribute(
       "tabindex",
       "-1",
     );
@@ -806,7 +823,7 @@ describe("FilesPane keyboard navigation", () => {
     await act(async () => {
       await Promise.resolve();
     });
-    expect(within(file).getByRole("button", { name: FILES_COPY_PATH_LABEL })).toHaveAttribute(
+    expect(within(file).getByRole("button", { name: FILES_REVEAL_LABEL })).toHaveAttribute(
       "tabindex",
       "0",
     );
@@ -890,6 +907,158 @@ describe("FilesPane — a name too long for the tree", () => {
     for (const label of FILES_UNBUILT_CONTROL_LABELS) {
       expect(within(rows).queryByRole("button", { name: label })).toBeNull();
     }
+  });
+});
+
+/**
+ * The owner's second report against 0.8.5: a file row's controls "merged and
+ * messed up", and folder rows fine.
+ *
+ * One cause. `Open` / `Reveal in Finder` / `Copy path` were three text buttons,
+ * always mounted and all `shrink-0`, next to a size cell and a sync mark that
+ * are too — about 250px of a 360px column. The name is the only member of the row
+ * that gives ground, so it was squeezed to roughly 30px on every file row, which
+ * is also why every file row grew an Expand trigger. A folder has no size cell
+ * and no Open button, so its name fitted and it looked fine.
+ *
+ * The policy is a pure function for `planPriorityActions`' reason: jsdom lays
+ * nothing out, so a test that asserted "the third control moved into the menu at
+ * 320px" against a rendered tree would be asserting a shim. Every boundary is
+ * provable exactly here, and the rendered half below asserts only what a
+ * stubbed `clientWidth` can honestly carry — which of the row's verbs are on it.
+ */
+describe("FilesPane — a row's verbs against the column's width", () => {
+  /**
+   * The width the tree reports for itself, before it mounts and measures.
+   *
+   * `role="tree"` rather than a class: it is the element the rows are laid out
+   * in and the one the pane's ref reads. Every other element keeps jsdom's
+   * honest zero, so nothing else in the pane changes behaviour under this.
+   */
+  function withTreeWidth(px: number): () => void {
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(Element.prototype, "clientWidth", {
+      configurable: true,
+      get(this: Element) {
+        return this.getAttribute("role") === "tree" ? px : 0;
+      },
+    });
+    return () => {
+      if (descriptor === undefined) {
+        Reflect.deleteProperty(Element.prototype, "clientWidth");
+      } else {
+        Object.defineProperty(Element.prototype, "clientWidth", descriptor);
+      }
+    };
+  }
+
+  /** A file two levels down — a profile root and one entry inside it, which is
+   *  the shallowest a file can be and therefore the widest row a file gets. */
+  const FILE_LEVEL = 2;
+
+  let restoreWidth: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreWidth?.();
+    restoreWidth = null;
+  });
+
+  async function rowAt(px: number): Promise<HTMLElement> {
+    restoreWidth = withTreeWidth(px);
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("clip.mov", "video")]));
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    return await screen.findByRole("treeitem", { name: "clip.mov" });
+  }
+
+  /** Which verbs are ON the row, in order. */
+  function verbs(row: HTMLElement): string[] {
+    return within(row)
+      .queryAllByRole("button")
+      .map((button) => button.getAttribute("aria-label") ?? "")
+      .filter((label) =>
+        [FILES_OPEN_LABEL, FILES_REVEAL_LABEL, FILES_COPY_PATH_LABEL].includes(label),
+      );
+  }
+
+  it("keeps the name its floor at the column's own minimum, and promotes nothing", () => {
+    // 220 is `SURFACE_COLUMNS["files-tree"].minWidth`: the narrowest the seam
+    // will go. Nothing is left over for a control there, which is the point —
+    // the row spends what it has on the name it exists to show.
+    expect(SURFACE_COLUMNS["files-tree"].minWidth).toBe(220);
+    expect(
+      filesRowActionsBudget({ column: SURFACE_COLUMNS["files-tree"].minWidth, level: FILE_LEVEL }),
+    ).toBe(0);
+  });
+
+  it("buys one control at 320 and all three by 480", () => {
+    // Each promoted control costs 32px and the 4px gap after it, so the budget
+    // buys one at 66px, two at 106 and three at 226. Boundaries either side, so
+    // the arithmetic is pinned rather than sampled.
+    expect(filesRowActionsBudget({ column: 320, level: FILE_LEVEL })).toBe(66);
+    expect(filesRowActionsBudget({ column: 360, level: FILE_LEVEL })).toBe(106);
+    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL })).toBe(226);
+    // And one level deeper is 16px narrower, all the way down.
+    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL + 1 })).toBe(210);
+  });
+
+  it("never returns less than nothing, however narrow or nonsense the column", () => {
+    expect(filesRowActionsBudget({ column: 48, level: FILE_LEVEL })).toBe(0);
+    expect(filesRowActionsBudget({ column: 0, level: 1 })).toBe(0);
+    expect(filesRowActionsBudget({ column: Number.NaN, level: FILE_LEVEL })).toBe(0);
+    expect(filesRowActionsBudget({ column: 480, level: Number.NaN })).toBe(0);
+  });
+
+  it("leaves the name more than its floor once the actions have been paid for", () => {
+    // The floor is what the budget reserves, so whatever the plan does not spend
+    // is the name's as well: the row is a flex box in which the name is the only
+    // member that grows.
+    const spentAt320 = 1 * (32 + 4);
+    expect(filesRowActionsBudget({ column: 320, level: FILE_LEVEL })).toBeGreaterThanOrEqual(
+      spentAt320,
+    );
+    expect(FILES_NAME_FLOOR_PX).toBeGreaterThan(0);
+  });
+
+  it("shows a 220px row no verbs at all", async () => {
+    expect(verbs(await rowAt(220))).toEqual([]);
+  });
+
+  it("shows a 320px row its first verb and no more", async () => {
+    expect(verbs(await rowAt(320))).toEqual([FILES_OPEN_LABEL]);
+  });
+
+  it("shows a 480px row all three, in the order the pane declared them", async () => {
+    expect(verbs(await rowAt(480))).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
+  });
+
+  it("still reaches every verb through the menu at the narrowest column", async () => {
+    const row = await rowAt(220);
+    expect(verbs(row)).toEqual([]);
+
+    // Nothing on the row and everything one right-click away. This is the whole
+    // licence for a row that shows no verbs: the budget decides which of them are
+    // ALSO one click away and never whether they are reachable.
+    await act(async () => {
+      fireEvent.contextMenu(row);
+      await Promise.resolve();
+    });
+    expect(
+      within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      FILES_OPEN_HERE_LABEL,
+      FILES_OPEN_BESIDE_LABEL,
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
   });
 });
 
@@ -1604,10 +1773,10 @@ describe("FilesPane — a row opens a panel", () => {
   it("leaves the panel alone when the click was on one of the row's own controls", async () => {
     const row = await fileRow();
 
-    await click(within(row).getByRole("button", { name: FILES_COPY_PATH_LABEL }));
+    await click(within(row).getByRole("button", { name: FILES_REVEAL_LABEL }));
 
-    // Copy path bubbles to the row. Without the guard every action button in
-    // the tree would also be an open-this-file button.
+    // Reveal bubbles to the row. Without the guard every action button in the
+    // tree would also be an open-this-file button.
     expect(activePanel(panelsStore.getState()).target).toBeNull();
   });
 
@@ -1664,17 +1833,27 @@ describe("FilesPane — the row's context menu", () => {
     resetPanelsStoreForTest();
   });
 
-  it("names all three ways to open a file, and words them apart", async () => {
+  it("holds every verb the row has, worded apart", async () => {
     const menu = await openMenu(await fileRow());
 
     const items = within(menu)
       .getAllByRole("menuitem")
       .map((item) => item.textContent);
-    expect(items).toEqual([FILES_OPEN_HERE_LABEL, FILES_OPEN_BESIDE_LABEL, FILES_OPEN_LABEL]);
+    // All five, and in one order at every width: the row shows as many of its
+    // verbs as it has pixels for, so a menu that dropped the promoted ones would
+    // make a verb unreachable on a narrow column and would also change places as
+    // the seam was dragged.
+    expect(items).toEqual([
+      FILES_OPEN_HERE_LABEL,
+      FILES_OPEN_BESIDE_LABEL,
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
     // Worded apart is the deliverable, so it is asserted rather than assumed:
-    // three distinct strings, none of which is a prefix of another. A reader who
-    // has to guess which `Open` they pressed has not been told anything.
-    expect(new Set(items).size).toBe(3);
+    // distinct strings, none of which is a prefix of another. A reader who has to
+    // guess which `Open` they pressed has not been told anything.
+    expect(new Set(items).size).toBe(items.length);
     for (const one of items) {
       for (const other of items) {
         if (one !== other) {
@@ -1730,19 +1909,19 @@ describe("FilesPane — the row's context menu", () => {
     expect(activePanel(panelsStore.getState()).target).toBeNull();
   });
 
-  it("says the short word and answers to the long one on the row's own button", async () => {
+  it("names a promoted control by the whole verb its menu item spells", async () => {
     const row = await fileRow();
 
-    // The row carries three text buttons and a name that has to truncate before
-    // they do, so the button shows `Open` — but a reader driving keeper by voice
-    // or by screen reader gets the whole verb, and the accessible name contains
-    // the visible label, which is what makes that safe (WCAG 2.5.3).
+    // The word is off the surface — the control is its glyph — and nowhere else.
+    // A reader driving keeper by voice or by screen reader gets the whole verb,
+    // and the pointer gets it as a tooltip. An icon with no name is a control
+    // nobody can ask for (WCAG 2.5.3).
     const button = within(row).getByRole("button", { name: FILES_OPEN_LABEL });
-    expect(button).toHaveTextContent(FILES_OPEN_SHORT_LABEL);
     expect(button).toHaveAttribute("title", FILES_OPEN_LABEL);
+    expect(button).toHaveTextContent("");
   });
 
-  it("offers no menu on a folder, whose gesture is expand and collapse", async () => {
+  it("offers a folder its own two verbs and none of the three panel ones", async () => {
     syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
     syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("Notes", "folder")]));
     render(<FilesPane />);
@@ -1750,15 +1929,15 @@ describe("FilesPane — the row's context menu", () => {
     await click(expander(root));
     const folder = await screen.findByRole("treeitem", { name: "Notes" });
 
-    await act(async () => {
-      fireEvent.contextMenu(folder);
-      await Promise.resolve();
-    });
-
-    // All three items are ways to open a FILE. A folder is not a panel target,
-    // so its menu would hold none of them — and an empty menu offered on a
-    // right-click is worse than the native one it suppressed.
-    expect(screen.queryByRole("menu")).toBeNull();
+    // A folder is not a panel target, so none of the three ways to open a file
+    // is offered on one. It still has a path to reveal and a path to copy, and
+    // those are the two the row is narrowest for — a folder with no menu was a
+    // folder whose only verbs vanished with the column's width.
+    expect(
+      within(await openMenu(folder))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([FILES_REVEAL_LABEL, FILES_COPY_PATH_LABEL]);
   });
 
   it("offers no menu on a profile root either", async () => {
@@ -1814,7 +1993,13 @@ describe("FilesPane — the row's context menu", () => {
         within(menu)
           .getAllByRole("menuitem")
           .map((item) => item.textContent),
-      ).toEqual([FILES_OPEN_HERE_LABEL, FILES_OPEN_BESIDE_LABEL, FILES_OPEN_LABEL]);
+      ).toEqual([
+        FILES_OPEN_HERE_LABEL,
+        FILES_OPEN_BESIDE_LABEL,
+        FILES_OPEN_LABEL,
+        FILES_REVEAL_LABEL,
+        FILES_COPY_PATH_LABEL,
+      ]);
     } finally {
       vi.useRealTimers();
       window.matchMedia = originalMatchMedia;
@@ -1876,7 +2061,9 @@ describe("FilesPane — the write path", () => {
       fireEvent.click(screen.getByRole("treeitem", { name: "c.md" }), { metaKey: true });
       await Promise.resolve();
     });
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("2 items selected");
+    // The chip draws the figure and announces the sentence — see the header's
+    // own test below. Asserted by role and name here, not by text content.
+    expect(screen.getByRole("status", { name: "2 items selected" })).toHaveTextContent("2");
     // The middle row was NOT taken: Cmd adds one, it does not fill the gap.
     expect(screen.getByRole("treeitem", { name: "b.md" })).toHaveAttribute(
       "aria-selected",
@@ -1890,7 +2077,7 @@ describe("FilesPane — the write path", () => {
     });
     // Shift fills it, because a run is what a person sees between two rows.
     expect(screen.getByRole("treeitem", { name: "b.md" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("3 items selected");
+    expect(screen.getByRole("status", { name: "3 items selected" })).toHaveTextContent("3");
   });
 
   it("treats Ctrl-click as Cmd-click, because one of them is the wrong platform", async () => {
@@ -1905,7 +2092,7 @@ describe("FilesPane — the write path", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("2 items selected");
+    expect(screen.getByRole("status", { name: "2 items selected" })).toHaveTextContent("2");
   });
 
   it("counts the selection into the delete request and shows Rust's counted question", async () => {
@@ -2677,7 +2864,7 @@ describe("FilesPane — the tree is a column", () => {
     render(<FilesPane />);
     await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
     await click(await screen.findByRole("treeitem", { name: "a.md" }));
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+    expect(screen.getByRole("status", { name: "1 item selected" })).toHaveTextContent("1");
 
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
 
@@ -2687,7 +2874,7 @@ describe("FilesPane — the tree is a column", () => {
     // the count that makes deleting safe to press is in the header.
     await click(held);
     expect(screen.getByRole("button", { name: FILES_DELETE_LABEL })).toBeInTheDocument();
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+    expect(screen.getByRole("status", { name: "1 item selected" })).toHaveTextContent("1");
   });
 
   it("offers no selection control when nothing is selected", async () => {
@@ -2698,5 +2885,124 @@ describe("FilesPane — the tree is a column", () => {
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
 
     expect(screen.queryByRole("button", { name: new RegExp(FILES_SELECTION_LABEL) })).toBeNull();
+  });
+});
+
+/**
+ * The header the owner photographed against 0.8.6.
+ *
+ * The sentence under the fold row came out ONE WORD PER LINE down the pane
+ * while `1 item selected`, `Delete`, `Attach to note` and `Refresh` sat beside
+ * it on one row at full width. Every control was `shrink-0`, so the prose was
+ * the only flex child that could give ground and the layout gave it exactly its
+ * min-content width — the longest word in it. The same defect the file rows had
+ * one level down, from the same cause.
+ *
+ * **None of this measures a reflow, and it is not trying to.** jsdom performs
+ * no layout — the reason `priority-actions` keeps its policy a pure function —
+ * so what these assert is the STRUCTURE that made the squeeze reachable and no
+ * longer does: every control is inside one row, the prose is not in it, and the
+ * verbs answer to their words with the words off the surface. A layout test
+ * here would be a test of `src/test/setup.ts`'s viewport shim.
+ */
+describe("FilesPane — the header the prose has to fit in", () => {
+  beforeEach(() => {
+    // Attach needs a vault open before it is offered at all — see the attach
+    // suite above. Every header control has to be on screen for these.
+    notesAttachTargets.mockResolvedValue([
+      { id: "n1", title: "Standup", path: "notes/standup.md", holds: [] },
+    ]);
+    notesVaultsStore.setState({ activeVaultId: "v1" });
+  });
+
+  afterEach(() => {
+    notesVaultsStore.setState({ activeVaultId: null });
+  });
+
+  /** One vault, one writable file selected: the fullest the header ever gets. */
+  async function headerWithOneSelected(): Promise<HTMLElement> {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("a.md", "file")]));
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await click(await screen.findByRole("treeitem", { name: "a.md" }));
+    const header = screen.getByText(FILES_PANE_SUBTITLE).closest("header");
+    if (header === null) {
+      throw new Error("the subtitle is not in a header");
+    }
+    return header;
+  }
+
+  it("puts every control in one row and leaves the sentence out of it", async () => {
+    const header = await headerWithOneSelected();
+    const prose = screen.getByText(FILES_PANE_SUBTITLE);
+    const actions = header.firstElementChild;
+
+    // The prose is the header's own child, beside the action row rather than
+    // inside it. This is the assertion that fails if the two are ever put back
+    // on one line: there, `prose.parentElement` would be `actions`.
+    expect(prose.parentElement).toBe(header);
+    expect(actions).not.toBe(prose);
+    expect(actions?.contains(prose)).toBe(false);
+
+    // And every control really is in that row, so there is nothing left beside
+    // the sentence to hold its width against it.
+    const controls = within(header).getAllByRole("button");
+    expect(controls.length).toBeGreaterThan(0);
+    for (const control of controls) {
+      expect(actions?.contains(control)).toBe(true);
+    }
+  });
+
+  it("draws each verb as a glyph that still answers to its word", async () => {
+    const header = await headerWithOneSelected();
+
+    for (const word of [FILES_DELETE_LABEL, ATTACH_TO_NOTE_LABEL, FILES_REFRESH_LABEL]) {
+      // By role and name, which is the whole promise of taking the word off:
+      // speech input can still ask for what the eye reads as a picture.
+      const control = within(header).getByRole("button", { name: word });
+      expect(control).toHaveAttribute("title", word);
+      // Nothing written on it, and one silent glyph inside it.
+      expect(control.textContent).toBe("");
+      const glyph = control.querySelector("svg");
+      expect(glyph).not.toBeNull();
+      expect(glyph).toHaveAttribute("aria-hidden", "true");
+    }
+
+    // Delete is the one verb here that cannot be undone, and it still says so
+    // without its word: `destructive` is a red label and a red hairline.
+    expect(within(header).getByRole("button", { name: FILES_DELETE_LABEL })).toHaveAttribute(
+      "data-variant",
+      "destructive",
+    );
+  });
+
+  it("counts the selection into a chip that draws the figure and names what it counts", async () => {
+    const header = await headerWithOneSelected();
+
+    const chip = within(header).getByRole("status", { name: filesSelectionSentence(1) });
+    // The figure is what is drawn; the sentence is what is announced and what a
+    // pointer gets. `1 item selected` as running text is what would not fit.
+    expect(chip).toHaveTextContent("1");
+    expect(chip).toHaveAttribute("title", filesSelectionSentence(1));
+    expect(chip).toHaveAttribute("data-slot", "badge");
+  });
+
+  it("spends the same Refresh glyph open as the rail does folded", async () => {
+    const header = await headerWithOneSelected();
+    const lucide = (button: HTMLElement): string | undefined => {
+      const svg = button.querySelector("svg");
+      return [...(svg?.classList ?? [])].find((name) => name.startsWith("lucide-"));
+    };
+    const open = lucide(within(header).getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    await click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["files-tree"].label}`,
+      }),
+    );
+
+    expect(open).toBe("lucide-refresh-cw");
+    expect(lucide(screen.getByRole("button", { name: FILES_REFRESH_LABEL }))).toBe(open);
   });
 });

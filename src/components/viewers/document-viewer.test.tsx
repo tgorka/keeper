@@ -386,6 +386,39 @@ describe("a workbook", () => {
     expect(screen.getByText("Ada")).toBeInTheDocument();
   });
 
+  it("marks the chosen sheet without drawing a second edge under the tab strip", async () => {
+    geometry = withListGeometry({ viewport: VIEWPORT_PX, row: ROW_PX });
+    syncReadDocument.mockResolvedValue(
+      vm({
+        format: "xlsx",
+        sheets: {
+          sheets: [sheet("Revenue", [["Europe"]]), sheet("Notes", [["Ada"]])],
+          sheetCount: 2,
+          truncated: false,
+        },
+      }),
+    );
+
+    mount(target({ name: "budget.xlsx", relativePath: "budget.xlsx" }));
+
+    await screen.findByTestId(DOCUMENT_VIEWER_TESTID);
+    const [active, idle] = screen.getAllByTestId(DOCUMENT_SHEET_TAB_TESTID);
+
+    // DESIGN.md → Elevation & Depth: a seam has exactly one owner. The strip
+    // owns the hairline; the active tab used to add `border-b-2` on top of it,
+    // so one tab sat over 3px of line and the rest over 1px. The mark is an
+    // overlay now — `TabsList`'s line-variant construction — and it lands ON
+    // the strip's pixel rather than under it.
+    expect(active.className).not.toContain("border-b");
+    expect(idle.className).not.toContain("border-b");
+    expect(active).toHaveClass("after:bg-primary");
+    expect(active).toHaveClass("after:-bottom-px");
+    // Still told apart, and not by the overlay alone.
+    expect(idle).toHaveClass("after:bg-transparent");
+    expect(active).toHaveAttribute("aria-selected", "true");
+    expect(idle).toHaveAttribute("aria-selected", "false");
+  });
+
   it("mounts a window over a 50 000-row sheet and still reports 50 000", async () => {
     geometry = withListGeometry({ viewport: VIEWPORT_PX, row: ROW_PX });
     const rows = Array.from({ length: 500 }, (_, at) => [`row ${at}`]);

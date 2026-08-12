@@ -59,6 +59,25 @@ import { spliceBetween } from "./text-splice";
 /** The rendered block. The hook a test finds the table by. */
 export const TABLE_BLOCK_CLASS = "cm-md-table";
 
+/**
+ * The box between the block and the table, which is the only thing in here that
+ * can scroll.
+ *
+ * `EditorView.lineWrapping` pins the content box to the editor's own width, so
+ * prose wraps and a BLOCK WIDGET does not: a table of eight columns is as wide
+ * as its columns need, and with nothing between it and the pane it simply left
+ * the pane — the owner's "notes are truncated with nothing to scroll". The
+ * table cannot be the scroll box itself (a `<table>` given `overflow` and a
+ * `display` that honours it stops being a table), and the block cannot be it
+ * either: {@link TABLE_CONTROLS_LABEL}'s cluster is the block's other child and
+ * scrolling the table sideways must not carry the controls off with it.
+ *
+ * So: one wrapper, the shape `.cm-lp-gallery-grid` already uses for the same
+ * problem on the other axis — a fixed box with `auto` overflow, where the
+ * content is what moves.
+ */
+export const TABLE_SCROLL_CLASS = "cm-md-table-scroll";
+
 /** One rendered cell, header or body. */
 export const TABLE_CELL_CLASS = "cm-md-table-cell";
 
@@ -513,7 +532,13 @@ class TableWidget extends WidgetType {
       body.append(bodyRow);
     }
     table.append(body);
-    host.append(table);
+    // The table goes in the scroll box and the scroll box goes in the block, so
+    // a table wider than the pane moves under the controls rather than past
+    // them. See {@link TABLE_SCROLL_CLASS}.
+    const scroll = document.createElement("div");
+    scroll.className = TABLE_SCROLL_CLASS;
+    scroll.append(table);
+    host.append(scroll);
 
     const controls = document.createElement("div");
     controls.className = "cm-md-table-controls";
@@ -678,10 +703,55 @@ const realignTables = EditorState.transactionFilter.of((transaction) => {
 const tableTheme = EditorView.baseTheme({
   [`.${TABLE_BLOCK_CLASS}`]: {
     margin: "0.4em 0",
+    // The block never exceeds the pane, whatever is inside it. Belt to the
+    // scroll box's braces: a block widget's parent is the wrapped content box,
+    // so this is already its width — and it stops being so the day this widget
+    // is mounted anywhere else.
+    maxWidth: "100%",
+  },
+  [`.${TABLE_SCROLL_CLASS}`]: {
+    // Size containment in the inline axis, and the whole fix turns on it.
+    //
+    // `.cm-content` is a flex item of `.cm-scroller` sized by its own contents,
+    // and `EditorView.lineWrapping` adds `flex-shrink: 1` so wrapped prose lets
+    // it fall back to the scroller's width. A `max-content` table inside it has a
+    // MINIMUM width of its own full width, so the content box could not shrink
+    // past it: measured in Chromium, `.cm-content` grew from 320px to the
+    // table's 914px, every line of prose in the note re-laid out to 914px, and
+    // both `scrollWidth` and `clientWidth` on this box read 914 — a scroll box as
+    // wide as the thing it was supposed to be scrolling.
+    //
+    // `contain: inline-size` says this box's width comes from its parent and
+    // never from its contents. The content box stays at the pane's width, and the
+    // overflow lands here, where there is a bar for it. `max-width: 100%` alone
+    // cannot do it: a percentage is ignored while intrinsic widths are computed,
+    // which is exactly when the damage was done.
+    contain: "inline-size",
+    maxWidth: "100%",
+    // `auto`, so the bar exists when the table's own columns are wider than the
+    // pane and is absent when they are not. `scroll` would put a permanent grey
+    // strip under every two-column table in the note, which is a different
+    // defect with the same cause.
+    overflowX: "auto",
   },
   [`.${TABLE_BLOCK_CLASS} table`]: {
     borderCollapse: "collapse",
-    width: "auto",
+    // `max-content`, and `auto` — which is what stood here — is what the owner
+    // photographed. Measured in Chromium rather than reasoned about, because the
+    // reasoning is wrong: `auto` looks like "fit if you can, overflow if you
+    // cannot", but `EditorView.lineWrapping` puts `overflow-wrap: anywhere` and
+    // `word-break: break-word` on `.cm-content`, and a table cell inherits both.
+    // So a cell's minimum width is ONE CHARACTER, "if you can" is always true,
+    // and a seven-column table in a 320px pane shrank to seven 14px columns of
+    // vertically stacked letters. `scrollWidth` and `clientWidth` were both 320:
+    // there was nothing to scroll because nothing had overflowed, which is
+    // exactly the report — adapted to the width, into something unreadable.
+    //
+    // `max-content` is the width the columns actually want. Wider than the pane
+    // is then a real overflow, and the box above is where it goes. No
+    // `max-width` on the table itself: capping it would hand the cells back to
+    // the character-stacking above, one level down.
+    width: "max-content",
   },
   [`.${TABLE_CELL_CLASS}`]: {
     border: "1px solid currentColor",

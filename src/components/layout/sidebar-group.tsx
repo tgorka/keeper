@@ -31,7 +31,9 @@
  */
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { type SidebarGroup, sidebarFoldStore, useSidebarFold } from "@/lib/stores/sidebar-fold";
 import { cn } from "@/lib/utils";
 
@@ -86,40 +88,80 @@ export function FoldSection({
   as?: "ul" | "div";
   children: ReactNode;
 }) {
+  const name = folded ? `Expand ${label}` : `Collapse ${label}`;
+  const disclosure = (
+    <Button
+      type="button"
+      variant="ghost"
+      // The name carries the direction because on the rail there is no
+      // visible text at all, and it CONTAINS the visible label so the two do
+      // not disagree where there is (WCAG 2.5.3). `aria-expanded` is what
+      // actually states the current state; the verb is what makes an
+      // icon-only control say what pressing it does.
+      aria-label={name}
+      aria-expanded={!folded}
+      aria-controls={id}
+      data-slot="sidebar-group-fold"
+      // On the rail this is one more item on a strip, so it is the strip's
+      // item and not a squashed row: it used to be `h-auto py-1` with a 14px
+      // glyph, ~22px tall among 36px nav buttons directly above it, which is
+      // the rhythm changing halfway down the strip that the owner saw.
+      size={collapsed ? FOLD_STRIP.controlSize : undefined}
+      className={cn(
+        // `text-muted-foreground`, not `text-faint`: this label is the
+        // visible name of a control, and a control's own name is held to
+        // 4.5:1 however label-like it looks.
+        "label-caps text-muted-foreground",
+        collapsed ? "shrink-0" : "h-auto min-w-0 flex-1 justify-start gap-2 px-2 py-1",
+      )}
+      onClick={onToggle}
+    >
+      <Icon aria-hidden="true" className={cn("shrink-0", !collapsed && "size-3.5")} />
+      {!collapsed && label}
+    </Button>
+  );
   return (
     <section
       aria-label={label}
-      className={cn("flex flex-col pb-1", collapsed ? "px-1" : "px-2", className)}
+      data-fold-strip-items={collapsed ? "nested" : undefined}
+      className={cn(
+        "flex flex-col",
+        // On the rail the strip's own container owns the inset and the rhythm
+        // for every section on it — see `sidebar-pane.tsx`. A section that
+        // brought its own would be the second opinion this module exists to
+        // stop having.
+        collapsed ? FOLD_STRIP.gapClass : "px-2 pb-1",
+        className,
+      )}
     >
       <div className={cn("flex shrink-0 items-center gap-1", collapsed && "justify-center")}>
-        <Button
-          type="button"
-          variant="ghost"
-          // The name carries the direction because on the rail there is no
-          // visible text at all, and it CONTAINS the visible label so the two do
-          // not disagree where there is (WCAG 2.5.3). `aria-expanded` is what
-          // actually states the current state; the verb is what makes an
-          // icon-only control say what pressing it does.
-          aria-label={folded ? `Expand ${label}` : `Collapse ${label}`}
-          aria-expanded={!folded}
-          aria-controls={id}
-          data-slot="sidebar-group-fold"
-          className={cn(
-            // `text-muted-foreground`, not `text-faint`: this label is the
-            // visible name of a control, and a control's own name is held to
-            // 4.5:1 however label-like it looks.
-            "h-auto py-1 label-caps text-muted-foreground",
-            collapsed ? "justify-center px-0" : "min-w-0 flex-1 justify-start gap-2 px-2",
-          )}
-          onClick={onToggle}
-        >
-          <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-          {!collapsed && label}
-        </Button>
+        {collapsed ? (
+          // Folded to a glyph, the tooltip is the only thing that says which
+          // section this is — the same answer, in the same words, that the
+          // strips around it give (`fold-strip.tsx`).
+          //
+          // Its own `TooltipProvider`, for the reason `surface-column.tsx`
+          // gives for the same decision: a section that only names itself
+          // inside the app shell is a section that goes silent in every other
+          // host, and this one is rendered directly by its own suite.
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>{disclosure}</TooltipTrigger>
+              <TooltipContent side="right">{name}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          disclosure
+        )}
         {actions}
       </div>
       {notice}
-      <Body id={id} hidden={folded} className={bodyClassName}>
+      <Body
+        id={id}
+        hidden={folded}
+        data-fold-strip-items={collapsed ? "nested" : undefined}
+        className={bodyClassName}
+      >
         {children}
       </Body>
     </section>
@@ -154,7 +196,14 @@ export function FoldableGroup({
       id={`sidebar-group-${group}`}
       collapsed={collapsed}
       as="ul"
-      bodyClassName={cn("flex flex-col gap-0.5", collapsed && "items-center")}
+      // On the rail these rows are items on the strip and take the strip's
+      // rhythm. Off it they are text rows in a 260px drawer, where 2px is the
+      // denser spacing a list of names wants — this `gap-0.5` is the one that
+      // used to leak onto the strip and change its rhythm halfway down.
+      bodyClassName={cn(
+        "flex flex-col",
+        collapsed ? cn(FOLD_STRIP.gapClass, "items-center") : "gap-0.5",
+      )}
     >
       {children}
     </FoldSection>

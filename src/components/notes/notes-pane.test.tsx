@@ -845,7 +845,11 @@ describe("NotesPane rail", () => {
   it("renders the four defaults as spaces, and nothing when the vault has none", async () => {
     renderPane();
 
-    const rail = await screen.findByRole("navigation", { name: "Notes" });
+    // The rail names itself from its own visible title now (Story 48.3), so the
+    // region's name is the column's display name rather than a second string.
+    const rail = await screen.findByRole("navigation", {
+      name: SURFACE_COLUMNS["notes-rail"].title,
+    });
     for (const name of ["Inbox", "Journal", "Pinned", "Recordings"]) {
       expect(await within(rail).findByRole("button", { name })).toBeInTheDocument();
     }
@@ -853,7 +857,9 @@ describe("NotesPane rail", () => {
     cleanup();
     spaceList = [];
     renderPane();
-    const bare = await screen.findByRole("navigation", { name: "Notes" });
+    const bare = await screen.findByRole("navigation", {
+      name: SURFACE_COLUMNS["notes-rail"].title,
+    });
     await waitFor(() => {
       expect(within(bare).queryByRole("button", { name: "Inbox" })).not.toBeInTheDocument();
     });
@@ -869,7 +875,9 @@ describe("NotesPane rail", () => {
    */
   it("has no Today row, and no row that opens a note instead of filtering", async () => {
     renderPane();
-    const rail = await screen.findByRole("navigation", { name: "Notes" });
+    const rail = await screen.findByRole("navigation", {
+      name: SURFACE_COLUMNS["notes-rail"].title,
+    });
     await within(rail).findByRole("button", { name: "Inbox" });
 
     expect(within(rail).queryByRole("button", { name: "Today" })).not.toBeInTheDocument();

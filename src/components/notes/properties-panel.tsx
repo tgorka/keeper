@@ -492,7 +492,11 @@ export function PropertiesPanel({
             </div>
           </Fragment>
         )}
-        <ColumnResizer {...keyColumn.resizerProps} />
+        {/* The one resizer in the app that paints its own hairline: the key /
+            value split is grid CELLS, so there is no box on either side of it
+            to own a `border-r`. Everywhere else a column owns the edge and the
+            handle only lights it — see `ColumnResizerProps.seam`. */}
+        <ColumnResizer {...keyColumn.resizerProps} seam="self" />
       </div>
       {/* "Record another like this" (Story 45.19, FR-197) — a note-level
           action, not a property row: it is about the whole session, and the

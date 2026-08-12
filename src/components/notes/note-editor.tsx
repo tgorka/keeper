@@ -26,13 +26,17 @@
  * which is a promise a remount could not keep.
  */
 import { Files, FolderSearch, History, SlidersHorizontal } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
 import { PaneHeader } from "@/components/layout/pane-header";
 import { type PriorityAction, PriorityActions } from "@/components/layout/priority-actions";
 import { Button } from "@/components/ui/button";
-import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenuCheckboxItem,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
@@ -309,9 +313,26 @@ export interface NoteEditorProps {
   noteId: string | null;
   /** Open another note — a backlink row, or a wikilink that resolved. */
   onOpenNote?: (noteId: string) => void;
+  /**
+   * The controls of the surface that HOLDS this editor — a panel's fold and
+   * close — handed straight to the header's fourth group (Story 50.1).
+   *
+   * A note open in a panel had two header rows: the panel's, whose whole
+   * content was the word `Note` and these two controls, and this one. The word
+   * said nothing the note's own title does not say better and the band cost
+   * 40px and a seam, so the panel gives up its row and passes its controls
+   * down. Absent in the notes pane, in a capture window and in the prewarmed
+   * draft, none of which is a frame — and the header renders no fourth group
+   * at all when it is, so nothing reserves space for a group that is not there.
+   *
+   * The editor never composes these, only places them: what a panel's fold
+   * looks like is `panel-strip.tsx`'s business, and a second spelling of it
+   * here is a second glyph to keep in step.
+   */
+  frame?: ReactNode;
 }
 
-export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
+export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
   // Two editors are two subscriptions to two documents in one store, and the
@@ -342,6 +363,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
   const [mode, setMode] = useState<EditorMode>("edit");
   const [showProperties, setShowProperties] = useState(false);
   const [showAttachments, setShowAttachments] = useState(false);
+  // The two disclosure regions the header's Properties and Attachments controls
+  // name. Ids rather than adjacency, because the controls are in the header and
+  // the regions are several strips further down: nothing about where they sit
+  // says which control opened them, so `aria-controls` has to.
+  const propertiesRegionId = useId();
+  const attachmentsRegionId = useId();
   const [conflictTheirs, setConflictTheirs] = useState<string | null>(null);
   // Story 45.13's sentence about what attaching just did — what was copied in,
   // what was already there. Rendered as a banner beside the conflict-copy one
@@ -710,13 +737,30 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
    * `format-toolbar.tsx`'s marks.
    */
   const headerActions = useMemo<readonly PriorityAction[]>(() => {
+    // Story 49: the first two are the only members of this row that are not
+    // verbs. They open a panel and press again to close it, and until now they
+    // said so to nobody — no state on the control, in either direction, so the
+    // only way to learn whether Properties was already open was to look at the
+    // pane and recognise the panel. `expanded` is the whole fix; the `ghost`
+    // variant paints it and `aria-controls` names what opened. `history` and
+    // `show-in-files` carry neither, because neither discloses anything: one
+    // replaces the pane and the other leaves the app.
     const acts: PriorityAction[] = [
-      { id: "attachments", label: ATTACHMENTS_LABEL, icon: Files, onSelect: toggleAttachments },
+      {
+        id: "attachments",
+        label: ATTACHMENTS_LABEL,
+        icon: Files,
+        onSelect: toggleAttachments,
+        expanded: showAttachments,
+        controls: showAttachments ? attachmentsRegionId : undefined,
+      },
       {
         id: "properties",
         label: PROPERTIES_LABEL,
         icon: SlidersHorizontal,
         onSelect: toggleProperties,
+        expanded: showProperties,
+        controls: showProperties ? propertiesRegionId : undefined,
       },
       { id: "history", label: NOTE_HISTORY_LABEL, icon: History, onSelect: openHistory },
     ];
@@ -729,7 +773,17 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
       });
     }
     return acts;
-  }, [vault, path, toggleAttachments, toggleProperties, openHistory]);
+  }, [
+    vault,
+    path,
+    toggleAttachments,
+    toggleProperties,
+    openHistory,
+    showAttachments,
+    showProperties,
+    attachmentsRegionId,
+    propertiesRegionId,
+  ]);
 
   // Story 46.4: read once, because the header both shows this word and hangs it
   // on a `title` — an error is the one caption that can outgrow its slot.
@@ -760,20 +814,36 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           it. The capture window mounts this exact header, so one structure
           answers both hosts. */}
       <PaneHeader
-        // `py-1` around the row's 32px controls is DESIGN.md's 40px pane-header
-        // exactly. It was `py-1.5` around controls that were already 32px, so
-        // the row has been 44px since 46.4 — four pixels the capture window
-        // spends on nothing, in the one host that has none to spare.
-        className="border-b px-3 py-1"
-        // Group 1 — identity. The only member of the row allowed to give
+        // `PaneHeader` owns its own height (DESIGN.md's 40px pane-header) and
+        // its own bottom edge. The only thing left for a host to say is the
+        // horizontal gutter: a `border-b` here drew the seam twice at 2px, and
+        // a `py-1` here set the height a second time from a different fact.
+        className="px-3"
+        // Group 1 — identity. The only member of the ROW allowed to give
         // ground; see the component's doc for why that is a property of the
         // wrapper and not of these two elements.
+        //
+        // Inside the group, the order in which they give it is this file's,
+        // and Story 50.1 reverses it. `flex-1` off a zero basis used to be on
+        // the TITLE, so the path — which is as long as a folder tree makes it
+        // — took its natural width first and the title grew into whatever was
+        // left. Measured in Chromium at a 560px pane, that left the title
+        // **0.47px**: the row showed `journal/2026/2026-08-08.md` in full and
+        // the note's own name as an ellipsis. Merging the panel's row into
+        // this one costs 40–80px more, so the shape that was already wrong at
+        // 560 would have been wrong at 640.
+        //
+        // So the basis-zero member is the PATH now. The title takes its
+        // natural width, the path absorbs the slack and is the first thing
+        // ellipsised, and a squeezed row says which note before it says where
+        // the note lives — which is the same ruling `PaneHeader` makes one
+        // level up about identity against the controls.
         identity={
           <>
-            <h1 className="min-w-0 flex-1 truncate font-heading text-title">
-              {deriveTitle(body.text)}
-            </h1>
-            <span className="truncate font-mono text-meta text-muted-foreground">{path ?? ""}</span>
+            <h1 className="min-w-0 truncate font-heading text-title">{deriveTitle(body.text)}</h1>
+            <span className="min-w-0 flex-1 truncate font-mono text-meta text-muted-foreground">
+              {path ?? ""}
+            </span>
           </>
         }
         // Group 2 — status. One box for all three captions, reserved from the
@@ -813,9 +883,24 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
               <NoteActions vaultId={vaultId} noteId={noteId} title={deriveTitle(body.text)}>
                 {headerActions.map((act) =>
                   inMenu(act.id) ? (
-                    <DropdownMenuItem key={act.id} onSelect={act.onSelect}>
-                      {act.label}
-                    </DropdownMenuItem>
+                    // A candidate that discloses a panel is a `menuitemcheckbox`
+                    // down here, not a `menuitem`: the promoted control says
+                    // "expanded" and the demoted one has to say the same fact in
+                    // the vocabulary a menu has for it, or the state disappears
+                    // at exactly the widths where the control did.
+                    act.expanded === undefined ? (
+                      <DropdownMenuItem key={act.id} onSelect={act.onSelect}>
+                        {act.label}
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuCheckboxItem
+                        key={act.id}
+                        checked={act.expanded}
+                        onCheckedChange={act.onSelect}
+                      >
+                        {act.label}
+                      </DropdownMenuCheckboxItem>
+                    )
                   ) : null,
                 )}
                 {/* Story 45.15's second door, mounted at last (Story 48.3,
@@ -864,6 +949,11 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
             )}
           />
         )}
+        // Group 4 — the panel's own controls, when a panel is what is holding
+        // this editor (Story 50.1). Placed and never composed here; undefined
+        // in the three hosts that are not frames, and the row then has three
+        // groups exactly as it did.
+        frame={frame}
       />
 
       <NoteDiffBar
@@ -876,40 +966,51 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
         }}
       />
 
-      {conflictCopy === null ? null : (
-        <p className="border-b px-3 py-1 text-meta text-muted-foreground">
-          keeper kept the version that was on disk as {conflictCopy} before writing yours.
-        </p>
-      )}
+      {/* One band, one edge. These four strips are all the same kind of thing —
+          "here is what keeper did to your file after you asked for something
+          else" — and each carrying its own `border-b` said four times that
+          something had ended and never once what had begun. The wrapper owns the
+          single hairline; inside it the strips are told apart by their `py-1`
+          rhythm, which is what separates rows of one kind. Unmounted rather than
+          empty, so a pane with no notice draws no edge at all. */}
+      {conflictCopy !== null || attachOutcome !== null || linkNotice !== null || body.gone ? (
+        <div className="shrink-0 border-b">
+          {conflictCopy === null ? null : (
+            <p className="px-3 py-1 text-meta text-muted-foreground">
+              keeper kept the version that was on disk as {conflictCopy} before writing yours.
+            </p>
+          )}
 
-      {/* Story 45.13's receipt: which files were copied into the vault, and
-          which were already in this note. `role="status"` because it answers
-          something the person just did and they may not be looking here. */}
-      {attachOutcome === null ? null : (
-        <p role="status" className="border-b px-3 py-1 text-meta text-muted-foreground">
-          {attachOutcome}
-        </p>
-      )}
+          {/* Story 45.13's receipt: which files were copied into the vault, and
+              which were already in this note. `role="status"` because it answers
+              something the person just did and they may not be looking here. */}
+          {attachOutcome === null ? null : (
+            <p role="status" className="px-3 py-1 text-meta text-muted-foreground">
+              {attachOutcome}
+            </p>
+          )}
 
-      {/* Story 45.18's answer when a link went nowhere: the note nobody has
-          written, the scheme keeper will not hand to the OS, the window with no
-          opener grant. A slot as well as `role="status"`, because the receipt
-          above is also a status and a test must be able to read one without
-          matching the other. */}
-      {linkNotice === null ? null : (
-        <p
-          role="status"
-          data-slot={LINK_NOTICE_SLOT}
-          className="border-b px-3 py-1 text-meta text-muted-foreground"
-        >
-          {linkNotice}
-        </p>
-      )}
+          {/* Story 45.18's answer when a link went nowhere: the note nobody has
+              written, the scheme keeper will not hand to the OS, the window with
+              no opener grant. A slot as well as `role="status"`, because the
+              receipt above is also a status and a test must be able to read one
+              without matching the other. */}
+          {linkNotice === null ? null : (
+            <p
+              role="status"
+              data-slot={LINK_NOTICE_SLOT}
+              className="px-3 py-1 text-meta text-muted-foreground"
+            >
+              {linkNotice}
+            </p>
+          )}
 
-      {body.gone ? (
-        <p className="border-b px-3 py-1 text-meta text-muted-foreground">
-          This note isn't on disk any more. Your text is still here and saving writes it back.
-        </p>
+          {body.gone ? (
+            <p className="px-3 py-1 text-meta text-muted-foreground">
+              This note isn't on disk any more. Your text is still here and saving writes it back.
+            </p>
+          ) : null}
+        </div>
       ) : null}
 
       {/* Only in edit mode, and below the honest-state banners: the offer is a
@@ -918,18 +1019,23 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           note is a template whose text changed in this session. */}
       {mode === "edit" ? <TemplateUpdateOffer vaultId={vaultId} noteId={noteId} rev={rev} /> : null}
 
+      {/* `display: contents` on the wrappers: the id is what the header control
+          points `aria-controls` at, and a wrapper that generated a box would put
+          a flex item between this column and the panel it holds. */}
       {showProperties ? (
-        mode === "edit" ? (
-          <PropertiesPanel
-            frontmatter={frontmatter}
-            body={body.text}
-            subscriptionId={subscriptionId}
-            baseRev={rev}
-            onSaved={adoptPanelWrite}
-          />
-        ) : (
-          <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />
-        )
+        <div id={propertiesRegionId} className="contents">
+          {mode === "edit" ? (
+            <PropertiesPanel
+              frontmatter={frontmatter}
+              body={body.text}
+              subscriptionId={subscriptionId}
+              baseRev={rev}
+              onSaved={adoptPanelWrite}
+            />
+          ) : (
+            <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />
+          )}
+        </div>
       ) : null}
 
       {/* Below the properties, because that is the order of the question it
@@ -938,16 +1044,18 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
           it holds no state worth keeping, and its `files:` reading is a
           function of the props it is given each time. */}
       {showAttachments ? (
-        mode === "edit" ? (
-          <AttachmentsPanel
-            vaultId={vaultId}
-            frontmatter={frontmatter}
-            body={body.text}
-            onInsert={insertAtCursor}
-          />
-        ) : (
-          <PanelUnavailable panel={ATTACHMENTS_LABEL} mode={mode} onBack={leaveMode} />
-        )
+        <div id={attachmentsRegionId} className="contents">
+          {mode === "edit" ? (
+            <AttachmentsPanel
+              vaultId={vaultId}
+              frontmatter={frontmatter}
+              body={body.text}
+              onInsert={insertAtCursor}
+            />
+          ) : (
+            <PanelUnavailable panel={ATTACHMENTS_LABEL} mode={mode} onBack={leaveMode} />
+          )}
+        </div>
       ) : null}
 
       {/* Directly over the text it formats, and unmounted outside edit mode:

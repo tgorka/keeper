@@ -47,7 +47,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   ) => csvSetCell(vaultId, target, rev, row, column, value),
 }));
 
-import { embedEntryFor, FileEmbedWidget } from "./file-embed";
+import { EMBED_BODY_CLASS, embedEntryFor, FileEmbedWidget } from "./file-embed";
 import { mountNoteFileEmbed } from "./file-embed-host";
 import { livePreview } from "./live-preview";
 
@@ -637,6 +637,85 @@ describe("the renderer", () => {
     // three assertions in this test were wrapped and the third was not, which
     // is why it kept failing about one full-suite run in six.
     await waitFor(() => expect(view.contentDOM.textContent).toContain("people.md"));
+    view.destroy();
+    parent.remove();
+  });
+
+  /**
+   * The other half of the owner's "truncated with nothing to scroll" against
+   * 0.8.5, and the worse half.
+   *
+   * A CSV cell was `max-width: 24em` with `overflow: hidden` and
+   * `text-overflow: ellipsis`. The clip was on the CELL and the only scroll box
+   * is the panel OUTSIDE the table, so a value wider than 24em was ellipsised
+   * with no way to reach the rest of it — truncation by construction. The
+   * one-line rule is what that pair was protecting and `white-space: pre` is the
+   * whole of it.
+   *
+   * A real editor and the real chain, so these are the declarations that reach a
+   * real cell: the theme is a CodeMirror base theme, scoped to the editor's own
+   * wrapper, and a cell rendered outside one is styled by nothing.
+   */
+  it("clips no cell of an embedded CSV, and keeps each one to a line", async () => {
+    embedRead.mockResolvedValue(embed());
+    csvRead.mockResolvedValue(
+      table({
+        rows: [
+          { index: 0, line: 1, cells: ["name", "note"], ragged: false },
+          {
+            index: 1,
+            line: 2,
+            cells: ["Doe, Jane", "a note far longer than twenty-four ems of it could ever be"],
+            ragged: false,
+          },
+        ],
+      }),
+    );
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: `intro\n\n![[${CSV_TARGET}]]\n`,
+        extensions: [
+          livePreview({
+            vaultId: VAULT,
+            assetUrl: (rel) => rel,
+            onOpenLink: () => {},
+            recordingSession: () => null,
+          }),
+        ],
+      }),
+    });
+    await settle();
+
+    const cell = await waitFor(() => {
+      const found = view.dom.querySelector(".cm-csv-cell");
+      if (!(found instanceof HTMLElement)) {
+        throw new Error("the embed rendered no CSV cells");
+      }
+      return found;
+    });
+    const style = getComputedStyle(cell);
+    // One line, still: a value with an embedded newline must not make one row as
+    // tall as the paragraph it is quoting.
+    expect(style.whiteSpace).toBe("pre");
+    // And nothing that hides the tail of it. The panel around the table scrolls
+    // horizontally, so as wide as its widest value means reachable, not lost.
+    expect(style.maxWidth).toBe("none");
+    // Not asserted as the initial value: jsdom leaves a shorthand nobody set
+    // empty rather than resolving it, and what matters is that neither of the two
+    // that hid the tail is in force.
+    expect(style.overflow).not.toBe("hidden");
+    expect(style.textOverflow).not.toBe("ellipsis");
+
+    // And the panel holding it takes its width from the pane, not from the file.
+    // Without this the `max-content` table's own minimum propagated up through the
+    // panel to `.cm-content`: measured in Chromium, a 320px pane became a 1301px
+    // content box and the panel's own `overflow-auto` had nothing left to scroll
+    // because it was as wide as the table inside it.
+    const body = view.dom.querySelector(`.${EMBED_BODY_CLASS}`);
+    expect(body === null ? null : getComputedStyle(body).contain).toBe("inline-size");
     view.destroy();
     parent.remove();
   });

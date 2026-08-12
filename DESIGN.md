@@ -232,6 +232,21 @@ It stands because Apple is already walking it back under legibility pressure —
 added to appearance controls, and their own developer forums citing visual fatigue during prolonged
 use. keeper is a prolonged-use app. Modal scrims are exempt; they are not glass, they are a scrim.
 
+**A seam has exactly one owner.** Every boundary in this app is a 1px hairline in `line`, and the
+rule for who draws it is: **the earlier sibling owns its trailing edge** — a column draws its
+`border-r`, a stacked band draws its `border-b` — and the last child cancels, because an edge with
+nothing beyond it is a line against the window.
+
+This is written down because its absence is visible. Drawn by BOTH neighbours a seam is 2px, which
+is what happened at every resizable column: the column painted a `border-r` and the resizer painted
+its own hairline on top. Drawn by NEITHER it disappears, which is why the note list had no row
+separators at all. And a component that owns no edge pushes the decision onto its callers, which is
+how three `PaneHeader` callers ended up spelling three different borders and two different heights.
+A boundary is a property of the thing that owns it, never of the thing that happens to be next to it.
+
+**A stack of bottom borders is a ladder, not a structure.** Six consecutive hairlines down one pane
+says six times that something ended and never says what began.
+
 ## Shapes
 
 Small radii — 5px default, 3px on inline chips. A workroom's fittings are square-ish; a 12px radius

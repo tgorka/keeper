@@ -52,6 +52,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuRadioGroup,
@@ -469,22 +470,65 @@ function GlobalDndToggle() {
   };
 
   return (
-    <DropdownMenuItem
+    // A `menuitemcheckbox`, not a `menuitem` with a tick drawn on it (Story 49).
+    // The tick was the whole of the state and a tick is a picture: to anyone not
+    // looking at this menu, an app-wide switch that silences every notification
+    // on every account reported nothing at all about which way it was set.
+    // `aria-checked` is the same fact in the vocabulary a menu has for it, and
+    // the indicator now comes from the primitive rather than from a `ml-auto`
+    // glyph beside the words.
+    <DropdownMenuCheckboxItem
+      checked={enabled === true}
       onSelect={(e) => {
         // Keep the menu open so the trailing check reflects the new state in place.
         e.preventDefault();
-        onToggle();
       }}
+      onCheckedChange={onToggle}
     >
       <MoonStar aria-hidden="true" />
       Do not disturb
-      {enabled === true && <Check aria-hidden="true" className="ml-auto" />}
-    </DropdownMenuItem>
+    </DropdownMenuCheckboxItem>
   );
 }
 
 /** What an unverified device's lamp says, on the row trigger and in the menu. */
 const VERIFY_NEEDED_WORD = "Verification needed";
+
+/**
+ * The row-menu trigger's reveal (Story 49).
+ *
+ * The owner's note was that the `⋮` beside every avatar is clutter and that the
+ * avatar should open the menu instead. Half of that is right and half of it
+ * would have cost a shipped function: **the avatar is already a control**. It
+ * carries `aria-pressed` and it is the inbox account filter — one click to
+ * filter to an account, one to clear — so a menu on the avatar's click is a
+ * filter nobody can reach. What is actually wrong is that two permanently drawn
+ * controls per account is two, worst on the folded rail where they stack and
+ * each account costs 68px of a 48px-wide strip.
+ *
+ * So the `⋮` is still here, still a real button, still in the tab order and
+ * still named — it is only quiet. It appears when the pointer is over its row,
+ * when anything in that row has focus (which includes itself, so tabbing to it
+ * shows it before it is reached), and while its own menu is open. `opacity-0`
+ * alone would leave an invisible button eating clicks aimed at the avatar
+ * underneath it on the folded rail, so it gives up pointer events with its
+ * paint and takes them back with it; keyboard activation never depended on
+ * either.
+ *
+ * **The cost, stated rather than buried:** a control revealed on hover is a
+ * control a mouse user has to discover, and the first time is by accident. The
+ * trade is one row of clutter per account against one discovery, and the menu
+ * holds nothing that is only there (Settings, Incognito, DND and Sign out are
+ * all reachable elsewhere or destructive-by-appointment). The one thing that
+ * must never hide is the unverified-device lamp, which is why a row wearing it
+ * opts out below. The other is a pointer that cannot hover: Tailwind compiles
+ * `group-hover` inside `@media (hover: hover)`, so on a coarse pointer the
+ * reveal would never fire and the control would be permanently invisible AND
+ * unclickable. `pointer-coarse` puts it back on screen there, drawn as it
+ * always was.
+ */
+const ROW_MENU_QUIET =
+  "pointer-events-none opacity-0 transition-opacity group-hover/account-row:pointer-events-auto group-hover/account-row:opacity-100 group-focus-within/account-row:pointer-events-auto group-focus-within/account-row:opacity-100 aria-expanded:pointer-events-auto aria-expanded:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100";
 
 function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
@@ -511,9 +555,23 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        // On the folded rail it is an overlay on the avatar's free corner
+        // rather than a second storey under it: two stacked 32px tiles per
+        // account is what made the folded footer as tall as it is, and the
+        // sync glyph already owns the other corner. `icon-xs` is 24px, which
+        // is the smallest a pointer target is allowed to be (WCAG 2.5.8), and
+        // it leaves the avatar's top and right free for the filter press.
+        size={collapsed ? "icon-xs" : "icon-sm"}
         aria-label={menuLabel}
-        className="relative shrink-0"
+        className={cn(
+          "relative shrink-0",
+          collapsed && "-bottom-1 -left-1 absolute",
+          // A row whose device is unverified keeps its menu drawn: the lamp on
+          // this trigger IS the persistent verify signal once the banner is
+          // dismissed, and a security state that appears on hover is a security
+          // state nobody sees.
+          !showVerifyBadge && ROW_MENU_QUIET,
+        )}
       >
         <MoreVertical aria-hidden="true" />
         {showVerifyBadge && (
@@ -590,7 +648,7 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
   if (collapsed) {
     const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
     return (
-      <div className="flex shrink-0 flex-col items-center gap-1">
+      <div className="group/account-row relative flex shrink-0 justify-center">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -619,7 +677,12 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
 
   const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
   return (
-    <div className={cn("flex shrink-0 items-center gap-2 rounded-md pr-1", active && "bg-accent")}>
+    <div
+      className={cn(
+        "group/account-row flex shrink-0 items-center gap-2 rounded-md pr-1",
+        active && "bg-accent",
+      )}
+    >
       <button
         type="button"
         aria-label={filterLabel}

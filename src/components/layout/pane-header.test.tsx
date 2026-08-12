@@ -26,6 +26,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
   PANE_HEADER_ACTIONS_SLOT,
+  PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
   PaneHeader,
@@ -261,5 +262,121 @@ describe("the status is a box before it is a word", () => {
     // An empty tooltip is a tooltip that flickers over a blank box on every
     // hover, which is noise for a state that is deliberately quiet.
     expect(shownElement()).not.toHaveAttribute("title");
+  });
+});
+
+/**
+ * The seam and the height, which the component did not own until this story.
+ *
+ * These are class assertions, and that is the honest ceiling: jsdom performs no
+ * layout and loads no Tailwind, so "the row is 40px" and "one hairline, not two"
+ * are not measurable here. What IS assertable is the thing that actually
+ * regressed — WHO spells the edge. Three callers each spelled their own, over
+ * three heights, all nominally implementing one 40px pane header; the defect was
+ * ownership, and ownership is exactly what a class on the right element proves.
+ * `check:design`'s `seam-doubled` rule guards the other side of it, at the
+ * callers.
+ */
+describe("the header owns its own bottom edge and its own height", () => {
+  it("draws the seam itself rather than leaving it to a caller", () => {
+    render(<PaneHeader identity={<span>a.md</span>} actions={<button type="button">X</button>} />);
+
+    // DESIGN.md → Elevation & Depth: the earlier sibling owns its trailing
+    // edge. A header is the band above whatever the pane draws next, so the
+    // hairline between them is the header's.
+    expect(headerRow()).toHaveClass("border-b");
+    expect(headerRow()).toHaveClass("border-border");
+  });
+
+  it("fixes the row at DESIGN.md's pane-header height", () => {
+    render(<PaneHeader identity={<span>a.md</span>} actions={<button type="button">X</button>} />);
+
+    // 40px, seam included, and `items-center` rather than a caller's guess at
+    // vertical padding — which is how one of the three shipped at 44.
+    expect(headerRow()).toHaveClass("h-10");
+    expect(headerRow()).toHaveClass("items-center");
+  });
+
+  it("keeps both when a caller passes its own padding", () => {
+    render(
+      <PaneHeader
+        className="px-3"
+        identity={<span>a.md</span>}
+        actions={<button type="button">X</button>}
+      />,
+    );
+
+    // The class hook is horizontal padding. It merges; it does not get to
+    // replace the edge or the height, which is what would let two callers of
+    // one component disagree about either again.
+    expect(headerRow()).toHaveClass("px-3");
+    expect(headerRow()).toHaveClass("border-b");
+    expect(headerRow()).toHaveClass("h-10");
+  });
+});
+
+/**
+ * The fourth group, which belongs to the frame and not to the surface
+ * (Story 50.1).
+ *
+ * The same ceiling as everywhere else in this file: jsdom lays nothing out, so
+ * what is provable is the STRUCTURE that decides the layout — where the group
+ * is in the row, whether it can be squeezed, and whether it is there at all
+ * when nobody passed one. Whether its pixels leave group 3 with less to spend
+ * is arithmetic, and it is proved to the pixel in
+ * `priority-actions.test.tsx`'s `paneHeaderActionsBudget` suite.
+ */
+describe("the frame's own controls are a group, not two more actions", () => {
+  it("renders them last, outside the actions group, and unsqueezable", () => {
+    render(
+      <PaneHeader
+        identity={<span>a note</span>}
+        status={{ sizers: [SHORT, LONG], caption: SHORT }}
+        actions={<button type="button">Attachments</button>}
+        frame={
+          <>
+            <button type="button">Fold panel</button>
+            <button type="button">Close panel</button>
+          </>
+        }
+      />,
+    );
+
+    const row = headerRow();
+    expect(Array.from(row.children).map((child) => child.getAttribute("data-slot"))).toEqual([
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+      PANE_HEADER_ACTIONS_SLOT,
+      PANE_HEADER_FRAME_SLOT,
+    ]);
+    // Outside group 3 in the DOM, which is what keeps them outside its
+    // overflow: `PriorityActions` may put any of its own candidates in a `⋯`
+    // menu, and the way to shut a panel must not depend on how wide the panel
+    // is.
+    expect(group(PANE_HEADER_ACTIONS_SLOT).querySelectorAll("button")).toHaveLength(1);
+    expect(group(PANE_HEADER_FRAME_SLOT).querySelectorAll("button")).toHaveLength(2);
+    // Never squeezed, unlike group 3's node form: these two controls are the
+    // only way out of the surface, and a clipped close button is worse than
+    // one fewer verb.
+    expect(group(PANE_HEADER_FRAME_SLOT)).toHaveClass("shrink-0");
+    expect(group(PANE_HEADER_FRAME_SLOT)).not.toHaveClass("flex-1");
+  });
+
+  it("renders no fourth group for a host that is not a frame", () => {
+    // Three of the four hosts that mount the note editor's header — the notes
+    // pane, a capture window, the prewarmed draft — hold it in nothing that
+    // folds or closes. An empty reserved box there would be 8px of gap held
+    // for controls that do not exist, which is the same mistake group 2
+    // already refuses.
+    render(
+      <PaneHeader
+        identity={<span>a note</span>}
+        status={{ sizers: [SHORT], caption: SHORT }}
+        actions={<button type="button">Attachments</button>}
+      />,
+    );
+
+    expect(headerRow().children).toHaveLength(3);
+    expect(headerRow().querySelector(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`)).toBeNull();
   });
 });

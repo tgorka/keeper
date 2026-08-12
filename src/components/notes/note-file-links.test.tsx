@@ -230,7 +230,11 @@ async function pressShowInFiles(): Promise<void> {
  */
 async function showInFilesIsNotOffered(): Promise<void> {
   const menu = await openNoteActions();
-  expect(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+  // `Properties` is a `menuitemcheckbox` since Story 49 — it opens a panel and
+  // says so — but it is still the unconditional sibling this proves the menu by.
+  expect(
+    within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }),
+  ).toBeInTheDocument();
   expect(within(menu).queryByRole("menuitem", { name: SHOW_IN_FILES_LABEL })).toBeNull();
 }
 

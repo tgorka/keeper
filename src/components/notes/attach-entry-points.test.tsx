@@ -268,11 +268,13 @@ async function openNoteActions(): Promise<HTMLElement> {
 async function throughThePanel(): Promise<string> {
   await mountEditor();
   // Story 46.5: the panel's own control is a menu item now — the 560px capture
-  // window could not hold six header buttons. `menuitem` and not a bare name
-  // query, because `ATTACHMENTS_LABEL` is also the panel section's accessible
-  // name and a name query would happily resolve to the thing being opened.
+  // window could not hold six header buttons — and a `menuitemcheckbox` since
+  // Story 49, because it discloses a panel and now says whether it is open.
+  // By role and not a bare name query, because `ATTACHMENTS_LABEL` is also the
+  // panel section's accessible name and a name query would happily resolve to
+  // the thing being opened.
   const menu = await openNoteActions();
-  fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACHMENTS_LABEL }));
+  fireEvent.click(within(menu).getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }));
   const insert = await screen.findByRole("button", { name: `Insert ${RELATIVE}` });
   // A real button takes focus on the way down, off the editor, which fires the
   // blur save — the moment the caret could be lost.

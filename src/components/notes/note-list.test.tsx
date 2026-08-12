@@ -1,9 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { NOTE_ROW_HEIGHT, NoteList } from "@/components/notes/note-list";
-import { NOTE_MORE_TAGS_LABEL, NOTE_ORDER_UNREADABLE_MARK } from "@/components/notes/note-row";
+import {
+  NOTE_MORE_TAGS_LABEL,
+  NOTE_ORDER_UNREADABLE_MARK,
+  NOTE_ROW_PIN_LABEL,
+  NOTE_ROW_REVEAL_LABEL,
+} from "@/components/notes/note-row";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { type ListGeometry, withListGeometry } from "@/test/layout";
 
 /**
@@ -198,6 +204,52 @@ describe("NoteList affordances", () => {
 
     fireEvent.keyDown(list, { key: "Enter" });
     expect(onSelect).toHaveBeenCalledWith(UNREAD);
+  });
+});
+
+/**
+ * The row's context menu, from the list's side: the wiring, not the menu.
+ *
+ * `note-row.test.tsx` asserts what the menu offers and that each item acts. What
+ * can only be checked here is that the list hands the row the two things the
+ * menu needs — the verb dispatcher its own keys already use, and the answer to
+ * "does this platform have a file manager" — because a menu built correctly and
+ * wired to a row the list never fed would pass every assertion in that file and
+ * do nothing in the app.
+ */
+describe("NoteList — the row's menu is the list's verbs", () => {
+  afterEach(() => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+  });
+
+  it("dispatches a menu item through the same handler its keys use", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true, revealInFileManager: true });
+    const onVerb = renderList([PLAIN, UNREAD]);
+    const rowButton = screen.getByRole("button", { name: /Note, Plain/ });
+
+    fireEvent.contextMenu(rowButton);
+    fireEvent.click(await screen.findByRole("menuitem", { name: NOTE_ROW_PIN_LABEL }));
+
+    // The same `(row, verb)` pair `p` on the focused row sends — one handler,
+    // so the pointer and the keyboard cannot drift apart.
+    expect(onVerb).toHaveBeenCalledWith(PLAIN, "p");
+    fireEvent.keyDown(rowButton, { key: "ArrowDown" });
+    fireEvent.keyDown(rowButton, { key: "p" });
+    expect(onVerb).toHaveBeenLastCalledWith(PLAIN, "p");
+  });
+
+  it("keeps Reveal out of the menu where the platform has no file manager", async () => {
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true, revealInFileManager: false });
+    renderList([PLAIN]);
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Note, Plain/ }));
+    // The menu is open — this is the gate, not a menu that failed to appear.
+    expect(await screen.findByRole("menuitem", { name: NOTE_ROW_PIN_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: NOTE_ROW_REVEAL_LABEL })).toBeNull();
   });
 });
 

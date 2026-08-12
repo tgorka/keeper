@@ -216,7 +216,11 @@ export function TextFileFrame({
     <div className="flex h-full min-h-0 flex-col">
       {savable ? (
         <PaneHeader
-          className="border-b px-3 py-1.5"
+          // Horizontal padding only. The bottom edge and the 40px height are
+          // `PaneHeader`'s now; this used to spell `border-b` (a second edge
+          // under the component's) and `py-1.5` (a 44px row where the other
+          // two callers were 40).
+          className="px-3"
           // The file's own name, which nothing inside this frame renders — the
           // panel's header names it too, and the note embed that mounts this has
           // no header at all, so this is the one identity both hosts can rely on.

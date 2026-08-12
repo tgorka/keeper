@@ -32,6 +32,11 @@
  * destructive verb that behaved differently here would be the exact failure the
  * paragraph above refuses, in the one place it costs a note.
  *
+ * Every one of those keys is now also a named item in the row's own context
+ * menu (see `note-row.tsx`), and both routes call the same `onVerb` — so a
+ * pointer and a keystroke cannot come to do different things, and the menu
+ * introduces no verb the list could not already reach from the keyboard.
+ *
  * The roving cursor is keyed by note id rather than index (the chat list's rule,
  * and for the same reason): a streamed re-order or a filter change must move the
  * row, never the cursor. Rendered rows are held by id too, and not by index: a
@@ -39,9 +44,10 @@
  * the element that used to be there.
  */
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { NoteRow } from "@/components/notes/note-row";
+import { NoteRow, type NoteRowVerb } from "@/components/notes/note-row";
 import { useWindowedRows } from "@/components/ui/window-list";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 
 /** The row height the window paces by; matches chat-row density, and matches
  * `h-16` on the row itself. */
@@ -87,10 +93,15 @@ export function NoteList({
    * the Files pane's rule (Story 45.3) and the reason a stray keystroke in a
    * list cannot lose a note.
    */
-  onVerb: (row: NoteRowVm, verb: "e" | "p" | "u" | "r" | "d") => void;
+  onVerb: (row: NoteRowVm, verb: NoteRowVerb) => void;
   /** Ask for a wider window; called as the viewport nears the last row. */
   onGrow: () => void;
 }) {
+  // Read once for the whole list rather than once per mounted row, which is
+  // where the Files pane and the recordings browser read it too — the row's
+  // menu leaves Reveal out on a platform with no file manager, because an
+  // affordance that fails on activation is worse than an absent one.
+  const canReveal = useCapabilitiesStore((state) => state.capabilities.revealInFileManager);
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
 
   // The roving keyboard cursor, kept apart from the open note on purpose: `↓`
@@ -224,9 +235,11 @@ export function NoteList({
                 row={row}
                 selected={row.id === selectedId}
                 tabIndex={tabStop === item.index ? 0 : -1}
+                canReveal={canReveal}
                 onSelect={onSelect}
                 onSelectBeside={onSelectBeside}
                 onToggleTag={onToggleTag}
+                onVerb={onVerb}
               />
             </li>
           );

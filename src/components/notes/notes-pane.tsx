@@ -502,9 +502,11 @@ export function NotesPane() {
     <div className="flex min-h-0 flex-1">
       {/* Pane 1 — the scope column (Story 48.1: it folds, and it resizes). */}
       <nav
-        aria-label="Notes"
+        // No `aria-label` here: the column's own chrome draws the visible name
+        // and `rootProps` points this region's `aria-labelledby` at it, so the
+        // region and the heading a reader hears are one string (Story 48.3).
         {...rail.rootProps}
-        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-sidebar"
+        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-sidebar last:border-r-0"
       >
         {rail.chrome}
         {!rail.folded && (
@@ -551,7 +553,7 @@ export function NotesPane() {
       <div
         onKeyDown={onColumnKeyDown}
         {...list.rootProps}
-        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-background"
+        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-background last:border-r-0"
       >
         {list.chrome}
         {!list.folded && (

@@ -123,6 +123,15 @@
   --muted: #eceae2;
   --muted-foreground: #5c655e;
   --faint: #7a817b;
+  /* `--accent` IS NOT the lichen accent. It is shadcn's name for the HOVER
+     SURFACE, and it is deliberately identical to `--secondary` here because
+     hovering a thing and raising a thing are the same gesture in this room.
+     DESIGN.md's "accent" — the green — is `--primary`.
+
+     The collision is shadcn's contract, not a choice: 26 call sites and several
+     vendored primitives spell `bg-accent`, so renaming it would fight the
+     framework for a word. It is written down here instead, because the trap is
+     real: read `bg-accent` on the active nav row and you expect green. */
   --accent: #e3e0d6;
   --accent-foreground: #1a1f1c;
   --destructive: #a8322b;

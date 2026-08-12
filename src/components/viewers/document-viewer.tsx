@@ -342,7 +342,7 @@ function SheetGrid({ sheet }: { sheet: SheetVm }) {
                 <span
                   // biome-ignore lint/suspicious/noArrayIndexKey: reason above — the position within one windowed row IS the identity
                   key={`${windowed.key}-${column}`}
-                  className="w-32 shrink-0 truncate border-r px-2 py-1 text-sm"
+                  className="w-32 shrink-0 truncate border-r px-2 py-1 text-sm last:border-r-0"
                 >
                   {row[column] ?? ""}
                 </span>
@@ -380,10 +380,16 @@ function SheetsBody({ sheets }: { sheets: readonly SheetVm[] }) {
               aria-selected={candidate === sheet}
               data-testid={DOCUMENT_SHEET_TAB_TESTID}
               onClick={() => setActive(index)}
-              className={`shrink-0 px-3 py-1.5 text-sm ${
+              // The strip below owns the seam (DESIGN.md → Elevation & Depth);
+              // an active tab LIGHTS that pixel rather than drawing a second
+              // edge under it. `border-b-2` here stacked a 2px tab edge on the
+              // strip's own 1px hairline — three pixels of line under one tab
+              // and one under the rest. The overlay is `TabsList`'s line
+              // variant, which is how every other tab in the app marks itself.
+              className={`relative shrink-0 px-3 py-1.5 text-sm after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 ${
                 candidate === sheet
-                  ? "border-primary border-b-2 font-medium"
-                  : "text-muted-foreground"
+                  ? "font-medium after:bg-primary"
+                  : "text-muted-foreground after:bg-transparent"
               }`}
             >
               {candidate.name}

@@ -50,9 +50,19 @@
  * Content only. The three wrappers, their classes and their order are this
  * component's, because they *are* the fix — a caller that could pass a class
  * into the status slot could pass `flex-1` into it, and the jump would be back
- * with the shape intact. The outer `<header>`'s own padding and border differ
- * per surface (a panel header is not a note header) and that is the one class
- * hook: {@link PaneHeaderProps.className}.
+ * with the shape intact.
+ *
+ * **The row's height and its bottom edge are this component's too**, and they
+ * were not before. `DESIGN.md` → Elevation & Depth: a seam has exactly one
+ * owner, and the earlier sibling owns its trailing edge. A header that owned no
+ * edge pushed the decision onto its callers, and three callers duly spelled it
+ * three ways — two `border-b`s, one `border-border border-b`, and heights of
+ * 40px, 40px and 44px against a `pane-header.height` of 40px that all three
+ * were nominally implementing. `h-10` and `border-b` live here now, so the one
+ * class hook — {@link PaneHeaderProps.className} — is HORIZONTAL padding and
+ * whatever a surface needs beyond the row itself. A caller that still spells a
+ * `py-*` is spelling nothing: the row's height is fixed and its members are
+ * centred in it.
  *
  * {@link PaneHeaderProps.status} is nullable rather than always present. A
  * header with nothing to report renders two groups, not an empty reserved box:
@@ -69,6 +79,37 @@
  * lives here because only the row knows what the two groups before it have
  * taken, and the deciding lives there because only the surface knows which of
  * its verbs matters most.
+ *
+ * # The fourth group, which is not the surface's (Story 50.1)
+ *
+ * A note open in a panel used to be TWO header rows: the panel's, which said
+ * `Note` and carried the fold and the close, and the editor's underneath it,
+ * which said which note and carried everything a note can do. The owner asked
+ * for one, and he is right — `Note` is a word the note's own title already
+ * says better, and it cost a whole 40px band and a seam to say it.
+ *
+ * Merging them puts a member in the row that does NOT belong to the surface
+ * drawing it: fold and close act on the panel, not on the note. That is the
+ * whole reason it is a group of its own rather than two more entries in group
+ * 3. `PriorityActions` may demote any of its candidates into a `⋯` menu, and
+ * the note's menu is the wrong place to look for the way to shut the panel —
+ * a control that acts on the frame must be in the frame's hands at every
+ * width. So {@link PaneHeaderProps.frame} is last, `shrink-0`, and never
+ * anything's overflow.
+ *
+ * **Outside group 3, inside the arithmetic.** Its pixels are subtracted from
+ * the budget exactly as the status slot's are, or the merge would hand the
+ * actions group a row that is 80px shorter than it was told and push the last
+ * verb off the edge — 46.5's defect, reintroduced by a layout change. Unlike
+ * the status slot it is also OBSERVED rather than read once per resize: its
+ * width is not a constant, because `closable` is false for the last panel and
+ * becomes true the moment a second one opens, and that happens without the
+ * row changing size.
+ *
+ * On the right, and not the left. This header is mounted in four hosts and
+ * only one of them has a frame; a group in front of identity would put the
+ * note's title at a different x in a panel than in the notes pane, for a
+ * reason the reader cannot see.
  */
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
@@ -81,6 +122,10 @@ export const PANE_HEADER_STATUS_SLOT = "pane-header-status";
 
 /** The controls, last, and the only group allowed to be squeezed. */
 export const PANE_HEADER_ACTIONS_SLOT = "pane-header-actions";
+
+/** The controls that belong to whatever FRAME holds this surface rather than
+ *  to the surface itself. Last, never squeezed, never anything's overflow. */
+export const PANE_HEADER_FRAME_SLOT = "pane-header-frame";
 
 /**
  * The gap between two adjacent members of the row, in pixels.
@@ -105,31 +150,44 @@ export const PANE_HEADER_GAP_PX = 8;
 export const PANE_HEADER_IDENTITY_MIN_PX = 160;
 
 /**
- * Pixels group 3 may occupy: the row, less what the groups before it are owed,
- * less the gaps between them.
+ * Pixels group 3 may occupy: the row, less what every other group in it is
+ * owed, less the gaps between them.
  *
  * Pure, because it is the half of the measurement with a decision in it.
  * `header` is the row's CONTENT width — its padding already gone, which is
- * what a `ResizeObserver` entry reports — and `status` is the reserved slot's
- * whole box, or null for a row that has no status group and therefore no gap
- * for one either. Never negative: "no room" is a smaller and truer claim than
- * "minus forty pixels of room".
+ * what a `ResizeObserver` entry reports. `status` is the reserved slot's whole
+ * box and `frame` the frame group's, each null for a row that does not have
+ * that group and therefore has no gap for it either. A width that is not a
+ * finite number is a measurement that has not happened, so it costs nothing at
+ * all — while a group measured at exactly 0 still costs its seam, because the
+ * slot IS in the row. Never negative: "no room"
+ *
+ * `frame` is defaulted and `status` is not, and the asymmetry is deliberate:
+ * every caller has to decide whether it reports a status, whereas a surface
+ * only has a frame group when something ELSE put one there — three of the four
+ * hosts that mount this header cannot have one at all.
  */
 export function paneHeaderActionsBudget({
   header,
   status,
+  frame = null,
   identityMin = PANE_HEADER_IDENTITY_MIN_PX,
   gap = PANE_HEADER_GAP_PX,
 }: {
   header: number;
   status: number | null;
+  frame?: number | null;
   identityMin?: number;
   gap?: number;
 }): number {
   if (!Number.isFinite(header)) {
     return 0;
   }
-  const owed = identityMin + gap + (status === null || !Number.isFinite(status) ? 0 : status + gap);
+  const owed =
+    identityMin +
+    gap +
+    (status === null || !Number.isFinite(status) ? 0 : status + gap) +
+    (frame === null || !Number.isFinite(frame) ? 0 : frame + gap);
   return Math.max(0, header - owed);
 }
 
@@ -173,7 +231,20 @@ export interface PaneHeaderProps {
    * control. The node form keeps 46.4's behaviour exactly.
    */
   actions: ReactNode | ((budget: number) => ReactNode);
-  /** The header element's own padding and border, which differ per surface. */
+  /**
+   * The controls belonging to whatever holds this surface — a panel's fold and
+   * its close — or absent, for a host that is not a frame.
+   *
+   * Last in the row and `shrink-0`, and deliberately not folded into
+   * {@link actions}: group 3 may demote any of its members into a `⋯` menu,
+   * and the surface's menu is the wrong place to keep the way out of the
+   * surface. Its measured width IS charged against group 3's budget — see the
+   * module doc for why outside-the-group and outside-the-arithmetic are two
+   * different things.
+   */
+  frame?: ReactNode;
+  /** The header element's own HORIZONTAL padding, which differs per surface.
+   *  Its height and its bottom edge are the component's — see the module doc. */
   className?: string;
 }
 
@@ -181,12 +252,19 @@ export function PaneHeader({
   identity,
   status = null,
   actions,
+  frame = null,
   className,
 }: PaneHeaderProps): React.ReactElement {
   const rowRef = useRef<HTMLElement>(null);
   const statusRef = useRef<HTMLSpanElement>(null);
+  const frameRef = useRef<HTMLDivElement>(null);
   const managed = typeof actions === "function";
   const [budget, setBudget] = useState(0);
+  // Whether there IS a fourth group, rather than what is in it. The effect
+  // below re-runs on this and not on `frame` itself: a host composes that node
+  // fresh every render, so depending on it would tear the observer down and
+  // build it again on every keystroke that changes the title.
+  const framed = frame !== null;
 
   // Zero until the row has been observed, and that is the safe direction: a
   // group with no budget renders the 560px shape, so the worst a missing
@@ -199,27 +277,51 @@ export function PaneHeader({
     if (!managed || row === null || typeof ResizeObserver === "undefined") {
       return;
     }
+    // The row's own last-known width, kept here because the observer now
+    // watches two elements and only one of them is the row: an entry for the
+    // frame group carries the FRAME's rect, and reading the header's width off
+    // whichever entry arrived last is how a 32px close button would come to be
+    // mistaken for the whole header.
+    let header = Number.NaN;
     const observer = new ResizeObserver((entries) => {
-      const entry = entries[entries.length - 1];
-      if (entry === undefined) {
-        return;
+      for (const entry of entries) {
+        if (entry.target === row) {
+          header = entry.contentRect.width;
+        }
       }
       // The status group is read from the DOM rather than observed: its width
       // is a constant by construction (that is what group 2 IS), so the only
-      // moment it can change is one where the row changed too.
+      // moment it can change is one where the row changed too. The frame group
+      // is NOT a constant — the last panel has no close control and gains one
+      // when a second panel opens, without the row changing size — so it is
+      // observed, and its rect is still read from the DOM here so both paths
+      // through this callback compute the budget from one expression.
       setBudget(
         paneHeaderActionsBudget({
-          header: entry.contentRect.width,
+          header,
           status: statusRef.current?.getBoundingClientRect().width ?? null,
+          frame: frameRef.current?.getBoundingClientRect().width ?? null,
         }),
       );
     });
     observer.observe(row);
+    const frameBox = framed ? frameRef.current : null;
+    if (frameBox !== null) {
+      observer.observe(frameBox);
+    }
     return () => observer.disconnect();
-  }, [managed]);
+  }, [managed, framed]);
 
   return (
-    <header ref={rowRef} className={cn("flex shrink-0 items-center gap-2", className)}>
+    <header
+      ref={rowRef}
+      // `h-10` is DESIGN.md's `pane-header.height`, measured the way the seam
+      // makes it real: 40px INCLUDING the hairline, because the hairline is the
+      // header's and not the next band's. `items-center` then centres a 32px
+      // control in what is left, which is what the three callers' `py-1`s and
+      // `py-1.5`s were each guessing at separately.
+      className={cn("flex h-10 shrink-0 items-center gap-2 border-border border-b", className)}
+    >
       {/* Group 1 — identity. `flex-1` off a zero basis: its width is whatever
           the row has left over, and it contributes nothing to the row's own
           content width. */}
@@ -263,6 +365,19 @@ export function PaneHeader({
       >
         {typeof actions === "function" ? actions(budget) : actions}
       </div>
+      {framed ? (
+        /* Group 4 — the frame's own controls. `shrink-0`, last, and outside
+           group 3 in every sense but the arithmetic: nothing here is ever
+           demoted into the surface's menu, because the way to shut a panel
+           must not be somewhere that depends on how wide the panel is. */
+        <div
+          ref={frameRef}
+          data-slot={PANE_HEADER_FRAME_SLOT}
+          className="flex shrink-0 items-center gap-2"
+        >
+          {frame}
+        </div>
+      ) : null}
     </header>
   );
 }
