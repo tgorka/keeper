@@ -120,6 +120,46 @@ const isScrim = (line) => /fixed\s+inset-0/.test(line) && /\bz-\d+/.test(line);
  */
 const EMOJI_IS_CONTENT = /(^|\/)(lib\/emoji\/|.*reaction-)/;
 
+/**
+ * A trailing vertical edge, and the cancel that keeps it off the window frame.
+ *
+ * `DESIGN.md` → Elevation & Depth: the earlier sibling owns its trailing edge
+ * and the LAST child cancels, because an edge with nothing beyond it is a line
+ * against the window. Every full-width pane in this app drew one; exactly one
+ * file had noticed, and its `last:border-r-0` is the spelling copied here.
+ *
+ * A variant-prefixed edge is exempt — `data-[side=left]:border-r` in a Sheet is
+ * already conditional, which is what the cancel is for. Hence the lookbehind:
+ * the token must not be preceded by a `:` or by more class characters, so
+ * `border-r-0`, `border-r-2` and `hover:border-r` are all left alone.
+ */
+const DRAWS_RIGHT_EDGE = /(?<![\w:-])border-r(?![-\w])/;
+const CANCELS_RIGHT_EDGE = /\blast:border-r-0\b/;
+
+/**
+ * Components that own an edge of their own, and what a caller may not spell
+ * back at them.
+ *
+ * `PaneHeader` owned no edge and no height until this rule's story, so each of
+ * its three callers spelled its own: two `border-b`s and one
+ * `border-border border-b`, over heights of 40px, 40px and 44px, all three
+ * nominally implementing the same `pane-header.height: 40px`. A boundary is a
+ * property of the thing that owns it; a caller that draws it again draws it
+ * twice.
+ *
+ * Only the props before the first NESTED element are inspected: past that the
+ * lines belong to a slot's own content, whose padding and height are its own
+ * business. A caller composing its class through `cn()` is not inspected
+ * either — see the note on this rule's limits at the call site.
+ */
+const EDGE_OWNERS = [
+  {
+    tag: "PaneHeader",
+    forbidden: /\b(?:border-b|border-y|py-[\d.]+|h-\d+)\b/,
+    owns: "its own bottom edge and its 40px height",
+  },
+];
+
 function checkSource(file) {
   const raw = readFileSync(file, "utf8");
   const clean = stripNoise(raw);
@@ -233,6 +273,72 @@ function checkSource(file) {
             `text-[${m[1]}px] is an arbitrary size — name it or use a step`,
           );
         }
+      }
+    }
+
+    // 7. Seams. `DESIGN.md` → Elevation & Depth: a seam has exactly one owner,
+    //    the earlier sibling owns its trailing edge, and the last child
+    //    cancels. Drawn by BOTH neighbours a seam is 2px; drawn by NEITHER it
+    //    disappears. Both halves shipped, which is why this is a rule and not
+    //    a paragraph.
+    //
+    //    WHAT THIS CANNOT SEE, stated here rather than discovered later: it
+    //    cannot tell whether two ADJACENT elements both draw the shared seam,
+    //    because adjacency is a runtime tree fact assembled somewhere else —
+    //    which pane is last in `app-shell` is a `primaryView` branch, and a
+    //    column's neighbour is a hook's return value in a third file. So the
+    //    genuinely double-drawn seam is caught by the two halves that ARE
+    //    local: an edge nobody cancels, and a component's edge re-spelled by
+    //    its caller. The third case a reviewer still has to look for is two
+    //    different files drawing the two sides of one boundary.
+
+    //    (a) An edge with nothing beyond it. `last:border-r-0` costs exactly
+    //        nothing when there IS a neighbour, so it is required rather than
+    //        suggested — that way a pane that gains a right-hand neighbour
+    //        later (the Files tree did, when the panel strip arrived) grows
+    //        its seam automatically instead of having carried a line against
+    //        the window in the meantime.
+    //
+    //        Deliberately NOT extended to `border-b`. A bottom edge at the end
+    //        of a scrolling column is a hairline against content, not against
+    //        the window frame, and most of this app's 60 `border-b`s really
+    //        are mid-stack bands — a rule that flagged them all would be
+    //        wrong far more often than right, and a gate that cries wolf is a
+    //        gate people learn to skip.
+    if (DRAWS_RIGHT_EDGE.test(line) && !CANCELS_RIGHT_EDGE.test(line)) {
+      report(
+        file,
+        n,
+        "seam-uncancelled",
+        "border-r with no `last:border-r-0` — the last child cancels, or the edge is a line against the window",
+      );
+    }
+
+    //    (b) A component's own edge, spelled again by its caller.
+    for (const owner of EDGE_OWNERS) {
+      if (!new RegExp(`<${owner.tag}\\b`).test(line)) {
+        continue;
+      }
+      for (let ahead = i + 1; ahead < Math.min(i + 12, lines.length); ahead += 1) {
+        const prop = lines[ahead];
+        // The first nested element ends the props this rule owns.
+        if (/<[A-Za-z]/.test(prop)) {
+          break;
+        }
+        const passed = /className="([^"]*)"/.exec(prop);
+        if (passed === null) {
+          continue;
+        }
+        const offence = owner.forbidden.exec(passed[1]);
+        if (offence !== null) {
+          report(
+            file,
+            ahead + 1,
+            "seam-doubled",
+            `${owner.tag} owns ${owner.owns}; \`${offence[0]}\` here states it a second time — pass horizontal padding only`,
+          );
+        }
+        break;
       }
     }
   });
