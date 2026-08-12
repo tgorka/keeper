@@ -53,6 +53,7 @@ import {
   FILES_OPEN_BESIDE_LABEL,
   FILES_OPEN_HERE_LABEL,
   FILES_OPEN_LABEL,
+  FILES_PANE_SUBTITLE,
   FILES_PANE_TITLE,
   FILES_REFRESH_LABEL,
   FILES_REVEAL_LABEL,
@@ -67,6 +68,7 @@ import {
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
   filesRowActionsBudget,
+  filesSelectionSentence,
 } from "@/components/layout/files-pane";
 import {
   COLUMN_COLLAPSE_PREFIX,
@@ -2059,7 +2061,9 @@ describe("FilesPane — the write path", () => {
       fireEvent.click(screen.getByRole("treeitem", { name: "c.md" }), { metaKey: true });
       await Promise.resolve();
     });
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("2 items selected");
+    // The chip draws the figure and announces the sentence — see the header's
+    // own test below. Asserted by role and name here, not by text content.
+    expect(screen.getByRole("status", { name: "2 items selected" })).toHaveTextContent("2");
     // The middle row was NOT taken: Cmd adds one, it does not fill the gap.
     expect(screen.getByRole("treeitem", { name: "b.md" })).toHaveAttribute(
       "aria-selected",
@@ -2073,7 +2077,7 @@ describe("FilesPane — the write path", () => {
     });
     // Shift fills it, because a run is what a person sees between two rows.
     expect(screen.getByRole("treeitem", { name: "b.md" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("3 items selected");
+    expect(screen.getByRole("status", { name: "3 items selected" })).toHaveTextContent("3");
   });
 
   it("treats Ctrl-click as Cmd-click, because one of them is the wrong platform", async () => {
@@ -2088,7 +2092,7 @@ describe("FilesPane — the write path", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("2 items selected");
+    expect(screen.getByRole("status", { name: "2 items selected" })).toHaveTextContent("2");
   });
 
   it("counts the selection into the delete request and shows Rust's counted question", async () => {
@@ -2860,7 +2864,7 @@ describe("FilesPane — the tree is a column", () => {
     render(<FilesPane />);
     await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
     await click(await screen.findByRole("treeitem", { name: "a.md" }));
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+    expect(screen.getByRole("status", { name: "1 item selected" })).toHaveTextContent("1");
 
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
 
@@ -2870,7 +2874,7 @@ describe("FilesPane — the tree is a column", () => {
     // the count that makes deleting safe to press is in the header.
     await click(held);
     expect(screen.getByRole("button", { name: FILES_DELETE_LABEL })).toBeInTheDocument();
-    expect(screen.getByTestId(FILES_SELECTED_TESTID)).toHaveTextContent("1 item selected");
+    expect(screen.getByRole("status", { name: "1 item selected" })).toHaveTextContent("1");
   });
 
   it("offers no selection control when nothing is selected", async () => {
@@ -2881,5 +2885,124 @@ describe("FilesPane — the tree is a column", () => {
     await click(screen.getByRole("button", { name: `${COLUMN_COLLAPSE_PREFIX} ${label}` }));
 
     expect(screen.queryByRole("button", { name: new RegExp(FILES_SELECTION_LABEL) })).toBeNull();
+  });
+});
+
+/**
+ * The header the owner photographed against 0.8.6.
+ *
+ * The sentence under the fold row came out ONE WORD PER LINE down the pane
+ * while `1 item selected`, `Delete`, `Attach to note` and `Refresh` sat beside
+ * it on one row at full width. Every control was `shrink-0`, so the prose was
+ * the only flex child that could give ground and the layout gave it exactly its
+ * min-content width — the longest word in it. The same defect the file rows had
+ * one level down, from the same cause.
+ *
+ * **None of this measures a reflow, and it is not trying to.** jsdom performs
+ * no layout — the reason `priority-actions` keeps its policy a pure function —
+ * so what these assert is the STRUCTURE that made the squeeze reachable and no
+ * longer does: every control is inside one row, the prose is not in it, and the
+ * verbs answer to their words with the words off the surface. A layout test
+ * here would be a test of `src/test/setup.ts`'s viewport shim.
+ */
+describe("FilesPane — the header the prose has to fit in", () => {
+  beforeEach(() => {
+    // Attach needs a vault open before it is offered at all — see the attach
+    // suite above. Every header control has to be on screen for these.
+    notesAttachTargets.mockResolvedValue([
+      { id: "n1", title: "Standup", path: "notes/standup.md", holds: [] },
+    ]);
+    notesVaultsStore.setState({ activeVaultId: "v1" });
+  });
+
+  afterEach(() => {
+    notesVaultsStore.setState({ activeVaultId: null });
+  });
+
+  /** One vault, one writable file selected: the fullest the header ever gets. */
+  async function headerWithOneSelected(): Promise<HTMLElement> {
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [entry("a.md", "file")]));
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await click(await screen.findByRole("treeitem", { name: "a.md" }));
+    const header = screen.getByText(FILES_PANE_SUBTITLE).closest("header");
+    if (header === null) {
+      throw new Error("the subtitle is not in a header");
+    }
+    return header;
+  }
+
+  it("puts every control in one row and leaves the sentence out of it", async () => {
+    const header = await headerWithOneSelected();
+    const prose = screen.getByText(FILES_PANE_SUBTITLE);
+    const actions = header.firstElementChild;
+
+    // The prose is the header's own child, beside the action row rather than
+    // inside it. This is the assertion that fails if the two are ever put back
+    // on one line: there, `prose.parentElement` would be `actions`.
+    expect(prose.parentElement).toBe(header);
+    expect(actions).not.toBe(prose);
+    expect(actions?.contains(prose)).toBe(false);
+
+    // And every control really is in that row, so there is nothing left beside
+    // the sentence to hold its width against it.
+    const controls = within(header).getAllByRole("button");
+    expect(controls.length).toBeGreaterThan(0);
+    for (const control of controls) {
+      expect(actions?.contains(control)).toBe(true);
+    }
+  });
+
+  it("draws each verb as a glyph that still answers to its word", async () => {
+    const header = await headerWithOneSelected();
+
+    for (const word of [FILES_DELETE_LABEL, ATTACH_TO_NOTE_LABEL, FILES_REFRESH_LABEL]) {
+      // By role and name, which is the whole promise of taking the word off:
+      // speech input can still ask for what the eye reads as a picture.
+      const control = within(header).getByRole("button", { name: word });
+      expect(control).toHaveAttribute("title", word);
+      // Nothing written on it, and one silent glyph inside it.
+      expect(control.textContent).toBe("");
+      const glyph = control.querySelector("svg");
+      expect(glyph).not.toBeNull();
+      expect(glyph).toHaveAttribute("aria-hidden", "true");
+    }
+
+    // Delete is the one verb here that cannot be undone, and it still says so
+    // without its word: `destructive` is a red label and a red hairline.
+    expect(within(header).getByRole("button", { name: FILES_DELETE_LABEL })).toHaveAttribute(
+      "data-variant",
+      "destructive",
+    );
+  });
+
+  it("counts the selection into a chip that draws the figure and names what it counts", async () => {
+    const header = await headerWithOneSelected();
+
+    const chip = within(header).getByRole("status", { name: filesSelectionSentence(1) });
+    // The figure is what is drawn; the sentence is what is announced and what a
+    // pointer gets. `1 item selected` as running text is what would not fit.
+    expect(chip).toHaveTextContent("1");
+    expect(chip).toHaveAttribute("title", filesSelectionSentence(1));
+    expect(chip).toHaveAttribute("data-slot", "badge");
+  });
+
+  it("spends the same Refresh glyph open as the rail does folded", async () => {
+    const header = await headerWithOneSelected();
+    const lucide = (button: HTMLElement): string | undefined => {
+      const svg = button.querySelector("svg");
+      return [...(svg?.classList ?? [])].find((name) => name.startsWith("lucide-"));
+    };
+    const open = lucide(within(header).getByRole("button", { name: FILES_REFRESH_LABEL }));
+
+    await click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["files-tree"].label}`,
+      }),
+    );
+
+    expect(open).toBe("lucide-refresh-cw");
+    expect(lucide(screen.getByRole("button", { name: FILES_REFRESH_LABEL }))).toBe(open);
   });
 });

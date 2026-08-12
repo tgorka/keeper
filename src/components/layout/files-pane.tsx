@@ -97,7 +97,9 @@ import {
   FolderSearch,
   ListChecks,
   NotebookPen,
+  Paperclip,
   RefreshCw,
+  Trash2,
 } from "lucide-react";
 import type {
   KeyboardEvent as ReactKeyboardEvent,
@@ -121,6 +123,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -218,6 +221,23 @@ export const FILES_REFRESH_LABEL = "Refresh";
  * header's, where the count that makes them safe to press is.
  */
 export const FILES_SELECTION_LABEL = "Selection";
+
+/**
+ * How many rows are held, said the same way wherever it is said.
+ *
+ * Two surfaces spell this: the header's count badge, and the folded rail's way
+ * back to the selection. They answer about different subsets on purpose — the
+ * rail names every selected row, the badge names the ones keeper may delete —
+ * so the number differs and the sentence must not. It was written out twice,
+ * which is one place too many for a string a test asserts by name.
+ *
+ * The sentence and not a numeral, because this is the accessible name in both
+ * places. The badge draws the figure; a reader who cannot see it is told what
+ * the figure counts.
+ */
+export function filesSelectionSentence(count: number): string {
+  return `${countLabel(count, ITEMS)} selected`;
+}
 
 /** What a folder with nothing in it says. The one place "empty" is the truth. */
 export const FILES_EMPTY_FOLDER_SENTENCE = "This folder is empty.";
@@ -1219,7 +1239,7 @@ export function FilesPane() {
               id: "selection",
               icon: ListChecks,
               label: FILES_SELECTION_LABEL,
-              detail: `${countLabel(selection.length, ITEMS)} selected`,
+              detail: filesSelectionSentence(selection.length),
               count: selection.length,
               onSelect: () => columnFoldStore.getState().toggleColumn("files-tree"),
             },
@@ -2065,12 +2085,32 @@ export function FilesPane() {
         {/* The heading used to sit here, over the sentence. It is one row up
             now: every foldable surface names itself in its fold row (Story
             48.3), and this pane was the only one that already had a name to
-            move. What is left is the sentence and the selection's actions. */}
-        <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
-          <div className="min-w-0">
-            <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
+            move. What is left is the sentence and the selection's actions.
+
+            **STACKED, and that is the whole repair.** The sentence and the
+            action cluster used to be siblings in one `justify-between` row in
+            which every control was `shrink-0`. The prose was therefore the only
+            child that could give ground, so the flex algorithm gave it exactly
+            its min-content width — the longest single word — and the owner
+            photographed a paragraph running ONE WORD PER LINE down the pane
+            while the buttons beside it kept their full width. It is the same
+            defect the file rows had one level down, from the same cause.
+
+            A paragraph that can only be read a word at a time is not a smaller
+            version of itself, so the fix is not a better squeeze: it is to stop
+            asking the prose to share a line. The actions take a row of their
+            own and the sentence takes the column's full width, at EVERY width.
+            One shape, no measured breakpoint, no `ResizeObserver` — nothing
+            here can reflow differently on a machine whose font disagrees, and
+            nothing moves as the seam is dragged.
+
+            The action row's floor is arithmetic a reader can check: three 32px
+            squares and two 8px gaps is 112px, the count badge is a figure in a
+            chip, and the narrowest this column may be is 220px less the 48px
+            `px-6` spends — 172. The prose below wraps into whatever is left,
+            which is what a paragraph is for. */}
+        <header className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-4">
+          <div className="flex items-center justify-end gap-2">
             {/* Delete acts on the SELECTION, which is why the count lives here
               rather than a Delete button living on every row (Story 45.3).
               A per-row button cannot answer "and the other four", and the
@@ -2081,16 +2121,42 @@ export function FilesPane() {
               rows already carries its own reason. */}
             {deletable.length > 0 && (
               <>
-                <span data-testid={FILES_SELECTED_TESTID} className="text-muted-foreground text-xs">
-                  {`${countLabel(deletable.length, ITEMS)} selected`}
-                </span>
+                {/* A COUNT, not a sentence beside buttons — the app's own chip,
+                  the way the nav rail counts pending approvals and a chat row
+                  counts mentions: the figure is what is drawn, the words are
+                  what is announced. It was `1 item selected` set as running
+                  text, about 90px of a 172px row, and it is the second thing
+                  that made this header impossible to lay out.
+
+                  `role="status"`, which is what `RecordingsPane` gives its own
+                  count, and it earns the live region here: the number changes
+                  under the reader's own clicks. It is also what makes the name
+                  reachable at all — an `aria-label` on a role-less `span` is
+                  the trap `phone-inbox-header` already fell into once. */}
+                <Badge
+                  variant="secondary"
+                  role="status"
+                  data-testid={FILES_SELECTED_TESTID}
+                  aria-label={filesSelectionSentence(deletable.length)}
+                  title={filesSelectionSentence(deletable.length)}
+                  className="figures mr-auto"
+                >
+                  {deletable.length}
+                </Badge>
+                {/* Still `destructive`, which since the palette pass is a red
+                  label and a red hairline rather than a tint — so the one verb
+                  in this row that cannot be undone still reads as itself with
+                  its word taken off. */}
                 <Button
                   type="button"
                   variant="destructive"
-                  size="sm"
+                  size="icon-sm"
+                  aria-label={FILES_DELETE_LABEL}
+                  title={FILES_DELETE_LABEL}
+                  className="shrink-0"
                   onClick={() => requestDelete(deletable)}
                 >
-                  {FILES_DELETE_LABEL}
+                  <Trash2 aria-hidden="true" />
                 </Button>
               </>
             )}
@@ -2103,16 +2169,42 @@ export function FilesPane() {
               Deliberately not gated on `write.writable`. That flag answers "may
               keeper change this file", and attaching changes the NOTE, not the
               file — a read-only PDF on a paused drive is a perfectly good thing
-              to put in a note. */}
+              to put in a note.
+
+              `Paperclip` is the app's attach glyph — the composer's and
+              `AttachFileButton`'s — rather than `NotebookPen`, which this very
+              pane already draws on every notes-vault folder in the tree below.
+              A mark that means "vault" in the body cannot also mean "attach" in
+              the header. */}
             {attachablePaths.length > 0 && activeVaultId !== null && (
-              <Button type="button" variant="outline" size="sm" onClick={() => setAttaching(true)}>
-                {ATTACH_TO_NOTE_LABEL}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={ATTACH_TO_NOTE_LABEL}
+                title={ATTACH_TO_NOTE_LABEL}
+                className="shrink-0"
+                onClick={() => setAttaching(true)}
+              >
+                <Paperclip aria-hidden="true" />
               </Button>
             )}
-            <Button type="button" variant="outline" size="sm" onClick={refresh}>
-              {FILES_REFRESH_LABEL}
+            {/* `RefreshCw` is the glyph the folded rail already spends on this
+              same verb (see `tree`'s rail above). One control, one mark,
+              whichever side of the fold it is drawn on. */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={FILES_REFRESH_LABEL}
+              title={FILES_REFRESH_LABEL}
+              className="shrink-0"
+              onClick={refresh}
+            >
+              <RefreshCw aria-hidden="true" />
             </Button>
           </div>
+          <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
         </header>
 
         {/* Rust's sentence for a write that was refused or only partly done.
