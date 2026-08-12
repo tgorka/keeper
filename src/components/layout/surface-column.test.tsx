@@ -1,11 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { Star } from "lucide-react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import {
   COLUMN_COLLAPSE_PREFIX,
   COLUMN_EXPAND_PREFIX,
   COLUMN_RAIL_SLOT,
-  SURFACE_COLUMN_FOLDED_WIDTH,
   type SurfaceRail,
   type SurfaceRailControl,
   useSurfaceColumn,
@@ -120,7 +120,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     // mounted keeps its subscriptions, which is the cost folding reclaims.
     expect(screen.queryByText(BODY)).not.toBeInTheDocument();
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${SURFACE_COLUMN_FOLDED_WIDTH}px`,
+      width: `${FOLD_STRIP.widthPx}px`,
     });
     // A fold with no handle is a column the user deleted by accident. The
     // control is a real button in the tab order, named for where it goes.
@@ -295,7 +295,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
 
     // The strip is 48px wide and the remembered width is untouched by it.
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${SURFACE_COLUMN_FOLDED_WIDTH}px`,
+      width: `${FOLD_STRIP.widthPx}px`,
     });
     expect(readColumnWidths(document.cookie)[id]).toBe(chosen);
     // No seam while folded: there is nothing to size, and a drag on a strip
@@ -315,7 +315,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     reload(id, unmount);
 
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${SURFACE_COLUMN_FOLDED_WIDTH}px`,
+      width: `${FOLD_STRIP.widthPx}px`,
     });
     fireEvent.click(screen.getByRole("button", { name: expand }));
     expect(screen.getByTestId("column")).toHaveStyle({ width: `${chosen}px` });

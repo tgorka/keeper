@@ -70,8 +70,26 @@ export interface SurfaceColumnSpec {
    * What the fold and the seam are named after, mid-sentence and lowercase:
    * "Collapse note list", "Resize note list". The label is the column, not the
    * surface — "Resize Notes" would name two different columns on one screen.
+   *
+   * It must contain {@link SurfaceColumnSpec.title}, case aside: the title is
+   * the visible words and this is the spoken name of the control that carries
+   * them, and a control whose visible label is not in its accessible name
+   * cannot be operated by anyone saying what they see (WCAG 2.5.3).
    */
   label: string;
+  /**
+   * The column's name as a reader sees it (Story 48.3).
+   *
+   * {@link SurfaceColumnSpec.label} is written for the middle of a sentence and
+   * cannot be shown: "note list" as a heading is a typo, and capitalising it at
+   * the call site is a rule that holds until the first surface forgets. So the
+   * display form is declared, once, beside the form it must agree with.
+   *
+   * Distinct across the four, for the same reason the labels are: two columns
+   * sit side by side on the Notes surface, and one name over both of them
+   * answers nothing.
+   */
+  title: string;
   /** The width it occupies until somebody drags it, in px. */
   defaultWidth: number;
   /**
@@ -95,12 +113,12 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // button: a 16px icon, a gap, the words, and the 8px padding either side —
   // under about 180 the label it exists to advertise starts being clipped, and
   // a space row's trailing `+` lands on top of the space's name.
-  "notes-rail": { label: "notes rail", defaultWidth: 240, minWidth: 180 },
+  "notes-rail": { label: "notes rail", title: "Notes rail", defaultWidth: 240, minWidth: 180 },
   // 320 is what the list has been since Story 37.1. The floor holds a row's two
   // lines — a title and a meta line of tag chips — plus the filter bar's search
   // field above them. Narrower and the chips wrap one per line, which makes the
   // list taller rather than narrower and helps nobody.
-  "notes-list": { label: "note list", defaultWidth: 320, minWidth: 240 },
+  "notes-list": { label: "note list", title: "Note list", defaultWidth: 320, minWidth: 240 },
   // The tree used to be `flex-1`, splitting the surface evenly with the panel
   // strip. That was never a decision — it was two panes with the same class —
   // and it gave half the window to a folder list while the document it opened
@@ -108,11 +126,17 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // path four deep still has to show a filename; the floor keeps three levels
   // and a short name, which is the point past which the tree stops being
   // navigable rather than merely tight.
-  "files-tree": { label: "file tree", defaultWidth: 360, minWidth: 220 },
+  //
+  // "files", not "file tree": this column IS the left half of the Files
+  // surface — it hosts that surface's header — and "Files" is what its nav
+  // entry, its region name and its tooltip have always called it. Naming the
+  // widget instead of the thing is the mistake, and there is only one surface
+  // column here, so nothing else on screen competes for the word.
+  "files-tree": { label: "files", title: "Files", defaultWidth: 360, minWidth: 220 },
   // 320 is what the inbox has been since the first shell. A chat row is a 40px
   // avatar, a name, a preview line and a timestamp; the floor is where the
   // timestamp would start eating the name.
-  "chat-list": { label: "chat list", defaultWidth: 320, minWidth: 240 },
+  "chat-list": { label: "chat list", title: "Chat list", defaultWidth: 320, minWidth: 240 },
 };
 
 /**

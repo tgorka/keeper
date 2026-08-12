@@ -27,6 +27,7 @@
 import { ChevronsLeftRight, ChevronsRightLeft, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
+import { FOLD_STRIP, FOLD_STRIP_SLOT } from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
 import { NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
@@ -342,7 +343,7 @@ function PanelFrame({
     <Button
       type="button"
       variant="ghost"
-      size="icon-sm"
+      size={FOLD_STRIP.headControlSize}
       // The name says which way the control goes; `aria-expanded` says where it
       // is now.
       aria-expanded={!panel.folded}
@@ -364,6 +365,7 @@ function PanelFrame({
       data-testid={`${PANEL_TESTID}-${panel.id}`}
       data-active={active ? "true" : undefined}
       data-folded={panel.folded ? "true" : undefined}
+      data-fold-strip={panel.folded ? FOLD_STRIP_SLOT : undefined}
       // Clicking anywhere in a panel focuses it, which is what makes the next
       // single click in the browser replace THIS panel rather than the one that
       // happened to be focused before.
@@ -371,8 +373,17 @@ function PanelFrame({
       onMouseDown={() => panelsStore.getState().focusPanel(panel.id)}
       className={cn(
         "flex h-full flex-col overflow-hidden border-border border-r bg-background last:border-r-0",
-        panel.folded ? "w-auto shrink-0 grow-0" : "min-w-[280px] flex-1",
-        active && "ring-1 ring-ring ring-inset",
+        // A folded panel is a folded strip, and it is now the same 48px as
+        // every other one (`fold-strip.tsx`). `w-auto` made its width a
+        // consequence of whatever its one button happened to measure — the
+        // only one of the four that nothing measured, and the reason four
+        // strips side by side were not the same width.
+        panel.folded ? cn(FOLD_STRIP.widthClass, "shrink-0 grow-0") : "min-w-[280px] flex-1",
+        // The active mark is the ring. An inset ring draws on all four sides,
+        // so on top of this panel's own trailing edge the right side would be
+        // 2px while the other three are 1px — the panel cancels its border
+        // rather than growing an edge, and DESIGN.md's hairline holds.
+        active && "border-r-transparent ring-1 ring-ring ring-inset",
       )}
     >
       {panel.folded ? (
@@ -380,23 +391,37 @@ function PanelFrame({
         // still named by the section's `aria-label` and by the control's own,
         // so neither a reader nor a pointer has to guess which one this is.
         //
-        // `py-1` beside a 32px control, here and on the open header below,
-        // keeps both rows at DESIGN.md's 40px pane-header while the control
-        // itself keeps DESIGN.md's 32px hit target. The height used to come
-        // from `py-2` around a 24px button, which spent the same 40px on a
-        // target a third smaller.
-        <header className="flex shrink-0 items-center border-border border-b px-1 py-1">
+        // `py-1` beside a 32px control keeps this row at DESIGN.md's 40px
+        // pane-header, which is the whole reason a folded panel does NOT take
+        // the strip's 36px item: its head is one segment of the header rule
+        // running across the strip, and a 44px segment would break the line.
+        // `fold-strip.tsx` states that exception rather than this file keeping
+        // it to itself.
+        <header
+          data-fold-strip-items="inset"
+          className={cn(
+            "flex shrink-0 items-center justify-center border-border border-b py-1",
+            FOLD_STRIP.padXClass,
+            FOLD_STRIP.gapClass,
+          )}
+        >
           {fold}
         </header>
       ) : (
         <PaneHeader
-          className="border-border border-b px-3 py-1"
+          // No `border-b` and no `py-*`: `PaneHeader` owns its own bottom edge
+          // and its own 40px height, and spelling either here draws it twice.
+          className="px-3"
           // Deliberately not a heading. The viewer inside draws the document's
           // own heading, and a second `h2` naming the same file would put two
           // entries in a screen reader's heading list for one document. The
           // panel is named by the section's `aria-label`, which is how a reader
           // jumps between panels — a tab strip's job, not an outline's.
-          identity={<span className="min-w-0 flex-1 truncate font-medium text-sm">{name}</span>}
+          //
+          // The treatment is the shared one every foldable surface names itself
+          // in, minus the heading semantics: DESIGN.md's `pane-header`
+          // typography, which this row was the one place not to use.
+          identity={<span className={FOLD_STRIP.titleClass}>{name}</span>}
           actions={
             <>
               {/* Story 45.21. A file only: a note panel's Export is in the

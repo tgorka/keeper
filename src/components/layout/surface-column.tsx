@@ -66,21 +66,20 @@
  */
 import { type LucideIcon, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
+import {
+  FOLD_STRIP,
+  FOLD_STRIP_SLOT,
+  FOLD_STRIP_TITLE_SLOT,
+  FoldStripDivider,
+} from "@/components/layout/fold-strip";
 import { Button } from "@/components/ui/button";
 import { ColumnResizer, useResizableColumn } from "@/components/ui/resizable-columns";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SURFACE_COLUMNS, type SurfaceColumnId } from "@/lib/column-widths";
 import { columnFoldStore, useColumnFold } from "@/lib/stores/column-fold";
+import { cn } from "@/lib/utils";
 
-/**
- * The strip a folded column leaves behind, in px.
- *
- * The sidebar's collapsed rail, which is `w-12`. One folded column should not
- * be a different width from another, and the sidebar got there first.
- */
-export const SURFACE_COLUMN_FOLDED_WIDTH = 48;
-
-/** What the control reads while the column is away. Suffixed with the label. */
+/** What the control reads while the column is away. Suffixed with the title. */
 export const COLUMN_EXPAND_PREFIX = "Expand";
 
 /** What it reads while the column is showing. */
@@ -137,10 +136,11 @@ export type SurfaceRail = readonly [SurfaceRailControl, ...SurfaceRailControl[]]
 /**
  * One rail control, in the house treatment.
  *
- * `size="icon"` and a tooltip on the right: the sidebar's collapsed rail, which
- * is the proof this works at 48px. No `title` beside the tooltip — the two draw
- * the same words twice, a second box a second later under the first, and the
- * tooltip is the one this app already uses at this width.
+ * {@link FOLD_STRIP.controlSize} and a tooltip on the right: the sidebar's
+ * collapsed rail, which is the proof this works at 48px. No `title` beside the
+ * tooltip — the two draw the same words twice, a second box a second later
+ * under the first, and the tooltip is the one this app already uses at this
+ * width.
  */
 function RailControl({ control }: { control: SurfaceRailControl }) {
   const { icon: Icon, label, detail, count, disabled, onSelect } = control;
@@ -154,7 +154,7 @@ function RailControl({ control }: { control: SurfaceRailControl }) {
         <Button
           type="button"
           variant="ghost"
-          size="icon"
+          size={FOLD_STRIP.controlSize}
           aria-label={name}
           data-slot={COLUMN_RAIL_CONTROL_SLOT}
           data-rail-control={control.id}
@@ -193,6 +193,18 @@ export interface SurfaceColumnFrame {
     id: string;
     style: CSSProperties;
     "data-folded": "true" | undefined;
+    /**
+     * The region's name, from exactly one place.
+     *
+     * Open, it points at the visible title this frame draws, so a reader hears
+     * the words that are on screen and the two cannot drift apart. Folded there
+     * is no title to point at — the strip's name lives on the way back — so the
+     * name is spelled out instead. Either way the surface spreads this and does
+     * NOT write an `aria-label` of its own: a region labelled "Files" wrapping a
+     * heading reading "Files" is the same word announced twice.
+     */
+    "aria-labelledby": string | undefined;
+    "aria-label": string | undefined;
   };
   /**
    * The fold control, and while folded the rail under it. The column's FIRST
@@ -247,12 +259,20 @@ export function useSurfaceColumn(
     );
   }
 
+  // Mid-sentence, so `spec.label` and not `spec.title`: the name is a sentence
+  // and the title is the word in it. WCAG 2.5.3 asks that the visible label be
+  // IN the accessible name ignoring case, which `label` guarantees by contract.
+  const foldName = `${folded ? COLUMN_EXPAND_PREFIX : COLUMN_COLLAPSE_PREFIX} ${spec.label}`;
+  const titleId = `column-${id}-title`;
   const foldControl = (
     <Button
       type="button"
       variant="ghost"
-      size="icon"
-      aria-label={`${folded ? COLUMN_EXPAND_PREFIX : COLUMN_COLLAPSE_PREFIX} ${spec.label}`}
+      size={FOLD_STRIP.controlSize}
+      // Contains the visible title, so the control can be operated by anyone
+      // saying the word they can see (WCAG 2.5.3), and leads with the verb,
+      // which is the half a folded strip has no other way to state.
+      aria-label={foldName}
       // The button sits inside the region it controls, which is how the
       // sidebar's does it: while folded the strip IS the column, and a
       // control parked in a neighbour would belong to the wrong surface.
@@ -266,11 +286,11 @@ export function useSurfaceColumn(
   );
 
   const chrome = !enabled ? null : folded ? (
-    // The rail, and its metrics are the sidebar's rather than this file's own:
-    // `p-2` and a `size="icon"` button, so the fold control of a folded column
-    // sits at the same height and the same size as the fold control of the
-    // folded sidebar beside it. Two 48px rails that disagreed by four pixels
-    // would read as an accident, which is half of what the owner saw.
+    // The strip, and every number in it comes from {@link FOLD_STRIP} rather
+    // than from this file, so the fold control of a folded column sits at the
+    // same height and the same size as the fold control of the folded sidebar
+    // beside it. Two 48px rails that disagreed by four pixels read as an
+    // accident, which is half of what the owner saw.
     //
     // `TooltipProvider` here rather than relied upon from an ancestor: the strip
     // is this hook's, and a column that only names its controls inside an app
@@ -278,26 +298,52 @@ export function useSurfaceColumn(
     <TooltipProvider>
       <div
         data-slot={COLUMN_RAIL_SLOT}
-        className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto p-2"
+        data-fold-strip={FOLD_STRIP_SLOT}
+        data-fold-strip-items="inset"
+        className={cn(
+          "flex min-h-0 flex-1 flex-col items-center overflow-y-auto",
+          FOLD_STRIP.padClass,
+          FOLD_STRIP.gapClass,
+        )}
       >
-        {foldControl}
+        {/* The way back, and the only thing on a 48px strip that says WHICH
+            surface this is. The tooltip and the accessible name are the same
+            words, because with the title gone the tooltip IS the visible label
+            — see this module's neighbour `fold-strip.tsx` for the measurement
+            that ruled out putting the name on the strip itself. */}
+        <Tooltip>
+          <TooltipTrigger asChild>{foldControl}</TooltipTrigger>
+          <TooltipContent side="right">{foldName}</TooltipContent>
+        </Tooltip>
         {/* Two things, not one list: the way back, and then what is inside. */}
-        <div aria-hidden="true" className="my-0.5 h-px w-6 shrink-0 bg-border" />
+        <FoldStripDivider />
         {options.rail.map((control) => (
           <RailControl key={control.id} control={control} />
         ))}
       </div>
     </TooltipProvider>
   ) : (
-    <div className="flex shrink-0 justify-end p-2 pb-0">{foldControl}</div>
+    // Open, the column says its name (Story 48.3). Every foldable surface in
+    // the shell draws it here, in one treatment, so four columns side by side
+    // are told apart by reading rather than by hovering — and the fold control
+    // keeps its place at the end of the row, because a strip that gained a
+    // title and lost its way back would be the worse defect.
+    <div className={cn("flex shrink-0 items-center", FOLD_STRIP.headPadClass, FOLD_STRIP.gapClass)}>
+      <h2 id={titleId} data-slot={FOLD_STRIP_TITLE_SLOT} className={FOLD_STRIP.titleClass}>
+        {spec.title}
+      </h2>
+      {foldControl}
+    </div>
   );
 
   return {
     folded,
     rootProps: {
       id: `column-${id}`,
-      style: { width: folded ? SURFACE_COLUMN_FOLDED_WIDTH : width },
+      style: { width: folded ? FOLD_STRIP.widthPx : width },
       "data-folded": folded ? "true" : undefined,
+      "aria-labelledby": enabled && !folded ? titleId : undefined,
+      "aria-label": enabled && !folded ? undefined : spec.title,
     },
     chrome,
     seam:

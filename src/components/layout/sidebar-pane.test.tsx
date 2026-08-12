@@ -18,6 +18,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { BridgeHealth } from "@/lib/ipc/client";
@@ -823,10 +824,12 @@ describe("SidebarPane rail geometry (the UI around the icons)", () => {
   });
 
   it("draws every folded rail control at one width", () => {
-    // The rail is a 48px column. A `size-9` nav button centred in it leaves a
-    // 6px gutter; a 24px avatar under `p-1` made a Space or Network row 32px,
-    // so its hover and selected pill was 4px narrower than the pill directly
-    // above it. `p-1.5` is 24 + 6 + 6 = 36, and the column lines up.
+    // The rail is a 48px column of items that are all one size. A Space or
+    // Network row used to reach that size by putting `p-1.5` around a 24px
+    // avatar — 24 + 6 + 6 — and under `p-1` before that it was 32px, so its
+    // hover and selected pill was 4px narrower than the pill directly above
+    // it. The sum is gone: every item asks {@link FOLD_STRIP} for the size,
+    // so there is nothing left to get wrong when the avatar changes.
     spacesStore.getState().applySnapshot({
       spaces: [
         {
@@ -840,10 +843,10 @@ describe("SidebarPane rail geometry (the UI around the icons)", () => {
     networksStore.getState().applySnapshot({ networks: [{ name: "Telegram" }] });
     renderSidebar(true);
 
-    expect(screen.getByRole("button", { name: "Chats" })).toHaveClass("size-9");
+    expect(screen.getByRole("button", { name: "Chats" })).toHaveClass(FOLD_STRIP.controlClass);
     for (const name of ["Design", "Telegram"]) {
       const row = screen.getByRole("button", { name });
-      expect(row, name).toHaveClass("p-1.5");
+      expect(row, name).toHaveClass(FOLD_STRIP.controlClass);
       // `size="sm"` is the 24px avatar; the size itself is a variant class, so
       // the honest assertion is the variant the row asked for.
       expect(row.querySelector('[data-slot="avatar"]'), name).toHaveAttribute("data-size", "sm");
