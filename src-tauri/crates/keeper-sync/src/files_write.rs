@@ -559,32 +559,73 @@ impl<'a> WriteScope<'a> {
         })
     }
 
-    /// The fork itself. Everything above it is arguments; everything below it
-    /// is consequences.
     /// Whether a profile-relative path sits inside a session's `workspace/`
     /// (Phase 7, AD-113): `<zone>/active/<session>/workspace/**` or
     /// `<zone>/archive/<year>/<session>/workspace/**`. Component-wise against
     /// the normalised zone subfolder, exactly as the vault test is.
-    fn in_session_workspace(&self, subpath: &str) -> bool {
+    ///
+    /// **Public because the surface that shows the lock must ask the fence
+    /// that enforces it** (FR-254): the session tree renders a read-only mark
+    /// on exactly these paths, and a shell-side "the third segment is
+    /// `workspace`" would be a second predicate that gets edited once.
+    /// Nothing outside [`Self::classify`] may act on the answer; elsewhere it
+    /// decides a glyph and a sentence, never a write.
+    pub fn in_session_workspace(&self, subpath: &str) -> bool {
+        matches!(self.workspace_position(subpath), WorkspacePosition::Inside)
+    }
+
+    /// Whether the session tree should render a read-only lock on this entry
+    /// (FR-254) — the fence's own answer, one question wider.
+    ///
+    /// A write lands *in* the workspace, so [`Self::in_session_workspace`] is
+    /// what [`Self::classify`] asks and it deliberately excludes the container
+    /// itself: a write whose target IS the `workspace` directory is refused as
+    /// a directory, which is the more precise thing to say.
+    ///
+    /// The tree asks a different question — "may keeper write here" — and for
+    /// a directory that means "into here". Without this, an EMPTY `workspace/`
+    /// would render with nothing said about being scratch, which is exactly
+    /// the session where the fence most needs explaining. Same parse, so the
+    /// two answers cannot drift apart.
+    pub fn session_workspace_lock(&self, subpath: &str, is_dir: bool) -> bool {
+        match self.workspace_position(subpath) {
+            WorkspacePosition::Inside => true,
+            WorkspacePosition::Container => is_dir,
+            WorkspacePosition::Outside => false,
+        }
+    }
+
+    /// The one segment walk both workspace questions read.
+    fn workspace_position(&self, subpath: &str) -> WorkspacePosition {
         let Some(zone) = self.sessions_subfolder.as_deref() else {
-            return false;
+            return WorkspacePosition::Outside;
         };
         let Some(rest) = subpath
             .strip_prefix(zone)
             .and_then(|rest| rest.strip_prefix('/'))
         else {
-            return false;
+            return WorkspacePosition::Outside;
         };
         let parts: Vec<&str> = rest.split('/').collect();
-        match parts.first() {
-            // active/<session>/workspace/...
-            Some(&"active") => parts.get(2) == Some(&"workspace") && parts.len() > 3,
-            // archive/<year>/<session>/workspace/...
-            Some(&"archive") => parts.get(3) == Some(&"workspace") && parts.len() > 4,
-            _ => false,
+        // The index the workspace segment sits at, per lifecycle layout:
+        // `active/<session>/workspace/...`, `archive/<year>/<session>/...`.
+        let at = match parts.first() {
+            Some(&"active") => 2,
+            Some(&"archive") => 3,
+            _ => return WorkspacePosition::Outside,
+        };
+        if parts.get(at) != Some(&"workspace") {
+            return WorkspacePosition::Outside;
+        }
+        if parts.len() > at + 1 {
+            WorkspacePosition::Inside
+        } else {
+            WorkspacePosition::Container
         }
     }
 
+    /// The fork itself. Everything above it is arguments; everything below it
+    /// is consequences.
     fn classify(&self, subpath: &str, is_dir: bool) -> Result<Owned, WriteRefusal> {
         // The workspace fence first (AD-113): scratch refuses every write, on
         // the zone's own contract, before any question about vaults is asked.
@@ -661,6 +702,19 @@ impl<'a> WriteScope<'a> {
 enum Owned {
     Vault(String),
     Unmanaged,
+}
+
+/// Where a path sits relative to a session's `workspace/` (AD-113).
+///
+/// Private: the distinction exists so the fence and the tree's lock can share
+/// one parse, and both public answers are `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspacePosition {
+    /// Under the workspace — every write refuses.
+    Inside,
+    /// The `workspace` directory itself.
+    Container,
+    Outside,
 }
 
 /// Which writer owns a path, for a caller that only needs to know which
@@ -1192,6 +1246,38 @@ mod tests {
             unaware.classify("60-sessions/active/x/workspace/y.md", false),
             Err(WriteRefusal::SessionWorkspace { .. })
         ));
+    }
+
+    /// The tree's lock is the fence, one question wider (FR-254): it adds the
+    /// `workspace` DIRECTORY, so an empty workspace still explains itself,
+    /// and adds nothing else — the two answers come off one parse.
+    #[test]
+    fn the_tree_lock_covers_the_workspace_container_and_the_fence_does_not() {
+        let scope = WriteScope::new("tgdrive", Some("60-notes")).with_sessions(Some("60-sessions"));
+        let dir = "60-sessions/active/2026-08-10-keeper/workspace";
+        let file = "60-sessions/active/2026-08-10-keeper/workspace/iter.md";
+
+        // A write INTO the workspace refuses; the container is a directory
+        // refusal, which is the more precise thing for a writer to say.
+        assert!(scope.in_session_workspace(file));
+        assert!(!scope.in_session_workspace(dir));
+
+        // The tree locks both, because "may keeper write here" over a folder
+        // means "into here".
+        assert!(scope.session_workspace_lock(file, false));
+        assert!(scope.session_workspace_lock(dir, true));
+
+        // …and a FILE that happens to be named `workspace` beside the sections
+        // is somebody's own file, not the container.
+        assert!(!scope.session_workspace_lock(dir, false));
+
+        // Everything outside stays unlocked, in both layouts.
+        assert!(
+            !scope.session_workspace_lock("60-sessions/active/2026-08-10-keeper/README.md", false)
+        );
+        assert!(!scope.session_workspace_lock("30-work/project/workspace", true));
+        assert!(scope
+            .session_workspace_lock("60-sessions/archive/2025/2025-03-01-taxes/workspace", true));
     }
 
     /// The refusal's sentence speaks the zone's own words — the promote path

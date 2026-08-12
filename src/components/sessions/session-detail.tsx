@@ -1,28 +1,32 @@
 /**
- * The session detail (Phase 7, FR-233, UX-DR89): the drill-in a board row
- * opens — header with tags, the properties widget, lineage chips, the
- * rendered activity log, and the mini-file sections.
+ * The session detail (Phase 7, FR-233, FR-254, UX-DR89): the drill-in a board
+ * row opens — header with tags, the properties widget, lineage chips, the
+ * rendered activity log, and the session's own file tree.
  *
- * A review surface, so the ordering choices all point one way: the log
- * renders NEWEST FIRST (the file on disk keeps the zone's newest-last
- * convention — only this projection reverses), and every file section sorts
- * by mtime descending. Everything shown is a fresh projection of the zone's
- * files (`sessions_detail`), re-read on the changed event — an agent writing
- * on disk moves this view live.
+ * A review surface, so the ordering choices all point one way: the log renders
+ * NEWEST FIRST (the file on disk keeps the zone's newest-last convention —
+ * only this projection reverses), and inside a file section the newest file is
+ * first. Everything shown is a fresh projection of the zone's files, re-read
+ * on the changed event — an agent writing on disk moves this view live.
  *
- * Files open in the panel strip beside the board through the SAME file
- * target the Files pane sets (AD-109, UX-DR91) — one editor, one viewer
- * registry, no second open path. `workspace/` rows carry the zone's own
- * caveat and open read-only; the write fence in Rust is what enforces it.
+ * **Two reads, not one** (FR-254). The record — header, properties, log —
+ * comes from `sessions_detail`; the files come from `sessions_tree`, which
+ * costs a directory walk and one `Engine::pending` query. Binding them into
+ * one payload would make every log re-read pay for the tree. Both re-read on
+ * the same event, so the surface still moves as one thing.
+ *
+ * Files open in the panel strip beside the board through the SAME file target
+ * the Files pane sets (AD-109, UX-DR91) — one editor, one viewer registry, no
+ * second open path. `workspace/` rows carry the write fence's own refusal
+ * sentence; the fence in Rust is what enforces it (AD-113).
  */
-import { ArrowLeft, FileText, Folder, Lock, Pencil, Pin } from "lucide-react";
+import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { SessionTree } from "@/components/sessions/session-tree";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { formatDraftAge } from "@/lib/format-time";
-import type { SessionDetailVm, SessionFileVm } from "@/lib/ipc/client";
-import { listenSessionsChanged, sessionsDetail } from "@/lib/ipc/client";
-import { formatSize } from "@/lib/recording-format";
+import type { SessionDetailVm, SessionEntryVm, SessionTreeVm } from "@/lib/ipc/client";
+import { listenSessionsChanged, sessionsDetail, sessionsTree } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 
 /** The way back to the board. */
@@ -30,123 +34,47 @@ export const SESSION_DETAIL_BACK_LABEL = "Back to sessions";
 
 /** Section headings — the zone's own vocabulary, not keeper's. */
 export const SESSION_DETAIL_LOG_HEADING = "Log";
-export const SESSION_DETAIL_ARTIFACTS_HEADING = "Artifacts";
-export const SESSION_DETAIL_REFS_HEADING = "Refs";
-export const SESSION_DETAIL_PROMPTS_HEADING = "Prompts";
-export const SESSION_DETAIL_WORKSPACE_HEADING = "Workspace";
-export const SESSION_DETAIL_EXTRAS_HEADING = "Other files";
+export const SESSION_DETAIL_FILES_HEADING = "Files";
 export const SESSION_DETAIL_PROPERTIES_HEADING = "Properties";
 
-/** The zone's own sentence under the workspace section (FR-237). */
+/**
+ * The zone's own sentence about `workspace/` (FR-237), on the Files heading
+ * rather than on a section of its own.
+ *
+ * The tree nests, so `workspace/` is one row among the session's sections and
+ * has nowhere to hang a paragraph. Saying it once, above the tree, is also the
+ * more useful place for it: the caveat explains a rule about the session's
+ * shape, and the fence's own refusal sentence is what explains an individual
+ * locked row.
+ */
 export const SESSION_DETAIL_WORKSPACE_CAVEAT =
-  "scratch — not versioned, not synced, dies with the session. Read-only in keeper; promote what matters into artifacts.";
+  "workspace/ is scratch — not versioned, not synced, dies with the session. Read-only in keeper; promote what matters into artifacts.";
 
-/** What an empty section says, per section, honestly. */
+/** What an empty log says, honestly. */
 export const SESSION_DETAIL_NO_LOG = "No log entries yet.";
-export const SESSION_DETAIL_NO_FILES = "Empty.";
 
 /** Open the session's README in the strip. */
 export const SESSION_DETAIL_OPEN_README_LABEL = "Open README";
 
 export interface SessionDetailProps {
   rootId: string;
-  /** The zone subfolder ("60-sessions"), for composing file targets. */
+  /**
+   * The zone subfolder ("60-sessions"), for the README target.
+   *
+   * Every OTHER path on this surface arrives composed from Rust
+   * (`SessionEntryVm.subpath`, AD-65). The README keeps a join here because it
+   * is the one file the header opens whether or not the tree has loaded — and
+   * it is a fixed name at a known place, not a path a walk discovered.
+   */
   subfolder: string;
   sessionId: string;
   onBack: () => void;
 }
 
-/** One file row: name, size, age; click opens in the strip. */
-function FileRow({
-  file,
-  readOnly,
-  nowMs,
-  onOpen,
-}: {
-  file: SessionFileVm;
-  readOnly: boolean;
-  nowMs: number;
-  onOpen: (file: SessionFileVm) => void;
-}) {
-  return (
-    <li>
-      <button
-        type="button"
-        onClick={() => onOpen(file)}
-        className="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-left text-sm hover:bg-accent/50"
-      >
-        {file.isDir ? (
-          <Folder aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        ) : (
-          <FileText aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        )}
-        <span className="min-w-0 flex-1 truncate">{file.name}</span>
-        {readOnly && (
-          <Lock aria-label="read-only" className="size-3 shrink-0 text-muted-foreground" />
-        )}
-        {!file.isDir && (
-          <span className="figures shrink-0 text-muted-foreground text-xs">
-            {formatSize(file.size)}
-          </span>
-        )}
-        {file.mtimeMs > 0 && (
-          <span className="figures w-16 shrink-0 text-right text-muted-foreground text-xs">
-            {formatDraftAge(file.mtimeMs, nowMs)}
-          </span>
-        )}
-      </button>
-    </li>
-  );
-}
-
-/** One mini-file section: heading, count, rows. Absent sections render a
- * quiet "Empty." rather than vanishing — a session missing its artifacts is
- * a fact worth seeing (the delete-instead rule feeds on it). */
-function FileSection({
-  heading,
-  files,
-  caveat,
-  readOnly,
-  nowMs,
-  onOpen,
-}: {
-  heading: string;
-  files: SessionFileVm[];
-  caveat?: string;
-  readOnly?: boolean;
-  nowMs: number;
-  onOpen: (file: SessionFileVm) => void;
-}) {
-  return (
-    <section aria-label={heading} className="flex flex-col gap-1">
-      <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {heading}
-        <span className="figures normal-case">{files.length}</span>
-      </h3>
-      {caveat !== undefined && <p className="text-muted-foreground text-xs">{caveat}</p>}
-      {files.length === 0 ? (
-        <p className="px-2 text-muted-foreground text-xs">{SESSION_DETAIL_NO_FILES}</p>
-      ) : (
-        <ul className="flex flex-col">
-          {files.map((file) => (
-            <FileRow
-              key={file.relPath}
-              file={file}
-              readOnly={readOnly === true}
-              nowMs={nowMs}
-              onOpen={onOpen}
-            />
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
 export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionDetailProps) {
   const [detail, setDetail] = useState<SessionDetailVm | null>(null);
+  const [tree, setTree] = useState<SessionTreeVm | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const nowMs = Date.now();
 
   // Read on mount and re-read on the changed event — an agent's write on
   // disk moves this surface without a keystroke (FR-234's detail half).
@@ -163,6 +91,23 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
         (e: unknown) => {
           if (live) {
             setError(e instanceof Error ? e.message : String(e));
+          }
+        },
+      );
+      // The tree's own failure does NOT blank the record: a session whose
+      // files could not be walked still has a log worth reading, and the
+      // record's error slot is where a real failure to find the session is
+      // reported. A missing tree renders as a session with no files, which
+      // is what a caller with no answer can honestly say.
+      sessionsTree(rootId, sessionId).then(
+        (vm) => {
+          if (live) {
+            setTree(vm);
+          }
+        },
+        () => {
+          if (live) {
+            setTree(null);
           }
         },
       );
@@ -186,21 +131,21 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     };
   }, [rootId, sessionId]);
 
-  // Files open in the strip through the one file target (AD-109). The
-  // workspace fence in Rust keeps read-only honest; the target itself is
-  // the same shape for every section.
+  // Files open in the strip through the one file target (AD-109). The path
+  // is the entry's own `subpath`, composed in Rust (AD-65) — this surface
+  // never joins one. The workspace fence in Rust keeps read-only honest.
   const openFile = useCallback(
-    (file: SessionFileVm) => {
-      if (detail === null || file.isDir) {
+    (entry: SessionEntryVm) => {
+      if (entry.isDir) {
         return;
       }
       panelsStore.getState().setActiveTarget({
         kind: "file",
         profileId: rootId,
-        relativePath: `${subfolder}/${detail.path}/${file.relPath}`,
+        relativePath: entry.subpath,
       });
     },
-    [detail, rootId, subfolder],
+    [rootId],
   );
 
   const openReadme = useCallback(() => {
@@ -317,41 +262,19 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             )}
           </section>
 
-          {/* The mini-file sections, in the zone's own order. */}
-          <FileSection
-            heading={SESSION_DETAIL_ARTIFACTS_HEADING}
-            files={detail.artifacts}
-            nowMs={nowMs}
-            onOpen={openFile}
-          />
-          <FileSection
-            heading={SESSION_DETAIL_REFS_HEADING}
-            files={detail.refs}
-            nowMs={nowMs}
-            onOpen={openFile}
-          />
-          <FileSection
-            heading={SESSION_DETAIL_PROMPTS_HEADING}
-            files={detail.prompts}
-            nowMs={nowMs}
-            onOpen={openFile}
-          />
-          {detail.extras.length > 0 && (
-            <FileSection
-              heading={SESSION_DETAIL_EXTRAS_HEADING}
-              files={detail.extras}
-              nowMs={nowMs}
+          {/* The session's own file tree, in the zone's own order (FR-254). */}
+          <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
+            <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              {SESSION_DETAIL_FILES_HEADING}
+            </h3>
+            <p className="text-muted-foreground text-xs">{SESSION_DETAIL_WORKSPACE_CAVEAT}</p>
+            <SessionTree
+              rootId={rootId}
+              entries={tree?.entries ?? []}
+              truncated={tree?.truncated ?? false}
               onOpen={openFile}
             />
-          )}
-          <FileSection
-            heading={SESSION_DETAIL_WORKSPACE_HEADING}
-            files={detail.workspace}
-            caveat={SESSION_DETAIL_WORKSPACE_CAVEAT}
-            readOnly
-            nowMs={nowMs}
-            onOpen={openFile}
-          />
+          </section>
         </div>
       )}
     </div>

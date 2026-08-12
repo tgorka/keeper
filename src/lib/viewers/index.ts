@@ -15,6 +15,7 @@ export {
   viewerComponentFor,
 } from "./components";
 export { FILE_ASSET_SCHEME, fileAssetUrl } from "./file-asset-url";
+export { VIEWER_ICON } from "./icons";
 export {
   extensionOf,
   FILE_FORMAT_ENTRIES,

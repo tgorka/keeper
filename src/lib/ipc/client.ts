@@ -203,7 +203,7 @@ export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SessionDetailVm } from "./gen/SessionDetailVm";
-export type { SessionFileVm } from "./gen/SessionFileVm";
+export type { SessionEntryVm } from "./gen/SessionEntryVm";
 export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
@@ -212,6 +212,7 @@ export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
 export type { SessionRowVm } from "./gen/SessionRowVm";
+export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
 export type { SlidesVm } from "./gen/SlidesVm";
@@ -344,6 +345,7 @@ import type { SessionPatternVm } from "./gen/SessionPatternVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
+import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
@@ -4834,16 +4836,41 @@ export async function listenSessionsChanged(
 }
 
 /**
- * One session's detail (FR-233): header facts, the user-tier properties,
+ * One session's *record* (FR-233): header facts, the user-tier properties and
  * the rendered log NEWEST FIRST (the review order — the file on disk stays
- * newest-last), and the file sections — artifacts, refs, prompts, the
- * read-only workspace, and any loose extras beside the README. Composed
- * fresh from disk on every call; re-read on the changed event.
+ * newest-last). Composed fresh from disk on every call; re-read on the
+ * changed event.
+ *
+ * The session's files are {@link sessionsTree}, read separately, so a log
+ * re-read does not pay for a directory walk and a git query.
  *
  * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
  */
 export async function sessionsDetail(rootId: string, sessionId: string): Promise<SessionDetailVm> {
   return await invoke<SessionDetailVm>("sessions_detail", { rootId, sessionId });
+}
+
+/**
+ * One session's own file tree (FR-254) — the session folder as the small
+ * workspace it is: the zone's four sections in the zone's own order, each
+ * nested, everything else after them.
+ *
+ * The whole subtree comes back in one call, flat, each entry carrying
+ * `parent` and `depth` for the renderer to nest on. Every entry already
+ * carries the facts the row needs and the frontend cannot derive: the
+ * profile-relative `subpath` (AD-65 — never joined here), the SAME sync mark
+ * and sentence the Files tab renders, and `locked` — the workspace fence's
+ * own refusal sentence, on exactly the paths a write would refuse (AD-113).
+ *
+ * `truncated` means the walk hit its budget: a session's `workspace/` can
+ * hold a `node_modules`, and a prefix that looked complete would be a lie.
+ *
+ * Rejects with: `internal` (unknown root/session, an unreadable exclude
+ * pattern), `unsupported` (mobile). An engine that cannot answer is NOT a
+ * rejection — the files come back marked unknown, with the engine's words.
+ */
+export async function sessionsTree(rootId: string, sessionId: string): Promise<SessionTreeVm> {
+  return await invoke<SessionTreeVm>("sessions_tree", { rootId, sessionId });
 }
 
 /**

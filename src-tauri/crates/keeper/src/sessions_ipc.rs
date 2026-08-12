@@ -102,9 +102,13 @@ pub fn sessions_rescan(root_id: String) -> Result<(), IpcError> {
     Err(unsupported())
 }
 
-/// One session's detail: header facts, the user-tier properties widget, the
-/// rendered log (newest first — the review order), and the file sections
-/// (FR-233). Composed from one walk + one README parse; nothing stored.
+/// One session's *record*: header facts, the user-tier properties widget and
+/// the rendered log, newest first — the review order (FR-233). Composed from
+/// one README parse; nothing stored.
+///
+/// The session's files are [`sessions_tree`], read separately (FR-254): the
+/// tree costs a directory walk and one `Engine::pending` query, and a log
+/// re-read should not pay for either.
 #[cfg(desktop)]
 #[tauri::command]
 pub fn sessions_detail(
@@ -122,6 +126,125 @@ pub fn sessions_detail(
 #[cfg(not(desktop))]
 #[tauri::command]
 pub fn sessions_detail(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
+/// One session's own file tree (FR-254, AD-117) — the session as the small
+/// workspace it is.
+///
+/// **Why the whole subtree in one call, and not a folder per expand.** The
+/// Files tab browses lazily because a synced folder is unbounded and each
+/// level costs one `Engine::pending` query. A session is bounded by its own
+/// contract — four shallow sections — and its five sections open together, so
+/// lazy browsing would trade one git query for five. AD-114 already decided
+/// this for the board; the tree is the same decision one level down.
+///
+/// **The sync mark is the Files tab's, not a second opinion.** `pending` is
+/// asked once for the whole tree and every entry is classified through
+/// [`keeper_sync::browse::status_of`] — the same function the listing and the
+/// delete confirmation go through — then worded by the same five sentences.
+/// A session file that the Files pane calls excluded is called excluded here,
+/// in those words, because it is one fact asked from two places.
+///
+/// **The lock is the write fence, asked** (AD-113). `workspace/` entries carry
+/// [`keeper_sync::files_write::WriteRefusal::SessionWorkspace`]'s own sentence
+/// rather than a UI convention that could drift from what a write would
+/// actually do.
+///
+/// Rejects with: `internal` (unknown root or session, an unreadable profile
+/// exclude pattern), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_tree(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+) -> Result<keeper_core::sessions::vm::SessionTreeVm, IpcError> {
+    use keeper_core::sessions::vm::{SessionEntryVm, SessionTreeVm};
+    use keeper_core::vm::FileSizeVm;
+    use keeper_sync::browse;
+    use keeper_sync::exclude::ExcludeSet;
+
+    let (session_path, raw, truncated) =
+        tokio::task::block_in_place(|| crate::sessions_root::tree(&root_id, &session_id))
+            .ok_or_else(|| IpcError {
+                code: IpcErrorCode::Internal,
+                message: format!("no such session: {session_id}"),
+                account_id: None,
+                retriable: false,
+            })?;
+
+    // A sessions root IS a sync profile (AD-107), so the engine, the excludes
+    // and the write scope all come off the profile the root id already names.
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let excludes = ExcludeSet::new(&profile.excludes).map_err(|error| IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    })?;
+    let (_vault, scope) = crate::sync_ipc::sessions_scope(&profile);
+
+    // Once for the whole tree, exactly as a listing asks once for a whole
+    // directory. An engine that cannot answer does not fail the tree: the
+    // files still come back, marked unknown with the engine's own words.
+    let (pending, unavailable) = match crate::sync_ipc::sessions_pending(&state, &root_id).await {
+        Ok(files) => (browse::PendingView::from_pending(files), None),
+        Err(error) => (browse::PendingView::Unavailable, Some(error)),
+    };
+
+    let entries = raw
+        .into_iter()
+        .map(|entry| {
+            // Composed here and only here (AD-65): the frontend receives a
+            // path it can hand straight to a file target and never joins one.
+            let subpath = format!("{zone}/{session_path}/{}", entry.rel_path);
+            let status = browse::status_of(
+                &profile.local_path,
+                &subpath,
+                entry.is_dir,
+                &excludes,
+                &pending,
+            );
+            SessionEntryVm {
+                name: entry.name,
+                rel_path: entry.rel_path,
+                parent: entry.parent,
+                depth: entry.depth,
+                is_dir: entry.is_dir,
+                sync: crate::sync_ipc::sessions_sync_mark(&status, unavailable.as_deref()),
+                locked: scope
+                    .session_workspace_lock(&subpath, entry.is_dir)
+                    .then(|| {
+                        keeper_sync::files_write::WriteRefusal::SessionWorkspace {
+                            subpath: subpath.clone(),
+                        }
+                        .to_string()
+                    }),
+                absolute_path: profile
+                    .local_path
+                    .join(&subpath)
+                    .to_string_lossy()
+                    .into_owned(),
+                subpath,
+                size: (!entry.is_dir).then(|| FileSizeVm::new(entry.size)),
+                mtime_ms: entry.mtime_ms,
+            }
+        })
+        .collect();
+
+    Ok(SessionTreeVm { entries, truncated })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_tree(root_id: String, session_id: String) -> Result<(), IpcError> {
     let _ = (root_id, session_id);
     Err(unsupported())
 }

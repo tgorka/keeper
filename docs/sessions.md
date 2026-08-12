@@ -108,6 +108,36 @@ the distinction is the review loop.
   recoverable. Never an unlink.
 - **Unarchive** — one move back to `active/`. Lineage untouched. Prefer a continuation.
 
+## The session's files
+
+A session folder is a small workspace, so the detail browses it as one: a real tree under
+**Files**, not a list per section. The zone's own sections come first in the zone's own
+order — `artifacts/`, `refs/`, `prompts/`, `workspace/` — each followed by whatever is
+inside it, and everything else in the session after them. The sections arrive open and
+their subtrees closed, which shows the session's shape without unrolling a `node_modules`
+the agent installed. Arrow keys walk it; `Enter` opens a file in the panel beside the
+board or toggles a folder.
+
+Each row carries the three facts the Files tab carries, and for the same reason:
+
+- **Its sync mark**, from the same engine answer the Files tab reads. A session lives in
+  a synced folder and therefore has a sync story; a row that hid it would let the two
+  surfaces disagree about one file. An excluded row says so, in the engine's words.
+- **Its size and age**, described rather than named — so a screen reader announces the
+  file, then the numbers, rather than reading a name nobody typed.
+- **A lock, where keeper will not write**, carrying the fence's own refusal sentence.
+  Everything under `workspace/` is locked, including an empty `workspace/` itself.
+
+The verbs on a row are open, open in the default app, and reveal — a review surface, so
+there is no selection, no rename and no delete here. Deleting a session's file is a
+question about the promote table, not a generic file delete, and creating one inside a
+session is not offered at all yet: keeper's create path is the notes vault's, and a
+`60-sessions/` zone is the vault's sibling.
+
+Sessions are bounded by their own contract, so the whole tree is read in one pass rather
+than one call per folder. A workspace somebody let a package manager into can still
+outgrow that: the tree then stops and says so rather than showing a prefix of itself.
+
 ## Editing
 
 Opening a session opens its README in the same editor every other keeper surface uses —
@@ -140,6 +170,6 @@ remaining steps; every step is idempotent, and the folder move is always last.
 The promote panel (per-row promote review with staleness badges), the full notes query
 grammar over sessions (`is:`, `origin:`, `field:` — the board's free-text filter covers
 title/path/tags/snippet/log today), unread marks and per-file history projections on
-rows, capture-into-session-log, the sticky current session in the tray, and wikilinking a
-session from a note. All specified (FR-229/235/236/241/242/250) and scheduled; none
-implemented. Sessions on iOS are out of scope with the rest of the sync surface.
+rows, capture-into-session-log, the sticky current session in the tray, wikilinking a
+session from a note, and creating or deleting a file from inside the session tree. All
+specified (FR-229/235/236/241/242/250) and scheduled; none implemented. Sessions on iOS are out of scope with the rest of the sync surface.

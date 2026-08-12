@@ -2191,6 +2191,57 @@ fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<Sync
     Ok(find_profile(&profiles, id)?.clone())
 }
 
+// ---------------------------------------------------------------------------
+// What the sessions tree borrows (Phase 7, FR-254, AD-117)
+// ---------------------------------------------------------------------------
+//
+// A sessions root IS a sync profile (AD-107), so the session tree needs the
+// same three facts a listing needs: the profile, its write scope, and one
+// `pending` answer. These three re-export the machinery above rather than
+// letting `sessions_ipc` build its own — the whole point of the tree's sync
+// mark is that it is not a second opinion, and it stops being one the moment
+// the sessions surface starts asking git its own questions.
+//
+// Nothing new is computed here. Each is one line over a private helper,
+// visible to the crate and to nobody else.
+
+/// The profile behind one sessions root.
+pub(crate) fn sessions_profile(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<SyncProfile, IpcError> {
+    routable_profile(state, root_id)
+}
+
+/// The live vault and the write scope over it — including the AD-113 fence,
+/// which is what the tree renders its read-only lock from.
+pub(crate) fn sessions_scope(
+    profile: &SyncProfile,
+) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
+    vault_and_scope(profile)
+}
+
+/// One `Engine::pending` answer for the whole tree, the engine's own words on
+/// failure.
+pub(crate) async fn sessions_pending(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<Vec<keeper_sync::engine::PendingFile>, String> {
+    let engine = engine_of(state).map_err(|error| error.message)?;
+    engine
+        .pending(root_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The five sentences, verbatim — [`sync_mark`], for the sessions tree.
+pub(crate) fn sessions_sync_mark(
+    status: &browse::EntrySyncStatus,
+    engine_failure: Option<&str>,
+) -> FilesEntrySyncVm {
+    sync_mark(status, engine_failure)
+}
+
 /// Save one file inside a synced folder (Story 45.3, FR-175, AD-89, AD-65;
 /// Story 46.14, AD-102).
 ///

@@ -594,113 +594,145 @@ pub fn detail(
         continued_by: line.continued_by,
         summary: section_snippet(body, "## Summary"),
         log,
-        artifacts: section_files(&dir, "artifacts"),
-        refs: section_files(&dir, "refs"),
-        prompts: section_files(&dir, "prompts"),
-        workspace: section_files(&dir, WORKSPACE_DIR),
-        extras: extra_files(&dir),
     })
 }
 
-/// The files of one session subtree, one level of recursion flattened to
-/// rows (a session's sections are shallow by contract; deeper nesting shows
-/// as `sub/dir/file` names). `.gitkeep` and dotfiles are furniture. Sorted
-/// newest first — these sections are review surfaces.
-fn section_files(dir: &Path, section: &str) -> Vec<keeper_core::sessions::vm::SessionFileVm> {
-    use keeper_core::sessions::vm::SessionFileVm;
+/// One raw entry of a session's own tree, before anything is said about sync.
+///
+/// The walk deliberately knows nothing about profiles, excludes or the write
+/// fence: it reads dirents. `sessions_ipc` is what turns these into
+/// [`keeper_core::sessions::vm::SessionEntryVm`], because that is where the
+/// engine and the scope already are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawEntry {
+    pub name: String,
+    /// Session-relative, `/`-joined.
+    pub rel_path: String,
+    /// Session-relative parent, `""` at the top level.
+    pub parent: String,
+    /// 1 at the top level.
+    pub depth: u32,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime_ms: i64,
+}
 
-    fn walk(base: &Path, prefix: &str, section: &str, out: &mut Vec<SessionFileVm>, depth: usize) {
-        let Ok(entries) = std::fs::read_dir(base) else {
-            return;
-        };
-        for entry in entries.flatten() {
+/// Walk one session folder, in the order the tree renders (FR-254, AD-117).
+///
+/// **The zone's own order, not the alphabet.** `artifacts/`, `refs/`,
+/// `prompts/` and `workspace/` come first, in the zone's own sequence, because
+/// that sequence is what the zone contract teaches and re-sorting it here
+/// would make keeper's tree disagree with the operator's own documentation.
+/// Anything else follows, folders before files, name-insensitively — the
+/// Files-pane rule for entries keeper has no opinion about.
+///
+/// **Within a section, newest first.** A session's sections are review
+/// surfaces; the file you want is the one that just changed. The four ordering
+/// rules are all "what is this list for", which is why they differ.
+///
+/// The budget is [`WORKSPACE_WALK_BUDGET`], shared with the freshness signal —
+/// a session's `workspace/` is the one subtree that can hold a `node_modules`,
+/// and the caller is told when the walk stopped rather than being handed a
+/// prefix that looks complete.
+pub fn tree(root_id: &str, session_id: &str) -> Option<(String, Vec<RawEntry>, bool)> {
+    let row = row_of(root_id, session_id)?;
+    let zone = zone_of(root_id)?;
+    let dir = zone.join(&row.path);
+    let mut out = Vec::new();
+    let mut budget = WORKSPACE_WALK_BUDGET;
+    walk_tree(&dir, "", 1, &mut out, &mut budget);
+    Some((row.path, out, budget == 0))
+}
+
+/// The recursive half. `budget` counts down across the whole walk, so one
+/// enormous section cannot starve the ones after it silently — it exhausts the
+/// budget, and `truncated` says so.
+fn walk_tree(dir: &Path, prefix: &str, depth: u32, out: &mut Vec<RawEntry>, budget: &mut usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut listed: Vec<RawEntry> = entries
+        .flatten()
+        .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Dotfiles are furniture here exactly as they are in the Files
+            // pane: `.gitkeep` is the zone's own placeholder and `.keeper/` is
+            // keeper's, and neither is a file anybody opened this tree to see.
             if name.starts_with('.') {
-                continue;
+                return None;
             }
-            let rel_name = if prefix.is_empty() {
+            let meta = entry.metadata().ok()?;
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_millis() as i64)
+                .unwrap_or(0);
+            let rel_path = if prefix.is_empty() {
                 name.clone()
             } else {
                 format!("{prefix}/{name}")
             };
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                // Flatten up to three levels; past that a directory row says
-                // "there is more here" rather than the walk exploding.
-                if depth < 3 {
-                    walk(&entry.path(), &rel_name, section, out, depth + 1);
-                } else {
-                    out.push(SessionFileVm {
-                        name: rel_name.clone(),
-                        rel_path: format!("{section}/{rel_name}"),
-                        size: 0,
-                        mtime_ms: 0,
-                        is_dir: true,
-                    });
-                }
-            } else {
-                let mtime_ms = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                out.push(SessionFileVm {
-                    name: rel_name.clone(),
-                    rel_path: format!("{section}/{rel_name}"),
-                    size: meta.len(),
-                    mtime_ms,
-                    is_dir: false,
-                });
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    walk(&dir.join(section), "", section, &mut out, 0);
-    out.sort_by_key(|file| std::cmp::Reverse(file.mtime_ms));
-    out
-}
-
-/// Loose files at the session root beside the README — extra `.md` notes a
-/// session grew. The README itself and the four standard directories are the
-/// structure, not extras.
-fn extra_files(dir: &Path) -> Vec<keeper_core::sessions::vm::SessionFileVm> {
-    use keeper_core::sessions::vm::SessionFileVm;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<SessionFileVm> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == README {
-                return None;
-            }
-            let meta = entry.metadata().ok()?;
-            if meta.is_dir() {
-                return None; // the four standard dirs are sections, not extras
-            }
-            let mtime_ms = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            Some(SessionFileVm {
-                name: name.clone(),
-                rel_path: name,
-                size: meta.len(),
+            Some(RawEntry {
+                name,
+                rel_path,
+                parent: prefix.to_owned(),
+                depth,
+                is_dir: meta.is_dir(),
+                size: if meta.is_dir() { 0 } else { meta.len() },
                 mtime_ms,
-                is_dir: false,
             })
         })
         .collect();
-    out.sort_by_key(|file| std::cmp::Reverse(file.mtime_ms));
-    out
+
+    if prefix.is_empty() {
+        // The session root: the zone's four standard directories in the zone's
+        // own order, then everything else folders-first-by-name.
+        listed.sort_by(|a, b| {
+            let rank = |entry: &RawEntry| {
+                SECTION_ORDER
+                    .iter()
+                    .position(|section| *section == entry.name)
+                    .unwrap_or(SECTION_ORDER.len())
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| b.is_dir.cmp(&a.is_dir))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    } else {
+        // Inside a section: newest first, the review order.
+        listed.sort_by(|a, b| {
+            b.mtime_ms
+                .cmp(&a.mtime_ms)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    for entry in listed {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let is_dir = entry.is_dir;
+        // `dir` is already this level; the child is one `name` below it, not
+        // one `rel_path` — `rel_path` is measured from the session root.
+        let child = dir.join(&entry.name);
+        let rel_path = entry.rel_path.clone();
+        out.push(entry);
+        if is_dir {
+            walk_tree(&child, &rel_path, depth + 1, out, budget);
+        }
+    }
 }
+
+/// The zone's own section order at a session's root (`60-sessions` contract).
+///
+/// `README.md` is deliberately absent: it sorts with everything else, after
+/// the four sections. It is not hidden — a session's record has a sync story
+/// like any other file — but it does not get promoted above the sections,
+/// because the header already opens it with its own verb.
+const SECTION_ORDER: [&str; 4] = ["artifacts", "refs", "prompts", WORKSPACE_DIR];
 
 /// First non-empty prose line under a `## <name>` heading.
 fn section_snippet(body: &str, heading: &str) -> String {
@@ -786,5 +818,120 @@ mod tests {
         );
         assert_eq!(date, "2026-08-09");
         assert_eq!(line, "the body line");
+    }
+
+    /// One session folder, walked (FR-254).
+    fn walk(dir: &Path, budget: usize) -> (Vec<RawEntry>, bool) {
+        let mut out = Vec::new();
+        let mut left = budget;
+        walk_tree(dir, "", 1, &mut out, &mut left);
+        (out, left == 0)
+    }
+
+    /// The tree renders in the zone's own order — the four contract sections
+    /// first, in the contract's sequence, then everything else — and each
+    /// section's subtree follows it rather than being appended at the end.
+    #[test]
+    fn the_walk_orders_by_the_zone_contract_and_nests_each_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["workspace", "prompts", "refs", "artifacts", "scratch"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        std::fs::write(session.join("README.md"), "# s\n").expect("write");
+        std::fs::write(session.join("artifacts/report.md"), "r").expect("write");
+        std::fs::write(session.join("workspace/iter.md"), "i").expect("write");
+
+        let (entries, truncated) = walk(session, WORKSPACE_WALK_BUDGET);
+        assert!(!truncated, "eight entries do not exhaust the budget");
+
+        let order: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "artifacts",
+                "artifacts/report.md",
+                "refs",
+                "prompts",
+                "workspace",
+                "workspace/iter.md",
+                "scratch",
+                "README.md",
+            ],
+            "contract sections in contract order, each followed by its own \
+             subtree; unknown entries after them, folders before files"
+        );
+
+        let report = entries
+            .iter()
+            .find(|e| e.rel_path == "artifacts/report.md")
+            .expect("the artifact");
+        assert_eq!(
+            report.parent, "artifacts",
+            "nesting is carried, not implied"
+        );
+        assert_eq!(report.depth, 2, "aria-level starts at 1 for the sections");
+        assert!(!report.is_dir);
+        assert_eq!(report.size, 1);
+
+        let artifacts = &entries[0];
+        assert_eq!(artifacts.parent, "", "a section's parent is the session");
+        assert_eq!(artifacts.depth, 1);
+        assert!(artifacts.is_dir);
+    }
+
+    /// Inside a section the newest file is first, because a session's sections
+    /// are review surfaces and the file you want is the one that just changed.
+    #[test]
+    fn a_section_lists_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("artifacts")).expect("mkdir");
+        // Explicit mtimes: two writes a millisecond apart are not an order.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let stamp = |name: &str, when: std::time::SystemTime| {
+            let path = session.join("artifacts").join(name);
+            std::fs::write(&path, "x").expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(when)
+                .expect("mtime");
+        };
+        stamp("old.md", old);
+        stamp("new.md", old + std::time::Duration::from_secs(86_400));
+
+        let (entries, _) = walk(session, WORKSPACE_WALK_BUDGET);
+        let inside: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.parent == "artifacts")
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(inside, vec!["new.md", "old.md"]);
+    }
+
+    /// Dotfiles are furniture, and a walk that runs out of budget says so
+    /// rather than handing back a prefix that looks complete.
+    #[test]
+    fn dotfiles_are_skipped_and_an_exhausted_budget_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("workspace")).expect("mkdir");
+        std::fs::write(session.join(".keeper-marker"), "x").expect("write");
+        for index in 0..8 {
+            std::fs::write(session.join("workspace").join(format!("f{index}.md")), "x")
+                .expect("write");
+        }
+
+        let (all, _) = walk(session, WORKSPACE_WALK_BUDGET);
+        assert!(
+            all.iter().all(|e| !e.name.starts_with('.')),
+            "the tree is not where dotfiles are read"
+        );
+
+        let (clipped, truncated) = walk(session, 4);
+        assert_eq!(clipped.len(), 4);
+        assert!(truncated, "the caller is told the walk stopped");
     }
 }

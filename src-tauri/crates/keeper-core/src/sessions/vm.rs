@@ -151,23 +151,73 @@ pub struct SessionLogEntryVm {
     pub body: String,
 }
 
-/// One file (or directory) inside a session, for the detail's mini-file
-/// sections (FR-233). Session-relative path, `/`-joined.
+/// One entry of a session's own file tree (FR-254, AD-117).
+///
+/// A session folder is a small workspace, so the detail browses it the way the
+/// Files tab browses a synced folder: real nesting, one sync mark per entry,
+/// and the same words for the same state. What made this a new type rather
+/// than a wider `SessionFileVm` is the two facts a flat list had nowhere to
+/// put — whether the entry syncs, and whether keeper may write to it.
+///
+/// **Flat on the wire, nested on screen.** Every entry carries `parent` and
+/// `depth`, and the frontend assembles the rows from them. That is rendering,
+/// not deciding: the shell already knows the shape (it walked the directory),
+/// and a nested payload would make the tree's own order a thing React could
+/// disagree with the shell about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionFileVm {
-    /// The file's name, for the row label.
+pub struct SessionEntryVm {
+    /// The entry's own name — the row's label, and the only thing a person
+    /// navigating by first letter is matching against.
     pub name: String,
-    /// Session-relative path (`artifacts/report.md`).
+    /// Session-relative path (`artifacts/report.md`), `/`-joined. The key.
     pub rel_path: String,
-    /// Bytes; 0 for a directory.
-    #[ts(type = "number")]
-    pub size: u64,
-    /// Modification time, ms since epoch.
+    /// Session-relative parent, `""` for a top-level entry. What the frontend
+    /// nests on.
+    pub parent: String,
+    /// 1 for a top-level entry, growing with each level. Rendered as
+    /// `aria-level`, so it starts at 1 like the ARIA tree it feeds.
+    pub depth: u32,
+    pub is_dir: bool,
+    /// **Profile-relative**, composed in Rust (AD-65): the zone subfolder, the
+    /// session folder and `rel_path`. The frontend hands this straight to a
+    /// file target or to `sync_open_entry` and never joins a path itself.
+    pub subpath: String,
+    /// The same entry against the profile's local path, composed in Rust —
+    /// [`crate::vm::FilesEntryVm::absolute_path`]'s rule, and its restriction:
+    /// only ever an action's argument (reveal), never something rendered.
+    pub absolute_path: String,
+    /// `None` for a directory — the [`crate::vm::FilesEntryVm::size`] rule: a
+    /// folder's byte count is a number keeper would have to invent.
+    pub size: Option<crate::vm::FileSizeVm>,
+    /// Modification time, ms since epoch; 0 when the OS would not say.
     #[ts(type = "number")]
     pub mtime_ms: i64,
-    pub is_dir: bool,
+    /// What sync says about this entry — the SAME mark and the SAME sentence
+    /// the Files tab renders, from the same `Engine::pending` answer. A
+    /// session that lives in a synced folder has a sync story, and hiding it
+    /// here would make the Files tab and this tree disagree about one file.
+    pub sync: crate::vm::FilesEntrySyncVm,
+    /// Why keeper will not write here, when it will not (AD-113): the
+    /// workspace fence's own refusal sentence, verbatim. `None` everywhere
+    /// else. A lock with no reason is a lock people file bugs about.
+    pub locked: Option<String>,
+}
+
+/// One session's file tree (FR-254): the entries, and whether the walk was cut
+/// short.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTreeVm {
+    /// Every entry, shell-ordered: the zone's own sections first, in the
+    /// zone's own order, each followed by its subtree.
+    pub entries: Vec<SessionEntryVm>,
+    /// The walk hit its budget and stopped. A session's `workspace/` can hold
+    /// a `node_modules`, and a tree that silently showed a prefix of one would
+    /// be a tree that lies about being complete.
+    pub truncated: bool,
 }
 
 /// One user-tier frontmatter field of the session README, for the detail's
@@ -182,10 +232,15 @@ pub struct SessionPropertyVm {
     pub value: String,
 }
 
-/// Everything the session detail renders (FR-233): the header facts, the
-/// properties widget, the rendered log, and the file sections. Composed in
-/// the shell from one directory walk plus the README parse; every field is
-/// derivable from files alone (AD-110).
+/// Everything the session detail renders about the session's *record*
+/// (FR-233): the header facts, the properties widget and the rendered log.
+/// Composed in the shell from one README parse; every field is derivable from
+/// files alone (AD-110).
+///
+/// The files themselves are [`SessionTreeVm`], read separately (FR-254): the
+/// tree costs a walk and one `Engine::pending` query, and the log does not,
+/// so binding them into one payload would make every log re-read pay for the
+/// tree.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
@@ -210,16 +265,4 @@ pub struct SessionDetailVm {
     /// The `## Log`, parsed, NEWEST FIRST (review order — the zone's file
     /// stays newest-last; only this projection reverses).
     pub log: Vec<SessionLogEntryVm>,
-    /// Promoted output — versioned, click-to-open.
-    pub artifacts: Vec<SessionFileVm>,
-    /// Kept inputs — versioned, click-to-open.
-    pub refs: Vec<SessionFileVm>,
-    /// Reusable prompts — versioned, click-to-open.
-    pub prompts: Vec<SessionFileVm>,
-    /// Scratch, READ-ONLY (AD-113): listed with the zone's own caveat, never
-    /// written, capped by the same walk budget as the freshness signal.
-    pub workspace: Vec<SessionFileVm>,
-    /// Loose files at the session root beside the README — a session that
-    /// grew extra notes keeps them visible rather than orphaned.
-    pub extras: Vec<SessionFileVm>,
 }
