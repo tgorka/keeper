@@ -15,6 +15,7 @@
  * `palette_query` is authoritative per query.
  */
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
+import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
 import {
   archiveRoom,
   chatNotifyModeSet,
@@ -41,6 +42,7 @@ import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import type { RoomSelection } from "@/lib/stores/rooms";
 import { searchStore } from "@/lib/stores/search";
+import { sessionsListStore } from "@/lib/stores/sessions-list";
 
 /** The open-chat context an open-chat action operates on. */
 export type PaletteActionContext = RoomSelection;
@@ -130,6 +132,24 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   "notes-switch-vault": () => {
     primaryViewStore.getState().setView("notes");
     notesVaultsStore.getState().requestSwitcherOpen();
+  },
+
+  // --- Sessions verbs (Phase 7, FR-251) --- registry-gated on the sessions
+  // capability in Rust, the notes rule again. Each lands on the board; the
+  // board's own controls carry the verb from there — the palette routes, it
+  // does not re-implement.
+  "sessions-view": () => {
+    primaryViewStore.getState().setView("sessions");
+  },
+  "sessions-new": () => {
+    primaryViewStore.getState().setView("sessions");
+    sessionsListStore.getState().requestCreateOpen();
+  },
+  "sessions-log-today": async () => {
+    // Routes through the SAME function ⌘⌥L uses (UX-DR42's one-verb rule);
+    // the board opens first so a refusal has a surface to explain itself on.
+    primaryViewStore.getState().setView("sessions");
+    await logTodayInCurrentSession();
   },
 
   // --- Global actions (dialogs / commands) ---

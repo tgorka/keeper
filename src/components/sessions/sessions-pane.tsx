@@ -128,6 +128,14 @@ export function SessionsPane() {
   // the README opens with the caret ready.
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
+  // The palette's New Session bumps the nonce; the board answers by opening
+  // its create row — the vault-switcher idiom (FR-251).
+  const createNonce = useSessionsListStore((s) => s.createNonce);
+  useEffect(() => {
+    if (createNonce > 0) {
+      setCreating(true);
+    }
+  }, [createNonce]);
   const submitCreate = useCallback(() => {
     const title = newTitle.trim();
     if (activeRoot === null || title === "") {

@@ -42,6 +42,9 @@ const MIN_CHAT_QUERY_LEN: usize = 2;
 /// iOS, which is the exact bug FR-122 forbids.
 const NOTES_CATEGORY: &str = "Notes";
 
+/// The sessions verbs' category (Phase 7, FR-251), gated whole like Notes.
+const SESSIONS_CATEGORY: &str = "Sessions";
+
 /// The registry ids of the three Recording verbs (Story 20.4, FR-48), named
 /// because a fourth surface now dispatches on them.
 ///
@@ -639,6 +642,33 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             Some("⌘⌥V"),
             false,
         ),
+        // --- Sessions (Phase 7, FR-251): gated by category exactly as Notes
+        // is, on the sessions capability — the same construction over the same
+        // sync substrate, so the same absence rule (FR-223).
+        action(
+            "sessions-view",
+            "Sessions",
+            SESSIONS_CATEGORY,
+            &["session", "work", "llm", "agent", "board"],
+            Some("⌘7"),
+            false,
+        ),
+        action(
+            "sessions-new",
+            "New Session",
+            SESSIONS_CATEGORY,
+            &["session", "start", "create", "work"],
+            None,
+            false,
+        ),
+        action(
+            "sessions-log-today",
+            "Log Today in Session",
+            SESSIONS_CATEGORY,
+            &["session", "log", "entry", "journal", "today"],
+            Some("⌘⌥L"),
+            false,
+        ),
         // --- Global actions (dialogs / commands) ---
         action(
             "new-chat",
@@ -822,6 +852,9 @@ const CATEGORY_ORDER: &[&str] = &[
     // category vanishes with its flag off, so this position only matters on a
     // desktop build that has folder sync.
     NOTES_CATEGORY,
+    // The capability-gated sessions verbs (Phase 7), directly after Notes —
+    // the sibling surface over the same sync substrate (FR-251).
+    SESSIONS_CATEGORY,
     "Chat",
 ];
 
@@ -841,12 +874,19 @@ const CATEGORY_ORDER: &[&str] = &[
 /// registry keeps all three surfaces consistent without any per-platform logic.
 /// `notes` does the same for the whole [`NOTES_CATEGORY`] section (Phase 5,
 /// FR-122): with it off the section is absent from the cheat sheet and the native
-/// menu bar, not greyed out in them.
+/// menu bar, not greyed out in them. The sessions section rides the SAME flag
+/// (Phase 7, FR-223): `CapabilitiesVm.sessions` is computed from the identical
+/// condition as `notes` (sync && desktop), so one gate parameter serves both —
+/// a second boolean here would be two names for one fact until the day the two
+/// capabilities diverge, and that day amends this signature with the AD it
+/// arrives on.
 pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
     let actions: Vec<PaletteActionVm> = palette_actions()
         .into_iter()
         .filter(|action| recording || !action.requires_recording)
-        .filter(|action| notes || action.category != NOTES_CATEGORY)
+        .filter(|action| {
+            notes || (action.category != NOTES_CATEGORY && action.category != SESSIONS_CATEGORY)
+        })
         .collect();
 
     // Preserve first-appearance order of categories, then sort by CATEGORY_ORDER

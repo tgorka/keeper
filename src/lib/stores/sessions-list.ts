@@ -31,6 +31,11 @@ export interface SessionsListState {
   unreadOnly: boolean;
   /** Human-readable read failure, or `null`. */
   error: string | null;
+  /**
+   * Bumped to ask the board to reveal its create row — the palette's New
+   * Session lands here (the `switcherNonce` idiom from `notes-vaults`).
+   */
+  createNonce: number;
   reset: (rootId: string, rows: SessionRowVm[]) => void;
   clear: () => void;
   setText: (text: string) => void;
@@ -38,6 +43,7 @@ export interface SessionsListState {
   setPinnedOnly: (pinnedOnly: boolean) => void;
   setUnreadOnly: (unreadOnly: boolean) => void;
   setError: (error: string | null) => void;
+  requestCreateOpen: () => void;
 }
 
 export const sessionsListStore = createStore<SessionsListState>()((set) => ({
@@ -48,6 +54,7 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   pinnedOnly: false,
   unreadOnly: false,
   error: null,
+  createNonce: 0,
   reset: (rootId, rows) => set({ rows, rowsRootId: rootId, error: null }),
   clear: () => set({ rows: null, rowsRootId: null, error: null }),
   setText: (text) => set({ text }),
@@ -55,6 +62,7 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
   setUnreadOnly: (unreadOnly) => set({ unreadOnly }),
   setError: (error) => set({ error }),
+  requestCreateOpen: () => set((state) => ({ createNonce: state.createNonce + 1 })),
 }));
 
 export function useSessionsListStore<T>(selector: (state: SessionsListState) => T): T {
@@ -118,5 +126,6 @@ export function resetSessionsListStoreForTest(): void {
     pinnedOnly: false,
     unreadOnly: false,
     error: null,
+    createNonce: 0,
   });
 }

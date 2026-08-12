@@ -40,6 +40,7 @@ import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import { useRecordingHotkey } from "@/hooks/use-recording-hotkey";
 import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
+import { useSessionsShortcut } from "@/hooks/use-sessions-shortcut";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
@@ -89,6 +90,9 @@ export function AppShell() {
   // chord self-gates on the `notes` capability, so none of them is a dead key
   // where notes cannot exist.
   useNotesShortcut();
+  // Wire ⌘7 to the Sessions board and ⌘⌥L to log-today (Phase 7, FR-251);
+  // self-gated on the sessions capability by the same rule.
+  useSessionsShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
