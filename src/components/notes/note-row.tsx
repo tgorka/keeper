@@ -131,7 +131,13 @@ export function NoteRow({
       // one — which is why no timer swallows the first click here either.
       onDoubleClick={() => onSelectBeside(row)}
       className={cn(
-        "flex h-16 w-full items-start gap-2 px-3 py-2 text-left outline-none",
+        // `items-center`, not `items-start`. Top-aligned content in a 64px box
+        // pooled all of a row's slack UNDER its text, so the gutter between two
+        // rows was 18px of one row plus 8px of the next and the boundary sat
+        // nowhere in particular. Centred, the slack is equal above and below
+        // and the boundary falls in the middle of a measurable gap — which is
+        // how the chat list, the recordings list and the Files tree all read.
+        "flex h-16 w-full items-center gap-2 px-3 py-2 text-left outline-none",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
         selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
         // A conflict is loss in progress, so it gets the destructive edge; a pin
@@ -140,13 +146,26 @@ export function NoteRow({
       )}
     >
       {/* The unread dot appears at full opacity and never animates (UX-DR39):
-          information that twitches trains people to ignore it. */}
+          information that twitches trains people to ignore it.
+
+          Filled for unread, HOLLOW for read, and never absent — it used to be
+          `bg-transparent` once read, which cost two things. It carried its one
+          state in colour alone, where DESIGN.md asks for a filled/hollow pair
+          and never a bare dot. And it left this list with no anchor: every
+          other list in the app draws no row rule and gets its rhythm from a
+          mark repeating at a constant x down the column — the chat list's
+          avatar and account bar, a recording row's card edge, a tree row's file
+          icon. A list of read notes had an empty lane and nothing to repeat,
+          which is the sense in which its row boundary went missing. The answer
+          is the app's answer, not a hairline per row: one rule here would make
+          the notes list the only ruled list in keeper, which is heavier than
+          the app rather than more legible. */}
       <span
         aria-hidden="true"
         data-slot="unread-dot"
         className={cn(
-          "mt-1.5 size-2 shrink-0 rounded-full",
-          row.unread ? "bg-primary" : "bg-transparent",
+          "size-2 shrink-0 rounded-full",
+          row.unread ? "bg-primary" : "border border-border",
         )}
       />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">

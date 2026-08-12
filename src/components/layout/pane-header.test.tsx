@@ -263,3 +263,53 @@ describe("the status is a box before it is a word", () => {
     expect(shownElement()).not.toHaveAttribute("title");
   });
 });
+
+/**
+ * The seam and the height, which the component did not own until this story.
+ *
+ * These are class assertions, and that is the honest ceiling: jsdom performs no
+ * layout and loads no Tailwind, so "the row is 40px" and "one hairline, not two"
+ * are not measurable here. What IS assertable is the thing that actually
+ * regressed — WHO spells the edge. Three callers each spelled their own, over
+ * three heights, all nominally implementing one 40px pane header; the defect was
+ * ownership, and ownership is exactly what a class on the right element proves.
+ * `check:design`'s `seam-doubled` rule guards the other side of it, at the
+ * callers.
+ */
+describe("the header owns its own bottom edge and its own height", () => {
+  it("draws the seam itself rather than leaving it to a caller", () => {
+    render(<PaneHeader identity={<span>a.md</span>} actions={<button type="button">X</button>} />);
+
+    // DESIGN.md → Elevation & Depth: the earlier sibling owns its trailing
+    // edge. A header is the band above whatever the pane draws next, so the
+    // hairline between them is the header's.
+    expect(headerRow()).toHaveClass("border-b");
+    expect(headerRow()).toHaveClass("border-border");
+  });
+
+  it("fixes the row at DESIGN.md's pane-header height", () => {
+    render(<PaneHeader identity={<span>a.md</span>} actions={<button type="button">X</button>} />);
+
+    // 40px, seam included, and `items-center` rather than a caller's guess at
+    // vertical padding — which is how one of the three shipped at 44.
+    expect(headerRow()).toHaveClass("h-10");
+    expect(headerRow()).toHaveClass("items-center");
+  });
+
+  it("keeps both when a caller passes its own padding", () => {
+    render(
+      <PaneHeader
+        className="px-3"
+        identity={<span>a.md</span>}
+        actions={<button type="button">X</button>}
+      />,
+    );
+
+    // The class hook is horizontal padding. It merges; it does not get to
+    // replace the edge or the height, which is what would let two callers of
+    // one component disagree about either again.
+    expect(headerRow()).toHaveClass("px-3");
+    expect(headerRow()).toHaveClass("border-b");
+    expect(headerRow()).toHaveClass("h-10");
+  });
+});

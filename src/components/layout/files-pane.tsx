@@ -77,9 +77,12 @@
 
 import type { LucideIcon } from "lucide-react";
 import {
+  Check,
   ChevronDown,
   ChevronRight,
   Clapperboard,
+  Copy,
+  ExternalLink,
   FileBraces,
   FileCode,
   FileHeadphone,
@@ -91,6 +94,7 @@ import {
   FileType,
   Folder,
   FolderOpen,
+  FolderSearch,
   ListChecks,
   NotebookPen,
   RefreshCw,
@@ -99,8 +103,10 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   ReactNode,
+  RefCallback,
 } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { planPriorityActions } from "@/components/layout/priority-actions";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
 import { ATTACH_TO_NOTE_LABEL, AttachToNoteDialog } from "@/components/notes/attach-to-note-dialog";
@@ -126,6 +132,7 @@ import {
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
+import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel, ITEMS } from "@/lib/count-label";
 import type {
   FilesDeletePlanVm,
@@ -172,7 +179,13 @@ import { resolveViewer } from "@/lib/viewers";
  */
 const FILES_ROW_ESTIMATE = 32;
 
-/** The pane's heading, and the accessible name of the surface itself. */
+/** The pane's display name.
+ *
+ * It reaches the screen through {@link SURFACE_COLUMNS}`["files-tree"].title`
+ * and the shared fold chrome, which draws it once at the top of the column and
+ * points the section's `aria-labelledby` at it — so the region's name and the
+ * heading a reader hears are the same element rather than the same word twice.
+ * Still exported: the surface's copy and its tests are written around it. */
 export const FILES_PANE_TITLE = "Files";
 
 /** The one honest sentence under the heading: what this shows, and what it can change. */
@@ -188,7 +201,8 @@ export const FILES_PANE_SUBTITLE =
  * document that list opens. The strip beside it is the flexible one now, which
  * is the arrangement Notes has had since Story 46.12.
  */
-const FILES_COLUMN_CLASS = "flex min-w-0 shrink-0 flex-col border-border border-r bg-background";
+const FILES_COLUMN_CLASS =
+  "flex min-w-0 shrink-0 flex-col border-border border-r bg-background last:border-r-0";
 
 /** The accessible name of the tree (distinct from the pane's own name). */
 export const FILES_TREE_LABEL = "Synced folders";
@@ -249,20 +263,6 @@ export const FILES_COPIED_LABEL = "Copied";
 export const FILES_OPEN_HERE_LABEL = "Open in this panel";
 export const FILES_OPEN_BESIDE_LABEL = "Open in a new panel";
 export const FILES_OPEN_LABEL = "Open in the default app";
-
-/**
- * What the row's own hand-it-to-the-system button SAYS, as against what it is
- * NAMED ({@link FILES_OPEN_LABEL}, its `aria-label` and its `title`).
- *
- * The row already carries three text buttons and a name that has to truncate
- * before they do; spelling the whole verb across it would cost the file name
- * about a hundred pixels on every row in the tree. So the button shows the short
- * word and answers to the long one. The accessible name CONTAINS the visible
- * label, which is the condition that makes this safe rather than a trap for
- * anyone driving keeper by voice (WCAG 2.5.3), and the menu — where a reader
- * goes to find out what the row can do — spells all three verbs out in full.
- */
-export const FILES_OPEN_SHORT_LABEL = "Open";
 
 /** The write controls, and the two sentences the surface uses around them
  * (Story 45.3). Every other word in the confirmation is Rust's. */
@@ -517,6 +517,114 @@ function entryCount(listing: FilesListingVm | undefined): string | null {
 /** What the affordance opens, for its accessible name. Every row's is the
  * same verb; the file's own name is what distinguishes them. */
 export const FILES_NAME_LABEL = "file name";
+
+/**
+ * How wide one row action's control is, in px.
+ *
+ * A `size="icon-sm"` ghost `Button`: a 32px square, which is DESIGN.md's
+ * load-bearing control height and is what `buttonVariants` draws. Declared
+ * rather than measured, and the difference from `PriorityActions` — which
+ * refuses a declared table of widths — is the difference between a WORD and a
+ * SQUARE. A word's width is a guess about a font, a locale and a text-size
+ * setting, and it is wrong on the first machine that disagrees. A square's side
+ * is a class.
+ */
+const FILES_ROW_ACTION_PX = 32;
+
+/** The row's own `gap-1`, in px. The arithmetic below and the layout above read
+ *  the same number, so they cannot come to disagree. */
+const FILES_ROW_GAP_PX = 4;
+
+/** What one level of nesting costs, in px — the row's `paddingInlineStart`. */
+const FILES_ROW_INDENT_PX = 16;
+
+/** The row's `px-2`, in px. Spent twice: once as the base of the indent, once
+ *  at the trailing edge. */
+const FILES_ROW_PAD_PX = 8;
+
+/**
+ * Pixels the row spends before the name: the chevron column (14) the files hold
+ * open so their names line up with the folders', the file-type glyph (16), the
+ * two 4px gaps between them and the name group's own `px-1`.
+ */
+const FILES_ROW_GLYPHS_PX = 46;
+
+/**
+ * Pixels the row spends after the name and before the actions: the size or count
+ * cell at the width a five-character figure takes in the mono face, plus the
+ * sync mark and their gaps.
+ */
+const FILES_ROW_META_PX = 64;
+
+/**
+ * Pixels the name is never asked to give up, whatever else wants the row.
+ *
+ * About fourteen characters at `text-sm`, which is the point below which a file
+ * name stops identifying a file — `2026-08-12-not…` still says something,
+ * `2026-…` does not. This is what the owner's report was actually about: at 360px
+ * the always-mounted `Open` / `Reveal in Finder` / `Copy path` text buttons, the
+ * size cell and the sync mark took about 250 of them, so the name was squeezed to
+ * roughly 30px on EVERY file row — which is also why every file row grew an
+ * Expand trigger and folder rows, having neither a size cell nor an Open button,
+ * did not. Folders looked fine because folders were never squeezed.
+ */
+export const FILES_NAME_FLOOR_PX = 112;
+
+export interface FilesRowBudgetInput {
+  /** The tree's own width in px, measured — see `FilesPane`'s viewport effect. */
+  readonly column: number;
+  /** The row's `aria-level`, 1 for a profile root. */
+  readonly level: number;
+}
+
+/**
+ * Pixels a row may spend on its action controls, which is everything the row has
+ * left once the name has been given its floor.
+ *
+ * The shape `paneHeaderActionsBudget` has, for the same reason: the surface knows
+ * what the pixels before the group have been spent on, and
+ * {@link planPriorityActions} — the same policy the note header spends, not a
+ * second one — decides how many controls that buys.
+ *
+ * **The reserves are declared and that is safe here, where a declared item width
+ * would not be.** Being a few pixels wrong about the size cell costs the name a
+ * few pixels; being wrong about a control's width pushes a control off the edge,
+ * which is the defect `PriorityActions` was written to end. Nothing is lost
+ * either way: every verb is in the row's context menu at every width, so this
+ * arithmetic decides which of them are ALSO one click away and never whether
+ * they are reachable.
+ *
+ * Zero, never negative: a row too narrow for any control still has a name, a
+ * size and a menu, which is the 220px shape.
+ */
+export function filesRowActionsBudget({ column, level }: FilesRowBudgetInput): number {
+  if (!Number.isFinite(column) || !Number.isFinite(level)) {
+    return 0;
+  }
+  const indent = (level - 1) * FILES_ROW_INDENT_PX + FILES_ROW_PAD_PX;
+  return Math.max(
+    0,
+    column -
+      indent -
+      FILES_ROW_PAD_PX -
+      FILES_ROW_GLYPHS_PX -
+      FILES_ROW_META_PX -
+      FILES_NAME_FLOOR_PX,
+  );
+}
+
+/** One of a row's verbs, as the row's own cluster and its menu both need it. */
+interface FilesRowAction {
+  /** Stable identity, so a promoted control keeps its place as labels change. */
+  readonly id: string;
+  /** The accessible name, the tooltip, and the words in the menu item. */
+  readonly label: string;
+  /** The glyph the promoted control draws. */
+  readonly icon: LucideIcon;
+  /** What the control and the menu item both do. One handler, so they cannot
+   *  drift — the rule `PriorityAction` states and this borrows. */
+  readonly onSelect: () => void;
+}
 
 /**
  * A row's name, plus the way to read it when the tree is narrower than the name
@@ -1121,6 +1229,45 @@ export function FilesPane() {
   });
 
   /**
+   * How wide a tree row actually is, in px — the number
+   * {@link filesRowActionsBudget} spends.
+   *
+   * The `tree` element and not the column: it is the box the rows are laid out
+   * in, so `clientWidth` has already had the pane's gutters and the vertical
+   * scrollbar taken out of it. One observer for the whole tree rather than one
+   * per row, for `window-list`'s reason: every row is the same width by
+   * construction, and the tree mounts and unmounts a screenful of them on every
+   * scroll.
+   *
+   * A callback ref with a cleanup rather than an effect, which is the idiom
+   * `useWindowedRows` attaches its own viewport with: the element comes and goes
+   * with the empty state and with the fold, and a ref runs when it does. Zero is
+   * never published — a platform that reports no layout at all (jsdom) gets the
+   * width this column has when nobody has dragged it, so a test sees the shape a
+   * fresh install has rather than the 48px one, exactly as that hook assumes a
+   * viewport height rather than rendering no rows.
+   */
+  const [treeWidth, setTreeWidth] = useState(SURFACE_COLUMNS["files-tree"].defaultWidth);
+  const attachTree = useCallback<RefCallback<HTMLElement>>((element) => {
+    if (element === null) {
+      return;
+    }
+    const read = () => {
+      const width = element.clientWidth;
+      setTreeWidth(width > 0 ? width : SURFACE_COLUMNS["files-tree"].defaultWidth);
+    };
+    read();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    // A seam drag moves no state this pane reads, so nothing here would
+    // re-render and the read above would never run again.
+    const observer = new ResizeObserver(read);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  /**
    * Ask Rust what deleting these rows would do, then show its answer.
    *
    * Nothing is deleted here. The plan is a separate call from the delete on
@@ -1515,11 +1662,78 @@ export function FilesPane() {
       ]
         .filter((id) => id !== null)
         .join(" ") || undefined;
-    // Story 46.13, FR-215: what this row can be opened as, and therefore whether
-    // it has a menu at all. Derived once — the menu's items and the row's own
-    // click gestures must be about the same target or the two gestures mean
-    // different things on the same row.
+    // Story 46.13, FR-215: what this row can be opened as. Derived once — the
+    // menu's items and the row's own click gestures must be about the same
+    // target or the two gestures mean different things on the same row.
     const target = rowTarget(node);
+    /**
+     * Every verb this row has, in the order it matters.
+     *
+     * A profile root has none: it is a configured folder, and what can be done
+     * to one is the Sync pane's business. Everything else has at least Copy
+     * path — the row's own text, which is worth having on a clipboard whatever
+     * else the platform will or will not do.
+     */
+    const actions: readonly FilesRowAction[] =
+      entry === null
+        ? []
+        : [
+            // A file's primary verb, and the one that leaves keeper. Absent on a
+            // folder, whose own gesture is expand/collapse.
+            ...(node.isFolder
+              ? []
+              : [
+                  {
+                    id: "open",
+                    label: FILES_OPEN_LABEL,
+                    icon: ExternalLink,
+                    onSelect: () => {
+                      void syncOpenEntry(node.profileId, entry.relativePath).catch(() => undefined);
+                    },
+                  },
+                ]),
+            // `FolderSearch` and not `FolderOpen`, which is the glyph
+            // `properties-panel` gives this same verb. There the glyph decorates
+            // a menu item that also spells the words; here it IS the control, on
+            // a row whose own leading glyph is `FolderOpen` for every expanded
+            // folder in the tree — two identical marks in one row read as one
+            // mark drawn twice, which is half of what the owner photographed.
+            ...(canReveal
+              ? [
+                  {
+                    id: "reveal",
+                    label: FILES_REVEAL_LABEL,
+                    icon: FolderSearch,
+                    onSelect: () => {
+                      void revealPath(entry.absolutePath).catch(() => undefined);
+                    },
+                  },
+                ]
+              : []),
+            {
+              id: "copy",
+              // The confirmation is the label and the glyph together, because the
+              // control has no words on it to change: a tick says the press
+              // landed, and the name says so to everyone who cannot see it.
+              label: copied === entry.absolutePath ? FILES_COPIED_LABEL : FILES_COPY_PATH_LABEL,
+              icon: copied === entry.absolutePath ? Check : Copy,
+              onSelect: () => copyPath(entry.absolutePath),
+            },
+          ];
+    // How many of them are on the row, as against only in its menu. The note
+    // header's own policy, applied to a narrower row: a PREFIX of the list, so a
+    // verb is out here only if everything above it is, and the cluster never
+    // reorders itself as the seam is dragged.
+    //
+    // Every promoted control is charged its own gap, which over-reserves the last
+    // one by 4px — the group is the row's final child, so there is nothing to its
+    // right. Four pixels in the name's favour is the safe direction.
+    const promoted = planPriorityActions({
+      available: filesRowActionsBudget({ column: treeWidth, level: node.level }),
+      reserved: 0,
+      widths: actions.map(() => FILES_ROW_ACTION_PX),
+      gap: FILES_ROW_GAP_PX,
+    });
     const row = (
       <div
         ref={(element) => {
@@ -1556,15 +1770,19 @@ export function FilesPane() {
         // Story 46.13: the phone tier's way into the very same menu the
         // right-click opens — a ≥500ms stationary press dispatches the synthetic
         // `contextmenu` the Radix trigger below is already listening for. Spread
-        // only on a row that HAS a menu, so a long press on a folder is not
-        // quietly swallowed by the click suppressor for a menu that never opens.
-        // Off the phone tier every one of these is a no-op.
-        {...(target === null ? {} : longPress)}
+        // only on a row that HAS a menu — which is now every row with an entry,
+        // folders included, because the menu is where the verbs the row is too
+        // narrow to show have gone. A profile root still has none, so a long
+        // press on one is not swallowed by the click suppressor for a menu that
+        // never opens. Off the phone tier every one of these is a no-op.
+        {...(entry === null ? {} : longPress)}
         className={cn(
           "flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring",
           selected.has(node.key) && "bg-accent",
         )}
-        style={{ paddingInlineStart: `${(node.level - 1) * 16 + 8}px` }}
+        style={{
+          paddingInlineStart: `${(node.level - 1) * FILES_ROW_INDENT_PX + FILES_ROW_PAD_PX}px`,
+        }}
       >
         <RowName name={node.name} tabIndex={actionTabIndex}>
           {(nameRef) =>
@@ -1681,54 +1899,46 @@ export function FilesPane() {
             {FILES_NEW_FILE_LABEL}
           </Button>
         )}
-        {entry !== null && (
+        {/* The verbs this row is wide enough to show (see `promoted`).
+
+            Icons, not words. Three text buttons — `Open`, `Reveal in Finder`,
+            `Copy path` — were about 250px of a 360px column, so the name they
+            sat beside was squeezed to roughly 30px on every file row in the
+            tree. The word is gone from the surface and from nowhere else: it is
+            still the accessible name and still the pointer's tooltip, and it is
+            still spelled in full in the row's menu, which is where a reader goes
+            to find out what a row can do. Story 48.9's treatment, applied to the
+            one cluster it did not reach.
+
+            An empty cluster is not rendered at all rather than rendered empty:
+            at the column's 220px floor nothing promotes, and a `flex` box with
+            no children still spends the row's gap. */}
+        {actions.length > 0 && promoted > 0 && (
           <span className="flex shrink-0 items-center gap-1">
-            {!node.isFolder && (
+            {actions.slice(0, promoted).map(({ id, label, icon: Icon, onSelect }) => (
               <Button
+                key={id}
                 type="button"
                 variant="ghost"
-                size="xs"
+                size="icon-sm"
                 tabIndex={actionTabIndex}
-                // Says `Open`, answers to `Open in the default app` — see
-                // {@link FILES_OPEN_SHORT_LABEL}. The full verb is also the
-                // pointer's tooltip, so the short word is never the only thing a
-                // reader can find out about this control.
-                aria-label={FILES_OPEN_LABEL}
-                title={FILES_OPEN_LABEL}
-                onClick={() => {
-                  void syncOpenEntry(node.profileId, entry.relativePath).catch(() => undefined);
-                }}
+                // The whole visible word as the name rather than a description of
+                // it, so speech input can ask for what the menu spells even
+                // though the eye reads a picture (WCAG 2.5.3).
+                aria-label={label}
+                title={label}
+                onClick={onSelect}
               >
-                {FILES_OPEN_SHORT_LABEL}
+                <Icon aria-hidden="true" />
               </Button>
-            )}
-            {canReveal && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="xs"
-                tabIndex={actionTabIndex}
-                onClick={() => {
-                  void revealPath(entry.absolutePath).catch(() => undefined);
-                }}
-              >
-                {FILES_REVEAL_LABEL}
-              </Button>
-            )}
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              tabIndex={actionTabIndex}
-              onClick={() => copyPath(entry.absolutePath)}
-            >
-              {copied === entry.absolutePath ? FILES_COPIED_LABEL : FILES_COPY_PATH_LABEL}
-            </Button>
+            ))}
           </span>
         )}
       </div>
     );
-    if (target === null) {
+    // A profile root has no verbs, so it gets no menu: an empty menu offered on
+    // a right-click is worse than the native one it suppressed.
+    if (actions.length === 0) {
       return row;
     }
     // Story 46.13, FR-215, UX-DR77. The house pattern, verbatim: one Radix
@@ -1737,34 +1947,45 @@ export function FilesPane() {
     // the phone tier — the same construction as `chat-row`, `favorites-section`,
     // `networks-group` and `pins-strip`. Not a fifth idiom.
     //
-    // The three items are the three verbs the pane already had and only ever
-    // named one of: a single click replaced the active panel, a double click
+    // The first three items are the three verbs the pane already had and only
+    // ever named one of: a single click replaced the active panel, a double click
     // opened a second one, and the row's button left keeper. Two of those were
     // undiscoverable and the third was called `Open`. The menu is where a reader
     // finds out that this row does three different things, so the wording is the
     // deliverable and the menu is the surface that carries it.
     //
-    // The rule sits above the last item because that item is the only one that
-    // leaves keeper — everything above it happens in this window, and the
-    // separator is the sentence "and now something different".
+    // **Reveal in Finder and Copy path are down here too, and this menu is now on
+    // folder rows as well.** The row shows as many of its verbs as it has pixels
+    // for and no more, so the menu has to hold ALL of them or a narrow column
+    // would make one unreachable — and a folder, which never had a menu because
+    // it is not a panel target, is exactly the row whose two verbs would go
+    // missing first. The list does not change with the column's width: a menu
+    // whose contents moved as the seam was dragged would be unlearnable, and a
+    // verb that is also one click away is not a verb worth hiding.
+    //
+    // The rules separate what happens in this window from what leaves it and then
+    // from what only names the file: each one is the sentence "and now something
+    // different".
     return (
       <ContextMenu>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent>
-          <ContextMenuItem onSelect={() => panelsStore.getState().setActiveTarget(target)}>
-            {FILES_OPEN_HERE_LABEL}
-          </ContextMenuItem>
-          <ContextMenuItem onSelect={() => panelsStore.getState().openPanel(target)}>
-            {FILES_OPEN_BESIDE_LABEL}
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            onSelect={() => {
-              void syncOpenEntry(node.profileId, target.relativePath).catch(() => undefined);
-            }}
-          >
-            {FILES_OPEN_LABEL}
-          </ContextMenuItem>
+          {target !== null && (
+            <>
+              <ContextMenuItem onSelect={() => panelsStore.getState().setActiveTarget(target)}>
+                {FILES_OPEN_HERE_LABEL}
+              </ContextMenuItem>
+              <ContextMenuItem onSelect={() => panelsStore.getState().openPanel(target)}>
+                {FILES_OPEN_BESIDE_LABEL}
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
+          {actions.map((action) => (
+            <ContextMenuItem key={action.id} onSelect={action.onSelect}>
+              {action.label}
+            </ContextMenuItem>
+          ))}
         </ContextMenuContent>
       </ContextMenu>
     );
@@ -1829,7 +2050,7 @@ export function FilesPane() {
   if (tree.folded) {
     return (
       <>
-        <section aria-label={FILES_PANE_TITLE} {...tree.rootProps} className={FILES_COLUMN_CLASS}>
+        <section {...tree.rootProps} className={FILES_COLUMN_CLASS}>
           {tree.chrome}
         </section>
         {tree.seam}
@@ -1839,11 +2060,14 @@ export function FilesPane() {
 
   return (
     <>
-      <section aria-label={FILES_PANE_TITLE} {...tree.rootProps} className={FILES_COLUMN_CLASS}>
+      <section {...tree.rootProps} className={FILES_COLUMN_CLASS}>
         {tree.chrome}
+        {/* The heading used to sit here, over the sentence. It is one row up
+            now: every foldable surface names itself in its fold row (Story
+            48.3), and this pane was the only one that already had a name to
+            move. What is left is the sentence and the selection's actions. */}
         <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
           <div className="min-w-0">
-            <h1 className="font-heading text-title">{FILES_PANE_TITLE}</h1>
             <p className="text-muted-foreground text-sm">{FILES_PANE_SUBTITLE}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -1911,6 +2135,7 @@ export function FilesPane() {
               </Alert>
             ) : (
               <div
+                ref={attachTree}
                 aria-label={FILES_TREE_LABEL}
                 aria-multiselectable="true"
                 role="tree"

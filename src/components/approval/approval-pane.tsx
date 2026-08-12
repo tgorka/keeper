@@ -233,7 +233,11 @@ export function ApprovalPane() {
   return (
     <section
       aria-label="Approvals"
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // `last:border-r-0` — DESIGN.md → Elevation & Depth: the earlier sibling
+      // owns its trailing edge, and the last child cancels, because an edge
+      // with nothing beyond it is a line against the window. This pane is the
+      // last child of the shell row whenever it is mounted at all.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="shrink-0 border-border border-b px-6 py-4">
         <h1 className="font-heading text-title">Approvals</h1>

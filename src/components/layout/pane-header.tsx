@@ -50,9 +50,19 @@
  * Content only. The three wrappers, their classes and their order are this
  * component's, because they *are* the fix — a caller that could pass a class
  * into the status slot could pass `flex-1` into it, and the jump would be back
- * with the shape intact. The outer `<header>`'s own padding and border differ
- * per surface (a panel header is not a note header) and that is the one class
- * hook: {@link PaneHeaderProps.className}.
+ * with the shape intact.
+ *
+ * **The row's height and its bottom edge are this component's too**, and they
+ * were not before. `DESIGN.md` → Elevation & Depth: a seam has exactly one
+ * owner, and the earlier sibling owns its trailing edge. A header that owned no
+ * edge pushed the decision onto its callers, and three callers duly spelled it
+ * three ways — two `border-b`s, one `border-border border-b`, and heights of
+ * 40px, 40px and 44px against a `pane-header.height` of 40px that all three
+ * were nominally implementing. `h-10` and `border-b` live here now, so the one
+ * class hook — {@link PaneHeaderProps.className} — is HORIZONTAL padding and
+ * whatever a surface needs beyond the row itself. A caller that still spells a
+ * `py-*` is spelling nothing: the row's height is fixed and its members are
+ * centred in it.
  *
  * {@link PaneHeaderProps.status} is nullable rather than always present. A
  * header with nothing to report renders two groups, not an empty reserved box:
@@ -173,7 +183,8 @@ export interface PaneHeaderProps {
    * control. The node form keeps 46.4's behaviour exactly.
    */
   actions: ReactNode | ((budget: number) => ReactNode);
-  /** The header element's own padding and border, which differ per surface. */
+  /** The header element's own HORIZONTAL padding, which differs per surface.
+   *  Its height and its bottom edge are the component's — see the module doc. */
   className?: string;
 }
 
@@ -219,7 +230,15 @@ export function PaneHeader({
   }, [managed]);
 
   return (
-    <header ref={rowRef} className={cn("flex shrink-0 items-center gap-2", className)}>
+    <header
+      ref={rowRef}
+      // `h-10` is DESIGN.md's `pane-header.height`, measured the way the seam
+      // makes it real: 40px INCLUDING the hairline, because the hairline is the
+      // header's and not the next band's. `items-center` then centres a 32px
+      // control in what is left, which is what the three callers' `py-1`s and
+      // `py-1.5`s were each guessing at separately.
+      className={cn("flex h-10 shrink-0 items-center gap-2 border-border border-b", className)}
+    >
       {/* Group 1 — identity. `flex-1` off a zero basis: its width is whatever
           the row has left over, and it contributes nothing to the row's own
           content width. */}

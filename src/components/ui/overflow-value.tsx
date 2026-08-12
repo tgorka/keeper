@@ -22,6 +22,7 @@
  */
 import { Expand } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { FOCUS_RING } from "@/components/ui/focus-ring";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 
@@ -117,7 +118,8 @@ function FullValuePanel({ name, value, monospace }: FullValuePanelProps) {
         aria-label={`${OVERFLOW_PANEL_LABEL}: ${name}`}
         className={cn(
           "max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-xs",
-          "outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          "outline-none",
+          FOCUS_RING,
           monospace === true && "font-mono",
         )}
       >
@@ -154,7 +156,10 @@ export function FullValueButton({
           tabIndex={tabIndex}
           data-slot="overflow-trigger"
           aria-label={`${OVERFLOW_TRIGGER_LABEL} ${name}`}
-          className="shrink-0 rounded-sm p-0.5 text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "shrink-0 rounded-sm p-0.5 text-muted-foreground outline-none hover:bg-accent hover:text-foreground",
+            FOCUS_RING,
+          )}
         >
           <Expand aria-hidden="true" className="size-3" />
         </button>
@@ -204,10 +209,7 @@ export function OverflowValue({ name, value, monospace, className }: OverflowVal
           ref={ref}
           data-slot="overflow-value"
           data-overflowing="true"
-          className={cn(
-            text,
-            "cursor-pointer text-left outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring",
-          )}
+          className={cn(text, "cursor-pointer text-left outline-none hover:underline", FOCUS_RING)}
         >
           {value}
         </button>

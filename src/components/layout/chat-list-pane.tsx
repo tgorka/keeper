@@ -62,7 +62,7 @@ import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
  * lets it be dragged.
  */
 const CHAT_LIST_COLUMN_CLASS =
-  "flex h-full shrink-0 flex-col border-border border-r bg-background outline-none";
+  "flex h-full shrink-0 flex-col border-border border-r bg-background outline-none last:border-r-0";
 
 /**
  * What the folded inbox's way back into the conversations reads as, and the

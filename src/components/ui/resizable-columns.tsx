@@ -77,6 +77,24 @@ export interface ColumnResizerProps {
    * same either way.
    */
   className?: string;
+  /**
+   * Who paints the hairline this handle sits on.
+   *
+   * `"neighbour"`, the default, is a boundary between two BOXES, and
+   * `DESIGN.md` → Elevation & Depth gives that to the earlier sibling: the
+   * column on the left draws its own `border-r` and this handle only lights it
+   * on hover and on focus. Painting one here as well is how every resizable
+   * column in the app shipped a 2px seam — the column's border and the
+   * handle's own pixel side by side — which is the defect that rule exists to
+   * name. A handle is not a sibling boundary; it is a grip sitting on one.
+   *
+   * `"self"` is a boundary between two grid TRACKS, where there is no box on
+   * either side that could own an edge: the properties grid is key cells and
+   * value cells, not two columns, and nothing in it spans the split except
+   * this handle. Then the handle IS the owner, and it paints. Still one owner,
+   * same rule — the rule names an owner, it does not name an element type.
+   */
+  seam?: "neighbour" | "self";
 }
 
 /**
@@ -157,6 +175,9 @@ export function useResizableColumn(id: string, label: string): ResizableColumn {
  * the layout by eight pixels. Pointer capture is taken on grab: a fast drag
  * leaves the strip within a frame, and without capture the column stops
  * following the cursor exactly when the user is moving fastest.
+ *
+ * It does not, by default, paint the hairline it straddles — see
+ * {@link ColumnResizerProps.seam}.
  */
 export function ColumnResizer({
   label,
@@ -165,6 +186,7 @@ export function ColumnResizer({
   containerLeft,
   min,
   className,
+  seam = "neighbour",
 }: ColumnResizerProps) {
   const drag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
@@ -228,7 +250,11 @@ export function ColumnResizer({
       aria-valuetext={width === null ? COLUMN_FITTED_VALUE_TEXT : undefined}
       tabIndex={0}
       data-slot="column-resizer"
-      className={cn("relative select-none", className ?? "col-start-2 [grid-row:1/-1]")}
+      data-seam={seam}
+      className={cn(
+        "group/column-resizer relative select-none",
+        className ?? "col-start-2 [grid-row:1/-1]",
+      )}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}
@@ -240,8 +266,21 @@ export function ColumnResizer({
         aria-hidden="true"
         className={cn(
           "-inset-x-1 absolute inset-y-0 cursor-col-resize",
-          "before:absolute before:inset-y-0 before:left-1 before:w-px before:bg-border",
-          "hover:before:bg-ring focus-visible:before:bg-ring",
+          // One pixel wide, and placed ON the boundary rather than beside it:
+          // `left-1` is this zero-width track's own x, and the extra pixel back
+          // is where a neighbouring column's `border-r` lives. Aligned, so
+          // lighting the seam changes its colour and never its thickness.
+          "before:absolute before:inset-y-0 before:left-1 before:w-px before:-translate-x-px",
+          // Transparent at rest wherever a box already owns the edge — see
+          // `seam`. This handle is a grip, and a grip that also paints is the
+          // 2px seam every resizable column in the app used to have.
+          seam === "self" ? "before:bg-border" : "before:bg-transparent",
+          // The `group/` is the separator, because the separator is what takes
+          // focus: this span is `aria-hidden` and unfocusable, so the
+          // `focus-visible:` this used to carry could never fire and a keyboard
+          // user got no seam feedback at all.
+          "group-hover/column-resizer:before:bg-ring",
+          "group-focus-visible/column-resizer:before:bg-ring",
         )}
       />
     </div>

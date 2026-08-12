@@ -167,7 +167,9 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
         </p>
       ) : null}
       <div className="flex min-h-0 flex-1">
-        <ul className="w-56 shrink-0 overflow-y-auto border-r">
+        {/* The revision list owns the seam against the diff beside it, and
+            cancels it if it ever ends up last — DESIGN.md → Elevation & Depth. */}
+        <ul className="w-56 shrink-0 overflow-y-auto border-r last:border-r-0">
           {revisions.map((revision) => (
             <li key={revision.rev}>
               <button

@@ -112,3 +112,87 @@ describe("NoteRow — the order beside the note", () => {
     );
   });
 });
+
+/**
+ * How a row boundary is drawn in this list, and — the load-bearing half — how it
+ * is deliberately NOT drawn.
+ *
+ * The owner reported missing borders and the notes list was the candidate,
+ * because it is the one list in keeper with no row rule. It is also the one list
+ * with no row ANCHOR: chat rows repeat an avatar and a full-height account bar,
+ * recording rows are enclosed cards, tree rows repeat a file icon, and this row's
+ * only mark in that lane went `bg-transparent` the moment a note was read. So the
+ * fix is the anchor, not a hairline — a rule here would make this the only ruled
+ * list in the app, which is heavier than the app rather than more legible.
+ *
+ * The negative assertion is the point of the file: it is what stops the next
+ * person reading "no separators" and adding one.
+ */
+function renderNoteRow(overrides: Partial<NoteRowVm> = {}): HTMLElement {
+  const { container } = render(
+    <NoteRow
+      row={row({ value: 0, source: "default" }, overrides)}
+      selected={false}
+      tabIndex={0}
+      onSelect={vi.fn()}
+      onSelectBeside={vi.fn()}
+      onToggleTag={vi.fn()}
+    />,
+  );
+  const found = container.querySelector<HTMLElement>('[data-slot="note-row"]');
+  if (found === null) {
+    throw new Error("the row drew no row");
+  }
+  return found;
+}
+
+function unreadDot(rowElement: HTMLElement): HTMLElement {
+  const found = rowElement.querySelector<HTMLElement>('[data-slot="unread-dot"]');
+  if (found === null) {
+    throw new Error("the row drew no unread dot");
+  }
+  return found;
+}
+
+describe("NoteRow — where one row stops and the next begins", () => {
+  it("keeps a mark in the anchor lane after a note has been read", () => {
+    const read = unreadDot(renderNoteRow({ unread: false }));
+
+    // A dot that vanishes leaves a list of read notes — the common case — with
+    // nothing repeating down its left edge and no rhythm to read a boundary
+    // from. Hollow is still a mark.
+    expect(read.className).not.toContain("bg-transparent");
+    expect(read).toHaveClass("border");
+    expect(read).toHaveClass("rounded-full");
+  });
+
+  it("tells read from unread by fill and not by the presence of the dot", () => {
+    const unread = unreadDot(renderNoteRow({ unread: true })).className;
+    const read = unreadDot(renderNoteRow({ unread: false })).className;
+
+    // DESIGN.md's grammar: filled and hollow, never a bare dot carrying its one
+    // state in colour alone.
+    expect(unread).not.toEqual(read);
+    expect(unread).toContain("bg-primary");
+  });
+
+  it("centres its content so the gap above a row equals the gap below it", () => {
+    // `items-start` pooled every pixel of a 64px row's slack underneath its
+    // text, so the boundary between two rows sat nowhere in particular. This is
+    // the chat list's construction, which is the list this row was built to
+    // match on density in the first place.
+    expect(renderNoteRow()).toHaveClass("items-center");
+  });
+
+  it("draws no row rule, on purpose", () => {
+    const rowElement = renderNoteRow();
+
+    // Not an omission — a decision, pinned here so it is not quietly reversed.
+    // No list in this app rules its rows. The left edge a conflicted row grows
+    // is a status mark and not a separator, which is why it is asserted apart.
+    expect(rowElement.className).not.toContain("border-b");
+    expect(rowElement.className).not.toContain("border-t");
+    expect(unreadDot(renderNoteRow({ conflict: true }))).toBeInTheDocument();
+    expect(renderNoteRow({ conflict: true })).toHaveClass("border-l-[3px]");
+  });
+});
