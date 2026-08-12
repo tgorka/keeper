@@ -19,6 +19,13 @@
  * not animate in or out either: a filter change is a cut, because an animated
  * bar moves the target the user is reaching for.
  *
+ * **Origin and pinned are toggles, not chips that appear** (Story 49). They
+ * used to be a button that could only turn the filter ON, unmounted the moment
+ * it did, and a chip elsewhere in the bar that was the only way back. The chip
+ * is gone: one persistent control each, `aria-pressed`, and the chip's own
+ * `bg-accent` as the pressed paint — so the bar's fixed order holds still
+ * whatever is on, which is the whole reason the order was fixed.
+ *
  * **The bar can now make a tag chip, and only ever an existing tag** (Story
  * 44.13). Until this the only way to raise a tag chip was to find the tag in
  * the sidebar tree, which is a fine way to browse and a poor way to reach a tag
@@ -272,42 +279,46 @@ export function NoteFilterBar({
           <Plus aria-hidden="true" className="size-3" />
           {ADD_TAG_FILTER}
         </Button>
-        {agentOnly && (
-          <FilterChip
-            label="Changed by agent"
-            clearLabel="Clear changed-by-agent filter"
-            onClear={() => notesFiltersStore.getState().setAgentOnly(false)}
-          />
-        )}
-        {pinnedOnly && (
-          <FilterChip
-            label="Pinned only"
-            clearLabel="Clear pinned-only filter"
-            onClear={() => notesFiltersStore.getState().setPinnedOnly(false)}
-          />
-        )}
-        {!agentOnly && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="xs"
-            className="shrink-0 text-muted-foreground"
-            onClick={() => notesFiltersStore.getState().setAgentOnly(true)}
-          >
-            Changed by agent
-          </Button>
-        )}
-        {!pinnedOnly && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="xs"
-            className="shrink-0 text-muted-foreground"
-            onClick={() => notesFiltersStore.getState().setPinnedOnly(true)}
-          >
-            Pinned only
-          </Button>
-        )}
+        {/* Story 49: two real toggles, drawn as two.
+
+            These were one-way controls. The button rendered only while the
+            filter was OFF and could only turn it on; turning it off happened on
+            a different control — a chip that took its place, with its own `✕`,
+            named something else. So the bar had two ways to say one fact, the
+            control moved on every press, and the only way back was to find the
+            thing that had replaced the thing you pressed. A toggle whose
+            off-switch is somewhere else is not a toggle.
+
+            One persistent control each, in one place, with one name in both
+            states — `aria-pressed` says which state it is in, and the pressed
+            paint is the chip's own `bg-accent`, so on it looks exactly like the
+            chip it replaces and off it looks like the control that makes one.
+            The name does not change with the state: a control renamed by its own
+            press is one that speech input cannot ask for twice (WCAG 2.5.3), and
+            `aria-pressed` already carries the difference exactly.
+
+            The Esc walk (`dropLastChip`) still clears them in the same order —
+            it reads the store, not the chips, and the store did not change. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          aria-pressed={agentOnly}
+          className="shrink-0 text-muted-foreground aria-pressed:bg-accent aria-pressed:text-accent-foreground"
+          onClick={() => notesFiltersStore.getState().setAgentOnly(!agentOnly)}
+        >
+          Changed by agent
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          aria-pressed={pinnedOnly}
+          className="shrink-0 text-muted-foreground aria-pressed:bg-accent aria-pressed:text-accent-foreground"
+          onClick={() => notesFiltersStore.getState().setPinnedOnly(!pinnedOnly)}
+        >
+          Pinned only
+        </Button>
         {savable && (
           <Button
             type="button"

@@ -279,7 +279,13 @@ describe("finding the destructive verb", () => {
     render(<NoteEditor vaultId="v1" noteId="note-7" />);
 
     const menu = await openActions(new RegExp(`^${NOTE_ACTIONS_LABEL}`));
-    const items = within(menu).getAllByRole("menuitem");
+    // Two roles: since Story 49 the two verbs that open a panel are
+    // `menuitemcheckbox` here, so the state the promoted control carries as
+    // `aria-expanded` survives the demotion into this list. A single-role query
+    // would have read this menu as three items and called nothing missing.
+    const items = Array.from(
+      menu.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]'),
+    ) as HTMLElement[];
     expect(items.map((item) => item.textContent)).toEqual([
       ATTACHMENTS_LABEL,
       PROPERTIES_LABEL,

@@ -141,6 +141,68 @@ describe("the empty result", () => {
 });
 
 /**
+ * The origin and pinned toggles (Story 49).
+ *
+ * These were one-way controls: the button existed only while the filter was
+ * OFF and could only turn it on, and the way back was a chip that had replaced
+ * it, somewhere else in the bar, named something else. So the assertions are
+ * that ONE control, found by one name, is there in both states and reports
+ * which one it is in — `pressed`, off a role+name query, because that is the
+ * fact a screen reader is given and the class it is painted with is not.
+ */
+describe("the origin and pinned toggles", () => {
+  for (const { name, read, set } of [
+    {
+      name: "Changed by agent",
+      read: () => notesFiltersStore.getState().agentOnly,
+      set: (on: boolean) => notesFiltersStore.getState().setAgentOnly(on),
+    },
+    {
+      name: "Pinned only",
+      read: () => notesFiltersStore.getState().pinnedOnly,
+      set: (on: boolean) => notesFiltersStore.getState().setPinnedOnly(on),
+    },
+  ]) {
+    it(`turns ${name} on and back off from the same control`, () => {
+      render(bar());
+
+      const off = screen.getByRole("button", { name, pressed: false });
+      fireEvent.click(off);
+
+      expect(read()).toBe(true);
+      // The same name, still one control, now reporting the other state — the
+      // press did not move the off-switch to a chip elsewhere in the bar.
+      const on = screen.getByRole("button", { name, pressed: true });
+      expect(screen.getAllByRole("button", { name })).toHaveLength(1);
+
+      fireEvent.click(on);
+      expect(read()).toBe(false);
+      expect(screen.getByRole("button", { name, pressed: false })).toBeInTheDocument();
+    });
+
+    it(`shows ${name} already pressed when the filter is on before the bar mounts`, () => {
+      set(true);
+      render(bar());
+
+      expect(screen.getByRole("button", { name, pressed: true })).toBeInTheDocument();
+    });
+  }
+
+  it("leaves the three-state tag chip without a pressed state", () => {
+    // Deliberate, and documented on `TagFilterChip`: three states are not a
+    // toggle, and a control reporting `pressed=false` while it is actively
+    // EXCLUDING notes would be worse than saying nothing. The state is in the
+    // name instead. Asserted so the next pass at this bar does not "fix" it.
+    notesFiltersStore.getState().setTagTerm("draft", "exclude");
+    render(bar());
+
+    const chip = chipFor("draft");
+    expect(chip).not.toHaveAttribute("aria-pressed");
+    expect(chip).toHaveAccessibleName("Tag draft: excluded. Stop filtering by it.");
+  });
+});
+
+/**
  * The bar's own tag chooser (Story 44.13, FR-169, UX-DR61).
  *
  * Driven through the real bar and the real store rather than through the

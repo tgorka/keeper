@@ -679,17 +679,19 @@ describe("inserting, through the editor the user types into", () => {
       expect(document.querySelector(".cm-content")).not.toBeNull();
       expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
     });
-    // Story 46.5: the control that opens this panel is a menu item now. Read as
-    // a `menuitem`, because `ATTACHMENTS_LABEL` also names the panel's own
-    // `<section>` — a bare name query would resolve to the thing being opened
-    // and the failure would read as "the item is missing".
+    // Story 46.5: the control that opens this panel is a menu item now, and
+    // Story 49 made it a `menuitemcheckbox` — it discloses a panel, so it
+    // reports whether that panel is open. Read by role either way, because
+    // `ATTACHMENTS_LABEL` also names the panel's own `<section>`: a bare name
+    // query would resolve to the thing being opened and the failure would read
+    // as "the item is missing".
     const trigger = await screen.findByRole("button", {
       name: new RegExp(`^${NOTE_ACTIONS_LABEL}`),
     });
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     fireEvent.pointerUp(trigger, { button: 0 });
     const menu = await screen.findByRole("menu");
-    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACHMENTS_LABEL }));
+    fireEvent.click(within(menu).getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }));
     await screen.findByLabelText(ATTACHMENTS_LABEL);
   }
 

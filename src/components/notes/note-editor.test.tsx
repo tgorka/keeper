@@ -27,7 +27,7 @@
  * still in the same place after a save, in a resized quick-capture window.
  * See `spec-46-4-save-does-not-move-the-toolbar.md`.
  */
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteVaultVm, NoteWriteVm } from "@/lib/ipc/client";
 
@@ -434,12 +434,30 @@ function names(): string[] {
   });
 }
 
-/** Open the note's own actions menu, and hand back what is in it. */
-function menuItems(): string[] {
+/**
+ * Every item in the note's actions menu, in DOM order.
+ *
+ * Two roles, not one. Since Story 49 the two verbs that open a panel are
+ * `menuitemcheckbox` down here rather than `menuitem`: the state the promoted
+ * control carries as `aria-expanded` has to survive the demotion, and a menu's
+ * word for "this one is on" is a checkbox item. A query for the single role
+ * would have quietly stopped seeing half of this menu.
+ */
+const MENU_ITEM_SELECTOR = '[role="menuitem"],[role="menuitemcheckbox"]';
+
+/** Open the note's own actions menu. */
+function openNoteActions(): void {
   const trigger = screen.getByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
   fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
   fireEvent.click(trigger);
-  return screen.getAllByRole("menuitem").map((item) => item.textContent ?? "");
+}
+
+/** Open the note's own actions menu, and hand back what is in it. */
+function menuItems(): string[] {
+  openNoteActions();
+  return Array.from(document.querySelectorAll(MENU_ITEM_SELECTOR)).map(
+    (item) => item.textContent ?? "",
+  );
 }
 
 describe("the header shows the verbs it has room for", () => {
@@ -532,7 +550,10 @@ describe("the header shows the verbs it has room for", () => {
         // only the second and would pass over a duplicated control. `hidden`
         // because Radix marks everything outside the open menu `aria-hidden`.
         const asControl = screen.queryAllByRole("button", { hidden: true, name: label });
-        const asItem = screen.queryAllByRole("menuitem", { hidden: true, name: label });
+        const asItem = [
+          ...screen.queryAllByRole("menuitem", { hidden: true, name: label }),
+          ...screen.queryAllByRole("menuitemcheckbox", { hidden: true, name: label }),
+        ];
         expect(asControl.length + asItem.length).toBe(1);
       }
       fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
@@ -574,6 +595,67 @@ describe("the header shows the verbs it has room for", () => {
       NOTE_DELETE_LABEL,
     ]);
   });
+
+  /**
+   * Story 49: the two panel verbs say whether their panel is open.
+   *
+   * `showProperties` and `showAttachments` have been `useState` booleans with
+   * toggle handlers since 45.x, rendered as plain actions with no state on them
+   * in either direction — so the only way to learn whether Properties was
+   * already open was to look down the pane and recognise the panel. Asserted
+   * through `expanded` on a role+name query rather than through a class,
+   * because the claim is about what the control reports, not about how it is
+   * painted.
+   */
+  it("says whether the panel it opens is open, and does not resize the row saying it", async () => {
+    const resize = await openAtWidths();
+    resize(1400);
+
+    const before = names();
+    expect(before).toContain(PROPERTIES_LABEL);
+    // Closed, and saying so.
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: false })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+
+    const open = screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: true });
+    // And it names what it opened, rather than leaving a screen reader to guess
+    // which of the strips below this header appeared because of this press.
+    const region = document.getElementById(open.getAttribute("aria-controls") ?? "");
+    expect(region).not.toBeNull();
+    expect(
+      within(region as HTMLElement).getByRole("region", { name: PROPERTIES_LABEL }),
+    ).toBeInTheDocument();
+
+    // The row did not change shape. Promotion is decided from one measurement
+    // per candidate, so a pressed treatment with a width — a border, a ring, a
+    // longer name — would make how many verbs are on screen a function of which
+    // panels are open, and the header would reflow when somebody opened one.
+    expect(names()).toEqual(before);
+
+    // The same control closes it. It was a toggle all along; now it says so.
+    fireEvent.click(open);
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: false })).toBeVisible();
+  });
+
+  it("keeps that state when the verb is too narrow to promote and falls into the menu", async () => {
+    // The zero-budget shape: everything is in the menu, which is exactly where
+    // a state carried only by the promoted control would have disappeared.
+    seedVault();
+    restoreWidths = withActionWidths(WIDTHS);
+    await openEditor();
+
+    openNoteActions();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }));
+
+    openNoteActions();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL, checked: true }),
+    ).toBeInTheDocument();
+    // And the verb that discloses nothing is still a plain item, so the menu
+    // does not grow a column of empty tick-boxes beside History and Export.
+    expect(screen.getByRole("menuitem", { name: NOTE_HISTORY_LABEL })).toBeInTheDocument();
+  });
 });
 
 /**
@@ -592,12 +674,13 @@ describe("a panel that will not open in this mode", () => {
     return document.querySelector<HTMLElement>(`[data-slot="${PANEL_UNAVAILABLE_SLOT}"]`);
   }
 
-  /** Press an item in the note's actions menu. */
+  /** Press an item in the note's actions menu, whichever kind of item it is. */
   function pick(label: string): void {
-    const trigger = screen.getByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
-    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
-    fireEvent.click(trigger);
-    fireEvent.click(screen.getByRole("menuitem", { name: label }));
+    openNoteActions();
+    const item =
+      screen.queryByRole("menuitem", { name: label }) ??
+      screen.getByRole("menuitemcheckbox", { name: label });
+    fireEvent.click(item);
   }
 
   it("explains itself in history mode, and comes back with one press", async () => {

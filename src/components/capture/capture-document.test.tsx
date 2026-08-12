@@ -241,12 +241,16 @@ describe("the quick-capture draft window", () => {
     expect(screen.getByLabelText("Bold")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: ATTACH_FILE_LABEL })).toBeInTheDocument();
     // Story 46.5: the note's panel verbs live in its Actions menu now, so the
-    // header carries the menu and the menu carries Properties. Read as a
-    // `menuitem` and not by bare name — `PropertiesPanel`'s own `<section>`
-    // answers to the same word, and a name query that resolved to the region
-    // would fail as "the item is missing" when the item was fine.
+    // header carries the menu and the menu carries Properties — as a
+    // `menuitemcheckbox` since Story 49, because it discloses a panel and now
+    // reports whether that panel is open. By role and not by bare name:
+    // `PropertiesPanel`'s own `<section>` answers to the same word, and a name
+    // query that resolved to the region would fail as "the item is missing"
+    // when the item was fine.
     const menu = await openNoteActions();
-    expect(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(
+      within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }),
+    ).toBeInTheDocument();
   });
 
   it("renders every notice the create had to say", async () => {
@@ -333,7 +337,7 @@ describe("the quick-capture draft window", () => {
     await liveEditor();
 
     const menu = await openNoteActions();
-    fireEvent.click(within(menu).getByRole("menuitem", { name: PROPERTIES_LABEL }));
+    fireEvent.click(within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }));
     fireEvent.click(await screen.findByRole("button", { name: ADD_NOTE_TAG }));
     const field = await screen.findByLabelText(ADD_NOTE_TAG);
     fireEvent.change(field, { target: { value: "errand" } });
