@@ -332,6 +332,7 @@ import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
+import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -4821,4 +4822,95 @@ export async function listenSessionsChanged(
   return await listen<string>(SESSIONS_CHANGED_EVENT, (event) => {
     onChanged(event.payload);
   });
+}
+
+/**
+ * Create a session from the zone's `_template/` (FR-238): the one question is
+ * the title; the folder, date prefix, collision counter, minted id and stamped
+ * README are keeper's. Resolves to the new session's ref.
+ *
+ * Rejects with: `internal` (unknown root, a plan refusal — re-plan and retry
+ * when `retriable`), `unsupported` (mobile).
+ */
+export async function sessionsCreate(rootId: string, title: string): Promise<SessionRefVm> {
+  return await invoke<SessionRefVm>("sessions_create", { rootId, title });
+}
+
+/**
+ * Create a session continuing another (FR-239): structure only — the source's
+ * prompts and ref pointers, its README's headings, never its prose — with
+ * `continues`/`continued-by` written on both ends, archived sources included
+ * (files are truth, AD-112).
+ *
+ * Rejects with: `internal`, `unsupported`.
+ */
+export async function sessionsCreateFrom(
+  rootId: string,
+  sourceId: string,
+  title: string,
+): Promise<SessionRefVm> {
+  return await invoke<SessionRefVm>("sessions_create_from", { rootId, sourceId, title });
+}
+
+/**
+ * Append (or find) today's `### YYYY-MM-DD — ` entry under the session's
+ * `## Log` (FR-240), newest last per the zone's convention. Resolves to the
+ * session's ref so the caller opens the README; a second call the same day
+ * writes nothing and still resolves.
+ *
+ * Rejects with: `internal` (a concurrent edit refused the guarded write —
+ * retriable), `unsupported`.
+ */
+export async function sessionsLogToday(rootId: string, sessionId: string): Promise<SessionRefVm> {
+  return await invoke<SessionRefVm>("sessions_log_today", { rootId, sessionId });
+}
+
+/**
+ * Pin or unpin a session (FR-232): one frontmatter boolean through the one
+ * byte-preserving writer; the row updates via the changed event.
+ *
+ * Rejects with: `internal`, `unsupported`.
+ */
+export async function sessionsSetPinned(
+  rootId: string,
+  sessionId: string,
+  pinned: boolean,
+): Promise<void> {
+  await invoke<void>("sessions_set_pinned", { rootId, sessionId, pinned });
+}
+
+/**
+ * Archive a session (FR-245): run the checklist's settled decision — the
+ * promote copies, optionally the workspace emptying — and move the folder to
+ * `archive/<year>/` as the last, journaled, crash-resumable step (NFR-38).
+ *
+ * Rejects with: `internal` (not active; a refusal — retriable), `unsupported`.
+ */
+export async function sessionsArchive(
+  rootId: string,
+  sessionId: string,
+  promotes: [string, string][],
+  emptyWorkspace: boolean,
+): Promise<void> {
+  await invoke<void>("sessions_archive", { rootId, sessionId, promotes, emptyWorkspace });
+}
+
+/**
+ * Delete a session into the zone's `.keeper/trash/<id>/` (FR-247):
+ * recoverable, never an unlink, workspace included.
+ *
+ * Rejects with: `internal`, `unsupported`.
+ */
+export async function sessionsDelete(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_delete", { rootId, sessionId });
+}
+
+/**
+ * Move an archived session back to `active/` (FR-248). Lineage is never
+ * rewritten — prefer a continuation ({@link sessionsCreateFrom}).
+ *
+ * Rejects with: `internal` (not archived), `unsupported`.
+ */
+export async function sessionsUnarchive(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_unarchive", { rootId, sessionId });
 }

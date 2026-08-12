@@ -37,6 +37,8 @@ mod recorder;
 // embedded in notes a desktop syncs.
 #[cfg(desktop)]
 mod recording_protocol;
+#[cfg(desktop)]
+mod sessions_exec;
 mod sessions_ipc;
 #[cfg(desktop)]
 mod sessions_root;
@@ -925,6 +927,13 @@ pub fn run() {
         sessions_ipc::sessions_roots,
         sessions_ipc::sessions_list,
         sessions_ipc::sessions_rescan,
+        sessions_ipc::sessions_create,
+        sessions_ipc::sessions_create_from,
+        sessions_ipc::sessions_log_today,
+        sessions_ipc::sessions_set_pinned,
+        sessions_ipc::sessions_archive,
+        sessions_ipc::sessions_delete,
+        sessions_ipc::sessions_unarchive,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,

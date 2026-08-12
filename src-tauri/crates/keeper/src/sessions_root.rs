@@ -280,6 +280,22 @@ pub fn known(root_id: &str) -> bool {
     registry().contains_key(root_id)
 }
 
+/// One root's zone path, for the lifecycle executor.
+pub fn zone_of(root_id: &str) -> Option<PathBuf> {
+    registry().get(root_id).map(|slot| slot.root.root.clone())
+}
+
+/// One row by session id, from the last scan.
+pub fn row_of(root_id: &str, session_id: &str) -> Option<SessionRowVm> {
+    registry()
+        .get(root_id)?
+        .rows
+        .as_ref()?
+        .iter()
+        .find(|row| row.id == session_id)
+        .cloned()
+}
+
 /// Ask one root to rescan now (FR-225's rebuild verb).
 pub fn rescan(root_id: &str) -> bool {
     registry()

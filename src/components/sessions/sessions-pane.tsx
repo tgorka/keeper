@@ -18,7 +18,8 @@
  * chain like every gated surface. A flagged-root-free build shows the one
  * honest empty state and a way to Settings → Sync.
  */
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { SessionActions } from "@/components/sessions/session-actions";
 import { SessionRow } from "@/components/sessions/session-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,7 +27,7 @@ import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { SessionRowVm } from "@/lib/ipc/client";
-import { sessionsRescan } from "@/lib/ipc/client";
+import { sessionsCreate, sessionsRescan } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 import {
   filterRows,
@@ -59,6 +60,11 @@ export const SESSIONS_NO_MATCH_LABEL = "Nothing matches this filter.";
 
 /** The rescan verb — the sessions "Rebuild index" (FR-225). */
 export const SESSIONS_RESCAN_LABEL = "Rescan";
+
+/** The create verb (FR-238): one question — the title — and a folder lands. */
+export const SESSIONS_NEW_LABEL = "New session";
+export const SESSIONS_NEW_TITLE_LABEL = "Session title";
+export const SESSIONS_NEW_CONFIRM_LABEL = "Create";
 
 /** The status chips, in board order. */
 const STATUS_CHOICES: { value: SessionsStatusFilter; label: string }[] = [
@@ -101,18 +107,38 @@ export function SessionsPane() {
   // session's folder. Everything downstream — the markdown editor, live
   // external changes, the raw/rendered toggle — is Epic 45/46 machinery,
   // reused rather than rebuilt.
+  const openReadme = useCallback((rootId: string, subfolder: string, sessionPath: string) => {
+    panelsStore.getState().setActiveTarget({
+      kind: "file",
+      profileId: rootId,
+      relativePath: `${subfolder}/${sessionPath}/README.md`,
+    });
+  }, []);
   const openRow = useCallback(
     (row: SessionRowVm) => {
       if (activeRoot !== null) {
-        panelsStore.getState().setActiveTarget({
-          kind: "file",
-          profileId: activeRoot.id,
-          relativePath: `${activeRoot.subfolder}/${row.path}/README.md`,
-        });
+        openReadme(activeRoot.id, activeRoot.subfolder, row.path);
       }
     },
-    [activeRoot],
+    [activeRoot, openReadme],
   );
+
+  // The one-question create (FR-238): a title field revealed in place, no
+  // dialog. Create lands the folder, the changed event brings the row, and
+  // the README opens with the caret ready.
+  const [creating, setCreating] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const submitCreate = useCallback(() => {
+    const title = newTitle.trim();
+    if (activeRoot === null || title === "") {
+      return;
+    }
+    void sessionsCreate(activeRoot.id, title).then((ref) => {
+      setCreating(false);
+      setNewTitle("");
+      openReadme(ref.rootId, activeRoot.subfolder, ref.path);
+    });
+  }, [activeRoot, newTitle, openReadme]);
 
   return (
     <section
@@ -130,17 +156,50 @@ export function SessionsPane() {
           )}
         </div>
         {activeRoot !== null && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            onClick={() => void sessionsRescan(activeRoot.id)}
-          >
-            {SESSIONS_RESCAN_LABEL}
-          </Button>
+          <div className="flex shrink-0 gap-2">
+            <Button type="button" size="sm" onClick={() => setCreating((open) => !open)}>
+              {SESSIONS_NEW_LABEL}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void sessionsRescan(activeRoot.id)}
+            >
+              {SESSIONS_RESCAN_LABEL}
+            </Button>
+          </div>
         )}
       </header>
+
+      {/* The create row, revealed in place — one question, no dialog (FR-238,
+          the capture no-filing philosophy). Escape closes; Enter creates. */}
+      {creating && activeRoot !== null && (
+        <div className="flex shrink-0 gap-2 border-border border-b px-6 py-3">
+          <InputGroup>
+            <InputGroupInput
+              // biome-ignore lint/a11y/noAutofocus: the row exists because the
+              // user just pressed New session; the title is the one question.
+              autoFocus
+              placeholder={SESSIONS_NEW_TITLE_LABEL}
+              aria-label={SESSIONS_NEW_TITLE_LABEL}
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  submitCreate();
+                }
+                if (e.key === "Escape") {
+                  setCreating(false);
+                }
+              }}
+            />
+          </InputGroup>
+          <Button type="button" size="sm" onClick={submitCreate}>
+            {SESSIONS_NEW_CONFIRM_LABEL}
+          </Button>
+        </div>
+      )}
 
       {/* The root switcher renders only with two or more roots — a label that
           is always the same value is noise (the capture-footer rule). */}
@@ -233,7 +292,24 @@ export function SessionsPane() {
           <ul aria-label={SESSIONS_LIST_LABEL} className="flex flex-col gap-2">
             {filtered.map((row) => (
               <li key={row.id}>
-                <SessionRow row={row} onOpen={openRow} />
+                <SessionRow
+                  row={row}
+                  onOpen={openRow}
+                  actions={
+                    activeRoot !== null ? (
+                      <SessionActions
+                        rootId={activeRoot.id}
+                        rootPath={activeRoot.root}
+                        row={row}
+                        // `path` arrives zone-relative (`active/<dir>`), the
+                        // same frame every row path is in.
+                        onCreatedFrom={(rootId, path) =>
+                          openReadme(rootId, activeRoot.subfolder, path)
+                        }
+                      />
+                    ) : undefined
+                  }
+                />
               </li>
             ))}
           </ul>

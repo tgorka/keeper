@@ -41,6 +41,12 @@ export interface SessionRowProps {
   /** "now", injectable so tests pin the clock. */
   nowMs?: number;
   onOpen: (row: SessionRowVm) => void;
+  /**
+   * The row's trailing actions (the lifecycle overflow menu), rendered
+   * OUTSIDE the open button — the row is a flex pair of the clickable body
+   * and this slot, because a menu button nested in a button is not HTML.
+   */
+  actions?: React.ReactNode;
 }
 
 /** One freshness signal: a glyph, a label for readers, and a relative time. */
@@ -71,7 +77,7 @@ function FreshnessSignal({
   );
 }
 
-export function SessionRow({ row, nowMs = Date.now(), onOpen }: SessionRowProps) {
+export function SessionRow({ row, nowMs = Date.now(), onOpen, actions }: SessionRowProps) {
   const stale = isStale(row, nowMs);
   const statusLabel =
     row.status === "archived"
@@ -80,75 +86,80 @@ export function SessionRow({ row, nowMs = Date.now(), onOpen }: SessionRowProps)
         ? SESSION_STATUS_STALE_LABEL
         : SESSION_STATUS_ACTIVE_LABEL;
   return (
-    <button
-      type="button"
-      onClick={() => onOpen(row)}
+    <div
       className={cn(
-        "flex w-full flex-col gap-1 rounded-md border border-border px-3 py-2 text-left",
-        "hover:bg-accent/50 focus-visible:outline-2",
+        "flex items-start gap-1 rounded-md border border-border pr-1",
+        "hover:bg-accent/50",
         row.status === "archived" && "opacity-80",
       )}
     >
-      <span className="flex min-w-0 items-center gap-2">
-        {/* The status glyph: filled-fresh / hollow-stale for active, the box
+      <button
+        type="button"
+        onClick={() => onOpen(row)}
+        className="flex min-w-0 flex-1 flex-col gap-1 px-3 py-2 text-left focus-visible:outline-2"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {/* The status glyph: filled-fresh / hollow-stale for active, the box
             for archived — location and mtimes, never a stored state. */}
-        <span data-testid={SESSION_ROW_STATUS_TESTID} title={statusLabel}>
-          {row.status === "archived" ? (
-            <Archive aria-hidden className="size-3.5 text-muted-foreground" />
-          ) : (
-            <CircleDot
-              aria-hidden
-              // The healthy green is the bridge-health token, not a new color:
-              // one palette for "this thing is alive" across the app (UX-DR92).
-              className={cn("size-3.5", stale ? "text-muted-foreground" : "text-bridge-healthy")}
+          <span data-testid={SESSION_ROW_STATUS_TESTID} title={statusLabel}>
+            {row.status === "archived" ? (
+              <Archive aria-hidden className="size-3.5 text-muted-foreground" />
+            ) : (
+              <CircleDot
+                aria-hidden
+                // The healthy green is the bridge-health token, not a new color:
+                // one palette for "this thing is alive" across the app (UX-DR92).
+                className={cn("size-3.5", stale ? "text-muted-foreground" : "text-bridge-healthy")}
+              />
+            )}
+            <span className="sr-only">{statusLabel}</span>
+          </span>
+          {row.pinned && <Pin aria-label="pinned" className="size-3 text-muted-foreground" />}
+          <span className="min-w-0 flex-1 truncate font-medium text-sm">{row.title}</span>
+          {row.lineage && (
+            <GitBranch aria-label="has lineage" className="size-3 text-muted-foreground" />
+          )}
+          {row.conflict && (
+            <TriangleAlert aria-label="conflict" className="size-3.5 text-bridge-degraded" />
+          )}
+          {row.unread && (
+            <span
+              aria-label="unread"
+              className="size-2 shrink-0 rounded-full bg-primary"
+              role="status"
             />
           )}
-          <span className="sr-only">{statusLabel}</span>
         </span>
-        {row.pinned && <Pin aria-label="pinned" className="size-3 text-muted-foreground" />}
-        <span className="min-w-0 flex-1 truncate font-medium text-sm">{row.title}</span>
-        {row.lineage && (
-          <GitBranch aria-label="has lineage" className="size-3 text-muted-foreground" />
+        {(row.lastLogLine !== "" || row.snippet !== "") && (
+          <span className="truncate text-muted-foreground text-xs">
+            {row.lastLogDate !== "" && <span className="figures">{row.lastLogDate} — </span>}
+            {row.lastLogLine !== "" ? row.lastLogLine : row.snippet}
+          </span>
         )}
-        {row.conflict && (
-          <TriangleAlert aria-label="conflict" className="size-3.5 text-bridge-degraded" />
-        )}
-        {row.unread && (
-          <span
-            aria-label="unread"
-            className="size-2 shrink-0 rounded-full bg-primary"
-            role="status"
+        <span className="flex items-center gap-3">
+          <FreshnessSignal
+            label={SESSION_WORKSPACE_SIGNAL_LABEL}
+            ms={row.workspaceMs}
+            nowMs={nowMs}
+            testId={SESSION_ROW_WORKSPACE_TESTID}
+            Icon={Wrench}
           />
-        )}
-      </span>
-      {(row.lastLogLine !== "" || row.snippet !== "") && (
-        <span className="truncate text-muted-foreground text-xs">
-          {row.lastLogDate !== "" && <span className="figures">{row.lastLogDate} — </span>}
-          {row.lastLogLine !== "" ? row.lastLogLine : row.snippet}
+          <FreshnessSignal
+            label={SESSION_RECORD_SIGNAL_LABEL}
+            ms={row.recordMs}
+            nowMs={nowMs}
+            testId={SESSION_ROW_RECORD_TESTID}
+            Icon={Pencil}
+          />
+          <span className="min-w-0 flex-1" />
+          {row.tags.slice(0, 4).map((tag) => (
+            <Badge key={tag} variant="secondary" className="max-w-32 truncate">
+              {tag}
+            </Badge>
+          ))}
         </span>
-      )}
-      <span className="flex items-center gap-3">
-        <FreshnessSignal
-          label={SESSION_WORKSPACE_SIGNAL_LABEL}
-          ms={row.workspaceMs}
-          nowMs={nowMs}
-          testId={SESSION_ROW_WORKSPACE_TESTID}
-          Icon={Wrench}
-        />
-        <FreshnessSignal
-          label={SESSION_RECORD_SIGNAL_LABEL}
-          ms={row.recordMs}
-          nowMs={nowMs}
-          testId={SESSION_ROW_RECORD_TESTID}
-          Icon={Pencil}
-        />
-        <span className="min-w-0 flex-1" />
-        {row.tags.slice(0, 4).map((tag) => (
-          <Badge key={tag} variant="secondary" className="max-w-32 truncate">
-            {tag}
-          </Badge>
-        ))}
-      </span>
-    </button>
+      </button>
+      {actions !== undefined && <span className="shrink-0 py-1.5">{actions}</span>}
+    </div>
   );
 }
