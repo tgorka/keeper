@@ -1452,6 +1452,10 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // on iOS is `false` twice over, and the whole surface is then absent
         // rather than disabled (AD-27).
         notes: notes_available(&state),
+        // Sessions (FR-223, AD-107): the same construction as notes — a sessions
+        // root IS a synced folder plus a flag, so the capability is exactly the
+        // notes capability's condition, computed once and shared.
+        sessions: notes_available(&state),
     })
 }
 

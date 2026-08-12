@@ -402,6 +402,8 @@ export async function setSyncProfileRecordingsSubfolder(
     // otherwise refuses rather than corrects, and correcting it here would make
     // a save succeed against a folder nobody named.
     recordingsSubfolder: subfolder,
+    sessions: stored.sessions,
+    sessionsSubfolder: stored.sessionsSubfolder,
   });
 }
 

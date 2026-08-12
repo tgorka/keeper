@@ -31,6 +31,7 @@ const DESKTOP_CAPABILITIES = {
   recording: false,
   sync: false,
   notes: false,
+  sessions: false,
   overlayTitleBar: false,
 };
 

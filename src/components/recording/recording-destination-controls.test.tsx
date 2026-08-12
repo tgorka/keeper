@@ -156,6 +156,8 @@ const STORED_TGDRIVE: SyncProfileVm = {
   notesSubfolder: null,
   recordings: true,
   recordingsSubfolder: "recordings",
+  sessions: false,
+  sessionsSubfolder: "60-sessions",
 };
 
 /** The settings VM Rust echoes once `tgdrive` is the destination: the kind
@@ -1046,6 +1048,8 @@ describe("RecordingDestinationControls", () => {
         notesSubfolder: null,
         recordings: true,
         recordingsSubfolder: "40-media/recordings",
+        sessions: false,
+        sessionsSubfolder: "60-sessions",
       }),
     );
     // A profile write, not a settings write: nothing about the recording settings

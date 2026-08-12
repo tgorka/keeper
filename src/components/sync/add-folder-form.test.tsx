@@ -110,6 +110,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     // subfolder flagging it would use, and it is why the form keeps no copy of
     // keeper's default (Story 41.7).
     recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -412,6 +414,8 @@ describe("AddFolderForm editing an existing folder", () => {
         notesSubfolder: null,
         recordings: false,
         recordingsSubfolder: null,
+        sessions: false,
+        sessionsSubfolder: null,
       }),
     );
   });

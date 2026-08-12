@@ -1101,6 +1101,7 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     recording: false,
     sync: false,
     notes: false,
+    sessions: false,
     overlayTitleBar: false,
   };
 
