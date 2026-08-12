@@ -181,6 +181,47 @@ const ENTRIES = [
 }));
 
 /**
+ * A CSV wider than any pane, so an embedded table can be LOOKED at under the
+ * one condition that matters: more columns than the note has room for, and one
+ * value long enough that no cap could show it whole.
+ *
+ * Answered for every `![[….csv]]` the shell is asked about, because the mock has
+ * no vault to resolve a target against and the point of the fixture is the shape
+ * rather than the file.
+ */
+const CSV_COLUMNS = [
+  "device",
+  "serial",
+  "firmware",
+  "last-seen",
+  "owner",
+  "location",
+  "notes",
+] as const;
+
+const CSV_ROWS = [
+  [...CSV_COLUMNS],
+  [
+    "hesperia",
+    "C02XK1YZQ6NV",
+    "15.4.1-build-2026-07-30",
+    "2026-08-12 09:14",
+    "alice",
+    "desk, second floor, by the window",
+    "a note long enough that a twenty-four em cap would have hidden the end of it and left nothing to press",
+  ],
+  [
+    "electra",
+    "C02XK1YZQ6NW",
+    "15.4.0-build-2026-06-02",
+    "2026-08-11 22:03",
+    "bob",
+    "rack 3",
+    "spare",
+  ],
+] as const;
+
+/**
  * Answers keyed by command. Anything absent falls through to `fallback`, which
  * is why a screen keeps rendering when it reaches for something not listed —
  * an unanswered command should show an empty state, never a white page.
@@ -215,6 +256,35 @@ const ANSWERS: Record<string, unknown> = {
   notes_backlinks: [],
   notes_history: [],
   notes_gallery: { entries: [] },
+  // A `![[….csv]]` embed reads the file and then reads it as a table. Both, or
+  // the panel degrades to the plain wikilink and the block nobody can see is the
+  // block that was being looked at.
+  notes_embed_read: {
+    relPath: "attachments/devices.csv",
+    name: "devices.csv",
+    kind: "file",
+    file: {
+      text: CSV_ROWS.map((row) => row.join(",")).join("\n"),
+      sizeBytes: 512,
+      sizeLabel: "512 B",
+      oversize: false,
+      binary: false,
+      detail: null,
+    },
+  },
+  notes_csv_read: {
+    relPath: "attachments/devices.csv",
+    rev: "rev-1",
+    columns: CSV_COLUMNS.length,
+    totalRows: CSV_ROWS.length,
+    rows: CSV_ROWS.map((cells, index) => ({
+      index,
+      line: index + 1,
+      cells: [...cells],
+      ragged: false,
+    })),
+    notices: [],
+  },
   sync_profiles: [
     {
       id: "p1",

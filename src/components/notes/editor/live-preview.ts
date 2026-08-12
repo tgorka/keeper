@@ -834,7 +834,29 @@ const livePreviewTheme = EditorView.baseTheme({
   // neither readable nor usable. The height is set on the body element by the
   // widget, from the same constant its `estimatedHeight` reports.
   ".cm-embed-block": { display: "block" },
-  ".cm-embed-body": { border: "1px solid var(--border)", borderRadius: "4px" },
+  ".cm-embed-body": {
+    border: "1px solid var(--border)",
+    borderRadius: "4px",
+    // The panel's width comes from the pane and never from the file inside it.
+    //
+    // Its HEIGHT was already fixed by the widget; its width was not, and a
+    // `max-content` CSV table propagated its own minimum straight up through this
+    // panel to `.cm-content` — which is a flex item sized by its contents.
+    // Measured in Chromium against the seven-column fixture in `dev/mock-shell`:
+    // a 320px pane became a 1301px content box, so every line of prose in the
+    // note re-laid out to 1301px and the panel's own `overflow-auto` had nothing
+    // left to scroll, because it was as wide as the table it contained. Which is
+    // the report: truncated at the pane's edge with no way to reach the rest.
+    //
+    // With the width contained, the panel is the pane's width and
+    // `RawRenderedView`'s CSV pane is the scroll box it was always written to be.
+    // The same rule and the same reason as `.cm-md-table-scroll`.
+    contain: "inline-size",
+  },
+  // `max-content`, deliberately: a CSV is a grid, and a grid that compressed
+  // itself into a narrow pane would wrap every cell and stop being scannable.
+  // The panel this is mounted in scrolls (`RawRenderedView`'s CSV pane is
+  // `overflow-auto`), so wider than the pane means reachable, not lost.
   ".cm-csv-table": { borderCollapse: "collapse", fontSize: "0.9em", width: "max-content" },
   ".cm-csv-cell": {
     border: "1px solid var(--border)",
@@ -843,10 +865,19 @@ const livePreviewTheme = EditorView.baseTheme({
     // A cell is one line. A value with an embedded newline in it would
     // otherwise make one row as tall as the paragraph it is quoting, and the
     // row's height is what makes a table scannable.
+    //
+    // What is NOT here any more is the pair that went with it: `max-width: 24em`
+    // with `overflow: hidden` and `text-overflow: ellipsis`. Those truncated by
+    // construction — a 30-character path or a sentence in a cell was ellipsised
+    // at 24em with NO way to read the rest of it, because the clip was on the
+    // cell and the only scroll box is the panel outside the table. Ellipsis is
+    // an honest affordance only when something can then be pressed or scrolled
+    // to see the whole value, and there was nothing. The one-line rule is what
+    // that pair was actually protecting, and `white-space: pre` above is the
+    // whole of it: the cell is now as wide as its value, the table is as wide as
+    // its widest cells, and the panel's own horizontal scroll is what reaches
+    // the far edge of both.
     whiteSpace: "pre",
-    maxWidth: "24em",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
   },
   // A column the row does not have is drawn as absent, not as blank: hatching
   // says "there is nothing here" where an empty box says "this is empty", and

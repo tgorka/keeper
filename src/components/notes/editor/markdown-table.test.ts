@@ -28,6 +28,7 @@ import {
   TABLE_BLOCK_CLASS,
   TABLE_CELL_CLASS,
   TABLE_RAGGED_CLASS,
+  TABLE_SCROLL_CLASS,
   tableAfter,
   tableCellText,
   tableHits,
@@ -308,6 +309,56 @@ describe("a table in the note editor", () => {
       "d",
     ]);
     expect(view.contentDOM.textContent).not.toContain("| a   | b   |");
+  });
+
+  /**
+   * The owner's report against 0.8.5: notes truncated at the pane's edge with
+   * nothing to scroll.
+   *
+   * `EditorView.lineWrapping` is on, so PROSE wraps. A block widget does not: a
+   * table is as wide as its columns need, the content box is pinned to the
+   * editor's width, and with nothing between the two the table simply left the
+   * pane. What is asserted here is the structure and the declarations that make
+   * the scroll possible — jsdom lays nothing out, so the measurement itself
+   * (`scrollWidth > clientWidth` on a real 320px pane) is not provable here and
+   * was taken in a browser.
+   */
+  it("puts a scroll box between the block and the table, and the controls outside it", () => {
+    const view = open(`intro\n\n${ALIGNED}\n`);
+
+    const block = view.contentDOM.querySelector(`.${TABLE_BLOCK_CLASS}`);
+    const scroll = block?.querySelector(`.${TABLE_SCROLL_CLASS}`);
+    // The table is INSIDE the scroll box, so it is the thing that moves.
+    expect(scroll?.querySelector("table")).not.toBeNull();
+    // The controls are its sibling, so scrolling a wide table sideways does not
+    // carry the four buttons off the edge with it.
+    expect(scroll?.querySelector(".cm-md-table-controls")).toBeNull();
+    expect(block?.querySelector(".cm-md-table-controls")).not.toBeNull();
+  });
+
+  it("scrolls the box horizontally only when it has to, and never past the pane", () => {
+    const view = open(`intro\n\n${ALIGNED}\n`);
+    const scroll = view.contentDOM.querySelector(`.${TABLE_SCROLL_CLASS}`);
+
+    if (!(scroll instanceof HTMLElement)) {
+      throw new Error("the table rendered without its scroll box");
+    }
+    const style = getComputedStyle(scroll);
+    // `auto` and not `scroll`: a permanent grey strip under every two-column
+    // table in the note is a different defect with the same cause.
+    expect(style.overflowX).toBe("auto");
+    expect(style.maxWidth).toBe("100%");
+    // The one that makes the other two work. Without inline-size containment the
+    // table's own minimum width propagates up to `.cm-content` — measured at
+    // 914px in a 320px pane — and this box ends up as wide as the thing it is
+    // supposed to be scrolling.
+    expect(style.contain).toBe("inline-size");
+    // `max-content`, not `auto`: `EditorView.lineWrapping` puts
+    // `overflow-wrap: anywhere` on the content box and a cell inherits it, so
+    // `auto` shrank a seven-column table into seven columns of stacked letters
+    // and overflowed nothing. That was the report.
+    const table = scroll.querySelector("table");
+    expect(table === null ? null : getComputedStyle(table).width).toBe("max-content");
   });
 
   it("is mounted by the note editor's own renderer, not only by this test", () => {
