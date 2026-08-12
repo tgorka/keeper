@@ -205,6 +205,9 @@ export type { SendState } from "./gen/SendState";
 export type { SessionDetailVm } from "./gen/SessionDetailVm";
 export type { SessionFileVm } from "./gen/SessionFileVm";
 export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
+export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
+export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
+export type { SessionPatternVm } from "./gen/SessionPatternVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
@@ -337,6 +340,7 @@ import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
+import type { SessionPatternVm } from "./gen/SessionPatternVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
@@ -4843,31 +4847,47 @@ export async function sessionsDetail(rootId: string, sessionId: string): Promise
 }
 
 /**
- * Create a session from the zone's `_template/` (FR-238): the one question is
- * the title; the folder, date prefix, collision counter, minted id and stamped
- * README are keeper's. Resolves to the new session's ref.
+ * Everything a new session can be shaped from (FR-253): the zone's own
+ * `_template/` first, then every session in the root, newest change first.
+ * Each pattern carries its own preview — what creating from it copies, and
+ * what it leaves behind with the reason — computed from the SAME rule the
+ * plan runs on, so the picker cannot promise a file the plan will not write
+ * (AD-116).
  *
- * Rejects with: `internal` (unknown root, a plan refusal — re-plan and retry
- * when `retriable`), `unsupported` (mobile).
+ * A zone with no `_template/` answers with sessions alone; a brand-new zone
+ * answers `[]`, which is the honest "there is nothing to copy yet".
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
  */
-export async function sessionsCreate(rootId: string, title: string): Promise<SessionRefVm> {
-  return await invoke<SessionRefVm>("sessions_create", { rootId, title });
+export async function sessionsPatterns(rootId: string): Promise<SessionPatternVm[]> {
+  return await invoke<SessionPatternVm[]>("sessions_patterns", { rootId });
 }
 
 /**
- * Create a session continuing another (FR-239): structure only — the source's
- * prompts and ref pointers, its README's headings, never its prose — with
- * `continues`/`continued-by` written on both ends, archived sources included
- * (files are truth, AD-112).
+ * Create a session (FR-238, FR-239): the one question is the title; the
+ * folder, date prefix, collision counter, minted id and stamped README are
+ * keeper's. Resolves to the new session's ref.
  *
- * Rejects with: `internal`, `unsupported`.
+ * `patternId` names what it is shaped from — `"_template"` for the zone
+ * template, or a session's id to continue that session (structure only: its
+ * prompts and ref pointers, its README's headings, never its prose, with
+ * `continues`/`continued-by` written on both ends — archived sources
+ * included, because files are truth, AD-112). Omitted, the zone template is
+ * used when it exists and an empty skeleton when it does not.
+ *
+ * Rejects with: `internal` (unknown root or pattern, a plan refusal — re-plan
+ * and retry when `retriable`), `unsupported` (mobile).
  */
-export async function sessionsCreateFrom(
+export async function sessionsCreate(
   rootId: string,
-  sourceId: string,
   title: string,
+  patternId?: string,
 ): Promise<SessionRefVm> {
-  return await invoke<SessionRefVm>("sessions_create_from", { rootId, sourceId, title });
+  return await invoke<SessionRefVm>("sessions_create", {
+    rootId,
+    title,
+    patternId: patternId ?? null,
+  });
 }
 
 /**
@@ -4925,7 +4945,8 @@ export async function sessionsDelete(rootId: string, sessionId: string): Promise
 
 /**
  * Move an archived session back to `active/` (FR-248). Lineage is never
- * rewritten — prefer a continuation ({@link sessionsCreateFrom}).
+ * rewritten — prefer a continuation ({@link sessionsCreate} naming the
+ * archived session as its pattern).
  *
  * Rejects with: `internal` (not archived), `unsupported`.
  */

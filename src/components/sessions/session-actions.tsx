@@ -31,13 +31,13 @@ import type { SessionRowVm } from "@/lib/ipc/client";
 import {
   revealPath,
   sessionsArchive,
-  sessionsCreateFrom,
   sessionsDelete,
   sessionsLogToday,
   sessionsSetPinned,
   sessionsUnarchive,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { sessionsListStore } from "@/lib/stores/sessions-list";
 
 export const SESSION_ACTIONS_LABEL = "Session actions";
 export const SESSION_PIN_LABEL = "Pin";
@@ -70,11 +70,9 @@ export interface SessionActionsProps {
   /** The zone's absolute root, for Reveal. */
   rootPath: string;
   row: SessionRowVm;
-  /** Called with the new-like-this ref target after a successful create. */
-  onCreatedFrom?: (rootId: string, path: string) => void;
 }
 
-export function SessionActions({ rootId, rootPath, row, onCreatedFrom }: SessionActionsProps) {
+export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
@@ -102,13 +100,10 @@ export function SessionActions({ rootId, rootPath, row, onCreatedFrom }: Session
               {SESSION_LOG_TODAY_LABEL}
             </DropdownMenuItem>
           )}
-          <DropdownMenuItem
-            onSelect={() => {
-              void sessionsCreateFrom(rootId, row.id, row.title).then((ref) => {
-                onCreatedFrom?.(ref.rootId, ref.path);
-              });
-            }}
-          >
+          {/* Not a second create (FR-253): this opens the board's ONE create
+              row with this session already chosen as the pattern, so the title
+              is still asked and the preview still says what travels. */}
+          <DropdownMenuItem onSelect={() => sessionsListStore.getState().requestCreateOpen(row.id)}>
             {SESSION_NEW_LIKE_THIS_LABEL}
           </DropdownMenuItem>
           <DropdownMenuSeparator />

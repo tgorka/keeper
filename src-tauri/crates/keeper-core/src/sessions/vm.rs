@@ -86,6 +86,55 @@ pub struct SessionRefVm {
     pub title: String,
 }
 
+/// One thing a new session can be shaped from (FR-253): the zone's own
+/// `_template/`, or a session that already exists. The picker lists these;
+/// creating with one is `sessions_create` naming its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatternVm {
+    /// `"_template"` for the zone template, else the source session's ULID —
+    /// the value the create command takes back.
+    pub id: String,
+    /// `"template"` or `"session"` — what kind of thing this is.
+    pub kind: String,
+    /// The label: the template's own name, or the session's title.
+    pub label: String,
+    /// One line of orientation: what the pattern is, in the zone's terms.
+    pub detail: String,
+    /// Newest change under the pattern, ms since epoch; `null` when unknown.
+    /// Orders the list — a pattern you used yesterday beats one from March.
+    #[ts(type = "number | null")]
+    pub mtime_ms: Option<i64>,
+    /// What creating from this pattern copies, and what it deliberately does
+    /// not — the SAME decision the plan runs on, projected (AD-116). Empty
+    /// `copies` is honest: some sessions carry nothing reusable.
+    pub copies: Vec<SessionPatternFileVm>,
+    pub skips: Vec<SessionPatternSkipVm>,
+}
+
+/// One file a pattern copies, for the preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatternFileVm {
+    /// Source-relative path (`prompts/01-scope.md`).
+    pub rel_path: String,
+    pub is_dir: bool,
+}
+
+/// One file a pattern deliberately leaves behind, with the rule's own
+/// sentence — so the preview answers "where did my report go" before it is
+/// asked, rather than being silently short.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatternSkipVm {
+    pub rel_path: String,
+    /// The reason, spelled for a person by the domain, rendered verbatim.
+    pub reason: String,
+}
+
 /// One dated entry of the session's `## Log`, parsed for the detail's
 /// rendered timeline (FR-233). The zone writes newest-last; the detail
 /// REVERSES for display, because the detail is a review surface and the

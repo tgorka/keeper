@@ -284,6 +284,7 @@ mod tests {
         let zone = zone();
         let plan = compile_create(
             "2026-08-12-research",
+            "_template",
             &[
                 ("README.md".to_owned(), false),
                 ("workspace".to_owned(), true),

@@ -63,27 +63,40 @@ pub struct Plan {
     pub steps: Vec<PlanStep>,
 }
 
-/// The files a template copy carries: everything under `_template/`, as
-/// `(template-relative path, is_dir)` facts the shell listed.
+/// Compile a **create** from a pattern (FR-238, FR-253): copy what
+/// [`crate::sessions::pattern::apply`] chose out of `pattern_root` — the
+/// zone's `_template`, or an existing session's zone-relative path — into
+/// `active/<dir_name>`, then write the stamped README last.
 ///
-/// Compile a **create**: copy the template verbatim to `active/<dir_name>`,
-/// then overwrite the README with `readme` (the caller has already stamped
-/// the date line and minted the id into it). Verbatim-first-then-overwrite
-/// rather than skipping the template README, so a template that grows extra
-/// files keeps working without this function learning about them (FR-238).
-pub fn compile_create(dir_name: &str, template_files: &[(String, bool)], readme: &str) -> Plan {
+/// The pattern root is a parameter rather than a constant because *where a
+/// new session is shaped from* is the user's choice now, not the code's: a
+/// template create and a continuation differ in which directory the copies
+/// read from and in nothing else. Making the shell rewrite copy sources after
+/// the fact — which it used to — meant the plan briefly described a copy that
+/// was never going to happen, and a journal is worth exactly as much as the
+/// plan it replays.
+///
+/// `copies` arrives directory-before-contents, so the steps are safe to run
+/// top to bottom; the README write is last so a pattern that carries its own
+/// README loses to the stamped one without this function knowing it did.
+pub fn compile_create(
+    dir_name: &str,
+    pattern_root: &str,
+    copies: &[(String, bool)],
+    readme: &str,
+) -> Plan {
     let target = format!("active/{dir_name}");
     let mut steps = vec![PlanStep::MkDir {
         path: target.clone(),
     }];
-    for (rel, is_dir) in template_files {
+    for (rel, is_dir) in copies {
         if *is_dir {
             steps.push(PlanStep::MkDir {
                 path: format!("{target}/{rel}"),
             });
         } else {
             steps.push(PlanStep::CopyFile {
-                from: format!("_template/{rel}"),
+                from: format!("{pattern_root}/{rel}"),
                 to: format!("{target}/{rel}"),
             });
         }
@@ -101,28 +114,12 @@ pub fn compile_create(dir_name: &str, template_files: &[(String, bool)], readme:
 
 /// What a pattern copy takes from a source session (FR-239): structure only.
 ///
-/// The decision function, pure over the source's file list: `prompts/**` is
-/// copied (reusable by design), `refs/**` is copied (pointers worth keeping),
-/// the four standard directories exist empty, and **nothing else** — no
-/// artifacts (they are the OLD session's output), no workspace (scratch), no
-/// README content (the new README is built from headings, not prose).
+/// Kept as the one-line spelling of [`crate::sessions::pattern::apply`] for
+/// the session kind — the rule itself, and the *reasons* the skipped files
+/// carry, live there so the picker's preview and the plan read one value.
 pub fn pattern_copies(source_files: &[(String, bool)]) -> Vec<(String, bool)> {
-    let mut out = vec![
-        ("workspace".to_owned(), true),
-        ("artifacts".to_owned(), true),
-        ("refs".to_owned(), true),
-        ("prompts".to_owned(), true),
-    ];
-    for (rel, is_dir) in source_files {
-        let copied = rel == "prompts"
-            || rel.starts_with("prompts/")
-            || rel == "refs"
-            || rel.starts_with("refs/");
-        if copied && !out.iter().any(|(existing, _)| existing == rel) {
-            out.push((rel.clone(), *is_dir));
-        }
-    }
-    out
+    crate::sessions::pattern::apply(crate::sessions::pattern::PatternKind::Session, source_files)
+        .copies
 }
 
 /// Compile a **create-from** (FR-239, AD-112): the structural copy plus the
@@ -142,7 +139,7 @@ pub fn compile_create_from(
     copies: &[(String, bool)],
     readme: &str,
 ) -> Plan {
-    let mut plan = compile_create(dir_name, copies, readme);
+    let mut plan = compile_create(dir_name, source_session, copies, readme);
     plan.verb = "create-from".to_owned();
     // The source-side lineage append, byte-preserving outside the key.
     let updated = append_lineage(source_readme, KEY_CONTINUED_BY, new_id);
@@ -371,7 +368,7 @@ mod tests {
             .iter()
             .map(|(rel, dir)| ((*rel).to_owned(), *dir))
             .collect();
-        let plan = compile_create("2026-08-12-research", &files, "# research\n");
+        let plan = compile_create("2026-08-12-research", "_template", &files, "# research\n");
         assert_eq!(plan.verb, "create");
         assert_eq!(plan.session, "active/2026-08-12-research");
         assert!(
@@ -384,6 +381,31 @@ mod tests {
         ));
         assert!(plan.steps.iter().any(|step| matches!(step,
             PlanStep::CopyFile { from, .. } if from == "_template/README.md")));
+    }
+
+    /// Every copy reads from the pattern the user picked (FR-253). The shell
+    /// used to rewrite copy sources after compiling; a plan that named a
+    /// source it did not mean was a journal that replayed the wrong thing.
+    #[test]
+    fn copies_read_from_the_pattern_the_caller_named() {
+        let plan = compile_create(
+            "2026-08-12-continuation",
+            "archive/2025/2025-03-01-old",
+            &[
+                ("prompts".to_owned(), true),
+                ("prompts/01-scope.md".to_owned(), false),
+            ],
+            "# continuation\n",
+        );
+        assert!(plan.steps.iter().any(|step| matches!(step,
+            PlanStep::CopyFile { from, to }
+                if from == "archive/2025/2025-03-01-old/prompts/01-scope.md"
+                && to == "active/2026-08-12-continuation/prompts/01-scope.md")));
+        assert!(
+            !plan.steps.iter().any(|step| matches!(step,
+                PlanStep::CopyFile { from, .. } if from.starts_with("_template/"))),
+            "a session pattern never reads the template"
+        );
     }
 
     /// The pattern copy is structure-only (FR-239): prompts and refs travel,

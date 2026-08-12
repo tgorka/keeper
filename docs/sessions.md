@@ -75,14 +75,29 @@ the distinction is the review loop.
 
 ## The verbs
 
-- **New session** — one question (the title). The template is copied verbatim, the README
-  stamped from the template's own headings with today's date and a minted id, the folder
-  named `YYYY-MM-DD-<slug>` with a collision counter.
-- **New like this** — a continuation (the zone's preferred reopen). Structure only:
-  `prompts/` and `refs/` travel, artifacts and workspace contents never do, and the new
-  README is the source's headings, empty. `continues`/`continued-by` are written into
-  BOTH READMEs — including an archived source — so the lineage is visible to `cat`,
-  Obsidian and the agent, not only to keeper.
+- **New session** — the title, and what to shape it from. The folder is named
+  `YYYY-MM-DD-<slug>` with a collision counter, the id is minted, and the README is
+  stamped from the pattern's own headings with today's date.
+
+  The **pattern** is the second half of the question, and it is already answered: the
+  zone's `_template/` is pre-chosen, and every session in the zone follows it in the
+  list, newest change first — because the thing you want to start from is nearly always
+  what you were last working in. Under the picker, the preview names every file that
+  travels **and** every file that does not, each with its reason. That list is not a
+  description of the copy; it is the copy, projected from the same rule the plan is
+  compiled from, so what you are promised and what lands on disk cannot drift.
+
+  Choosing the template copies it verbatim. Choosing a **session** is a continuation
+  (the zone's preferred reopen): structure only — `prompts/` and `refs/` travel,
+  artifacts and workspace contents never do, and the new README is the source's
+  headings, empty. `continues`/`continued-by` are written into BOTH READMEs —
+  including an archived source — so the lineage is visible to `cat`, Obsidian and the
+  agent, not only to keeper.
+
+  A zone with no `_template/` offers its sessions alone; a zone with neither offers no
+  picker at all and creates the standard empty skeleton.
+- **New like this** — the same door, opened with this row already chosen as the pattern.
+  Not a second create verb: the title is still asked and the preview still shown.
 - **Log today** — appends `### YYYY-MM-DD — ` under `## Log`, newest last (the zone's
   convention), once per day, and opens the README. `⌘⌥L`, the palette, or the row menu.
 - **Pin** — `pinned: true` in frontmatter; pinned sessions sort first in their group.

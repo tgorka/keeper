@@ -21,14 +21,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { SessionActions } from "@/components/sessions/session-actions";
 import { SessionDetail } from "@/components/sessions/session-detail";
+import { SessionPatternPicker } from "@/components/sessions/session-pattern-picker";
 import { SessionRow } from "@/components/sessions/session-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { countLabel, SESSIONS } from "@/lib/count-label";
-import type { SessionRowVm } from "@/lib/ipc/client";
-import { sessionsCreate, sessionsRescan } from "@/lib/ipc/client";
+import type { SessionPatternVm, SessionRowVm } from "@/lib/ipc/client";
+import { sessionsCreate, sessionsPatterns, sessionsRescan } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 import {
   filterRows,
@@ -62,7 +63,11 @@ export const SESSIONS_NO_MATCH_LABEL = "Nothing matches this filter.";
 /** The rescan verb — the sessions "Rebuild index" (FR-225). */
 export const SESSIONS_RESCAN_LABEL = "Rescan";
 
-/** The create verb (FR-238): one question — the title — and a folder lands. */
+/**
+ * The create verb (FR-238, FR-253): the title, and what to shape the session
+ * from — one row, one Create. The pattern defaults to the zone's own template
+ * and is a change away from being the session you were just in.
+ */
 export const SESSIONS_NEW_LABEL = "New session";
 export const SESSIONS_NEW_TITLE_LABEL = "Session title";
 export const SESSIONS_NEW_CONFIRM_LABEL = "Create";
@@ -141,30 +146,78 @@ export function SessionsPane() {
       ? openSession.id
       : null;
 
-  // The one-question create (FR-238): a title field revealed in place, no
-  // dialog. Create lands the folder, the changed event brings the row, and
-  // the README opens with the caret ready.
+  // The create row, revealed in place, no dialog (FR-238): the title, and what
+  // the session is shaped from (FR-253). Create lands the folder, the changed
+  // event brings the row, and the README opens with the caret ready.
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
+  const [patterns, setPatterns] = useState<SessionPatternVm[] | null>(null);
+  const [patternId, setPatternId] = useState<string | null>(null);
   // The palette's New Session bumps the nonce; the board answers by opening
-  // its create row — the vault-switcher idiom (FR-251).
+  // its create row — the vault-switcher idiom (FR-251). A row's "New like
+  // this" bumps the same nonce with its own id, so both verbs land on ONE
+  // surface with one already chosen (FR-253).
   const createNonce = useSessionsListStore((s) => s.createNonce);
+  const createPatternId = useSessionsListStore((s) => s.createPatternId);
   useEffect(() => {
     if (createNonce > 0) {
       setCreating(true);
+      if (createPatternId !== null) {
+        setPatternId(createPatternId);
+      }
     }
-  }, [createNonce]);
+  }, [createNonce, createPatternId]);
+
+  // Read the patterns when the row opens, and again whenever the zone changes
+  // under it — a session created a minute ago is a pattern a minute later, and
+  // a stale list would offer an id the shell no longer resolves. The read is
+  // one directory walk per pattern; it belongs to the open row, not the pane,
+  // so a board nobody is creating on does no walking at all.
+  const rowsRootId = useSessionsListStore((s) => s.rowsRootId);
+  const rowCount = rows?.length ?? 0;
+  const rootId = activeRoot?.id ?? null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `rowsRootId`/`rowCount` are re-run triggers, not reads — the zone's changed event re-reads the rows, and this re-reads the patterns behind them so an open picker cannot offer an id the shell no longer resolves.
+  useEffect(() => {
+    if (!creating || rootId === null) {
+      return;
+    }
+    let live = true;
+    void sessionsPatterns(rootId).then((list) => {
+      if (!live) {
+        return;
+      }
+      setPatterns(list);
+      // Default to the zone's own answer, and fall back to the newest pattern
+      // in a zone with no `_template/`. Resolving in the setter keeps a
+      // user's choice through a re-read: only an id that stopped existing is
+      // replaced.
+      setPatternId((current) =>
+        current !== null && list.some((pattern) => pattern.id === current)
+          ? current
+          : (list[0]?.id ?? null),
+      );
+    });
+    return () => {
+      live = false;
+    };
+    // `rowsRootId`/`rowCount` are the zone's own change signal, mirrored: the
+    // changed event re-reads the rows, which re-reads the patterns.
+  }, [creating, rootId, rowsRootId, rowCount]);
+
+  const closeCreate = useCallback(() => {
+    setCreating(false);
+    setNewTitle("");
+  }, []);
   const submitCreate = useCallback(() => {
     const title = newTitle.trim();
     if (activeRoot === null || title === "") {
       return;
     }
-    void sessionsCreate(activeRoot.id, title).then((ref) => {
-      setCreating(false);
-      setNewTitle("");
+    void sessionsCreate(activeRoot.id, title, patternId ?? undefined).then((ref) => {
+      closeCreate();
       openReadme(ref.rootId, activeRoot.subfolder, ref.path);
     });
-  }, [activeRoot, newTitle, openReadme]);
+  }, [activeRoot, newTitle, patternId, closeCreate, openReadme]);
 
   // Drilled in: the detail replaces the board's body wholesale — the header
   // stays (New/Rescan keep working), the filter row and list yield. One pane,
@@ -217,32 +270,37 @@ export function SessionsPane() {
         )}
       </header>
 
-      {/* The create row, revealed in place — one question, no dialog (FR-238,
-          the capture no-filing philosophy). Escape closes; Enter creates. */}
+      {/* The create row, revealed in place — no dialog (FR-238, the capture
+          no-filing philosophy). The title stays the one field you must fill;
+          the pattern below it is already answered and shows its consequence
+          (FR-253). Escape closes; Enter creates. */}
       {creating && activeRoot !== null && (
-        <div className="flex shrink-0 gap-2 border-border border-b px-6 py-3">
-          <InputGroup>
-            <InputGroupInput
-              // biome-ignore lint/a11y/noAutofocus: the row exists because the
-              // user just pressed New session; the title is the one question.
-              autoFocus
-              placeholder={SESSIONS_NEW_TITLE_LABEL}
-              aria-label={SESSIONS_NEW_TITLE_LABEL}
-              value={newTitle}
-              onChange={(e) => setNewTitle(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  submitCreate();
-                }
-                if (e.key === "Escape") {
-                  setCreating(false);
-                }
-              }}
-            />
-          </InputGroup>
-          <Button type="button" size="sm" onClick={submitCreate}>
-            {SESSIONS_NEW_CONFIRM_LABEL}
-          </Button>
+        <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
+          <div className="flex gap-2">
+            <InputGroup>
+              <InputGroupInput
+                // biome-ignore lint/a11y/noAutofocus: the row exists because the
+                // user just pressed New session; the title is the one question.
+                autoFocus
+                placeholder={SESSIONS_NEW_TITLE_LABEL}
+                aria-label={SESSIONS_NEW_TITLE_LABEL}
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    submitCreate();
+                  }
+                  if (e.key === "Escape") {
+                    closeCreate();
+                  }
+                }}
+              />
+            </InputGroup>
+            <Button type="button" size="sm" onClick={submitCreate}>
+              {SESSIONS_NEW_CONFIRM_LABEL}
+            </Button>
+          </div>
+          <SessionPatternPicker patterns={patterns} value={patternId} onChange={setPatternId} />
         </div>
       )}
 
@@ -342,16 +400,7 @@ export function SessionsPane() {
                   onOpen={openRow}
                   actions={
                     activeRoot !== null ? (
-                      <SessionActions
-                        rootId={activeRoot.id}
-                        rootPath={activeRoot.root}
-                        row={row}
-                        // `path` arrives zone-relative (`active/<dir>`), the
-                        // same frame every row path is in.
-                        onCreatedFrom={(rootId, path) =>
-                          openReadme(rootId, activeRoot.subfolder, path)
-                        }
-                      />
+                      <SessionActions rootId={activeRoot.id} rootPath={activeRoot.root} row={row} />
                     ) : undefined
                   }
                 />

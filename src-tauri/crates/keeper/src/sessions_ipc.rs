@@ -158,10 +158,11 @@ fn exec_error(error: crate::sessions_exec::ExecError) -> IpcError {
     }
 }
 
-/// The `(template-relative path, is_dir)` facts a template copy needs, walked
-/// shallowly enough for a skeleton (depth-capped at the template's own shape).
+/// The `(dir-relative path, is_dir)` facts a pattern copy needs — one walk,
+/// used for the zone's `_template/` and for a source session alike, because
+/// [`keeper_core::sessions::pattern::apply`] is what tells them apart.
 #[cfg(desktop)]
-fn template_files(zone: &std::path::Path) -> Vec<(String, bool)> {
+fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
     fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, bool)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -188,8 +189,134 @@ fn template_files(zone: &std::path::Path) -> Vec<(String, bool)> {
         }
     }
     let mut out = Vec::new();
-    walk(&zone.join("_template"), "", &mut out);
+    walk(dir, "", &mut out);
     out
+}
+
+/// The pattern id the zone's own `_template/` answers to.
+#[cfg(desktop)]
+const TEMPLATE_PATTERN_ID: &str = "_template";
+
+/// Newest mtime under a directory, ms since epoch — what orders the picker.
+#[cfg(desktop)]
+fn newest_mtime_ms(dir: &std::path::Path, files: &[(String, bool)]) -> Option<i64> {
+    files
+        .iter()
+        .filter(|(_, is_dir)| !*is_dir)
+        .filter_map(|(rel, _)| {
+            std::fs::metadata(dir.join(rel))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|since| since.as_millis() as i64)
+                })
+        })
+        .max()
+}
+
+/// Project one pattern for the picker: the decision, applied and rendered.
+#[cfg(desktop)]
+fn pattern_vm(
+    id: &str,
+    kind: keeper_core::sessions::pattern::PatternKind,
+    label: &str,
+    detail: &str,
+    dir: &std::path::Path,
+) -> keeper_core::sessions::vm::SessionPatternVm {
+    use keeper_core::sessions::pattern;
+    use keeper_core::sessions::vm::{SessionPatternFileVm, SessionPatternSkipVm, SessionPatternVm};
+
+    let files = pattern_files(dir);
+    let mtime_ms = newest_mtime_ms(dir, &files);
+    let outcome = pattern::apply(kind, &files);
+    SessionPatternVm {
+        id: id.to_owned(),
+        kind: kind.as_str().to_owned(),
+        label: label.to_owned(),
+        detail: detail.to_owned(),
+        mtime_ms,
+        // Placeholders travel but are never shown: an empty `refs/` that
+        // advertised a file would be true about bytes and false about meaning.
+        copies: outcome
+            .copies
+            .iter()
+            .filter(|(rel, _)| !pattern::is_placeholder(rel))
+            .map(|(rel, is_dir)| SessionPatternFileVm {
+                rel_path: rel.clone(),
+                is_dir: *is_dir,
+            })
+            .collect(),
+        skips: outcome
+            .skips
+            .iter()
+            .filter(|(rel, _)| !pattern::is_placeholder(rel))
+            .map(|(rel, reason)| SessionPatternSkipVm {
+                rel_path: rel.clone(),
+                reason: reason.sentence().to_owned(),
+            })
+            .collect(),
+    }
+}
+
+/// Everything a new session can be shaped from (FR-253): the zone's
+/// `_template/` first, then the sessions themselves, newest first.
+///
+/// The board used to offer these as two unrelated verbs — *New session* on
+/// the header and *New like this* on a row's menu — which made "start from
+/// what I did last time" a thing you had to already know about. One list,
+/// one question, and the preview each entry carries is the plan's own
+/// decision rather than a second description of it (AD-116).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_patterns(
+    root_id: String,
+) -> Result<Vec<keeper_core::sessions::vm::SessionPatternVm>, IpcError> {
+    use keeper_core::sessions::pattern::PatternKind;
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let mut out = Vec::new();
+    let template_dir = zone.join(keeper_core::sessions::model::TEMPLATE_DIR);
+    if template_dir.is_dir() {
+        out.push(pattern_vm(
+            TEMPLATE_PATTERN_ID,
+            PatternKind::Template,
+            "Zone template",
+            "the zone's own skeleton — copied whole",
+            &template_dir,
+        ));
+    }
+    // Sessions as patterns, newest record change first — the same order the
+    // board sorts by, so the picker agrees with the list behind it.
+    for row in crate::sessions_root::rows(&root_id)
+        .map(|rows| rows.as_ref().clone())
+        .unwrap_or_default()
+    {
+        let detail = if row.status == "active" {
+            "continues this session".to_owned()
+        } else {
+            match row.archived_year {
+                Some(year) => format!("continues this session — archived {year}"),
+                None => "continues this session — archived".to_owned(),
+            }
+        };
+        out.push(pattern_vm(
+            &row.id,
+            PatternKind::Session,
+            &row.title,
+            &detail,
+            &zone.join(&row.path),
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_patterns(root_id: String) -> Result<Vec<()>, IpcError> {
+    let _ = root_id;
+    Err(unsupported())
 }
 
 /// The folder names already taken in `active/`, for the collision counter.
@@ -205,15 +332,27 @@ fn taken_names(zone: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Create a session from the zone's `_template/` (FR-238): one question in
-/// (the title), one folder out — copied verbatim, README stamped with the
-/// date line and a minted id, and the caret's home returned as the ref.
+/// Create a session from a pattern (FR-238, FR-239, FR-253, AD-112, AD-116).
+///
+/// Two questions in — the title, and what to shape it from — and one folder
+/// out. `pattern_id` is `None` or `"_template"` for the zone's skeleton, and
+/// a session's ULID to continue that session: structure only, with
+/// `continues`/`continued-by` written into BOTH READMEs, an archived source
+/// included, because files are truth and a lineage only the index knew would
+/// be invisible to `cat`, to Obsidian and to the agent.
+///
+/// One command rather than the pair it replaces: which pattern a session
+/// starts from is an *argument*, not a different verb, and keeping it as two
+/// commands is what let the template path and the continuation path drift
+/// apart in the first place.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_create(
     root_id: String,
     title: String,
+    pattern_id: Option<String>,
 ) -> Result<keeper_core::sessions::vm::SessionRefVm, IpcError> {
+    use keeper_core::sessions::pattern::{self, PatternKind};
     use keeper_core::sessions::{model, plan};
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
@@ -221,15 +360,57 @@ pub async fn sessions_create(
     let date = today();
     let dir_name = model::session_dir_name(&title, &date, &taken_names(&zone));
     let id = crate::sync_ipc::new_ulid();
-    // The stamped README: template prose replaced by the canonical skeleton
-    // with the title and date in place. The template's own README stays the
-    // pattern for what sections exist — read it, keep its headings.
-    let template_readme = std::fs::read_to_string(zone.join("_template/README.md"))
+
+    // Which pattern, resolved to the one thing the plan needs: a zone-relative
+    // directory to copy out of, and the kind that decides what travels.
+    let source_id = pattern_id.filter(|value| value != TEMPLATE_PATTERN_ID);
+    let (kind, pattern_root, source) = match &source_id {
+        None => (PatternKind::Template, model::TEMPLATE_DIR.to_owned(), None),
+        Some(source_id) => {
+            let row =
+                crate::sessions_root::row_of(&root_id, source_id).ok_or_else(|| IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!("no such session: {source_id}"),
+                    account_id: None,
+                    retriable: false,
+                })?;
+            (PatternKind::Session, row.path.clone(), Some(row))
+        }
+    };
+    let pattern_dir = zone.join(&pattern_root);
+
+    // The stamped README: the pattern's own headings, empty, with the title
+    // and date in place. A template README that grows a section grows it for
+    // every new session; a continued session inherits the shape it earned.
+    let pattern_readme = std::fs::read_to_string(pattern_dir.join(model::README))
         .unwrap_or_else(|_| "# <session title>\n\n## Summary\n\n## Log\n\n## Promote\n\n| workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n".to_owned());
-    let body = plan::skeleton_from(&template_readme, &title, &date);
-    let readme = format!("---\nid: {id}\ncreated: {date}\n---\n{body}");
-    let compiled = plan::compile_create(&dir_name, &template_files(&zone), &readme);
+    let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(&pattern_readme);
+    let body = plan::skeleton_from(&pattern_readme[body_at..], &title, &date);
+    let readme = match &source {
+        // continues: baked into the new README's frontmatter at birth (AD-112).
+        Some(row) => format!(
+            "---\nid: {id}\ncreated: {date}\nkeeper:\n  session-continues: [{}]\n---\n{body}",
+            row.id
+        ),
+        None => format!("---\nid: {id}\ncreated: {date}\n---\n{body}"),
+    };
+
+    let copies = pattern::apply(kind, &pattern_files(&pattern_dir)).copies;
+    let mut compiled = match &source {
+        None => plan::compile_create(&dir_name, &pattern_root, &copies, &readme),
+        Some(row) => {
+            let source_readme =
+                std::fs::read_to_string(pattern_dir.join(model::README)).unwrap_or_default();
+            plan::compile_create_from(&dir_name, &row.path, &source_readme, &id, &copies, &readme)
+        }
+    };
+    compiled.verb = if source.is_some() {
+        "create-from".to_owned()
+    } else {
+        "create".to_owned()
+    };
     let session_path = compiled.session.clone();
+
     tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
         .await
         .map_err(|join| IpcError {
@@ -250,124 +431,12 @@ pub async fn sessions_create(
 
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn sessions_create(root_id: String, title: String) -> Result<(), IpcError> {
-    let _ = (root_id, title);
-    Err(unsupported())
-}
-
-/// Create a session continuing another (FR-239, AD-112): structure-only copy
-/// of the source's shape, lineage written on BOTH ends — including into an
-/// archived source, because files are truth.
-#[cfg(desktop)]
-#[tauri::command]
-pub async fn sessions_create_from(
+pub fn sessions_create(
     root_id: String,
-    source_id: String,
     title: String,
-) -> Result<keeper_core::sessions::vm::SessionRefVm, IpcError> {
-    use keeper_core::sessions::{model, plan};
-
-    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let source = crate::sessions_root::row_of(&root_id, &source_id).ok_or_else(|| IpcError {
-        code: IpcErrorCode::Internal,
-        message: format!("no such session: {source_id}"),
-        account_id: None,
-        retriable: false,
-    })?;
-    let title = title.trim().to_owned();
-    let date = today();
-    let dir_name = model::session_dir_name(&title, &date, &taken_names(&zone));
-    let id = crate::sync_ipc::new_ulid();
-
-    let source_dir = zone.join(&source.path);
-    let source_readme = std::fs::read_to_string(source_dir.join("README.md")).unwrap_or_default();
-    let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(&source_readme);
-    let skeleton = plan::skeleton_from(&source_readme[body_at..], &title, &date);
-    // continues: baked into the new README's frontmatter at birth (AD-112).
-    let readme = format!(
-        "---\nid: {id}\ncreated: {date}\nkeeper:\n  session-continues: [{source_id}]\n---\n{skeleton}"
-    );
-
-    // The structural copy: the source's prompts and ref pointers, walked here
-    // and filtered by the pure rule.
-    let mut source_files = Vec::new();
-    {
-        fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, bool)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && name != ".gitkeep" {
-                    continue;
-                }
-                let rel = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_dir() {
-                    out.push((rel.clone(), true));
-                    walk(&entry.path(), &rel, out);
-                } else {
-                    out.push((rel, false));
-                }
-            }
-        }
-        walk(&source_dir, "", &mut source_files);
-    }
-    let copies_rel = plan::pattern_copies(&source_files);
-    // pattern copies name paths relative to the SOURCE session; the compile
-    // function copies from `_template/` — so re-point the copy sources by
-    // building the plan by hand from compile_create's shape, with the source
-    // session as the origin for the copied files.
-    let mut compiled = plan::compile_create(&dir_name, &copies_rel, &readme);
-    for step in &mut compiled.steps {
-        if let keeper_core::sessions::plan::PlanStep::CopyFile { from, .. } = step {
-            if let Some(rest) = from.strip_prefix("_template/") {
-                *from = format!("{}/{rest}", source.path);
-            }
-        }
-    }
-    let with_lineage =
-        plan::compile_create_from(&dir_name, &source.path, &source_readme, &id, &[], &readme);
-    // Take the guarded source-side lineage write from the canonical compile
-    // and append it to the re-pointed structural plan.
-    if let Some(lineage_step) = with_lineage.steps.last().cloned() {
-        compiled.steps.push(lineage_step);
-    }
-    compiled.verb = "create-from".to_owned();
-    let session_path = compiled.session.clone();
-
-    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
-        .await
-        .map_err(|join| IpcError {
-            code: IpcErrorCode::Internal,
-            message: format!("create-from task failed: {join}"),
-            account_id: None,
-            retriable: false,
-        })?
-        .map_err(exec_error)?;
-    crate::sessions_root::rescan(&root_id);
-    Ok(keeper_core::sessions::vm::SessionRefVm {
-        root_id,
-        id,
-        path: session_path,
-        title,
-    })
-}
-
-#[cfg(not(desktop))]
-#[tauri::command]
-pub fn sessions_create_from(
-    root_id: String,
-    source_id: String,
-    title: String,
+    pattern_id: Option<String>,
 ) -> Result<(), IpcError> {
-    let _ = (root_id, source_id, title);
+    let _ = (root_id, title, pattern_id);
     Err(unsupported())
 }
 

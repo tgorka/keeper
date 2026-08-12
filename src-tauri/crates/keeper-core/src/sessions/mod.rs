@@ -25,6 +25,7 @@
 //! is a design defect, not a feature.
 
 pub mod model;
+pub mod pattern;
 pub mod plan;
 pub mod promote;
 pub mod vm;

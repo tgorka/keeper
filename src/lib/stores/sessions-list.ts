@@ -36,6 +36,14 @@ export interface SessionsListState {
    * Session lands here (the `switcherNonce` idiom from `notes-vaults`).
    */
   createNonce: number;
+  /**
+   * Which pattern the revealed create row should start on (FR-253), or `null`
+   * for the board's own default. A row's "New like this" sets its own id here
+   * and bumps the nonce — the SAME create row, the SAME preview, one pattern
+   * already chosen. It is a request, not a selection: the row clears it into
+   * local state on open, and the user is free to pick another.
+   */
+  createPatternId: string | null;
   reset: (rootId: string, rows: SessionRowVm[]) => void;
   clear: () => void;
   setText: (text: string) => void;
@@ -43,7 +51,7 @@ export interface SessionsListState {
   setPinnedOnly: (pinnedOnly: boolean) => void;
   setUnreadOnly: (unreadOnly: boolean) => void;
   setError: (error: string | null) => void;
-  requestCreateOpen: () => void;
+  requestCreateOpen: (patternId?: string) => void;
 }
 
 export const sessionsListStore = createStore<SessionsListState>()((set) => ({
@@ -55,6 +63,7 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   unreadOnly: false,
   error: null,
   createNonce: 0,
+  createPatternId: null,
   reset: (rootId, rows) => set({ rows, rowsRootId: rootId, error: null }),
   clear: () => set({ rows: null, rowsRootId: null, error: null }),
   setText: (text) => set({ text }),
@@ -62,7 +71,11 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
   setUnreadOnly: (unreadOnly) => set({ unreadOnly }),
   setError: (error) => set({ error }),
-  requestCreateOpen: () => set((state) => ({ createNonce: state.createNonce + 1 })),
+  requestCreateOpen: (patternId) =>
+    set((state) => ({
+      createNonce: state.createNonce + 1,
+      createPatternId: patternId ?? null,
+    })),
 }));
 
 export function useSessionsListStore<T>(selector: (state: SessionsListState) => T): T {
@@ -127,5 +140,6 @@ export function resetSessionsListStoreForTest(): void {
     unreadOnly: false,
     error: null,
     createNonce: 0,
+    createPatternId: null,
   });
 }

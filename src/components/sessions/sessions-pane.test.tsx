@@ -1,21 +1,39 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SessionRootVm, SessionRowVm } from "@/lib/ipc/client";
+import type { SessionPatternVm, SessionRootVm, SessionRowVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC client so the pane never touches Tauri.
 const sessionsRoots = vi.fn();
 const sessionsList = vi.fn();
 const sessionsRescan = vi.fn();
+const sessionsPatterns = vi.fn();
+const sessionsCreate = vi.fn();
 const revealPath = vi.fn();
 const listenSessionsChanged = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   sessionsRoots: () => sessionsRoots(),
   sessionsList: (rootId: unknown) => sessionsList(rootId),
   sessionsRescan: (rootId: unknown) => sessionsRescan(rootId),
+  sessionsPatterns: (rootId: unknown) => sessionsPatterns(rootId),
+  sessionsCreate: (rootId: unknown, title: unknown, patternId: unknown) =>
+    sessionsCreate(rootId, title, patternId),
   revealPath: (path: unknown) => revealPath(path),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
+  sessionsSetPinned: vi.fn(async () => {}),
+  sessionsLogToday: vi.fn(async () => {}),
+  sessionsArchive: vi.fn(async () => {}),
+  sessionsUnarchive: vi.fn(async () => {}),
+  sessionsDelete: vi.fn(async () => {}),
 }));
 
+import {
+  SESSION_ACTIONS_LABEL,
+  SESSION_NEW_LIKE_THIS_LABEL,
+} from "@/components/sessions/session-actions";
+import {
+  SESSION_PATTERN_LABEL,
+  SESSION_PATTERN_SKIPS_LABEL,
+} from "@/components/sessions/session-pattern-picker";
 import {
   SESSION_ROW_RECORD_TESTID,
   SESSION_ROW_STATUS_TESTID,
@@ -23,6 +41,9 @@ import {
 } from "@/components/sessions/session-row";
 import {
   SESSIONS_LIST_LABEL,
+  SESSIONS_NEW_CONFIRM_LABEL,
+  SESSIONS_NEW_LABEL,
+  SESSIONS_NEW_TITLE_LABEL,
   SESSIONS_NO_MATCH_LABEL,
   SESSIONS_NO_ROOT_TITLE,
   SESSIONS_PANE_TITLE,
@@ -70,12 +91,48 @@ function row(over: Partial<SessionRowVm> = {}): SessionRowVm {
   };
 }
 
+function templatePattern(): SessionPatternVm {
+  return {
+    id: "_template",
+    kind: "template",
+    label: "Zone template",
+    detail: "the zone's own skeleton — copied whole",
+    mtimeMs: null,
+    copies: [{ relPath: "prompts/00-brief.md", isDir: false }],
+    skips: [],
+  };
+}
+
+function sessionPattern(): SessionPatternVm {
+  return {
+    id: "01J5AAAAAAAAAAAAAAAAAAAAAA",
+    kind: "session",
+    label: "keeper — rolling work session",
+    detail: "continues this session",
+    mtimeMs: NOW - 60 * 60_000,
+    copies: [{ relPath: "prompts/01-scope.md", isDir: false }],
+    skips: [
+      {
+        relPath: "artifacts/report.md",
+        reason: "artifacts stay with the session that produced them",
+      },
+    ],
+  };
+}
+
 beforeEach(() => {
   resetSessionsRootsStoreForTest();
   resetSessionsListStoreForTest();
   sessionsRoots.mockResolvedValue([root()]);
   sessionsList.mockResolvedValue([row()]);
   sessionsRescan.mockResolvedValue(undefined);
+  sessionsPatterns.mockResolvedValue([templatePattern(), sessionPattern()]);
+  sessionsCreate.mockResolvedValue({
+    rootId: "tgdrive",
+    id: "01J5NEWNEWNEWNEWNEWNEWNEWN",
+    path: "active/2026-08-12-next",
+    title: "next",
+  });
   revealPath.mockResolvedValue(undefined);
   listenSessionsChanged.mockResolvedValue(() => {});
 });
@@ -126,6 +183,68 @@ describe("SessionsPane", () => {
     render(<SessionsPane />);
     await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
     expect(screen.queryByRole("button", { name: /^tgdrive/ })).not.toBeInTheDocument();
+  });
+
+  it("creating asks for the title and the pattern on ONE row, template chosen", async () => {
+    render(<SessionsPane />);
+    (await screen.findByRole("button", { name: SESSIONS_NEW_LABEL })).click();
+
+    const title = await screen.findByLabelText(SESSIONS_NEW_TITLE_LABEL);
+    const picker = await screen.findByRole("combobox", { name: SESSION_PATTERN_LABEL });
+    // The zone's own answer is pre-chosen — the picker is a change, not a step.
+    expect(picker).toHaveTextContent("Zone template");
+
+    fireEvent.change(title, { target: { value: "  next thing  " } });
+    (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
+    await waitFor(() =>
+      expect(sessionsCreate).toHaveBeenCalledWith("tgdrive", "next thing", "_template"),
+    );
+  });
+
+  it("refuses to create without a title, and never calls Rust to find that out", async () => {
+    render(<SessionsPane />);
+    (await screen.findByRole("button", { name: SESSIONS_NEW_LABEL })).click();
+    (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
+    expect(sessionsCreate).not.toHaveBeenCalled();
+  });
+
+  it("'New like this' opens the SAME create row with that session chosen", async () => {
+    render(<SessionsPane />);
+    const list = await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
+    // Radix opens on pointer events, not click (the note-actions precedent).
+    const trigger = within(list).getByRole("button", { name: SESSION_ACTIONS_LABEL });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    const menu = await screen.findByRole("menu");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: SESSION_NEW_LIKE_THIS_LABEL }));
+
+    // One door: the title is still asked, and the consequence is still shown.
+    const picker = await screen.findByRole("combobox", { name: SESSION_PATTERN_LABEL });
+    expect(picker).toHaveTextContent("keeper — rolling work session");
+    const skips = await screen.findByRole("list", { name: SESSION_PATTERN_SKIPS_LABEL });
+    expect(
+      within(skips).getByText(/artifacts stay with the session that produced them/),
+    ).toBeInTheDocument();
+
+    fireEvent.change(await screen.findByLabelText(SESSIONS_NEW_TITLE_LABEL), {
+      target: { value: "round two" },
+    });
+    (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
+    await waitFor(() =>
+      expect(sessionsCreate).toHaveBeenCalledWith(
+        "tgdrive",
+        "round two",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+      ),
+    );
+  });
+
+  it("reads patterns only once the create row is open — a board nobody creates on walks nothing", async () => {
+    render(<SessionsPane />);
+    await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
+    expect(sessionsPatterns).not.toHaveBeenCalled();
+    (await screen.findByRole("button", { name: SESSIONS_NEW_LABEL })).click();
+    await waitFor(() => expect(sessionsPatterns).toHaveBeenCalledWith("tgdrive"));
   });
 
   it("switching roots re-reads rows scoped to the new root", async () => {
