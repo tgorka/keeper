@@ -263,9 +263,10 @@ Four constraints shaped it, and three of them are hard:
    rectangles and circles — findable in peripheral vision rather than merely legible once found.
 2. **Android's trademark forbids derivatives of the bugdroid**, which is a dome head with two thin
    antennae and two dot eyes. The hex-bot stays out of its shadow structurally: the head is a
-   flat-topped hexagon, not a dome; **no template wears an antenna at all**; and the coloured app
-   icon wears exactly one — a stem tipped with a smaller hexagon, the mark broadcasting itself,
-   pointedly not a pair of feelers. Silhouette, count and grammar all differ.
+   flat-topped hexagon, not a dome, and **no antenna exists anywhere in the brand** — an antenna'd
+   app-icon variant was tried and retired, for proportion as much as for distance: the cell now
+   fills the tile, and the icon is exactly the tray's silhouette, one identity everywhere.
+   Silhouette, count and grammar all differ.
 3. **A mark dies as mush along its edges, so it is authored on the grid it is worn on.** The
    viewBox is **44 units**: 44 → 44px is 1:1 and 44 → 22px is exactly 0.5, and 22px is what macOS
    renders a menu-bar template at. The cell's horizontal bands sit on even coordinates and land on

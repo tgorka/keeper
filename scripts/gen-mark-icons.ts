@@ -58,11 +58,11 @@ const MARK_GRID = 44;
 /** The cell's bounding box — x 6..38 by y 6..38, so 32 by 32. */
 const MARK_BOX = { x0: 6, y0: 6, x1: 38, y1: 38 } as const;
 /**
- * The hero's bounding box: the cell plus the short antenna above it (stem to
- * y 0, tip hexagon to y -4.77, held as -5). Only the coloured tiles use it; no
- * template ever wears the antenna.
+ * The hero is the idle cell plus a smile and nothing above it — the antenna is
+ * retired (see mark.svg), so the hero shares the cell's own box and can scale
+ * up to fill the tile instead of budgeting headroom for a mast.
  */
-const HERO_BOX = { x0: 6, y0: -5, x1: 38, y1: 38 } as const;
+const APP_SCALE = 1.25;
 
 const MARK_W = MARK_BOX.x1 - MARK_BOX.x0;
 const MARK_H = MARK_BOX.y1 - MARK_BOX.y0;
@@ -268,16 +268,14 @@ function hexPath(cx: number, cy: number, r: number): string {
  * an iOS app icon may carry no alpha at all, which a rounded tile's antialiased
  * corners violate by construction.
  *
- * The hero is placed at 1:1 — a 32-wide cell plus its short antenna on a 64
- * tile needs no scale, and centring HERO_BOX keeps the creature optically
- * centred: with the antenna at ~5 units the top and bottom margins come out
- * equal, which is the "tucked in" the owner asked for.
+ * With the antenna retired the hero is the cell alone, so it scales up by
+ * APP_SCALE to fill the tile the way an icon should — 40 of the inner 56 units
+ * — instead of sitting small under headroom nothing uses any more. Colour
+ * rasters antialiase, so the off-grid scale costs nothing the templates pay.
  */
 function appIcon(inset: number, rx: number): string {
-  const heroW = HERO_BOX.x1 - HERO_BOX.x0;
-  const heroH = HERO_BOX.y1 - HERO_BOX.y0;
-  const tx = TILE / 2 - (HERO_BOX.x0 + heroW / 2);
-  const ty = TILE / 2 - (HERO_BOX.y0 + heroH / 2);
+  const tx = TILE / 2 - APP_SCALE * (MARK_BOX.x0 + MARK_W / 2);
+  const ty = TILE / 2 - APP_SCALE * (MARK_BOX.y0 + MARK_H / 2);
   const clipId = `tile-${inset}-${rx}`;
   return svg(
     `0 0 ${TILE} ${TILE}`,
@@ -289,7 +287,7 @@ function appIcon(inset: number, rx: number): string {
       `stroke-opacity="${NEIGHBOUR_OPACITY}" stroke-width="2">` +
       `<path d="${hexPath(7, 9, 13)}"/><path d="${hexPath(57, 56, 13)}"/></g>` +
       `<g style="color:${MARK_INK}"><use href="#mark-hero" ` +
-      `transform="translate(${tx} ${ty})"/></g>`,
+      `transform="translate(${tx} ${ty}) scale(${APP_SCALE})"/></g>`,
   );
 }
 

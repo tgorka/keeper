@@ -121,18 +121,20 @@
     <g id="mark-paused"><use href="#cell"/><use href="#eyes-closed"/></g>
 
     <!--
-      hero — the coloured-icon face, NEVER a template: the idle mark plus a smile (the menu bar's
-      mouth is a state display and must be empty at rest; the app icon is not a status indicator,
-      so it may be pleased to see you) and the antenna: a short, thick stem rising from the wall,
-      tipped with a smaller hexagon — the mark broadcasting itself. Short and tucked close on the
-      owner's instruction: the tip clears the cell by ~5 units, so the icon reads as one compact
-      creature rather than a mast on a hut.
+      hero — the coloured-icon face, NEVER a template: the idle mark plus a smile, and nothing
+      else. The menu bar's mouth is a state display and must be empty at rest; the app icon is
+      not a status indicator, so it may be pleased to see you. The smile is modest — a shallow
+      10-unit arc, sized against the eyes rather than the cell, because a grin that spans the
+      face tips the head into caricature and visually squashes the hexagon.
+
+      The antenna is RETIRED, on the owner's call, and the icon is better for it three ways: the
+      cell scales up to fill the tile instead of budgeting headroom for a mast, the icon is now
+      exactly the tray's silhouette (one identity everywhere, not two), and the mark moves even
+      further out of the bugdroid's shadow — no antenna exists anywhere in the brand.
     -->
     <g id="mark-hero">
       <use href="#mark-idle"/>
-      <path d="M15 24Q22 31 29 24L29 27Q22 34 15 27Z" fill="currentColor"/>
-      <rect x="20.6" y="1" width="2.8" height="6" fill="currentColor"/>
-      <path d="M20.4 -4.57L23.6 -4.57L25.2 -1.8L23.6 0.97L20.4 0.97L18.8 -1.8Z" fill="currentColor"/>
+      <path d="M17 24.6Q22 29.2 27 24.6L27 27.2Q22 31.8 17 27.2Z" fill="currentColor"/>
     </g>
   </defs>
 
