@@ -72,12 +72,11 @@ pub fn parse(body: &str) -> Option<PromoteTable> {
     let mut row_spans = Vec::new();
     let mut append_at = None;
     let mut header_seen = false;
-    let mut line_no = body[..offset].matches('\n').count();
+    let first_line_no = body[..offset].matches('\n').count();
 
-    for line in lines {
+    for (line_no, line) in (first_line_no + 1..).zip(lines) {
         let start = offset;
         offset += line.len();
-        line_no += 1;
         let trimmed = line.trim_end_matches(['\n', '\r']).trim();
         if trimmed.starts_with("## ") {
             break;
