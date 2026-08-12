@@ -188,6 +188,33 @@ describe("paneHeaderActionsBudget", () => {
     // The slot is in the DOM, so the seam beside it is too.
     expect(paneHeaderActionsBudget({ header: 1000, status: 0 })).toBe(824);
   });
+
+  it("takes the frame group's box and its seam out of it too", () => {
+    // Story 50.1. A note panel's fold and close are a 72px group (two 32px
+    // controls and the 8px between them) that the row did not carry before the
+    // two header rows were merged into one, and 1154 - 72 - 8 is what group 3
+    // is left with. Without this term the actions group would be told it has a
+    // row 80px wider than it does and would push its last control off the
+    // right-hand edge — 46.5's defect, reintroduced by a layout change.
+    expect(paneHeaderActionsBudget({ header: 1400, status: 70, frame: 72 })).toBe(1074);
+  });
+
+  it("charges nothing for a host that is not a frame", () => {
+    // Absent and defaulted are the same claim, and both mean "there is no
+    // fourth group here": the notes pane and the capture window mount this
+    // header inside nothing that folds or closes.
+    expect(paneHeaderActionsBudget({ header: 1400, status: 70, frame: null })).toBe(1154);
+    expect(paneHeaderActionsBudget({ header: 1400, status: 70 })).toBe(1154);
+  });
+
+  it("treats an unmeasurable frame group the same way it treats an unmeasurable status", () => {
+    // Not a state the component can currently reach — the group is only ever
+    // measured off an element that exists, and an element that exists has a
+    // rect. It is here because the two group terms are ONE rule, and a rule
+    // spelled once must be asserted on both of the things it governs, or the
+    // next person to touch the arithmetic will find only half of it defended.
+    expect(paneHeaderActionsBudget({ header: 1400, status: 70, frame: Number.NaN })).toBe(1154);
+  });
 });
 
 /**

@@ -28,6 +28,7 @@
  * See `spec-46-4-save-does-not-move-the-toolbar.md`.
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteVaultVm, NoteWriteVm } from "@/lib/ipc/client";
 
@@ -61,6 +62,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import {
   PANE_HEADER_ACTIONS_SLOT,
+  PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
 } from "@/components/layout/pane-header";
@@ -133,8 +135,9 @@ function seedVault(): void {
   notesVaultsStore.getState().setVaults([vault]);
 }
 
-/** Mount the editor on a note, and let its opening `Reset` land. */
-async function openEditor(): Promise<void> {
+/** Mount the editor on a note, and let its opening `Reset` land. `frame` is
+ *  the holding surface's own controls, which only a panel has. */
+async function openEditor(frame?: ReactNode): Promise<void> {
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
       kind: "reset",
@@ -146,7 +149,7 @@ async function openEditor(): Promise<void> {
     });
     return "sub-1";
   });
-  render(<NoteEditor vaultId="v1" noteId="n1" />);
+  render(<NoteEditor vaultId="v1" noteId="n1" frame={frame} />);
   await act(async () => {
     await Promise.resolve();
   });
@@ -655,6 +658,126 @@ describe("the header shows the verbs it has room for", () => {
     // And the verb that discloses nothing is still a plain item, so the menu
     // does not grow a column of empty tick-boxes beside History and Export.
     expect(screen.getByRole("menuitem", { name: NOTE_HISTORY_LABEL })).toBeInTheDocument();
+  });
+});
+
+/**
+ * One row for a note in a panel, and the panel's controls in it (Story 50.1).
+ *
+ * The owner's report is "merge 2 pierwsze linijki note w jedna". A note open in
+ * a panel drew TWO 40px bands: the panel's, whose entire content was the word
+ * `Note` and its fold and close, and this header underneath it. The word says
+ * nothing the note's own title does not say better, so the panel gives up its
+ * row and hands its two controls down here.
+ *
+ * What the merge can break is the arithmetic. Group 3 decides how many verbs
+ * are on screen from the pixels the row can spare, and two controls that were
+ * not in this row before are 80px it can no longer spare. `panel-strip.test.
+ * tsx` proves the panel stopped drawing a row; these prove that the row it
+ * stopped drawing arrived here intact, and that group 3 was told.
+ */
+describe("a note in a panel: one row, carrying the panel's own controls", () => {
+  const FOLD_LABEL = "Fold panel";
+  const CLOSE_LABEL = "Close panel";
+
+  /** What a panel hands down. Plain buttons, because what these are is
+   *  `panel-strip.tsx`'s decision and this file's claim is only about where
+   *  the header puts whatever it is given. */
+  const PANEL_CONTROLS = (
+    <>
+      <button type="button">{FOLD_LABEL}</button>
+      <button type="button">{CLOSE_LABEL}</button>
+    </>
+  );
+
+  /** The same geometry as the suite above, plus the frame group: two 32px
+   *  controls and the 8px between them. */
+  const FRAMED_WIDTHS: Record<string, number> = { ...WIDTHS, frame: 72 };
+
+  let restoreWidths: (() => void) | null = null;
+  let observer: { resize: (width: number) => void; undo: () => void } | null = null;
+
+  afterEach(() => {
+    restoreWidths?.();
+    restoreWidths = null;
+    observer?.undo();
+    observer = null;
+  });
+
+  async function openFramed(): Promise<(width: number) => void> {
+    seedVault();
+    restoreWidths = withActionWidths(FRAMED_WIDTHS);
+    observer = withHandFiredResize();
+    await openEditor(PANEL_CONTROLS);
+    const { resize } = observer;
+    return (width) => {
+      act(() => resize(width));
+    };
+  }
+
+  it("draws one header, with the panel's controls last and outside the verbs", async () => {
+    await openFramed();
+
+    const row = headerRow();
+    // One row and not two: the whole point of the merge. The editor's header
+    // is the only `<header>` this mount produces, and the panel's controls are
+    // in it rather than in a band above it.
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(Array.from(row.children).map((child) => child.getAttribute("data-slot"))).toEqual([
+      PANE_HEADER_IDENTITY_SLOT,
+      PANE_HEADER_STATUS_SLOT,
+      PANE_HEADER_ACTIONS_SLOT,
+      PANE_HEADER_FRAME_SLOT,
+    ]);
+    const frame = row.querySelector<HTMLElement>(`[data-slot="${PANE_HEADER_FRAME_SLOT}"]`);
+    expect(within(frame as HTMLElement).getByRole("button", { name: FOLD_LABEL })).toBeVisible();
+    expect(within(frame as HTMLElement).getByRole("button", { name: CLOSE_LABEL })).toBeVisible();
+  });
+
+  it("keeps the way out of the panel out of the note's overflow at every width", async () => {
+    const resize = await openFramed();
+
+    for (const width of [1400, 800, 600, 400, 0]) {
+      resize(width);
+      // Fold and close are the panel's, not the note's, and a verb that acts on
+      // the frame must not be findable only by opening the surface's menu — the
+      // 0.8.1 reports behind Story 48.5 are what that costs. They are controls
+      // at every width, including the one where the note has promoted nothing.
+      expect(screen.getByRole("button", { name: FOLD_LABEL })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: CLOSE_LABEL })).toBeInTheDocument();
+      const promoted = names();
+      expect(promoted).not.toContain(FOLD_LABEL);
+      expect(promoted).not.toContain(CLOSE_LABEL);
+      // Opened once and read once: the trigger goes `aria-hidden` while the
+      // menu is up, so a second `menuItems()` in the same breath cannot find
+      // the control it needs to press.
+      const inMenu = menuItems();
+      expect(inMenu).not.toContain(FOLD_LABEL);
+      expect(inMenu).not.toContain(CLOSE_LABEL);
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    }
+  });
+
+  it("charges the row for them, so one fewer verb promotes at the same width", async () => {
+    const resize = await openFramed();
+
+    // 800px unframed promotes three — the suite above asserts exactly that at
+    // exactly this width. Framed, group 3 is owed 80px more (72 for the two
+    // controls, 8 for the seam beside them): 800 - 160 - 8 - 90 - 8 - 72 - 8 =
+    // 454, and 454 less the 198 the leading control and the trigger reserve
+    // buys the 108 and the 100 but not the 74 behind them.
+    resize(800);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
+
+    // And the row is still a row that grows: the frame group is a constant
+    // subtraction, not a cap.
+    resize(1400);
+    expect(names()).toEqual([
+      ATTACHMENTS_LABEL,
+      PROPERTIES_LABEL,
+      NOTE_HISTORY_LABEL,
+      SHOW_IN_FILES_LABEL,
+    ]);
   });
 });
 

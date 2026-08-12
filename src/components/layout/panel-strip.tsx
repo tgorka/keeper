@@ -24,20 +24,28 @@
  * surfaces wording the absent drive differently is how a user concludes they
  * are two different problems.
  */
-import { ChevronsLeftRight, ChevronsRightLeft, X } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { X } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
-import { FOLD_STRIP, FOLD_STRIP_SLOT } from "@/components/layout/fold-strip";
+import {
+  FOLD_STRIP,
+  FOLD_STRIP_SLOT,
+  FoldStripHead,
+  FoldStripName,
+} from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
-import { NoteEditor } from "@/components/notes/note-editor";
+import { deriveTitle, NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
 import {
   type FilesEntryVm,
   type FilesListingVm,
   type IpcError,
+  type NoteVaultVm,
+  notesBodyRead,
   type PanelTargetVm,
   syncBrowse,
 } from "@/lib/ipc/client";
+import { useNoteDocument } from "@/lib/stores/notes-editor";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type Panel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
@@ -242,31 +250,65 @@ function FilePanelBody({ profileId, relativePath }: { profileId: string; relativ
   return <Component file={file} entry={viewerEntry} />;
 }
 
-/** A note target: the vault has to exist before the editor can open anything. */
-function NotePanelBody({ vaultId, noteId }: { vaultId: string; noteId: string }) {
-  const vaults = useNotesVaultsStore((s) => s.vaults);
+/**
+ * Why a note panel cannot show its editor — or null, when it can (Story 50.1).
+ *
+ * Pure, and lifted out of the body, because two decisions now turn on it and
+ * they must not be able to disagree: what the body draws, and whether the
+ * FRAME draws a header row of its own. Since 50.1 a note panel that mounts its
+ * editor draws no panel header at all — the editor's own row carries the
+ * panel's fold and close — so a note whose vault is gone would have had no
+ * header, and therefore no way to close the panel, if the two answers were
+ * derived separately and came apart.
+ */
+export function noteVaultReason(
+  vaults: readonly NoteVaultVm[] | null,
+  vaultId: string,
+): string | null {
+  if (vaults === null) {
+    return PANEL_RESOLVING_SENTENCE;
+  }
+  return vaults.some((vault) => vault.id === vaultId) ? null : PANEL_NO_VAULT_SENTENCE;
+}
+
+/** A note target: the vault has to exist before the editor can open anything.
+ *  `reason` is {@link noteVaultReason}'s answer, decided by the frame above so
+ *  that the frame knows whether this is going to draw the panel's header. */
+function NotePanelBody({
+  vaultId,
+  noteId,
+  reason,
+  frame,
+}: {
+  vaultId: string;
+  noteId: string;
+  reason: string | null;
+  frame: ReactNode;
+}) {
   const onOpenNote = useCallback(
     (next: string) =>
       panelsStore.getState().setActiveTarget({ kind: "note", vaultId, noteId: next }),
     [vaultId],
   );
 
-  if (vaults === null) {
-    return <PanelReason reason={PANEL_RESOLVING_SENTENCE} />;
+  if (reason !== null) {
+    return <PanelReason reason={reason} />;
   }
-  if (!vaults.some((vault) => vault.id === vaultId)) {
-    return <PanelReason reason={PANEL_NO_VAULT_SENTENCE} />;
-  }
-  return <NoteEditor vaultId={vaultId} noteId={noteId} onOpenNote={onOpenNote} />;
+  return <NoteEditor vaultId={vaultId} noteId={noteId} onOpenNote={onOpenNote} frame={frame} />;
 }
 
-/** What one panel is showing. */
+/** What one panel is showing. `noteReason` and `frame` are the frame's, and
+ *  only a note target has any use for either. */
 function PanelBody({
   target,
   emptySentence,
+  noteReason,
+  frame,
 }: {
   target: PanelTargetVm | null;
   emptySentence: string;
+  noteReason: string | null;
+  frame: ReactNode;
 }) {
   if (target === null) {
     return <PanelReason reason={emptySentence} />;
@@ -275,15 +317,81 @@ function PanelBody({
     case "file":
       return <FilePanelBody profileId={target.profileId} relativePath={target.relativePath} />;
     case "note":
-      return <NotePanelBody vaultId={target.vaultId} noteId={target.noteId} />;
+      return (
+        <NotePanelBody
+          vaultId={target.vaultId}
+          noteId={target.noteId}
+          reason={noteReason}
+          frame={frame}
+        />
+      );
     case "recording":
       return <PanelReason reason={PANEL_UNSUPPORTED_SENTENCE} />;
   }
 }
 
-/** What the panel's header calls it. A file has a name; nothing else does yet,
- *  and the note editor draws its own title under this. */
-function panelName(target: PanelTargetVm | null): string {
+/**
+ * The note's own title, for a panel that has to say which note it is holding.
+ *
+ * Two sources, because a panel outlives the editor inside it. While the note is
+ * open the title is the FIRST LINE OF THE BUFFER — the same derivation the
+ * editor's own heading uses, so a title being typed and the name of the panel
+ * holding it never disagree. Folded, there is no buffer: the editor is
+ * unmounted, its mirror is dropped, and a panel restored from disk at launch
+ * never had one. So a folded note panel reads the note once through
+ * `notes_body_read`, which is the call Rust already provides for exactly this —
+ * "the read half of the one read-modify-write a surface can do to a note it has
+ * not opened in the editor" — and nothing else changes on that strip until it
+ * is unfolded.
+ *
+ * `null` for every other kind of target, and `null` while the one read is in
+ * flight: the caller falls back to naming the KIND, which is what a panel said
+ * about every note before this.
+ */
+function useNoteTitle(
+  vaultId: string | null,
+  noteId: string | null,
+  folded: boolean,
+): string | null {
+  const live = useNoteDocument(vaultId, noteId, (d) =>
+    d.text === "" ? null : deriveTitle(d.text),
+  );
+  const [read, setRead] = useState<{ readonly key: string; readonly title: string } | null>(null);
+  useEffect(() => {
+    if (!folded || vaultId === null || noteId === null) {
+      return;
+    }
+    let alive = true;
+    notesBodyRead(vaultId, noteId).then(
+      (body) => {
+        if (alive) {
+          setRead({ key: `${vaultId}\u0000${noteId}`, title: deriveTitle(body.text) });
+        }
+      },
+      // A note that cannot be read is a note this strip cannot name, which is
+      // the state it was already in. The unfolded panel says why; a 48px strip
+      // has nowhere to put a sentence and no reason to shout.
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [folded, vaultId, noteId]);
+  if (live !== null) {
+    return live;
+  }
+  if (vaultId === null || noteId === null || read === null) {
+    return null;
+  }
+  return read.key === `${vaultId}\u0000${noteId}` ? read.title : null;
+}
+
+/** What the panel's header calls it, and what its folded spine reads.
+ *
+ *  A note is named by its own title where one could be resolved
+ *  ({@link useNoteTitle}): "Note" over a strip standing beside three other
+ *  panels answers the question a name is asked. */
+function panelName(target: PanelTargetVm | null, noteTitle: string | null): string {
   if (target === null) {
     return "Panel";
   }
@@ -291,7 +399,7 @@ function panelName(target: PanelTargetVm | null): string {
     case "file":
       return fileNameOf(target.relativePath);
     case "note":
-      return "Note";
+      return noteTitle ?? "Note";
     case "recording":
       return "Recording";
   }
@@ -329,7 +437,28 @@ function PanelFrame({
   closable: boolean;
   emptySentence: string;
 }) {
-  const name = panelName(panel.target);
+  const vaults = useNotesVaultsStore((s) => s.vaults);
+  // Story 50.1: a note panel draws NO header of its own. The editor below it
+  // already draws a row that says which note, where it lives and what can be
+  // done to it, and the panel's row said `Note` — a word the note's own title
+  // says better — for the price of a 40px band and a seam. So the panel hands
+  // its two controls down instead of drawing a row to hold them.
+  //
+  // Only when the editor is what is going to be there, though. A note whose
+  // vault is gone shows a sentence, and a sentence cannot carry a fold or a
+  // close: that panel keeps its own row, and the ONE rule that decides which
+  // it is is `noteVaultReason`, read here and passed down rather than asked
+  // twice.
+  const noteReason =
+    panel.target?.kind === "note" ? noteVaultReason(vaults, panel.target.vaultId) : null;
+  const noteOwnsRow = panel.target?.kind === "note" && noteReason === null;
+  const noteTitle = useNoteTitle(
+    panel.target?.kind === "note" ? panel.target.vaultId : null,
+    panel.target?.kind === "note" ? panel.target.noteId : null,
+    panel.folded,
+  );
+  const name = panelName(panel.target, noteTitle);
+  const FoldGlyph = panel.folded ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   // Folded, the tooltip and the accessible name are ONE string and it carries
   // the panel's name, because a folded panel has nothing else on screen: a
   // pointer that hovered a bare chevron would learn only that the strip folds,
@@ -352,12 +481,30 @@ function PanelFrame({
       className="shrink-0"
       onClick={() => panelsStore.getState().toggleFold(panel.id)}
     >
-      {panel.folded ? (
-        <ChevronsLeftRight aria-hidden="true" />
-      ) : (
-        <ChevronsRightLeft aria-hidden="true" />
-      )}
+      <FoldGlyph aria-hidden="true" />
     </Button>
+  );
+  const close = closable ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label={PANEL_CLOSE_LABEL}
+      title={PANEL_CLOSE_LABEL}
+      className="shrink-0"
+      onClick={() => panelsStore.getState().closePanel(panel.id)}
+    >
+      <X aria-hidden="true" />
+    </Button>
+  ) : null;
+  // What the PANEL's controls are, wherever the row that carries them is drawn
+  // — this frame's own header, or the note editor's. One node either way, so a
+  // note panel and a file panel cannot come to offer different chrome.
+  const frame = (
+    <>
+      {fold}
+      {close}
+    </>
   );
   return (
     <section
@@ -387,27 +534,21 @@ function PanelFrame({
       )}
     >
       {panel.folded ? (
-        // Folded: the control that undoes it, and nothing else. The panel is
-        // still named by the section's `aria-label` and by the control's own,
-        // so neither a reader nor a pointer has to guess which one this is.
+        // Folded: the control that undoes it, and the panel's name down the
+        // strip. No body — see this function's header for why a folded panel
+        // unmounts rather than hides.
         //
-        // `py-1` beside a 32px control keeps this row at DESIGN.md's 40px
-        // pane-header, which is the whole reason a folded panel does NOT take
-        // the strip's 36px item: its head is one segment of the header rule
-        // running across the strip, and a 44px segment would break the line.
-        // `fold-strip.tsx` states that exception rather than this file keeping
-        // it to itself.
-        <header
-          data-fold-strip-items="inset"
-          className={cn(
-            "flex shrink-0 items-center justify-center border-border border-b py-1",
-            FOLD_STRIP.padXClass,
-            FOLD_STRIP.gapClass,
-          )}
-        >
-          {fold}
-        </header>
-      ) : (
+        // The band is {@link FoldStripHead}, which is this head, the drawer's
+        // and every surface column's: 40px, DESIGN.md's `pane-header`, ending
+        // in the rule that runs across every pane beside it. It used to be
+        // spelled here, and the OTHER THREE strips were the ones that got it
+        // wrong — 44px, with their divider 8px lower. `fold-strip.tsx` owns
+        // the sum now, so there is nowhere left for the four to disagree.
+        <>
+          <FoldStripHead className="justify-center">{fold}</FoldStripHead>
+          <FoldStripName name={name} />
+        </>
+      ) : noteOwnsRow ? null : (
         <PaneHeader
           // No `border-b` and no `py-*`: `PaneHeader` owns its own bottom edge
           // and its own 40px height, and spelling either here draws it twice.
@@ -435,27 +576,22 @@ function PanelFrame({
                   relativePath={panel.target.relativePath}
                 />
               )}
-              {fold}
-              {closable && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={PANEL_CLOSE_LABEL}
-                  title={PANEL_CLOSE_LABEL}
-                  className="shrink-0"
-                  onClick={() => panelsStore.getState().closePanel(panel.id)}
-                >
-                  <X aria-hidden="true" />
-                </Button>
-              )}
+              {frame}
             </>
           }
         />
       )}
       {panel.folded ? null : (
         <div className="min-h-0 flex-1 overflow-auto">
-          <PanelBody target={panel.target} emptySentence={emptySentence} />
+          <PanelBody
+            target={panel.target}
+            emptySentence={emptySentence}
+            noteReason={noteReason}
+            // Handed to every body and consumed by exactly one: the note
+            // editor, when it is the thing drawing this panel's row. A body
+            // that draws no row ignores it and the row above is this frame's.
+            frame={noteOwnsRow ? frame : null}
+          />
         </div>
       )}
     </section>

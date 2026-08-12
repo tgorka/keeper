@@ -1,11 +1,29 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { FilesEntryVm, FilesListingVm } from "@/lib/ipc/client";
+import { FOLD_STRIP_HEAD_SLOT, FOLD_STRIP_NAME_SLOT } from "@/components/layout/fold-strip";
+import type { FilesEntryVm, FilesListingVm, NoteVaultVm } from "@/lib/ipc/client";
 
-// Only the IPC edge is mocked. Everything below the strip — the panel store, the
-// viewer registry, the unknown viewer — is the real module, because the defect
-// this suite exists to catch is a panel that renders nothing, and a mocked body
-// can never render nothing.
+/** Test id for the stand-in the note panel's own suite explains. */
+const EDITOR_STUB_TESTID = "note-editor-stub";
+
+// The note editor COMPONENT, and nothing else in its module: see the
+// note-panel describe at the bottom of this file for why this one component is
+// a stub here when nothing else below the strip is. The stub renders the
+// `frame` prop and nothing else, because the prop boundary is the whole of
+// what this file claims about it — while `deriveTitle`, which the strip itself
+// calls to name a folded note, stays the real function.
+vi.mock(import("@/components/notes/note-editor"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  NoteEditor: ({ frame }: { frame?: ReactNode }) => (
+    <div data-testid={EDITOR_STUB_TESTID}>{frame}</div>
+  ),
+}));
+
+// The IPC edge, and the one component above. Everything else below the strip —
+// the panel store, the viewer registry, the unknown viewer — is the real
+// module, because the defect this suite exists to catch is a panel that renders
+// nothing, and a mocked body can never render nothing.
 const syncBrowse = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
@@ -19,12 +37,17 @@ vi.mock("@/lib/ipc/client", () => ({
   // that never settles keeps that assertion about the strip rather than about
   // a document's contents.
   syncReadDocument: vi.fn(() => new Promise(() => undefined)),
+  // A folded note panel reads the note once to name its spine. Resolved with
+  // an empty body: naming a folded strip is its own story's claim, and this
+  // one only needs the call not to explode when a note panel mounts.
+  notesBodyRead: vi.fn(async () => ({ text: "", frontmatter: "", rev: "r0", path: null })),
 }));
 
 import {
   PANEL_CLOSE_LABEL,
   PANEL_EMPTY_SENTENCE,
   PANEL_FOLD_LABEL,
+  PANEL_NO_VAULT_SENTENCE,
   PANEL_REASON_TESTID,
   PANEL_STRIP_LABEL,
   PANEL_TESTID,
@@ -38,6 +61,7 @@ import {
   MEDIA_VIEWER_ELEMENT_TESTID,
   MEDIA_VIEWER_FACTS_TESTID,
 } from "@/components/viewers/media-viewer";
+import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { UNKNOWN_VIEWER_OPEN_LABEL } from "@/lib/viewers";
 
@@ -427,8 +451,14 @@ describe("the panel strip's fold control", () => {
     // mirror open over a note nobody can see. Asserted as the section's shape
     // rather than by looking for the file's name: a viewer that happened to draw
     // nothing would satisfy the second and not the first.
-    expect(folded.children).toHaveLength(1);
-    expect(folded.firstElementChild?.tagName).toBe("HEADER");
+    //
+    // Two children, and neither is a body: the head band, and the panel's name
+    // written down the strip (`FoldStripName`). The name is the whole reason a
+    // folded panel is not a mystery glyph, so it is asserted by slot here
+    // rather than counted away.
+    expect(folded.firstElementChild).toHaveAttribute("data-slot", FOLD_STRIP_HEAD_SLOT);
+    expect(folded.lastElementChild).toHaveAttribute("data-slot", FOLD_STRIP_NAME_SLOT);
+    expect(folded.lastElementChild?.textContent).toBe("a.md");
     // And it stops taking a share of the strip's width, which is the visible
     // point of folding: the neighbours get it.
     expect(folded).not.toHaveClass("flex-1");
@@ -518,5 +548,84 @@ describe("the panel strip's fold control", () => {
     const frame = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
     expect(frame).not.toHaveAttribute("data-folded");
     expect(within(frame).getByText("b.md")).toBeInTheDocument();
+  });
+});
+
+/**
+ * A note panel gives up its own header row (Story 50.1).
+ *
+ * The owner's report is two header bands over one note: this frame's, whose
+ * whole content was the word `Note` plus a fold and a close, and the editor's
+ * underneath it. The frame now draws nothing and hands its two controls down.
+ *
+ * **The editor is stubbed here and nowhere else in this file, and the stub is
+ * the point rather than a shortcut.** What this file owes is the PROP
+ * BOUNDARY, the way `capture-window.test.tsx` owes it for the same component:
+ * that the frame stops drawing a row and that its real fold and its real close
+ * — composed here, by this file, with this file's labels — arrive at the thing
+ * below. That they then land in a group of the editor's header that never
+ * overflows into the note's menu is `note-editor.test.tsx`'s claim, asserted
+ * over the real editor. Mounting the real one here would drag a second
+ * story's IPC surface into a suite whose `@/lib/ipc/client` mock has four
+ * functions in it.
+ */
+describe("a note in a panel", () => {
+  beforeEach(() => {
+    resetNotesVaultsStoreForTest();
+  });
+
+  /** The vault the note lives in, as the store mirrors one. */
+  function seedVault(): void {
+    notesVaultsStore.getState().setVaults([{ id: "v1" } as NoteVaultVm]);
+  }
+
+  async function openNotePanel(): Promise<void> {
+    panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
+    await mount();
+  }
+
+  it("draws no header of its own, and hands its controls to the editor", async () => {
+    seedVault();
+    await openNotePanel();
+
+    // The band that carried the word `Note` is gone, and with it the seam
+    // under it: one 40px row reclaimed over every note opened in a panel.
+    expect(document.querySelectorAll("header")).toHaveLength(0);
+    expect(screen.queryByText("Note")).not.toBeInTheDocument();
+    // And the panel's two controls are not gone with it — they went down.
+    const editor = screen.getByTestId(EDITOR_STUB_TESTID);
+    expect(within(editor).getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("still folds and closes from the controls it handed down", async () => {
+    seedVault();
+    panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "v1", noteId: "n1" });
+    panelsStore.getState().setActiveTarget({ kind: "note", vaultId: "v1", noteId: "n2" });
+    panelsStore.getState().openPanel({ kind: "note", vaultId: "v1", noteId: "n2" });
+    await mount();
+
+    const frames = screen.getAllByTestId(EDITOR_STUB_TESTID);
+    const first = frames[0] as HTMLElement;
+    await act(async () => {
+      fireEvent.click(within(first).getByRole("button", { name: PANEL_FOLD_LABEL }));
+      await Promise.resolve();
+    });
+
+    // A control passed through two components is a control that can arrive
+    // rendered and dead. This is the press, and the fold is the effect.
+    expect(panelsStore.getState().panels[0]?.folded).toBe(true);
+  });
+
+  it("keeps its own row for a note whose vault is gone", async () => {
+    // No `seedVault`: the store is hydrated with a list this vault is not in,
+    // so the body is a sentence rather than an editor — and a sentence cannot
+    // carry a fold or a close. This is the case that makes the frame's
+    // decision and the body's one rule instead of two.
+    notesVaultsStore.getState().setVaults([]);
+    await openNotePanel();
+
+    expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(PANEL_NO_VAULT_SENTENCE);
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
   });
 });

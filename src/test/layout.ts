@@ -22,7 +22,7 @@
  * the ellipsis is applied at all, and whether the real font makes a real value
  * overflow a real pane. Those are browser facts and this is not a browser.
  */
-import { PANE_HEADER_STATUS_SLOT } from "@/components/layout/pane-header";
+import { PANE_HEADER_FRAME_SLOT, PANE_HEADER_STATUS_SLOT } from "@/components/layout/pane-header";
 import { PRIORITY_ACTION_ATTR, PRIORITY_ACTIONS_SLOT } from "@/components/layout/priority-actions";
 import { WINDOW_ROW_ATTR, WINDOW_VIEWPORT_ATTR } from "@/components/ui/window-list";
 
@@ -252,9 +252,11 @@ export function withListGeometry(sizes: { viewport: number; row: number }): List
  * for exactly those elements and leaves every other element to the suite's own
  * shim, so a header test states its geometry instead of inheriting one.
  *
- * Keys are {@link PRIORITY_ACTION_ATTR} values, plus `leading`, `menu` and
- * `status`. The two wrappers are found by their position in the group rather
- * than by an attribute added to the product for this file's benefit.
+ * Keys are {@link PRIORITY_ACTION_ATTR} values, plus `leading`, `menu`,
+ * `status` and `frame`. The two wrappers are found by their position in the
+ * group rather than by an attribute added to the product for this file's
+ * benefit; the two reserved slots are found by the `data-slot` the product
+ * already carries.
  *
  * Returns the undo, which the caller MUST run — `Element.prototype` is shared
  * with every other test in the file.
@@ -284,6 +286,9 @@ export function withActionWidths(widths: Record<string, number>): () => void {
     }
     if (this.getAttribute("data-slot") === PANE_HEADER_STATUS_SLOT && widths.status !== undefined) {
       return box(widths.status);
+    }
+    if (this.getAttribute("data-slot") === PANE_HEADER_FRAME_SLOT && widths.frame !== undefined) {
+      return box(widths.frame);
     }
     const group = this.parentElement;
     if (group?.getAttribute("data-slot") === PRIORITY_ACTIONS_SLOT) {

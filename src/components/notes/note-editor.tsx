@@ -26,7 +26,7 @@
  * which is a promise a remount could not keep.
  */
 import { Files, FolderSearch, History, SlidersHorizontal } from "lucide-react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { CaptureNoteItem } from "@/components/capture/capture-note-item";
 import { ExportNoteItem } from "@/components/export/export-note-item";
 import { PaneHeader } from "@/components/layout/pane-header";
@@ -313,9 +313,26 @@ export interface NoteEditorProps {
   noteId: string | null;
   /** Open another note — a backlink row, or a wikilink that resolved. */
   onOpenNote?: (noteId: string) => void;
+  /**
+   * The controls of the surface that HOLDS this editor — a panel's fold and
+   * close — handed straight to the header's fourth group (Story 50.1).
+   *
+   * A note open in a panel had two header rows: the panel's, whose whole
+   * content was the word `Note` and these two controls, and this one. The word
+   * said nothing the note's own title does not say better and the band cost
+   * 40px and a seam, so the panel gives up its row and passes its controls
+   * down. Absent in the notes pane, in a capture window and in the prewarmed
+   * draft, none of which is a frame — and the header renders no fourth group
+   * at all when it is, so nothing reserves space for a group that is not there.
+   *
+   * The editor never composes these, only places them: what a panel's fold
+   * looks like is `panel-strip.tsx`'s business, and a second spelling of it
+   * here is a second glyph to keep in step.
+   */
+  frame?: ReactNode;
 }
 
-export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
+export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
   // Two editors are two subscriptions to two documents in one store, and the
@@ -802,15 +819,31 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
         // horizontal gutter: a `border-b` here drew the seam twice at 2px, and
         // a `py-1` here set the height a second time from a different fact.
         className="px-3"
-        // Group 1 — identity. The only member of the row allowed to give
+        // Group 1 — identity. The only member of the ROW allowed to give
         // ground; see the component's doc for why that is a property of the
         // wrapper and not of these two elements.
+        //
+        // Inside the group, the order in which they give it is this file's,
+        // and Story 50.1 reverses it. `flex-1` off a zero basis used to be on
+        // the TITLE, so the path — which is as long as a folder tree makes it
+        // — took its natural width first and the title grew into whatever was
+        // left. Measured in Chromium at a 560px pane, that left the title
+        // **0.47px**: the row showed `journal/2026/2026-08-08.md` in full and
+        // the note's own name as an ellipsis. Merging the panel's row into
+        // this one costs 40–80px more, so the shape that was already wrong at
+        // 560 would have been wrong at 640.
+        //
+        // So the basis-zero member is the PATH now. The title takes its
+        // natural width, the path absorbs the slack and is the first thing
+        // ellipsised, and a squeezed row says which note before it says where
+        // the note lives — which is the same ruling `PaneHeader` makes one
+        // level up about identity against the controls.
         identity={
           <>
-            <h1 className="min-w-0 flex-1 truncate font-heading text-title">
-              {deriveTitle(body.text)}
-            </h1>
-            <span className="truncate font-mono text-meta text-muted-foreground">{path ?? ""}</span>
+            <h1 className="min-w-0 truncate font-heading text-title">{deriveTitle(body.text)}</h1>
+            <span className="min-w-0 flex-1 truncate font-mono text-meta text-muted-foreground">
+              {path ?? ""}
+            </span>
           </>
         }
         // Group 2 — status. One box for all three captions, reserved from the
@@ -916,6 +949,11 @@ export function NoteEditor({ vaultId, noteId, onOpenNote }: NoteEditorProps) {
             )}
           />
         )}
+        // Group 4 — the panel's own controls, when a panel is what is holding
+        // this editor (Story 50.1). Placed and never composed here; undefined
+        // in the three hosts that are not frames, and the row then has three
+        // groups exactly as it did.
+        frame={frame}
       />
 
       <NoteDiffBar
