@@ -35,6 +35,7 @@ pub mod platform;
 pub mod recording;
 pub mod registry;
 pub mod send;
+pub mod sessions;
 pub mod signals;
 pub mod size;
 pub mod text_file;
