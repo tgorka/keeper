@@ -927,6 +927,7 @@ pub fn run() {
         sessions_ipc::sessions_roots,
         sessions_ipc::sessions_list,
         sessions_ipc::sessions_rescan,
+        sessions_ipc::sessions_detail,
         sessions_ipc::sessions_create,
         sessions_ipc::sessions_create_from,
         sessions_ipc::sessions_log_today,

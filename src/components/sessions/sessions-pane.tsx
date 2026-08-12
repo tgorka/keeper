@@ -20,6 +20,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { SessionActions } from "@/components/sessions/session-actions";
+import { SessionDetail } from "@/components/sessions/session-detail";
 import { SessionRow } from "@/components/sessions/session-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -114,14 +115,31 @@ export function SessionsPane() {
       relativePath: `${subfolder}/${sessionPath}/README.md`,
     });
   }, []);
+  // A row click drills into the detail (FR-233): the rendered log, the file
+  // sections, the properties widget. The README stays one click away from
+  // there — a review first, an edit second.
+  //
+  // The open id carries the ROOT it belongs to and is resolved in render:
+  // a root switch changes the resolution to null (a session id is scoped to
+  // its root), and a session that vanished from the rows (deleted; an
+  // archived one keeps its id) resolves to null too — the board comes back,
+  // never a dead pane. State derived at render beats a pair of effects that
+  // chase it (and is exactly what the exhaustive-deps lint pushes toward).
+  const [openSession, setOpenSession] = useState<{ rootId: string; id: string } | null>(null);
   const openRow = useCallback(
     (row: SessionRowVm) => {
       if (activeRoot !== null) {
-        openReadme(activeRoot.id, activeRoot.subfolder, row.path);
+        setOpenSession({ rootId: activeRoot.id, id: row.id });
       }
     },
-    [activeRoot, openReadme],
+    [activeRoot],
   );
+  const openSessionId =
+    openSession !== null &&
+    openSession.rootId === activeRoot?.id &&
+    (rows === null || rows.some((row) => row.id === openSession.id))
+      ? openSession.id
+      : null;
 
   // The one-question create (FR-238): a title field revealed in place, no
   // dialog. Create lands the folder, the changed event brings the row, and
@@ -147,6 +165,25 @@ export function SessionsPane() {
       openReadme(ref.rootId, activeRoot.subfolder, ref.path);
     });
   }, [activeRoot, newTitle, openReadme]);
+
+  // Drilled in: the detail replaces the board's body wholesale — the header
+  // stays (New/Rescan keep working), the filter row and list yield. One pane,
+  // two depths; the panel strip beside carries whatever files get opened.
+  if (openSessionId !== null && activeRoot !== null) {
+    return (
+      <section
+        aria-label={SESSIONS_PANE_TITLE}
+        className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
+      >
+        <SessionDetail
+          rootId={activeRoot.id}
+          subfolder={activeRoot.subfolder}
+          sessionId={openSessionId}
+          onBack={() => setOpenSession(null)}
+        />
+      </section>
+    );
+  }
 
   return (
     <section

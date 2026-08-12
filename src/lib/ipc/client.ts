@@ -202,6 +202,10 @@ export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
+export type { SessionDetailVm } from "./gen/SessionDetailVm";
+export type { SessionFileVm } from "./gen/SessionFileVm";
+export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
+export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
 export type { SessionRowVm } from "./gen/SessionRowVm";
@@ -332,6 +336,7 @@ import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
+import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
@@ -4822,6 +4827,19 @@ export async function listenSessionsChanged(
   return await listen<string>(SESSIONS_CHANGED_EVENT, (event) => {
     onChanged(event.payload);
   });
+}
+
+/**
+ * One session's detail (FR-233): header facts, the user-tier properties,
+ * the rendered log NEWEST FIRST (the review order — the file on disk stays
+ * newest-last), and the file sections — artifacts, refs, prompts, the
+ * read-only workspace, and any loose extras beside the README. Composed
+ * fresh from disk on every call; re-read on the changed event.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsDetail(rootId: string, sessionId: string): Promise<SessionDetailVm> {
+  return await invoke<SessionDetailVm>("sessions_detail", { rootId, sessionId });
 }
 
 /**

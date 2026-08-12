@@ -85,3 +85,92 @@ pub struct SessionRefVm {
     pub path: String,
     pub title: String,
 }
+
+/// One dated entry of the session's `## Log`, parsed for the detail's
+/// rendered timeline (FR-233). The zone writes newest-last; the detail
+/// REVERSES for display, because the detail is a review surface and the
+/// question it answers is "what happened most recently".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLogEntryVm {
+    /// `YYYY-MM-DD` from the entry's heading.
+    pub date: String,
+    /// What follows the dash on the heading — the sitting's own summary line.
+    pub title: String,
+    /// The entry's prose, markdown verbatim, trimmed. Empty is ordinary.
+    pub body: String,
+}
+
+/// One file (or directory) inside a session, for the detail's mini-file
+/// sections (FR-233). Session-relative path, `/`-joined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionFileVm {
+    /// The file's name, for the row label.
+    pub name: String,
+    /// Session-relative path (`artifacts/report.md`).
+    pub rel_path: String,
+    /// Bytes; 0 for a directory.
+    #[ts(type = "number")]
+    pub size: u64,
+    /// Modification time, ms since epoch.
+    #[ts(type = "number")]
+    pub mtime_ms: i64,
+    pub is_dir: bool,
+}
+
+/// One user-tier frontmatter field of the session README, for the detail's
+/// properties widget (FR-227): keeper-owned keys and `tags` are projected
+/// elsewhere on the header, so what remains here is exactly "yours".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPropertyVm {
+    pub key: String,
+    /// The flattened index form — a list joins on newline, the notes rule.
+    pub value: String,
+}
+
+/// Everything the session detail renders (FR-233): the header facts, the
+/// properties widget, the rendered log, and the file sections. Composed in
+/// the shell from one directory walk plus the README parse; every field is
+/// derivable from files alone (AD-110).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDetailVm {
+    pub id: String,
+    /// Zone-relative folder path.
+    pub path: String,
+    pub title: String,
+    /// `"active"` or `"archived"` — location, never a stored flag.
+    pub status: String,
+    #[ts(type = "number | null")]
+    pub archived_year: Option<i32>,
+    pub pinned: bool,
+    pub tags: Vec<String>,
+    /// User-tier frontmatter, the properties widget.
+    pub properties: Vec<SessionPropertyVm>,
+    /// Lineage ids, both directions (AD-112). Dangling ids render inert.
+    pub continues: Vec<String>,
+    pub continued_by: Vec<String>,
+    /// First prose under `## Summary`, the header's one-liner.
+    pub summary: String,
+    /// The `## Log`, parsed, NEWEST FIRST (review order — the zone's file
+    /// stays newest-last; only this projection reverses).
+    pub log: Vec<SessionLogEntryVm>,
+    /// Promoted output — versioned, click-to-open.
+    pub artifacts: Vec<SessionFileVm>,
+    /// Kept inputs — versioned, click-to-open.
+    pub refs: Vec<SessionFileVm>,
+    /// Reusable prompts — versioned, click-to-open.
+    pub prompts: Vec<SessionFileVm>,
+    /// Scratch, READ-ONLY (AD-113): listed with the zone's own caveat, never
+    /// written, capped by the same walk budget as the freshness signal.
+    pub workspace: Vec<SessionFileVm>,
+    /// Loose files at the session root beside the README — a session that
+    /// grew extra notes keeps them visible rather than orphaned.
+    pub extras: Vec<SessionFileVm>,
+}

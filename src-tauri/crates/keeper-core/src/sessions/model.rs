@@ -164,6 +164,57 @@ pub struct Lineage {
     pub continued_by: Vec<String>,
 }
 
+/// Parse a README body's `## Log` into its dated entries, file order —
+/// the zone writes newest-last; a *display* that wants newest-first reverses
+/// the projection, never the file (FR-233).
+///
+/// An entry is a `### YYYY-MM-DD[ — title]` heading and the prose until the
+/// next `###`/`##` heading. Non-dated `###` headings inside the section are
+/// carried as part of the preceding entry's body — they are the entry's own
+/// sub-structure, not new sittings. Pure over `&str`, like everything here.
+pub fn log_entries(body: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut in_log = false;
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        let lead = trimmed.trim_start();
+        if lead.starts_with("## ") {
+            in_log = lead == "## Log";
+            continue;
+        }
+        if !in_log {
+            continue;
+        }
+        if let Some(rest) = lead.strip_prefix("### ") {
+            let candidate = rest.trim();
+            let dated = candidate.len() >= 10
+                && candidate.as_bytes().get(4) == Some(&b'-')
+                && candidate.as_bytes().get(7) == Some(&b'-')
+                && candidate[..4].bytes().all(|b| b.is_ascii_digit());
+            if dated {
+                let date: String = candidate.chars().take(10).collect();
+                let title = candidate
+                    .split_once('—')
+                    .map(|(_, after)| after.trim().to_owned())
+                    .unwrap_or_default();
+                out.push((date, title, String::new()));
+                continue;
+            }
+        }
+        if let Some((_, _, entry_body)) = out.last_mut() {
+            if !entry_body.is_empty() || !lead.is_empty() {
+                entry_body.push_str(trimmed);
+                entry_body.push('\n');
+            }
+        }
+    }
+    for (_, _, entry_body) in &mut out {
+        let trimmed = entry_body.trim().to_owned();
+        *entry_body = trimmed;
+    }
+    out
+}
+
 /// Read the lineage off a parsed README frontmatter block.
 ///
 /// The keys live one level under the `keeper:` map, which the parser models
@@ -302,5 +353,25 @@ mod tests {
         // No keeper map at all: empty, never an error.
         let (fm3, _) = Frontmatter::parse("---\nid: x\n---\n");
         assert_eq!(lineage(&fm3), Lineage::default());
+    }
+
+    /// The log parser reads the zone's own convention: dated ### headings in
+    /// file order, dash titles, prose bodies, non-dated ### as sub-structure
+    /// of the sitting it belongs to, and nothing outside `## Log`.
+    #[test]
+    fn log_entries_read_the_zones_own_convention() {
+        let body = "# s\n\n## Summary\n\n### not a log heading\n\n## Log\n\n### 2026-08-10 — opened\n\nfirst prose\n\n### interlude heading\n\nmore of the first sitting\n\n### 2026-08-11\n\nsecond prose\n\n## Follow-ups\n\n### 2026-08-12 — not in the log\n";
+        let entries = log_entries(body);
+        assert_eq!(entries.len(), 2, "only dated headings inside ## Log");
+        assert_eq!(entries[0].0, "2026-08-10");
+        assert_eq!(entries[0].1, "opened");
+        assert!(entries[0].2.contains("first prose"));
+        assert!(
+            entries[0].2.contains("### interlude heading"),
+            "a non-dated heading is the sitting's own sub-structure"
+        );
+        assert_eq!(entries[1].0, "2026-08-11");
+        assert_eq!(entries[1].1, "", "a heading without a dash has no title");
+        assert_eq!(entries[1].2, "second prose");
     }
 }

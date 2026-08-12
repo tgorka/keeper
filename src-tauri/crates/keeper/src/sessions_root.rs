@@ -527,6 +527,181 @@ fn last_log(body: &str) -> (String, String) {
     (date, line_out)
 }
 
+/// Compose one session's detail — header facts, properties, the rendered
+/// log, and the file sections (FR-233). One directory walk plus one README
+/// parse; every field derivable from files alone (AD-110).
+pub fn detail(
+    root_id: &str,
+    session_id: &str,
+) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
+    use keeper_core::sessions::vm::{SessionDetailVm, SessionLogEntryVm, SessionPropertyVm};
+
+    let zone = zone_of(root_id)?;
+    let row = row_of(root_id, session_id)?;
+    let dir = zone.join(&row.path);
+    let readme = std::fs::read_to_string(dir.join(README)).unwrap_or_default();
+    let (fm, body_at) = Frontmatter::parse(&readme);
+    let body = &readme[body_at..];
+    let line = lineage(&fm);
+
+    // The properties widget (FR-227): user-tier keys only. keeper-owned keys
+    // and the Obsidian-native `tags` are projected elsewhere on the header;
+    // repeating them here would be two spellings of one fact.
+    let owned = [
+        "id",
+        "created",
+        "updated",
+        "pinned",
+        "archived",
+        "keeper",
+        "tags",
+        "aliases",
+        "cssclasses",
+        "title",
+    ];
+    let properties: Vec<SessionPropertyVm> = fm
+        .keys()
+        .filter(|key| !owned.contains(key) && !key.starts_with("keeper."))
+        .filter_map(|key| {
+            fm.get(key).map(|value| SessionPropertyVm {
+                key: key.to_owned(),
+                value: value.index_string(),
+            })
+        })
+        .collect();
+
+    let log: Vec<SessionLogEntryVm> = keeper_core::sessions::model::log_entries(body)
+        .into_iter()
+        .rev() // review order: newest first; the FILE stays newest-last
+        .map(|(date, title, entry_body)| SessionLogEntryVm {
+            date,
+            title,
+            body: entry_body,
+        })
+        .collect();
+
+    let (status, archived_year) = (row.status.clone(), row.archived_year);
+    Some(SessionDetailVm {
+        id: row.id,
+        path: row.path,
+        title: row.title,
+        status,
+        archived_year,
+        pinned: row.pinned,
+        tags: row.tags,
+        properties,
+        continues: line.continues,
+        continued_by: line.continued_by,
+        summary: section_snippet(body, "## Summary"),
+        log,
+        artifacts: section_files(&dir, "artifacts"),
+        refs: section_files(&dir, "refs"),
+        prompts: section_files(&dir, "prompts"),
+        workspace: section_files(&dir, WORKSPACE_DIR),
+        extras: extra_files(&dir),
+    })
+}
+
+/// The files of one session subtree, one level of recursion flattened to
+/// rows (a session's sections are shallow by contract; deeper nesting shows
+/// as `sub/dir/file` names). `.gitkeep` and dotfiles are furniture. Sorted
+/// newest first — these sections are review surfaces.
+fn section_files(dir: &Path, section: &str) -> Vec<keeper_core::sessions::vm::SessionFileVm> {
+    use keeper_core::sessions::vm::SessionFileVm;
+
+    fn walk(base: &Path, prefix: &str, section: &str, out: &mut Vec<SessionFileVm>, depth: usize) {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel_name = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                // Flatten up to three levels; past that a directory row says
+                // "there is more here" rather than the walk exploding.
+                if depth < 3 {
+                    walk(&entry.path(), &rel_name, section, out, depth + 1);
+                } else {
+                    out.push(SessionFileVm {
+                        name: rel_name.clone(),
+                        rel_path: format!("{section}/{rel_name}"),
+                        size: 0,
+                        mtime_ms: 0,
+                        is_dir: true,
+                    });
+                }
+            } else {
+                let mtime_ms = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                out.push(SessionFileVm {
+                    name: rel_name.clone(),
+                    rel_path: format!("{section}/{rel_name}"),
+                    size: meta.len(),
+                    mtime_ms,
+                    is_dir: false,
+                });
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(&dir.join(section), "", section, &mut out, 0);
+    out.sort_by_key(|file| std::cmp::Reverse(file.mtime_ms));
+    out
+}
+
+/// Loose files at the session root beside the README — extra `.md` notes a
+/// session grew. The README itself and the four standard directories are the
+/// structure, not extras.
+fn extra_files(dir: &Path) -> Vec<keeper_core::sessions::vm::SessionFileVm> {
+    use keeper_core::sessions::vm::SessionFileVm;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<SessionFileVm> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name == README {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if meta.is_dir() {
+                return None; // the four standard dirs are sections, not extras
+            }
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Some(SessionFileVm {
+                name: name.clone(),
+                rel_path: name,
+                size: meta.len(),
+                mtime_ms,
+                is_dir: false,
+            })
+        })
+        .collect();
+    out.sort_by_key(|file| std::cmp::Reverse(file.mtime_ms));
+    out
+}
+
 /// First non-empty prose line under a `## <name>` heading.
 fn section_snippet(body: &str, heading: &str) -> String {
     let mut in_section = false;

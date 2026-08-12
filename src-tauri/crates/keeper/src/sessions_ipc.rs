@@ -102,6 +102,30 @@ pub fn sessions_rescan(root_id: String) -> Result<(), IpcError> {
     Err(unsupported())
 }
 
+/// One session's detail: header facts, the user-tier properties widget, the
+/// rendered log (newest first — the review order), and the file sections
+/// (FR-233). Composed from one walk + one README parse; nothing stored.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_detail(
+    root_id: String,
+    session_id: String,
+) -> Result<keeper_core::sessions::vm::SessionDetailVm, IpcError> {
+    crate::sessions_root::detail(&root_id, &session_id).ok_or_else(|| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("no such session: {session_id}"),
+        account_id: None,
+        retriable: false,
+    })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_detail(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle verbs (FR-238..FR-248, AD-111, AD-112)
 // ---------------------------------------------------------------------------
