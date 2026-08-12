@@ -24,7 +24,9 @@
  * is no runtime flag to get wrong. It also refuses to install when a real shell
  * is present, so `tauri dev` is never quietly served fixtures.
  */
+
 import { mockIPC } from "@tauri-apps/api/mocks";
+import type { FileSizeVm, FilesEntryVm, FilesListingVm } from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -155,30 +157,67 @@ const TAGS = [
   ["test", 1],
 ].map(([tag, count]) => ({ tag, count, children: [] }));
 
+/**
+ * One row of a synced folder, in the shape the pane actually reads.
+ *
+ * **Typed against the generated `FilesEntryVm` on purpose.** This fixture had
+ * drifted two stories behind the wire — `isDir`, `sizeBytes`, a bare
+ * `sync: "synced"` and a `roles` array, where the pane now reads `kind`,
+ * `size: { bytes, label }`, `sync: { status, detail }` and `folderRole`. The
+ * cost of a wrong-shaped fixture is not a wrong-looking row: expanding any
+ * folder threw on `write.writable` and took the whole window with it, so the
+ * failure read as a bug in the surface being examined rather than in the
+ * harness. A missing answer falls through to {@link fallback} and renders an
+ * empty state; a wrong-shaped one is a blank page. `dev` is inside
+ * `tsconfig.json`'s `include` so that this annotation is a gate rather than a
+ * comment.
+ */
+function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): FilesEntryVm {
+  return {
+    name: name.slice(name.lastIndexOf("/") + 1),
+    relativePath: name,
+    absolutePath: `/Volumes/merope/tgdrive/${name}`,
+    kind: isDir ? "folder" : "file",
+    sync: { status: "synced", detail: null },
+    size: isDir ? null : size,
+    folderRole: name === "10-notes" ? "notesVault" : null,
+    // Writable, because the write path — New file, Delete, and the header's
+    // count that gates them — is exactly what a viewing aid has to be able to
+    // show. A refusal is a different fixture and this is not it.
+    write: { writable: true, reason: null, caveat: null },
+  };
+}
+
 /** A folder tree with the depth and the awkward names a real drive has. */
-const ENTRIES = [
-  ["00-inbox", true, 0],
-  ["10-notes", true, 0],
-  ["20-records", true, 0],
-  ["30-work", true, 0],
-  ["40-media", true, 0],
-  ["50-library", true, 0],
-  [".gitattributes", false, 16_384],
-  ["AGENTS.md", false, 4_812],
-  ["README.md", false, 3_380],
-  ["deck-v10-complete.pdf", false, 8_400_000],
-  ["screen-0000.mov", false, 412_000_000],
-].map(([name, isDir, size]) => ({
-  name,
-  relativePath: String(name),
-  absolutePath: `/Volumes/merope/tgdrive/${name}`,
-  isDir,
-  sizeBytes: isDir ? null : size,
-  sync: "synced",
-  roles: [],
-  write: { writable: true, reason: null, caveat: null },
-  unspellable: null,
-}));
+const ENTRIES: FilesEntryVm[] = [
+  browseEntry("00-inbox", true, null),
+  browseEntry("10-notes", true, null),
+  browseEntry("20-records", true, null),
+  browseEntry("30-work", true, null),
+  browseEntry("40-media", true, null),
+  browseEntry("50-library", true, null),
+  browseEntry(".gitattributes", false, { bytes: 16_384, label: "16.4 kB" }),
+  browseEntry("AGENTS.md", false, { bytes: 4_812, label: "4.8 kB" }),
+  browseEntry("README.md", false, { bytes: 3_380, label: "3.4 kB" }),
+  browseEntry("deck-v10-complete.pdf", false, { bytes: 8_400_000, label: "8.4 MB" }),
+  browseEntry("screen-0000.mov", false, { bytes: 412_000_000, label: "412 MB" }),
+];
+
+/**
+ * What one folder inside the root holds.
+ *
+ * One and not six: an expansion has to show something other than the root's own
+ * eleven rows again, and beyond that this is a viewing aid rather than a disk.
+ * Every other folder answers `listed` with nothing in it, which is a state the
+ * pane draws a sentence for and is worth seeing too.
+ */
+const CHILDREN: Record<string, FilesEntryVm[]> = {
+  "10-notes": [
+    browseEntry("10-notes/standup.md", false, { bytes: 1_204, label: "1.2 kB" }),
+    browseEntry("10-notes/decisions.md", false, { bytes: 9_100, label: "9.1 kB" }),
+    browseEntry("10-notes/attachments", true, null),
+  ],
+};
 
 /**
  * A CSV wider than any pane, so an embedded table can be LOOKED at under the
@@ -285,6 +324,13 @@ const ANSWERS: Record<string, unknown> = {
     })),
     notices: [],
   },
+  // Deliberately NOT annotated `satisfies SyncProfileVm[]`: that type carries
+  // twenty fields and this row answers six. It is under-specified rather than
+  // wrong-shaped, which is the harmless failure — every consumer reads the six
+  // and the rest come back `undefined` — and filling in fourteen invented
+  // values to buy a type annotation would be a fixture that lies. The rule the
+  // Files listing above follows is the one worth keeping: annotate the shapes
+  // a consumer DEREFERENCES, because those are the ones that blank a window.
   sync_profiles: [
     {
       id: "p1",
@@ -296,7 +342,6 @@ const ANSWERS: Record<string, unknown> = {
     },
   ],
   sync_statuses: [{ profileId: "p1", state: "idle", pending: 0, lastSyncMs: ago(3) }],
-  sync_browse: { entries: ENTRIES, truncated: false },
   sync_problems: { profiles: [] },
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
   sync_device: { id: "01DEVICE", label: "hesperia" },
@@ -337,6 +382,48 @@ function fallback(command: string): unknown {
   return null;
 }
 
+/**
+ * The few commands whose answer depends on WHICH thing was asked for.
+ *
+ * `ANSWERS` is a table of one shape per command, which is enough for a viewing
+ * aid until two callers ask the same command about different rows and both get
+ * the first row back. `notes_body_read` is the first of those: a folded note
+ * panel names its spine from the note's own body, so a table would draw the
+ * same title down every strip.
+ *
+ * The body is composed to start with the row's title, because that is the
+ * relationship the app relies on (FR-98: a note's title IS its first body
+ * line). A fixture whose body and title disagree tests the mock, not the app.
+ */
+const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  notes_body_read: (payload) => {
+    const row = NOTES.find(([id]) => id === payload.noteId);
+    if (row === undefined) {
+      return null;
+    }
+    const [, title, body] = row;
+    const rest = String(body).split("\n").slice(1).join("\n");
+    return { rev: "rev-mock", text: `# ${title}\n${rest}` };
+  },
+  // The tree asks this once per folder it opens, so a table would answer the
+  // root's eleven rows for every expansion and the tree would repeat itself
+  // down the pane. `state`, `detail` and `write` are the listing's own fields
+  // and not the entries' — the folder that cannot be written into is a
+  // different fact from the file that cannot be.
+  sync_browse: (payload): FilesListingVm => {
+    const subpath = String(payload.subpath ?? "");
+    return {
+      profileId: String(payload.id ?? "p1"),
+      subpath,
+      state: "listed",
+      entries: subpath === "" ? ENTRIES : (CHILDREN[subpath] ?? []),
+      detail: null,
+      truncated: false,
+      write: { writable: true, reason: null, caveat: null },
+    };
+  },
+};
+
 /** True when a real Tauri shell is already answering. */
 function realShellPresent(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -347,7 +434,13 @@ export function installMockShell(): void {
     return;
   }
   mockIPC((command, payload) => {
-    const answer = command in ANSWERS ? ANSWERS[command] : fallback(command);
+    const handler = HANDLERS[command];
+    const answer =
+      handler !== undefined
+        ? handler((payload ?? {}) as Record<string, unknown>)
+        : command in ANSWERS
+          ? ANSWERS[command]
+          : fallback(command);
     // One line per call, so a screen that looks wrong can be traced to the
     // command it asked for rather than guessed at.
     console.debug("[mock-shell]", command, payload ?? "", "→", answer);
