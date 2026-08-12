@@ -243,64 +243,83 @@ one idea is how a UI starts looking slightly wrong without anyone being able to 
 **The lamp is the app's one repeated shape.** A 6px round indicator with four states carried by
 fill, not by hue alone: filled (live), hollow (idle), dashed ring (working), filled with a bite
 taken out (fault). It appears in the sidebar, on sync rows, on bridge cards, on the recording
-button, and — at 1:1 with the mark's aperture — inside the icon itself.
+button, and — at 1:1 with the mark's mouth — inside the icon itself.
 
 ## Components
 
-**The mark: an accession tag.** The punched, ruled label a museum keeper ties to every object in a
-collection so the thing and its record never come apart. A stepped head with an **eyelet**, a
-**rule**, and an **aperture** — three holes, read top to bottom, growing as the tag fills in. No
-face, no eyes, no antennae.
+**The mark: the hex-bot.** A honeycomb cell with a face. keeper → beekeeper → the hive: a hive is
+many cells kept as one structure, which is literally what this product is — many networks bridged
+into one kept archive — and the keeper is the one who tends it. The face is the **owner's
+decision**, made with the earlier no-face draft on the table: the eyes are what make the mark a
+someone in the menu bar rather than another rectangle, and the mouth is what makes it an
+instrument — it is the state display. An earlier draft of this section argued for a faceless
+accession tag; the research it rested on (grid arithmetic, the vendor-mark mush survey, the
+one-vocabulary rule) all carries over — the silhouette changed, not the discipline.
 
 Four constraints shaped it, and three of them are hard:
 
-1. **It has to say what keeper is.** A tag is the only one of six measured candidates whose idea is
-   the product rather than a nice shape, and its stepped outline is the only asymmetric silhouette
-   in a menu bar otherwise full of rectangles — which is what makes it findable in peripheral
-   vision rather than merely legible once found.
+1. **It has to say what keeper is.** The cell is the product: one of many, kept, tended, part of a
+   structure. A hexagon is also the only silhouette of its kind in a menu bar otherwise full of
+   rectangles and circles — findable in peripheral vision rather than merely legible once found.
 2. **Android's trademark forbids derivatives of the bugdroid**, which is a dome head with two thin
-   antennae and two dot eyes. Any antennae-and-two-eyes robot is legally and visually in its
-   shadow. This is why keeper's mark is an object rather than a character.
+   antennae and two dot eyes. The hex-bot stays out of its shadow structurally: the head is a
+   flat-topped hexagon, not a dome, and **no antenna exists anywhere in the brand** — an antenna'd
+   app-icon variant was tried and retired, for proportion as much as for distance: the cell now
+   fills the tile, and the icon is exactly the tray's silhouette, one identity everywhere.
+   Silhouette, count and grammar all differ.
 3. **A mark dies as mush along its edges, so it is authored on the grid it is worn on.** The
    viewBox is **44 units**: 44 → 44px is 1:1 and 44 → 22px is exactly 0.5, and 22px is what macOS
-   renders a menu-bar template at. Every coordinate is even, so every edge is a whole pixel at both
-   tray sizes and the shipped glyphs measure **zero** antialiased pixels — not "few", zero, which
-   is a threshold with no slack in it to quietly spend.
+   renders a menu-bar template at. The cell's horizontal bands sit on even coordinates and land on
+   whole pixels at both tray sizes; the four diagonals run at slope exactly 1:2, so their fringe
+   is one deterministic repeating pattern — a crisp angle, not mush.
 
-   16px is a different size and cannot also be served: a coordinate lands whole at both 16 and 22
-   only if it is a multiple of half the grid, so one of the two has to be chosen. 22px is the one
-   that ships; nothing renders a 16px alpha-only template. The 16px number is still measured and
-   printed, because it is how this mark is compared to the vendor marks — Ollama 89% mush, the
-   sparkle 83%, Zed 72%, all illegible; Perplexity 45% and Cursor 42% survive. The contract that
-   separates them holds either way: **the outer contour is one filled shape and the identity lives
-   in the holes.** A mark whose idea is its colour (Mistral) dies at 16px even when its geometry
-   survives.
+   The rest of the face is **round, because the approved comp is round** — rounded cell corners,
+   round eyes, round mouth ink. A first revision squared all of that off chasing whole-pixel
+   purity, and the owner rejected it in the menu bar: the identity is the comp, not the raster
+   arithmetic. What the whole-pixel doctrine actually defended — determinism — is kept in full:
+   every glyph's partial-pixel count, enclosed-hole count and ink box at 22px is **pinned
+   exactly** in the generator and its test, so any drift off the authored geometry still changes
+   a number and fails. The zero-gate did not relax; it re-based onto the comp.
 
-   The previous 32-unit grid is instructive about what this actually costs. It was chosen because
-   "32 halves to 16 exactly", and the consequence nobody measured was that a 28×26 drawing centred
-   in a 44-unit tray canvas is 14×13 px of the 22 available — the mark was a quarter smaller than
-   the surface it shipped on, and the starved aperture made `live` and `fault` differ by **three
-   pixels** in the menu bar. The tag is 16×18 px, and they differ by ten.
-4. **The aperture is a state display**, at the same four states as the lamp. So the mark, the macOS
-   tray template family, the bot list and the sync indicator speak one vocabulary instead of four
-   unrelated drawings. That is what makes the mark functional instead of decorative, and it is the
-   reason this direction is worth more than a nicer picture.
+   16px cannot also be served (44/16 lands nothing whole; no grid serves 16 and 22 at once, and
+   nothing ships a 16px alpha-only template). The 16px number is still measured and printed,
+   because it is how this mark is compared to the vendor marks — Ollama 89% mush, the sparkle 83%,
+   Zed 72%, all illegible; Perplexity 45% and Cursor 42% survive. The contract that separates them
+   holds for the cell too: **the identity lives in the contrast between one closed contour and
+   what it keeps inside** — a cell with things kept in it rather than a tag with holes punched
+   out, which is, after all, the product. A mark whose idea is its colour (Mistral) dies at 16px
+   even when its geometry survives.
+4. **The face and its corners are a slotted state display.** The mouth speaks the lamp's four
+   states: filled (`live` — a solid dot, on the record), hollow (`idle` — calm, empty), dashed
+   (`working` — three dots, the "typing…" idiom, which a messenger gets to claim as its own),
+   broken (`fault` — an exclamation grounded on the chin). The eyes are the identity and never
+   carry information — with one earned exception: they close to two lids for `paused`, because a
+   resting bot is what paused means. The **bottom-left corner** is the transport slot: a badge
+   seated in the canvas corner the hexagon's cut leaves free, with a halo bitten out of the ring
+   so it reads as a token pinned beside the cell — a hollow ring for sync armed, arrows for
+   direction (up / down / both), an exclamation for sync warning. The **top-right corner** is
+   reserved for the unread-messages dot and its `set_title` count (approved, not yet wired in
+   `tray.rs`). The cell sits at a fixed translate in a fixed 44-unit canvas and macOS centres the
+   bitmap, so a corner badge cannot move the head.
 
-   **"One vocabulary" is a claim about the visual language, not a budget of four files.** The tray
-   legitimately ships more glyphs than the lamp has states, because it carries facts the lamp does
-   not: sync direction (up / down / both) and paused-versus-warning. Those are shipped, tested
-   behaviour and collapsing them would delete information the menu bar currently tells the truth
-   about. The rule is one silhouette, one aperture, one state grammar — a vocabulary having more
-   words than four is what makes it a vocabulary.
+   So the mark, the macOS tray template family, the bot list and the sync indicator speak one
+   vocabulary instead of four unrelated drawings — one silhouette, one face, two corner slots,
+   one state grammar. A vocabulary having more words than the lamp's four is what makes it a
+   vocabulary: sync direction and paused-versus-warning are shipped, tested behaviour, and
+   collapsing them would delete information the menu bar currently tells the truth about.
 
-**No face — and neither does any bot.** When conversational agents arrive they get the same tag
-with a different aperture state, never eyes and never a smile. keeper's AI is a kept instrument,
-not a friend; the product's whole argument is that this runs on your machine.
+**The face is the mark's, and only the mark's.** The smile exists on the coloured app icon alone —
+in the menu bar the mouth is an instrument and must be empty at rest. No emoji in chrome, no
+sparkles, and conversational agents do not each get a mascot: a bot in keeper is a kept
+instrument, and it wears the same cell.
 
-Every raster is cut from `src-tauri/crates/keeper/icons/mark.svg` by
+Every asset is cut from `src-tauri/crates/keeper/icons/mark.svg` by
 `bun run scripts/gen-mark-icons.ts` — app icons, ten tray templates, the iOS AppIcon set, and
-`favicon.png` in the repo root. The two colours are read from `src/index.css`, so a retheme moves
-the icon with it. Do not hand-edit the PNGs.
+`favicon.png` plus `favicon.svg` in the repo root. The coloured tile is the owner's approved
+comp: the mark in paper (light `--background`) on the healthy-hive green (light
+`--bridge-healthy` — keeper's original brand green, which is where that colour now lives in the
+palette), with neighbour cells ghosted in the dark ground at low opacity. All three colours are
+read from `src/index.css`, so a retheme moves the icon with it. Do not hand-edit the PNGs.
 
 ## Do's and Don'ts
 
@@ -319,7 +338,10 @@ lives in 4% of the pixels and a style guide nobody re-reads cannot defend that.
   is banned by name.
 - **No colour-only status.** Every state carries a shape. This is a WCAG requirement the app
   currently fails, not a preference.
-- **No face on the mark, no emoji in chrome, no sparkles.**
+- **No face anywhere but the mark, no emoji in chrome, no sparkles.** The hex-bot's face is the
+  brand and it is singular: nothing else in the product grows eyes, and the mark itself smiles
+  only on the coloured app icon — in the menu bar its mouth is a state display and stays empty at
+  rest.
 
 **Always:**
 

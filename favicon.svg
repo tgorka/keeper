@@ -1,48 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44">
-  <title>keeper — the hex-bot</title>
-  <!--
-    THE KEEPER MARK. A honeycomb cell with a face: the hex-bot. keeper -> beekeeper -> the hive.
-    A hive is many cells kept as one structure, which is literally what this product is — many
-    networks bridged into one kept archive — and the keeper is the one who tends it. The face is
-    the owner's decision, approved from comps and HELD TO here: rounded cell corners, round eyes,
-    round mouth ink. An earlier revision of this file squared all of that off chasing whole-pixel
-    purity, and the owner rejected the result in the menu bar — rightly: the identity is the comp,
-    not the raster arithmetic. macOS renders retina templates through greyscale alpha; a curve is
-    a first-class citizen there, and determinism is still enforced, by PINNED per-glyph partial
-    counts in `gen-mark-icons.ts` and its test, so any drift off the authored geometry changes a
-    number and fails. The gate survives; the aesthetic serves the comp.
-
-    Why this is not a bugdroid problem: Android's trademark is a dome head with two thin antennae
-    and two dot eyes. This mark is a flat-topped hexagon, it wears NO antenna in any template
-    (the antenna exists only on the coloured app icon, where it is a single short stem tipped
-    with a smaller hexagon — self-similar, not a feeler), and its face carries a state grammar no
-    character mascot has. Silhouette, count and grammar all differ.
-
-    THE GRID IS 44 UNITS: 1:1 with the @2x tray raster, halved exactly at 22px. The cell's
-    horizontal bands still land on even whole pixels (y 6..10 and 34..38); the four diagonals run
-    at slope exactly 1:2 so their fringe is one repeating pattern; everything else is allowed to
-    be round, because the comp is round.
-
-    THE FACE AND ITS SLOTS — the state grammar, shared with the lamp component and, in the two
-    corner slots, with the approved combination scheme (messages top-right, transport
-    bottom-left). Everything is additive over the base; the ring is never re-cut except by the
-    BADGE HALO, a deliberate bite that separates a corner badge from the cell wall:
-
-      - EYES, r 2.8 at (17,19)/(27,19): always open, always present — the identity, never a
-        state. The one exception is `paused`, where they close to two lids: the bot is resting,
-        which is what paused means.
-      - MOUTH, centred under the eyes: live = a filled round dot (recording, on the record),
-        idle = empty (calm), working = three dots (the "typing…" idiom), fault = an exclamation.
-      - BOTTOM-LEFT BADGE, centred (8,36) in the canvas corner the hexagon's cut leaves free:
-        the transport facts. A hollow ring = sync armed; up / down / paired arrows = direction;
-        an exclamation = sync warning. The halo (#bl-halo) knocks the ring open around it so the
-        badge reads as a token pinned NEXT to the cell, not a growth on it. The cell sits at a
-        fixed translate in a fixed 44-unit canvas, so the badge cannot move the head: macOS
-        centres the bitmap, and the bitmap never changes size or layout.
-      - TOP-RIGHT: reserved for the unread-messages dot + `set_title` count (not yet wired in
-        tray.rs; the slot is part of the approved grammar and deliberately kept empty here).
-  -->
-  <defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><title>keeper — the hex-bot</title><defs>
     <!--
       The cell wall: a stroked hexagon on the centerline path, 4 units of stroke, joins rounded —
       the comp's soft corners. Centerline vertices are the midpoints of the old outer/inner
@@ -136,12 +92,4 @@
       <use href="#mark-idle"/>
       <path d="M17 24.6Q22 29.2 27 24.6L27 27.2Q22 31.8 17 27.2Z" fill="currentColor"/>
     </g>
-  </defs>
-
-  <!--
-    Standalone, the file renders the idle face. That is the canonical mark and the state the app
-    icon's hero is built from: calm, eyes open, mouth empty — present and keeping, reporting
-    nothing, which is the only state an icon with no way to stay current should claim.
-  -->
-  <g style="color:#000"><use href="#mark-idle"/></g>
-</svg>
+  </defs><clipPath id="tile-4-13"><rect x="4" y="4" width="56" height="56" rx="13"/></clipPath><rect x="4" y="4" width="56" height="56" rx="13" fill="#0f6e5c"/><g clip-path="url(#tile-4-13)" fill="none" stroke="#0d1210" stroke-opacity="0.3" stroke-width="2"><path d="M0.5 -2.257999999999999L13.5 -2.257999999999999L20 9L13.5 20.258L0.5 20.258L-6 9Z"/><path d="M50.5 44.742000000000004L63.5 44.742000000000004L70 56L63.5 67.258L50.5 67.258L44 56Z"/></g><g style="color:#f4f2ec"><use href="#mark-hero" transform="translate(4.5 4.5) scale(1.25)"/></g></svg>
