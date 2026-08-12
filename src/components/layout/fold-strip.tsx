@@ -30,56 +30,91 @@
  * So the numbers live here, once, and every mechanism spends them. A fifth
  * foldable thing gets them for free; a change to them changes all five.
  *
- * # What is fixed, and what a strip may still decide
+ * # The head is a pane-header band, and that is why the panel won
  *
- * The 48px width is load-bearing and `DESIGN.md` says so by name ("Load-bearing
- * dimensions that the design may not move … the 48px folded-column strip"). The
- * padding, gap and item size are the sidebar's, because the sidebar's rail
- * shipped first and is the proof the treatment works at this width.
+ * Owning the width, the inset, the gap and the item size still left the four
+ * strips visibly ragged, because the two numbers that decide where a strip
+ * STARTS were not here: the glyph on the way back, and the height of the row it
+ * sits in. The owner's second screenshot is exactly those two.
  *
- * A strip decides exactly one thing for itself: whether anything follows the
- * way back. Where something does — the sidebar's views, a surface column's rail
- * controls — {@link FoldStripDivider} separates the two, because "the way out"
- * and "what is still in here" are two groups and not one list. Where nothing
- * does, as on a folded panel, there is nothing to separate.
+ * | | sidebar | surface column | panel |
+ * |---|---|---|---|
+ * | glyph, before | `PanelLeftClose`/`Open` | `PanelLeftClose`/`Open` | **`ChevronsRightLeft`/`LeftRight`** |
+ * | head height, before | 44px (`p-2 pb-0` + a 36px control) | 44px, the same sum | **40px** (`py-1` + a 32px control) |
+ * | rule under it, before | a 24px hairline at y=48 | a 24px hairline at y=48 | **a full-bleed edge at y=40** |
  *
- * # A folded strip says its name in a tooltip, and the geometry decided that
+ * Three strips standing in a row, one of them wearing a different glyph 6px
+ * higher with its divider 8px off the other two. The fix is NOT to bring the
+ * panel up to the other three: a panel's head is one segment of the header rule
+ * that runs across every open pane beside it, and `DESIGN.md` fixes that rule's
+ * height at 40px (`pane-header`). 44px cannot be made to line up with 40px, so
+ * the panel was the only one of the three that was already right and the other
+ * two were carrying a sum nothing checked.
+ *
+ * So {@link FoldStripHead} is the head of every foldable surface, folded or
+ * open: `DESIGN.md`'s 40px band, the strip's 8px horizontal inset, a
+ * {@link FOLD_STRIP.headControlSize} control in it, and the band's own bottom
+ * edge as the rule under it. One consequence worth saying out loud, because it
+ * reverses a decision this module used to state: the head control is 32px and
+ * the items BELOW the divider are still 36px. They are two groups — that is
+ * what the rule between them means — and each is sized by the row it is in. A
+ * control in a header band is a header control, which is the size every other
+ * control in every other pane header in this app already is; a control on the
+ * strip proper has no label beside it to widen its target, so it stays above
+ * `DESIGN.md`'s 32px floor rather than at it.
+ *
+ * The 24px hairline is gone with it. It was the right mark while a head was
+ * just the first thing on a strip; now that a head is a band, a band ends in an
+ * edge, and one edge at one height across every pane is the whole point.
+ *
+ * # A folded strip says its name down its own spine
  *
  * A foldable surface has a display name ({@link FOLD_STRIP.titleClass} draws it
- * at the top while the surface is open). Folded, the four strips stand side by
- * side wearing the same chevron, and the owner's complaint was exactly that:
- * you cannot tell which menu is which.
+ * at the top while the surface is open). Folded, the strips stand side by side
+ * wearing the same glyph, and the owner's first complaint was exactly that: you
+ * cannot tell which menu is which.
  *
- * Vertical text was measured against the real font rather than argued about.
- * Instrument Sans Variable at `label-caps` (11px, 0.08em) renders the five
- * names at 27.7px (Files), 32.8px (Menu), 49.5px (Chat list), 49.6px (Note
- * list) and 56.3px (Notes rail). The strip's content box is 48 − 2×8 = **32px**,
- * so horizontally four of the five do not fit at all and the two that would be
- * truncated — "Chat…" and "Note…" — are the two a reader most needs told apart.
- * Turned on its side the text fits the cross axis easily (an 11px line box at
- * 1.4 is 15.4px) but spends 50–56px of the strip's HEIGHT, which would make the
- * name the single tallest object on a strip whose every control is 36px, on the
- * one axis a strip is short of, in a rotated register that appears nowhere else
- * in this codebase.
+ * This module's first answer was a tooltip, and the reasoning was measured
+ * rather than argued: Instrument Sans Variable at `label-caps` (11px, 0.08em)
+ * renders the five names at 27.7px (Files), 32.8px (Menu), 49.5px (Chat list),
+ * 49.6px (Note list) and 56.3px (Notes rail), against a 32px content box — so
+ * horizontally four of the five do not fit at all, and turned on its side the
+ * name would spend 50–56px of the strip's HEIGHT, "the single tallest object on
+ * a strip whose every control is 36px, on the one axis a strip is short of".
  *
- * So the name rides the way back: its accessible name and its tooltip are the
- * same words, on the glyph that is already there, in the treatment every other
- * control on the strip already uses. This is not a new idea — `panel-strip.tsx`
- * has done it since Story 45.1 for exactly this reason ("a pointer that hovered
- * a bare chevron would learn only that the strip folds, not which of four files
- * this one is"). It is now what all four do.
+ * The owner has now looked at the tooltip-only strip and asked for the text.
+ * The measurement was not wrong; the conclusion was. Height is only scarce at
+ * the TOP of a strip, where the controls are. A folded strip is 48px wide and
+ * as tall as the window, and below its two-to-five icons it is empty for
+ * several hundred pixels. So {@link FoldStripName} is the LAST child of a
+ * strip: it takes the leftover and nothing else.
  *
- * # The one documented exception: a strip whose head is a pane header
+ * That placement is the whole design, and each part of it answers the objection
+ * it was built from:
  *
- * A folded panel is a strip standing in a row of unfolded panels, and its head
- * shares their header band — one continuous 40px rule across the strip, which
- * `DESIGN.md` fixes as the `pane-header` height. A 36px control in that band is
- * 44px and breaks the line. So a panel's head control is
- * {@link FOLD_STRIP.headControlPx}, the pane header's 32px, and that number is
- * named HERE rather than typed there: an exception a module states is a
- * decision, an exception a file keeps to itself is the drift this module exists
- * to end.
+ * - **It cannot push a control.** It is `flex-1` off a zero basis next to a
+ *   `shrink` body: free space flows to the name, and the instant the controls
+ *   need that space back the name is the thing that gives, down to nothing.
+ *   The strip keeps scrolling exactly as it did.
+ * - **It cannot run off the strip.** `writing-mode: vertical-rl` makes height
+ *   the INLINE axis, so `max-h` is a line-length cap and `truncate` ellipsises
+ *   against it — {@link FOLD_STRIP.namePx}, four rail items' worth, past which
+ *   a long note title ends in an ellipsis instead of a scroll bar.
+ * - **It cannot steal a click.** `pointer-events-none`, so the strip's hit
+ *   targets are the controls and only the controls.
+ * - **It cannot be read twice.** `aria-hidden`: the strip is already named by
+ *   its region's `aria-label` and by the way back's own accessible name, and a
+ *   third copy is a third thing to read.
+ *
+ * The rotation is spelled `vertical-rl` + `rotate-180` rather than
+ * `sideways-lr`, which says it in one property: `sideways-lr` is Chromium 130
+ * and Safari 26, and this app ships in a WKWebView on macOS 13. Both compose to
+ * the same thing — glyph tops to the left, reading from the bottom up, the way
+ * a book spine is read.
  */
+import { type LucideIcon, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import type { ReactNode } from "react";
+import { cn } from "@/lib/utils";
 
 /** Names a folded strip in the DOM, so a test can measure one. */
 export const FOLD_STRIP_SLOT = "fold-strip";
@@ -87,8 +122,11 @@ export const FOLD_STRIP_SLOT = "fold-strip";
 /** Names a foldable surface's visible title. */
 export const FOLD_STRIP_TITLE_SLOT = "fold-title";
 
-/** Names the hairline between the way back and what is still on the strip. */
-export const FOLD_STRIP_DIVIDER_SLOT = "fold-divider";
+/** Names the band at the top of a foldable surface, folded or open. */
+export const FOLD_STRIP_HEAD_SLOT = "fold-head";
+
+/** Names the vertical name down a folded strip's spine. */
+export const FOLD_STRIP_NAME_SLOT = "fold-name";
 
 export const FOLD_STRIP = {
   /**
@@ -109,13 +147,10 @@ export const FOLD_STRIP = {
   padXClass: "px-2",
 
   /**
-   * The head of a strip whose body is a separate scrolling element: it ends
-   * flush, and the body below opens with exactly one {@link FOLD_STRIP.gapPx},
-   * so the rhythm does not change at the seam between the two.
+   * The body under the head: the top is the head's edge, and the body opens one
+   * {@link FOLD_STRIP.gapPx} below it so the rhythm does not change at the seam
+   * between the head and the scrolling part.
    */
-  headPadClass: "p-2 pb-0",
-
-  /** That body. The top is the head's job; the other three sides are the inset. */
   bodyPadClass: "p-2 pt-1",
 
   /** Between two things on a strip. */
@@ -143,9 +178,30 @@ export const FOLD_STRIP = {
    */
   controlClass: "size-9",
 
-  /** The pane-header exception. See this module's header for why. */
+  /**
+   * The head band: `DESIGN.md`'s `pane-header` height, which is not this
+   * module's to choose. See the header for why every strip is now drawn to it
+   * rather than only the panel that had to be.
+   */
+  headPx: 40,
+  headHeightClass: "h-10",
+
+  /** The control in that band. 32px, the size every pane header's controls are. */
   headControlSize: "icon-sm",
   headControlPx: 32,
+
+  /**
+   * The way back, in both directions, for every foldable surface.
+   *
+   * One pair, because the owner counted the glyphs: a panel folded under
+   * `ChevronsRightLeft` while the three columns beside it folded under
+   * `PanelLeftClose`, and nothing but this constant can stop a fifth mechanism
+   * picking a third pair. `PanelLeft*` and not the chevrons because it draws
+   * the thing that happens — a panel leaving a strip behind — rather than an
+   * abstract squeeze.
+   */
+  foldIcon: PanelLeftClose as LucideIcon,
+  unfoldIcon: PanelLeftOpen as LucideIcon,
 
   /**
    * A foldable surface's visible name, while it is open.
@@ -157,25 +213,100 @@ export const FOLD_STRIP = {
    * control rather than pushing the way back off the end of the row.
    */
   titleClass: "min-w-0 flex-1 truncate font-heading text-title",
+
+  /**
+   * How long that name may get once it is turned on its side, in px of the
+   * strip's height, and the class that says the same thing.
+   *
+   * 160px is four rail items and a gap — enough for every surface title this
+   * app has (the longest, "Notes rail", is 56.3px) and enough for a real note
+   * title, while still being visibly a label rather than a column of text. A
+   * note is titled by its first line (`deriveTitle`), which is user input and
+   * therefore unbounded: past this the line ellipsises.
+   */
+  namePx: 160,
+  nameMaxClass: "max-h-40",
 } as const;
 
 /**
- * The hairline between the way back and whatever is still reachable below it.
+ * The band at the top of a foldable surface.
  *
- * `aria-hidden`, and 24px rather than the strip's full 32px of content width:
- * it is a grouping mark, not a boundary between regions, and `DESIGN.md`'s rule
- * that a seam has exactly one owner is about the edges of columns.
+ * Folded or open, drawer, column or panel: one height, one inset, one bottom
+ * edge, so the way back is at the same y in every strip in the row and the rule
+ * under it is one line across the shell. See this module's header for why the
+ * folded panel's 40px won over the other two mechanisms' 44px.
  *
- * No margin of its own. The strip's `gap` spaces it like everything else on the
- * strip, which is the whole point — a divider carrying its own `my-*` is how
- * the surface column ended up with 13px where the sidebar had 8px.
+ * A caller supplies the arrangement and nothing else — `justify-center` for a
+ * strip whose head holds one control, nothing for an open surface whose title
+ * is `flex-1` and pushes the control to the end.
+ *
+ * # Why this is a `div` and not a `header`
+ *
+ * A `<header>` is a `banner` LANDMARK whenever no `article`/`aside`/`main`/
+ * `nav`/`section` scopes it, and the four column roots are not one kind of
+ * element: the notes rail and the chat sidebar are `<nav>`, the files tree is
+ * `<section>`, and the note list and the chat list are plain `<div>`s carrying
+ * their own key handlers. Drafted as a `<header>`, this component was measured
+ * in the running app announcing itself as a second and third `banner` — one
+ * per div-rooted column — which is a landmark that means "site orientation
+ * chrome" and there is only ever one of it. Scoped inside a section the tag
+ * carries no role at all, so it was buying nothing anywhere and costing this
+ * everywhere. The surfaces are named by their region's own label; the band is
+ * a band.
  */
-export function FoldStripDivider() {
+export function FoldStripHead({
+  className,
+  children,
+}: {
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-slot={FOLD_STRIP_HEAD_SLOT}
+      data-fold-strip-items="inset"
+      className={cn(
+        "flex shrink-0 items-center border-border border-b",
+        FOLD_STRIP.headHeightClass,
+        FOLD_STRIP.padXClass,
+        FOLD_STRIP.gapClass,
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * A folded strip's name, down its spine, read from the bottom.
+ *
+ * The LAST child of the strip, after the body: see this module's header for the
+ * four properties that make a rotated name at 48px safe rather than the trap it
+ * was judged to be. In one line each — it takes only leftover space, it
+ * ellipsises at {@link FOLD_STRIP.namePx} instead of running off the strip, it
+ * is transparent to the pointer, and it is invisible to a screen reader that
+ * has already been told this surface's name twice.
+ */
+export function FoldStripName({ name }: { name: string }) {
   return (
     <div
       aria-hidden="true"
-      data-slot={FOLD_STRIP_DIVIDER_SLOT}
-      className="h-px w-6 shrink-0 bg-border"
-    />
+      data-slot={FOLD_STRIP_NAME_SLOT}
+      className={cn(
+        "pointer-events-none flex min-h-0 flex-1 select-none items-end justify-center overflow-hidden",
+        FOLD_STRIP.padClass,
+      )}
+    >
+      <span
+        className={cn(
+          "label-caps truncate text-muted-foreground",
+          FOLD_STRIP.nameMaxClass,
+          "rotate-180 [writing-mode:vertical-rl]",
+        )}
+      >
+        {name}
+      </span>
+    </div>
   );
 }

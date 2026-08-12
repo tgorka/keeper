@@ -7,8 +7,6 @@ import {
   MessageSquare,
   MonitorDot,
   NotebookPen,
-  PanelLeftClose,
-  PanelLeftOpen,
   Settings,
   Stamp,
   WifiOff,
@@ -18,7 +16,8 @@ import {
   FOLD_STRIP,
   FOLD_STRIP_SLOT,
   FOLD_STRIP_TITLE_SLOT,
-  FoldStripDivider,
+  FoldStripHead,
+  FoldStripName,
 } from "@/components/layout/fold-strip";
 import { NetworksGroup } from "@/components/layout/networks-group";
 import { SpacesGroup } from "@/components/layout/spaces-group";
@@ -228,18 +227,24 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   // word in it. WCAG 2.5.3 asks that the visible label be IN the accessible
   // name, ignoring case, and "Collapse Menu" mid-sentence is a typo.
   const foldName = `${collapsed ? "Expand" : "Collapse"} ${SIDEBAR_TITLE.toLowerCase()}`;
+  const FoldGlyph = collapsed ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   const foldControl = (
     <Button
       type="button"
       variant="ghost"
-      size={FOLD_STRIP.controlSize}
+      // A head control: the drawer's head is the same 40px pane-header band as
+      // every other foldable surface's, and this is the size a control in one
+      // is. See `fold-strip.tsx` — the drawer used to spend 36px here and stand
+      // 4px taller than the panel header beside it.
+      size={FOLD_STRIP.headControlSize}
       aria-label={foldName}
       aria-expanded={!collapsed}
       aria-controls={VIEWS_LIST_ID}
       data-slot="sidebar-fold"
+      className="shrink-0"
       onClick={onToggleFold ?? undefined}
     >
-      {collapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+      <FoldGlyph aria-hidden="true" />
     </Button>
   );
 
@@ -265,43 +270,33 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
           has already folded the drawer, because there is nothing it could
           honestly do at that width.
 
-          Folded, the name rides the control as a tooltip and as its accessible
-          name, in the same words: four folded strips wearing the same chevron
-          were the owner's complaint, and 48px has no room for the word itself
-          — see `fold-strip.tsx` for the measurement. */}
+          Folded, the way back keeps the tooltip — it is the only thing that
+          says what pressing it DOES — and the drawer's own name moves to the
+          spine at the foot of the strip (`FoldStripName`), where it costs the
+          controls nothing. */}
       {(!collapsed || onToggleFold !== null) && (
-        <div
-          data-fold-strip-items={collapsed ? "inset" : undefined}
-          className={cn(
-            "flex shrink-0 flex-col",
-            FOLD_STRIP.headPadClass,
-            FOLD_STRIP.gapClass,
-            collapsed && "items-center",
+        <FoldStripHead className={collapsed ? "justify-center" : undefined}>
+          {!collapsed && (
+            <h2 data-slot={FOLD_STRIP_TITLE_SLOT} className={FOLD_STRIP.titleClass}>
+              {SIDEBAR_TITLE}
+            </h2>
           )}
-        >
-          <div className={cn("flex items-center", FOLD_STRIP.gapClass)}>
-            {!collapsed && (
-              <h2 data-slot={FOLD_STRIP_TITLE_SLOT} className={FOLD_STRIP.titleClass}>
-                {SIDEBAR_TITLE}
-              </h2>
-            )}
-            {onToggleFold !== null &&
-              (collapsed ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>{foldControl}</TooltipTrigger>
-                  <TooltipContent side="right">{foldName}</TooltipContent>
-                </Tooltip>
-              ) : (
-                foldControl
-              ))}
-          </div>
-          {/* Two things, not one list: the way back, and then what is inside.
-              Only on the strip, and only when there is a way back to separate
-              from — the same rule a folded surface column follows. */}
-          {collapsed && onToggleFold !== null && <FoldStripDivider />}
-        </div>
+          {onToggleFold !== null &&
+            (collapsed ? (
+              <Tooltip>
+                <TooltipTrigger asChild>{foldControl}</TooltipTrigger>
+                <TooltipContent side="right">{foldName}</TooltipContent>
+              </Tooltip>
+            ) : (
+              foldControl
+            ))}
+        </FoldStripHead>
       )}
-      <ScrollArea className="min-h-0 flex-1">
+      {/* `shrink` and not `flex-1` while folded: the views take the height they
+          need and the spine below takes whatever is left, so a drawer with more
+          Spaces than fit loses its name rather than its scroll. Open, there is
+          no spine and the scroller is the flexible child again. */}
+      <ScrollArea className={cn("min-h-0", collapsed ? "shrink" : "flex-1")}>
         {/* The primary views and both data-driven groups scroll as one, so the
             footer below stays reachable however many Spaces or Networks the user
             belongs to (AD-34-4).
@@ -466,6 +461,10 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
           <NetworksGroup collapsed={collapsed} />
         </div>
       </ScrollArea>
+      {/* The drawer's name, down the spine, in the space between the last view
+          and the footer — the same treatment every other folded strip in the
+          shell wears (`fold-strip.tsx`). */}
+      {collapsed && <FoldStripName name={SIDEBAR_TITLE} />}
       {/* Persistent sidebar-footer region (pushed to the bottom with `mt-auto`):
           the offline pill directly ABOVE the account row, both inside the footer
           region. The account row is always mounted while signed in; the pill

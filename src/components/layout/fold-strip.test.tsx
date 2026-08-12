@@ -14,10 +14,18 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 
 import {
   FOLD_STRIP,
-  FOLD_STRIP_DIVIDER_SLOT,
+  FOLD_STRIP_HEAD_SLOT,
+  FOLD_STRIP_NAME_SLOT,
+  FOLD_STRIP_SLOT,
   FOLD_STRIP_TITLE_SLOT,
 } from "@/components/layout/fold-strip";
-import { PANEL_TESTID, PanelStrip } from "@/components/layout/panel-strip";
+import { PaneHeader } from "@/components/layout/pane-header";
+import {
+  PANEL_FOLD_LABEL,
+  PANEL_TESTID,
+  PANEL_UNFOLD_LABEL,
+  PanelStrip,
+} from "@/components/layout/panel-strip";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { SIDEBAR_TITLE, SidebarPane } from "@/components/layout/sidebar-pane";
 import {
@@ -60,6 +68,26 @@ import { spacesStore } from "@/lib/stores/spaces";
  * the first `describe` pins that module's Tailwind classes to its own pixel
  * figures, so the two notations cannot come apart either. A test that hard-coded
  * `"w-12"` would pass forever while the strips diverged again around it.
+ *
+ * The second round of this was the head. Owning the width, the inset, the gap
+ * and the item size still left three strips ragged, because the glyph on the
+ * way back and the HEIGHT of the row holding it were not here: a panel folded
+ * under `ChevronsRightLeft` in a 40px band while the drawer and the columns
+ * folded under `PanelLeftClose` in a 44px one, so the divider under the panel
+ * sat 8px above the divider under everything beside it. That is why this suite
+ * now compares the mechanisms' HEADS glyph for glyph and class for class, and
+ * why it holds the band against {@link PaneHeader} itself: the band is
+ * `DESIGN.md`'s `pane-header`, and a strip's head lining up with the pane
+ * headers beside it is the whole of what the owner asked for.
+ *
+ * The third is the name down the spine. A strip that says which one it is in
+ * rotated text is one CSS property away from a strip whose name pushes its
+ * controls off the top or eats their clicks, so the properties that make it
+ * safe are asserted rather than trusted: it comes last, it is `aria-hidden`, it
+ * is transparent to the pointer, and it carries a cap. What this suite CANNOT
+ * see is the pixels — jsdom does no layout — so the boxes were measured in
+ * Chromium against the running app, and what is left here is the contract that
+ * measurement depended on.
  */
 
 /** `DESIGN.md` → `spacing.unit`. What one Tailwind step is worth, in px. */
@@ -184,10 +212,11 @@ describe("the folded-strip metrics", () => {
     expect(FOLD_STRIP.padClass).toBe(`p-${FOLD_STRIP.padPx / UNIT}`);
     expect(FOLD_STRIP.padXClass).toBe(`px-${FOLD_STRIP.padPx / UNIT}`);
     expect(FOLD_STRIP.gapClass).toBe(`gap-${FOLD_STRIP.gapPx / UNIT}`);
-    // A head ends flush and the body under it opens with exactly one gap, so
-    // the rhythm does not change at the seam between two scroll containers.
-    expect(FOLD_STRIP.headPadClass).toBe(`${FOLD_STRIP.padClass} pb-0`);
+    // The body under the head's edge opens with exactly one gap, so the rhythm
+    // does not change at the seam between the band and the scrolling part.
     expect(FOLD_STRIP.bodyPadClass).toBe(`${FOLD_STRIP.padClass} pt-${FOLD_STRIP.gapPx / UNIT}`);
+    expect(FOLD_STRIP.headHeightClass).toBe(`h-${FOLD_STRIP.headPx / UNIT}`);
+    expect(FOLD_STRIP.nameMaxClass).toBe(`max-h-${FOLD_STRIP.namePx / UNIT}`);
   });
 
   it("keeps DESIGN.md's load-bearing 48px strip", () => {
@@ -195,6 +224,21 @@ describe("the folded-strip metrics", () => {
     // move. Asserted here because it is now spent from one place, so one edit
     // could move all four strips at once.
     expect(FOLD_STRIP.widthPx).toBe(48);
+  });
+
+  it("draws its head to DESIGN.md's pane-header, the same one PaneHeader draws", () => {
+    // The head height is not this module's to choose: a folded strip stands in
+    // a row with open panes, and their header band is 40px. Asserted against
+    // the COMPONENT rather than against the number, because a `pane-header`
+    // that moved and a `FOLD_STRIP` that did not is the same class of drift as
+    // the four widths this module was written to end.
+    expect(FOLD_STRIP.headPx).toBe(40);
+    render(<PaneHeader identity={<span>a pane</span>} actions={null} />);
+    const band = classesOf(screen.getByRole("banner"));
+    expect(band).toContain(FOLD_STRIP.headHeightClass);
+    // And it ends in an edge, which is the rule a strip's head puts its divider
+    // at. One band, one height, one line across the row.
+    expect(band).toContain("border-b");
   });
 
   it("sizes a strip item and a pane-header item at the sizes it claims", () => {
@@ -212,10 +256,16 @@ describe("the folded-strip metrics", () => {
     expect(classesOf(screen.getByTestId("head-item"))).toContain(
       `size-${FOLD_STRIP.headControlPx / UNIT}`,
     );
-    // The exception is smaller, not larger: it exists to fit a 40px pane-header
-    // row, and it still clears DESIGN.md's 32px control floor exactly.
+    // The head control is SMALLER than a strip item, and that is the shape and
+    // not an accident: a control in a header band is a header control, at the
+    // size every other pane header in this app spends, and it still clears
+    // DESIGN.md's 32px floor exactly. A strip item below the band has no label
+    // beside it to widen its target, so it stays above the floor.
     expect(FOLD_STRIP.headControlPx).toBe(32);
     expect(FOLD_STRIP.controlPx).toBeGreaterThan(FOLD_STRIP.headControlPx);
+    // Both fit the band they are in — 36px in a 40px row still leaves the rule
+    // where it belongs, but only one of them is what a header row spends.
+    expect(FOLD_STRIP.headControlPx).toBeLessThanOrEqual(FOLD_STRIP.headPx);
   });
 });
 
@@ -275,13 +325,18 @@ describe("every folded strip is the same strip", () => {
     expectStripRhythm(container);
   });
 
-  it("sizes every way back on a rail at the strip's item size", () => {
-    const item = `size-${FOLD_STRIP.controlPx / UNIT}`;
+  it("puts every way back in a head band, at the head control's size", () => {
+    // Before this the drawer and the columns spent a 36px strip item here and
+    // the panel spent a 32px header one, so three strips in a row had their
+    // glyphs at two different heights with their dividers 8px apart. The head
+    // is a pane-header band now, and a control in a header band is a header
+    // control.
+    const head = `size-${FOLD_STRIP.headControlPx / UNIT}`;
 
     const sidebar = renderSidebar(true);
-    expect(
-      classesOf(sidebar.container.querySelector("[data-slot=sidebar-fold]") as Element),
-    ).toContain(item);
+    const sidebarFold = sidebar.container.querySelector("[data-slot=sidebar-fold]") as Element;
+    expect(classesOf(sidebarFold)).toContain(head);
+    expect(sidebarFold.closest(`[data-slot=${FOLD_STRIP_HEAD_SLOT}]`)).not.toBeNull();
     sidebar.unmount();
 
     const column = render(<Column id="notes-rail" />);
@@ -290,16 +345,77 @@ describe("every folded strip is the same strip", () => {
         name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
       }),
     );
-    expect(
-      classesOf(column.container.querySelector("[data-slot=column-fold]") as Element),
-    ).toContain(item);
+    const columnFold = column.container.querySelector("[data-slot=column-fold]") as Element;
+    expect(classesOf(columnFold)).toContain(head);
+    expect(columnFold.closest(`[data-slot=${FOLD_STRIP_HEAD_SLOT}]`)).not.toBeNull();
     column.unmount();
 
+    const panel = renderFoldedPanel();
+    const panelFold = panel.container.querySelector(
+      `[aria-label^="${PANEL_UNFOLD_LABEL}"]`,
+    ) as Element;
+    expect(classesOf(panelFold)).toContain(head);
+    expect(panelFold.closest(`[data-slot=${FOLD_STRIP_HEAD_SLOT}]`)).not.toBeNull();
+  });
+
+  it("keeps a section folded onto the rail at the strip's ITEM size", () => {
+    // Not a head: a `FoldSection` is a row ON a strip, under somebody else's
+    // band, so it is sized by the list it is in and not by a header row. ~22px
+    // `h-auto` before this module, sitting under 36px nav buttons.
     const section = renderSection(true);
-    // ~22px `h-auto` before this, sitting under 36px nav buttons on one strip.
     expect(
       classesOf(section.container.querySelector("[data-slot=sidebar-group-fold]") as Element),
-    ).toContain(item);
+    ).toContain(`size-${FOLD_STRIP.controlPx / UNIT}`);
+  });
+
+  it("folds every mechanism under one glyph, and unfolds under its pair", () => {
+    // The panel wore `ChevronsRightLeft` beside three `PanelLeftClose`s. The
+    // glyphs are compared to EACH OTHER rather than to a name lucide could
+    // rename: what must hold is that no mechanism picks its own.
+    const glyphOf = (control: Element): string => {
+      const svg = control.querySelector("svg");
+      expect(svg).not.toBeNull();
+      return (svg as SVGElement).getAttribute("class") ?? "";
+    };
+
+    const openSidebar = renderSidebar(false);
+    const openGlyph = glyphOf(
+      openSidebar.container.querySelector("[data-slot=sidebar-fold]") as Element,
+    );
+    const openColumn = render(<Column id="notes-rail" />);
+    expect(glyphOf(openColumn.container.querySelector("[data-slot=column-fold]") as Element)).toBe(
+      openGlyph,
+    );
+    const openPanel = render(<PanelStrip />);
+    expect(glyphOf(screen.getByRole("button", { name: PANEL_FOLD_LABEL }))).toBe(openGlyph);
+    openSidebar.unmount();
+    openColumn.unmount();
+    openPanel.unmount();
+
+    const sidebar = renderSidebar(true);
+    const foldedGlyph = glyphOf(
+      sidebar.container.querySelector("[data-slot=sidebar-fold]") as Element,
+    );
+    // The two states are two glyphs, not one: the control says which way it
+    // goes, which is the half a strip has no other way to state.
+    expect(foldedGlyph).not.toBe(openGlyph);
+    sidebar.unmount();
+
+    const column = render(<Column id="notes-rail" />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
+      }),
+    );
+    expect(glyphOf(column.container.querySelector("[data-slot=column-fold]") as Element)).toBe(
+      foldedGlyph,
+    );
+    column.unmount();
+
+    const panel = renderFoldedPanel();
+    expect(
+      glyphOf(panel.container.querySelector(`[aria-label^="${PANEL_UNFOLD_LABEL}"]`) as Element),
+    ).toBe(foldedGlyph);
   });
 
   it("sizes every ITEM on the sidebar's strip alike, nav rows and group rows", () => {
@@ -320,53 +436,79 @@ describe("every folded strip is the same strip", () => {
     });
     const { container } = renderSidebar(true);
 
-    const rows = [...container.querySelectorAll("[data-fold-strip-items] button")];
+    // Below the band only: the head holds the way back, which is a header
+    // control and deliberately a size smaller. Two groups, one rule between.
+    const rows = [
+      ...container.querySelectorAll(
+        `[data-fold-strip-items]:not([data-slot=${FOLD_STRIP_HEAD_SLOT}]) button`,
+      ),
+    ];
     expect(rows.length).toBeGreaterThan(1);
     for (const row of rows) {
       expect(classesOf(row)).toContain(FOLD_STRIP.controlClass);
     }
   });
 
-  it("puts a divider under the way back on every strip that has more below it", () => {
-    // The sidebar had none and a surface column had one, for no reason either
-    // file could state. Now the rule is the reason: a divider separates the way
-    // out from what is still reachable, so a strip with nothing else has none.
+  it("gives every strip exactly one head, and the head is what carries the rule", () => {
+    // The divider used to be a 24px hairline the drawer did not draw, the
+    // column did, and the panel replaced with its own full-bleed edge 8px
+    // higher. There is one rule now and it is the bottom of the band, so every
+    // strip's divider is at the same y as every other strip's by construction
+    // — and at the same y as the pane headers of the open panes beside them.
+    const expectOneRuledHead = (root: ParentNode): void => {
+      // Every strip marks its own root, so this suite finds them by ONE
+      // selector rather than by a list of per-mechanism ones it has to be told
+      // about — the fifth foldable thing is held to this without an edit here.
+      const strips = [...root.querySelectorAll(`[data-fold-strip=${FOLD_STRIP_SLOT}]`)];
+      expect(strips).toHaveLength(1);
+      const heads = [...root.querySelectorAll(`[data-slot=${FOLD_STRIP_HEAD_SLOT}]`)];
+      expect(heads).toHaveLength(1);
+      const classes = classesOf(heads[0] as Element);
+      expect(classes).toContain(FOLD_STRIP.headHeightClass);
+      expect(classes).toContain("border-b");
+      // And it is not a landmark. Drafted as a `<header>`, the band was
+      // measured in Chromium announcing a second and a third `banner` — one
+      // for each column whose root is a plain `<div>` and so does not scope it
+      // away. There is one banner on a screen, and it is not a fold row.
+      expect((heads[0] as Element).tagName).toBe("DIV");
+      expect(heads[0] as Element).not.toHaveAttribute("role");
+    };
+
     const sidebar = renderSidebar(true);
-    expect(
-      sidebar.container.querySelectorAll(`[data-slot=${FOLD_STRIP_DIVIDER_SLOT}]`),
-    ).toHaveLength(1);
+    expectOneRuledHead(sidebar.container);
     sidebar.unmount();
 
-    const column = render(<Column id="notes-rail" />);
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["notes-rail"].label}`,
-      }),
-    );
-    expect(
-      column.container.querySelectorAll(`[data-slot=${FOLD_STRIP_DIVIDER_SLOT}]`),
-    ).toHaveLength(1);
-    column.unmount();
+    for (const id of SURFACE_COLUMN_IDS) {
+      const column = render(<Column id={id} />);
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS[id].label}`,
+        }),
+      );
+      expectOneRuledHead(column.container);
+      column.unmount();
+    }
 
-    // A folded panel is the way back and nothing else, so there is nothing to
-    // separate it from.
-    const panel = renderFoldedPanel();
-    expect(panel.container.querySelectorAll(`[data-slot=${FOLD_STRIP_DIVIDER_SLOT}]`)).toHaveLength(
-      0,
-    );
+    // The panel was the one that had this right. It still has it, from the
+    // shared component rather than from a `py-1` of its own.
+    expectOneRuledHead(renderFoldedPanel().container);
   });
 
-  it("draws no divider while a surface is open", () => {
+  it("gives an OPEN surface the same band, so folding moves nothing", () => {
+    // The head used to be 44px open and 44px folded, which was self-consistent
+    // and 4px off every pane header in the shell. Now the fold control is at
+    // the same y in both states and in every mechanism.
     const sidebar = renderSidebar(false);
-    expect(
-      sidebar.container.querySelectorAll(`[data-slot=${FOLD_STRIP_DIVIDER_SLOT}]`),
-    ).toHaveLength(0);
+    const openHead = sidebar.container.querySelector(
+      `[data-slot=${FOLD_STRIP_HEAD_SLOT}]`,
+    ) as Element;
+    expect(classesOf(openHead)).toContain(FOLD_STRIP.headHeightClass);
     sidebar.unmount();
 
     const column = render(<Column id="notes-list" />);
     expect(
-      column.container.querySelectorAll(`[data-slot=${FOLD_STRIP_DIVIDER_SLOT}]`),
-    ).toHaveLength(0);
+      classesOf(column.container.querySelector(`[data-slot=${FOLD_STRIP_HEAD_SLOT}]`) as Element),
+    ).toContain(FOLD_STRIP.headHeightClass);
   });
 });
 
@@ -405,8 +547,8 @@ describe("every foldable surface says which one it is", () => {
     expect(screen.getByRole("heading", { name: SIDEBAR_TITLE })).toBeInTheDocument();
     open.unmount();
 
-    // 48px has no room for the word — see `fold-strip.tsx` for the measurement
-    // — so the folded strip carries it on the control instead.
+    // Folded, the heading is gone and the name is down the spine instead — the
+    // strip still says it, in an element no heading list has to carry.
     renderSidebar(true);
     expect(screen.queryByRole("heading", { name: SIDEBAR_TITLE })).toBeNull();
     expect(
@@ -466,6 +608,66 @@ describe("every foldable surface says which one it is", () => {
     expect(section.container.querySelector("[data-slot=sidebar-group-fold]")).toHaveAttribute(
       "data-state",
     );
+  });
+
+  it.each(SURFACE_COLUMN_IDS)("writes the %s column's name down the folded spine", (id) => {
+    // The owner looked at four tooltipped strips and asked for the words. This
+    // is the words: the surface's own title, the last thing on the strip.
+    render(<Column id={id} />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS[id].label}`,
+      }),
+    );
+    const strip = screen.getByTestId("column");
+    const spine = strip.querySelector(`[data-slot=${FOLD_STRIP_NAME_SLOT}]`) as Element;
+    expect(spine.textContent).toBe(SURFACE_COLUMNS[id].title);
+    // LAST. Everything above it took its height first; the spine is what is
+    // left over, which is the only reason a rotated name at 48px is safe.
+    expect(strip.lastElementChild).toBe(spine);
+  });
+
+  it("writes the drawer's name down its spine, and nothing while it is open", () => {
+    const sidebar = renderSidebar(true);
+    expect(
+      sidebar.container.querySelector(`[data-slot=${FOLD_STRIP_NAME_SLOT}]`)?.textContent,
+    ).toBe(SIDEBAR_TITLE);
+    sidebar.unmount();
+
+    const open = renderSidebar(false);
+    expect(open.container.querySelector(`[data-slot=${FOLD_STRIP_NAME_SLOT}]`)).toBeNull();
+  });
+
+  it("writes a folded panel's name down its spine", () => {
+    const panel = renderFoldedPanel();
+    const spine = panel.frame.querySelector(`[data-slot=${FOLD_STRIP_NAME_SLOT}]`) as Element;
+    // The default panel has no target, so this is what a panel with nothing in
+    // it is called. The point is that the strip is not blank below its glyph.
+    expect(spine.textContent).toBe("Panel");
+    expect(panel.frame.lastElementChild).toBe(spine);
+  });
+
+  it("keeps the spine out of the way of the strip it is on", () => {
+    // The four properties the rotated name is only safe because of. jsdom does
+    // no layout, so these are the contract the Chromium measurement rested on:
+    // it cannot be read aloud a third time, it cannot take a click meant for a
+    // control, it cannot grow past its cap, and it gives its space back before
+    // anything else does.
+    const sidebar = renderSidebar(true);
+    const spine = sidebar.container.querySelector(
+      `[data-slot=${FOLD_STRIP_NAME_SLOT}]`,
+    ) as HTMLElement;
+    expect(spine).toHaveAttribute("aria-hidden", "true");
+    expect(classesOf(spine)).toContain("pointer-events-none");
+    expect(classesOf(spine)).toEqual(expect.arrayContaining(["min-h-0", "flex-1"]));
+
+    const line = spine.firstElementChild as Element;
+    expect(classesOf(line)).toContain(FOLD_STRIP.nameMaxClass);
+    // Turned on its side, so the cap above is a LINE LENGTH and `truncate`
+    // ellipsises against it — a note title is user input and unbounded.
+    expect(classesOf(line)).toContain("[writing-mode:vertical-rl]");
+    expect(classesOf(line)).toContain("rotate-180");
+    expect(classesOf(line)).toContain("truncate");
   });
 });
 

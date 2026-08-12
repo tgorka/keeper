@@ -149,11 +149,14 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
 
     fireEvent.click(screen.getByRole("button", { name: collapse }));
 
-    const strip = document.querySelector(`[data-slot="${COLUMN_RAIL_SLOT}"]`);
-    expect(strip).not.toBeNull();
+    const strip = screen.getByTestId("column");
+    expect(strip.querySelector(`[data-slot="${COLUMN_RAIL_SLOT}"]`)).not.toBeNull();
     // The way back AND what is inside. One button is the strip this story was
-    // opened about: 48px offering nothing but its own undo.
-    expect(strip?.querySelectorAll("button").length).toBeGreaterThan(1);
+    // opened about: 48px offering nothing but its own undo. Counted over the
+    // whole strip rather than over the rail container, because the way back
+    // moved up into the head band the strip shares with every pane header
+    // beside it (`fold-strip.tsx`) — it is still on the strip, one group up.
+    expect(strip.querySelectorAll("button").length).toBeGreaterThan(1);
 
     const control = screen.getByRole("button", { name: RAIL_LABEL });
     control.focus();

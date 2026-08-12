@@ -42,9 +42,9 @@
  *
  * Folded, the column renders its RAIL: the control that undoes the fold, and
  * under it one icon button per thing the fold would otherwise have taken away.
- * It is the sidebar's collapsed rail — same width, same button metric, same
- * name-plus-tooltip shape — because a person who has met one fold has met all
- * of them, and because two 48px rails side by side must not read as an
+ * It is the sidebar's collapsed rail — same width, same head band, same button
+ * metric, same name down the spine — because a person who has met one fold has
+ * met all of them, and because two 48px rails side by side must not read as an
  * accident.
  *
  * The first cut of this folded to the fold control and nothing else. The owner
@@ -64,13 +64,14 @@
  * rather than merely discouraged, and {@link useSurfaceColumn} says it out loud
  * for the cast that gets around a type.
  */
-import { type LucideIcon, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
 import {
   FOLD_STRIP,
   FOLD_STRIP_SLOT,
   FOLD_STRIP_TITLE_SLOT,
-  FoldStripDivider,
+  FoldStripHead,
+  FoldStripName,
 } from "@/components/layout/fold-strip";
 import { Button } from "@/components/ui/button";
 import { ColumnResizer, useResizableColumn } from "@/components/ui/resizable-columns";
@@ -194,12 +195,20 @@ export interface SurfaceColumnFrame {
     style: CSSProperties;
     "data-folded": "true" | undefined;
     /**
+     * Marks the root as one of the app's folded strips while it is folded, so a
+     * parity test can find every strip on a screen and hold them to each other
+     * rather than to a list of selectors it has to be told about. The drawer
+     * and a panel mark their own roots the same way.
+     */
+    "data-fold-strip": typeof FOLD_STRIP_SLOT | undefined;
+    /**
      * The region's name, from exactly one place.
      *
      * Open, it points at the visible title this frame draws, so a reader hears
      * the words that are on screen and the two cannot drift apart. Folded there
-     * is no title to point at — the strip's name lives on the way back — so the
-     * name is spelled out instead. Either way the surface spreads this and does
+     * is no title to point at — the strip's name is down its spine and on the
+     * way back — so the name is spelled out instead. Either way the surface
+     * spreads this and does
      * NOT write an `aria-label` of its own: a region labelled "Files" wrapping a
      * heading reading "Files" is the same word announced twice.
      */
@@ -264,11 +273,16 @@ export function useSurfaceColumn(
   // IN the accessible name ignoring case, which `label` guarantees by contract.
   const foldName = `${folded ? COLUMN_EXPAND_PREFIX : COLUMN_COLLAPSE_PREFIX} ${spec.label}`;
   const titleId = `column-${id}-title`;
+  const FoldGlyph = folded ? FOLD_STRIP.unfoldIcon : FOLD_STRIP.foldIcon;
   const foldControl = (
     <Button
       type="button"
       variant="ghost"
-      size={FOLD_STRIP.controlSize}
+      // A head control, not a strip item: it lives in the 40px pane-header band
+      // every foldable surface's head now is, at the size every other control
+      // in every other pane header is. `fold-strip.tsx` states why the panel's
+      // band won over this file's old 44px sum.
+      size={FOLD_STRIP.headControlSize}
       // Contains the visible title, so the control can be operated by anyone
       // saying the word they can see (WCAG 2.5.3), and leads with the verb,
       // which is the half a folded strip has no other way to state.
@@ -279,9 +293,10 @@ export function useSurfaceColumn(
       aria-expanded={!folded}
       aria-controls={`column-${id}`}
       data-slot="column-fold"
+      className="shrink-0"
       onClick={() => columnFoldStore.getState().toggleColumn(id)}
     >
-      {folded ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}
+      <FoldGlyph aria-hidden="true" />
     </Button>
   );
 
@@ -296,31 +311,35 @@ export function useSurfaceColumn(
     // is this hook's, and a column that only names its controls inside an app
     // shell is a column that goes silent in every other host.
     <TooltipProvider>
-      <div
-        data-slot={COLUMN_RAIL_SLOT}
-        data-fold-strip={FOLD_STRIP_SLOT}
-        data-fold-strip-items="inset"
-        className={cn(
-          "flex min-h-0 flex-1 flex-col items-center overflow-y-auto",
-          FOLD_STRIP.padClass,
-          FOLD_STRIP.gapClass,
-        )}
-      >
-        {/* The way back, and the only thing on a 48px strip that says WHICH
-            surface this is. The tooltip and the accessible name are the same
-            words, because with the title gone the tooltip IS the visible label
-            — see this module's neighbour `fold-strip.tsx` for the measurement
-            that ruled out putting the name on the strip itself. */}
+      {/* The way back. The tooltip and the accessible name are the same words:
+          the spine below says WHICH surface this is, but it says nothing about
+          what pressing this does, and it is `aria-hidden` besides. */}
+      <FoldStripHead className="justify-center">
         <Tooltip>
           <TooltipTrigger asChild>{foldControl}</TooltipTrigger>
           <TooltipContent side="right">{foldName}</TooltipContent>
         </Tooltip>
-        {/* Two things, not one list: the way back, and then what is inside. */}
-        <FoldStripDivider />
+      </FoldStripHead>
+      {/* What is still reachable, under the head's edge. `shrink` and not
+          `flex-1`: the controls take the height they need and the name below
+          takes what is left, so a strip that fills up loses its name rather
+          than its scroll. */}
+      <div
+        data-slot={COLUMN_RAIL_SLOT}
+        data-fold-strip-items="inset"
+        className={cn(
+          "flex min-h-0 shrink flex-col items-center overflow-y-auto",
+          FOLD_STRIP.bodyPadClass,
+          FOLD_STRIP.gapClass,
+        )}
+      >
         {options.rail.map((control) => (
           <RailControl key={control.id} control={control} />
         ))}
       </div>
+      {/* The column's own name, down the spine, in the space nothing else
+          wanted (Story 50.x — the owner asked for the words after all). */}
+      <FoldStripName name={spec.title} />
     </TooltipProvider>
   ) : (
     // Open, the column says its name (Story 48.3). Every foldable surface in
@@ -328,12 +347,16 @@ export function useSurfaceColumn(
     // are told apart by reading rather than by hovering — and the fold control
     // keeps its place at the end of the row, because a strip that gained a
     // title and lost its way back would be the worse defect.
-    <div className={cn("flex shrink-0 items-center", FOLD_STRIP.headPadClass, FOLD_STRIP.gapClass)}>
+    //
+    // The same band as the folded head, so folding moves nothing: before this
+    // the open head was 44px and the folded one was 44px too, and both were 4px
+    // taller than the panel header they stood beside.
+    <FoldStripHead>
       <h2 id={titleId} data-slot={FOLD_STRIP_TITLE_SLOT} className={FOLD_STRIP.titleClass}>
         {spec.title}
       </h2>
       {foldControl}
-    </div>
+    </FoldStripHead>
   );
 
   return {
@@ -342,6 +365,7 @@ export function useSurfaceColumn(
       id: `column-${id}`,
       style: { width: folded ? FOLD_STRIP.widthPx : width },
       "data-folded": folded ? "true" : undefined,
+      "data-fold-strip": enabled && folded ? FOLD_STRIP_SLOT : undefined,
       "aria-labelledby": enabled && !folded ? titleId : undefined,
       "aria-label": enabled && !folded ? undefined : spec.title,
     },
