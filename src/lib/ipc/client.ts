@@ -205,6 +205,7 @@ export type { SendState } from "./gen/SendState";
 export type { SessionDetailVm } from "./gen/SessionDetailVm";
 export type { SessionEntryVm } from "./gen/SessionEntryVm";
 export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
+export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
@@ -343,6 +344,7 @@ import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
+import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
 import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
@@ -4957,6 +4959,40 @@ export async function sessionsCreate(
  */
 export async function sessionsLogToday(rootId: string, sessionId: string): Promise<SessionRefVm> {
   return await invoke<SessionRefVm>("sessions_log_today", { rootId, sessionId });
+}
+
+/**
+ * What {@link sessionsMigrate} would do, before it does any of it (FR-257) —
+ * every path it would create, rewrite and trash, session-relative.
+ *
+ * Pure: it compiles the plan and throws it away. `needed: false` means the
+ * session already reads as flat and the button should say so rather than offer
+ * a no-op run.
+ *
+ * Rejects with: `internal` (unknown root or session), `unsupported`.
+ */
+export async function sessionsMigratePreview(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionMigrationVm> {
+  return await invoke<SessionMigrationVm>("sessions_migrate_preview", { rootId, sessionId });
+}
+
+/**
+ * Convert one folder-shaped session to the flat contract (FR-257): the README's
+ * record becomes `about.md`, each `### ` log entry becomes its own stamped
+ * file, `refs/` and `prompts/` are hoisted into the root pool with their kind
+ * as a tag, and the two directories are trashed last.
+ *
+ * Journaled and idempotent — a crash mid-run resumes from the journal, and a
+ * session that is already flat resolves without writing. **Never automatic**:
+ * only the operator triggers it.
+ *
+ * Rejects with: `internal` (unknown root or session; a failed step — the
+ * journal survives and the run is retriable), `unsupported`.
+ */
+export async function sessionsMigrate(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_migrate", { rootId, sessionId });
 }
 
 /**

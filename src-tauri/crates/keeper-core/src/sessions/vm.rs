@@ -386,3 +386,28 @@ pub struct SessionTaskVm {
     /// The id is path-derived, so pins and lineage will not survive a rename.
     pub unstable_identity: bool,
 }
+
+/// What migrating one session would do, shown before anything is done (FR-257).
+///
+/// Migration rewrites the shape of a folder on a live, synced drive, and the
+/// two removals at the end are not undoable from inside keeper. So it is a verb
+/// the operator triggers after reading what it will do — never something a scan
+/// performs on their behalf, and never a dialog that only says "are you sure".
+/// This is the *what*: every path that will appear, the one that will be
+/// rewritten, and the two that will go to the trash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMigrationVm {
+    /// False when this session already follows the flat contract. Everything
+    /// below is then empty, and the UI offers nothing rather than an inert
+    /// button.
+    pub needed: bool,
+    /// Session-relative paths that will be created, in write order.
+    pub creates: Vec<String>,
+    /// Paths that will be rewritten in place — today only `README.md`, which
+    /// becomes a signpost pointing at `about.md`.
+    pub rewrites: Vec<String>,
+    /// Directories that will be moved to the trash, last and irreversibly.
+    pub trashes: Vec<String>,
+}

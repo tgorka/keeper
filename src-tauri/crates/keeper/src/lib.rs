@@ -933,6 +933,8 @@ pub fn run() {
         sessions_ipc::sessions_patterns,
         sessions_ipc::sessions_create,
         sessions_ipc::sessions_log_today,
+        sessions_ipc::sessions_migrate_preview,
+        sessions_ipc::sessions_migrate,
         sessions_ipc::sessions_set_pinned,
         sessions_ipc::sessions_archive,
         sessions_ipc::sessions_delete,

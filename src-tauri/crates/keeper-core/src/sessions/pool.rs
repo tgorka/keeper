@@ -259,6 +259,30 @@ pub fn read_pool(files: &[PoolFile<'_>]) -> Pool {
     group(read(files))
 }
 
+/// Root `.md` names that could be logs, newest first — from the names alone.
+///
+/// The board draws one row per session and needs each session's newest log
+/// line. Reading every markdown file in every session to find it would make
+/// opening the board cost the whole zone; this narrows the field to the files
+/// whose *name* carries a `YYYY-MM-DD-HHMM` stamp and orders them so the shell
+/// can read the first one or two, stop, and still be right.
+///
+/// Only a candidate list, never a verdict: the tag decides whether a file is a
+/// log, and a stamped name is not a tag. The shell reads down this list until
+/// [`read_one`] yields `kind == Some(Log)`. A session whose logs are all named
+/// something else simply has no cheap answer, and the board says nothing rather
+/// than guessing — which is the same thing the folder shape does when its
+/// README has no `## Log`.
+pub fn log_candidates(names: &[String]) -> Vec<&str> {
+    let mut out: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| name.ends_with(".md") && !stamp_of(name).0.is_empty())
+        .collect();
+    out.sort_by(|a, b| fold_cmp(b, a));
+    out
+}
+
 /// The session's log, whichever contract it follows.
 ///
 /// Returns `(date, title, body)` triples, **newest first**, which is
@@ -573,5 +597,53 @@ mod tests {
     fn an_empty_session_has_an_empty_log_in_both_shapes() {
         assert!(log_view(Shape::Flat, "", &Pool::default()).is_empty());
         assert!(log_view(Shape::Folder, "", &Pool::default()).is_empty());
+    }
+
+    /// The board's cheap path: stamped names, newest first, and nothing else
+    /// offered — so the shell reads one or two files per session instead of the
+    /// whole pool.
+    #[test]
+    fn log_candidates_are_stamped_names_newest_first() {
+        let names: Vec<String> = [
+            "about.md",
+            "AGENTS.md",
+            "2026-08-10-0000-opened.md",
+            "2026-08-12-0900-shipped.md",
+            "2026-08-11-1330-review.md",
+            "README.md",
+            "2026-08-12-notes.md",      // dated but no time: not the log naming
+            "2026-08-13-0800-plan.txt", // stamped, but not markdown
+            "artifacts",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+
+        assert_eq!(
+            log_candidates(&names),
+            [
+                "2026-08-12-0900-shipped.md",
+                "2026-08-11-1330-review.md",
+                "2026-08-10-0000-opened.md",
+            ],
+            "only the full YYYY-MM-DD-HHMM markdown names, newest first"
+        );
+        assert!(log_candidates(&[]).is_empty());
+    }
+
+    /// A candidate is a name, not a verdict: the tag still decides. A stamped
+    /// file that declares another kind must not be mistaken for the newest log.
+    #[test]
+    fn a_stamped_name_is_not_itself_a_log() {
+        let entry = read_one(file(
+            "2026-08-12-0900-shipped.md",
+            "---\ntags: [ref]\n---\n# Shipped\n",
+        ));
+        assert_eq!(entry.kind, Some(KindTag::Ref));
+        assert_eq!(
+            log_candidates(&["2026-08-12-0900-shipped.md".to_owned()]).len(),
+            1,
+            "it is offered to the shell, which then reads it and moves on"
+        );
     }
 }

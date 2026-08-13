@@ -28,7 +28,8 @@ use keeper_core::sessions::model::{
     classify, freshness, lineage, Freshness, SessionStatus, ACTIVE_DIR, ARCHIVE_DIR, README,
     WORKSPACE_DIR,
 };
-use keeper_core::sessions::shape::{shape as shape_of, Shape};
+use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
+use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, ABOUT};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
 use tauri::{AppHandle, Emitter};
@@ -344,6 +345,63 @@ fn session_dirs(zone: &Path) -> Vec<String> {
     out
 }
 
+/// Every entry name directly under `path` — files and directories both,
+/// best-effort.
+///
+/// [`dir_names`] answers a different question and cannot be reused here: the
+/// shape signal is a *file* (`AGENTS.md` or `about.md`), so a directories-only
+/// listing would report every flat session as folder-shaped.
+fn entry_names(path: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The newest log file's date and first line, for a flat session.
+///
+/// A flat session has no `## Log` section to fold over, so the signal comes from
+/// the pool — but the board draws every session in the zone, and reading every
+/// markdown file in each of them to find one line would make opening it cost the
+/// whole drive. [`log_candidates`] narrows the field by filename, and this reads
+/// down that list until a file's own tags confirm it is a log, giving up after
+/// [`LOG_PROBE_BUDGET`] files.
+///
+/// Giving up means the row says nothing about its last log, which is what the
+/// folder shape already does when its README has no `## Log`. An empty answer
+/// here is "not cheaply knowable", never "no logs".
+fn last_log_flat(dir: &Path, names: &[String]) -> (String, String) {
+    for name in log_candidates(names).into_iter().take(LOG_PROBE_BUDGET) {
+        let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
+            continue;
+        };
+        let entry = read_one(PoolFile {
+            rel: name,
+            text: &text,
+        });
+        if entry.kind != Some(KindTag::Log) {
+            continue;
+        }
+        let line = entry
+            .body(&text)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or_default()
+            .to_owned();
+        return (entry.date.clone(), line);
+    }
+    (String::new(), String::new())
+}
+
+/// How many stamped candidates a single row will open before giving up. Small
+/// on purpose: this runs once per session on every zone scan, and the answer is
+/// normally the first file.
+const LOG_PROBE_BUDGET: usize = 8;
+
 /// The directory names directly under `path`, `/`-clean, best-effort.
 fn dir_names(path: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(path) else {
@@ -360,9 +418,20 @@ fn dir_names(path: &Path) -> Vec<String> {
 
 /// Project one session directory into its board row. `None` only when the
 /// directory vanished mid-scan.
+///
+/// The row is read from whichever file this session's shape calls the record —
+/// `README.md` for a folder session, `about.md` for a flat one. That branch is
+/// what makes migration non-destructive: identity, title, tags, pinned state and
+/// lineage all live in the record's frontmatter, so a row that kept reading
+/// `README.md` after migration would silently unpin every migrated session and
+/// drop it to a `path:` id, which the board would render as a *different*
+/// session that had lost its history.
 fn row_for(dir: &Path, rel: &str, status: SessionStatus) -> Option<SessionRowVm> {
     let folder_name = rel.rsplit('/').next().unwrap_or(rel);
-    let readme = std::fs::read_to_string(dir.join(README)).unwrap_or_default();
+    let names = entry_names(dir);
+    let flat = shape_of(&names) == Shape::Flat;
+    let record_name = if flat { ABOUT } else { README };
+    let readme = std::fs::read_to_string(dir.join(record_name)).unwrap_or_default();
     let (fm, body_at) = Frontmatter::parse(&readme);
     let body = &readme[body_at..];
 
@@ -392,7 +461,11 @@ fn row_for(dir: &Path, rel: &str, status: SessionStatus) -> Option<SessionRowVm>
     let pinned = fm.as_bool("pinned").unwrap_or(false);
     let line = lineage(&fm);
     let fresh = walk_freshness(dir);
-    let (last_log_date, last_log_line) = last_log(body);
+    let (last_log_date, last_log_line) = if flat {
+        last_log_flat(dir, &names)
+    } else {
+        last_log(body)
+    };
 
     let (status_str, archived_year) = match status {
         SessionStatus::Active => ("active", None),

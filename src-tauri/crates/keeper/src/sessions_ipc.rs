@@ -441,6 +441,20 @@ fn root_error(root_id: &str) -> IpcError {
     }
 }
 
+/// The refusal for an id the registry does not hold — [`root_error`]'s twin.
+///
+/// The same eight lines are still written inline in the older commands above;
+/// this is not a sweep of them, only the shape new ones should use.
+#[cfg(desktop)]
+fn session_error(session_id: &str) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("no such session: {session_id}"),
+        account_id: None,
+        retriable: false,
+    }
+}
+
 #[cfg(desktop)]
 fn exec_error(error: crate::sessions_exec::ExecError) -> IpcError {
     use crate::sessions_exec::ExecError;
@@ -781,6 +795,175 @@ pub async fn sessions_log_today(
 #[cfg(not(desktop))]
 #[tauri::command]
 pub fn sessions_log_today(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
+/// Read one session for migration: what shape it is, and every file the
+/// compiler needs to plan the conversion.
+///
+/// Shared by the preview and the run so the two can never disagree about what
+/// they are looking at. It is bounded the way every other session read is: the
+/// carried files are `refs/` and `prompts/` markdown, which the zone's own
+/// contract keeps small, and nothing descends into `artifacts/` or `workspace/`.
+#[cfg(desktop)]
+fn migrate_input(
+    zone: &std::path::Path,
+    session_rel: &str,
+) -> keeper_core::sessions::migrate::MigrateInput {
+    use keeper_core::sessions::migrate::{MigrateFile, MigrateInput};
+
+    let dir = zone.join(session_rel);
+    let top_level: Vec<String> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut carried = Vec::new();
+    for kind in ["refs", "prompts"] {
+        let Ok(entries) = std::fs::read_dir(dir.join(kind)) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".md"))
+            .collect();
+        // Sorted so a preview and the run that follows it list the same files in
+        // the same order — `read_dir` order is the filesystem's business.
+        names.sort();
+        for name in names {
+            let Ok(text) = std::fs::read_to_string(dir.join(kind).join(&name)) else {
+                continue;
+            };
+            carried.push(MigrateFile {
+                rel: format!("{kind}/{name}"),
+                text,
+            });
+        }
+    }
+
+    let mut input = MigrateInput {
+        session: session_rel.to_owned(),
+        top_level,
+        readme: std::fs::read_to_string(dir.join("README.md")).unwrap_or_default(),
+        carried,
+        ids: Vec::new(),
+        today: today(),
+    };
+    input.ids = (0..keeper_core::sessions::migrate::id_count(&input))
+        .map(|_| crate::sync_ipc::new_ulid())
+        .collect();
+    input
+}
+
+/// What migrating this session would do — every path, before any of them
+/// happens (FR-257).
+///
+/// Pure in the only sense that matters here: it reads the session and writes
+/// nothing. The ids it mints are thrown away with the preview, and the run
+/// mints its own — which is correct, because the operator may preview twice and
+/// run once, and the ids that end up in the files must be the ones the journal
+/// recorded.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_migrate_preview(
+    root_id: String,
+    session_id: String,
+) -> Result<keeper_core::sessions::vm::SessionMigrationVm, IpcError> {
+    use keeper_core::sessions::plan::PlanStep;
+    use keeper_core::sessions::vm::SessionMigrationVm;
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+
+    let input = migrate_input(&zone, &row.path);
+    let Some(plan) = keeper_core::sessions::migrate::compile_migrate(&input) else {
+        return Ok(SessionMigrationVm {
+            needed: false,
+            creates: Vec::new(),
+            rewrites: Vec::new(),
+            trashes: Vec::new(),
+        });
+    };
+
+    // Session-relative, because that is what the operator is looking at: the
+    // zone prefix is the same on every row and would only be noise.
+    let strip = |path: &str| {
+        path.strip_prefix(&format!("{}/", row.path))
+            .unwrap_or(path)
+            .to_owned()
+    };
+    let mut vm = SessionMigrationVm {
+        needed: true,
+        creates: Vec::new(),
+        rewrites: Vec::new(),
+        trashes: Vec::new(),
+    };
+    for step in &plan.steps {
+        match step {
+            PlanStep::WriteFile { path, .. } => vm.creates.push(strip(path)),
+            PlanStep::GuardedWrite { path, .. } => vm.rewrites.push(strip(path)),
+            PlanStep::TrashDir { path, .. } => vm.trashes.push(strip(path)),
+            _ => {}
+        }
+    }
+    Ok(vm)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_migrate_preview(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
+/// Convert one folder-shaped session to the flat contract (FR-257).
+///
+/// Journaled and idempotent like every other lifecycle verb: a crash mid-run
+/// resumes from the journal, and a completed migration compiles to no plan at
+/// all, so pressing the button twice is not a second migration. **Never
+/// automatic** — a scan that migrated what it read would turn opening the board
+/// into a commit against the operator's drive.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_migrate(root_id: String, session_id: String) -> Result<(), IpcError> {
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+
+    let input = migrate_input(&zone, &row.path);
+    let Some(compiled) = keeper_core::sessions::migrate::compile_migrate(&input) else {
+        // Already flat. Not an error: the operator asked for an outcome that
+        // already holds.
+        return Ok(());
+    };
+
+    let zone_for_run = zone.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::sessions_exec::run(&zone_for_run, compiled)
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("migrate task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_migrate(root_id: String, session_id: String) -> Result<(), IpcError> {
     let _ = (root_id, session_id);
     Err(unsupported())
 }

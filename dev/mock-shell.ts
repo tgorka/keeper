@@ -514,6 +514,29 @@ const ANSWERS: Record<string, unknown> = {
       conflict: false,
       lineage: false,
     },
+    // The folder-shaped session, without which the migrate verb has nothing to
+    // act on: every fixture being already-flat would show only the branch that
+    // does nothing. Its row is deliberately ordinary — a session that predates
+    // the flat contract is not a broken one, and must not render as a warning.
+    {
+      id: "01J8SESSIONBBBBBBBBBBBBBBB",
+      path: "active/2026-06-30-old-shape",
+      title: "Before the flat contract",
+      status: "active",
+      archivedYear: null,
+      workspaceMs: null,
+      recordMs: ago(9_000),
+      lastLogDate: "2026-07-02",
+      lastLogLine: "Wrapped the first pass",
+      snippet: "A session from when refs/ and prompts/ were directories.",
+      tags: ["keeper"],
+      pinned: false,
+      unread: false,
+      origin: "local",
+      headRev: "rev-mock",
+      conflict: false,
+      lineage: false,
+    },
   ],
   sessions_detail: {
     id: "01J8SESSIONAAAAAAAAAAAAAAA",
@@ -637,7 +660,66 @@ function fallback(command: string): unknown {
  * relationship the app relies on (FR-98: a note's title IS its first body
  * line). A fixture whose body and title disagree tests the mock, not the app.
  */
+/**
+ * The pre-flat session, as `pool.rs` never sees it: `log` comes from the
+ * README's `### ` entries, `unfiled` and `tasks` are empty because neither
+ * exists before the migration, and `shape` says so. Everything the flat detail
+ * shows is absent here, which is the point — this is the fixture that proves
+ * the detail degrades instead of erroring on a session it cannot group.
+ */
+const FOLDER_DETAIL = {
+  id: "01J8SESSIONBBBBBBBBBBBBBBB",
+  path: "active/2026-06-30-old-shape",
+  title: "Before the flat contract",
+  status: "active",
+  archivedYear: null,
+  pinned: false,
+  tags: ["keeper"],
+  properties: [{ key: "owner", value: "tgorka" }],
+  continues: [],
+  continuedBy: [],
+  summary: "A session from when refs/ and prompts/ were directories.",
+  log: [
+    { date: "2026-07-02", title: "Wrapped the first pass", body: "Promoted two artifacts." },
+    { date: "2026-06-30", title: "", body: "" },
+  ],
+  shape: "folder",
+  unfiled: [],
+  tasks: [],
+};
+
+/**
+ * What migrating that session would do — the same three lists the real preview
+ * returns, session-relative. The empty-title `### 2026-06-30 — ` entry becomes
+ * `2026-06-30-0000-untitled.md` rather than being dropped, because a heading
+ * the operator typed is content even when they typed nothing after it.
+ */
+const FOLDER_MIGRATION = {
+  needed: true,
+  creates: [
+    "about.md",
+    "2026-06-30-0000-untitled.md",
+    "2026-07-02-0001-wrapped-the-first-pass.md",
+    "refs/inputs.md",
+    "prompts/01-scope.md",
+    "AGENTS.md",
+  ],
+  rewrites: ["README.md"],
+  trashes: ["refs", "prompts"],
+};
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // Two sessions, two shapes: a table would answer the flat one for both and
+  // the folder-shaped row would render as something it is not.
+  sessions_detail: (payload) =>
+    payload.sessionId === FOLDER_DETAIL.id ? FOLDER_DETAIL : ANSWERS.sessions_detail,
+  // `needed: false` is not an error and not an empty preview — it is the answer
+  // for every session that already holds the contract, which is most of them.
+  sessions_migrate_preview: (payload) =>
+    payload.sessionId === FOLDER_DETAIL.id
+      ? FOLDER_MIGRATION
+      : { needed: false, creates: [], rewrites: [], trashes: [] },
+  sessions_migrate: () => null,
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
     if (row === undefined) {
