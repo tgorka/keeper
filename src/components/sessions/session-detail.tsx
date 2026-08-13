@@ -1,7 +1,15 @@
 /**
  * The session detail (Phase 7, FR-233, FR-254, UX-DR89): the drill-in a board
  * row opens — header with tags, the properties widget, lineage chips, the
- * rendered activity log, and the session's own file tree.
+ * session's own file tree, what it points at, and the rendered activity log.
+ *
+ * **The section order is files → refs → log**, and it inverted when the flat
+ * contract landed. Under the folder shape the log was the session: it lived in
+ * the README and the files were the supporting cast. Flat, the files ARE the
+ * session — every log entry, prompt and reference is one of them — so the tree
+ * is both the map and the contents, and it goes first. The log goes last
+ * because it is the one section that grows without bound; anything under it
+ * would drift out of reach as the session aged.
  *
  * A review surface, so the ordering choices all point one way: the log renders
  * NEWEST FIRST (the file on disk keeps the zone's newest-last convention —
@@ -64,7 +72,28 @@ export const SESSION_DETAIL_WORKSPACE_CAVEAT =
 /** What an empty log says, honestly. */
 export const SESSION_DETAIL_NO_LOG = "No log entries yet.";
 
-/** Open the session's README in the strip. */
+/**
+ * The `unfiled` notice (AD-119): root markdown that declares no kind.
+ *
+ * Not an error and not styled as one — a hand-dropped note is an ordinary way
+ * to use a folder, and a person mid-thought should not be scolded by their own
+ * tooling. It is a *nudge*, and it exists because in a flat session an untagged
+ * file is invisible to every space: it would sit on disk being skipped by the
+ * one surface that was supposed to show it.
+ */
+export const SESSION_DETAIL_UNFILED_HEADING = "Unfiled";
+export const SESSION_DETAIL_UNFILED_HINT =
+  "No kind tag, so no space will list these. Add tags: [log], [ref], [prompt] or [task] to file them.";
+
+/**
+ * Open the session's record in the strip — whose NAME depends on the shape.
+ *
+ * A flat session's record is `about.md`; a folder-shaped one's is `README.md`,
+ * where it has always been. The button says which, because "Open record" would
+ * be keeper's word for a file the operator knows by its filename, and the whole
+ * point of the flat contract is that the files are the truth.
+ */
+export const SESSION_DETAIL_OPEN_ABOUT_LABEL = "Open about.md";
 export const SESSION_DETAIL_OPEN_README_LABEL = "Open README";
 
 export interface SessionDetailProps {
@@ -177,16 +206,21 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     [rootId],
   );
 
-  const openReadme = useCallback(() => {
+  // The record's filename is the shape's, not a guess: `shape` is decided in
+  // Rust from the session's own listing (AD-119) and arrives on the VM, so this
+  // reads a field rather than probing the disk for which file exists.
+  const recordName = detail?.shape === "flat" ? "about.md" : "README.md";
+
+  const openRecord = useCallback(() => {
     if (detail === null) {
       return;
     }
     panelsStore.getState().setActiveTarget({
       kind: "file",
       profileId: rootId,
-      relativePath: `${subfolder}/${detail.path}/README.md`,
+      relativePath: `${subfolder}/${detail.path}/${recordName}`,
     });
-  }, [detail, rootId, subfolder]);
+  }, [detail, recordName, rootId, subfolder]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -215,9 +249,11 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
                   ? `archived ${detail.archivedYear}`
                   : detail.status}
               </Badge>
-              <Button type="button" variant="outline" size="sm" onClick={openReadme}>
+              <Button type="button" variant="outline" size="sm" onClick={openRecord}>
                 <Pencil aria-hidden className="size-3.5" />
-                {SESSION_DETAIL_OPEN_README_LABEL}
+                {detail.shape === "flat"
+                  ? SESSION_DETAIL_OPEN_ABOUT_LABEL
+                  : SESSION_DETAIL_OPEN_README_LABEL}
               </Button>
             </div>
             {detail.summary !== "" && (
@@ -262,7 +298,68 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             </section>
           )}
 
-          {/* The rendered activity log, newest first (the review order). */}
+          {/* The session's own file tree, in the zone's own order (FR-254) —
+              FIRST, and fully expanded. In a flat session the files ARE the
+              structure, so this is both the map and the contents; anything
+              above it would be read past. */}
+          <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
+            <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              {SESSION_DETAIL_FILES_HEADING}
+            </h3>
+            <p className="text-muted-foreground text-xs">{SESSION_DETAIL_WORKSPACE_CAVEAT}</p>
+            <SessionTree
+              rootId={rootId}
+              entries={tree?.entries ?? []}
+              truncated={tree?.truncated ?? false}
+              onOpen={openFile}
+            />
+          </section>
+
+          {/* Root markdown that declares no kind (AD-119) — directly under the
+              tree, because the fix is to edit one of the files just listed.
+              Absent for a clean session, which is what makes it a signal. */}
+          {detail.unfiled.length > 0 && (
+            <section
+              aria-label={SESSION_DETAIL_UNFILED_HEADING}
+              className="flex flex-col gap-1 rounded-md border border-border border-dashed px-3 py-2"
+            >
+              <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                {SESSION_DETAIL_UNFILED_HEADING}
+              </h3>
+              <p className="text-muted-foreground text-xs">{SESSION_DETAIL_UNFILED_HINT}</p>
+              <ul className="flex flex-wrap gap-1">
+                {detail.unfiled.map((name) => (
+                  <li key={name}>
+                    <Badge variant="outline" className="font-mono text-xs">
+                      {name}
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {/* What the session points at (FR-255) — after the files, because it
+              is the same question asked the other way: what it holds, then what
+              it names. */}
+          <section aria-label={SESSION_REFS_HEADING} className="flex flex-col gap-1">
+            <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+              {SESSION_REFS_HEADING}
+            </h3>
+            <SessionRefs
+              refs={refs?.refs ?? []}
+              missing={refs?.missing ?? 0}
+              truncated={refs?.truncated ?? false}
+            />
+          </section>
+
+          {/* The rendered activity log, newest first (the review order), and
+              LAST on the surface. It is the section that grows without bound —
+              a session running for weeks has dozens of entries — so anything
+              placed under it would drift out of reach as the session aged.
+              Everything above is a fixed-height answer to "what is this?"; the
+              log is the unbounded answer to "what happened?", and that is the
+              order a person reads them in. */}
           <section aria-label={SESSION_DETAIL_LOG_HEADING} className="flex flex-col gap-2">
             <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
               {SESSION_DETAIL_LOG_HEADING}
@@ -289,34 +386,6 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
                 ))}
               </ol>
             )}
-          </section>
-
-          {/* The session's own file tree, in the zone's own order (FR-254). */}
-          <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
-            <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-              {SESSION_DETAIL_FILES_HEADING}
-            </h3>
-            <p className="text-muted-foreground text-xs">{SESSION_DETAIL_WORKSPACE_CAVEAT}</p>
-            <SessionTree
-              rootId={rootId}
-              entries={tree?.entries ?? []}
-              truncated={tree?.truncated ?? false}
-              onOpen={openFile}
-            />
-          </section>
-
-          {/* What the session points at (FR-255) — after the files, because it
-              is the same question asked the other way: what it holds, then what
-              it names. */}
-          <section aria-label={SESSION_REFS_HEADING} className="flex flex-col gap-1">
-            <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-              {SESSION_REFS_HEADING}
-            </h3>
-            <SessionRefs
-              refs={refs?.refs ?? []}
-              missing={refs?.missing ?? 0}
-              truncated={refs?.truncated ?? false}
-            />
           </section>
         </div>
       )}

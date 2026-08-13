@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { FILES_SYNC_MARK_TESTID } from "@/components/layout/sync-status-mark";
 import {
+  initialOpenFolders,
   SESSION_TREE_EMPTY,
   SESSION_TREE_LABEL,
   SESSION_TREE_OPEN_EXTERNAL_LABEL,
@@ -83,6 +84,25 @@ function zone(): SessionEntryVm[] {
   ];
 }
 
+/**
+ * The case the scratch exception exists for: a folder inside `workspace/`,
+ * which is what a package manager leaves behind.
+ */
+function deepScratch(): SessionEntryVm[] {
+  return [
+    entry({ name: "workspace", isDir: true, size: null, locked: LOCK_SENTENCE }),
+    entry({
+      name: "node_modules",
+      relPath: "workspace/node_modules",
+      parent: "workspace",
+      depth: 2,
+      isDir: true,
+      size: null,
+      locked: LOCK_SENTENCE,
+    }),
+  ];
+}
+
 function mount(over: Partial<React.ComponentProps<typeof SessionTree>> = {}) {
   const onOpen = vi.fn();
   const result = render(
@@ -106,18 +126,36 @@ afterEach(() => {
 });
 
 describe("SessionTree", () => {
-  it("opens the sections and leaves their subtrees closed", () => {
+  it("opens every folder on arrival, however deep", () => {
     mount();
     const tree = screen.getByRole("tree", { name: SESSION_TREE_LABEL });
-    // The sections are open, so their direct children render...
+    // A section's children render...
     expect(within(tree).getByRole("treeitem", { name: "release-notes.md" })).toBeInTheDocument();
-    expect(within(tree).getByRole("treeitem", { name: "iter-3.md" })).toBeInTheDocument();
-    // ...and the folder INSIDE a section is not, so what it holds does not.
+    // ...and so does what a folder INSIDE a section holds. This is the whole
+    // change: the operator asked for the structure preloaded, and in a flat
+    // session `artifacts/` is where the only real nesting is left.
     expect(within(tree).getByRole("treeitem", { name: "shots" })).toHaveAttribute(
       "aria-expanded",
-      "false",
+      "true",
     );
-    expect(within(tree).queryByRole("treeitem", { name: "board.png" })).not.toBeInTheDocument();
+    expect(within(tree).getByRole("treeitem", { name: "board.png" })).toBeInTheDocument();
+  });
+
+  it("opens workspace/ itself but not the depth below it", () => {
+    mount();
+    const tree = screen.getByRole("tree", { name: SESSION_TREE_LABEL });
+    // Scratch is the one directory with no contract about its size — an agent
+    // pointing a package manager at it is the case the truncation notice names.
+    // So its own row opens (its contents are never hidden) and the subtree
+    // below stays closed, which is the one-level rule surviving exactly where
+    // it was earning its keep.
+    expect(within(tree).getByRole("treeitem", { name: "workspace" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(within(tree).getByRole("treeitem", { name: "iter-3.md" })).toBeInTheDocument();
+    expect(initialOpenFolders(zone()).has("workspace")).toBe(true);
+    expect(initialOpenFolders(deepScratch()).has("workspace/node_modules")).toBe(false);
   });
 
   it("renders nesting as aria-level, one level per folder", () => {

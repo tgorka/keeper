@@ -13,9 +13,9 @@
  *   Files pane lists lazily; a session is bounded by its own contract, and its
  *   sections open together, so lazily browsing would trade one git query for
  *   five (AD-114 at one level down).
- * - **The sections start open, everything below them closed.** What a person
- *   opened a session to see is what is in it; what they did not is the
- *   twentieth file of a `node_modules` the agent installed.
+ * - **Everything starts open, except below `workspace/`.** What a person opened
+ *   a session to see is what is in it; what they did not is the twentieth file
+ *   of a `node_modules` the agent installed — and scratch is where that lands.
  * - **No selection, no multi-select, no delete.** This is a review surface.
  *   The row's verbs are open, open-with, reveal — and that is the whole list.
  *
@@ -96,15 +96,39 @@ function visibleRows(entries: SessionEntryVm[], open: Set<string>): SessionEntry
 }
 
 /**
- * The folders open on arrival: the session's own top-level directories.
+ * The one folder whose subtree does NOT open on arrival — see below.
+ */
+const SCRATCH_DIR = "workspace";
+
+/**
+ * The folders open on arrival: **all of them, except inside `workspace/`**.
  *
- * Not "everything", which would render a `node_modules` nobody asked for, and
- * not "nothing", which would make a session look empty until clicked. The
- * sections ARE the session's shape, so they are what opens.
+ * This used to open the top level only. The flat contract is what changed the
+ * answer: a flat session's structure is no longer "which sections exist" — the
+ * sections are gone — it is the files themselves, and `artifacts/` is now the
+ * only place real nesting lives. Opening one level deep would show a person a
+ * folder icon where the thing they came to see is.
+ *
+ * The tree already arrives whole (the shell walks it in one pass), so this
+ * costs no read; it is purely which rows render.
+ *
+ * `workspace/` keeps its subtree closed, and this is the same judgement the
+ * original one-level rule was making rather than a retreat from it: scratch is
+ * the one directory in a session with no contract about its size, the one the
+ * truncation notice names by name, and the one an agent points a package
+ * manager at. Its own row still opens, so its contents are one click away and
+ * never hidden — what stays closed is the depth below them.
  */
 export function initialOpenFolders(entries: SessionEntryVm[]): Set<string> {
   return new Set(
-    entries.filter((entry) => entry.isDir && entry.parent === "").map((entry) => entry.relPath),
+    entries
+      .filter(
+        (entry) =>
+          entry.isDir &&
+          entry.parent !== SCRATCH_DIR &&
+          !entry.parent.startsWith(`${SCRATCH_DIR}/`),
+      )
+      .map((entry) => entry.relPath),
   );
 }
 

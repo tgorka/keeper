@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   SessionDetailVm,
@@ -29,7 +29,11 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }))
 import {
   SESSION_DETAIL_FILES_HEADING,
   SESSION_DETAIL_LOG_HEADING,
+  SESSION_DETAIL_OPEN_ABOUT_LABEL,
+  SESSION_DETAIL_OPEN_README_LABEL,
   SESSION_DETAIL_PROPERTIES_HEADING,
+  SESSION_DETAIL_UNFILED_HEADING,
+  SESSION_DETAIL_UNFILED_HINT,
   SESSION_DETAIL_WORKSPACE_CAVEAT,
   SessionDetail,
 } from "@/components/sessions/session-detail";
@@ -203,6 +207,67 @@ describe("SessionDetail", () => {
     mount();
     const files = await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
     expect(within(files).getByText(SESSION_DETAIL_WORKSPACE_CAVEAT)).toBeInTheDocument();
+  });
+
+  it("puts the files first and the log last, in document order", async () => {
+    mount();
+    await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
+    // Asserting on the DOM's own order rather than on three separate presence
+    // checks: "files first, log last" is a claim about sequence, and only a
+    // sequence can falsify it. `compareDocumentPosition` reads the rendered
+    // tree, so a reorder that satisfied every individual query but shuffled the
+    // page would still fail here.
+    const order = [
+      SESSION_DETAIL_FILES_HEADING,
+      SESSION_REFS_HEADING,
+      SESSION_DETAIL_LOG_HEADING,
+    ].map((name) => screen.getByRole("region", { name }));
+    for (let index = 0; index + 1 < order.length; index += 1) {
+      expect(
+        order[index].compareDocumentPosition(order[index + 1]) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
+
+  it("names the record by shape: about.md when flat, README when not", async () => {
+    mount();
+    expect(
+      await screen.findByRole("button", { name: SESSION_DETAIL_OPEN_README_LABEL }),
+    ).toBeInTheDocument();
+
+    cleanup();
+    sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
+    mount();
+    const open = await screen.findByRole("button", { name: SESSION_DETAIL_OPEN_ABOUT_LABEL });
+    open.click();
+    await waitFor(() => {
+      const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;
+      // The flat session's record is `about.md`; opening README.md would open
+      // the migration's signpost instead of the session.
+      expect(target).toMatchObject({
+        relativePath: "60-sessions/active/2026-08-10-keeper/about.md",
+      });
+    });
+  });
+
+  it("shows unfiled root markdown as a nudge, and shows nothing when there is none", async () => {
+    mount();
+    // The clean session is the common one, and a permanent empty section on it
+    // would make the notice mean nothing when it did appear.
+    await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
+    expect(
+      screen.queryByRole("region", { name: SESSION_DETAIL_UNFILED_HEADING }),
+    ).not.toBeInTheDocument();
+
+    cleanup();
+    sessionsDetail.mockResolvedValue(
+      detail({ shape: "flat", unfiled: ["stray-thought.md", "pasted.md"] }),
+    );
+    mount();
+    const unfiled = await screen.findByRole("region", { name: SESSION_DETAIL_UNFILED_HEADING });
+    expect(within(unfiled).getByText("stray-thought.md")).toBeInTheDocument();
+    expect(within(unfiled).getByText("pasted.md")).toBeInTheDocument();
+    expect(within(unfiled).getByText(SESSION_DETAIL_UNFILED_HINT)).toBeInTheDocument();
   });
 
   it("re-reads ALL THREE when the changed event names this root — the agent's write moves the view", async () => {
