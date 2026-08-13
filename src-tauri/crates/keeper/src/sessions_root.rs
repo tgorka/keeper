@@ -28,6 +28,7 @@ use keeper_core::sessions::model::{
     classify, freshness, lineage, Freshness, SessionStatus, ACTIVE_DIR, ARCHIVE_DIR, README,
     WORKSPACE_DIR,
 };
+use keeper_core::sessions::shape::{shape as shape_of, Shape};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
 use tauri::{AppHandle, Emitter};
@@ -528,21 +529,66 @@ fn last_log(body: &str) -> (String, String) {
 }
 
 /// Compose one session's detail — header facts, properties, the rendered
-/// log, and the file sections (FR-233). One directory walk plus one README
+/// log, and the file sections (FR-233). One directory read plus one record
 /// parse; every field derivable from files alone (AD-110).
+///
+/// **Both contracts, one payload.** Which file holds the record and where the
+/// log lives differ by shape, and *nothing downstream of here knows that*: the
+/// header, the properties widget and the timeline render identically either
+/// way. The shape is reported so the UI can decide what to **offer** — a
+/// migrate button, a new-log button — never what a file means.
 pub fn detail(
     root_id: &str,
     session_id: &str,
 ) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
-    use keeper_core::sessions::vm::{SessionDetailVm, SessionLogEntryVm, SessionPropertyVm};
+    use keeper_core::sessions::pool::{read_pool, PoolFile};
+    use keeper_core::sessions::shape::ABOUT;
+    use keeper_core::sessions::vm::{
+        SessionDetailVm, SessionLogEntryVm, SessionPropertyVm, SessionTaskVm,
+    };
 
     let zone = zone_of(root_id)?;
     let row = row_of(root_id, session_id)?;
     let dir = zone.join(&row.path);
-    let readme = std::fs::read_to_string(dir.join(README)).unwrap_or_default();
+
+    // One read of the session root, reused for everything: the shape, and (when
+    // flat) the pool itself. `ref_sources`' own scan is a separate call with a
+    // separate budget, deliberately — the detail must not pay for `refs/`.
+    let (sources, _truncated, shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
+    let flat = shape == Shape::Flat;
+
+    // The record: `about.md` under the flat contract, `README.md` under the
+    // folder one. Under the flat shape a missing `about.md` is ordinary — a
+    // session may be nothing but logs — and an empty parse degrades exactly the
+    // way an empty README already does.
+    let record_name = if flat { ABOUT } else { README };
+    let record = sources
+        .iter()
+        .find(|source| source.rel == record_name)
+        .map(|source| source.text.clone())
+        .unwrap_or_else(|| std::fs::read_to_string(dir.join(record_name)).unwrap_or_default());
+    let readme = record;
     let (fm, body_at) = Frontmatter::parse(&readme);
     let body = &readme[body_at..];
     let line = lineage(&fm);
+
+    // The pool, for a flat session: parsed once, and the source of the log, the
+    // board and the unfiled list alike. `read_pool` is pure, so this is the
+    // only place the three can disagree — and they cannot, because it is one
+    // call.
+    let pool = if flat {
+        read_pool(
+            &sources
+                .iter()
+                .map(|source| PoolFile {
+                    rel: &source.rel,
+                    text: &source.text,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        Default::default()
+    };
 
     // The properties widget (FR-227): user-tier keys only. keeper-owned keys
     // and the Obsidian-native `tags` are projected elsewhere on the header;
@@ -570,15 +616,52 @@ pub fn detail(
         })
         .collect();
 
-    let log: Vec<SessionLogEntryVm> = keeper_core::sessions::model::log_entries(body)
-        .into_iter()
-        .rev() // review order: newest first; the FILE stays newest-last
-        .map(|(date, title, entry_body)| SessionLogEntryVm {
-            date,
-            title,
-            body: entry_body,
+    // The log, from whichever contract this session follows. `log_view` owns
+    // that branch so the two readings cannot drift into two ideas of what an
+    // entry is; the folder path stays byte-identical to what it always was
+    // (parse `## Log`, reverse into review order — the FILE stays newest-last).
+    let log: Vec<SessionLogEntryVm> = if flat {
+        // Bodies come from the same texts the pool was parsed from, indexed in
+        // step with `pool.logs`.
+        let texts: Vec<&str> = pool
+            .logs
+            .iter()
+            .map(|entry| {
+                sources
+                    .iter()
+                    .find(|source| source.rel == entry.rel)
+                    .map(|source| source.text.as_str())
+                    .unwrap_or("")
+            })
+            .collect();
+        keeper_core::sessions::pool::log_view_with_bodies(&pool, &texts)
+    } else {
+        keeper_core::sessions::pool::log_view(shape, body, &pool)
+    }
+    .into_iter()
+    .map(|(date, title, entry_body)| SessionLogEntryVm {
+        date,
+        title,
+        body: entry_body,
+    })
+    .collect();
+
+    let tasks: Vec<SessionTaskVm> = pool
+        .tasks
+        .iter()
+        .map(|entry| SessionTaskVm {
+            id: entry.id.clone(),
+            rel_path: entry.rel.clone(),
+            title: entry.title.clone(),
+            status: entry.status.map(|status| status.as_str().to_owned()),
+            order: entry.order.value,
+            order_is_own: entry.order.is_own(),
+            tags: entry.tags.clone(),
+            unstable_identity: entry.unstable_identity,
         })
         .collect();
+
+    let unfiled: Vec<String> = pool.unfiled.iter().map(|entry| entry.rel.clone()).collect();
 
     let (status, archived_year) = (row.status.clone(), row.archived_year);
     Some(SessionDetailVm {
@@ -594,8 +677,20 @@ pub fn detail(
         continued_by: line.continued_by,
         summary: section_snippet(body, "## Summary"),
         log,
+        shape: shape.as_str().to_owned(),
+        unfiled,
+        tasks,
     })
 }
+
+/// The most markdown one session's *detail* reads, in bytes.
+///
+/// Its own constant rather than a share of [`REF_SCAN_BUDGET`], because the two
+/// scans answer different questions and are triggered at different rates: the
+/// detail re-reads on every open and every log write, the reference scan only
+/// when the references widget asks. Same ceiling today; separate so that
+/// tightening one never silently truncates the other.
+const DETAIL_SCAN_BUDGET: usize = 10 * 1024 * 1024;
 
 /// One raw entry of a session's own tree, before anything is said about sync.
 ///
@@ -673,14 +768,22 @@ pub struct RefSources {
 /// Every pointer written in one session's markdown, with the file it was
 /// written in (FR-255, AD-118).
 ///
-/// **Which files.** The README and every `.md` under `refs/` and `prompts/`,
-/// in that order — the README first because it is the record, and `refs/` next
-/// because the zone's own contract says that is where inputs worth keeping are
-/// listed. `artifacts/` is deliberately excluded: promoted output is a
-/// deliverable, and a reference inside it is a reference from the artifact,
-/// not from the session. `workspace/` is excluded because it is scratch that
-/// dies with the session (AD-113) — a broken pointer in a file nobody keeps is
-/// not something to report.
+/// **Which files, under the folder contract.** The README and every `.md`
+/// under `refs/` and `prompts/`, in that order — the README first because it is
+/// the record, and `refs/` next because the zone's own contract says that is
+/// where inputs worth keeping are listed.
+///
+/// **Which files, under the flat contract.** Every `.md` at the session root,
+/// in name order. There is nowhere else for markdown to be: the flat shape's
+/// premise is that kind is a tag, so a pointer's file is not distinguishable by
+/// location and all of them must be read.
+///
+/// **What is excluded, in both.** `artifacts/` — promoted output is a
+/// deliverable, and a reference inside it is a reference from the artifact, not
+/// from the session. `workspace/` — scratch that dies with the session
+/// (AD-113); a broken pointer in a file nobody keeps is not worth reporting.
+/// Neither exclusion needs restating for the flat shape, because neither is a
+/// root `.md`, but both remain true and both remain the reason.
 ///
 /// **A byte budget, not an entry budget.** The tree's budget counts dirents
 /// because that is what a `node_modules` inflates; here the cost is parsing
@@ -689,7 +792,10 @@ pub struct RefSources {
 pub fn ref_sources(root_id: &str, session_id: &str) -> Option<RefSources> {
     let row = row_of(root_id, session_id)?;
     let zone = zone_of(root_id)?;
-    let (files, truncated) = read_ref_sources(&zone.join(&row.path), REF_SCAN_BUDGET);
+    // The shape is discarded here and only here: a reference is a reference
+    // whichever contract wrote it, and the widget renders the same rows either
+    // way. `detail` and `migrate` call the reader directly for the shape.
+    let (files, truncated, _shape) = read_ref_sources(&zone.join(&row.path), REF_SCAN_BUDGET);
     Some(RefSources {
         path: row.path,
         files,
@@ -707,7 +813,20 @@ const REF_DIRS: [&str; 2] = ["refs", "prompts"];
 
 /// [`ref_sources`] over a plain directory — the half that is about files rather
 /// than about which session, so a test can hand it a folder.
-fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool) {
+///
+/// The single `read_dir` of the session root does double duty: it decides the
+/// shape and, for a flat session, *is* the file list. One read, one answer.
+fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) {
+    let top_level: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let shape = shape_of(&top_level);
+
     let mut out: Vec<RefSource> = Vec::new();
     let mut budget = budget;
 
@@ -725,6 +844,26 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool) {
         *budget -= text.len();
         out.push(RefSource { rel, text });
     };
+
+    if shape == Shape::Flat {
+        // Name order, which for logs is also date order — the filename carries
+        // `YYYY-MM-DD-HHMM` precisely so that a plain sort is chronological.
+        let mut names: Vec<String> = top_level
+            .iter()
+            .filter(|name| !name.starts_with('.') && name.to_lowercase().ends_with(".md"))
+            .filter(|name| dir.join(name).is_file())
+            .cloned()
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        for name in names {
+            if budget == 0 {
+                break;
+            }
+            let path = dir.join(&name);
+            take(name, &path, &mut budget);
+        }
+        return (out, budget == 0, shape);
+    }
 
     take(README.to_owned(), &dir.join(README), &mut budget);
     for section in REF_DIRS {
@@ -750,7 +889,7 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool) {
         }
     }
 
-    (out, budget == 0)
+    (out, budget == 0, shape)
 }
 
 /// Whether a profile-relative path is inside a session folder of this root,
@@ -1087,8 +1226,13 @@ mod tests {
         write("artifacts/report.md", "the deliverable's own references");
         write("workspace/iter-3.md", "scratch that dies with the session");
 
-        let (files, truncated) = read_ref_sources(session, REF_SCAN_BUDGET);
+        let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
         assert!(!truncated);
+        assert_eq!(
+            shape,
+            Shape::Folder,
+            "a README with refs/ and prompts/ is the original contract"
+        );
         let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
         assert_eq!(
             read,
@@ -1118,7 +1262,7 @@ mod tests {
         std::fs::write(session.join("README.md"), "x".repeat(40)).expect("write");
         std::fs::write(session.join("refs/big.md"), "y".repeat(400)).expect("write");
 
-        let (files, truncated) = read_ref_sources(session, 100);
+        let (files, truncated, _shape) = read_ref_sources(session, 100);
         assert_eq!(
             files.len(),
             1,
@@ -1127,6 +1271,113 @@ mod tests {
         assert!(
             truncated,
             "and the caller is told, rather than shown a prefix"
+        );
+    }
+
+    /// Under the flat contract the pool IS the source list: every root `.md`,
+    /// in name order, and still nothing from the two directories that are not
+    /// markdown (FR-256).
+    #[test]
+    fn a_flat_session_reads_every_root_md_and_still_skips_artifacts_and_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["artifacts", "workspace"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("AGENTS.md", "how to read this folder");
+        write("about.md", "the record");
+        write("2026-08-12-1400-second.md", "later sitting");
+        write("2026-08-12-0900-first.md", "earlier sitting");
+        write("01-prompt.md", "reusable text");
+        write(".hidden.md", "furniture");
+        write("clip.m4a", "not markdown");
+        write("artifacts/report.md", "the deliverable's own references");
+        write("workspace/iter-3.md", "scratch that dies with the session");
+
+        let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Flat, "AGENTS.md declares the flat contract");
+        assert!(!truncated);
+        let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(
+            read,
+            vec![
+                "01-prompt.md",
+                "2026-08-12-0900-first.md",
+                "2026-08-12-1400-second.md",
+                "about.md",
+                "AGENTS.md",
+            ],
+            "every root .md in name order — which for logs is date order, since \
+             the filename carries the clock; artifacts and workspace are still \
+             not the session's references, and a dotfile and a media file are \
+             still not markdown. The sort folds case, as the prompts/ sort and \
+             the pool's own already do, because APFS and NTFS do not \
+             distinguish the two spellings either"
+        );
+    }
+
+    /// The detail composes from whichever contract it finds, and the payload
+    /// it produces is the same shape either way (FR-256).
+    #[test]
+    fn a_flat_sessions_log_and_board_come_from_its_tagged_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("AGENTS.md", "---\ntags: []\n---\nhow to read this folder\n");
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write(
+            "2026-08-11-0900-opened.md",
+            "---\ntags: [log]\n---\n# opened\n\nfirst sitting\n",
+        );
+        write(
+            "2026-08-12-1700-closed.md",
+            "---\ntags: [log]\n---\n# closed\n\nwrapped up\n",
+        );
+        write(
+            "ship-it.md",
+            "---\ntags: [task]\nstatus: todo\norder: 1.5\n---\n# Ship it\n",
+        );
+        write("README.md", "left over from a half-finished migration\n");
+
+        let (sources, _truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Flat);
+        let pool = keeper_core::sessions::pool::read_pool(
+            &sources
+                .iter()
+                .map(|source| keeper_core::sessions::pool::PoolFile {
+                    rel: &source.rel,
+                    text: &source.text,
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let log = keeper_core::sessions::pool::log_view(shape, "", &pool);
+        assert_eq!(
+            log.iter()
+                .map(|(_, title, _)| title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed", "opened"],
+            "newest first, the review order — same as the folder contract's"
+        );
+        assert_eq!(log[0].0, "2026-08-12", "the date comes from the filename");
+
+        assert_eq!(pool.tasks.len(), 1);
+        assert_eq!(pool.tasks[0].title, "Ship it");
+        assert_eq!(pool.tasks[0].order.value, 1.5);
+
+        assert_eq!(
+            pool.unfiled
+                .iter()
+                .map(|e| e.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AGENTS.md", "README.md"],
+            "the navigation file declares no kind, and the residual README is \
+             visible rather than merely survivable"
         );
     }
 }

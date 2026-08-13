@@ -91,7 +91,11 @@ pub fn classify(rel_path: &str) -> Option<SessionStatus> {
 
 /// The names the index never treats as sessions: the template, anything
 /// underscore-prefixed beside it, and dotfiles (FR-225).
-fn skipped(name: &str) -> bool {
+///
+/// Public because the zone holds more `_`-prefixed things than `_template/`
+/// now — `_spaces/` joins it — and every reader of the zone must agree on
+/// which names are infrastructure rather than work. One rule, asked here.
+pub fn skipped(name: &str) -> bool {
     name.starts_with('_') || name.starts_with('.')
 }
 

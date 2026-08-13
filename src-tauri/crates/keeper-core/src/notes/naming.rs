@@ -37,6 +37,24 @@ pub(crate) const RESERVED_DEVICE_NAMES: [&str; 22] = [
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+/// Whether a string is a ULID: 26 Crockford base32 characters.
+///
+/// Checked rather than assumed, because `id` is a top-level frontmatter key
+/// that an agent or another tool may already be using for something else
+/// entirely — and what keeper does with a foreign `id` (keep it, index by path,
+/// flag the identity as unstable) depends entirely on this answer.
+///
+/// Lives in the domain because three readers now need the same rule: the notes
+/// index, the sessions board, and the session markdown pool. A second spelling
+/// of "is this one of ours" is how the 22-character regression happened.
+pub fn is_ulid(value: &str) -> bool {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| ALPHABET.contains(&byte.to_ascii_uppercase()))
+}
+
 /// Fold a title into a slug, with **no** fallback and **no** device-name
 /// escape: an emoji-only title folds to the empty string, and `"NUL"` folds to
 /// `"nul"`.
@@ -263,6 +281,27 @@ pub fn journal_path(template: &str, y: i32, m: u32, d: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three readers now depend on this one rule — the notes index, the
+    /// sessions board and the session markdown pool — and a file that fails it
+    /// is indexed by path instead. It travelled here from `notes_vault` with
+    /// its test, because a rule and the thing that guards it should not live in
+    /// different crates.
+    #[test]
+    fn only_a_real_ulid_gives_a_note_a_stable_identity() {
+        assert!(is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGH"));
+        assert!(!is_ulid("not-a-ulid"));
+        assert!(!is_ulid(""));
+        // `U`, `I`, `L` and `O` are not in Crockford base32.
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGU"));
+        // 26 characters exactly. The 22-character regression that broke every
+        // note is the reason this is a function rather than an assumption.
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0"));
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGHX"));
+        // Case-insensitive: Crockford's alphabet is, and a hand-typed id is
+        // more likely lowercase than not.
+        assert!(is_ulid("01j8zq4m7t5r9v3xk2b6c0dfgh"));
+    }
 
     #[test]
     fn slugs_an_ordinary_title() {

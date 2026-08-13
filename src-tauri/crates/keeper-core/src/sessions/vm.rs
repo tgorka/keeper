@@ -325,5 +325,64 @@ pub struct SessionDetailVm {
     pub summary: String,
     /// The `## Log`, parsed, NEWEST FIRST (review order — the zone's file
     /// stays newest-last; only this projection reverses).
+    ///
+    /// Same shape and same order under both contracts: a flat session's log is
+    /// its `log`-tagged files, and the detail cannot tell which it is holding.
+    /// That is the point — the reader changed, the rendering did not.
     pub log: Vec<SessionLogEntryVm>,
+    /// Which on-disk contract this session follows: `"flat"` or `"folder"`
+    /// ([`crate::sessions::shape::Shape`]).
+    ///
+    /// A string rather than a bool because the set may grow and a field named
+    /// `flat` cannot carry a third answer. The frontend reads it to decide what
+    /// to *offer* — migration, a new-log button — never to decide what a file
+    /// means; that decision was already made in Rust (AD-7).
+    pub shape: String,
+    /// Root markdown declaring no kind: a leftover `README.md`, a file someone
+    /// dropped in, anything mid-migration. Session-relative paths.
+    ///
+    /// Surfaced rather than swallowed. The flat contract's whole premise is
+    /// that a file says what it is, so a file that says nothing is exactly the
+    /// case the operator needs to see — and it is what makes a half-finished
+    /// migration visible instead of merely survivable. Empty for a clean
+    /// session, in both shapes.
+    pub unfiled: Vec<String>,
+    /// The work items, ready for the board. Empty under the folder contract,
+    /// which has no such thing.
+    pub tasks: Vec<SessionTaskVm>,
+}
+
+/// One work item of a flat session — a `task`-tagged markdown file, projected
+/// as a board card (FR-259).
+///
+/// A card is a *file*, not a row in a database keeper keeps beside the files:
+/// its column is its `status:` and its position is its `order:`, both ordinary
+/// frontmatter that Obsidian shows and an agent can write. Moving a card writes
+/// one key (FR-121); nothing else in the file changes, and nothing outside the
+/// file has to be told.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTaskVm {
+    /// ULID when the file has one, else `path:<rel>` — keeper never stamps an
+    /// id into a file it did not author (FR-121).
+    pub id: String,
+    /// Session-relative path: what opens the card.
+    pub rel_path: String,
+    pub title: String,
+    /// The column, as [`crate::sessions::shape::TaskStatus::as_str`] spells it.
+    /// `null` when the file states a status nothing can read — the card renders
+    /// as unplaced rather than silently landing in "to do".
+    #[ts(type = "string | null")]
+    pub status: Option<String>,
+    /// Position within the column. Fractional by design: dropping a card
+    /// between two others writes one number rather than renumbering the rest.
+    pub order: f64,
+    /// The order is the file's own rather than a default keeper supplied —
+    /// [`crate::notes::order::NoteOrderSource::Own`].
+    pub order_is_own: bool,
+    /// Tags beyond the kind, for filtering and for the card's own chips.
+    pub tags: Vec<String>,
+    /// The id is path-derived, so pins and lineage will not survive a rename.
+    pub unstable_identity: bool,
 }

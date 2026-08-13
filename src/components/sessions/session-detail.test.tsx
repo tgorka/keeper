@@ -67,6 +67,13 @@ function detail(over: Partial<SessionDetailVm> = {}): SessionDetailVm {
       { date: "2026-08-11", title: "shipped 0.6.5", body: "Release drafted; DMG attached." },
       { date: "2026-08-10", title: "opened", body: "" },
     ],
+    // The folder contract, which is what every case in this file exercises: a
+    // README-backed session with no task files and nothing unfiled. The flat
+    // contract's own rendering is tested where it is built, not by widening
+    // every fixture here into a shape it never has to draw.
+    shape: "folder",
+    unfiled: [],
+    tasks: [],
     ...over,
   };
 }

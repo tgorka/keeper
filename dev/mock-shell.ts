@@ -1,11 +1,21 @@
 /**
  * A fake shell, so the real frontend can be looked at without Tauri.
  *
- * **Why this exists.** The `keeper` shell crate does not build on Linux (AD-55,
- * AD-56), so for five epics the only way to see this app was to build it on a
- * Mac and look at it there — a fifteen-minute round trip that made visual work
- * effectively impossible and is the honest reason the UI stayed characterless.
- * Every design decision was made by reading code.
+ * **Why this exists.** For five epics the only way to see this app was to build
+ * it on a Mac and look at it there — a fifteen-minute round trip that made
+ * visual work effectively impossible and is the honest reason the UI stayed
+ * characterless. Every design decision was made by reading code.
+ *
+ * That round trip was never a *Linux* limitation, whatever earlier revisions of
+ * this comment claimed (they cited AD-55 and AD-56, which are about
+ * `keeper_core` being tauri-free and sync-free and say nothing about any
+ * platform). The `keeper` shell crate builds here — `cargo build -p keeper`
+ * produces an ELF. What is genuinely Mac-only is narrower: the recording
+ * sidecar (Swift + Xcode) and code signing. Running the built binary needs a
+ * DISPLAY, which is a different problem with a different fix.
+ *
+ * Keeping the false version cost real time: it steered agents into a Mac round
+ * trip for work a `bun run dev` in this container would have shown in seconds.
  *
  * `mockIPC` answers `invoke` in the browser, so `bun run dev` serves the REAL
  * components, the real stores, the real CSS — everything except Rust. That is
@@ -220,6 +230,119 @@ const CHILDREN: Record<string, FilesEntryVm[]> = {
 };
 
 /**
+ * One session's file tree, in the FLAT shape (`shape.rs`): every markdown file
+ * sits at the root and declares its kind in frontmatter, and the only two
+ * directories left are `artifacts/` (versioned) and `workspace/` (scratch).
+ *
+ * The fixture's whole job is to be the case that is hard to look at: a pile of
+ * dated filenames that means nothing until something reads the tags. If the
+ * detail renders this legibly — files first, kinds grouped, log at the bottom —
+ * it renders the live zone legibly.
+ *
+ * `workspace/` carries `locked` with the fence's own sentence, because a lock
+ * with no reason is the bug AD-113's refusal text exists to prevent, and a
+ * viewing aid that quietly dropped it would hide the one row whose rendering is
+ * least obvious.
+ */
+function sessionEntry(
+  relPath: string,
+  isDir: boolean,
+  bytes: number | null,
+  minutesAgo: number,
+  locked: string | null = null,
+) {
+  const cut = relPath.lastIndexOf("/");
+  return {
+    name: relPath.slice(cut + 1),
+    relPath,
+    parent: cut === -1 ? "" : relPath.slice(0, cut),
+    depth: relPath.split("/").length,
+    isDir,
+    subpath: `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    absolutePath: `/Volumes/merope/tgdrive/60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    size: bytes === null ? null : { bytes, label: `${(bytes / 1000).toFixed(1)} kB` },
+    mtimeMs: ago(minutesAgo),
+    sync: { status: "synced", detail: null },
+    locked,
+  };
+}
+
+const SESSION_ENTRIES = [
+  sessionEntry("AGENTS.md", false, 2_140, 220),
+  sessionEntry("about.md", false, 1_860, 45),
+  sessionEntry("2026-08-12-0900-opened-the-session.md", false, 720, 220),
+  sessionEntry("2026-08-12-1740-flat-pool-lands.md", false, 1_310, 45),
+  sessionEntry("2026-08-13-0910-spaces-and-the-board.md", false, 980, 12),
+  sessionEntry("task-migrate-the-live-zone.md", false, 410, 30),
+  sessionEntry("task-task-board-columns.md", false, 380, 30),
+  sessionEntry("task-search-everywhere.md", false, 350, 30),
+  sessionEntry("task-named-templates.md", false, 330, 30),
+  sessionEntry("prompt-01-scope.md", false, 640, 220),
+  sessionEntry("ref-inputs.md", false, 520, 100),
+  sessionEntry("stray-thought.md", false, 180, 8),
+  sessionEntry("artifacts", true, null, 45),
+  sessionEntry("artifacts/flat-contract.md", false, 4_400, 45),
+  sessionEntry("workspace", true, null, 3, "workspace/ is scratch: keeper never writes here."),
+  sessionEntry(
+    "workspace/scratch.md",
+    false,
+    900,
+    3,
+    "workspace/ is scratch: keeper never writes here.",
+  ),
+];
+
+/**
+ * The board's four columns, each holding at least one card, plus the two cases
+ * the columns alone would not show: a card whose `order:` keeper defaulted
+ * (`orderIsOwn: false`) and a card with no ULID (`path:` identity, flagged).
+ * Both render differently, and both come from files a person hand-wrote — which
+ * is the ordinary case in a zone Obsidian also edits.
+ */
+const SESSION_TASKS = [
+  {
+    id: "01J8AAAAAAAAAAAAAAAAAAAAAA",
+    relPath: "task-migrate-the-live-zone.md",
+    title: "Migrate the live zone",
+    status: "in-preparation",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task", "migration"],
+    unstableIdentity: false,
+  },
+  {
+    id: "01J8BBBBBBBBBBBBBBBBBBBBBB",
+    relPath: "task-task-board-columns.md",
+    title: "Task board — four columns, drag to reorder",
+    status: "todo",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task", "ui"],
+    unstableIdentity: false,
+  },
+  {
+    id: "path:task-search-everywhere.md",
+    relPath: "task-search-everywhere.md",
+    title: "Search everywhere (⌘F, ⌘⇧F)",
+    status: "todo",
+    order: 0,
+    orderIsOwn: false,
+    tags: ["task"],
+    unstableIdentity: true,
+  },
+  {
+    id: "01J8CCCCCCCCCCCCCCCCCCCCCC",
+    relPath: "task-named-templates.md",
+    title: "Named templates",
+    status: "done",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: false,
+  },
+];
+
+/**
  * A CSV wider than any pane, so an embedded table can be LOOKED at under the
  * one condition that matters: more columns than the note has room for, and one
  * value long enough that no cap could show it whole.
@@ -357,6 +480,125 @@ const ANSWERS: Record<string, unknown> = {
     echoCancellation: true,
   },
   notes_capture_windows: [],
+  // Sessions. Until now this whole feature fell through to `fallback`, which
+  // answers `null` for `sessions_detail` and blanks the pane — so the one
+  // surface being built was the one surface the viewing aid could not show.
+  sessions_roots: [
+    {
+      id: "p1",
+      name: "tgdrive",
+      subfolder: "60-sessions",
+      root: "/Volumes/merope/tgdrive/60-sessions",
+      indexed: true,
+      activeCount: 1,
+      unreadCount: 0,
+    },
+  ],
+  sessions_list: [
+    {
+      id: "01J8SESSIONAAAAAAAAAAAAAAA",
+      path: "active/2026-08-12-keeper-sessions",
+      title: "Keeper — sessions, round two",
+      status: "active",
+      archivedYear: null,
+      workspaceMs: ago(3),
+      recordMs: ago(12),
+      lastLogDate: "2026-08-13",
+      lastLogLine: "Spaces and the board",
+      snippet: "Flat markdown pool, spaces as saved queries, a task board.",
+      tags: ["keeper", "sessions"],
+      pinned: true,
+      unread: false,
+      origin: "local",
+      headRev: "rev-mock",
+      conflict: false,
+      lineage: false,
+    },
+  ],
+  sessions_detail: {
+    id: "01J8SESSIONAAAAAAAAAAAAAAA",
+    path: "active/2026-08-12-keeper-sessions",
+    title: "Keeper — sessions, round two",
+    status: "active",
+    archivedYear: null,
+    pinned: true,
+    tags: ["keeper", "sessions"],
+    properties: [
+      { key: "owner", value: "tgorka" },
+      { key: "stack", value: "#118" },
+    ],
+    continues: [],
+    continuedBy: [],
+    summary: "Flat markdown pool, spaces as saved queries, a task board.",
+    // Newest first — the projection reverses, the files do not (FR-233).
+    log: [
+      {
+        date: "2026-08-13",
+        title: "Spaces and the board",
+        body: "Five default spaces parse. The board reuses `order: f64`.",
+      },
+      {
+        date: "2026-08-12",
+        title: "Flat pool lands",
+        body: "`shape.rs` decides the contract; `pool.rs` reads it.",
+      },
+      { date: "2026-08-12", title: "Opened the session", body: "" },
+    ],
+    shape: "flat",
+    // One untagged file, because a clean fixture would never show the state the
+    // `unfiled` list exists for — and a half-migrated session is the state the
+    // operator will actually meet.
+    unfiled: ["stray-thought.md"],
+    tasks: SESSION_TASKS,
+  },
+  sessions_tree: { entries: SESSION_ENTRIES, truncated: false },
+  sessions_refs: {
+    refs: [
+      {
+        kind: "missing",
+        target: "refs/gone.md",
+        label: "refs/gone.md",
+        source: "ref-inputs.md",
+        panelTarget: null,
+        url: null,
+        notice: "Looked in the session folder and in 10-notes; no such file.",
+      },
+      {
+        kind: "note",
+        target: "[[Keeper work]]",
+        label: "Keeper work",
+        source: "ref-inputs.md",
+        panelTarget: null,
+        url: null,
+        notice: null,
+      },
+      {
+        kind: "external",
+        target: "https://github.com/tgorka/keeper",
+        label: "keeper on GitHub",
+        source: "about.md",
+        panelTarget: null,
+        url: "https://github.com/tgorka/keeper",
+        notice: null,
+      },
+    ],
+    missing: 1,
+    truncated: false,
+  },
+  sessions_patterns: [
+    {
+      id: "_template",
+      kind: "template",
+      label: "Zone template",
+      detail: "AGENTS.md, about.md, a seed log and a seed prompt.",
+      mtimeMs: ago(1_440),
+      copies: [
+        { relPath: "AGENTS.md", isDir: false },
+        { relPath: "about.md", isDir: false },
+      ],
+      skips: [],
+    },
+  ],
 };
 
 /**

@@ -1450,7 +1450,7 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     // path-derived identity instead, flagged so the UI can say that its pins and
     // unread marks will not survive a rename.
     let id = match fm.as_string("id") {
-        Some(id) if is_ulid(id) => id.to_owned(),
+        Some(id) if naming::is_ulid(id) => id.to_owned(),
         _ => {
             flags.push("unstable_identity".to_owned());
             format!("path:{rel}")
@@ -1532,18 +1532,6 @@ fn snippet(body: &str) -> String {
 fn stem(rel: &str) -> &str {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.strip_suffix(".md").unwrap_or(name)
-}
-
-/// Whether a string is a ULID: 26 Crockford base32 characters.
-///
-/// Checked rather than assumed, because `id` is a top-level frontmatter key that
-/// an agent or another tool may already be using for something else entirely.
-fn is_ulid(value: &str) -> bool {
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    value.len() == 26
-        && value
-            .bytes()
-            .all(|byte| ALPHABET.contains(&byte.to_ascii_uppercase()))
 }
 
 /// An RFC-3339 timestamp as epoch milliseconds, or a bare `YYYY-MM-DD` at local
@@ -3243,15 +3231,6 @@ mod tests {
         // A bare `-10` is a one-line span.
         assert_eq!((hunks[1].old_start, hunks[1].old_lines), (10, 1));
         assert_eq!((hunks[1].new_start, hunks[1].new_lines), (11, 2));
-    }
-
-    #[test]
-    fn only_a_real_ulid_gives_a_note_a_stable_identity() {
-        assert!(is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGH"));
-        assert!(!is_ulid("not-a-ulid"));
-        assert!(!is_ulid(""));
-        // `U`, `I`, `L` and `O` are not in Crockford base32.
-        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGU"));
     }
 
     #[test]

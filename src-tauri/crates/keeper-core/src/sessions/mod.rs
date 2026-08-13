@@ -2,10 +2,22 @@
 //!
 //! A session is a **directory with a contract**: `active/YYYY-MM-DD-<slug>/`
 //! or `archive/YYYY/YYYY-MM-DD-<slug>/` inside a sessions-flagged synced
-//! folder's zone (default `60-sessions/`), shaped by the zone's `_template/`
-//! — `README.md`, `workspace/` (unversioned scratch), `artifacts/` (promoted
-//! output), `refs/`, `prompts/`. Both live drives (tgdrive, neuradrive)
-//! already run this layout; keeper adopts it, never invents it.
+//! folder's zone (default `60-sessions/`), shaped by the zone's `_template/`.
+//! Both live drives (tgdrive, neuradrive) already run this layout; keeper
+//! adopts it, never invents it.
+//!
+//! There are **two** such contracts, and [`shape`] decides which one a given
+//! folder follows:
+//!
+//! - **Folder** — the original: `README.md` holds the record, and `refs/` and
+//!   `prompts/` hold their kinds by sitting there.
+//! - **Flat** — one markdown pool at the session root, every file declaring its
+//!   own kind as a tag (AD-120), read by [`pool`].
+//!
+//! `workspace/` (unversioned scratch) and `artifacts/` (promoted output) are in
+//! both, because they are the parts that are not markdown. Neither contract is
+//! deprecated on a timetable: these are folders on the operator's drives, and a
+//! session nobody migrates has to keep working.
 //!
 //! Everything here is a *rule* rather than an *effect*, exactly as
 //! [`crate::notes`] is: which directory names are sessions, what folder name a
@@ -27,8 +39,10 @@
 pub mod model;
 pub mod pattern;
 pub mod plan;
+pub mod pool;
 pub mod promote;
 pub mod refs;
+pub mod shape;
 pub mod vm;
 
 /// Everything the sessions domain can refuse to do.
