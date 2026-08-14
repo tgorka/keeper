@@ -45,6 +45,7 @@ pub mod plan;
 pub mod pool;
 pub mod promote;
 pub mod refs;
+pub mod search;
 pub mod shape;
 pub mod spaces;
 pub mod tasks;

@@ -950,6 +950,8 @@ pub fn run() {
         sessions_ipc::sessions_task_move,
         sessions_ipc::sessions_ref_candidates,
         sessions_ipc::sessions_ref_add,
+        sessions_ipc::sessions_search,
+        sessions_ipc::sessions_search_cancel,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,

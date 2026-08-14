@@ -676,3 +676,56 @@ pub struct SessionRefAddedVm {
 pub struct SessionSpacesRestoredVm {
     pub names: Vec<String>,
 }
+
+/// A streamed content search over one zone (FR-267).
+///
+/// The twin of [`crate::notes::vm::NoteSearchReq`] rather than a variation on
+/// it (AD-114): the two scans read different folders — a zone can never be a
+/// vault, since a subfolder that is both is refused at profile validation — so
+/// they are two searches, and a request that pretended otherwise would have to
+/// carry a discriminator the caller does not have.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchReq {
+    pub text: String,
+    pub limit: u32,
+}
+
+/// One batch of streamed zone-search results (FR-267).
+///
+/// The first batch may be empty and `done` is what ends the spinner, so a
+/// search that finds nothing still terminates honestly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchBatch {
+    pub done: bool,
+    pub hits: Vec<SessionSearchHitVm>,
+}
+
+/// One content-search hit inside a session (FR-267).
+///
+/// Carries the session as well as the file because a bare path is not an
+/// answer here: `about.md` names nothing on its own, and the operator's real
+/// question — *which session was that in* — is the part a flat pool of
+/// identically-named files makes hardest to answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchHitVm {
+    /// The session this file belongs to, as [`SessionRowVm::id`] spells it.
+    pub session_id: String,
+    /// That session's title, so the row needs no second lookup.
+    pub session_title: String,
+    /// Session-relative path of the file the hit is in — what the row shows.
+    pub file: String,
+    /// **Profile-relative**, composed in Rust (AD-65) exactly as
+    /// [`SessionSpaceFileVm::subpath`] is. The frontend hands this straight to
+    /// a file target to open the hit and never joins a path itself.
+    pub subpath: String,
+    /// 1-based line number of the hit.
+    pub line: u32,
+    /// The matching line, trimmed for display.
+    pub snippet: String,
+}

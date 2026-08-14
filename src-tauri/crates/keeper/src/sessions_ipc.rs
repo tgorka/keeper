@@ -2393,3 +2393,214 @@ fn add_ref_error(error: keeper_core::sessions::add_ref::AddRefError) -> IpcError
         retriable: false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Search (FR-267)
+// ---------------------------------------------------------------------------
+
+/// Live zone scans, keyed by root — at most one per root, because a second
+/// scan of the same zone is always a newer query for the same field.
+///
+/// Aborting the previous one is the point: notes leaves its superseded scan
+/// running and relies on the client to ignore late batches, which works but
+/// spends a whole zone read on results nobody will ever see. Here the older
+/// task is dropped, and dropping a [`ScanTask`] aborts it.
+#[cfg(desktop)]
+fn scans() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, ScanTask>> {
+    use std::sync::{Mutex, OnceLock};
+    static SCANS: OnceLock<Mutex<std::collections::HashMap<String, ScanTask>>> = OnceLock::new();
+    SCANS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        // A poisoned lock means a scan panicked mid-walk. The map holds join
+        // handles and nothing else, so there is no torn state to protect and
+        // refusing every later search would be the worse failure.
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One running scan. Dropping it aborts the task, which is what makes
+/// supersession free rather than cooperative.
+#[cfg(desktop)]
+struct ScanTask {
+    id: String,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+#[cfg(desktop)]
+impl Drop for ScanTask {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// How many hits accumulate before a batch is flushed to the client.
+///
+/// Small enough that the first results appear while the walk is still going —
+/// which is the whole reason this streams rather than returning a `Vec` — and
+/// large enough that a zone of short files does not become one message per hit.
+#[cfg(desktop)]
+const SEARCH_BATCH: usize = 20;
+
+/// Bounded content scan across one zone, streamed as found (FR-267).
+///
+/// The sessions twin of `notes_search` (AD-114), and a separate command rather
+/// than a flag on that one because the two read different folders: a subfolder
+/// that is both a vault and a zone is refused at profile validation, so no id
+/// can name both and no single scan could serve both.
+///
+/// Returns the scan's id. Any scan already running for this root is aborted
+/// first, so a fast typist funds one walk rather than one per keystroke.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_search(
+    root_id: String,
+    req: keeper_core::sessions::vm::SessionSearchReq,
+    channel: tauri::ipc::Channel<keeper_core::sessions::vm::SessionSearchBatch>,
+) -> Result<String, IpcError> {
+    if !crate::sessions_root::known(&root_id) {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("no such sessions root: {root_id}"),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    let id = crate::sync_ipc::new_ulid();
+    let scan_id = id.clone();
+    let scan_root = root_id.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        run_zone_search(&scan_root, &req.text, req.limit as usize, &channel).await;
+        // Retire self, but only if a newer scan has not already taken the slot
+        // — otherwise a finishing scan would abort its own successor on drop.
+        let mut live = scans();
+        if live.get(&scan_root).is_some_and(|held| held.id == scan_id) {
+            // The task is finished, so this drop aborts nothing.
+            live.remove(&scan_root);
+        }
+    });
+    // Inserting replaces — and dropping the replaced value aborts it.
+    scans().insert(
+        root_id,
+        ScanTask {
+            id: id.clone(),
+            task,
+        },
+    );
+    Ok(id)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_search(
+    root_id: String,
+    req: keeper_core::sessions::vm::SessionSearchReq,
+) -> Result<String, IpcError> {
+    let _ = (root_id, req);
+    Err(unsupported())
+}
+
+/// Stop a scan by id. An id that names nothing — already finished, or already
+/// superseded — is a no-op, so a racing unmount is not an error.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_search_cancel(subscription_id: String) -> Result<(), IpcError> {
+    let mut live = scans();
+    let holder = live
+        .iter()
+        .find(|(_, held)| held.id == subscription_id)
+        .map(|(root, _)| root.clone());
+    if let Some(root) = holder {
+        live.remove(&root);
+    }
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_search_cancel(subscription_id: String) -> Result<(), IpcError> {
+    let _ = subscription_id;
+    Err(unsupported())
+}
+
+/// The walk behind [`sessions_search`]: every session of the zone, newest
+/// first, every markdown file of each, in name order.
+///
+/// Reuses `session_pool` — the same read the spaces evaluator uses — rather
+/// than walking the zone itself, so "the files of a session" has one definition
+/// and a file the board cannot see is a file search cannot find either.
+#[cfg(desktop)]
+async fn run_zone_search(
+    root_id: &str,
+    needle: &str,
+    limit: usize,
+    channel: &tauri::ipc::Channel<keeper_core::sessions::vm::SessionSearchBatch>,
+) {
+    use keeper_core::sessions::search;
+    use keeper_core::sessions::vm::SessionSearchBatch;
+
+    if !search::searchable(needle) {
+        let _ = channel.send(SessionSearchBatch {
+            done: true,
+            hits: Vec::new(),
+        });
+        return;
+    }
+    let Some(rows) = crate::sessions_root::rows(root_id) else {
+        // Cold zone: the scan has not landed yet. An empty done-batch says "no
+        // results" honestly; the client re-searches when the changed event
+        // lands, exactly as every other sessions surface does.
+        let _ = channel.send(SessionSearchBatch {
+            done: true,
+            hits: Vec::new(),
+        });
+        return;
+    };
+    let Some(zone) = crate::sessions_root::subfolder_of(root_id) else {
+        let _ = channel.send(SessionSearchBatch {
+            done: true,
+            hits: Vec::new(),
+        });
+        return;
+    };
+    let mut scan = search::Scan::new(limit);
+    for row in rows.iter() {
+        if scan.exhausted() {
+            break;
+        }
+        let Some(pool) = crate::sessions_root::session_pool(root_id, &row.id) else {
+            continue;
+        };
+        // `<zone>/<session path>` — the same prefix every other session row's
+        // `subpath` is built from, so a hit opens through the one file target.
+        let prefix = format!("{zone}/{}", pool.path);
+        let session = search::Session {
+            id: &row.id,
+            title: &row.title,
+            prefix: &prefix,
+        };
+        for (rel, text, _mtime) in &pool.files {
+            scan.push_file(session, rel, text, needle);
+            if scan.exhausted() {
+                break;
+            }
+        }
+        if scan.pending() >= SEARCH_BATCH
+            && channel
+                .send(SessionSearchBatch {
+                    done: false,
+                    hits: scan.take(),
+                })
+                .is_err()
+        {
+            // The client is gone. Nothing left to send it to.
+            return;
+        }
+        // One session's worth of blocking reads, then yield: a zone of forty
+        // sessions must not starve the runtime it shares with the editor.
+        tokio::task::yield_now().await;
+    }
+    let _ = channel.send(SessionSearchBatch {
+        done: true,
+        hits: scan.take(),
+    });
+}

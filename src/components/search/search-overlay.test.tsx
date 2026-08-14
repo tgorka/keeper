@@ -2,17 +2,24 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm, InboxRoomVm, IpcError, SearchHitVm } from "@/lib/ipc/client";
 
-// Mock the typed IPC client so the overlay never touches Tauri.
+// Mock the typed IPC client so the overlay never touches Tauri. The two
+// document searches (FR-267) resolve to nothing here: what this file tests is
+// the surface and its source switcher, and each document panel has its own.
 const searchArchive = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   searchArchive: (filter: unknown) => searchArchive(filter),
+  notesSearch: () => Promise.resolve(undefined),
+  sessionsSearch: () => Promise.resolve("scan-1"),
+  sessionsSearchCancel: () => Promise.resolve(undefined),
 }));
 
 import { SearchOverlay } from "@/components/search/search-overlay";
 import { accountsStore } from "@/lib/stores/accounts";
 import { networksStore } from "@/lib/stores/networks";
+import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { roomsStore } from "@/lib/stores/rooms";
 import { searchStore } from "@/lib/stores/search";
+import { sessionsRootsStore } from "@/lib/stores/sessions-roots";
 
 function room(p: Pick<InboxRoomVm, "accountId" | "roomId"> & Partial<InboxRoomVm>): InboxRoomVm {
   return {
@@ -55,14 +62,16 @@ function hit(
 beforeEach(() => {
   searchArchive.mockReset();
   searchArchive.mockResolvedValue([]);
-  searchStore.setState({ isOpen: true, scope: "global" });
+  searchStore.setState({ isOpen: true, scope: "global", source: "messages" });
   roomsStore.setState({ rooms: [], selected: null, focusEvent: null });
   accountsStore.setState({ accounts: [] });
   networksStore.setState({ networks: [] });
+  notesVaultsStore.setState({ activeVaultId: null });
+  sessionsRootsStore.setState({ activeRootId: null });
 });
 
 afterEach(() => {
-  searchStore.setState({ isOpen: false, scope: "global" });
+  searchStore.setState({ isOpen: false, scope: "global", source: "messages" });
   vi.clearAllMocks();
 });
 
@@ -230,5 +239,47 @@ describe("SearchOverlay", () => {
     await type("   ");
     await new Promise((r) => setTimeout(r, 250));
     expect(searchArchive).not.toHaveBeenCalled();
+  });
+
+  // FR-267: three sources on one surface, so the operator does not have to know
+  // where the sentence they remember was written before they can look for it.
+  describe("source switcher", () => {
+    it("switches to the notes body and back", () => {
+      notesVaultsStore.setState({ activeVaultId: "v1" });
+      render(<SearchOverlay />);
+      expect(screen.getByText("Searching your local archive")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("tab", { name: "Notes" }));
+      expect(searchStore.getState().source).toBe("notes");
+      // The messages body is gone — its header is the tell — and the notes
+      // field is what took its place.
+      expect(screen.queryByText("Searching your local archive")).not.toBeInTheDocument();
+      expect(screen.getByPlaceholderText("Search notes")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("tab", { name: "Messages" }));
+      expect(screen.getByText("Searching your local archive")).toBeInTheDocument();
+    });
+
+    it("opens on the source the store was given", () => {
+      sessionsRootsStore.setState({ activeRootId: "r1" });
+      searchStore.setState({ isOpen: true, scope: "global", source: "sessions" });
+      render(<SearchOverlay />);
+      expect(screen.getByPlaceholderText("Search sessions")).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "Sessions" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    });
+
+    it("shows no switcher in chat scope — the lock is the point of that surface", () => {
+      roomsStore.setState({
+        rooms: [room({ accountId: "a1", roomId: "!r1:x", displayName: "Design" })],
+        selected: { accountId: "a1", roomId: "!r1:x" },
+      });
+      searchStore.setState({ isOpen: true, scope: "chat", source: "messages" });
+      render(<SearchOverlay />);
+      expect(screen.queryByRole("tablist", { name: "Search source" })).not.toBeInTheDocument();
+      expect(screen.getByText("Searching your local archive")).toBeInTheDocument();
+    });
   });
 });

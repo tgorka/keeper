@@ -288,6 +288,19 @@ pub fn zone_of(root_id: &str) -> Option<PathBuf> {
     registry().get(root_id).map(|slot| slot.root.root.clone())
 }
 
+/// One root's zone **subfolder** — the profile-relative prefix every session
+/// path is composed against (AD-65).
+///
+/// The registry's own copy, taken from the same `SessionsConfig::subfolder` the
+/// commands read off the profile, so the two cannot disagree. It exists for the
+/// callers that have a root id and no `AppState` to reach a profile through — a
+/// spawned scan, for instance, which outlives the command that started it.
+pub fn subfolder_of(root_id: &str) -> Option<String> {
+    registry()
+        .get(root_id)
+        .map(|slot| slot.root.subfolder.clone())
+}
+
 /// One row by session id, from the last scan.
 pub fn row_of(root_id: &str, session_id: &str) -> Option<SessionRowVm> {
     registry()

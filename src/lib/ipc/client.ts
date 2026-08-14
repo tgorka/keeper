@@ -220,6 +220,9 @@ export type { SessionReferenceVm } from "./gen/SessionReferenceVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
 export type { SessionRowVm } from "./gen/SessionRowVm";
+export type { SessionSearchBatch } from "./gen/SessionSearchBatch";
+export type { SessionSearchHitVm } from "./gen/SessionSearchHitVm";
+export type { SessionSearchReq } from "./gen/SessionSearchReq";
 export type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
 export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
 export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
@@ -366,6 +369,8 @@ import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
+import type { SessionSearchBatch } from "./gen/SessionSearchBatch";
+import type { SessionSearchReq } from "./gen/SessionSearchReq";
 import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
 import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
@@ -5037,6 +5042,50 @@ export async function sessionsRefAdd(
   req: SessionRefAddReq,
 ): Promise<SessionRefAddedVm> {
   return await invoke<SessionRefAddedVm>("sessions_ref_add", { rootId, sessionId, req });
+}
+
+/**
+ * Run a content scan over every session in one zone, streaming hits as they are
+ * found (FR-267), and resolve with the subscription id.
+ *
+ * The twin of {@link notesSearch} rather than a widening of it, because a zone
+ * can never be a vault: a subfolder flagged as both is refused at profile
+ * validation, so `notes_search` cannot reach a session file whatever id it is
+ * handed. Two searches, one matcher — the folding is
+ * `keeper_core::notes::search::find`'s in both.
+ *
+ * A hit names its session as well as its file, because `about.md` names nothing
+ * on its own when every session has one.
+ *
+ * Starting a scan **cancels** the previous one for the same root: a second scan
+ * of one zone is always a newer query for the same field. Batches already in
+ * flight can still land, so a caller that keys on the query must still drop
+ * stale ones.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsSearch(
+  rootId: string,
+  req: SessionSearchReq,
+  onBatch: (batch: SessionSearchBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<SessionSearchBatch>("sessions_search", onBatch, {
+    rootId,
+    req,
+  });
+}
+
+/**
+ * Stop a running zone scan (FR-267).
+ *
+ * Idempotent: a scan that already finished, or one that was superseded by a
+ * newer query, is not an error to cancel — the caller unmounting has no way to
+ * know which of those happened and should not have to.
+ *
+ * Rejects with: `unsupported` (mobile).
+ */
+export async function sessionsSearchCancel(subscriptionId: string): Promise<void> {
+  await invoke<void>("sessions_search_cancel", { subscriptionId });
 }
 
 /**
