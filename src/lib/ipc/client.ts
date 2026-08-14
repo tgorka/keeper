@@ -221,6 +221,7 @@ export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
 export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+export type { SessionTaskVm } from "./gen/SessionTaskVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
@@ -5093,6 +5094,36 @@ export async function sessionsFileDelete(
   rel: string,
 ): Promise<void> {
   await invoke<null>("sessions_file_delete", { rootId, sessionId, rel });
+}
+
+/**
+ * Move one task card to a column and a position in it (FR-263).
+ *
+ * `rel` is the card's session-relative path, as it arrives on
+ * {@link SessionTaskVm}. `status` is one of the four the board's columns are
+ * named for; `index` is the position among the cards **already in that column
+ * with this card removed**, so `0` is the top and the column's length is the
+ * bottom.
+ *
+ * The move is two frontmatter keys on one file — `status:` and `order:` — each
+ * written so every other byte survives. Nothing else is told a card moved, which
+ * is why a board is safe to render anywhere the same files are visible.
+ *
+ * The column is re-read in Rust before the write, so the index is resolved
+ * against what is on disk now rather than against the board as it was rendered:
+ * a session an agent has been writing to is the ordinary case, not the edge one.
+ *
+ * Rejects with: `internal` (unknown root or session, an unknown status, a card
+ * that has since been moved or deleted, a refused path), `unsupported`.
+ */
+export async function sessionsTaskMove(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+  status: string,
+  index: number,
+): Promise<void> {
+  await invoke<null>("sessions_task_move", { rootId, sessionId, rel, status, index });
 }
 
 /**

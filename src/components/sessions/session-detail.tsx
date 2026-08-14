@@ -30,6 +30,7 @@
  */
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { SessionBoard } from "@/components/sessions/session-board";
 import { SessionFileActions } from "@/components/sessions/session-file-actions";
 import { SESSION_REFS_HEADING, SessionRefs } from "@/components/sessions/session-refs";
 import { SessionSpaces } from "@/components/sessions/session-spaces";
@@ -419,6 +420,30 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             selections={spaceFiles}
             onChanged={() => setReload((n) => n + 1)}
           />
+
+          {/* The board (FR-263) — after the spaces, because a space is the
+              question "which files are tasks?" and the board is what those files
+              say about themselves. Rendered for a flat session only: a
+              folder-shaped one has no pool to tag, so its board would be four
+              empty columns saying nothing true. */}
+          {detail.shape === "flat" && (
+            <SessionBoard
+              rootId={rootId}
+              sessionId={sessionId}
+              tasks={detail.tasks}
+              // A card knows its session-relative path; the path that OPENS it
+              // is the `subpath` Rust composed for the same file in the tree
+              // (AD-65). Looked up rather than joined, so there is still exactly
+              // one place in the app that knows how a zone path is built.
+              onOpen={(relPath) => {
+                const entry = tree?.entries.find((candidate) => candidate.relPath === relPath);
+                if (entry !== undefined) {
+                  openFile(entry);
+                }
+              }}
+              onChanged={() => setReload((n) => n + 1)}
+            />
+          )}
 
           {/* What the session points at (FR-255) — after the files, because it
               is the same question asked the other way: what it holds, then what

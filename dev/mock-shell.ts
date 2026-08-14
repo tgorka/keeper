@@ -993,6 +993,41 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     }
     return null;
   },
+  // The move Rust makes by writing two frontmatter keys, faked by mutating the
+  // fixture the detail answers from — so a drag in `bun dev` lands where it was
+  // dropped and stays there across the re-read the board does afterwards. The
+  // numbering is the real `drop_order`'s: midpoint between neighbours, a whole
+  // step past the ends, and 1 (never 0) into an empty column, because 0 is what
+  // a file with no `order:` reads as.
+  sessions_task_move: (payload) => {
+    const rel = String(payload.rel ?? "");
+    const status = String(payload.status ?? "");
+    const index = Number(payload.index ?? 0);
+    const card = SESSION_TASKS.find((task) => task.relPath === rel);
+    if (card === undefined) {
+      return null;
+    }
+    const column = SESSION_TASKS.filter(
+      (task) => task.status === status && task.relPath !== rel,
+    ).sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+    const at = Math.min(Math.max(index, 0), column.length);
+    const before = at > 0 ? column[at - 1]?.order : undefined;
+    const after = column[at]?.order;
+    card.status = status;
+    card.order =
+      before === undefined && after === undefined
+        ? 1
+        : before === undefined
+          ? (after as number) - 1
+          : after === undefined
+            ? before + 1
+            : before + (after - before) / 2;
+    // A card keeper has now written an `order:` into owns that number, whatever
+    // it read as before — which is the one thing the real write changes about
+    // how the card renders.
+    card.orderIsOwn = true;
+    return null;
+  },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
     if (row === undefined) {

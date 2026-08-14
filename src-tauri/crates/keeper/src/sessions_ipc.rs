@@ -1831,6 +1831,129 @@ pub async fn sessions_file_delete(
     Ok(())
 }
 
+/// Move one task card: which column it lands in, and where in that column.
+///
+/// `status` is one of the four the closed [`TaskStatus`] set names, and `index`
+/// is the position among the cards **already in that column, with the moved card
+/// removed** — `0` is the top, past the end is the bottom. The frontend sends
+/// the index it rendered rather than two neighbour ids, because the column it is
+/// looking at is the column the operator dropped into; resolving that to a
+/// number is [`keeper_core::sessions::tasks::compile_move`]'s job (AD-65).
+///
+/// **The column is re-read here, not trusted from the drag.** A board that has
+/// been open for ten minutes is a board an agent has had ten minutes to write
+/// tasks into, and placing a card between two neighbours that have since moved
+/// is how a drop lands somewhere nobody chose. The read is the same
+/// [`crate::sessions_root::session_pool`] scan the spaces list already does.
+///
+/// Rejects with: `internal` (unknown root or session, an unknown status, a card
+/// that is not in the pool, a refused path, a failed write), `unsupported`
+/// (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_task_move(
+    root_id: String,
+    session_id: String,
+    rel: String,
+    status: String,
+    index: u32,
+) -> Result<(), IpcError> {
+    use keeper_core::sessions::pool::{read_pool, PoolFile};
+    use keeper_core::sessions::shape::TaskStatus;
+    use keeper_core::sessions::tasks::{self, TaskFile};
+
+    let status = TaskStatus::parse(&status).ok_or_else(|| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "{status} is not one of this board's columns. A card's status is one of \
+             in-preparation, todo, done or deferred — a fifth column would be a column no \
+             session can show."
+        ),
+        account_id: None,
+        retriable: false,
+    })?;
+
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let pool_read =
+        crate::sessions_root::session_pool(&root_id, &session_id).ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("no such session: {session_id}"),
+            account_id: None,
+            retriable: false,
+        })?;
+    let pool = read_pool(
+        &pool_read
+            .files
+            .iter()
+            .map(|(rel, text, _)| PoolFile { rel, text })
+            .collect::<Vec<_>>(),
+    );
+
+    // The moved card's own bytes, from the same read: the write splices against
+    // what is on disk now, and a text the frontend still held would silently
+    // revert whatever was edited in the meantime (FR-121 is about preserving
+    // bytes, which means the *current* ones).
+    let text = pool_read
+        .files
+        .iter()
+        .find(|(candidate, _, _)| *candidate == rel)
+        .map(|(_, text, _)| text.as_str())
+        .ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "{rel} is not in this session any more — someone moved or deleted it while the \
+                 board was open. Reopen the session to see where its cards are now."
+            ),
+            account_id: None,
+            retriable: false,
+        })?;
+
+    // The target column as it stands, in rendered order, without the card being
+    // moved — which is exactly what `compile_move` documents as its `column`.
+    let column: Vec<TaskFile<'_>> = pool
+        .tasks
+        .iter()
+        .filter(|entry| entry.status == Some(status) && entry.rel != rel)
+        .map(|entry| TaskFile {
+            rel: &entry.rel,
+            text: pool_read
+                .files
+                .iter()
+                .find(|(candidate, _, _)| *candidate == entry.rel)
+                .map_or("", |(_, text, _)| text.as_str()),
+            order: entry.order.value,
+        })
+        .collect();
+
+    let compiled =
+        tasks::compile_move(&pool_read.path, &rel, text, status, &column, index as usize)
+            .map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("task-move task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_task_move(
+    root_id: String,
+    session_id: String,
+    rel: String,
+    status: String,
+    index: u32,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, rel, status, index);
+    Err(unsupported())
+}
+
 #[cfg(not(desktop))]
 #[tauri::command]
 pub fn sessions_file_new(

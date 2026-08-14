@@ -947,6 +947,7 @@ pub fn run() {
         sessions_ipc::sessions_file_new,
         sessions_ipc::sessions_file_new_kind,
         sessions_ipc::sessions_file_delete,
+        sessions_ipc::sessions_task_move,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,

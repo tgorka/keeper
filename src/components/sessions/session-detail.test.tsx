@@ -36,6 +36,9 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsFileNewKind: vi.fn(),
   sessionsFileDelete: vi.fn(),
   sessionsLogToday: vi.fn(),
+  // And the board's one write (FR-263), imported transitively through
+  // SessionBoard.
+  sessionsTaskMove: vi.fn(),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
