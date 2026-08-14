@@ -27,7 +27,7 @@
 //! and the timestamp, because the domain has no clock (AD-56) — and because a
 //! resumed journal must replay the stamp it recorded rather than a fresh one.
 
-use super::shape::{ABOUT, AGENTS};
+use super::shape::{KindTag, ABOUT, AGENTS};
 
 /// One file of the template, ready to write.
 ///
@@ -39,6 +39,14 @@ pub struct TemplateFile {
     /// Session-relative name. Flat, so never contains a `/`.
     pub name: String,
     pub content: String,
+    /// What this file *is*, when it is one of the five kinds.
+    ///
+    /// Carried beside the bytes because a seed's filename is stamped
+    /// (`YYYY-MM-DD-HHMM-opened.md`), so a caller deciding "does the pattern
+    /// already supply a log" cannot ask the name — two seeds written a minute
+    /// apart have different names and identical meaning. The kind is the thing
+    /// that must not be duplicated, so the kind is what travels.
+    pub kind: Option<KindTag>,
 }
 
 /// The navigation contract, verbatim.
@@ -226,6 +234,8 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
         TemplateFile {
             name: AGENTS.to_owned(),
             content: AGENTS_MD.to_owned(),
+            // The contract is not one of the five kinds: it describes them.
+            kind: None,
         },
         TemplateFile {
             name: ABOUT.to_owned(),
@@ -237,6 +247,7 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 frontmatter(ids[0], date, "about"),
                 about_body(title, date)
             ),
+            kind: Some(KindTag::About),
         },
         TemplateFile {
             name: format!("{stamp}-opened.md"),
@@ -245,6 +256,7 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 frontmatter(ids[1], date, "log"),
                 seed_log_body(title)
             ),
+            kind: Some(KindTag::Log),
         },
         TemplateFile {
             name: format!("{stamp}-handoff.md"),
@@ -253,6 +265,45 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 frontmatter(ids[2], date, "prompt"),
                 SEED_PROMPT_BODY
             ),
+            kind: Some(KindTag::Prompt),
+        },
+    ]
+}
+
+/// What `_template/` gets when the operator adopts keeper's default (FR-268):
+/// the navigation contract and an empty record, and deliberately **not** the
+/// two seed files.
+///
+/// A template is a *skeleton*, and the seeds are not part of the skeleton —
+/// they are examples keeper composes fresh for each new session, with that
+/// session's own title and its own timestamp. Writing them into `_template/`
+/// froze both: every session made from the adopted template inherited a log
+/// saying it was the install's title that had been created, under a filename
+/// stamped with the minute the operator pressed the button, *and* got a second
+/// seed pair composed beside it. Neither is a template's job.
+///
+/// The record ships titled `<session title>` rather than with a real one,
+/// because [`super::plan::skeleton_from`] copies only its `## ` headings into a
+/// new session: the title line exists to be replaced, and saying so in the
+/// placeholder is cheaper than a comment nobody reads. The operator can add
+/// their own seed log or prompt here afterwards — and if they do, create
+/// carries theirs and composes none, which is the same rule this fixes stated
+/// from the other side.
+pub fn zone_skeleton(date: &str, id: &str) -> Vec<TemplateFile> {
+    vec![
+        TemplateFile {
+            name: AGENTS.to_owned(),
+            content: AGENTS_MD.to_owned(),
+            kind: None,
+        },
+        TemplateFile {
+            name: ABOUT.to_owned(),
+            content: format!(
+                "{}{}",
+                frontmatter(id, date, "about"),
+                about_body("<session title>", date)
+            ),
+            kind: Some(KindTag::About),
         },
     ]
 }
@@ -451,6 +502,79 @@ mod tests {
             assert!(
                 AGENTS_MD.contains(&format!("`{kind}`")),
                 "AGENTS.md must name the {kind} kind"
+            );
+        }
+    }
+
+    /// Found by driving the real UI: pressing "Write keeper's template into
+    /// this zone" wrote the two seed files into `_template/`, so every session
+    /// created from the adopted template inherited a log reading "Session **New
+    /// session** created" — the install-time title, frozen — under a filename
+    /// stamped with the minute the button was pressed.
+    ///
+    /// A template is a skeleton. The seeds are examples keeper composes per
+    /// create, with that session's own title; they are not part of it.
+    #[test]
+    fn the_zone_skeleton_carries_no_seed_files_to_freeze() {
+        let files = zone_skeleton("2026-08-14", "01J8A");
+        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, vec![AGENTS, ABOUT]);
+
+        // Nothing here is stamped with an install-time minute, and nothing
+        // states a title that a later session would inherit as its own.
+        for file in &files {
+            assert!(
+                !file.name.contains("-opened.md") && !file.name.contains("-handoff.md"),
+                "{} is a seed and must not live in _template/",
+                file.name
+            );
+            assert!(
+                !file.content.contains("created. Nothing has happened yet"),
+                "{} freezes a title into the template",
+                file.name
+            );
+        }
+
+        // Still a flat session by its own top-level names, so a create from it
+        // takes the flat path — a skeleton that read as folder-shaped would be
+        // a worse bug than the one this fixes.
+        let top: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
+        assert_eq!(shape(&top), Shape::Flat);
+    }
+
+    /// The other half of the same defect: the create path deduped what the
+    /// pattern already supplies **by filename**, and a seed's filename carries
+    /// a `YYYY-MM-DD-HHMM` stamp — so a template holding a log and keeper
+    /// composing one produced two different names for the same kind and the
+    /// test never fired. The kind is what may not be duplicated.
+    #[test]
+    fn a_seed_is_identified_by_its_kind_not_its_stamped_name() {
+        let monday = default_template("A", "2026-08-10", "2026-08-10-0900", ["1", "2", "3"]);
+        let friday = default_template("B", "2026-08-14", "2026-08-14-1700", ["4", "5", "6"]);
+
+        let log_of = |files: &[TemplateFile]| {
+            files
+                .iter()
+                .find(|file| file.kind == Some(KindTag::Log))
+                .expect("the default template ships a seed log")
+                .name
+                .clone()
+        };
+        // Same kind, different names — which is exactly why a name comparison
+        // could not see the duplicate.
+        assert_ne!(log_of(&monday), log_of(&friday));
+
+        // Every file declares what it is, and the kinds are the ones the pool
+        // reader would derive from the frontmatter each file actually carries.
+        for file in &friday {
+            let derived = {
+                let (fm, _) = Frontmatter::parse(&file.content);
+                KindTag::of(&note_tags(&fm, &file.content))
+            };
+            assert_eq!(
+                file.kind, derived,
+                "{}'s declared kind must match the tag in its own bytes",
+                file.name
             );
         }
     }

@@ -929,6 +929,18 @@ pub async fn sessions_create(
     if flat {
         let carried: std::collections::BTreeSet<&str> =
             copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        // What the pattern already supplies, by KIND — not by filename. A seed
+        // is named `YYYY-MM-DD-HHMM-opened.md`, so a template holding one and
+        // keeper composing another produce two different names for the same
+        // thing and a filename test never fires: the session lands with two
+        // "Opened" logs, one of them stamped with a minute that has nothing to
+        // do with it. The kind is what may not be duplicated, so the kind is
+        // what is compared.
+        let carried_kinds: std::collections::BTreeSet<keeper_core::sessions::shape::KindTag> =
+            copies
+                .iter()
+                .filter_map(|(rel, _)| kinds.get(rel).copied())
+                .collect();
         let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
         let seeds = template::default_template(
             &title,
@@ -940,6 +952,7 @@ pub async fn sessions_create(
             let is_contract = file.name == keeper_core::sessions::shape::AGENTS;
             if file.name == keeper_core::sessions::shape::ABOUT
                 || carried.contains(file.name.as_str())
+                || file.kind.is_some_and(|kind| carried_kinds.contains(&kind))
                 || (!is_contract && source.is_some())
             {
                 continue;
@@ -1798,18 +1811,13 @@ pub async fn sessions_template_install(
     };
 
     let date = today();
-    let stamp = format!("{date}-{}", now_hhmm());
-    let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
-    let title = {
-        let trimmed = title.trim();
-        if trimmed.is_empty() {
-            "Session".to_owned()
-        } else {
-            trimmed.to_owned()
-        }
-    };
-    let files =
-        template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
+    // The skeleton, not a rendered session: `_template/` gets the contract and
+    // an empty record, and keeper composes the seed log and seed prompt fresh
+    // per create. `title` is accepted and ignored — a template has no title to
+    // freeze, and the parameter stays so the IPC shape is unchanged for the
+    // named-template path that may yet want it.
+    let _ = title;
+    let files = template::zone_skeleton(&date, &crate::sync_ipc::new_ulid());
     // What is already there decides trash-then-write versus plain write, and
     // reading it is the shell's job — the domain opens nothing (AD-108).
     let present: Vec<String> = std::fs::read_dir(zone.join(&dest))

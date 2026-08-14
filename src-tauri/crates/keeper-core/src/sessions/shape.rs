@@ -98,7 +98,7 @@ pub fn shape(top_level: &[String]) -> Shape {
 /// board could not name its own columns. A file may of course carry any other
 /// tags it likes — they are ordinary tags and the query language reaches them;
 /// what is closed is the set of kinds keeper itself surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KindTag {
     /// The session's record — one per session, normally.
     About,
