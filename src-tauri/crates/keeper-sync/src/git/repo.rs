@@ -786,8 +786,11 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// passes with nothing else syncing.
 ///
 /// That is the failure NFR-24 and FR-89 exist to forbid: convergence must not
-/// wait on a human. So a failing status is not the answer here, it is the
-/// question. [`unreadable_tracked_paths`] finds which paths cannot be read, and
+/// wait on a human. And it is not an inherent property of the operation: given
+/// the same unreadable tracked file, plain `git status` reports it as modified
+/// and carries on. keeper was strictly less robust than the tool it wraps, on a
+/// file git itself shrugs at. So a failing status is not the answer here, it is
+/// the question. [`unreadable_tracked_paths`] finds which paths cannot be read, and
 /// the walk is repeated with those excluded by pathspec, which gitoxide honours
 /// before it ever opens them. The result describes the rest of the folder
 /// truthfully and names what it had to step over in [`RepoStatus::unreadable`],

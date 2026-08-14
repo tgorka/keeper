@@ -2323,6 +2323,26 @@ impl Engine {
                 return Ok(durability);
             }
         };
+        // A path the walk had to step over is a path whose state nobody knows,
+        // and "unknown" must never round up to "safe" on this surface: the
+        // whole question being asked is whether a recording is already durable,
+        // and a wrong yes is the answer that loses one. The status succeeded,
+        // which is exactly why this has to be checked — before the fix that let
+        // it succeed, the failing branch above caught this case for free.
+        if status
+            .unreadable
+            .iter()
+            .any(|item| item.path.as_path() == rela)
+        {
+            tracing::warn!(
+                profile = profile.name,
+                path = %rela.display(),
+                "this file could not be read, so the recording's durability is unknown; \
+                 the last known state stands"
+            );
+            return Ok(durability);
+        }
+
         // A path in `HEAD` that the status walk also names has moved since the
         // commit — staged again, edited again, or deleted — so the commit no
         // longer describes what is on the drive.
