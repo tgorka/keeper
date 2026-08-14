@@ -436,6 +436,14 @@ fn capture(
     args: &[String],
     credential: Option<&Credential>,
 ) -> Result<Output> {
+    // Prepended rather than passed through: `-c` only counts before the
+    // subcommand, and hardening a call site can forget is not hardening.
+    let args: Vec<String> = repository_config_args(cwd)
+        .into_iter()
+        .chain(args.iter().cloned())
+        .collect();
+    let args = args.as_slice();
+
     let mut command = Command::new(program);
     if let Some(credential) = credential {
         // Read back only by `CREDENTIAL_HELPER`, which git spawns as a child of
@@ -498,6 +506,57 @@ fn capture(
 /// Leaving those in place is what lets a push authenticate as an unrelated
 /// account that happens to be stored for the same host, which fails per
 /// repository depending on that account's access and never says why.
+/// A `core.hooksPath` that can never be a directory, so git finds no hook to
+/// run and says nothing about it.
+///
+/// `/dev/null` is a character device, so every lookup below it fails with
+/// `ENOTDIR` rather than merely being absent — which matters, because an
+/// *absent* path is one a user or another process could later create, and this
+/// value ends up on the command line of a process that writes to their
+/// repository. The Windows spelling of the same trick is the `NUL` device.
+#[cfg(not(windows))]
+const NO_HOOKS_PATH: &str = "/dev/null/keeper-runs-no-repository-hooks";
+#[cfg(windows)]
+const NO_HOOKS_PATH: &str = r"NUL\keeper-runs-no-repository-hooks";
+
+/// The `-c` settings every invocation *inside a repository* carries.
+///
+/// # Repository hooks are never run
+///
+/// keeper commits, merges and checks out through gitoxide, which has no hook
+/// support at all — so for the whole write half of the engine the user's hooks
+/// have never run. The four things the shim exists for (AD-41) are the only
+/// operations that could still fire one, and firing one there would make the
+/// engine's behaviour depend on which half of itself did the work.
+///
+/// The failure that made this load-bearing is not hypothetical. A `git lfs
+/// install` run by hand inside a synced folder writes stock `pre-push`,
+/// `post-checkout`, `post-commit` and `post-merge` hooks, and every one of them
+/// begins by refusing to run unless `git-lfs` is on `PATH`. keeper *is* the LFS
+/// implementation for a folder it manages — it registers its own
+/// `filter.lfs.clean`/`smudge`, uploads through its own journal and prunes
+/// local objects it has already replicated — so those hooks are wrong even when
+/// git-lfs is installed: `git lfs pre-push` walks a store keeper has
+/// deliberately emptied. On a desktop launch, where `PATH` is Finder's rather
+/// than a shell's, they simply made every push fail with a message about a
+/// binary keeper never needed.
+///
+/// A user's own hooks are silenced too, and that is the intended reading: an
+/// unattended engine converging a folder in the background is not the event a
+/// `pre-push` was written to gate. Nothing keeper does depends on a hook, so
+/// there is no case in which running one is required and every case in which
+/// running one is a surprise.
+///
+/// `cwd` gates this because it is exactly the "are we in a repository" question:
+/// [`version_detail`] probes a binary with no repository in sight, and a `-c`
+/// on that call would only make the diagnostic vector harder to read.
+fn repository_config_args(cwd: Option<&Path>) -> Vec<String> {
+    if cwd.is_none() {
+        return Vec::new();
+    }
+    vec!["-c".to_owned(), format!("core.hooksPath={NO_HOOKS_PATH}")]
+}
+
 fn credential_config_args(credential: Option<&Credential>) -> Vec<String> {
     let mut args = vec!["-c".to_owned(), "credential.helper=".to_owned()];
     if credential.is_some() {
@@ -1049,6 +1108,29 @@ mod tests {
         );
         assert_eq!(args.len(), 4);
         assert!(args[3].starts_with("credential.helper=!"));
+    }
+
+    #[test]
+    fn a_repository_invocation_always_disables_hooks() {
+        // A `git lfs install` run by hand in a synced folder leaves hooks that
+        // refuse to run without git-lfs on PATH, which is how a desktop launch
+        // lost every push. Nothing keeper does needs a hook, so none run.
+        let args = repository_config_args(Some(Path::new("/w/folder")));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        assert!(
+            args[1].starts_with("core.hooksPath="),
+            "the hook path must be overridden, got {}",
+            args[1]
+        );
+        assert!(
+            !Path::new(args[1].trim_start_matches("core.hooksPath=")).is_dir(),
+            "the sentinel must not be a directory anything could put a hook in"
+        );
+
+        // Probing a binary is not repository work, and a `-c` there would only
+        // clutter the one diagnostic that gets read by a human.
+        assert!(repository_config_args(None).is_empty());
     }
 
     #[test]

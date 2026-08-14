@@ -88,7 +88,12 @@ pub enum SyncError {
     /// A path cannot be represented on the remote or on a peer's filesystem
     /// (reserved name, illegal character, too long). This is one of the few
     /// conditions that genuinely requires a human: the user must rename.
-    #[error("path cannot be synchronized: {reason}")]
+    /// The message names the path because the surfaces that show this one only
+    /// ever render `to_string()`: `record_failure` copies it into the profile's
+    /// warning verbatim, and a "path cannot be synchronized" with no path is a
+    /// sentence a user can do nothing with. The path is theirs already — they
+    /// named the file — so it carries no secret the taxonomy forbids.
+    #[error("{} cannot be synchronized: {reason}", .path.display())]
     InvalidPathForRemote { path: PathBuf, reason: String },
 
     /// The profile's volume is not mounted. **Not a failure** — AD-48's whole
@@ -353,6 +358,22 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), codes.len(), "duplicate error code");
+    }
+
+    #[test]
+    fn an_unsynchronizable_path_is_named_by_its_message() {
+        // `record_failure` puts `to_string()` into the profile's warning and
+        // nothing downstream destructures the variant, so a path missing from
+        // the message is a path the user never learns.
+        let err = SyncError::InvalidPathForRemote {
+            path: PathBuf::from("20-records/pipe.fifo"),
+            reason: "only regular files and symlinks can be synchronized".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("20-records/pipe.fifo"),
+            "got: {err}"
+        );
+        assert!(err.needs_user_action());
     }
 
     #[test]

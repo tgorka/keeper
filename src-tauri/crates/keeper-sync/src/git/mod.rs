@@ -48,5 +48,5 @@ pub use cli::{GitCapabilities, GitCli};
 pub use commit::StagedChange;
 pub use conflict::{ChangeKind, Resolution, Side};
 pub use fetch::{Credential, FetchOptions, FetchOutcome, TransferProgress};
-pub use repo::RepoStatus;
+pub use repo::{RepoStatus, UnreadablePath};
 pub use resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};

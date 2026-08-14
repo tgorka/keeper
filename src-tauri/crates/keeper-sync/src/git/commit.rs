@@ -152,9 +152,12 @@ pub fn stage_and_commit(
     // An owned copy of the index: `index_or_empty` hands out a shared snapshot,
     // and for a repository that has never been staged it still carries the path
     // the index has to be written to.
-    let shared = repo
-        .index_or_empty()
-        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let shared = repo.index_or_empty().map_err(|err| {
+        SyncError::Git(format!(
+            "could not read the index: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
     let mut index: gix::index::File = (**shared).clone();
     // Lookups are a binary search, so they are only valid over the region that
     // was sorted when we started. Everything pushed below lands after it.
@@ -215,7 +218,13 @@ pub fn stage_and_commit(
 
         let oid = repo
             .write_blob(&content)
-            .map_err(|err| SyncError::Git(format!("could not write {}: {err}", rela.display())))?
+            .map_err(|err| {
+                SyncError::Git(format!(
+                    "could not write {}: {}",
+                    rela.display(),
+                    super::fetch::flatten(&err)
+                ))
+            })?
             .detach();
         // A pre-epoch timestamp is the only way this fails; an all-zero stat
         // just makes the entry racily clean, so the next status re-reads it.
@@ -269,16 +278,31 @@ pub fn stage_and_commit(
     // NFR-24 asks for. The reverse order could lose the staging entirely.
     index
         .write(gix::index::write::Options::default())
-        .map_err(|err| SyncError::Git(format!("could not write the index: {err}")))?;
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not write the index: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?;
 
     let tree_id = write_tree_from_index(repo, &index)?;
     let parent = super::repo::head_commit_id(repo)?;
     let parent_tree = match parent {
         Some(id) => Some(
             repo.find_commit(id)
-                .map_err(|err| SyncError::Git(format!("could not read HEAD commit: {err}")))?
+                .map_err(|err| {
+                    SyncError::Git(format!(
+                        "could not read HEAD commit: {}",
+                        super::fetch::flatten(&err)
+                    ))
+                })?
                 .tree_id()
-                .map_err(|err| SyncError::Git(format!("could not read HEAD tree: {err}")))?
+                .map_err(|err| {
+                    SyncError::Git(format!(
+                        "could not read HEAD tree: {}",
+                        super::fetch::flatten(&err)
+                    ))
+                })?
                 .detach(),
         ),
         None => None,
@@ -320,7 +344,7 @@ pub fn stage_and_commit(
 
     let id = repo
         .commit_as(signature, signature, "HEAD", &message, tree_id, parents)
-        .map_err(|err| SyncError::Git(format!("commit failed: {err}")))?
+        .map_err(|err| SyncError::Git(format!("commit failed: {}", super::fetch::flatten(&err))))?
         .detach();
     Ok(Some(id))
 }
@@ -553,7 +577,12 @@ fn write_tree(
     let tree = gix::objs::Tree { entries };
     Ok(repo
         .write_object(&tree)
-        .map_err(|err| SyncError::Git(format!("could not write tree: {err}")))?
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not write tree: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?
         .detach())
 }
 
