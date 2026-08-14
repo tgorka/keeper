@@ -1,0 +1,33 @@
+src-tauri/crates/keeper-sync/src/git/commit.rs
+  s_45b1426f60f163::t_36af384dae985e 347
+  s_45b1426f60f163::t_b4024a01c98587 580-585
+  s_45b1426f60f163::t_5b549994c5b52f 281-286
+  s_45b1426f60f163::t_09b9bac127bda7 155-160
+  s_45b1426f60f163::t_1e83756c67b509 221-227
+  s_45b1426f60f163::t_d7b687d99789fe 293-298,300-305
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_45b1426f60f163::t_09b9bac127bda7 762-764,835-846
+  s_45b1426f60f163::t_e75a2f6c007cf3 461
+  s_45b1426f60f163::t_a8955b08a6db94 743-747,750,758
+  s_45b1426f60f163::t_7f9703cf22e216 1239-1244
+  s_45b1426f60f163::t_0e9c69a13e26ac 74
+src-tauri/crates/keeper-sync/tests/status_names_the_cause.rs
+  s_45b1426f60f163::t_09b9bac127bda7 48-52,64-68
+  s_45b1426f60f163::t_d13c52ab158814 1-47,53-63,69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "590c6704d01be6d7c09b7864573e49e3ba256e33",
+  "prompts": {},
+  "sessions": {
+    "s_45b1426f60f163": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08e999c8-c890-418c-ab79-ca9ea3a5bd7c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
