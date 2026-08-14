@@ -71,7 +71,7 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
         options = options.with(gix::sec::Trust::Full);
     }
     let repo = gix::open_opts(path, options)
-        .map_err(|err| SyncError::Git(format!("open failed: {err}")))?;
+        .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))?;
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
     Ok(repo)
@@ -458,7 +458,7 @@ pub fn clone(
         .main_worktree(gix::progress::Discard, interrupt)
         .map_err(|err| {
             cancelled_or(interrupt, || {
-                SyncError::Git(format!("checkout failed: {err}"))
+                SyncError::Git(format!("checkout failed: {}", super::fetch::flatten(&err)))
             })
         })?;
 
@@ -740,9 +740,14 @@ impl RepoStatus {
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
+    // `flatten`, not `{err}`: a status that trips over one unreadable tracked
+    // file reports "IO error while writing blob or reading file metadata or
+    // changing filetype" in its top frame, and the errno that says *why* —
+    // permission denied, EOF from a file rewritten mid-read — is two `source()`
+    // hops down. gix never names the path, so the cause is all there is.
     let platform = repo
         .status(gix::progress::Discard)
-        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?
+        .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?
         .index_worktree_options_mut(|options| {
             if let Some(dirwalk) = options.dirwalk_options.as_mut() {
                 dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
@@ -750,11 +755,13 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
         });
     let iter = platform
         .into_iter(None)
-        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?;
+        .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
 
     let mut out = RepoStatus::default();
     for item in iter {
-        let item = item.map_err(|err| SyncError::Git(format!("status failed: {err}")))?;
+        let item = item.map_err(|err| {
+            SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
+        })?;
         match item {
             Item::TreeIndex(change) => match change {
                 gix::diff::index::Change::Addition { location, .. } => {
@@ -825,12 +832,18 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
 /// A freshly initialized repository with no commits is an ordinary state, not
 /// an error — every profile starts there.
 pub fn head_commit_id(repo: &gix::Repository) -> Result<Option<gix::hash::ObjectId>> {
-    let mut head = repo
-        .head()
-        .map_err(|err| SyncError::Git(format!("could not read HEAD: {err}")))?;
-    let id = head
-        .try_peel_to_id()
-        .map_err(|err| SyncError::Git(format!("could not peel HEAD: {err}")))?;
+    let mut head = repo.head().map_err(|err| {
+        SyncError::Git(format!(
+            "could not read HEAD: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+    let id = head.try_peel_to_id().map_err(|err| {
+        SyncError::Git(format!(
+            "could not peel HEAD: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
     Ok(id.map(gix::Id::detach))
 }
 
@@ -1223,7 +1236,12 @@ pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<(
     }
     index
         .write(gix::index::write::Options::default())
-        .map_err(|err| SyncError::Git(format!("could not write the index: {err}")))?;
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not write the index: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?;
     Ok(())
 }
 
