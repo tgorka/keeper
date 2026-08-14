@@ -30,6 +30,7 @@
  */
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { SessionAddRef } from "@/components/sessions/session-add-ref";
 import { SessionBoard } from "@/components/sessions/session-board";
 import { SessionFileActions } from "@/components/sessions/session-file-actions";
 import { SESSION_REFS_HEADING, SessionRefs } from "@/components/sessions/session-refs";
@@ -449,9 +450,21 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               is the same question asked the other way: what it holds, then what
               it names. */}
           <section aria-label={SESSION_REFS_HEADING} className="flex flex-col gap-1">
-            <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-              {SESSION_REFS_HEADING}
-            </h3>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                {SESSION_REFS_HEADING}
+              </h3>
+              {/* The verb that grows this list, on the heading of the list it
+                  grows — the Files section's own placement (FR-265). It shares
+                  the reload counter for the same reason: adding a reference
+                  writes a markdown file, so the tree, the spaces and this list
+                  are all a keystroke out of date until they re-read. */}
+              <SessionAddRef
+                rootId={rootId}
+                sessionId={sessionId}
+                onChanged={() => setReload((n) => n + 1)}
+              />
+            </div>
             <SessionRefs
               refs={refs?.refs ?? []}
               missing={refs?.missing ?? 0}

@@ -211,6 +211,10 @@ export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
+export type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
+export type { SessionRefAddReq } from "./gen/SessionRefAddReq";
+export type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
+export type { SessionRefCandidateVm } from "./gen/SessionRefCandidateVm";
 export type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 export type { SessionReferenceVm } from "./gen/SessionReferenceVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
@@ -355,6 +359,9 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
+import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
+import type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
 import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
@@ -4973,6 +4980,63 @@ export async function sessionsRefs(
   sessionId: string,
 ): Promise<SessionReferencesVm> {
   return await invoke<SessionReferencesVm>("sessions_refs", { rootId, sessionId });
+}
+
+/**
+ * Everything the operator could reference from this session (FR-265) — the
+ * write half of {@link sessionsRefs}.
+ *
+ * Three sources in one list: the session's own files first (a reference is most
+ * often to something the sitting just produced), then the vault's notes and
+ * recordings, newest first. Which source a row came from is its `kind`, in the
+ * same words the references list already prints.
+ *
+ * **`query` is filtered in Rust**, not here. The list is budgeted, so filtering
+ * a returned prefix would search the wrong 500 — and `tag:x` is the tag
+ * hierarchy's question, which belongs beside the index that answers it (AD-7).
+ * Pass the operator's raw input; keeper decides what it means.
+ *
+ * `promotable` is the workspace fence's own answer, so an offer to copy into
+ * `artifacts/` never appears on a file keeper would then refuse to copy.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsRefCandidates(
+  rootId: string,
+  sessionId: string,
+  query: string,
+): Promise<SessionRefCandidatesVm> {
+  return await invoke<SessionRefCandidatesVm>("sessions_ref_candidates", {
+    rootId,
+    sessionId,
+    query,
+  });
+}
+
+/**
+ * Write one reference into one of the session's markdown files (FR-265).
+ *
+ * The markdown is composed in Rust, because the syntax a reference is written in
+ * is the syntax {@link sessionsRefs} reads back and a second author of that
+ * contract is how the two drift (AD-65). What comes back is the line as written,
+ * so the confirmation shows what landed rather than what was requested.
+ *
+ * The append is guarded on the target's current bytes: an agent writing the same
+ * file turns into a refusal the operator can retry rather than a lost line.
+ *
+ * `promote: true` on a `workspace/` target copies it into `artifacts/` first and
+ * points the line at the copy — `workspace/` is scratch that the archive verb
+ * empties, so a reference into it is a dangling link with a date on it.
+ *
+ * Rejects with: `internal` (unknown root/session, a refused pick, a target that
+ * is not markdown, a failed write), `unsupported` (mobile).
+ */
+export async function sessionsRefAdd(
+  rootId: string,
+  sessionId: string,
+  req: SessionRefAddReq,
+): Promise<SessionRefAddedVm> {
+  return await invoke<SessionRefAddedVm>("sessions_ref_add", { rootId, sessionId, req });
 }
 
 /**

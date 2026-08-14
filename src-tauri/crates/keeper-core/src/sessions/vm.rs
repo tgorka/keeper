@@ -562,6 +562,108 @@ pub struct SessionSpaceReq {
     pub order: f64,
 }
 
+/// One thing the operator could reference (FR-265).
+///
+/// Three sources — the vault's notes, the vault's recordings, the session's own
+/// files — projected into ONE row shape rather than three lists, because the
+/// picker is one list the operator filters and a union type would make the
+/// frontend decide which of three shapes it is holding. Which source a row came
+/// from is already in [`Self::kind`], decided in Rust (AD-118, AD-73).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefCandidateVm {
+    /// `"note"`, `"recording"` or `"file"` —
+    /// [`crate::sessions::refs::RefKind::as_str`], the same word the references
+    /// list already prints, so the picker's icon and the list's icon are the
+    /// same lookup.
+    pub kind: String,
+    /// What the written pointer will name: a note's title, or a
+    /// profile-relative path. Sent back verbatim on add, so the frontend
+    /// composes nothing (AD-65).
+    pub target: String,
+    /// What the row reads as — a note's title, a file's basename.
+    pub label: String,
+    /// The second line: a note's folder, a file's session-relative path. Empty
+    /// when there is nothing more to say than the label.
+    pub detail: String,
+    /// Every tag the candidate carries, so the picker's search box can match on
+    /// them and the row can show them. Empty for a file, which has none.
+    pub tags: Vec<String>,
+    /// Last modified, for the picker's own ordering and for the row's date.
+    ///
+    /// `number` for [`SessionSpaceFileVm::mtime_ms`]'s reason — a bare `i64`
+    /// crosses as `bigint` and does not survive `JSON.parse`.
+    #[ts(type = "number")]
+    pub mtime_ms: i64,
+    /// This candidate is inside the session's `workspace/`, so adding it will
+    /// offer a copy into `artifacts/` first.
+    ///
+    /// A flag rather than a computed destination: the destination depends on
+    /// what `artifacts/` already holds at the moment of the add, and a name
+    /// computed when the list was built would be stale by the time it was used.
+    pub promotable: bool,
+}
+
+/// What the picker was given to pick from (FR-265).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefCandidatesVm {
+    /// The rows, already ordered: files of this session first, then notes and
+    /// recordings newest first. The session's own files lead because a
+    /// reference is most often to something the sitting just produced.
+    pub candidates: Vec<SessionRefCandidateVm>,
+    /// The markdown files a reference could be written into — session-relative,
+    /// `ref`-tagged first. Empty when the session has none yet, and the picker
+    /// then offers to create one.
+    pub targets: Vec<String>,
+    /// What keeper would create when `targets` is empty or the operator asks
+    /// for a new file: session-relative, already de-duplicated against the pool.
+    pub default_target: String,
+    /// The list hit its budget and is a prefix. Said rather than hidden, the
+    /// tree's rule: a list that silently truncates is a list that lies about
+    /// being complete.
+    pub truncated: bool,
+}
+
+/// What the picker sends to add one reference (FR-265).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefAddReq {
+    /// One [`SessionRefCandidateVm::kind`], or `"external"` for a typed URL.
+    pub kind: String,
+    /// That row's `target`, unchanged, or the URL.
+    pub target: String,
+    /// The operator's own words for this reference, or `None` to let the target
+    /// name itself. Never invented in Rust — an alias keeper made up would be
+    /// keeper naming somebody else's reference.
+    pub label: Option<String>,
+    /// Session-relative markdown file to append to. Created when absent.
+    pub file: String,
+    /// Copy a `workspace/` target into `artifacts/` and point at the copy.
+    /// Ignored for anything not inside this session's workspace.
+    pub promote: bool,
+}
+
+/// What the add actually wrote (FR-265).
+///
+/// The line and the file rather than a bare ok, for
+/// [`SessionSpacesRestoredVm`]'s reason: both cost the same to send and only
+/// one of them lets the operator see that keeper wrote what they meant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefAddedVm {
+    /// Session-relative file the line landed in.
+    pub file: String,
+    /// The markdown bullet, exactly as written.
+    pub line: String,
+    /// Session-relative path of the promoted copy, when one was made.
+    pub promoted: Option<String>,
+}
+
 /// What a restore actually wrote (FR-261).
 ///
 /// Names rather than a count, because "3 spaces restored" and "About, Log and

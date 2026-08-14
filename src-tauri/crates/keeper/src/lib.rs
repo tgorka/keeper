@@ -948,6 +948,8 @@ pub fn run() {
         sessions_ipc::sessions_file_new_kind,
         sessions_ipc::sessions_file_delete,
         sessions_ipc::sessions_task_move,
+        sessions_ipc::sessions_ref_candidates,
+        sessions_ipc::sessions_ref_add,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,

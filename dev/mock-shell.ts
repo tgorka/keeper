@@ -1118,6 +1118,100 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     card.orderIsOwn = true;
     return null;
   },
+  // The reference picker (FR-265). Candidates come from the SAME fixture the
+  // tree renders, plus two vault rows, so a file created in `bun dev` is
+  // referenceable a moment later — the one behaviour a viewing aid can show
+  // that a screenshot cannot.
+  //
+  // The filter here is a crude prefix of `add_ref::matches`: it understands
+  // `tag:` and ANDs plain words, and it does NOT walk the tag hierarchy. That
+  // is a stated limit, not an oversight — a second matcher that agreed with
+  // Rust in every corner would be a second matcher to keep in step, and the
+  // budget/truncation reasoning that makes the real one live in Rust does not
+  // apply to sixteen rows.
+  sessions_ref_candidates: (payload) => {
+    const query = String(payload.query ?? "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((word) => word !== "");
+    const rows = [
+      ...SESSION_ENTRIES.filter((entry) => !entry.isDir).map((entry) => ({
+        kind: "file",
+        target: entry.relPath,
+        label: entry.name,
+        detail: entry.parent,
+        tags: [] as string[],
+        mtimeMs: entry.mtimeMs,
+        // The write fence's own answer (AD-113), read off the row that already
+        // carries it rather than recomputed from the path.
+        promotable: entry.locked !== null,
+      })),
+      {
+        kind: "note",
+        target: "Keeper work",
+        label: "Keeper work",
+        detail: "10-notes/projects",
+        tags: ["project/keeper", "work"],
+        mtimeMs: ago(90),
+        promotable: false,
+      },
+      {
+        kind: "recording",
+        target: "Standup 2026-08-12",
+        label: "Standup 2026-08-12",
+        detail: "30-recordings",
+        tags: ["work"],
+        mtimeMs: ago(2_880),
+        promotable: false,
+      },
+    ];
+    const targets = SESSION_ENTRIES.filter(
+      (entry) => !entry.isDir && entry.relPath.endsWith(".md") && entry.parent === "",
+    ).map((entry) => entry.relPath);
+    return {
+      candidates: rows.filter((row) =>
+        query.every((word) =>
+          word.startsWith("tag:")
+            ? row.tags.some((tag) => tag.toLowerCase().includes(word.slice(4)))
+            : `${row.label} ${row.detail}`.toLowerCase().includes(word),
+        ),
+      ),
+      targets,
+      defaultTarget: "references.md",
+      truncated: false,
+    };
+  },
+  sessions_ref_add: (payload) => {
+    const req = (payload.req ?? {}) as Record<string, unknown>;
+    const kind = String(req.kind ?? "file");
+    const target = String(req.target ?? "");
+    const label = req.label === null || req.label === undefined ? null : String(req.label);
+    const promoted =
+      req.promote === true ? `artifacts/${target.slice(target.lastIndexOf("/") + 1)}` : null;
+    const dest = promoted ?? target;
+    // The three forms `add_ref::line` writes, restated — the same acceptable
+    // copy as `sessions_file_new`'s namer, for the same reason: this file never
+    // runs in the app, and a mock that echoes a plausible line is still a mock
+    // that renders the confirmation.
+    const line =
+      kind === "note" || kind === "recording"
+        ? label === null
+          ? `- [[${target}]]`
+          : `- [[${target}|${label}]]`
+        : kind === "external"
+          ? label === null
+            ? `- ${target}`
+            : `- [${label}](${target})`
+          : `- [${label ?? dest.slice(dest.lastIndexOf("/") + 1)}](${dest})`;
+    const file = String(req.file ?? "references.md");
+    if (!SESSION_ENTRIES.some((entry) => entry.relPath === file)) {
+      SESSION_ENTRIES.push(sessionEntry(file, false, 140, 0));
+    }
+    if (promoted !== null && !SESSION_ENTRIES.some((entry) => entry.relPath === promoted)) {
+      SESSION_ENTRIES.push(sessionEntry(promoted, false, 900, 0));
+    }
+    return { file, line, promoted };
+  },
   // The three markdown widgets (FR-264). The mock answers by tag and ignores
   // the callout's argument, and that is a stated limit rather than an oversight:
   // parsing a query here would be the second parser AD-20 forbids, and the one

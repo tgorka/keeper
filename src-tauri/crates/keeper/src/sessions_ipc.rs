@@ -1989,3 +1989,314 @@ pub fn sessions_file_delete(
     let _ = (root_id, session_id, rel);
     Err(unsupported())
 }
+
+// ---------------------------------------------------------------------------
+// Adding a reference (FR-265, AD-118)
+// ---------------------------------------------------------------------------
+
+/// How many candidates one picker call will return.
+///
+/// A vault holds tens of thousands of notes and a session's `workspace/` can
+/// hold a checkout. The picker is a list somebody scrolls, so the honest design
+/// is a bounded list plus a `truncated` flag that says so — [`sessions_tree`]'s
+/// rule, and the reason `query` is filtered in Rust rather than in React: a
+/// frontend filtering a prefix of the vault would be filtering the wrong 500.
+#[cfg(desktop)]
+const CANDIDATE_BUDGET: usize = 500;
+
+/// Everything the operator could reference from this session (FR-265).
+///
+/// Three sources, one list, ordered session-files-first: a reference is most
+/// often to something the sitting just produced, and a picker that opens on the
+/// vault's oldest note is a picker that opens on the wrong answer.
+///
+/// **`query` is applied here, not in the webview.** Filtering after truncation
+/// would search a prefix, and a `tag:` term is the tag hierarchy's question — it
+/// belongs beside the index that answers it (AD-7, AD-65).
+///
+/// **The workspace fence is asked, not guessed.** Whether a candidate is
+/// promotable comes from the same [`keeper_sync::files_write::WriteScope`] the
+/// write path enforces, so the offer cannot appear on a file keeper would then
+/// refuse to copy.
+///
+/// Rejects with: `internal` (unknown root or session), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_ref_candidates(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    query: String,
+) -> Result<keeper_core::sessions::vm::SessionRefCandidatesVm, IpcError> {
+    use keeper_core::sessions::add_ref::{self, DEFAULT_REF_FILE};
+    use keeper_core::sessions::pool::{read_pool, PoolFile};
+    use keeper_core::sessions::refs::RefKind;
+    use keeper_core::sessions::vm::{SessionRefCandidateVm, SessionRefCandidatesVm};
+
+    // Asked for its refusal, not its value: every reader below degrades to an
+    // empty list for an unknown session, and an empty picker is a worse answer
+    // than "no such session" for the one case that is actually a bug.
+    crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let (_vault, scope) = crate::sync_ipc::sessions_scope(&profile);
+
+    let query = query.trim();
+    let mut candidates: Vec<SessionRefCandidateVm> = Vec::new();
+    let mut truncated = false;
+
+    // The session's own files first, in the tree's own order — which already
+    // puts `artifacts/` before `workspace/`, so the promoted output a sitting
+    // meant to reference is above the scratch it happened to leave behind.
+    if let Some((session_path, entries, tree_truncated)) =
+        crate::sessions_root::tree(&root_id, &session_id)
+    {
+        truncated |= tree_truncated;
+        for entry in entries.iter().filter(|entry| !entry.is_dir) {
+            let subpath = format!("{zone}/{session_path}/{}", entry.rel_path);
+            let label = entry.name.clone();
+            if !add_ref::matches(query, &label, &entry.rel_path, &[]) {
+                continue;
+            }
+            if candidates.len() >= CANDIDATE_BUDGET {
+                truncated = true;
+                break;
+            }
+            candidates.push(SessionRefCandidateVm {
+                kind: RefKind::File.as_str().to_owned(),
+                target: subpath.clone(),
+                label,
+                detail: entry.rel_path.clone(),
+                tags: Vec::new(),
+                mtime_ms: entry.mtime_ms,
+                promotable: scope.in_session_workspace(&subpath),
+            });
+        }
+    }
+
+    // Then the vault, newest first. A profile that is not also a vault answers
+    // nothing here, which is the honest answer rather than an error (AD-90).
+    if let Some(snapshot) = crate::notes_vault::snapshot(&profile.id) {
+        let mut notes: Vec<&keeper_core::notes::index::IndexEntry> = snapshot
+            .entries()
+            .iter()
+            .filter(|entry| {
+                let folder = entry.path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                add_ref::matches(query, &entry.title, folder, &entry.tags)
+            })
+            .collect();
+        notes.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.path.cmp(&b.path)));
+        for entry in notes {
+            if candidates.len() >= CANDIDATE_BUDGET {
+                truncated = true;
+                break;
+            }
+            let recording = entry.flags.iter().any(|flag| flag == "recording");
+            candidates.push(SessionRefCandidateVm {
+                kind: if recording {
+                    RefKind::Recording.as_str().to_owned()
+                } else {
+                    RefKind::Note.as_str().to_owned()
+                },
+                // The title, because a wikilink addresses a note by name — which
+                // is what makes the written reference survive the note moving.
+                target: entry.title.clone(),
+                label: entry.title.clone(),
+                detail: entry.path.clone(),
+                tags: entry.tags.clone(),
+                mtime_ms: entry.updated_ms,
+                // A note is not in the session's workspace by construction: a
+                // zone and a vault cannot overlap (`SessionsConfig`'s own rule).
+                promotable: false,
+            });
+        }
+    }
+
+    // Where a reference could go: the session's `ref`-tagged markdown first,
+    // then its other markdown. Composed in Rust so the picker offers a list and
+    // never a path it built itself (AD-65).
+    let (targets, default_target) = match crate::sessions_root::session_pool(&root_id, &session_id)
+    {
+        Some(pool_read) => {
+            let pool = read_pool(
+                &pool_read
+                    .files
+                    .iter()
+                    .map(|(rel, text, _)| PoolFile { rel, text })
+                    .collect::<Vec<_>>(),
+            );
+            let mut targets: Vec<String> =
+                pool.refs.iter().map(|entry| entry.rel.clone()).collect();
+            for entry in pool
+                .about
+                .iter()
+                .chain(pool.prompts.iter())
+                .chain(pool.logs.iter())
+                .chain(pool.unfiled.iter())
+            {
+                if !targets.contains(&entry.rel) {
+                    targets.push(entry.rel.clone());
+                }
+            }
+            // The default is the constant whether or not the file exists: an
+            // existing `references.md` is the file the operator meant, and
+            // dodging it into `references-2.md` would split one list in two.
+            // `new_named`'s collision rule is for files a *title* names; this is
+            // a fixed name that keeps accumulating.
+            (targets, DEFAULT_REF_FILE.to_owned())
+        }
+        None => (Vec::new(), DEFAULT_REF_FILE.to_owned()),
+    };
+
+    Ok(SessionRefCandidatesVm {
+        candidates,
+        targets,
+        default_target,
+        truncated,
+    })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_ref_candidates(
+    root_id: String,
+    session_id: String,
+    query: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, query);
+    Err(unsupported())
+}
+
+/// Write one reference into one of the session's markdown files (FR-265).
+///
+/// The line is composed in Rust — the syntax a reference is written in is the
+/// syntax [`keeper_core::sessions::refs::scan`] reads back, and a frontend
+/// composing markdown would be the second author of that contract (AD-65).
+///
+/// **Guarded, because an agent may be writing the same file.** The target's
+/// current bytes are read here and the plan's write refuses if they changed
+/// underneath it, which turns a race into a retry rather than a lost line.
+///
+/// Rejects with: `internal` (unknown root or session, a refused pick, a target
+/// that is not markdown, a failed write), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_ref_add(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    req: keeper_core::sessions::vm::SessionRefAddReq,
+) -> Result<keeper_core::sessions::vm::SessionRefAddedVm, IpcError> {
+    use keeper_core::sessions::add_ref::{self, Pick};
+    use keeper_core::sessions::vm::SessionRefAddedVm;
+
+    let pick = Pick::parse(&req.kind, &req.target).map_err(add_ref_error)?;
+
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+
+    // The promotion is computed against what `artifacts/` holds *now*, not
+    // against a name the picker precomputed: the list may be minutes old and a
+    // stale destination is how two promotions land on one file.
+    let promotion = match (&pick, req.promote) {
+        (Pick::Path { subpath }, true) => add_ref::promotion(
+            &zone,
+            &row.path,
+            subpath,
+            &taken_in(&zone_root.join(&row.path).join("artifacts")),
+        ),
+        _ => None,
+    };
+
+    let line = add_ref::line(
+        &zone,
+        &row.path,
+        &pick,
+        req.label.as_deref(),
+        promotion.as_ref(),
+    )
+    .map_err(add_ref_error)?;
+
+    let rel = req.file.trim().to_owned();
+    let (zone_root, session_path, _subpath) =
+        resolve_session_file(&state, &root_id, &session_id, &rel)?;
+
+    // Read the target's current bytes, or `None` when it does not exist yet —
+    // which is the create case and the only one that is not guarded.
+    let existing = std::fs::read_to_string(zone_root.join(&session_path).join(&rel)).ok();
+    let (existing, line_written) = match existing {
+        Some(text) => (Some(text), line.clone()),
+        // A brand-new references file is seeded with frontmatter and the `ref`
+        // tag, so the References space lists it the moment it lands rather than
+        // after somebody notices it is untagged.
+        None => (
+            None,
+            add_ref::seeded(
+                rel.trim_end_matches(".md"),
+                &crate::sync_ipc::new_ulid(),
+                &today(),
+                &line,
+            ),
+        ),
+    };
+
+    let compiled = add_ref::compile_add(
+        &session_path,
+        &rel,
+        existing.as_deref(),
+        &line_written,
+        promotion.as_ref(),
+    )
+    .map_err(add_ref_error)?;
+
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("ref-add task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+
+    Ok(SessionRefAddedVm {
+        file: rel,
+        line,
+        promoted: promotion.map(|promotion| promotion.rel),
+    })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_ref_add(
+    root_id: String,
+    session_id: String,
+    req: keeper_core::sessions::vm::SessionRefAddReq,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, req);
+    Err(unsupported())
+}
+
+/// One refusal, in the domain's own words (UX-DR43).
+#[cfg(desktop)]
+fn add_ref_error(error: keeper_core::sessions::add_ref::AddRefError) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.message(),
+        account_id: None,
+        retriable: false,
+    }
+}
