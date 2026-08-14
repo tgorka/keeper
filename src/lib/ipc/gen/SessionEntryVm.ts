@@ -70,4 +70,22 @@ sync: FilesEntrySyncVm,
  * workspace fence's own refusal sentence, verbatim. `None` everywhere
  * else. A lock with no reason is a lock people file bugs about.
  */
-locked: string | null, };
+locked: string | null, 
+/**
+ * Why this row has no Delete, when it has none (FR-262):
+ * [`super::files::check_deletable`]'s own sentence, verbatim.
+ *
+ * The same shape as [`Self::locked`] and for the same reason, but a
+ * strictly wider question — scratch is one of four ways a file can be
+ * undeletable, beside a path that leaves the session, an extension keeper
+ * does not author, and the two files that decide the session's shape. The
+ * row renders its Delete exactly when this is `None`, so the button and
+ * the command agree by construction rather than by both being kept in step
+ * (AD-108): a rule the frontend re-derives is a rule that drifts the first
+ * time a fifth refusal is added here.
+ *
+ * Always `Some` for a directory, because deleting a folder is a different
+ * verb — recursive, and irreversible in a way one file is not — and this
+ * module does not offer it.
+ */
+undeletable: string | null, };

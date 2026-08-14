@@ -4,14 +4,19 @@ import type { SessionEntryVm } from "@/lib/ipc/client";
 
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
+const sessionsFileDelete = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
+  sessionsFileDelete: (root: unknown, session: unknown, rel: unknown) =>
+    sessionsFileDelete(root, session, rel),
 }));
 
 import { FILES_SYNC_MARK_TESTID } from "@/components/layout/sync-status-mark";
 import {
   initialOpenFolders,
+  SESSION_TREE_DELETE_FAILED,
+  SESSION_TREE_DELETE_LABEL,
   SESSION_TREE_EMPTY,
   SESSION_TREE_LABEL,
   SESSION_TREE_OPEN_EXTERNAL_LABEL,
@@ -27,6 +32,19 @@ const NOW = Date.now();
 const LOCK_SENTENCE =
   "60-sessions/active/2026-08-10-keeper/workspace is inside a session's workspace — scratch that is not versioned, not synced, and dies with the session. keeper reads it but never writes there; promote the file into the session's artifacts instead.";
 
+/**
+ * `check_deletable`'s sentence for the two files that decide the shape, as the
+ * tree receives it (FR-262). Quoted rather than re-derived, because quoting is
+ * what the component does too — the row's job is to say Rust's answer, and a
+ * fixture that invented its own would be testing a rule that does not exist.
+ */
+const UNDELETABLE_SENTENCE =
+  "about.md is what tells keeper this session is a flat one: deleting it would silently turn the session back into the old folder shape.";
+
+/** Every directory, always — a folder delete is a verb this tree does not offer. */
+const DIR_UNDELETABLE =
+  "keeper deletes one file at a time. Removing a folder takes everything inside it with it, which is a bigger promise than this tree makes — do it in Finder.";
+
 function entry(over: Partial<SessionEntryVm> & Pick<SessionEntryVm, "name">): SessionEntryVm {
   const relPath = over.relPath ?? over.name;
   return {
@@ -40,6 +58,7 @@ function entry(over: Partial<SessionEntryVm> & Pick<SessionEntryVm, "name">): Se
     mtimeMs: NOW - 60_000,
     sync: { status: "synced", detail: null },
     locked: null,
+    undeletable: over.isDir === true ? DIR_UNDELETABLE : null,
     ...over,
   };
 }
@@ -78,8 +97,14 @@ function zone(): SessionEntryVm[] {
       parent: "workspace",
       depth: 2,
       locked: LOCK_SENTENCE,
+      // Rust says both things about a scratch file: the fence locks it and
+      // `check_deletable` refuses it for the same reason. The row picks one.
+      undeletable: LOCK_SENTENCE,
       sync: { status: "excluded", detail: "workspace/ is excluded by the zone's own pattern." },
     }),
+    // The file whose refusal is the surprising one: it looks like any other
+    // note in the pool, and deleting it silently changes what the session IS.
+    entry({ name: "about.md", undeletable: UNDELETABLE_SENTENCE }),
     entry({ name: "README.md" }),
   ];
 }
@@ -105,15 +130,25 @@ function deepScratch(): SessionEntryVm[] {
 
 function mount(over: Partial<React.ComponentProps<typeof SessionTree>> = {}) {
   const onOpen = vi.fn();
+  const onChanged = vi.fn();
   const result = render(
-    <SessionTree rootId="tgdrive" entries={zone()} truncated={false} onOpen={onOpen} {...over} />,
+    <SessionTree
+      rootId="tgdrive"
+      sessionId="active/2026-08-10-keeper"
+      entries={zone()}
+      truncated={false}
+      onOpen={onOpen}
+      onChanged={onChanged}
+      {...over}
+    />,
   );
-  return { ...result, onOpen };
+  return { ...result, onOpen, onChanged };
 }
 
 beforeEach(() => {
   syncOpenEntry.mockResolvedValue(undefined);
   revealPath.mockResolvedValue(undefined);
+  sessionsFileDelete.mockResolvedValue(null);
   capabilitiesStore.setState({
     capabilities: { ...DEFAULT_CAPABILITIES, revealInFileManager: true },
     hydrated: true,
@@ -281,5 +316,84 @@ describe("SessionTree", () => {
     mount({ entries: [] });
     expect(screen.getByText(SESSION_TREE_EMPTY)).toBeInTheDocument();
     expect(screen.queryByRole("tree")).not.toBeInTheDocument();
+  });
+
+  it("deletes a file only after the confirmation names it", async () => {
+    const { onChanged } = mount();
+    const row = screen.getByRole("treeitem", { name: "README.md" });
+    within(row).getByLabelText(`${SESSION_TREE_DELETE_LABEL} README.md`).click();
+    // Nothing has been asked of Rust yet — the dialog is the whole point.
+    expect(sessionsFileDelete).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole("alertdialog");
+    // Which file, in a tree of forty rows.
+    expect(dialog).toHaveTextContent("README.md");
+    within(dialog).getByRole("button", { name: SESSION_TREE_DELETE_LABEL }).click();
+    await waitFor(() => {
+      expect(sessionsFileDelete).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "README.md",
+      );
+    });
+    // The surface re-reads rather than trusting its own idea of the pool.
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("asks and then does nothing when the answer is Cancel", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "README.md" });
+    within(row).getByLabelText(`${SESSION_TREE_DELETE_LABEL} README.md`).click();
+    const dialog = await screen.findByRole("alertdialog");
+    within(dialog).getByRole("button", { name: "Cancel" }).click();
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(sessionsFileDelete).not.toHaveBeenCalled();
+  });
+
+  it("disables Delete on a file Rust refuses, and says the refusal", () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "about.md" });
+    // Labelled by the refusal itself, so the reason is what a screen reader
+    // reads and what the tooltip shows — a disabled button with no sentence
+    // teaches nothing about why this one file is different.
+    const button = within(row).getByLabelText(UNDELETABLE_SENTENCE);
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", UNDELETABLE_SENTENCE);
+  });
+
+  it("offers no Delete at all on a scratch row, which already says why", () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "iter-3.md" });
+    expect(within(row).queryByLabelText(LOCK_SENTENCE)).not.toBeInTheDocument();
+    expect(
+      within(row).queryByLabelText(`${SESSION_TREE_DELETE_LABEL} iter-3.md`),
+    ).not.toBeInTheDocument();
+    // The lock's own sentence is still on the row — this is UX-DR43, not silence.
+    expect(row).toHaveAccessibleDescription(expect.stringContaining("never writes there"));
+  });
+
+  it("offers no Delete on a folder, whatever it holds", () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "artifacts" });
+    const button = within(row).queryByLabelText(DIR_UNDELETABLE);
+    expect(button === null || button.hasAttribute("disabled")).toBe(true);
+    expect(
+      within(row).queryByLabelText(`${SESSION_TREE_DELETE_LABEL} artifacts`),
+    ).not.toBeInTheDocument();
+  });
+
+  it("says keeper's own refusal when the delete is refused, and changes nothing", async () => {
+    const { onChanged } = mount();
+    sessionsFileDelete.mockRejectedValue({ message: "That file is outside the session." });
+    const row = screen.getByRole("treeitem", { name: "README.md" });
+    within(row).getByLabelText(`${SESSION_TREE_DELETE_LABEL} README.md`).click();
+    const dialog = await screen.findByRole("alertdialog");
+    within(dialog).getByRole("button", { name: SESSION_TREE_DELETE_LABEL }).click();
+    // Rust's sentence, not the fallback — the fallback exists for a refusal
+    // that arrived without one.
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "That file is outside the session.",
+    );
+    expect(screen.queryByText(SESSION_TREE_DELETE_FAILED)).not.toBeInTheDocument();
+    expect(onChanged).not.toHaveBeenCalled();
   });
 });

@@ -250,6 +250,13 @@ const CHILDREN: Record<string, FilesEntryVm[]> = {
  * with no reason is the bug AD-113's refusal text exists to prevent, and a
  * viewing aid that quietly dropped it would hide the one row whose rendering is
  * least obvious.
+ *
+ * `undeletable` is computed here rather than passed in, mirroring what
+ * `files::check_deletable` answers in Rust (FR-262): the two shape files and
+ * every directory refuse, everything else is deletable. It is a re-statement of
+ * a Rust rule and therefore exactly the kind of thing that drifts — which is
+ * survivable in a viewing aid whose whole purpose is to show what the rows look
+ * like, and would not be anywhere else.
  */
 function sessionEntry(
   relPath: string,
@@ -271,6 +278,11 @@ function sessionEntry(
     mtimeMs: ago(minutesAgo),
     sync: { status: "synced", detail: null },
     locked,
+    undeletable: isDir
+      ? "keeper deletes one file at a time. Removing a folder takes everything inside it with it, which is a bigger promise than this tree makes — do it in Finder."
+      : relPath === "AGENTS.md" || relPath === "about.md"
+        ? `${relPath} is what tells keeper this session is a flat one: deleting it would silently turn the session back into the old folder shape.`
+        : null,
   };
 }
 
@@ -929,6 +941,55 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const filesAt = SESSION_SPACE_FILES.findIndex((row) => row.spaceId === id);
     if (filesAt !== -1) {
       SESSION_SPACE_FILES.splice(filesAt, 1);
+    }
+    return null;
+  },
+  // The three file verbs mutate `SESSION_ENTRIES` for the reason the space
+  // writes mutate theirs: what is being looked at IS the round trip. A create
+  // that answered a path the tree then failed to show would look exactly like
+  // the bug this aid exists to rule out.
+  //
+  // The names are keeper's own rules restated in TypeScript — slug, counter,
+  // stamp — and that is a copy of `files::new_named`/`new_stamped`. Acceptable
+  // here and nowhere else: this file never runs in the app, and a mock that
+  // returns a name the real one would not is still a mock that renders a row.
+  sessions_file_new: (payload) => {
+    const parent = String(payload.parent ?? "");
+    const kind = String(payload.kind ?? "md");
+    const slug =
+      String(payload.title ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "untitled";
+    const relPath = `${parent === "" ? "" : `${parent}/`}${slug}.${kind}`;
+    SESSION_ENTRIES.push(sessionEntry(relPath, false, 120, 0));
+    return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
+  },
+  sessions_file_new_kind: (payload) => {
+    const kind = String(payload.kind ?? "log");
+    const slug =
+      String(payload.title ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "untitled";
+    // The stamp the real namer writes, from the clock this file already fakes
+    // against — `YYYY-MM-DD-HHMM-<slug>.md`, which is what makes a log folder
+    // sort itself.
+    const now = new Date(ago(0));
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const relPath = `${stamp}-${slug}.md`;
+    SESSION_ENTRIES.push(sessionEntry(relPath, false, 96, 0));
+    void kind;
+    return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
+  },
+  sessions_file_delete: (payload) => {
+    const rel = String(payload.rel ?? "");
+    const at = SESSION_ENTRIES.findIndex((entry) => entry.relPath === rel);
+    if (at !== -1) {
+      SESSION_ENTRIES.splice(at, 1);
     }
     return null;
   },

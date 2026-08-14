@@ -130,6 +130,18 @@ pub fn sessions_detail(root_id: String, session_id: String) -> Result<(), IpcErr
     Err(unsupported())
 }
 
+/// Why a folder has no Delete (FR-262).
+///
+/// Not a rule [`keeper_core::sessions::files`] states, because it is not a rule
+/// about *paths*: that module's verbs take one file, and a folder delete is a
+/// different, recursive thing whose blast radius is whatever happens to be
+/// inside. Saying so on the row is what keeps this from reading as an oversight
+/// — the operator has Finder for the day they mean it.
+#[cfg(desktop)]
+const SESSION_TREE_DIR_UNDELETABLE: &str =
+    "keeper deletes one file at a time. Removing a folder takes everything inside it with it, \
+     which is a bigger promise than this tree makes — do it in Finder.";
+
 /// One session's own file tree (FR-254, AD-117) — the session as the small
 /// workspace it is.
 ///
@@ -150,7 +162,9 @@ pub fn sessions_detail(root_id: String, session_id: String) -> Result<(), IpcErr
 /// **The lock is the write fence, asked** (AD-113). `workspace/` entries carry
 /// [`keeper_sync::files_write::WriteRefusal::SessionWorkspace`]'s own sentence
 /// rather than a UI convention that could drift from what a write would
-/// actually do.
+/// actually do. `undeletable` is the same trick for the Delete verb: the row
+/// carries [`keeper_core::sessions::files::check_deletable`]'s refusal, so the
+/// button the tree draws and the command it would call cannot disagree.
 ///
 /// Rejects with: `internal` (unknown root or session, an unreadable profile
 /// exclude pattern), `unsupported` (mobile).
@@ -161,6 +175,7 @@ pub async fn sessions_tree(
     root_id: String,
     session_id: String,
 ) -> Result<keeper_core::sessions::vm::SessionTreeVm, IpcError> {
+    use keeper_core::sessions::files;
     use keeper_core::sessions::vm::{SessionEntryVm, SessionTreeVm};
     use keeper_core::vm::FileSizeVm;
     use keeper_sync::browse;
@@ -205,6 +220,22 @@ pub async fn sessions_tree(
             // Composed here and only here (AD-65): the frontend receives a
             // path it can hand straight to a file target and never joins one.
             let subpath = format!("{zone}/{session_path}/{}", entry.rel_path);
+            // The Delete button's own answer, from the predicate the command
+            // runs (FR-262) rather than from a rule re-stated here. A directory
+            // is refused up front: `check_deletable` takes a file path and
+            // would happily accept `notes` as one, and removing a folder is a
+            // recursive verb this module does not offer.
+            //
+            // Asked before the struct literal because `rel_path` moves into it,
+            // and a `clone()` to keep asking later would be a copy taken for
+            // the sake of statement order.
+            let undeletable = if entry.is_dir {
+                Some(SESSION_TREE_DIR_UNDELETABLE.to_owned())
+            } else {
+                files::check_deletable(&entry.rel_path)
+                    .err()
+                    .map(|refusal| refusal.to_string())
+            };
             let status = browse::status_of(
                 &profile.local_path,
                 &subpath,
@@ -232,6 +263,7 @@ pub async fn sessions_tree(
                     .join(&subpath)
                     .to_string_lossy()
                     .into_owned(),
+                undeletable,
                 subpath,
                 size: (!entry.is_dir).then(|| FileSizeVm::new(entry.size)),
                 mtime_ms: entry.mtime_ms,
@@ -1500,5 +1532,337 @@ pub async fn sessions_spaces_restore(
 #[tauri::command]
 pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
     let _ = root_id;
+    Err(unsupported())
+}
+
+// ---------------------------------------------------------------------------
+// File verbs (FR-262): make and unmake one file inside a session
+// ---------------------------------------------------------------------------
+
+/// Now, as the flat contract's filename clock wants it: `HHMM`.
+///
+/// [`today`]'s companion, and separate from it because the two are used
+/// separately — a session folder is named by day, a log file by minute. Local
+/// time, like `today`, because the name is read by a person looking at their own
+/// Finder and a UTC stamp would put an evening's work on tomorrow.
+#[cfg(desktop)]
+fn now_hhmm() -> String {
+    chrono::Local::now().format("%H%M").to_string()
+}
+
+/// The refusal for a path this session will not write, in core's own words.
+#[cfg(desktop)]
+fn file_verb_error(error: keeper_core::sessions::files::FileVerbError) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Resolve a session and ask the **real** write fence about a path in it.
+///
+/// The fence is `WriteScope`'s, not a copy: `files::check_rel` refuses a
+/// `workspace/` path on shape grounds with no knowledge of zones, and this asks
+/// [`keeper_sync::files_write::WriteScope::in_session_workspace`] — the same
+/// predicate `sessions_tree` renders its lock from (AD-113). Two predicates that
+/// must agree both run; a second "third segment is workspace" test written here
+/// would be the one that gets edited alone and drifts.
+///
+/// Returns the zone root, the session's zone-relative path, and the file's
+/// profile-relative subpath — composed here and only here (AD-65).
+#[cfg(desktop)]
+fn resolve_session_file(
+    state: &tauri::State<'_, crate::ipc::AppState>,
+    root_id: &str,
+    session_id: &str,
+    rel: &str,
+) -> Result<(std::path::PathBuf, String, String), IpcError> {
+    keeper_core::sessions::files::check_rel(rel).map_err(file_verb_error)?;
+
+    let zone_root = crate::sessions_root::zone_of(root_id).ok_or_else(|| root_error(root_id))?;
+    let row = crate::sessions_root::row_of(root_id, session_id)
+        .ok_or_else(|| session_error(session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(state, root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let subpath = format!("{zone}/{}/{rel}", row.path);
+    let (_vault, scope) = crate::sync_ipc::sessions_scope(&profile);
+    if scope.in_session_workspace(&subpath) {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: keeper_sync::files_write::WriteRefusal::SessionWorkspace { subpath }
+                .to_string(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    Ok((zone_root, row.path, subpath))
+}
+
+/// Every `.md`/`.csv`/`.json` name already taken in one folder of a session.
+///
+/// Read fresh rather than passed in from the frontend: the name a new file gets
+/// has to dodge what is on disk *now*, and a listing the UI fetched when the
+/// detail opened is a listing an agent has had minutes to invalidate. Case is
+/// folded by the namers, not here — this returns what the directory says.
+#[cfg(desktop)]
+fn taken_in(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // A folder that does not exist yet holds no names. The plan's `MkDir`
+        // is what creates it, so this is the ordinary first-file case and not
+        // an error worth failing a create over.
+        return std::collections::BTreeSet::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Make one file inside a session, and answer with the path that opens it.
+///
+/// `parent` is session-relative and `""` for the session's own root — the pool,
+/// which is where a flat session's markdown belongs. `title` is what the
+/// operator typed; the *filename* is derived from it here (AD-65), because a
+/// frontend that composed one would be the second namer and the two would
+/// disagree about collisions.
+///
+/// The answer is the profile-relative subpath, so the caller opens the new file
+/// through the one file target (AD-109) without joining anything.
+///
+/// Rejects with: `internal` (unknown root or session, a refused path, a failed
+/// write), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_file_new(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    parent: String,
+    title: String,
+    kind: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::files;
+
+    let kind = files::NewFileKind::parse(&kind).ok_or_else(|| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "keeper creates .md, .csv and .json files — {kind} is none of those. Anything else \
+             belongs in artifacts/, put there by the tool that made it."
+        ),
+        account_id: None,
+        retriable: false,
+    })?;
+    let parent = parent.trim().trim_matches('/').to_owned();
+    // The parent is checked as a path in its own right before a filename is
+    // appended to it: `workspace/` must be refused whatever the file is called,
+    // and a traversal must not be smuggled in through the folder half.
+    if !parent.is_empty() {
+        files::check_dir(&parent).map_err(file_verb_error)?;
+    }
+
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let dir = if parent.is_empty() {
+        zone_root.join(&row.path)
+    } else {
+        zone_root.join(&row.path).join(&parent)
+    };
+    let name = files::new_named(&title, kind, &taken_in(&dir));
+    let rel = if parent.is_empty() {
+        name
+    } else {
+        format!("{parent}/{name}")
+    };
+
+    let (zone_root, session_path, subpath) =
+        resolve_session_file(&state, &root_id, &session_id, &rel)?;
+    let content = files::render_new(
+        kind,
+        None,
+        title.trim(),
+        &crate::sync_ipc::new_ulid(),
+        &today(),
+    );
+    let compiled = files::compile_new(&session_path, &rel, &content).map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("file-new task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(subpath)
+}
+
+/// Make a correctly-named, correctly-tagged log or prompt in the session's pool.
+///
+/// **[`sessions_log_today`]'s flat twin, not a rival.** That command appends a
+/// dated heading to a folder-shaped session's `README.md`, which is where its
+/// log lives; a flat session has no `## Log` section to append to, and its log
+/// is a *file*. Same verb, same button, two contracts — which is why the
+/// frontend picks between them on `detail.shape` rather than offering both.
+///
+/// The name is `YYYY-MM-DD-HHMM-<slug>.md` and the tag is written into
+/// frontmatter, because those two together are what decide whether the zone's
+/// spaces will ever list the file. A log the operator named freehand is a log
+/// that no space selects — the flat shape's one real failure mode, and the whole
+/// reason these two verbs exist beside the general one.
+///
+/// Rejects with: `internal` (unknown root or session, an unknown kind tag, a
+/// failed write), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_file_new_kind(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    kind: String,
+    title: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::files;
+    use keeper_core::sessions::shape::{KindTag, KINDS};
+
+    let tag = KINDS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.as_str() == kind.trim())
+        .ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("not a session file kind: {kind}"),
+            account_id: None,
+            retriable: false,
+        })?;
+    // `about` is the session's record, one per session, written by the template
+    // and edited in place — a second one would give `shape()` two answers.
+    if tag == KindTag::About {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: "a session has one about.md — open it rather than making a second.".to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let title = if title.trim().is_empty() {
+        // An untitled log still needs a slug, and "untitled" is what the
+        // migration already writes for an entry whose heading was left blank.
+        "untitled".to_owned()
+    } else {
+        title.trim().to_owned()
+    };
+    let dir = zone_root.join(&row.path);
+    let today = today();
+    let rel = files::new_stamped(&title, &today, &now_hhmm(), &taken_in(&dir));
+
+    let (zone_root, session_path, subpath) =
+        resolve_session_file(&state, &root_id, &session_id, &rel)?;
+    let content = files::render_new(
+        files::NewFileKind::Markdown,
+        Some(tag),
+        &title,
+        &crate::sync_ipc::new_ulid(),
+        &today,
+    );
+    let compiled = files::compile_new(&session_path, &rel, &content).map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("file-new-kind task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(subpath)
+}
+
+/// Remove one file from a session, recoverably.
+///
+/// A trash move into the zone's `.keeper/trash/<id>/`, never an unlink: a file
+/// in a session is something somebody wrote, and a delete button that erases
+/// bytes is one nobody presses without making a copy first.
+///
+/// `about.md` and `AGENTS.md` are refused by
+/// [`keeper_core::sessions::files::check_deletable`] — they are the two names
+/// `shape()` reads, so deleting one turns a flat session back into a
+/// folder-shaped one and hides every log behind a section that no longer exists.
+///
+/// Rejects with: `internal` (unknown root or session, a refused path, a failed
+/// move), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_file_delete(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    rel: String,
+) -> Result<(), IpcError> {
+    use keeper_core::sessions::files;
+
+    files::check_deletable(&rel).map_err(file_verb_error)?;
+    let (zone_root, session_path, _subpath) =
+        resolve_session_file(&state, &root_id, &session_id, &rel)?;
+    let compiled = files::compile_delete(&session_path, &rel, &crate::sync_ipc::new_ulid())
+        .map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("file-delete task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_file_new(
+    root_id: String,
+    session_id: String,
+    parent: String,
+    title: String,
+    kind: String,
+) -> Result<String, IpcError> {
+    let _ = (root_id, session_id, parent, title, kind);
+    Err(unsupported())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_file_new_kind(
+    root_id: String,
+    session_id: String,
+    kind: String,
+    title: String,
+) -> Result<String, IpcError> {
+    let _ = (root_id, session_id, kind, title);
+    Err(unsupported())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_file_delete(
+    root_id: String,
+    session_id: String,
+    rel: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, rel);
     Err(unsupported())
 }

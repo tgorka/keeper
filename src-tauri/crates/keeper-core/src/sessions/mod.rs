@@ -36,6 +36,7 @@
 //! promotion is the README's own table. Any state a Finder edit could desync
 //! is a design defect, not a feature.
 
+pub mod files;
 pub mod migrate;
 pub mod model;
 pub mod pattern;

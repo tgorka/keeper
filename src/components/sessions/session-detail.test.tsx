@@ -30,6 +30,12 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsSpacesRestore: vi.fn(),
   sessionsSpaceSave: vi.fn(),
   notesSpaceTerms: vi.fn(),
+  // The file verbs, for the same reason: the Files heading imports all three
+  // and the tree imports the fourth (FR-262).
+  sessionsFileNew: vi.fn(),
+  sessionsFileNewKind: vi.fn(),
+  sessionsFileDelete: vi.fn(),
+  sessionsLogToday: vi.fn(),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
@@ -109,6 +115,9 @@ function entry(over: Partial<SessionEntryVm> & Pick<SessionEntryVm, "name">): Se
     mtimeMs: NOW - 60_000,
     sync: { status: "synced", detail: null },
     locked: null,
+    // A directory is never deletable from this tree (FR-262); a file here is,
+    // unless a case says otherwise.
+    undeletable: over.isDir === true ? "Removing a folder is a Finder job." : null,
     ...over,
   };
 }

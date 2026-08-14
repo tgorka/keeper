@@ -16,14 +16,22 @@
  * - **Everything starts open, except below `workspace/`.** What a person opened
  *   a session to see is what is in it; what they did not is the twentieth file
  *   of a `node_modules` the agent installed — and scratch is where that lands.
- * - **No selection, no multi-select, no delete.** This is a review surface.
- *   The row's verbs are open, open-with, reveal — and that is the whole list.
+ * - **No selection and no multi-select.** The row's verbs are open, open-with,
+ *   reveal and delete, one row at a time. This used to say "and no delete", and
+ *   FR-262 is what changed the answer: a flat session is a pool a person adds
+ *   to constantly, and a surface that can only grow is one whose mistakes are
+ *   permanent. Deleting is still a single, confirmed, recoverable gesture — a
+ *   trash move — rather than the beginning of a file manager.
  *
  * Every fact on a row was decided in Rust: the `subpath` a file target is set
  * from (AD-65 — nothing here joins a path), the sync mark and its sentence
- * (the Files tab's own, from one `Engine::pending` answer), and `locked` — the
+ * (the Files tab's own, from one `Engine::pending` answer), `locked` — the
  * workspace fence's refusal sentence, on exactly the paths a write refuses
- * (AD-113). This file renders them and runs the keyboard.
+ * (AD-113) — and `undeletable`, which is `sessions::files::check_deletable`'s
+ * refusal on exactly the paths a delete refuses. The row draws its Delete when
+ * that is null and says the reason when it is not; **it never re-derives the
+ * rule**, so a fifth refusal added in Rust reaches this tree without anyone
+ * remembering to come here. This file renders them and runs the keyboard.
  */
 import {
   ChevronDown,
@@ -33,15 +41,27 @@ import {
   FolderOpen,
   Lock,
   SquareArrowOutUpRight,
+  Trash2,
 } from "lucide-react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionEntryVm } from "@/lib/ipc/client";
-import { revealPath, syncOpenEntry } from "@/lib/ipc/client";
+import { revealPath, sessionsFileDelete, syncOpenEntry } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
 /** The tree's accessible name. */
@@ -62,6 +82,23 @@ export const SESSION_TREE_TRUNCATED =
 export const SESSION_TREE_OPEN_LABEL = "Open in the panel";
 export const SESSION_TREE_OPEN_EXTERNAL_LABEL = "Open in the default app";
 export const SESSION_TREE_REVEAL_LABEL = "Reveal in Finder";
+export const SESSION_TREE_DELETE_LABEL = "Delete";
+
+/** The confirmation, and what it promises. */
+export const SESSION_TREE_DELETE_TITLE = "Delete this file?";
+
+/**
+ * The body, which says where the file goes rather than that it is gone.
+ *
+ * A trash move is recoverable and a person deciding deserves to know that — but
+ * the sentence stops short of "you can undo this", because recovery is Finder's
+ * job here and keeper has no button for it.
+ */
+export const SESSION_TREE_DELETE_BODY =
+  "keeper moves it to the trash, so it is recoverable from there. Any reference pointing at it will report it missing.";
+
+/** What a failed delete says when Rust has nothing more specific. */
+export const SESSION_TREE_DELETE_FAILED = "keeper couldn't delete that file. Nothing was changed.";
 
 /** One row, for tests that need to find one by path. */
 export const SESSION_TREE_ROW_TESTID = "session-tree-row";
@@ -135,21 +172,49 @@ export function initialOpenFolders(entries: SessionEntryVm[]): Set<string> {
 export interface SessionTreeProps {
   /** The profile id — a sessions root IS a profile (AD-107). */
   rootId: string;
+  /** Which session these files are in — the delete verb's other half. */
+  sessionId: string;
   entries: SessionEntryVm[];
   truncated: boolean;
   /** Open a file in the panel strip through the one file target (AD-109). */
   onOpen: (entry: SessionEntryVm) => void;
+  /** Re-read the surface after a delete, without waiting on the watcher. */
+  onChanged: () => void;
 }
 
-export function SessionTree({ rootId, entries, truncated, onOpen }: SessionTreeProps) {
+export function SessionTree({
+  rootId,
+  sessionId,
+  entries,
+  truncated,
+  onOpen,
+  onChanged,
+}: SessionTreeProps) {
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
   const [open, setOpen] = useState<Set<string>>(() => initialOpenFolders(entries));
   // The roving tabindex's memory: exactly one row is in the tab order, and it
   // is the last one focused rather than always the first — so Tab back into a
   // tree returns where the person left it (Story 43.8's rule).
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  // Which file the confirmation is about, `null` when it is closed. The entry
+  // rather than its path, so the dialog can name the file even after a re-read
+  // has removed the row that opened it.
+  const [deleting, setDeleting] = useState<SessionEntryVm | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
   const nowMs = Date.now();
+
+  const confirmDelete = useCallback(() => {
+    if (deleting === null) {
+      return;
+    }
+    const target = deleting;
+    setDeleting(null);
+    setNotice(null);
+    sessionsFileDelete(rootId, sessionId, target.relPath)
+      .then(onChanged)
+      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_TREE_DELETE_FAILED)));
+  }, [deleting, rootId, sessionId, onChanged]);
 
   const rows = useMemo(() => visibleRows(entries, open), [entries, open]);
   const active = rows.some((row) => row.relPath === activeKey)
@@ -383,6 +448,44 @@ export function SessionTree({ rootId, entries, truncated, onOpen }: SessionTreeP
                       <SquareArrowOutUpRight aria-hidden="true" className="size-3.5" />
                     </Button>
                   )}
+                  {/* Live exactly when Rust says the file is deletable, and
+                      DISABLED-with-the-reason when it is not (FR-262). Neither
+                      state is decided here: `undeletable` is
+                      `files::check_deletable`'s own refusal, so the button and
+                      the command cannot disagree, and a fifth rule added in
+                      Rust arrives with its sentence already written.
+
+                      A disabled button rather than no button, because the two
+                      files a person will actually try to delete — `about.md`
+                      and `AGENTS.md` — are the ones whose refusal is
+                      surprising, and a control that quietly is not there
+                      teaches nothing.
+
+                      `locked` is the one case that drops the button entirely:
+                      a `workspace/` file already carries the fence's sentence
+                      on the same row, and a disabled Delete would say scratch
+                      is scratch a second time (UX-DR43). Scratch is also one of
+                      the four refusals `check_deletable` states, so this is a
+                      choice about which of two identical sentences to show —
+                      not a rule re-derived here. */}
+                  {entry.locked === null && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      disabled={entry.undeletable !== null}
+                      tabIndex={active === entry.relPath ? 0 : -1}
+                      aria-label={entry.undeletable ?? `${SESSION_TREE_DELETE_LABEL} ${entry.name}`}
+                      title={entry.undeletable ?? SESSION_TREE_DELETE_LABEL}
+                      className="size-6 text-muted-foreground hover:text-destructive"
+                      onClick={() => {
+                        setNotice(null);
+                        setDeleting(entry);
+                      }}
+                    >
+                      <Trash2 aria-hidden="true" className="size-3.5" />
+                    </Button>
+                  )}
                 </span>
               )}
             </div>
@@ -394,6 +497,30 @@ export function SessionTree({ rootId, entries, truncated, onOpen }: SessionTreeP
           {SESSION_TREE_TRUNCATED}
         </p>
       )}
+      {notice !== null && (
+        <p role="status" className="px-2 text-destructive text-xs">
+          {notice}
+        </p>
+      )}
+
+      {/* The confirmation names the file, because "Delete this file?" over a
+          tree of forty rows is a question about which one. */}
+      <AlertDialog open={deleting !== null} onOpenChange={(next) => !next && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{SESSION_TREE_DELETE_TITLE}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleting?.relPath} — {SESSION_TREE_DELETE_BODY}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDelete}>
+              {SESSION_TREE_DELETE_LABEL}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

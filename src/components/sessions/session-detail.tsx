@@ -30,6 +30,7 @@
  */
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { SessionFileActions } from "@/components/sessions/session-file-actions";
 import { SESSION_REFS_HEADING, SessionRefs } from "@/components/sessions/session-refs";
 import { SessionSpaces } from "@/components/sessions/session-spaces";
 import { SessionTree } from "@/components/sessions/session-tree";
@@ -354,15 +355,31 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               structure, so this is both the map and the contents; anything
               above it would be read past. */}
           <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
-            <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
-              {SESSION_DETAIL_FILES_HEADING}
-            </h3>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                {SESSION_DETAIL_FILES_HEADING}
+              </h3>
+              {/* The verbs that GROW the pool, on the heading of the thing they
+                  grow (FR-262). They re-read through the same counter the
+                  spaces section bumps, so one write refreshes every read on
+                  this surface rather than each section keeping its own idea of
+                  what is on disk. */}
+              <SessionFileActions
+                rootId={rootId}
+                sessionId={sessionId}
+                shape={detail.shape}
+                entries={tree?.entries ?? []}
+                onChanged={() => setReload((n) => n + 1)}
+              />
+            </div>
             <p className="text-muted-foreground text-xs">{SESSION_DETAIL_WORKSPACE_CAVEAT}</p>
             <SessionTree
               rootId={rootId}
+              sessionId={sessionId}
               entries={tree?.entries ?? []}
               truncated={tree?.truncated ?? false}
               onOpen={openFile}
+              onChanged={() => setReload((n) => n + 1)}
             />
           </section>
 

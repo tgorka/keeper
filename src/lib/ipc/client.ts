@@ -5018,6 +5018,83 @@ export async function sessionsSpacesRestore(rootId: string): Promise<SessionSpac
   return await invoke<SessionSpacesRestoredVm>("sessions_spaces_restore", { rootId });
 }
 
+/** What {@link sessionsFileNew} will write. The set is closed in Rust. */
+export type SessionFileKind = "md" | "csv" | "json";
+
+/**
+ * Make one file inside a session (FR-262), and resolve with the profile-relative
+ * subpath that opens it.
+ *
+ * `parent` is session-relative and `""` for the session's own root — the pool,
+ * where a flat session's markdown belongs. The FILENAME is derived in Rust from
+ * `title`, against a directory listing read at that moment (AD-65): a name
+ * composed here would be a second namer, and the two would disagree about
+ * collisions the instant an agent wrote a file between the read and the create.
+ *
+ * A new `.md` declares no kind, so it lands in the detail's *unfiled* list and
+ * is told so — keeper does not know what an operator's new file is, and guessing
+ * `log` would file a stray thought as history. {@link sessionsFileNewKind} is
+ * the verb for the two it does know.
+ *
+ * Rejects with: `internal` (unknown root or session; a path inside `workspace/`,
+ * which is scratch keeper never writes to; an extension outside the closed set),
+ * `unsupported`.
+ */
+export async function sessionsFileNew(
+  rootId: string,
+  sessionId: string,
+  parent: string,
+  title: string,
+  kind: SessionFileKind,
+): Promise<string> {
+  return await invoke<string>("sessions_file_new", { rootId, sessionId, parent, title, kind });
+}
+
+/**
+ * Make a correctly-named, correctly-tagged log, prompt, ref or task in a flat
+ * session's pool (FR-262), and resolve with the subpath that opens it.
+ *
+ * **{@link sessionsLogToday}'s flat twin.** That command appends a dated heading
+ * to a folder-shaped session's `README.md`, which is where its log lives; a flat
+ * session has no `## Log` to append to and its log is a *file*. Callers pick on
+ * `detail.shape` rather than offering both — one verb, two contracts.
+ *
+ * The name (`YYYY-MM-DD-HHMM-slug.md`) and the frontmatter tag are what decide
+ * whether the zone's spaces will ever list the file, which is why keeper spells
+ * both rather than leaving them to whoever is typing.
+ *
+ * Rejects with: `internal` (unknown root or session, or `about` — a session has
+ * one record and a second would give the shape reader two answers),
+ * `unsupported`.
+ */
+export async function sessionsFileNewKind(
+  rootId: string,
+  sessionId: string,
+  kind: string,
+  title: string,
+): Promise<string> {
+  return await invoke<string>("sessions_file_new_kind", { rootId, sessionId, kind, title });
+}
+
+/**
+ * Remove one file from a session (FR-262) — a trash move, not an unlink.
+ *
+ * `rel` is session-relative, as it arrives on {@link SessionEntryVm}. `about.md`
+ * and `AGENTS.md` are refused: they are the two names the shape reader keys on,
+ * so deleting one turns a flat session back into a folder-shaped one and hides
+ * every log behind a section that no longer exists.
+ *
+ * Rejects with: `internal` (unknown root or session, a refused path, a file
+ * inside `workspace/`), `unsupported`.
+ */
+export async function sessionsFileDelete(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_file_delete", { rootId, sessionId, rel });
+}
+
 /**
  * Everything a new session can be shaped from (FR-253): the zone's own
  * `_template/` first, then every session in the root, newest change first.
