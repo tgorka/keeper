@@ -703,10 +703,21 @@ pub struct RepoStatus {
     pub deleted: Vec<PathBuf>,
     /// Paths on disk that git does not track.
     pub untracked: Vec<PathBuf>,
+    /// Tracked paths whose state could not be determined, and why.
+    ///
+    /// Empty in every ordinary pass. A non-empty vector means the status is a
+    /// report about the *rest* of the folder: these paths were stepped over so
+    /// the others could be answered at all. See [`status_paths`].
+    pub unreadable: Vec<UnreadablePath>,
 }
 
 impl RepoStatus {
     /// Whether anything at all differs.
+    ///
+    /// Deliberately blind to [`Self::unreadable`]: a path nobody can read is
+    /// not a change to synchronize, and answering "yes, something differs"
+    /// because of one would send the commit path off to stage a file it cannot
+    /// open. The condition is reported, not converged.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.modified.is_empty()
@@ -714,6 +725,32 @@ impl RepoStatus {
             && self.untracked.is_empty()
     }
 }
+
+/// A tracked path the engine could not read, and the reason it could not.
+///
+/// `reason` is an errno rendering — "Permission denied (os error 13)" — never
+/// file content, so it is safe in a log and in the UI (AD-21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadablePath {
+    /// Repository-relative.
+    pub path: PathBuf,
+    /// What the filesystem said.
+    pub reason: String,
+}
+
+impl std::fmt::Display for UnreadablePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.path.display(), self.reason)
+    }
+}
+
+/// How many unreadable paths one pass will step over before giving up.
+///
+/// A handful of them is a permissions accident and worth working around. A
+/// thousand is a different fault — an unmounted subtree, a revoked group, a
+/// failing disk — and quietly synchronizing "everything except those thousand
+/// files" would be a worse answer than refusing, because it looks like success.
+const MAX_UNREADABLE_SKIPPED: usize = 32;
 
 /// Classify everything `gix::status` reports.
 ///
@@ -737,7 +774,150 @@ impl RepoStatus {
 /// `.gitignore`, `.git/info/exclude` and the global excludes file correctly.
 /// It costs one entry per untracked file instead of one per directory — the
 /// same paths the caller had to produce anyway.
+/// # One unreadable file does not cost the folder its synchronization
+///
+/// gitoxide reports a per-entry IO failure by aborting the whole walk: the
+/// error surfaces only when the worker thread is joined, after every successful
+/// item has already been yielded, so there is no "skip it and keep going" for
+/// the caller to take. One file whose read fails therefore used to fail every
+/// pass — and because `collect_stable_changes` propagates that, a single
+/// unreadable path stalled the entire profile indefinitely. Two machines hit it
+/// in the field within a day of each other, one of them for sixteen consecutive
+/// passes with nothing else syncing.
+///
+/// That is the failure NFR-24 and FR-89 exist to forbid: convergence must not
+/// wait on a human. So a failing status is not the answer here, it is the
+/// question. [`unreadable_tracked_paths`] finds which paths cannot be read, and
+/// the walk is repeated with those excluded by pathspec, which gitoxide honours
+/// before it ever opens them. The result describes the rest of the folder
+/// truthfully and names what it had to step over in [`RepoStatus::unreadable`],
+/// so the engine can raise it with the user while everything else converges.
+///
+/// The fallback matters as much as the mechanism: when the diagnosis finds
+/// nothing — a file that opens but fails mid-read, a disk failing under the
+/// hash — the original error is returned unchanged rather than a guess.
+/// # The diagnosis is remembered, because it costs a walk of the whole index
+///
+/// Finding the bad path means one `lstat` and one `open` per tracked entry:
+/// about six seconds on the 154 000-file profile this was found on, and it is a
+/// removable USB volume. The condition persists until a human fixes it, and the
+/// durability probe asks for a status roughly once a second while a recording
+/// runs — so re-diagnosing per call would peg a core and thrash the disk for as
+/// long as the file stayed broken.
+///
+/// So the answer is memoized per repository. A pass with a remembered set
+/// excludes it up front and never scans at all; only a status that fails
+/// *anyway* pays for a fresh walk. The memo is keyed by git directory rather
+/// than by profile because being unreadable is a property of the disk, not of
+/// whoever is asking.
+///
+/// It re-verifies before it trusts itself: every remembered path is re-checked
+/// each pass — at most [`MAX_UNREADABLE_SKIPPED`] of them, so the check is
+/// bounded — and one that has become readable is dropped, which is what lets a
+/// file return to synchronization the moment its permissions are restored,
+/// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
+    let known = still_unreadable(repo, remembered_unreadable(repo));
+    let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
+
+    let status = match status_paths_excluding(repo, &skip) {
+        Ok(mut status) => {
+            status.unreadable = known;
+            status
+        }
+        Err(first) => {
+            let found = unreadable_tracked_paths(repo);
+            if found.is_empty() {
+                // Nothing to blame, so nothing to work around. The caller gets
+                // the real error rather than a story about a path we invented.
+                remember_unreadable(repo, &[]);
+                return Err(first);
+            }
+            if found.len() > MAX_UNREADABLE_SKIPPED {
+                tracing::warn!(
+                    count = found.len(),
+                    "too many unreadable paths to step over; reporting the failure instead"
+                );
+                remember_unreadable(repo, &[]);
+                return Err(first);
+            }
+            let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
+            let mut status = status_paths_excluding(repo, &skip)?;
+            for item in &found {
+                tracing::warn!(path = %item.path.display(), reason = %item.reason,
+                    "this file could not be read; the rest of the folder was synchronized without it");
+            }
+            status.unreadable = found;
+            status
+        }
+    };
+
+    remember_unreadable(repo, &status.unreadable);
+    Ok(status)
+}
+
+/// Unreadable paths already diagnosed for a repository, keyed by git directory.
+///
+/// A process-wide memo rather than engine state on purpose: all three callers
+/// of [`status_paths`] would otherwise have to thread and agree on the same
+/// set, and the thing being remembered belongs to the repository either way.
+/// Bounded twice over — one entry per repository this process has synchronized,
+/// each holding at most [`MAX_UNREADABLE_SKIPPED`] paths.
+static UNREADABLE_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<UnreadablePath>>>,
+> = std::sync::OnceLock::new();
+
+fn unreadable_memo(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<UnreadablePath>>> {
+    UNREADABLE_MEMO.get_or_init(Default::default)
+}
+
+fn remembered_unreadable(repo: &gix::Repository) -> Vec<UnreadablePath> {
+    match unreadable_memo().lock() {
+        Ok(memo) => memo.get(repo.git_dir()).cloned().unwrap_or_default(),
+        // A poisoned memo is a cache miss, never a failed sync: the worst it
+        // costs is the walk it existed to avoid.
+        Err(_) => Vec::new(),
+    }
+}
+
+fn remember_unreadable(repo: &gix::Repository, unreadable: &[UnreadablePath]) {
+    let Ok(mut memo) = unreadable_memo().lock() else {
+        return;
+    };
+    if unreadable.is_empty() {
+        memo.remove(repo.git_dir());
+    } else {
+        memo.insert(repo.git_dir().to_path_buf(), unreadable.to_vec());
+    }
+}
+
+/// Which of `known` still cannot be read, with a refreshed reason.
+fn still_unreadable(repo: &gix::Repository, known: Vec<UnreadablePath>) -> Vec<UnreadablePath> {
+    if known.is_empty() {
+        return known;
+    }
+    let Ok(workdir) = workdir(repo) else {
+        return Vec::new();
+    };
+    known
+        .into_iter()
+        .filter_map(|item| {
+            why_unreadable(&workdir.join(&item.path)).map(|reason| UnreadablePath {
+                path: item.path,
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// [`status_paths`], with `skip` held out of the walk entirely.
+///
+/// The exclusions are spelled `:(exclude,literal)<path>`: `literal` because a
+/// synced folder is full of names that are also glob syntax — `[2026]`, `*`,
+/// `?` all occur in real user content — and a pattern that quietly matched more
+/// than the one path it names would hide unrelated files from every pass.
+fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
@@ -753,8 +933,16 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
                 dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
             }
         });
+    let patterns: Vec<gix::bstr::BString> = skip
+        .iter()
+        .map(|path| {
+            let mut pattern = gix::bstr::BString::from(":(exclude,literal)");
+            pattern.extend_from_slice(&gix::path::into_bstr(path.as_path()));
+            pattern
+        })
+        .collect();
     let iter = platform
-        .into_iter(None)
+        .into_iter(patterns)
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
 
     let mut out = RepoStatus::default();
@@ -825,6 +1013,76 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
         bucket.dedup();
     }
     Ok(out)
+}
+
+/// Tracked paths that cannot be read right now, and what the filesystem said.
+///
+/// Only ever reached after a status has already failed, which is what makes the
+/// cost defensible: it is one `lstat` and one `open` per tracked entry, no
+/// content is read, and nothing calls it on a healthy repository.
+///
+/// # What it can and cannot catch
+///
+/// An `open` proves the file can be *started*, not finished. A disk failing
+/// mid-file, or a file truncated between the stat and the read, still fails the
+/// status and is invisible here — deliberately, because the alternative is
+/// reading every tracked byte to find out. [`status_paths`] returns the
+/// original error when this finds nothing, so an undiagnosable failure stays
+/// exactly as loud as it was.
+///
+/// A missing path is not unreadable: a deleted file is an ordinary change and
+/// status reports it as one. Only an error that is *not* `NotFound` counts.
+fn unreadable_tracked_paths(repo: &gix::Repository) -> Vec<UnreadablePath> {
+    let Ok(workdir) = workdir(repo) else {
+        return Vec::new();
+    };
+    let Ok(index) = repo.index_or_empty() else {
+        return Vec::new();
+    };
+    let state = &*index;
+
+    let mut out: Vec<UnreadablePath> = Vec::new();
+    for entry in state.entries() {
+        let rela = to_path(entry.path(state));
+        if let Some(reason) = why_unreadable(&workdir.join(&rela)) {
+            out.push(UnreadablePath { path: rela, reason });
+            // One past the ceiling is enough to prove the ceiling was breached,
+            // and stops a failing volume from being walked to its end.
+            if out.len() > MAX_UNREADABLE_SKIPPED {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Why `absolute` cannot be read, or `None` if it can.
+fn why_unreadable(absolute: &Path) -> Option<String> {
+    let metadata = match std::fs::symlink_metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => return Some(err.to_string()),
+    };
+
+    if metadata.is_symlink() {
+        // The blob of a symlink is its target, so reading the link is the whole
+        // of what staging it needs.
+        return match std::fs::read_link(absolute) {
+            Ok(_) => None,
+            Err(err) => Some(err.to_string()),
+        };
+    }
+    if !metadata.is_file() {
+        // A directory or device where a file is tracked is a different
+        // condition with its own error, and not one an exclusion would fix.
+        return None;
+    }
+    match std::fs::File::open(absolute) {
+        Ok(_) => None,
+        // Gone between the two syscalls: an ordinary deletion, not a fault.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(err.to_string()),
+    }
 }
 
 /// The commit `HEAD` resolves to, or `None` on an unborn branch.

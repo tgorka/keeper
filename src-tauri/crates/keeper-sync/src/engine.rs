@@ -3708,6 +3708,36 @@ impl Engine {
         }
     }
 
+    /// Raise the paths this pass could not read, if any.
+    ///
+    /// These need a human — a permission has to be restored, a file has to be
+    /// released by whatever holds it, or the path has to be excluded — so this
+    /// goes to the warning surface rather than the log alone. The engine keeps
+    /// converging everything else meanwhile, which is the whole point of
+    /// stepping over them (FR-89: convergence never waits on a prompt).
+    ///
+    /// One profile carries one warning string, so a second unreadable path
+    /// cannot have its own line. It is counted rather than dropped: "and 3
+    /// more" is the difference between a user who knows to keep looking and one
+    /// who fixes a single file and assumes they are done.
+    fn report_unreadable(&self, profile: &SyncProfile, unreadable: &[git::repo::UnreadablePath]) {
+        let Some(first) = unreadable.first() else {
+            return;
+        };
+        let others = match unreadable.len() - 1 {
+            0 => String::new(),
+            rest => format!(", and {rest} more"),
+        };
+        self.warn(
+            &profile.id,
+            &profile.name,
+            format!(
+                "could not read {first}{others} — everything else in this folder synchronized \
+                 without it; restore access to the file or exclude it",
+            ),
+        );
+    }
+
     /// Walk the working tree and keep only what the completeness gate passes.
     ///
     /// Blocking, and deliberately synchronous: it is pure filesystem work with
@@ -3732,6 +3762,12 @@ impl Engine {
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
         let status = git::repo::status_paths(&repo)?;
+        // The pass only got this far because those paths were stepped over, and
+        // a folder that syncs while quietly omitting a file is the one outcome
+        // worse than a folder that stops: nobody looks for what they were not
+        // told about. Raised here rather than in `git::repo` because this is the
+        // layer that knows which profile is speaking.
+        self.report_unreadable(profile, &status.unreadable);
         let now = self.platform.now_ms();
 
         let mut gates = Self::lock(&self.gates);
