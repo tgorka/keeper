@@ -21,7 +21,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { SessionActions } from "@/components/sessions/session-actions";
 import { SessionDetail } from "@/components/sessions/session-detail";
-import { SessionPatternPicker } from "@/components/sessions/session-pattern-picker";
+import {
+  SESSION_PATTERN_INSTALL_FAILED,
+  SESSION_PATTERN_INSTALL_TITLE,
+  SessionPatternPicker,
+} from "@/components/sessions/session-pattern-picker";
 import { SessionRow } from "@/components/sessions/session-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,7 +33,12 @@ import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { SessionPatternVm, SessionRowVm } from "@/lib/ipc/client";
-import { sessionsCreate, sessionsPatterns, sessionsRescan } from "@/lib/ipc/client";
+import {
+  sessionsCreate,
+  sessionsPatterns,
+  sessionsRescan,
+  sessionsTemplateInstall,
+} from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 import {
   filterRows,
@@ -41,6 +50,7 @@ import {
   useActiveSessionsRoot,
   useSessionsRootsStore,
 } from "@/lib/stores/sessions-roots";
+import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The pane's heading, and the accessible name of the surface itself. */
 export const SESSIONS_PANE_TITLE = "Sessions";
@@ -176,7 +186,12 @@ export function SessionsPane() {
   const rowsRootId = useSessionsListStore((s) => s.rowsRootId);
   const rowCount = rows?.length ?? 0;
   const rootId = activeRoot?.id ?? null;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `rowsRootId`/`rowCount` are re-run triggers, not reads — the zone's changed event re-reads the rows, and this re-reads the patterns behind them so an open picker cannot offer an id the shell no longer resolves.
+  // Writing keeper's template into the zone creates a pattern without creating
+  // a session, so the rows never move and the re-read above never fires. The
+  // nonce is that missing signal — one number, bumped by the only verb that
+  // needs it, rather than a second copy of the read with its own defaulting.
+  const [installNonce, setInstallNonce] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `rowsRootId`/`rowCount`/`installNonce` are re-run triggers, not reads — the zone's changed event re-reads the rows, and this re-reads the patterns behind them so an open picker cannot offer an id the shell no longer resolves.
   useEffect(() => {
     if (!creating || rootId === null) {
       return;
@@ -202,7 +217,29 @@ export function SessionsPane() {
     };
     // `rowsRootId`/`rowCount` are the zone's own change signal, mirrored: the
     // changed event re-reads the rows, which re-reads the patterns.
-  }, [creating, rootId, rowsRootId, rowCount]);
+  }, [creating, rootId, rowsRootId, rowCount, installNonce]);
+
+  // Adopt keeper's default as the zone's own `_template/` (FR-268). The picker
+  // decides whether to offer this — it holds the list that answers "does this
+  // zone have a template" — and the pane owns the call, because the pane owns
+  // the read that has to happen afterwards. The write goes through the same
+  // plan/journal/exec path every lifecycle verb uses, so the zone's history
+  // records it exactly as it records a create.
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const installTemplate = useCallback(() => {
+    if (rootId === null) {
+      return;
+    }
+    setInstalling(true);
+    setInstallError(null);
+    sessionsTemplateInstall(rootId, undefined, SESSION_PATTERN_INSTALL_TITLE)
+      .then(() => setInstallNonce((n) => n + 1))
+      .catch((raw: unknown) =>
+        setInstallError(syncErrorMessage(raw, SESSION_PATTERN_INSTALL_FAILED)),
+      )
+      .finally(() => setInstalling(false));
+  }, [rootId]);
 
   const closeCreate = useCallback(() => {
     setCreating(false);
@@ -300,7 +337,14 @@ export function SessionsPane() {
               {SESSIONS_NEW_CONFIRM_LABEL}
             </Button>
           </div>
-          <SessionPatternPicker patterns={patterns} value={patternId} onChange={setPatternId} />
+          <SessionPatternPicker
+            patterns={patterns}
+            value={patternId}
+            onChange={setPatternId}
+            onInstallTemplate={installTemplate}
+            installing={installing}
+            installError={installError}
+          />
         </div>
       )}
 

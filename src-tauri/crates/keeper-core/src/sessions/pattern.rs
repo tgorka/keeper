@@ -95,8 +95,27 @@ pub struct PatternOutcome {
     pub skips: Vec<(String, SkipReason)>,
 }
 
-/// The four directories every session has, whether or not the source did.
+/// The four directories a **folder-shaped** session has, whether or not the
+/// source did.
 const STANDARD_DIRS: [&str; 4] = ["workspace", "artifacts", "refs", "prompts"];
+
+/// The two a **flat** one has (FR-268).
+///
+/// `refs/` and `prompts/` are gone because in the flat contract they are tag
+/// queries, not places — creating them empty would put two directories in a new
+/// session that `AGENTS.md` says not to create, which is a contradiction the
+/// operator would meet on their first session and reasonably read as a bug.
+/// `artifacts/` and `workspace/` stay: their difference is about versioning,
+/// not about kind, so no tag can replace them.
+const FLAT_DIRS: [&str; 2] = ["workspace", "artifacts"];
+
+/// The directories a new session of this shape starts with.
+pub fn standard_dirs(shape: super::shape::Shape) -> &'static [&'static str] {
+    match shape {
+        super::shape::Shape::Flat => &FLAT_DIRS,
+        super::shape::Shape::Folder => &STANDARD_DIRS,
+    }
+}
 
 /// Whether a path is a placeholder rather than content — the `.gitkeep` rule
 /// [`super::model::freshness`] already applies to activity, applied here to
@@ -237,21 +256,55 @@ pub fn without_dirs(source: &[(String, bool)], dirs: &[String]) -> Vec<(String, 
 /// to explain.
 ///
 /// **Session** (FR-239): `prompts/**` (reusable by design) and `refs/**`
-/// (pointers worth keeping) travel; the four standard directories exist
-/// empty; artifacts, workspace, the README and any loose file stay behind,
-/// each named with its reason.
+/// (pointers worth keeping) travel; the standard directories for the source's
+/// shape exist empty; artifacts, workspace, the record and any loose file stay
+/// behind, each named with its reason.
+///
+/// The shape is derived from the source's own top-level names, so a
+/// continuation inherits the contract of what it continues — a flat session
+/// begets a flat one and never sprouts the two directories its `AGENTS.md`
+/// tells the reader not to create.
 pub fn apply(kind: PatternKind, source: &[(String, bool)]) -> PatternOutcome {
+    apply_with_kinds(kind, source, |_| None)
+}
+
+/// [`apply`], told what each flat file *is*.
+///
+/// In the folder contract a file's kind is its directory, so `prompts/**` and
+/// `refs/**` can be recognised from the path alone. In the flat contract the
+/// kind is a tag inside the file, and a path cannot answer it: two markdown
+/// files sitting side by side at the session root can be a reusable prompt and
+/// last Tuesday's log. `kind_of` is how the caller — which has already parsed
+/// the pool — answers that without this module doing IO.
+///
+/// A caller that cannot answer passes a closure returning `None`, which is
+/// exactly [`apply`]: every loose file then stays behind with `Loose`. That is
+/// the conservative direction. Leaving a prompt out of a continuation is a
+/// missing file the operator can copy in; carrying last week's log into a fresh
+/// session is a false record, and false records are the failure this whole
+/// shape exists to prevent.
+pub fn apply_with_kinds(
+    kind: PatternKind,
+    source: &[(String, bool)],
+    kind_of: impl Fn(&str) -> Option<super::shape::KindTag>,
+) -> PatternOutcome {
+    let top_level: Vec<String> = source
+        .iter()
+        .filter(|(rel, _)| !rel.contains('/'))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    let shape = super::shape::shape(&top_level);
     let mut out = PatternOutcome::default();
     if kind == PatternKind::Session {
-        for dir in STANDARD_DIRS {
-            out.copies.push((dir.to_owned(), true));
+        for dir in standard_dirs(shape) {
+            out.copies.push(((*dir).to_owned(), true));
         }
     }
     for (rel, is_dir) in source {
         if out.copies.iter().any(|(existing, _)| existing == rel) {
             continue;
         }
-        match fate(kind, rel) {
+        match fate(kind, shape, rel, &kind_of) {
             None => out.copies.push((rel.clone(), *is_dir)),
             Some(reason) => {
                 // A skipped directory is silent — what the reader cares about
@@ -268,11 +321,30 @@ pub fn apply(kind: PatternKind, source: &[(String, bool)]) -> PatternOutcome {
 }
 
 /// The per-path decision: `None` travels, `Some(reason)` stays.
-fn fate(kind: PatternKind, rel: &str) -> Option<SkipReason> {
-    if rel == super::model::README {
+fn fate(
+    kind: PatternKind,
+    shape: super::shape::Shape,
+    rel: &str,
+    kind_of: &impl Fn(&str) -> Option<super::shape::KindTag>,
+) -> Option<SkipReason> {
+    // The record is stamped, never copied — in either contract, and from
+    // either kind of pattern. `about.md` joins `README.md` here because it is
+    // the same file under a different name: a flat template whose `about.md`
+    // travelled verbatim would hand every new session the template's title and
+    // the template's date, which is exactly the thing stamping exists to
+    // prevent.
+    if rel == super::model::README || rel == super::shape::ABOUT {
         return Some(SkipReason::Record);
     }
+    // `AGENTS.md` is deliberately NOT a record. It is the navigation contract,
+    // and a zone that edited its own copy meant it — keeper stamps its default
+    // only when the pattern did not supply one, the same way it treats every
+    // other file the operator owns.
     if kind == PatternKind::Template {
+        return None;
+    }
+    // A continuation inherits the contract it continues, edits included.
+    if rel == super::shape::AGENTS {
         return None;
     }
     if in_dir(rel, "prompts") || in_dir(rel, "refs") {
@@ -283,6 +355,14 @@ fn fate(kind: PatternKind, rel: &str) -> Option<SkipReason> {
     }
     if in_dir(rel, "workspace") {
         return Some(SkipReason::Scratch);
+    }
+    // A flat pool file travels on what it declares, not on where it sits: the
+    // same two kinds the folder contract carries by directory.
+    if shape == super::shape::Shape::Flat {
+        return match kind_of(rel) {
+            Some(super::shape::KindTag::Prompt) | Some(super::shape::KindTag::Ref) => None,
+            _ => Some(SkipReason::Loose),
+        };
     }
     Some(SkipReason::Loose)
 }
@@ -332,6 +412,11 @@ mod tests {
         for dir in STANDARD_DIRS {
             assert!(copied.contains(&dir), "{dir} exists in every new session");
         }
+        assert_eq!(
+            standard_dirs(super::super::shape::Shape::Folder),
+            STANDARD_DIRS,
+            "a folder-shaped source keeps all four"
+        );
         assert!(!copied.contains(&"artifacts/final-report.md"));
         assert!(!copied.contains(&"workspace/scratch.csv"));
         assert!(!copied.contains(&"README.md"));
@@ -504,14 +589,141 @@ mod tests {
         let trimmed = without_dirs(&source, &["house".to_owned()]);
         let out = apply(PatternKind::Template, &trimmed);
         let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
-        assert_eq!(
-            copied,
-            vec!["AGENTS.md", "about.md", "refs", "refs/.gitkeep"]
-        );
+        // `about.md` is absent because it is the record under its flat name and
+        // gets restamped with this session's own title and date — copying the
+        // template's would name every new session after the template.
+        assert_eq!(copied, vec!["AGENTS.md", "refs", "refs/.gitkeep"]);
         // Not "left behind with a reason" either — a named template is not a
         // file this session refused, it is a different pattern entirely, and
         // listing it as a skip would put it in the preview's "Leaves behind".
         assert!(!out.skips.iter().any(|(rel, _)| rel.starts_with("house")));
+    }
+
+    /// A flat source begets a flat session (FR-268): two directories, not
+    /// four. Creating `refs/` and `prompts/` here would put in a brand-new
+    /// session exactly the two directories its own `AGENTS.md` tells the reader
+    /// not to create — a contradiction the operator meets on day one and would
+    /// reasonably read as a bug.
+    #[test]
+    fn a_flat_source_begets_a_flat_session_with_two_directories() {
+        let out = apply(
+            PatternKind::Session,
+            &files(&[
+                ("AGENTS.md", false),
+                ("about.md", false),
+                ("2026-08-12-0930-opened.md", false),
+                ("artifacts", true),
+                ("artifacts/report.pdf", false),
+                ("workspace", true),
+            ]),
+        );
+        let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(copied, vec!["AGENTS.md", "artifacts", "workspace"]);
+        assert!(
+            !copied.contains(&"refs") && !copied.contains(&"prompts"),
+            "the flat contract has no kind directories — kinds are tags"
+        );
+    }
+
+    /// In the flat pool a file's kind is a tag, so the path cannot answer what
+    /// travels. Told the kinds, `apply` carries the same two it carries by
+    /// directory in the folder shape — and nothing else.
+    #[test]
+    fn a_flat_file_travels_on_what_it_declares_not_where_it_sits() {
+        use super::super::shape::KindTag;
+
+        let source = files(&[
+            ("AGENTS.md", false),
+            ("about.md", false),
+            ("house-style.md", false),
+            ("reading-list.md", false),
+            ("2026-08-12-0930-opened.md", false),
+            ("ship-it.md", false),
+            ("loose.md", false),
+            ("workspace", true),
+        ]);
+        let out = apply_with_kinds(PatternKind::Session, &source, |rel| match rel {
+            "house-style.md" => Some(KindTag::Prompt),
+            "reading-list.md" => Some(KindTag::Ref),
+            "2026-08-12-0930-opened.md" => Some(KindTag::Log),
+            "ship-it.md" => Some(KindTag::Task),
+            _ => None,
+        });
+        let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            copied,
+            vec![
+                "AGENTS.md",
+                "artifacts",
+                "house-style.md",
+                "reading-list.md",
+                "workspace"
+            ]
+        );
+
+        let reason = |path: &str| {
+            out.skips
+                .iter()
+                .find(|(rel, _)| rel == path)
+                .map(|(_, reason)| *reason)
+        };
+        // A log is the previous session's record of its own sittings, and a
+        // task is that session's state — carrying either forward would make the
+        // new session's board a lie the moment it opened.
+        assert_eq!(reason("2026-08-12-0930-opened.md"), Some(SkipReason::Loose));
+        assert_eq!(reason("ship-it.md"), Some(SkipReason::Loose));
+        assert_eq!(reason("loose.md"), Some(SkipReason::Loose));
+        assert_eq!(reason("about.md"), Some(SkipReason::Record));
+    }
+
+    /// The conservative default: a caller that cannot classify the pool leaves
+    /// every loose file behind rather than guessing. A missing prompt is a file
+    /// the operator copies in; a carried-over log is a false record, and false
+    /// records are the failure the flat shape exists to prevent.
+    #[test]
+    fn an_unclassified_flat_pool_carries_nothing_loose() {
+        let out = apply(
+            PatternKind::Session,
+            &files(&[
+                ("AGENTS.md", false),
+                ("about.md", false),
+                ("house-style.md", false),
+            ]),
+        );
+        let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(copied, vec!["AGENTS.md", "artifacts", "workspace"]);
+        assert!(out
+            .skips
+            .iter()
+            .any(|(rel, reason)| rel == "house-style.md" && *reason == SkipReason::Loose));
+    }
+
+    /// The two files keeper stamps are the two it must not copy: `about.md`
+    /// carries the source's title and date, and copying it would hand every new
+    /// session someone else's record. `AGENTS.md` travels, because an edited
+    /// navigation contract is the operator's and keeper does not improve on it.
+    #[test]
+    fn the_record_never_travels_under_either_name_but_the_contract_does() {
+        for kind in [PatternKind::Session, PatternKind::Template] {
+            let out = apply(
+                kind,
+                &files(&[
+                    ("AGENTS.md", false),
+                    ("about.md", false),
+                    ("README.md", false),
+                ]),
+            );
+            let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
+            assert!(copied.contains(&"AGENTS.md"), "{kind:?} keeps the contract");
+            assert!(
+                !copied.contains(&"about.md"),
+                "{kind:?} restamps the record"
+            );
+            assert!(
+                !copied.contains(&"README.md"),
+                "{kind:?} restamps the record"
+            );
+        }
     }
 
     /// A placeholder is copied but never counted — an empty `refs/` that

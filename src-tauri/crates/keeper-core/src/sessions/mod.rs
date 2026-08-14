@@ -49,6 +49,7 @@ pub mod search;
 pub mod shape;
 pub mod spaces;
 pub mod tasks;
+pub mod template;
 pub mod vm;
 
 /// Everything the sessions domain can refuse to do.

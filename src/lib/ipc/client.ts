@@ -5192,6 +5192,39 @@ export async function sessionsSpacesRestore(rootId: string): Promise<SessionSpac
   return await invoke<SessionSpacesRestoredVm>("sessions_spaces_restore", { rootId });
 }
 
+/**
+ * Write keeper's own default template into this zone (FR-268), and resolve with
+ * the zone-relative folder it landed in.
+ *
+ * A zone that has a `_template/` is never touched by a create — keeper copies
+ * what it finds and does not improve on it — so adopting an updated default is
+ * something you ask for. This is the ask.
+ *
+ * `name` is `undefined` for the zone's own `_template/` and a label for a named
+ * one, which is how a zone keeps its template *and* gains keeper's beside it.
+ * `title` is what the seeded record and log are written about; it is a template,
+ * so a placeholder is the honest default.
+ *
+ * Anything already there under one of the template's four names is moved to
+ * `.keeper/trash/` before it is rewritten — an `AGENTS.md` somebody improved by
+ * hand is recoverable, not gone — and files the template does not name are left
+ * alone.
+ *
+ * Rejects with: `internal` (unknown zone, a name with nothing to slug, a failed
+ * write), `unsupported`.
+ */
+export async function sessionsTemplateInstall(
+  rootId: string,
+  name: string | undefined,
+  title: string,
+): Promise<string> {
+  return await invoke<string>("sessions_template_install", {
+    rootId,
+    name: name ?? null,
+    title,
+  });
+}
+
 /** What {@link sessionsFileNew} will write. The set is closed in Rust. */
 export type SessionFileKind = "md" | "csv" | "json";
 

@@ -534,6 +534,41 @@ fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
     out
 }
 
+/// What each root markdown file of a **flat** pattern declares itself to be
+/// (FR-268, AD-120).
+///
+/// The flat contract puts a file's kind in its frontmatter, so the question
+/// "does this file travel into a new session" cannot be answered from the path
+/// the way `prompts/**` answers it in the folder contract. The domain decides
+/// what each kind means; this only reads the bytes it needs to ask (AD-108).
+///
+/// Bounded on purpose. Only root markdown is read — a flat session's pool is
+/// however much prose the operator wrote, while `artifacts/` and `workspace/`
+/// are decided by path and never opened, which is what keeps "make a session
+/// like this one" from costing a walk of a folder holding a video render. An
+/// unreadable file is simply absent from the map, and an absent kind is
+/// `Loose`: it stays behind, which is the safe direction.
+#[cfg(desktop)]
+fn flat_kinds(
+    dir: &std::path::Path,
+    files: &[(String, bool)],
+) -> std::collections::BTreeMap<String, keeper_core::sessions::shape::KindTag> {
+    use keeper_core::sessions::pool::{read_one, PoolFile};
+
+    files
+        .iter()
+        .filter(|(rel, is_dir)| !*is_dir && !rel.contains('/') && rel.ends_with(".md"))
+        .filter_map(|(rel, _)| {
+            let text = std::fs::read_to_string(dir.join(rel)).ok()?;
+            let entry = read_one(PoolFile {
+                rel,
+                text: text.as_str(),
+            });
+            entry.kind.map(|kind| (rel.clone(), kind))
+        })
+        .collect()
+}
+
 /// The named templates a zone offers (FR-266): every `_template/<name>/` that
 /// holds a record file, in name order.
 ///
@@ -617,7 +652,14 @@ fn pattern_vm(
 
     let files = pattern::without_dirs(&pattern_files(dir), excluded);
     let mtime_ms = newest_mtime_ms(dir, &files);
-    let outcome = pattern::apply(kind, &files);
+    // The same kinds the create path reads, for the same reason: the preview
+    // and the plan are one value rendered twice, so a flat pattern previewed
+    // without its kinds would promise to leave behind prompts the create then
+    // copies. Whether it is flat is `apply_with_kinds`' own question; an empty
+    // map for a folder-shaped pattern costs one `is_dir` scan and changes
+    // nothing.
+    let kinds = flat_kinds(dir, &files);
+    let outcome = pattern::apply_with_kinds(kind, &files, |rel| kinds.get(rel).copied());
     SessionPatternVm {
         id: id.to_owned(),
         kind: kind.as_str().to_owned(),
@@ -764,7 +806,7 @@ pub async fn sessions_create(
     pattern_id: Option<String>,
 ) -> Result<keeper_core::sessions::vm::SessionRefVm, IpcError> {
     use keeper_core::sessions::pattern::{self, PatternKind};
-    use keeper_core::sessions::{model, plan};
+    use keeper_core::sessions::{model, plan, template};
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let title = title.trim().to_owned();
@@ -809,34 +851,114 @@ pub async fn sessions_create(
         Vec::new()
     };
 
-    // The stamped README: the pattern's own headings, empty, with the title
-    // and date in place. A template README that grows a section grows it for
-    // every new session; a continued session inherits the shape it earned.
-    let pattern_readme = std::fs::read_to_string(pattern_dir.join(model::README))
-        .unwrap_or_else(|_| "# <session title>\n\n## Summary\n\n## Log\n\n## Promote\n\n| workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n".to_owned());
-    let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(&pattern_readme);
-    let body = plan::skeleton_from(&pattern_readme[body_at..], &title, &date);
+    // Which contract the new session is born into: the pattern's own. A flat
+    // template begets a flat session and a folder-shaped one begets a folder —
+    // the shape is a property of the thing being copied, never a preference
+    // asked of the user, because a session whose files say one thing and whose
+    // shape says another is unreadable by both readers.
+    let pattern_files = pattern::without_dirs(&pattern_files(&pattern_dir), &excluded);
+    let pattern_top: Vec<String> = pattern_files
+        .iter()
+        .filter(|(rel, _)| !rel.contains('/'))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    let shape = keeper_core::sessions::shape::shape(&pattern_top);
+    let flat = shape == keeper_core::sessions::shape::Shape::Flat;
+
+    // The stamped record. Folder-shaped: the pattern's own headings, empty,
+    // with the title and date in place — a template README that grows a section
+    // grows it for every new session, and a continued session inherits the
+    // shape it earned. Flat: the same idea against `about.md`, falling back to
+    // the shipped default (FR-268) when the pattern has none to inherit from.
+    let record_name = if flat {
+        keeper_core::sessions::shape::ABOUT
+    } else {
+        model::README
+    };
+    let pattern_record = std::fs::read_to_string(pattern_dir.join(record_name)).ok();
+    let body = match (&pattern_record, flat) {
+        (Some(text), _) => {
+            let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(text);
+            plan::skeleton_from(&text[body_at..], &title, &date)
+        }
+        // No record to inherit: the default template's own `about.md` body,
+        // reached through the same renderer so the two cannot drift.
+        (None, true) => template::about_only(&title, &date),
+        (None, false) => plan::skeleton_from(
+            "# <session title>\n\n## Summary\n\n## Log\n\n## Promote\n\n| workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n",
+            &title,
+            &date,
+        ),
+    };
+    // The record's own tag, so the About space finds it by what it declares
+    // rather than by its filename (AD-120). Only the flat contract has kinds.
+    let kind_line = if flat { "tags: [about]\n" } else { "" };
     let readme = match &source {
-        // continues: baked into the new README's frontmatter at birth (AD-112).
+        // continues: baked into the new record's frontmatter at birth (AD-112).
         Some(row) => format!(
-            "---\nid: {id}\ncreated: {date}\nkeeper:\n  session-continues: [{}]\n---\n{body}",
+            "---\nid: {id}\ncreated: {date}\n{kind_line}keeper:\n  session-continues: [{}]\n---\n{body}",
             row.id
         ),
-        None => format!("---\nid: {id}\ncreated: {date}\n---\n{body}"),
+        None => format!("---\nid: {id}\ncreated: {date}\n{kind_line}---\n{body}"),
     };
 
-    let copies = pattern::apply(
-        kind,
-        &pattern::without_dirs(&pattern_files(&pattern_dir), &excluded),
-    )
-    .copies;
-    let mut compiled = match &source {
-        None => plan::compile_create(&dir_name, &pattern_root, &copies, &readme),
-        Some(row) => {
-            let source_readme =
-                std::fs::read_to_string(pattern_dir.join(model::README)).unwrap_or_default();
-            plan::compile_create_from(&dir_name, &row.path, &source_readme, &id, &copies, &readme)
+    // What travels. In the flat contract a file's kind is a tag inside it, so
+    // the decision needs the pool — read here, in the shell, because the domain
+    // opens nothing (AD-108). Bounded by the same walk the preview already
+    // pays for: root markdown only, and `artifacts/`/`workspace/` are decided
+    // by path without being read.
+    let kinds = if flat {
+        flat_kinds(&pattern_dir, &pattern_files)
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let copies =
+        pattern::apply_with_kinds(kind, &pattern_files, |rel| kinds.get(rel).copied()).copies;
+
+    // What keeper composes rather than copies. Folder-shaped: the record alone.
+    // Flat: the record, always the navigation contract, and — only for a
+    // session with nothing to inherit — the two seed files (FR-268).
+    //
+    // The split is the rule stated once: `AGENTS.md` is a *contract*, so a flat
+    // session without one is unreadable and keeper supplies it whenever the
+    // pattern did not. The seed log and seed prompt are *examples*, and a
+    // continuation is not short of examples — it was made from a session that
+    // has real ones. Seeding it anyway would put a "Nothing has happened yet"
+    // log at the top of a session continuing months of work.
+    let mut stamped = vec![(record_name.to_owned(), readme.clone())];
+    if flat {
+        let carried: std::collections::BTreeSet<&str> =
+            copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
+        let seeds = template::default_template(
+            &title,
+            &date,
+            &format!("{date}-{}", now_hhmm()),
+            [&ulids[0], &ulids[1], &ulids[2]],
+        );
+        for file in seeds {
+            let is_contract = file.name == keeper_core::sessions::shape::AGENTS;
+            if file.name == keeper_core::sessions::shape::ABOUT
+                || carried.contains(file.name.as_str())
+                || (!is_contract && source.is_some())
+            {
+                continue;
+            }
+            stamped.push((file.name, file.content));
         }
+    }
+
+    let mut compiled = match &source {
+        None => plan::compile_create_shaped(&dir_name, &pattern_root, &copies, &stamped),
+        Some(row) => plan::compile_create_from_shaped(
+            &dir_name,
+            &row.path,
+            &std::fs::read_to_string(pattern_dir.join(record_name)).unwrap_or_default(),
+            record_name,
+            &id,
+            &copies,
+            &stamped,
+        ),
     };
     compiled.verb = if source.is_some() {
         "create-from".to_owned()
@@ -1625,6 +1747,103 @@ pub async fn sessions_spaces_restore(
 #[tauri::command]
 pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
     let _ = root_id;
+    Err(unsupported())
+}
+
+/// Write keeper's own template into this zone's `_template/` (FR-268).
+///
+/// **The zone's template is the operator's, and this verb says so out loud.** A
+/// zone that has one is never touched by a create — keeper copies what it finds
+/// and does not improve on it — so the only way to *adopt* an updated default is
+/// to ask for it. Pressing this is that ask.
+///
+/// `name` is `None` for the zone's own `_template/` and `Some(slug)` for a named
+/// one, which is what makes "keep my template, add keeper's as `flat`" possible
+/// without a second command.
+///
+/// Anything already there under one of the four names is trashed before it is
+/// rewritten, so an `AGENTS.md` somebody improved by hand is recoverable in
+/// `.keeper/trash/` rather than gone. Files the template does not name are left
+/// alone: this replaces four files, it does not clear a directory.
+///
+/// Rejects with: `internal` (unknown root, a bad name, a failed write),
+/// `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_install(
+    root_id: String,
+    name: Option<String>,
+    title: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::{model, template};
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let dest = match name.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        None => model::TEMPLATE_DIR.to_owned(),
+        Some(raw) => {
+            let slug = keeper_core::notes::naming::slug(raw);
+            if slug.is_empty() {
+                return Err(IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!(
+                        "\"{raw}\" has nothing in it a folder can be named after — a named \
+                         template needs letters or digits."
+                    ),
+                    account_id: None,
+                    retriable: false,
+                });
+            }
+            format!("{}/{slug}", model::TEMPLATE_DIR)
+        }
+    };
+
+    let date = today();
+    let stamp = format!("{date}-{}", now_hhmm());
+    let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
+    let title = {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            "Session".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    };
+    let files =
+        template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
+    // What is already there decides trash-then-write versus plain write, and
+    // reading it is the shell's job — the domain opens nothing (AD-108).
+    let present: Vec<String> = std::fs::read_dir(zone.join(&dest))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let compiled = template::compile_install(&dest, &files, &present, &crate::sync_ipc::new_ulid());
+    let zone_root = zone.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-install task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(dest)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_install(
+    root_id: String,
+    name: Option<String>,
+    title: String,
+) -> Result<String, IpcError> {
+    let _ = (root_id, name, title);
     Err(unsupported())
 }
 

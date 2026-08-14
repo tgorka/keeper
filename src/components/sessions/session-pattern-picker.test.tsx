@@ -8,6 +8,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   SESSION_PATTERN_COPIES_LABEL,
   SESSION_PATTERN_EMPTY_LABEL,
+  SESSION_PATTERN_INSTALL_HINT,
+  SESSION_PATTERN_INSTALL_LABEL,
   SESSION_PATTERN_LABEL,
   SESSION_PATTERN_LOADING_LABEL,
   SESSION_PATTERN_SKIPS_LABEL,
@@ -132,6 +134,72 @@ describe("SessionPatternPicker", () => {
     // `_template/interview` — the id is the directory it copies out of, and
     // nothing here composes a second spelling of it (AD-65).
     expect(onChange).toHaveBeenCalledWith("_template/interview");
+  });
+
+  it("offers keeper's own template to a zone that has none, even an empty one", () => {
+    const onInstall = vi.fn();
+    render(
+      <SessionPatternPicker
+        patterns={[]}
+        value={null}
+        onChange={() => {}}
+        onInstallTemplate={onInstall}
+        nowMs={NOW}
+      />,
+    );
+    // The one case where a zone with nothing to pick between still renders: it
+    // has a question to answer that the create row cannot ask for it.
+    fireEvent.click(screen.getByRole("button", { name: SESSION_PATTERN_INSTALL_LABEL }));
+    expect(onInstall).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(SESSION_PATTERN_INSTALL_HINT)).toBeInTheDocument();
+  });
+
+  it("still offers it beside a session-only list — a session is not a template", () => {
+    render(
+      <SessionPatternPicker
+        patterns={[pattern({ id: "01J5DDDDDDDDDDDDDDDDDDDDDD", kind: "session", label: "friday" })]}
+        value="01J5DDDDDDDDDDDDDDDDDDDDDD"
+        onChange={() => {}}
+        onInstallTemplate={() => {}}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByRole("button", { name: SESSION_PATTERN_INSTALL_LABEL })).toBeInTheDocument();
+  });
+
+  it("does not ask a zone that already answered — a named template counts", () => {
+    render(
+      <SessionPatternPicker
+        patterns={[pattern({ id: "_template/interview", label: "interview" })]}
+        value="_template/interview"
+        onChange={() => {}}
+        onInstallTemplate={() => {}}
+        nowMs={NOW}
+      />,
+    );
+    // FR-266's lesson, applied to the offer: `_template/interview` IS a
+    // template, so the zone has one and keeper does not offer to write another.
+    expect(
+      screen.queryByRole("button", { name: SESSION_PATTERN_INSTALL_LABEL }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("cannot be pressed twice, and reports the refusal in Rust's own words", () => {
+    render(
+      <SessionPatternPicker
+        patterns={[]}
+        value={null}
+        onChange={() => {}}
+        onInstallTemplate={() => {}}
+        installing
+        installError="permission denied writing _template/AGENTS.md"
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByRole("button", { name: SESSION_PATTERN_INSTALL_LABEL })).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "permission denied writing _template/AGENTS.md",
+    );
   });
 
   it("puts the chosen pattern's own label on the control", () => {

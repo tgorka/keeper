@@ -944,6 +944,7 @@ pub fn run() {
         sessions_ipc::sessions_space_save,
         sessions_ipc::sessions_space_delete,
         sessions_ipc::sessions_spaces_restore,
+        sessions_ipc::sessions_template_install,
         sessions_ipc::sessions_file_new,
         sessions_ipc::sessions_file_new_kind,
         sessions_ipc::sessions_file_delete,

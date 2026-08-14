@@ -95,6 +95,33 @@ pub fn compile_create(
     copies: &[(String, bool)],
     readme: &str,
 ) -> Plan {
+    compile_create_shaped(
+        dir_name,
+        pattern_root,
+        copies,
+        &[(super::model::README.to_owned(), readme.to_owned())],
+    )
+}
+
+/// The general form: copy the pattern, then write `stamped` — one entry per
+/// file keeper composes itself, session-relative name and bytes (FR-268).
+///
+/// The shape-aware seam, and the only one. A folder-shaped create stamps one
+/// `README.md`; a flat one stamps `AGENTS.md`, `about.md` and its two seed
+/// files. Everything else about a create — where the copies come from, that
+/// directories precede their contents, that the stamped files are written last
+/// so a pattern carrying its own copy loses to them — is identical, and putting
+/// the difference here rather than in the shell is what keeps it to one line of
+/// divergence instead of two create paths that drift.
+///
+/// Stamped writes are last and in the order given. `MkDir` and `WriteFile` are
+/// both idempotent, so the whole plan stays replayable (AD-111).
+pub fn compile_create_shaped(
+    dir_name: &str,
+    pattern_root: &str,
+    copies: &[(String, bool)],
+    stamped: &[(String, String)],
+) -> Plan {
     let target = format!("active/{dir_name}");
     let mut steps = vec![PlanStep::MkDir {
         path: target.clone(),
@@ -111,10 +138,12 @@ pub fn compile_create(
             });
         }
     }
-    steps.push(PlanStep::WriteFile {
-        path: format!("{target}/README.md"),
-        content: readme.to_owned(),
-    });
+    for (name, content) in stamped {
+        steps.push(PlanStep::WriteFile {
+            path: format!("{target}/{name}"),
+            content: content.clone(),
+        });
+    }
     Plan {
         verb: "create".to_owned(),
         session: target,
@@ -149,13 +178,43 @@ pub fn compile_create_from(
     copies: &[(String, bool)],
     readme: &str,
 ) -> Plan {
-    let mut plan = compile_create(dir_name, source_session, copies, readme);
+    compile_create_from_shaped(
+        dir_name,
+        source_session,
+        source_readme,
+        super::model::README,
+        new_id,
+        copies,
+        &[(super::model::README.to_owned(), readme.to_owned())],
+    )
+}
+
+/// The general form of [`compile_create_from`] (FR-268): the shaped create
+/// plus the lineage append, written to the record under **its own name**.
+///
+/// `record_name` is `README.md` for a folder-shaped source and `about.md` for a
+/// flat one. It is a parameter rather than a lookup because the caller already
+/// knows the shape — it read the directory to decide what to copy — and because
+/// guessing here would mean this function opening a file, which is the one thing
+/// the domain does not do (AD-108). Get it wrong and the append lands on a file
+/// that does not exist; the executor's `GuardedWrite` refuses a length mismatch,
+/// so the failure is loud rather than a half-written lineage.
+pub fn compile_create_from_shaped(
+    dir_name: &str,
+    source_session: &str,
+    source_record: &str,
+    record_name: &str,
+    new_id: &str,
+    copies: &[(String, bool)],
+    stamped: &[(String, String)],
+) -> Plan {
+    let mut plan = compile_create_shaped(dir_name, source_session, copies, stamped);
     plan.verb = "create-from".to_owned();
     // The source-side lineage append, byte-preserving outside the key.
-    let updated = append_lineage(source_readme, KEY_CONTINUED_BY, new_id);
+    let updated = append_lineage(source_record, KEY_CONTINUED_BY, new_id);
     plan.steps.push(PlanStep::GuardedWrite {
-        path: format!("{source_session}/README.md"),
-        expect_len: source_readme.len(),
+        path: format!("{source_session}/{record_name}"),
+        expect_len: source_record.len(),
         content: updated,
     });
     plan

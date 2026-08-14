@@ -906,6 +906,11 @@ const ANSWERS: Record<string, unknown> = {
   sessions_spaces: SESSION_SPACES,
   sessions_space_files: SESSION_SPACE_FILES,
   sessions_spaces_restore: { names: [] },
+  // The install verb answers with the directory it wrote (FR-268). The mock
+  // zone above already HAS a `_template`, so the picker's offer stays hidden
+  // here — the fixture exists so a hand-driven call does not fall through to
+  // the name-guessing default and come back as a list.
+  sessions_template_install: "_template",
 };
 
 /**
