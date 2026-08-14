@@ -534,9 +534,47 @@ fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
     out
 }
 
-/// The pattern id the zone's own `_template/` answers to.
+/// The named templates a zone offers (FR-266): every `_template/<name>/` that
+/// holds a record file, in name order.
+///
+/// Named rather than counted: what makes a directory under `_template/` a
+/// template of its own and not a part of the skeleton is
+/// [`keeper_core::sessions::pattern::is_named_template`]'s question, asked
+/// against that directory's own top-level names. This reads them; the domain
+/// decides (AD-108).
 #[cfg(desktop)]
-const TEMPLATE_PATTERN_ID: &str = "_template";
+fn named_templates(zone: &std::path::Path) -> Vec<String> {
+    use keeper_core::sessions::pattern;
+
+    let template_dir = zone.join(keeper_core::sessions::model::TEMPLATE_DIR);
+    let Ok(entries) = std::fs::read_dir(&template_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            pattern::could_be_named_template(&name, is_dir)
+        })
+        .filter(|entry| {
+            let top_level: Vec<String> = std::fs::read_dir(entry.path())
+                .map(|inner| {
+                    inner
+                        .flatten()
+                        .map(|child| child.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            pattern::is_named_template(&top_level)
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Sorted, because `read_dir` order is the filesystem's business and the
+    // picker's rows must not move between two reads of an unchanged zone.
+    out.sort();
+    out
+}
 
 /// Newest mtime under a directory, ms since epoch — what orders the picker.
 #[cfg(desktop)]
@@ -558,6 +596,13 @@ fn newest_mtime_ms(dir: &std::path::Path, files: &[(String, bool)]) -> Option<i6
 }
 
 /// Project one pattern for the picker: the decision, applied and rendered.
+///
+/// `excluded` is the directories the source keeps but the copy does not — the
+/// zone template's own named templates, and nothing else. It is subtracted
+/// before `apply` rather than filtered out of the result, so the preview and
+/// the plan are still the one value projected twice: a named template must not
+/// appear under *Copies*, and it must not appear under *Leaves behind* either,
+/// because it is a different pattern rather than a file this one refused.
 #[cfg(desktop)]
 fn pattern_vm(
     id: &str,
@@ -565,11 +610,12 @@ fn pattern_vm(
     label: &str,
     detail: &str,
     dir: &std::path::Path,
+    excluded: &[String],
 ) -> keeper_core::sessions::vm::SessionPatternVm {
     use keeper_core::sessions::pattern;
     use keeper_core::sessions::vm::{SessionPatternFileVm, SessionPatternSkipVm, SessionPatternVm};
 
-    let files = pattern_files(dir);
+    let files = pattern::without_dirs(&pattern_files(dir), excluded);
     let mtime_ms = newest_mtime_ms(dir, &files);
     let outcome = pattern::apply(kind, &files);
     SessionPatternVm {
@@ -601,31 +647,53 @@ fn pattern_vm(
     }
 }
 
-/// Everything a new session can be shaped from (FR-253): the zone's
-/// `_template/` first, then the sessions themselves, newest first.
+/// Everything a new session can be shaped from (FR-253, FR-266): the zone's
+/// `_template/` first, then its named templates, then the sessions
+/// themselves, newest first.
 ///
 /// The board used to offer these as two unrelated verbs — *New session* on
 /// the header and *New like this* on a row's menu — which made "start from
 /// what I did last time" a thing you had to already know about. One list,
 /// one question, and the preview each entry carries is the plan's own
 /// decision rather than a second description of it (AD-116).
+///
+/// Named templates sit between the two halves because that is what they are
+/// between: more deliberate than the zone default, more reusable than the
+/// session you happened to run last. They are ordered by name rather than by
+/// mtime — a template's identity is the name somebody gave it, and a list that
+/// reshuffles because a file was touched is a list you cannot learn.
 #[cfg(desktop)]
 #[tauri::command]
 pub fn sessions_patterns(
     root_id: String,
 ) -> Result<Vec<keeper_core::sessions::vm::SessionPatternVm>, IpcError> {
-    use keeper_core::sessions::pattern::PatternKind;
+    use keeper_core::sessions::pattern::{self, PatternKind};
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let mut out = Vec::new();
     let template_dir = zone.join(keeper_core::sessions::model::TEMPLATE_DIR);
+    let named = named_templates(&zone);
     if template_dir.is_dir() {
         out.push(pattern_vm(
-            TEMPLATE_PATTERN_ID,
+            pattern::TEMPLATE_ID,
             PatternKind::Template,
-            "Zone template",
-            "the zone's own skeleton — copied whole",
+            pattern::TEMPLATE_LABEL,
+            pattern::TEMPLATE_DETAIL,
             &template_dir,
+            // The zone skeleton keeps its named templates on disk and leaves
+            // them out of what it copies: a template that grew a sibling would
+            // otherwise start putting that sibling in every new session.
+            &named,
+        ));
+    }
+    for name in &named {
+        out.push(pattern_vm(
+            &pattern::named_template_id(name),
+            PatternKind::Template,
+            name,
+            pattern::NAMED_TEMPLATE_DETAIL,
+            &template_dir.join(name),
+            &[],
         ));
     }
     // Sessions as patterns, newest record change first — the same order the
@@ -648,6 +716,7 @@ pub fn sessions_patterns(
             &row.title,
             &detail,
             &zone.join(&row.path),
+            &[],
         ));
     }
     Ok(out)
@@ -676,7 +745,8 @@ fn taken_names(zone: &std::path::Path) -> Vec<String> {
 /// Create a session from a pattern (FR-238, FR-239, FR-253, AD-112, AD-116).
 ///
 /// Two questions in — the title, and what to shape it from — and one folder
-/// out. `pattern_id` is `None` or `"_template"` for the zone's skeleton, and
+/// out. `pattern_id` is `None` or `"_template"` for the zone's skeleton,
+/// `"_template/<name>"` for one of its named templates (FR-266), and
 /// a session's ULID to continue that session: structure only, with
 /// `continues`/`continued-by` written into BOTH READMEs, an archived source
 /// included, because files are truth and a lineage only the index knew would
@@ -703,11 +773,22 @@ pub async fn sessions_create(
     let id = crate::sync_ipc::new_ulid();
 
     // Which pattern, resolved to the one thing the plan needs: a zone-relative
-    // directory to copy out of, and the kind that decides what travels.
-    let source_id = pattern_id.filter(|value| value != TEMPLATE_PATTERN_ID);
-    let (kind, pattern_root, source) = match &source_id {
-        None => (PatternKind::Template, model::TEMPLATE_DIR.to_owned(), None),
-        Some(source_id) => {
+    // directory to copy out of, and the kind that decides what travels. The
+    // domain owns the id→source question (AD-108) — a `_template/<name>` id is
+    // a template, not a session path, and an id keeper cannot join onto the
+    // zone is refused here rather than reinterpreted downstream.
+    let resolved = pattern::resolve(pattern_id.as_deref()).ok_or_else(|| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "no such template: {}",
+            pattern_id.as_deref().unwrap_or_default()
+        ),
+        account_id: None,
+        retriable: false,
+    })?;
+    let (kind, pattern_root, source) = match &resolved {
+        pattern::PatternSource::Template { root } => (PatternKind::Template, root.clone(), None),
+        pattern::PatternSource::Session { id: source_id } => {
             let row =
                 crate::sessions_root::row_of(&root_id, source_id).ok_or_else(|| IpcError {
                     code: IpcErrorCode::Internal,
@@ -719,6 +800,14 @@ pub async fn sessions_create(
         }
     };
     let pattern_dir = zone.join(&pattern_root);
+    // The zone skeleton does not carry its own named templates into a session.
+    // Only the bare `_template` root can hold them, so nothing else pays for
+    // the read.
+    let excluded = if pattern_root == model::TEMPLATE_DIR {
+        named_templates(&zone)
+    } else {
+        Vec::new()
+    };
 
     // The stamped README: the pattern's own headings, empty, with the title
     // and date in place. A template README that grows a section grows it for
@@ -736,7 +825,11 @@ pub async fn sessions_create(
         None => format!("---\nid: {id}\ncreated: {date}\n---\n{body}"),
     };
 
-    let copies = pattern::apply(kind, &pattern_files(&pattern_dir)).copies;
+    let copies = pattern::apply(
+        kind,
+        &pattern::without_dirs(&pattern_files(&pattern_dir), &excluded),
+    )
+    .copies;
     let mut compiled = match &source {
         None => plan::compile_create(&dir_name, &pattern_root, &copies, &readme),
         Some(row) => {

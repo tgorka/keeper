@@ -3,8 +3,8 @@
  * is told BEFORE pressing Create — most of all about the files that do not
  * travel, which is the half a picker normally leaves silent.
  */
-import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import {
   SESSION_PATTERN_COPIES_LABEL,
   SESSION_PATTERN_EMPTY_LABEL,
@@ -104,6 +104,34 @@ describe("SessionPatternPicker", () => {
       <SessionPatternPicker patterns={[bare]} value={bare.id} onChange={() => {}} nowMs={NOW} />,
     );
     expect(screen.getByText(SESSION_PATTERN_EMPTY_LABEL)).toBeInTheDocument();
+  });
+
+  it("offers a named template under its own name, and sends the id verbatim", async () => {
+    const named = pattern({
+      id: "_template/interview",
+      label: "interview",
+      detail: "a named template — copied whole",
+      copies: [{ relPath: "questions.md", isDir: false }],
+    });
+    const onChange = vi.fn();
+    render(
+      <SessionPatternPicker
+        patterns={[pattern(), named]}
+        value="_template"
+        onChange={onChange}
+        nowMs={NOW}
+      />,
+    );
+
+    // The label is the folder's own name — keeper does not improve on what the
+    // operator called it.
+    const control = screen.getByRole("combobox", { name: SESSION_PATTERN_LABEL });
+    fireEvent.keyDown(control, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: /interview/ }));
+
+    // `_template/interview` — the id is the directory it copies out of, and
+    // nothing here composes a second spelling of it (AD-65).
+    expect(onChange).toHaveBeenCalledWith("_template/interview");
   });
 
   it("puts the chosen pattern's own label on the control", () => {

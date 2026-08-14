@@ -103,6 +103,19 @@ function templatePattern(): SessionPatternVm {
   };
 }
 
+/** A `_template/<name>/` (FR-266) — a template, addressed by its path. */
+function namedTemplatePattern(): SessionPatternVm {
+  return {
+    id: "_template/interview",
+    kind: "template",
+    label: "interview",
+    detail: "a named template — copied whole",
+    mtimeMs: NOW - 3 * 24 * 60 * 60_000,
+    copies: [{ relPath: "questions.md", isDir: false }],
+    skips: [],
+  };
+}
+
 function sessionPattern(): SessionPatternVm {
   return {
     id: "01J5AAAAAAAAAAAAAAAAAAAAAA",
@@ -198,6 +211,35 @@ describe("SessionsPane", () => {
     (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
     await waitFor(() =>
       expect(sessionsCreate).toHaveBeenCalledWith("tgdrive", "next thing", "_template"),
+    );
+  });
+
+  it("creates from a named template, sending the path it copies out of", async () => {
+    sessionsPatterns.mockResolvedValue([
+      templatePattern(),
+      namedTemplatePattern(),
+      sessionPattern(),
+    ]);
+    render(<SessionsPane />);
+    (await screen.findByRole("button", { name: SESSIONS_NEW_LABEL })).click();
+
+    const picker = await screen.findByRole("combobox", { name: SESSION_PATTERN_LABEL });
+    fireEvent.keyDown(picker, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: /interview/ }));
+
+    fireEvent.change(await screen.findByLabelText(SESSIONS_NEW_TITLE_LABEL), {
+      target: { value: "candidate screen" },
+    });
+    (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
+    // `_template/interview` reaches Rust intact. Before FR-266 this id fell
+    // past the shell's `!= "_template"` test and was looked up as a session,
+    // which failed with "no such session: _template/interview".
+    await waitFor(() =>
+      expect(sessionsCreate).toHaveBeenCalledWith(
+        "tgdrive",
+        "candidate screen",
+        "_template/interview",
+      ),
     );
   });
 

@@ -887,6 +887,21 @@ const ANSWERS: Record<string, unknown> = {
       ],
       skips: [],
     },
+    // A named template (FR-266) — `_template/<name>/`, addressed by the path
+    // it copies out of, sorted by name rather than by mtime.
+    {
+      id: "_template/interview",
+      kind: "template",
+      label: "interview",
+      detail: "a named template — copied whole",
+      mtimeMs: ago(4_320),
+      copies: [
+        { relPath: "AGENTS.md", isDir: false },
+        { relPath: "about.md", isDir: false },
+        { relPath: "2026-08-01-0900-questions.md", isDir: false },
+      ],
+      skips: [],
+    },
   ],
   sessions_spaces: SESSION_SPACES,
   sessions_space_files: SESSION_SPACE_FILES,

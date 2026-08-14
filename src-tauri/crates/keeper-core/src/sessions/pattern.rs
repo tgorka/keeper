@@ -25,6 +25,24 @@ pub enum PatternKind {
     Session,
 }
 
+/// The pattern id the zone's own `_template/` answers to.
+///
+/// The directory name doubles as the id on purpose: a template pattern's id
+/// **is** the zone-relative directory it copies out of, which is what lets one
+/// named template be addressed without a second registry to keep in step with
+/// the filesystem (AD-110).
+pub const TEMPLATE_ID: &str = super::model::TEMPLATE_DIR;
+
+/// What the zone's own skeleton calls itself in the picker, and why it is
+/// there. Here rather than in the shell because the picker renders the
+/// domain's sentences and composes none of its own (AD-7, AD-108).
+pub const TEMPLATE_LABEL: &str = "Zone template";
+pub const TEMPLATE_DETAIL: &str = "the zone's own skeleton — copied whole";
+
+/// What a named template says about itself. A named template's *label* is its
+/// folder name — the operator named it, and keeper does not improve on that.
+pub const NAMED_TEMPLATE_DETAIL: &str = "a named template — copied whole";
+
 impl PatternKind {
     /// The wire spelling, for the VM and the picker.
     pub fn as_str(self) -> &'static str {
@@ -87,6 +105,128 @@ const STANDARD_DIRS: [&str; 4] = ["workspace", "artifacts", "refs", "prompts"];
 /// with a true sentence.
 pub fn is_placeholder(rel: &str) -> bool {
     rel.rsplit('/').next() == Some(".gitkeep")
+}
+
+/// What a pattern id names, resolved once (FR-266).
+///
+/// The shell used to decide this with `pattern_id.filter(|v| v != "_template")`
+/// — everything that is not the zone template is a session. That held exactly
+/// as long as `_template` was the only template there could be: a named
+/// template's id slips past an equality test and is then looked up in the
+/// session index, where it is not, so `_template/house` failed with *no such
+/// session: \_template/house*. The test is a prefix test now, and it lives here
+/// so there is one answer to "what is this id" rather than one per call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternSource {
+    /// A template — `root` is the zone-relative directory to copy out of,
+    /// either `_template` or `_template/<name>`.
+    Template { root: String },
+    /// A session that already exists, by id.
+    Session { id: String },
+}
+
+impl PatternSource {
+    /// Which rule decides what travels out of this source.
+    pub fn kind(&self) -> PatternKind {
+        match self {
+            Self::Template { .. } => PatternKind::Template,
+            Self::Session { .. } => PatternKind::Session,
+        }
+    }
+}
+
+/// The id a named template answers to. One spelling, composed here, so the
+/// picker's row and the create that follows it cannot disagree (AD-65).
+pub fn named_template_id(name: &str) -> String {
+    format!("{TEMPLATE_ID}/{name}")
+}
+
+/// Resolve a pattern id to what it names — `None` when it is a `_template/…`
+/// spelling keeper will not accept.
+///
+/// `None` and `"_template"` are both the zone's own skeleton: the argument is
+/// optional on the wire and absent means default, which is the same thing said
+/// twice rather than two things.
+///
+/// A refusal is a refusal and not a fallback: an id keeper cannot resolve must
+/// not quietly create a session from the zone template, because "it made
+/// something, just not what you asked for" is the failure nobody notices until
+/// the wrong skeleton is three sessions deep.
+pub fn resolve(pattern_id: Option<&str>) -> Option<PatternSource> {
+    let template = || PatternSource::Template {
+        root: TEMPLATE_ID.to_owned(),
+    };
+    let Some(id) = pattern_id else {
+        return Some(template());
+    };
+    if id == TEMPLATE_ID {
+        return Some(template());
+    }
+    match id
+        .strip_prefix(TEMPLATE_ID)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        // Under `_template/`, so it can only be a template — a bad name is
+        // refused rather than reinterpreted as a session id.
+        Some(name) => safe_segment(name).then(|| PatternSource::Template {
+            root: id.to_owned(),
+        }),
+        None => Some(PatternSource::Session { id: id.to_owned() }),
+    }
+}
+
+/// One path segment keeper will join onto a zone root.
+///
+/// The traversal cases (`.`, `..`, an embedded separator) are the reason this
+/// exists at all: a pattern id arrives from the frontend, and `_template/../..`
+/// joined onto the zone would read a directory outside it. Underscored and
+/// dotted names are refused too — [`super::model::skipped`] hides them from
+/// every walk, so a template named `_house` would be a row in the picker that
+/// nothing else in the zone can see.
+fn safe_segment(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+        && !super::model::skipped(name)
+}
+
+/// Whether a `_template/` entry is worth reading as a named template at all —
+/// the cheap half of the test, applied before anything is opened.
+pub fn could_be_named_template(name: &str, is_dir: bool) -> bool {
+    is_dir && safe_segment(name)
+}
+
+/// Whether one subdirectory of `_template/` is a **named template** rather than
+/// a part of the zone skeleton, from its own top-level entry names.
+///
+/// The distinction has to be made, because `_template/refs/` in a folder-shaped
+/// zone is part of the skeleton and `_template/house/` is a template of its
+/// own, and both are just directories. Nothing is stored to tell them apart:
+/// the test is that the directory holds a file that *is a session's record* —
+/// `AGENTS.md`, `about.md` or `README.md` — which is [`super::shape::shape`]'s
+/// own signal widened by one. A `refs/` full of pointers is not a template; an
+/// empty `workspace/` is not a template; a folder somebody built to start
+/// sessions from says what it is on its first line.
+pub fn is_named_template(top_level: &[String]) -> bool {
+    top_level.iter().any(|name| {
+        name == super::shape::AGENTS || name == super::shape::ABOUT || name == super::model::README
+    })
+}
+
+/// A source list with everything under `dirs` removed.
+///
+/// This is what stops the zone's own skeleton from carrying the named templates
+/// that live inside it. Without it, a zone with `_template/house/` would copy
+/// `house/AGENTS.md` into every session created from *Zone template* — a
+/// template that grows a sibling would silently start polluting its own output.
+pub fn without_dirs(source: &[(String, bool)], dirs: &[String]) -> Vec<(String, bool)> {
+    source
+        .iter()
+        .filter(|(rel, _)| !dirs.iter().any(|dir| in_dir(rel, dir)))
+        .cloned()
+        .collect()
 }
 
 /// Apply a pattern to a source file list.
@@ -262,6 +402,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bug this module's prefix test exists to prevent: before it, a named
+    /// template's id was not equal to `_template`, so it fell through to the
+    /// session index and failed with "no such session: _template/house".
+    #[test]
+    fn a_named_template_id_resolves_to_a_template_and_not_to_a_session() {
+        assert_eq!(
+            resolve(Some("_template/house")),
+            Some(PatternSource::Template {
+                root: "_template/house".to_owned()
+            })
+        );
+        assert_eq!(
+            resolve(Some("_template/house")).map(|source| source.kind()),
+            Some(PatternKind::Template)
+        );
+        // …and its root is the directory it copies out of, which is the id.
+        assert_eq!(named_template_id("house"), "_template/house");
+    }
+
+    /// Absent and `_template` are the same request said two ways; a ULID is
+    /// still a session, which is the case the prefix test must not break.
+    #[test]
+    fn absent_and_the_bare_id_are_the_zone_template_and_a_ulid_is_a_session() {
+        let zone = Some(PatternSource::Template {
+            root: "_template".to_owned(),
+        });
+        assert_eq!(resolve(None), zone);
+        assert_eq!(resolve(Some("_template")), zone);
+        assert_eq!(
+            resolve(Some("01J5AAAAAAAAAAAAAAAAAAAAAA")),
+            Some(PatternSource::Session {
+                id: "01J5AAAAAAAAAAAAAAAAAAAAAA".to_owned()
+            })
+        );
+    }
+
+    /// A `_template/…` id keeper will not accept is **refused**, never
+    /// downgraded to the zone template: creating the wrong skeleton silently is
+    /// the failure nobody notices until three sessions later. Traversal is the
+    /// sharp case — the id crosses the IPC boundary and is joined onto a zone.
+    #[test]
+    fn a_template_id_keeper_cannot_join_is_refused_rather_than_reinterpreted() {
+        for bad in [
+            "_template/..",
+            "_template/.",
+            "_template/../../etc",
+            "_template/a/b",
+            "_template/",
+            "_template/.hidden",
+            "_template/_inner",
+            "_template/side\\ways",
+        ] {
+            assert_eq!(resolve(Some(bad)), None, "{bad} must be refused");
+        }
+        // A session id that merely starts with the same letters is untouched:
+        // the prefix test is on the separator, not on the characters.
+        assert_eq!(
+            resolve(Some("_templates-old")),
+            Some(PatternSource::Session {
+                id: "_templates-old".to_owned()
+            })
+        );
+    }
+
+    /// What tells a named template apart from the skeleton's own `refs/`: a
+    /// file that is a session's record. Nothing is stored to say so (AD-110).
+    #[test]
+    fn a_named_template_is_a_directory_holding_a_record_file() {
+        let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(is_named_template(&names(&["AGENTS.md", "about.md"])));
+        assert!(is_named_template(&names(&["about.md"])));
+        // A folder-shaped named template still says what it is.
+        assert!(is_named_template(&names(&["README.md", "prompts"])));
+        // The skeleton's own directories are not templates.
+        assert!(!is_named_template(&names(&[".gitkeep"])));
+        assert!(!is_named_template(&names(&["design.md", "pointer.md"])));
+        assert!(!is_named_template(&[]));
+        // And the cheap pre-test refuses what `resolve` would refuse anyway.
+        assert!(could_be_named_template("house", true));
+        assert!(!could_be_named_template("house", false));
+        assert!(!could_be_named_template("_inner", true));
+    }
+
+    /// The zone template must not carry the named templates that live inside
+    /// it: a template that grows a sibling would otherwise start copying that
+    /// sibling into every session made from it.
+    #[test]
+    fn the_zone_template_leaves_its_named_templates_behind() {
+        let source = files(&[
+            ("AGENTS.md", false),
+            ("about.md", false),
+            ("house", true),
+            ("house/AGENTS.md", false),
+            ("house/about.md", false),
+            ("refs", true),
+            ("refs/.gitkeep", false),
+        ]);
+        let trimmed = without_dirs(&source, &["house".to_owned()]);
+        let out = apply(PatternKind::Template, &trimmed);
+        let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(
+            copied,
+            vec!["AGENTS.md", "about.md", "refs", "refs/.gitkeep"]
+        );
+        // Not "left behind with a reason" either — a named template is not a
+        // file this session refused, it is a different pattern entirely, and
+        // listing it as a skip would put it in the preview's "Leaves behind".
+        assert!(!out.skips.iter().any(|(rel, _)| rel.starts_with("house")));
     }
 
     /// A placeholder is copied but never counted — an empty `refs/` that
