@@ -1774,10 +1774,17 @@ pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
 /// one, which is what makes "keep my template, add keeper's as `flat`" possible
 /// without a second command.
 ///
-/// Anything already there under one of the four names is trashed before it is
+/// **A skeleton, not a rendered session**: the contract and an empty record, and
+/// none of the seeds. There is no `title` parameter because a template has no
+/// title — the one this used to take was frozen into every session ever created
+/// from the result (see [`template::zone_skeleton`]).
+///
+/// Anything already there under one of the two names is trashed before it is
 /// rewritten, so an `AGENTS.md` somebody improved by hand is recoverable in
 /// `.keeper/trash/` rather than gone. Files the template does not name are left
-/// alone: this replaces four files, it does not clear a directory.
+/// alone — including seeds the operator added themselves, which a create then
+/// carries in preference to keeper's: this replaces two files, it does not clear
+/// a directory.
 ///
 /// Rejects with: `internal` (unknown root, a bad name, a failed write),
 /// `unsupported` (mobile).
@@ -1786,7 +1793,6 @@ pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
 pub async fn sessions_template_install(
     root_id: String,
     name: Option<String>,
-    title: String,
 ) -> Result<String, IpcError> {
     use keeper_core::sessions::{model, template};
 
@@ -1813,10 +1819,7 @@ pub async fn sessions_template_install(
     let date = today();
     // The skeleton, not a rendered session: `_template/` gets the contract and
     // an empty record, and keeper composes the seed log and seed prompt fresh
-    // per create. `title` is accepted and ignored — a template has no title to
-    // freeze, and the parameter stays so the IPC shape is unchanged for the
-    // named-template path that may yet want it.
-    let _ = title;
+    // per create, with that session's own title.
     let files = template::zone_skeleton(&date, &crate::sync_ipc::new_ulid());
     // What is already there decides trash-then-write versus plain write, and
     // reading it is the shell's job — the domain opens nothing (AD-108).
@@ -1849,9 +1852,8 @@ pub async fn sessions_template_install(
 pub fn sessions_template_install(
     root_id: String,
     name: Option<String>,
-    title: String,
 ) -> Result<String, IpcError> {
-    let _ = (root_id, name, title);
+    let _ = (root_id, name);
     Err(unsupported())
 }
 

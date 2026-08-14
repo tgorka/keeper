@@ -71,9 +71,6 @@ export const SESSION_PATTERN_INSTALL_HINT =
   "This zone has no _template/. Keeper shapes new sessions from its own default; writing it down makes it yours to edit.";
 export const SESSION_PATTERN_INSTALL_FAILED = "keeper couldn't write the template.";
 
-/** The placeholder title the seeded record and log are written about. */
-export const SESSION_PATTERN_INSTALL_TITLE = "New session";
-
 export interface SessionPatternPickerProps {
   /** Every pattern the root offers, shell-ordered; `null` while loading. */
   patterns: SessionPatternVm[] | null;

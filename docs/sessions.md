@@ -167,6 +167,20 @@ made.
   rather than only as a rule — delete them freely, nothing depends on them. A
   continuation gets the contract but not the seeds: it was made from a session that has
   real ones.
+
+  **Keeper composes the seeds; it never copies them.** What a create adds beside the
+  pattern is decided by *kind*, not by filename — a seed is named
+  `YYYY-MM-DD-HHMM-opened.md`, so two of them written a minute apart share nothing but
+  their meaning. If the pattern already supplies a file tagged `log`, that file travels
+  and keeper composes none; supply a prompt too and it composes neither. This is why
+  putting your own seed log in `_template/` works exactly as you would expect, and why
+  keeper's own does not end up beside it.
+- **Write keeper's template into this zone** — offered under the picker to a zone with no
+  `_template/` of its own. What lands is a **skeleton**: `AGENTS.md` and an `about.md`
+  titled `<session title>`, and deliberately not the seeds. A template has no title and
+  no minute — freezing either would name every session after the moment you pressed the
+  button — so the seeds stay something keeper writes per create, with that session's own
+  title. Add your own afterwards if you want different ones; a create will prefer yours.
 - **New like this** — the same door, opened with this row already chosen as the pattern.
   Not a second create verb: the title is still asked and the preview still shown.
 - **Log today** — in a folder-shaped session, appends `### YYYY-MM-DD — ` under `## Log`,

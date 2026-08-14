@@ -5,6 +5,14 @@
 //! and it is written in the flat contract because that is the shape keeper now
 //! recommends: one pool of markdown, kinds declared as tags (AD-120).
 //!
+//! **Two functions, and the difference between them is the whole of this
+//! module's subtlety.** [`default_template`] renders a *session* — four files,
+//! titled and stamped for one particular create. [`zone_skeleton`] renders a
+//! *template* — the two files that carry no session-specific bytes. The seeds
+//! are examples composed per create, so writing them into `_template/` freezes
+//! one session's title and minute into every session made from it afterwards;
+//! that shipped once and is what the second function exists to prevent.
+//!
 //! The four files are not a sample. They are the smallest set that makes the
 //! flat shape legible:
 //!

@@ -23,7 +23,6 @@ import { SessionActions } from "@/components/sessions/session-actions";
 import { SessionDetail } from "@/components/sessions/session-detail";
 import {
   SESSION_PATTERN_INSTALL_FAILED,
-  SESSION_PATTERN_INSTALL_TITLE,
   SessionPatternPicker,
 } from "@/components/sessions/session-pattern-picker";
 import { SessionRow } from "@/components/sessions/session-row";
@@ -233,7 +232,7 @@ export function SessionsPane() {
     }
     setInstalling(true);
     setInstallError(null);
-    sessionsTemplateInstall(rootId, undefined, SESSION_PATTERN_INSTALL_TITLE)
+    sessionsTemplateInstall(rootId)
       .then(() => setInstallNonce((n) => n + 1))
       .catch((raw: unknown) =>
         setInstallError(syncErrorMessage(raw, SESSION_PATTERN_INSTALL_FAILED)),

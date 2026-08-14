@@ -5202,26 +5202,25 @@ export async function sessionsSpacesRestore(rootId: string): Promise<SessionSpac
  *
  * `name` is `undefined` for the zone's own `_template/` and a label for a named
  * one, which is how a zone keeps its template *and* gains keeper's beside it.
- * `title` is what the seeded record and log are written about; it is a template,
- * so a placeholder is the honest default.
  *
- * Anything already there under one of the template's four names is moved to
+ * What lands is a **skeleton** — the navigation contract and an empty record —
+ * and not the seed log and seed prompt, which keeper composes fresh per create
+ * with that session's own title. There is no `title` here for the same reason:
+ * a template has no title, and the one this used to take was frozen into every
+ * session made from the result.
+ *
+ * Anything already there under one of the template's two names is moved to
  * `.keeper/trash/` before it is rewritten — an `AGENTS.md` somebody improved by
  * hand is recoverable, not gone — and files the template does not name are left
- * alone.
+ * alone, including a seed the operator wrote themselves.
  *
  * Rejects with: `internal` (unknown zone, a name with nothing to slug, a failed
  * write), `unsupported`.
  */
-export async function sessionsTemplateInstall(
-  rootId: string,
-  name: string | undefined,
-  title: string,
-): Promise<string> {
+export async function sessionsTemplateInstall(rootId: string, name?: string): Promise<string> {
   return await invoke<string>("sessions_template_install", {
     rootId,
     name: name ?? null,
-    title,
   });
 }
 
