@@ -28,7 +28,7 @@
  * there is no optimistic overlay to get out of step.
  */
 import { useCallback } from "react";
-import type { NoteCreateVm, NoteRefVm, NoteRowVm } from "@/lib/ipc/client";
+import type { NoteCreateVm, NoteRefVm, NoteRowVm, NoteSpaceFieldVm } from "@/lib/ipc/client";
 import {
   notesCaptureShow,
   notesCreate,
@@ -256,6 +256,13 @@ export function spaceQueryText(parts: {
   flags: readonly string[];
   origin: string | null;
   text: string | null;
+  /**
+   * `field:key=value` terms, as Rust decomposed them. Optional because the
+   * filter bar has no field control and never writes one — it saves what is on
+   * screen, and a `field:` term can only arrive from a space that already had
+   * it. The editor, which round-trips a stored query, always passes them.
+   */
+  fields?: readonly NoteSpaceFieldVm[];
 }): string {
   const terms: string[] = [];
   for (const { tag, term } of parts.tags) {
@@ -266,6 +273,13 @@ export function spaceQueryText(parts: {
   }
   if (parts.origin !== null) {
     terms.push(`origin:${parts.origin}`);
+  }
+  for (const { key, op, value } of parts.fields ?? []) {
+    // No quoting: `op` is one of the two Rust admitted, and both `key` and
+    // `value` came back trimmed from a query that already parsed. Re-quoting a
+    // value the tokenizer handed over unquoted would change the bytes of a
+    // space that was only opened and saved (FR-121).
+    terms.push(`field:${key}${op}${value}`);
   }
   if (parts.text !== null) {
     terms.push(`text:"${parts.text.replace(/"/g, '\\"')}"`);

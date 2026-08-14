@@ -55,7 +55,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
-import type { NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
+import type { NoteSpaceFieldVm, NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
 import {
   nextTagChipState,
@@ -192,6 +192,12 @@ interface Draft {
   flags: readonly string[];
   origin: string | null;
   text: string | null;
+  /**
+   * `field:key=value` / `field:key!=value` terms, in the order the query wrote
+   * them. A list rather than one slot, because two field terms are two
+   * questions — `status` and `priority` — and neither one displaces the other.
+   */
+  fields: readonly NoteSpaceFieldVm[];
 }
 
 /**
@@ -279,6 +285,7 @@ export function SpaceEditor({
                   flags: read.flags,
                   origin: read.origin,
                   text: read.text,
+                  fields: read.fields,
                 },
               }
             : { kind: "frozen", reason: SPACE_TERMS_READONLY, terms: read.terms },
@@ -346,7 +353,8 @@ export function SpaceEditor({
     terms.draft.tags.length === 0 &&
     terms.draft.flags.length === 0 &&
     terms.draft.origin === null &&
-    terms.draft.text === null;
+    terms.draft.text === null &&
+    terms.draft.fields.length === 0;
   const refusal =
     trimmedName === "" ? SPACE_NO_NAME : emptyDraft ? SPACE_NO_TERMS : (failure ?? null);
   // The stored template is not one of the options the chooser can offer —
@@ -370,6 +378,23 @@ export function SpaceEditor({
       seen.set(term, nth + 1);
       frozenRows.push({ key: `${term}#${nth}`, term });
     }
+  }
+
+  // The same counter, for the same reason, over the field chips — and here the
+  // position has to be carried alongside rather than folded into the key.
+  // `field:status!=done field:status!=deferred` is a legal pair and so is the
+  // same term written twice, so a chip is removed BY POSITION: removing "the
+  // one that reads status" would take both. The key stays value-derived, so a
+  // chip keeps its identity when the one before it goes.
+  const fieldRows: { key: string; field: NoteSpaceFieldVm; at: number }[] = [];
+  if (terms.kind === "chips") {
+    const seen = new Map<string, number>();
+    terms.draft.fields.forEach((field, at) => {
+      const label = `field:${field.key}${field.op}${field.value}`;
+      const nth = seen.get(label) ?? 0;
+      seen.set(label, nth + 1);
+      fieldRows.push({ key: `${label}#${nth}`, field, at });
+    });
   }
 
   function editDraft(next: (draft: Draft) => Draft): void {
@@ -685,6 +710,23 @@ export function SpaceEditor({
                       onRemove={() => editDraft((draft) => ({ ...draft, origin: null }))}
                     />
                   )}
+                  {/* Removed BY POSITION, not by value: `field:status!=done
+                      field:status!=deferred` is a legal pair, and removing "the
+                      one that reads status" would take both. The key is the
+                      value plus an occurrence counter (see `fieldRows`), so a
+                      chip keeps its identity when the one before it goes. */}
+                  {fieldRows.map((row) => (
+                    <FixedTerm
+                      key={row.key}
+                      label={`${row.field.key} ${row.field.op} ${row.field.value}`}
+                      onRemove={() =>
+                        editDraft((draft) => ({
+                          ...draft,
+                          fields: draft.fields.filter((_, at) => at !== row.at),
+                        }))
+                      }
+                    />
+                  ))}
                   {terms.draft.text !== null && (
                     <FixedTerm
                       label={`text:${terms.draft.text}`}

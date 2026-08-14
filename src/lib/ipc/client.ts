@@ -139,6 +139,7 @@ export type { NoteRowVm } from "./gen/NoteRowVm";
 export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
+export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
 export type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";

@@ -18,7 +18,10 @@
 //! here writes one — in particular, a file with no `id` is **not** stamped with
 //! a fresh ULID. See [`PoolEntry::id`].
 
+use std::collections::BTreeMap;
+
 use crate::notes::frontmatter::Frontmatter;
+use crate::notes::index::IndexEntry;
 use crate::notes::naming::{is_ulid, note_title};
 use crate::notes::order::{read_order, NoteOrder};
 use crate::notes::search::fold_cmp;
@@ -58,6 +61,21 @@ pub struct PoolEntry {
     pub title: String,
     /// Frontmatter tags unioned with inline `#a/b`, normalised (one set).
     pub tags: Vec<String>,
+    /// Every frontmatter key flattened to a string, exactly as the notes index
+    /// flattens one ([`crate::notes::frontmatter::FieldValue::index_string`]).
+    ///
+    /// Carried so a pool file can answer `field:status=todo` — which is what
+    /// the board's four columns *are* (FR-259). Projecting a `PoolEntry` into
+    /// an [`crate::notes::index::IndexEntry`] is what runs a space over the
+    /// pool, and an entry with an empty `fields` map would make every `field:`
+    /// term silently false: the board would draw four empty columns over a
+    /// session full of tasks and look like it was working.
+    ///
+    /// The whole map rather than a `status` slot, because a session's spaces
+    /// are ordinary saved queries and the query language reaches any key. A
+    /// typed slot here would mean `field:owner=me` works in notes and not in
+    /// sessions, for no reason a user could discover.
+    pub fields: BTreeMap<String, String>,
     /// Which kind this file declares, or `None` for an unfiled file.
     pub kind: Option<KindTag>,
     /// The task state. `Some` only when `kind == Some(KindTag::Task)`.
@@ -92,6 +110,74 @@ impl PoolEntry {
     /// detail open and most callers want the metadata only.
     pub fn body<'a>(&self, text: &'a str) -> &'a str {
         text.get(self.body_at..).unwrap_or("")
+    }
+}
+
+/// Project a pool file into what [`crate::notes::query::eval`] already takes.
+///
+/// **The one evaluator, asked a second question.** A session's spaces are the
+/// same saved queries notes have — same grammar, same chips, same editor — so
+/// running one over the pool must not mean a second implementation of `tag:`,
+/// `field:` and `is:`. It means handing the existing one an entry. A parallel
+/// evaluator is how `tag:ref` would come to mean one thing in a note and
+/// another in a session, and neither surface would be obviously wrong.
+///
+/// `mtime_ns` is the shell's — the domain has no clock and does not stat — and
+/// `updated_ms` is derived from it so `date:` and a `modified` sort answer
+/// something rather than treating every file as born at the epoch. The
+/// frontmatter `created`/`updated` keys still win where present, because
+/// [`crate::notes::query::resolve_date`] reads `fields` first; this is only the
+/// floor beneath them.
+///
+/// Three of [`IndexEntry`]'s fields are deliberately **not** filled:
+///
+/// - `size` and `ino` are the revalidation triple's other two thirds, and the
+///   pool has no cache to revalidate: it is read whole on every detail open.
+///   Zeros here are honest — nothing reads them on this path — where a
+///   plausible-looking guess would be a number some later cache could trust.
+/// - `links` is empty, so `link:`/`backlink:` select nothing in a session
+///   space. That is the same degradation an unbound `link:` already takes in
+///   notes (see [`crate::notes::query::bind_index`]): those two predicates are
+///   answered by a whole-index resolver, and a session pool is not an index.
+///   Extracting outbound links here would make `link:` half-work — matching
+///   literal paths but never a `[[Wikilink]]` — which is worse than not
+///   matching, because a half-working predicate reads as a working one.
+///
+/// `flags` carries what the pool actually knows: `unstable_identity` and
+/// `unparsed`, which are facts about the file. It does **not** carry `pinned`,
+/// `journal`, `template` or the rest — those are notes-vault facts, and
+/// `is:pinned` in a session space is therefore false rather than wrong.
+pub fn as_index_entry(entry: &PoolEntry, mtime_ns: i128) -> IndexEntry {
+    let mut flags = Vec::new();
+    if entry.unstable_identity {
+        flags.push("unstable_identity".to_owned());
+    }
+    if entry.unparsed {
+        flags.push("unparsed".to_owned());
+    }
+    let updated_ms = i64::try_from(mtime_ns / 1_000_000).unwrap_or(i64::MAX);
+    IndexEntry {
+        id: entry.id.clone(),
+        path: entry.rel.clone(),
+        title: entry.title.clone(),
+        size: 0,
+        mtime_ns,
+        ino: 0,
+        created_ms: updated_ms,
+        updated_ms,
+        tags: entry.tags.clone(),
+        fields: entry.fields.clone(),
+        links: Vec::new(),
+        flags,
+        // Empty rather than a body excerpt, and this is the one place the two
+        // projections differ on purpose: `notes_vault` builds a snippet because
+        // its list renders one without reopening the file, and the pool's
+        // caller already holds the text (`PoolEntry::body` takes it back). A
+        // `text:` term still reads the real body through `eval`'s `body`
+        // closure, so nothing is lost — only a copy of every file's first 240
+        // characters that no session surface asks for.
+        snippet: String::new(),
+        order: entry.order,
     }
 }
 
@@ -185,12 +271,23 @@ pub fn read_one(file: PoolFile<'_>) -> PoolEntry {
 
     let (date, time) = stamp_of(file.rel);
 
+    // Flattened the same way `notes_vault`'s projection flattens one, through
+    // the same `index_string` — so `field:` asks one question of a note and of
+    // a session file, and a list-valued key joins on the same separator in both.
+    let mut fields = BTreeMap::new();
+    for key in fm.keys() {
+        if let Some(value) = fm.get(key) {
+            fields.insert(key.to_owned(), value.index_string());
+        }
+    }
+
     PoolEntry {
         rel: file.rel.to_owned(),
         id,
         unstable_identity,
         title,
         tags,
+        fields,
         kind,
         status,
         status_unreadable,
@@ -644,6 +741,166 @@ mod tests {
             log_candidates(&["2026-08-12-0900-shipped.md".to_owned()]).len(),
             1,
             "it is offered to the shell, which then reads it and moves on"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The projection: a pool file, seen by the one query evaluator
+    // -----------------------------------------------------------------------
+
+    /// Run a real query over a real pool file, through the real evaluator.
+    ///
+    /// Deliberately not a hand-built `IndexEntry`: the whole claim being tested
+    /// is that the *projection* is faithful, and an entry written by hand in
+    /// this file would test only that `eval` still works.
+    fn selects(query: &str, rel: &str, text: &str) -> bool {
+        let entry = read_one(file(rel, text));
+        let projected = as_index_entry(&entry, 0);
+        let parsed = crate::notes::query::parse(query)
+            .unwrap_or_else(|err| panic!("parse `{query}`: {}", err.message));
+        let mut body = || entry.body(text).to_owned();
+        crate::notes::query::eval(&parsed, &projected, &mut body, 0)
+    }
+
+    /// The five zone spaces are five `tag:` queries, and each one has to select
+    /// the kind it names off a real pool file.
+    #[test]
+    fn the_five_default_space_queries_select_their_own_kind() {
+        for (query, tag) in [
+            ("tag:about", "about"),
+            ("tag:task", "task"),
+            ("tag:log", "log"),
+            ("tag:ref", "ref"),
+            ("tag:prompt", "prompt"),
+        ] {
+            let text = format!("---\ntags: [{tag}]\n---\n# x\n");
+            assert!(selects(query, "a.md", &text), "{query} should select {tag}");
+            // And selects nothing else: five spaces that all matched everything
+            // would look identical to five that all worked.
+            for (other, _) in [
+                ("tag:about", "about"),
+                ("tag:task", "task"),
+                ("tag:log", "log"),
+                ("tag:ref", "ref"),
+                ("tag:prompt", "prompt"),
+            ] {
+                if other != query {
+                    assert!(!selects(other, "a.md", &text), "{other} matched {tag}");
+                }
+            }
+        }
+    }
+
+    /// The board's whole grammar: four columns are four `field:status=` terms
+    /// over the same `tag:task` set. If the projection dropped `fields`, every
+    /// column would be empty and the board would look like an empty session
+    /// rather than a broken projection — which is why this asserts the
+    /// *positive* case rather than only that nothing crashes.
+    #[test]
+    fn a_field_term_selects_a_task_by_its_status() {
+        let todo = "---\ntags: [task]\nstatus: todo\n---\n# Write it\n";
+        assert!(selects("tag:task field:status=todo", "t.md", todo));
+        assert!(!selects("tag:task field:status=done", "t.md", todo));
+        assert!(selects("tag:task field:status!=done", "t.md", todo));
+
+        // The four board columns partition a status-carrying pool: exactly one
+        // of them holds this card.
+        let hits = crate::sessions::shape::STATUSES
+            .iter()
+            .filter(|status| {
+                selects(
+                    &format!("tag:task field:status={}", status.as_str()),
+                    "t.md",
+                    todo,
+                )
+            })
+            .count();
+        assert_eq!(hits, 1, "a card sits in exactly one column");
+    }
+
+    /// A task whose file states no status is `Todo` in [`PoolEntry::status`] —
+    /// but its *file* says nothing, so `field:status=todo` does not select it.
+    ///
+    /// That divergence is deliberate and worth pinning: the default lives in
+    /// the reader, where it is a display decision, and never in `fields`, where
+    /// it would be keeper answering a query about frontmatter with a value the
+    /// frontmatter does not contain. The board fills its Todo column from the
+    /// grouped pool, which has the default; a hand-written `field:status=todo`
+    /// space asks the file, and gets the file's answer.
+    #[test]
+    fn an_absent_status_is_defaulted_for_the_board_but_never_invented_in_fields() {
+        let bare = "---\ntags: [task]\n---\n# Untriaged\n";
+        let entry = read_one(file("t.md", bare));
+        assert_eq!(entry.status, Some(TaskStatus::Todo), "the reader defaults");
+        assert!(
+            !entry.fields.contains_key("status"),
+            "the projection never invents a key the file does not have"
+        );
+        assert!(!selects("field:status=todo", "t.md", bare));
+        assert!(
+            selects("-field:status=done", "t.md", bare),
+            "the negated form is how a space asks for `not done, or unstated`"
+        );
+    }
+
+    /// `text:` still reads the real body: the projection carries no snippet, so
+    /// a free-text term that silently matched nothing would be the failure.
+    #[test]
+    fn a_text_term_reads_the_body_through_the_projection() {
+        let text = "---\ntags: [log]\n---\n# Opened\n\nthe migration landed\n";
+        assert!(selects("text:migration", "l.md", text));
+        assert!(selects("tag:log text:migration", "l.md", text));
+        assert!(!selects("text:rollback", "l.md", text));
+    }
+
+    /// Two facts the pool knows travel as flags; the notes-vault ones do not,
+    /// and are false rather than wrong.
+    #[test]
+    fn the_projection_carries_only_the_flags_the_pool_can_know() {
+        let hand_written = as_index_entry(&read_one(file("x.md", "prose\n")), 0);
+        assert!(hand_written.has_flag("unstable_identity"));
+        assert!(!hand_written.has_flag("pinned"), "not a notes-vault fact");
+        assert!(!hand_written.has_flag("template"));
+
+        let broken = as_index_entry(&read_one(file("y.md", "---\ntags: [log\n---\n# y\n")), 0);
+        assert!(broken.has_flag("unparsed"));
+
+        // `is:` over a flag the pool cannot know is false, not an error: the
+        // query parses, selects nothing, and says nothing untrue.
+        assert!(!selects("is:pinned", "x.md", "prose\n"));
+    }
+
+    /// `link:` and `backlink:` degrade to selecting nothing, exactly as an
+    /// unbound one does in notes — never to a half-working literal match.
+    #[test]
+    fn link_predicates_select_nothing_rather_than_half_working() {
+        let text = "---\ntags: [ref]\n---\n# R\n\nsee [[Vault as a Lens]] and notes/vault.md\n";
+        assert!(as_index_entry(&read_one(file("r.md", text)), 0)
+            .links
+            .is_empty());
+        assert!(!selects("link:notes/vault.md", "r.md", text));
+        assert!(!selects("backlink:notes/vault.md", "r.md", text));
+    }
+
+    /// The shell's mtime becomes the entry's timestamps, so a `modified` sort
+    /// and a `date:` term have something true to work from — and frontmatter
+    /// still wins over it, because `resolve_date` reads `fields` first.
+    #[test]
+    fn the_shells_mtime_floors_the_timestamps_and_frontmatter_outranks_it() {
+        let entry = read_one(file("a.md", "---\ntags: [log]\n---\n# x\n"));
+        let projected = as_index_entry(&entry, 1_700_000_000_000_000_000);
+        assert_eq!(projected.updated_ms, 1_700_000_000_000);
+        assert_eq!(projected.created_ms, 1_700_000_000_000);
+
+        let stated = read_one(file(
+            "b.md",
+            "---\ntags: [log]\nupdated: 2020-01-02\n---\n# x\n",
+        ));
+        let projected = as_index_entry(&stated, 1_700_000_000_000_000_000);
+        assert_eq!(
+            crate::notes::query::resolve_date(crate::notes::query::DateField::Modified, &projected),
+            crate::notes::query::stamp_ms("2020-01-02").expect("a readable stamp"),
+            "the file's own word outranks the filesystem's"
         );
     }
 }

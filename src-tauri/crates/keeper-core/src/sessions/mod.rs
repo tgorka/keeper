@@ -44,6 +44,7 @@ pub mod pool;
 pub mod promote;
 pub mod refs;
 pub mod shape;
+pub mod spaces;
 pub mod vm;
 
 /// Everything the sessions domain can refuse to do.

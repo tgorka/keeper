@@ -435,6 +435,28 @@ pub struct NoteSpaceTagVm {
     pub term: NoteTagTerm,
 }
 
+/// One `field:` term of a space's query, in the shape a removable chip holds.
+///
+/// **Only `=` and `!=` reach this type**, and that is the whole of its
+/// contract — see [`crate::notes::query::decompose`] for why the four ordered
+/// operators and the negated form stay outside the chip vocabulary. A chip that
+/// could not be re-emitted as the term it came from would be a chip that edits
+/// a query by being read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceFieldVm {
+    /// The frontmatter key, trimmed — `status` in `field:status=todo`.
+    pub key: String,
+    /// Exactly `"="` or `"!="`, as the query spelled it. A string rather than a
+    /// two-case enum because it is re-emitted verbatim on save and never
+    /// branched on; an enum here would buy a match arm on both sides of the
+    /// wire and change nothing about what is written.
+    pub op: String,
+    /// The compared value, trimmed and unquoted.
+    pub value: String,
+}
+
 /// A space's stored query said in the vocabulary the editor's controls speak,
 /// or the reason it cannot be (FR-149, UX-DR55).
 ///
@@ -465,6 +487,12 @@ pub enum NoteSpaceTermsVm {
         origin: Option<String>,
         /// `text:`'s needle, unquoted — the editor re-quotes it on the way out.
         text: Option<String>,
+        /// `field:key=value` and `field:key!=value` terms, in written order.
+        ///
+        /// Unlike the three above, a query may hold several: `status` and
+        /// `priority` are different questions, and a board asks both. The bar
+        /// shows one chip per term and removes them one at a time.
+        fields: Vec<NoteSpaceFieldVm>,
     },
     /// At least one term is outside the chip vocabulary, so no chip may claim to
     /// stand for this query. `terms` is the offending source text, verbatim, for

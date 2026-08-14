@@ -43,7 +43,7 @@ use crate::notes::index::{
     FIELD_LIST_SEPARATOR, FIELD_ORIGIN, FIELD_TOUCHED,
 };
 use crate::notes::search;
-use crate::notes::vm::{NoteSpaceTagVm, NoteSpaceTermsVm};
+use crate::notes::vm::{NoteSpaceFieldVm, NoteSpaceTagVm, NoteSpaceTermsVm};
 
 /// Maximum nesting of parenthesised groups.
 pub const MAX_DEPTH: usize = 8;
@@ -712,10 +712,22 @@ fn tag_pred(value: &str) -> Pred {
 ///
 /// The chip vocabulary is a **flat conjunction** of: `tag:x` / `-tag:x` (at most
 /// one term per tag, since a chip has one slot per tag), `is:<flag>`,
-/// `origin:<value>` and one free-text term. Everything else the grammar
-/// parses — `|`, groups, `path:`, `field:`, `date:`, `link:`, `backlink:`,
-/// `tag:x/*`, and negation of anything that is not a `tag:` — is reported
-/// verbatim rather than approximated.
+/// `origin:<value>`, `field:key=value` / `field:key!=value`, and one free-text
+/// term. Everything else the grammar parses — `|`, groups, `path:`, `date:`,
+/// `link:`, `backlink:`, `tag:x/*`, and negation of anything that is not a
+/// `tag:` — is reported verbatim rather than approximated.
+///
+/// **`field:` admits two of its six operators and no more.** `=` and `!=` are
+/// each other's exact inverse over a stored value ([`eval_field`] implements
+/// them as one call and its negation), so a chip reading `status = todo` says
+/// what the term says. The four ordered comparisons do not survive that trip:
+/// `field:priority>2` is a *range*, and there is no chip shape that shows a
+/// range without either lying about it or growing into the query bar it exists
+/// to avoid. A `field:` with no operator at all — the presence test — is
+/// likewise out: "has a `status`" and "`status` is empty" are the distinction
+/// it draws, and a two-slot key/value chip cannot draw it. Both fall to
+/// `Unrepresentable`, where they are shown verbatim and left alone, which is
+/// this function's whole discipline.
 ///
 /// A query that does not parse is an `Err`, not an empty chip set: the space row
 /// already renders that failure (`NoteSpaceVm::error`), and an editor that
@@ -741,6 +753,7 @@ pub fn decompose(input: &str) -> Result<NoteSpaceTermsVm, QueryError> {
     let mut flags: Vec<String> = Vec::new();
     let mut origin: Option<String> = None;
     let mut text: Option<String> = None;
+    let mut fields: Vec<NoteSpaceFieldVm> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
 
     let mut at = 0;
@@ -793,6 +806,25 @@ pub fn decompose(input: &str) -> Result<NoteSpaceTermsVm, QueryError> {
             }
             "origin" if !negated && origin.is_none() => origin = Some(value.to_owned()),
             "text" if !negated && text.is_none() => text = Some(value.to_owned()),
+            // `field:` is split by the SAME function the forward direction uses
+            // (`split_cmp`), so a chip cannot disagree with the predicate it
+            // came from about where the operator was. `-field:…` goes to `rest`
+            // with everything else negated-and-not-a-tag: the bar has no
+            // negation control outside the tag chip's three states, and the
+            // `Ne` chip is not that control — `-field:status=todo` is true for
+            // a note with no `status` at all, while `field:status!=todo` is
+            // false for it (see `eval_field`'s early return). Folding one into
+            // the other would change which notes the space selects.
+            "field" if !negated => match split_cmp(value) {
+                Some((key, op @ (CmpOp::Eq | CmpOp::Ne), wanted)) if !key.trim().is_empty() => {
+                    fields.push(NoteSpaceFieldVm {
+                        key: key.trim().to_owned(),
+                        op: if op == CmpOp::Eq { "=" } else { "!=" }.to_owned(),
+                        value: wanted.trim().to_owned(),
+                    });
+                }
+                _ => rest.push(source),
+            },
             _ => rest.push(source),
         }
     }
@@ -803,6 +835,7 @@ pub fn decompose(input: &str) -> Result<NoteSpaceTermsVm, QueryError> {
             flags,
             origin,
             text,
+            fields,
         })
     } else {
         Ok(NoteSpaceTermsVm::Unrepresentable { terms: rest })
@@ -2014,6 +2047,11 @@ mod tests {
     );
 
     /// The chip set a query decomposes into, or a panic naming what stopped it.
+    ///
+    /// `field:` terms are not in the tuple: they are asserted by [`field_chips`]
+    /// in the cases that are about them, and every case here predates them and
+    /// has none. Widening the tuple would have edited two dozen assertions to
+    /// say `vec![]` about a question they were not asking.
     fn chips(query: &str) -> Chips {
         match decompose(query).unwrap_or_else(|err| panic!("parse `{query}`: {}", err.message)) {
             NoteSpaceTermsVm::Chips {
@@ -2021,12 +2059,25 @@ mod tests {
                 flags,
                 origin,
                 text,
+                ..
             } => (
                 tags.into_iter().map(|t| (t.tag, t.term)).collect(),
                 flags,
                 origin,
                 text,
             ),
+            NoteSpaceTermsVm::Unrepresentable { terms } => {
+                panic!("`{query}` should be chips, not {terms:?}")
+            }
+        }
+    }
+
+    /// The `field:` chips a query decomposes into, as `key op value` triples.
+    fn field_chips(query: &str) -> Vec<(String, String, String)> {
+        match decompose(query).unwrap_or_else(|err| panic!("parse `{query}`: {}", err.message)) {
+            NoteSpaceTermsVm::Chips { fields, .. } => {
+                fields.into_iter().map(|f| (f.key, f.op, f.value)).collect()
+            }
             NoteSpaceTermsVm::Unrepresentable { terms } => {
                 panic!("`{query}` should be chips, not {terms:?}")
             }
@@ -2101,9 +2152,11 @@ mod tests {
             refused("path:journal/**"),
             vec!["path:journal/**".to_owned()]
         );
+        // `=` and `!=` became chips (Story 45.x); the four ordered operators
+        // did not, because a chip cannot show a range without lying about it.
         assert_eq!(
-            refused("field:priority=high"),
-            vec!["field:priority=high".to_owned()]
+            refused("field:priority>=high"),
+            vec!["field:priority>=high".to_owned()]
         );
         assert_eq!(
             refused("link:notes/a.md"),
@@ -2121,11 +2174,11 @@ mod tests {
     fn a_query_of_nothing_but_refusals_names_every_one_of_them() {
         assert_eq!(
             refused(
-                "path:a/** field:x=1 date:created<today link:b.md backlink:c.md tag:d/* -is:pinned"
+                "path:a/** field:x<1 date:created<today link:b.md backlink:c.md tag:d/* -is:pinned"
             ),
             vec![
                 "path:a/**".to_owned(),
-                "field:x=1".to_owned(),
+                "field:x<1".to_owned(),
                 "date:created<today".to_owned(),
                 "link:b.md".to_owned(),
                 "backlink:c.md".to_owned(),
@@ -2133,6 +2186,88 @@ mod tests {
                 "-is:pinned".to_owned(),
             ]
         );
+    }
+
+    /// The two operators a chip can round-trip, and the order the query wrote
+    /// them in — a board asks `status` and `priority` in one query, so unlike
+    /// `origin:` and `text:` this is a list rather than one slot.
+    #[test]
+    fn the_two_equality_field_operators_become_chips_in_written_order() {
+        assert_eq!(
+            field_chips("tag:task field:status=todo field:priority!=low"),
+            vec![
+                ("status".to_owned(), "=".to_owned(), "todo".to_owned()),
+                ("priority".to_owned(), "!=".to_owned(), "low".to_owned()),
+            ]
+        );
+        // The rest of the query still decomposes beside them rather than being
+        // pushed out by the new arm.
+        let (tags, ..) = chips("tag:task field:status=todo");
+        assert_eq!(tags, vec![("task".to_owned(), NoteTagTerm::Include)]);
+    }
+
+    /// The same key twice is two questions, not a collision: `tag:` has one
+    /// slot per tag because a tag chip has three states and one of them is
+    /// "off", while `field:status!=done field:status!=deferred` is an ordinary
+    /// conjunction with no slot to fight over.
+    #[test]
+    fn the_same_field_key_twice_is_two_chips_because_they_are_two_terms() {
+        assert_eq!(
+            field_chips("field:status!=done field:status!=deferred"),
+            vec![
+                ("status".to_owned(), "!=".to_owned(), "done".to_owned()),
+                ("status".to_owned(), "!=".to_owned(), "deferred".to_owned()),
+            ]
+        );
+    }
+
+    /// The four ordered operators are ranges and the bare form is a presence
+    /// test; neither fits a key/value chip, so both stay verbatim.
+    #[test]
+    fn ordered_and_presence_field_forms_stay_outside_the_chip_vocabulary() {
+        for query in [
+            "field:priority>2",
+            "field:priority>=2",
+            "field:priority<2",
+            "field:priority<=2",
+            "field:status",
+        ] {
+            assert_eq!(refused(query), vec![query.to_owned()], "{query}");
+        }
+    }
+
+    /// `-field:status=todo` and `field:status!=todo` are DIFFERENT sets — the
+    /// first holds notes with no `status` at all, the second does not (see
+    /// `eval_field`'s early return on a missing field). So the negated form is
+    /// refused rather than folded into the `!=` chip, which would silently
+    /// change what the space selects on the next Save.
+    #[test]
+    fn a_negated_field_is_refused_rather_than_folded_into_the_not_equals_chip() {
+        assert_eq!(
+            refused("-field:status=todo"),
+            vec!["-field:status=todo".to_owned()]
+        );
+        // The claim above, exercised rather than asserted in prose: on a note
+        // with no `status` key at all, the `!=` chip and its would-be negated
+        // twin disagree, which is exactly why one may not stand for the other.
+        let absent = entry("a.md");
+        assert!(!hit("field:status=todo", &absent));
+        assert!(!hit("field:status!=todo", &absent));
+        assert!(hit("-field:status=todo", &absent));
+    }
+
+    /// A `field:` with nothing before the operator never reaches the chip bar
+    /// at all: `decompose` parses before it decomposes, and `field_pred`
+    /// already refuses an empty key. So this is an `Err` — a broken query,
+    /// which the space row reports — rather than a term the chips decline.
+    ///
+    /// The keyless guard in the chip arm is therefore belt-and-braces, and this
+    /// test is what says so; without it a later reader would find a branch with
+    /// no case behind it and could not tell whether it was dead or untested.
+    #[test]
+    fn a_field_term_with_no_key_is_a_parse_error_and_never_a_chip() {
+        assert!(decompose("field:=todo").is_err());
+        assert!(decompose("field:").is_err());
     }
 
     /// The exact query `space-editor.test.tsx` round-trips for byte identity.
