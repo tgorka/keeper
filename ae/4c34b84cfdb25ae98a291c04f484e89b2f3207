@@ -1,0 +1,33 @@
+src-tauri/crates/keeper-sync/tests/hooks_never_run.rs
+  s_45b1426f60f163::t_1b35386ecc8c4b 1-53,56-105
+  s_45b1426f60f163::t_71f779909ff1a9 54-55
+src-tauri/crates/keeper-sync/src/git/cli.rs
+  s_45b1426f60f163::t_3a2c0f73700043 439-446
+  s_45b1426f60f163::t_7d70fa9726e6aa 509-559
+  s_45b1426f60f163::t_66a5befa021d3f 1114-1135
+  s_707b9e4679cdf7::t_82a6cc53939f63 1113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ae4c34b84cfdb25ae98a291c04f484e89b2f3207",
+  "prompts": {},
+  "sessions": {
+    "s_45b1426f60f163": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08e999c8-c890-418c-ab79-ca9ea3a5bd7c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_707b9e4679cdf7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5947ffec-663e-4064-8824-efa15cf5854d",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
