@@ -318,6 +318,96 @@ const SESSION_ENTRIES = [
  * Both render differently, and both come from files a person hand-wrote — which
  * is the ordinary case in a zone Obsidian also edits.
  */
+/**
+ * What the three markdown widgets select, in a vault rather than in a session
+ * (FR-264).
+ *
+ * Deliberately a second fixture and not `SESSION_TASKS` reshaped: a widget board
+ * lives in an ordinary note, addresses its cards by note id, and — unlike a
+ * session's closed four — may hold any word at all in `status:`. The `blocked`
+ * card is here for that: it is what the board's "Not in a column" row exists to
+ * show, and in a vault it is the common case rather than the exception.
+ */
+const WIDGET_NOTES = [
+  {
+    id: "w1",
+    path: "projects/keeper/task-widgets.md",
+    title: "Markdown widgets in any note",
+    snippet: "Callout syntax, a StateField, one React host.",
+    tags: ["task"],
+    updatedMs: ago(30),
+    status: "todo" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w2",
+    path: "projects/keeper/task-add-ref.md",
+    title: "The add-a-reference picker",
+    snippet: "Disk, note, recording — and the promotion offer.",
+    tags: ["task", "ui"],
+    updatedMs: ago(90),
+    status: "in-preparation" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w3",
+    path: "projects/keeper/task-search.md",
+    title: "Search everywhere",
+    snippet: "⌘F in the document, ⌘⇧F across all of it.",
+    tags: ["task"],
+    updatedMs: ago(200),
+    status: "blocked" as string,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w4",
+    path: "projects/keeper/task-spaces.md",
+    title: "Spaces replace the folders",
+    snippet: "Five defaults, all of them files.",
+    tags: ["task"],
+    updatedMs: ago(400),
+    status: "done" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w5",
+    path: "projects/keeper/log/2026-08-13-1420-board.md",
+    title: "The board landed",
+    snippet: "Four columns, drag, and the column menu for everybody else.",
+    tags: ["log"],
+    updatedMs: ago(60),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w6",
+    path: "projects/keeper/log/2026-08-12-0930-flat.md",
+    title: "Flat contract",
+    snippet: "One pool of markdown; the kind is a tag.",
+    tags: ["log"],
+    updatedMs: ago(1_500),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w7",
+    path: "projects/keeper/ref-live-zone.md",
+    title: "The live 60-sessions zone",
+    snippet: "/Volumes/merope/tgdrive/60-sessions — read-only from the container.",
+    tags: ["ref"],
+    updatedMs: ago(2_000),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+];
+
 const SESSION_TASKS = [
   {
     id: "01J8AAAAAAAAAAAAAAAAAAAAAA",
@@ -1025,6 +1115,52 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     // A card keeper has now written an `order:` into owns that number, whatever
     // it read as before — which is the one thing the real write changes about
     // how the card renders.
+    card.orderIsOwn = true;
+    return null;
+  },
+  // The three markdown widgets (FR-264). The mock answers by tag and ignores
+  // the callout's argument, and that is a stated limit rather than an oversight:
+  // parsing a query here would be the second parser AD-20 forbids, and the one
+  // thing `bun dev` needs from this command is that a `> [!board]` in a note
+  // draws cards a person can drag.
+  notes_widget: (payload) => {
+    const kind = String(payload.kind ?? "board");
+    const tag = kind === "board" ? "task" : kind === "log" ? "log" : "ref";
+    const rows = WIDGET_NOTES.filter((row) => row.tags.includes(tag));
+    // Rust's own order per kind: a board by `order` then title, a log by path
+    // descending (the filename carries the date), references by title.
+    return kind === "board"
+      ? [...rows].sort((a, b) => a.order - b.order || a.title.localeCompare(b.title))
+      : kind === "log"
+        ? [...rows].sort((a, b) => b.path.localeCompare(a.path))
+        : [...rows].sort((a, b) => a.title.localeCompare(b.title));
+  },
+  // The same arithmetic `sessions_task_move` fakes, over note ids instead of
+  // paths — which is the one difference between the two write paths that a
+  // surface can see.
+  notes_widget_move: (payload) => {
+    const noteId = String(payload.noteId ?? "");
+    const status = String(payload.status ?? "");
+    const index = Number(payload.index ?? 0);
+    const card = WIDGET_NOTES.find((row) => row.id === noteId);
+    if (card === undefined) {
+      return null;
+    }
+    const column = WIDGET_NOTES.filter(
+      (row) => row.tags.includes("task") && row.status === status && row.id !== noteId,
+    ).sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+    const at = Math.min(Math.max(index, 0), column.length);
+    const before = at > 0 ? column[at - 1]?.order : undefined;
+    const after = column[at]?.order;
+    card.status = status;
+    card.order =
+      before === undefined && after === undefined
+        ? 1
+        : before === undefined
+          ? (after as number) - 1
+          : after === undefined
+            ? before + 1
+            : before + (after - before) / 2;
     card.orderIsOwn = true;
     return null;
   },

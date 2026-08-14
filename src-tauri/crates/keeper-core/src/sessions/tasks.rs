@@ -8,15 +8,15 @@
 //! whole reason the board can be a widget in an arbitrary note later, and the
 //! reason two agents editing two different tasks never conflict.
 //!
-//! **The position is fractional on purpose.** [`crate::notes::order`]'s own
-//! header already said this is "what a future drag-to-reorder would write so
-//! that moving one note does not rewrite the frontmatter of every note after
-//! it". This is that future: dropping a card between two others normally writes
-//! exactly one number, in one file.
+//! **The position is fractional on purpose**, and the arithmetic is not this
+//! module's. [`crate::notes::order::drop_order`] owns it, because `order` is a
+//! property of the note and a board is only one thing that drags notes around —
+//! the widget board in an ordinary note (FR-264) drops cards through the same
+//! function. This module owns what is genuinely a session's: turning a drop into
+//! a [`Plan`] against session-relative paths.
 //!
-//! **Normally.** Halving a gap forever runs out of `f64`, and this module says
-//! so rather than pretending otherwise: [`drop_order`] answers `None` when the
-//! midpoint is not strictly between its neighbours, and [`compile_move`] then
+//! **Normally.** Halving a gap forever runs out of `f64`, and `drop_order`
+//! answers `None` rather than pretending otherwise; [`compile_move`] then
 //! renumbers the target column with whole numbers — every file in it, in one
 //! plan. That is a rare, bounded, visible cost, and the alternative is a drop
 //! that silently does nothing because the card landed on a tie the title
@@ -27,21 +27,13 @@
 //! a task keeper did not author keeps its bytes (FR-121).
 
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
-use crate::notes::order::set_order_in;
+use crate::notes::order::{drop_order, renumbered_order, set_order_in};
 use crate::sessions::files::{check_rel, FileVerbError};
 use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::shape::TaskStatus;
 
 /// The frontmatter key that decides a card's column.
 pub const TASK_STATUS_KEY: &str = "status";
-
-/// The step between renumbered cards, and the first card's own position.
-///
-/// One, not zero: `order: 0` is what a file with no `order` key reads as
-/// ([`crate::notes::order::DEFAULT_NOTE_ORDER`]), so a card renumbered to zero
-/// would claim a position it did not choose and sort against silent files by
-/// title. The board's own spaces use `1..5` for the same reason.
-const STEP: f64 = 1.0;
 
 /// One member of a column, as the shell read it.
 ///
@@ -56,41 +48,6 @@ pub struct TaskFile<'a> {
     pub rel: &'a str,
     pub text: &'a str,
     pub order: f64,
-}
-
-/// Where a card dropped between two neighbours goes — or `None` when nothing
-/// fits between them any more.
-///
-/// `before` is the order of the card it lands *after* and `after` the order of
-/// the card it lands *before*; either is `None` at the ends of a column, and
-/// both are `None` in an empty one.
-///
-/// The `None` answer is the honest one rather than a defeat. Two neighbours can
-/// end up adjacent in `f64` after enough halving, or equal because two files
-/// were written with the same number by hand — and in both cases there is no
-/// value that sorts strictly between them. Returning the midpoint anyway would
-/// place the card on a tie, and the tie break (folded title) would then decide
-/// the position instead of the drop: the card jumps somewhere the operator did
-/// not drop it, and pressing again does nothing.
-///
-/// Ends of a column are open-ended by a whole [`STEP`] rather than by a fraction,
-/// so the common "drag to the bottom" case keeps the numbers small and readable
-/// in the file — a person reading `order: 4` in frontmatter can tell what it
-/// means; `order: 3.0000000000000004` teaches nothing.
-#[must_use]
-pub fn drop_order(before: Option<f64>, after: Option<f64>) -> Option<f64> {
-    match (before, after) {
-        (None, None) => Some(STEP),
-        (Some(a), None) => Some(a + STEP),
-        (None, Some(b)) => Some(b - STEP),
-        (Some(a), Some(b)) => {
-            let mid = a + (b - a) / 2.0;
-            // Strictly between, tested rather than assumed: this is false when
-            // the two are equal, when they are adjacent floats, and when either
-            // is non-finite — all of which are reachable from a hand-edited file.
-            (mid > a && mid < b).then_some(mid)
-        }
-    }
 }
 
 /// The plan that moves one card: status, position, and a renumber if forced.
@@ -149,8 +106,7 @@ pub fn compile_move(
                 } else {
                     position + 1
                 };
-                #[allow(clippy::cast_precision_loss)]
-                let renumbered = (slot + 1) as f64 * STEP;
+                let renumbered = renumbered_order(slot);
                 // Only the files whose number actually changes: a plan that
                 // rewrites a file to the bytes it already holds is a sync
                 // commit nobody made.
@@ -161,9 +117,7 @@ pub fn compile_move(
                     });
                 }
             }
-            #[allow(clippy::cast_precision_loss)]
-            let placed = (at + 1) as f64 * STEP;
-            placed
+            renumbered_order(at)
         }
     };
 
@@ -194,43 +148,6 @@ mod tests {
 
     fn card(order: &str, status: &str) -> String {
         format!("---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ntitle: A task\ntags: [task]\nstatus: {status}\norder: {order}\n---\n\n# A task\n\nBody.\n")
-    }
-
-    #[test]
-    fn an_empty_column_starts_at_one_not_zero() {
-        // Zero is what a file with no `order` reads as, so a card placed there
-        // would claim a position it did not choose.
-        assert_eq!(drop_order(None, None), Some(1.0));
-    }
-
-    #[test]
-    fn the_ends_of_a_column_stay_whole_numbers() {
-        assert_eq!(drop_order(Some(3.0), None), Some(4.0));
-        assert_eq!(drop_order(None, Some(3.0)), Some(2.0));
-        // Including below zero: a column whose top card is 1 has somewhere to
-        // drop above it without renumbering anything.
-        assert_eq!(drop_order(None, Some(1.0)), Some(0.0));
-    }
-
-    #[test]
-    fn a_drop_between_two_cards_is_their_midpoint() {
-        assert_eq!(drop_order(Some(1.0), Some(2.0)), Some(1.5));
-        assert_eq!(drop_order(Some(1.5), Some(2.0)), Some(1.75));
-    }
-
-    #[test]
-    fn a_gap_that_cannot_be_halved_says_so() {
-        // Two files written with the same number by hand.
-        assert_eq!(drop_order(Some(2.0), Some(2.0)), None);
-        // Adjacent floats: the midpoint is one of the endpoints, so no value
-        // sorts strictly between them.
-        let next = f64::from_bits(2.0_f64.to_bits() + 1);
-        assert_eq!(drop_order(Some(2.0), Some(next)), None);
-        // Inverted neighbours cannot arrive from a sorted column, but a
-        // hand-edited file can invert one — and no value is between them.
-        assert_eq!(drop_order(Some(3.0), Some(1.0)), None);
-        // Non-finite values are unreachable over JSON and reachable in YAML.
-        assert_eq!(drop_order(Some(f64::NAN), Some(1.0)), None);
     }
 
     #[test]

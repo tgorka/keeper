@@ -261,6 +261,8 @@ export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { WidgetKind } from "./gen/WidgetKind";
+export type { WidgetRow } from "./gen/WidgetRow";
 export type { WordBlockStyle } from "./gen/WordBlockStyle";
 export type { WordBlockVm } from "./gen/WordBlockVm";
 export type { WordRunVm } from "./gen/WordRunVm";
@@ -382,6 +384,8 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { WidgetKind } from "./gen/WidgetKind";
+import type { WidgetRow } from "./gen/WidgetRow";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -3899,6 +3903,62 @@ export async function notesSpaceValidate(query: string): Promise<NoteQueryCheckV
  */
 export async function notesSpaceTerms(query: string): Promise<NoteSpaceTermsVm> {
   return await invoke<NoteSpaceTermsVm>("notes_space_terms", { query });
+}
+
+/**
+ * The rows one markdown widget draws (FR-264) — a `> [!board]`, `> [!log]` or
+ * `> [!refs]` callout in any note, not only in a session.
+ *
+ * `argument` is the callout's own text, verbatim and unparsed: Rust decides what
+ * an empty argument means (the kind's default query) and what a non-empty one
+ * means (it replaces the default). Nothing here composes a query (AD-65), which
+ * is also why a board in a note and a session's board cannot drift apart in what
+ * they select.
+ *
+ * Rejects with: `invalidInput` (the callout's query does not parse — a broken
+ * query is an error rather than an empty widget, because "no rows" and "your
+ * query is wrong" look identical on screen), `unsupported`, `internal`.
+ */
+export async function notesWidget(
+  vaultId: string,
+  kind: WidgetKind,
+  argument: string,
+): Promise<WidgetRow[]> {
+  return await invoke<WidgetRow[]>("notes_widget", { vaultId, kind, argument });
+}
+
+/**
+ * Drag a card between the columns of a board widget: `status` says which column,
+ * `index` says where in it (`0` = top).
+ *
+ * `status` is the column's own word rather than a member of a closed set — a
+ * board in an ordinary note has no fixed column vocabulary, and the four session
+ * statuses are one such vocabulary rather than the only one.
+ *
+ * Deliberately not the same command as {@link sessionsTaskMove}: a session's
+ * move runs through the sessions plan executor, a note's is written through the
+ * vault's own writer with its own trash and sync ledger. Only the arithmetic is
+ * shared, in Rust, which is the part that could have drifted.
+ *
+ * Rejects with: `invalidInput` (an unknown note, or an unparseable query),
+ * `unsupported`, `internal`.
+ */
+export async function notesWidgetMove(
+  vaultId: string,
+  kind: WidgetKind,
+  argument: string,
+  noteId: string,
+  status: string,
+  index: number,
+): Promise<void> {
+  return await invoke<void>("notes_widget_move", {
+    vaultId,
+    kind,
+    argument,
+    noteId,
+    status,
+    index,
+  });
 }
 
 /**

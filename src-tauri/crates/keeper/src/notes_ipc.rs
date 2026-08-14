@@ -51,7 +51,8 @@ use keeper_core::notes::vm::{
     NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{
-    attach, counts, csv, naming, query, search, seed, sort, tags, templates, NotesError,
+    attach, counts, csv, naming, order, query, search, seed, sort, tags, templates, widget,
+    NotesError,
 };
 use keeper_core::vm::{
     ExportReceiptVm, IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm,
@@ -1691,6 +1692,156 @@ pub async fn notes_space_validate(query: String) -> Result<NoteQueryCheckVm, Ipc
             )),
         },
     })
+}
+
+// ---------------------------------------------------------------------------
+// Markdown widgets
+// ---------------------------------------------------------------------------
+
+/// What one `> [!board]` / `> [!log]` / `> [!refs]` callout draws (FR-264).
+///
+/// `argument` is the callout's own text, verbatim — this command decides what an
+/// empty one means and composes the query from it
+/// ([`widget::WidgetKind::effective_query`]), so no query is spliced in the
+/// webview (AD-65). The kind decides the ordering too, which is why the rows
+/// come back already sorted: a widget that returned an unordered set and let
+/// three components each sort it would be three chances to disagree with the
+/// session pane the widget mirrors.
+///
+/// **A broken query is an error, not an empty widget.** A note whose callout has
+/// a typo in it must say so, because "no rows" and "your query does not parse"
+/// look identical on screen and only one of them is the reader's fault.
+///
+/// Rejects with: `internal` (unknown vault), `query` (a callout whose argument
+/// does not parse — carrying the token index the editor underlines).
+#[tauri::command]
+pub async fn notes_widget(
+    vault_id: String,
+    kind: widget::WidgetKind,
+    argument: String,
+) -> Result<Vec<widget::WidgetRow>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    let mut parsed =
+        keeper_core::notes::query::parse(&kind.effective_query(&argument)).map_err(|error| {
+            notes_error(NotesError::Query {
+                message: error.message,
+                token_index: error.token_index,
+            })
+        })?;
+    // The same binding `project_list` does, and for the same reason: `backlink:`
+    // and a title-resolved `link:` cannot be answered without the index behind
+    // them, and the binding is only valid for this snapshot revision.
+    query::bind_index(&mut parsed, &snapshot);
+    let now_ms = notes_vault::local_now_ms();
+    let matched: Vec<&IndexEntry> = snapshot
+        .entries()
+        .iter()
+        .filter(|entry| {
+            let mut body = body_reader(&vault, &entry.path);
+            query::eval(&parsed, entry, &mut body, now_ms)
+        })
+        .collect();
+    Ok(widget::rows_of(kind, &matched))
+}
+
+/// Move one card on a board widget: which column, and where in that column.
+///
+/// The note-side twin of [`crate::sessions_ipc::sessions_task_move`], and
+/// deliberately not a call into it: a session's move compiles a [`Plan`] against
+/// a session folder and runs through the sessions executor, while a note is
+/// written through the vault's own writer with its own trash and sync ledger.
+/// The *arithmetic* is shared — both ask [`order::drop_order`] where a card
+/// goes — which is the part that could have drifted.
+///
+/// `status` is the column's own word rather than a parsed enum: a board widget
+/// in an ordinary note has no closed column set, because the note's own callout
+/// query decides what it selects. The session board's four are that board's
+/// contract, not markdown's.
+///
+/// **The column is re-read here, not trusted from the drag** — the same reason
+/// the session board re-reads: a widget that has been on screen for ten minutes
+/// is a widget an agent has had ten minutes to write notes into, and placing a
+/// card between two neighbours that have since moved is how a drop lands
+/// somewhere nobody chose.
+///
+/// Both keys are spliced ([`Frontmatter::set_in`]), so each write changes one
+/// key and leaves every other byte — key order, comments, CRLF endings, the
+/// body — exactly as it was (FR-121). And when the gap between two neighbours
+/// cannot be halved, the column is renumbered first and the moved card written
+/// **last** (AD-111): a crash halfway leaves a renumbered column and an unmoved
+/// card, never a card placed into a numbering that never happened.
+///
+/// Rejects with: `internal` (unknown vault), `notFound` (a card that is not in
+/// the vault any more), `query` (an unparseable callout argument).
+#[tauri::command]
+pub async fn notes_widget_move(
+    vault_id: String,
+    kind: widget::WidgetKind,
+    argument: String,
+    note_id: String,
+    status: String,
+    index: u32,
+) -> Result<(), IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let moved = entry_of(&vault_id, &note_id)?;
+    let rows = notes_widget(vault_id.clone(), kind, argument).await?;
+
+    // The target column as it stands, in rendered order, without the card being
+    // moved — which is exactly what `drop_order` needs neighbours out of.
+    let column: Vec<&widget::WidgetRow> = rows
+        .iter()
+        .filter(|row| row.status.as_deref() == Some(status.as_str()) && row.id != moved.id)
+        .collect();
+    let at = (index as usize).min(column.len());
+    let before = at
+        .checked_sub(1)
+        .and_then(|i| column.get(i))
+        .map(|r| r.order);
+    let after = column.get(at).map(|r| r.order);
+
+    let placed = match order::drop_order(before, after) {
+        Some(placed) => placed,
+        None => {
+            // The gap collapsed: hand out whole numbers again, keeping the order
+            // the reader is looking at and leaving a hole at `at`.
+            for (position, row) in column.iter().enumerate() {
+                let slot = if position < at {
+                    position
+                } else {
+                    position + 1
+                };
+                let renumbered = order::renumbered_order(slot);
+                // Only the notes whose number actually changes: a write that
+                // produces the bytes already on disk is a sync commit nobody
+                // made.
+                if (row.order - renumbered).abs() <= f64::EPSILON {
+                    continue;
+                }
+                let source = notes_vault::read_note(&vault, &row.path).map_err(notes_error)?;
+                notes_vault::write_note(
+                    &vault,
+                    &row.path,
+                    &order::set_order_in(&source, renumbered),
+                )
+                .map_err(notes_error)?;
+            }
+            order::renumbered_order(at)
+        }
+    };
+
+    // Read now, not before the renumber: the splice preserves the bytes on disk
+    // *at the moment of writing*, and a source captured earlier would revert an
+    // edit made in between.
+    let source = notes_vault::read_note(&vault, &moved.path).map_err(notes_error)?;
+    let updated = Frontmatter::set_in(
+        &source,
+        widget::WIDGET_STATUS_KEY,
+        FieldValue::Str(status.clone()),
+    );
+    notes_vault::write_note(&vault, &moved.path, &order::set_order_in(&updated, placed))
+        .map_err(notes_error)
 }
 
 /// Every template in the vault (FR-100).

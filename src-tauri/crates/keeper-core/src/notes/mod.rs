@@ -29,6 +29,7 @@ pub mod tags;
 pub mod template_update;
 pub mod templates;
 pub mod vm;
+pub mod widget;
 
 /// Everything the notes domain can refuse to do.
 #[derive(Debug, thiserror::Error)]

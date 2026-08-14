@@ -34,6 +34,7 @@ import { embedEntryFor, FileEmbedWidget } from "./file-embed";
 import { galleryLayer } from "./gallery-block";
 import { tableLayer } from "./markdown-table";
 import { mermaidLayer } from "./mermaid-widget";
+import { type NoteWidgetOptions, noteWidgetLayer } from "./note-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
 import { transportFor } from "./recording-transport";
 import { LINK_ATTR, WIKILINK, WIKILINK_ATTR } from "./wikilink";
@@ -157,6 +158,20 @@ export interface LivePreviewOptions {
    * showing an empty grid.
    */
   listFolder?: (folder: string) => Promise<NoteGalleryVm>;
+  /**
+   * Mount a `> [!board]` / `> [!log]` / `> [!refs]` panel (FR-264).
+   *
+   * Injected for the same reason `listFolder` is, and with the same fallback:
+   * absent, the widget mounts its own React host through a dynamic import. What
+   * a caller overrides it for is a test — a renderer driven without a Tauri
+   * host has no vault to query — which is why the default is the real one
+   * rather than nothing.
+   *
+   * Note the vault is NOT a second option here: {@link LivePreviewOptions.vaultId}
+   * is already the vault this editor was built for, and a widget asking a
+   * different one than an embed in the same note could not be right.
+   */
+  mountWidget?: NoteWidgetOptions["mount"];
 }
 
 /** An embedded image, or — when the file is not there — its alt text and the
@@ -853,6 +868,37 @@ const livePreviewTheme = EditorView.baseTheme({
     // The same rule and the same reason as `.cm-md-table-scroll`.
     contain: "inline-size",
   },
+  // FR-264's widget host. `block` for the same reason the embed's is, and with
+  // the same width containment: a board is four columns of cards and a card's
+  // title is arbitrary text, so without this a long title would widen
+  // `.cm-content` and re-lay-out every line of prose in the note.
+  //
+  // The height is deliberately NOT fixed, unlike `.cm-embed-body`. A widget
+  // holds as many rows as the query selected, and a fixed box would put a
+  // second scrollbar inside a document that already scrolls — the widget's
+  // `estimatedHeight` is a hint to the height map, not the box.
+  ".cm-note-widget": { display: "block" },
+  ".cm-note-widget-body": {
+    border: "1px solid var(--border)",
+    borderRadius: "4px",
+    contain: "inline-size",
+  },
+  // The degraded state: the callout as Obsidian would show it, which is what a
+  // widget looks like before its panel arrives and what it stays as where
+  // nothing can query. A quote, because that is what the source is.
+  ".cm-note-widget-head": {
+    borderLeft: "2px solid var(--border)",
+    display: "flex",
+    gap: "0.5em",
+    padding: "0.25em 0.6em",
+  },
+  ".cm-note-widget-kind": { fontWeight: "600", textTransform: "uppercase" },
+  ".cm-note-widget-argument": { color: "var(--muted-foreground)" },
+  ".cm-note-widget-note": {
+    color: "var(--muted-foreground)",
+    display: "block",
+    padding: "0 0.6em 0.25em 0.6em",
+  },
   // `max-content`, deliberately: a CSV is a grid, and a grid that compressed
   // itself into a narrow pane would wrap every cell and stop being scannable.
   // The panel this is mounted in scrolls (`RawRenderedView`'s CSV pane is
@@ -952,6 +998,7 @@ export function livePreview(options: LivePreviewOptions): Extension {
   return [
     plugin,
     galleryLayer({ list: options.listFolder }),
+    noteWidgetLayer({ vaultId: options.vaultId, mount: options.mountWidget }),
     tableLayer(),
     mermaidLayer(),
     externalFlashField,

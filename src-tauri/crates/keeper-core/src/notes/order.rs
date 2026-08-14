@@ -58,6 +58,66 @@ pub const NOTE_ORDER_KEY: &str = "order";
 /// The order of a note that has never been given one.
 pub const DEFAULT_NOTE_ORDER: f64 = 0.0;
 
+/// The step between renumbered notes, and the first one's own position.
+///
+/// One, not zero: [`DEFAULT_NOTE_ORDER`] is what a silent file reads as, so a
+/// note renumbered to zero would claim a position it did not choose and then
+/// sort against every silent note by title.
+pub const ORDER_STEP: f64 = 1.0;
+
+/// Where a note dropped between two neighbours goes — or `None` when nothing
+/// fits between them any more.
+///
+/// `before` is the order of the note it lands *after* and `after` the order of
+/// the one it lands *before*; either is `None` at the ends of a list, and both
+/// are `None` in an empty one.
+///
+/// This is the drag-to-reorder arithmetic the module header promises above:
+/// dropping between two neighbours normally writes exactly one number, in one
+/// file, rather than renumbering everything below it.
+///
+/// The `None` answer is the honest one rather than a defeat. Two neighbours can
+/// end up adjacent in `f64` after enough halving, or equal because two files
+/// were written with the same number by hand — and in both cases there is no
+/// value that sorts strictly between them. Returning the midpoint anyway would
+/// place the note on a tie, and [`cmp_order`]'s tiebreak (folded title) would
+/// then decide the position instead of the drop: the note jumps somewhere the
+/// operator did not drop it, and pressing again does nothing. A caller that
+/// gets `None` renumbers; see `sessions::tasks::compile_move` for the shape.
+///
+/// Ends of a list are open-ended by a whole [`ORDER_STEP`] rather than by a
+/// fraction, so the common "drag to the bottom" case keeps the numbers small
+/// and readable in the file — a person reading `order: 4` in frontmatter can
+/// tell what it means; `order: 3.0000000000000004` teaches nothing.
+#[must_use]
+pub fn drop_order(before: Option<f64>, after: Option<f64>) -> Option<f64> {
+    match (before, after) {
+        (None, None) => Some(ORDER_STEP),
+        (Some(a), None) => Some(a + ORDER_STEP),
+        (None, Some(b)) => Some(b - ORDER_STEP),
+        (Some(a), Some(b)) => {
+            let mid = a + (b - a) / 2.0;
+            // Strictly between, tested rather than assumed: this is false when
+            // the two are equal, when they are adjacent floats, and when either
+            // is non-finite — all of which are reachable from a hand-edited file.
+            (mid > a && mid < b).then_some(mid)
+        }
+    }
+}
+
+/// The whole number a note renumbered into `slot` takes.
+///
+/// Separate from [`drop_order`] because it is the *other* half of the same
+/// decision: when no fraction fits, positions are handed out again from the top,
+/// and both halves have to agree on where a list starts ([`ORDER_STEP`], never
+/// zero).
+#[must_use]
+pub fn renumbered_order(slot: usize) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let position = (slot + 1) as f64;
+    position * ORDER_STEP
+}
+
 /// Where a note's order came from — which the list has to render, because a
 /// number the reader cannot account for is the thing this story removes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -237,6 +297,52 @@ mod tests {
     fn read(source: &str) -> NoteOrder {
         let (fm, _) = Frontmatter::parse(source);
         read_order(&fm)
+    }
+
+    #[test]
+    fn an_empty_list_starts_at_one_not_zero() {
+        // Zero is what a file with no `order` reads as, so a note placed there
+        // would claim a position it did not choose.
+        assert_eq!(drop_order(None, None), Some(1.0));
+    }
+
+    #[test]
+    fn the_ends_of_a_list_stay_whole_numbers() {
+        assert_eq!(drop_order(Some(3.0), None), Some(4.0));
+        assert_eq!(drop_order(None, Some(3.0)), Some(2.0));
+        // Including below zero: a list whose top note is 1 has somewhere to
+        // drop above it without renumbering anything.
+        assert_eq!(drop_order(None, Some(1.0)), Some(0.0));
+    }
+
+    #[test]
+    fn a_drop_between_two_notes_is_their_midpoint() {
+        assert_eq!(drop_order(Some(1.0), Some(2.0)), Some(1.5));
+        assert_eq!(drop_order(Some(1.5), Some(2.0)), Some(1.75));
+    }
+
+    #[test]
+    fn a_gap_that_cannot_be_halved_says_so() {
+        // Two files written with the same number by hand.
+        assert_eq!(drop_order(Some(2.0), Some(2.0)), None);
+        // Adjacent floats: the midpoint is one of the endpoints, so no value
+        // sorts strictly between them.
+        let next = f64::from_bits(2.0_f64.to_bits() + 1);
+        assert_eq!(drop_order(Some(2.0), Some(next)), None);
+        // Inverted neighbours cannot arrive from a sorted list, but a
+        // hand-edited file can invert one — and no value is between them.
+        assert_eq!(drop_order(Some(3.0), Some(1.0)), None);
+        // Non-finite values are unreachable over JSON and reachable in YAML.
+        assert_eq!(drop_order(Some(f64::NAN), Some(1.0)), None);
+    }
+
+    #[test]
+    fn a_renumbered_slot_counts_from_one() {
+        assert_eq!(renumbered_order(0), 1.0);
+        assert_eq!(renumbered_order(3), 4.0);
+        // And agrees with the empty-list case, which is the same statement made
+        // by the other half of the pair.
+        assert_eq!(Some(renumbered_order(0)), drop_order(None, None));
     }
 
     #[test]
