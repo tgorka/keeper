@@ -1,0 +1,25 @@
+package.json
+  s_45b1426f60f163::t_5bcf6a8a06353b 4
+src-tauri/Cargo.lock
+  s_45b1426f60f163::t_fdd5c4017e3882 4189,4225,4254,4282
+src-tauri/Cargo.toml
+  s_45b1426f60f163::t_1aefb322178765 6
+src-tauri/crates/keeper/tauri.conf.json
+  s_45b1426f60f163::t_f43eb1e3dc3a1d 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f7537ee923c782922f1b4efe0b9e0e9f21f09310",
+  "prompts": {},
+  "sessions": {
+    "s_45b1426f60f163": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08e999c8-c890-418c-ab79-ca9ea3a5bd7c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
