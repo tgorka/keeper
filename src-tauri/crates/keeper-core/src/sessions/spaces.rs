@@ -44,6 +44,7 @@ use crate::notes::index::IndexEntry;
 use crate::notes::naming;
 use crate::notes::query;
 use crate::notes::sort;
+use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::pool::{as_index_entry, PoolEntry};
 
 /// Where a zone's space definitions live, zone-relative.
@@ -467,6 +468,247 @@ pub fn select(space: &SessionSpace, candidates: &[Candidate<'_>], now_ms: i64) -
     Selection {
         picked,
         error: None,
+    }
+}
+
+/// What the editor asked to be written to one space.
+///
+/// Everything the form can change and nothing it cannot. There is no `default`
+/// field, deliberately: `keeper.default` is keeper's own marker, the editor has
+/// no control for it, and a request that could carry it would be a request that
+/// could turn a hand-written space into a seeded one — after which "Restore
+/// defaults" would stop offering the real thing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceEdit {
+    pub name: String,
+    /// The query, exactly as the chips composed it.
+    pub query: String,
+    /// The canonical `<key> <dir>`. Writing this is what makes saving a space
+    /// whose stored sort keeper could not read a *repair*: the form showed the
+    /// fallback and said why, so Save is the operator agreeing to it.
+    pub sort: String,
+    pub icon: Option<String>,
+    pub order: f64,
+}
+
+/// Rewrite an existing space's definition, preserving every other byte
+/// (FR-121).
+///
+/// `source` is the file as it stands. Only the `keeper:` map and — when the name
+/// actually changed — `title` and keeper's own heading are touched; prose,
+/// unknown keys, and key order elsewhere all survive, because a space file is
+/// something a person opens in Obsidian and writes in.
+///
+/// **The filename never moves.** A note space renames its file, because a
+/// vault's filenames are derived from titles and the index re-resolves the id.
+/// Here the path *is* the id ([`crate::sessions::vm::SessionSpaceVm::id`]): there
+/// is no index to re-resolve it, so renaming the file would silently break every
+/// reference the surface is holding — and the operator gains nothing, since
+/// `_spaces/` is five files they navigate by their titles anyway.
+///
+/// `keeper.default` is carried through from `source` rather than from the edit,
+/// which is what stops editing the seeded Tasks space from turning it into an
+/// ordinary one and making Restore offer a second copy.
+#[must_use]
+pub fn render_edit(rel: &str, source: &str, edit: &SpaceEdit) -> String {
+    // Read rather than trust the request: `default_key` and the *old* name both
+    // come from the file, and the old name is what decides whether the body's
+    // heading is keeper's to retitle or the operator's to leave alone. `rel` is
+    // passed so the name falls back to the real filename stem — the same name
+    // the rail was showing — when the file carries neither `title` nor heading.
+    let existing = read_one(rel, source);
+    let mut pairs = vec![
+        ("space".to_owned(), FieldValue::Str(edit.query.clone())),
+        ("sort".to_owned(), FieldValue::Str(edit.sort.clone())),
+    ];
+    // Written only when there is one, so a space nobody gave an icon keeps the
+    // frontmatter it had rather than growing an empty key to explain — and the
+    // same rule for the rail position, where zero *is* unpositioned and stamping
+    // `order: 0` into every space would claim each of them had been placed.
+    // `notes_ipc::notes_space_save`'s rule, for its reasons.
+    if let Some(icon) = edit
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+    {
+        pairs.push(("icon".to_owned(), FieldValue::Str(icon.to_owned())));
+    }
+    if edit.order != sort::DEFAULT_SPACE_ORDER {
+        pairs.push(("order".to_owned(), FieldValue::Num(edit.order)));
+    }
+    if let Some(key) = existing.default_key {
+        pairs.push(("default".to_owned(), FieldValue::Str(key)));
+    }
+
+    let mut updated = Frontmatter::set_in(source, "keeper", FieldValue::Map(pairs));
+    if edit.name != existing.name {
+        // `title` rather than the heading alone: `note_title` reads frontmatter
+        // first, and a space's body belongs to whoever last edited it, so the
+        // key is the only place a name is guaranteed to stick.
+        updated = Frontmatter::set_in(&updated, "title", FieldValue::Str(edit.name.clone()));
+        let (_, body_at) = Frontmatter::parse(&updated);
+        if let Some(body) = naming::retitle_heading(&updated[body_at..], &existing.name, &edit.name)
+        {
+            updated = format!("{}{body}", &updated[..body_at]);
+        }
+    }
+    updated
+}
+
+/// The file a brand-new hand-made space is written as.
+///
+/// [`render_note`]'s twin for a space that is not one of the defaults, and it
+/// differs in exactly one key: no `default`, because nothing here is a default.
+/// Same `keeper:` map otherwise, so the reader, the editor and the seeder all
+/// see one shape.
+#[must_use]
+pub fn render_new(edit: &SpaceEdit, id: &str, now: &str) -> String {
+    let mut keeper = vec![
+        ("space".to_owned(), FieldValue::Str(edit.query.clone())),
+        ("sort".to_owned(), FieldValue::Str(edit.sort.clone())),
+    ];
+    if let Some(icon) = edit
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+    {
+        keeper.push(("icon".to_owned(), FieldValue::Str(icon.to_owned())));
+    }
+    if edit.order != sort::DEFAULT_SPACE_ORDER {
+        keeper.push(("order".to_owned(), FieldValue::Num(edit.order)));
+    }
+    let front = Frontmatter::serialise_new(&[
+        ("id".to_owned(), FieldValue::Str(id.to_owned())),
+        ("created".to_owned(), FieldValue::Str(now.to_owned())),
+        ("updated".to_owned(), FieldValue::Str(now.to_owned())),
+        ("title".to_owned(), FieldValue::Str(edit.name.clone())),
+        ("keeper".to_owned(), FieldValue::Map(keeper)),
+    ]);
+    format!("{front}\n# {}\n", edit.name)
+}
+
+/// The zone-relative path a new space is written to, avoiding `taken`.
+///
+/// The title's slug, then `-2`, `-3` … — [`naming::slug`]'s fold decides the
+/// collision, which is the same fold [`claimed`] uses, so a space the operator
+/// calls "Tasks" lands beside the seeded one rather than silently overwriting it.
+/// That function already guarantees a usable stem for a name that folds to
+/// nothing and for a name Windows reserves, which is why there is no second
+/// fallback here: a note and a space that cannot be named would be named
+/// differently, and one of the two spellings would be the one nobody tested.
+///
+/// [`rel_of`]'s undated form, for [`rel_of`]'s reason — five files named after
+/// what they do, in a directory the operator opens by hand.
+#[must_use]
+pub fn rel_for_new(name: &str, taken: &BTreeSet<String>) -> String {
+    let stem = naming::slug(name);
+    let mut candidate = format!("{SPACES_DIR}/{stem}.md");
+    let mut n = 2;
+    while taken.contains(&candidate) {
+        candidate = format!("{SPACES_DIR}/{stem}-{n}.md");
+        n += 1;
+    }
+    candidate
+}
+
+/// Whether a path is one this module is allowed to write or delete.
+///
+/// The containment rule, stated once and asked by the shell before every write:
+/// directly inside `_spaces/`, a `.md`, no traversal, no nesting. The executor
+/// has its own zone-relative check, but that one only proves a path cannot
+/// *escape the zone* — it would happily let `sessions_space_delete` be handed
+/// `active/2026-08-14-keeper/about.md` and remove somebody's session record.
+#[must_use]
+pub fn is_space_path(rel: &str) -> bool {
+    let Some(stem) = rel.strip_prefix(&format!("{SPACES_DIR}/")) else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem.ends_with(".md")
+        && !stem.contains('/')
+        && stem != ".md"
+        && !stem.starts_with('.')
+}
+
+/// The plan that writes one space — new when `source` is `None`, a rewrite
+/// otherwise.
+///
+/// A plan rather than a bare string, so a space write goes through the same
+/// journaled executor every other write does (AD-111) and the shell keeps
+/// executing rather than deciding (AD-108). `MkDir` leads, because a `Restore`
+/// into a zone that never had `_spaces/` must create it, and the step is
+/// idempotent when it did.
+///
+/// Not a `GuardedWrite`: the optimistic guard exists for `README.md`, which an
+/// agent may be appending to while the operator edits it. `_spaces/` is edited
+/// by one human in one editor, and a guard there would turn "your file changed
+/// on disk" into a refusal with nothing useful to do about it.
+#[must_use]
+pub fn compile_save(
+    rel: &str,
+    source: Option<&str>,
+    edit: &SpaceEdit,
+    id: &str,
+    now: &str,
+) -> Plan {
+    let content = match source {
+        Some(text) => render_edit(rel, text, edit),
+        None => render_new(edit, id, now),
+    };
+    Plan {
+        verb: "space-save".to_owned(),
+        session: rel.to_owned(),
+        steps: vec![
+            PlanStep::MkDir {
+                path: SPACES_DIR.to_owned(),
+            },
+            PlanStep::WriteFile {
+                path: rel.to_owned(),
+                content,
+            },
+        ],
+    }
+}
+
+/// The plan that removes one space: a trash move, recoverable.
+///
+/// The whole plan is the irreversible step, which AD-111 puts last and here
+/// makes the only one.
+#[must_use]
+pub fn compile_delete(rel: &str, trash_key: &str) -> Plan {
+    Plan {
+        verb: "space-delete".to_owned(),
+        session: rel.to_owned(),
+        steps: vec![PlanStep::TrashFile {
+            path: rel.to_owned(),
+            trash_key: trash_key.to_owned(),
+        }],
+    }
+}
+
+/// The plan that seeds defaults into `_spaces/` (FR-261).
+///
+/// `ids` and `now` come from the shell for the usual reason — the domain has
+/// neither a clock nor an id generator — and are zipped positionally against
+/// [`plan`]'s output, so a caller that supplies too few ids seeds fewer spaces
+/// rather than reusing one id for two files.
+#[must_use]
+pub fn compile_seed(defaults: &[&'static DefaultSessionSpace], ids: &[String], now: &str) -> Plan {
+    let mut steps = vec![PlanStep::MkDir {
+        path: SPACES_DIR.to_owned(),
+    }];
+    for (space, id) in defaults.iter().zip(ids) {
+        steps.push(PlanStep::WriteFile {
+            path: rel_of(space),
+            content: render_note(space, id, now),
+        });
+    }
+    Plan {
+        verb: "spaces-seed".to_owned(),
+        session: SPACES_DIR.to_owned(),
+        steps,
     }
 }
 
@@ -962,5 +1204,202 @@ mod tests {
             run(&seeded("tasks"), &files).expect("tasks"),
             ["a.md", "b.md"]
         );
+    }
+
+    fn edit(name: &str, query: &str) -> SpaceEdit {
+        SpaceEdit {
+            name: name.to_owned(),
+            query: query.to_owned(),
+            sort: "name asc".to_owned(),
+            icon: Some("list-todo".to_owned()),
+            order: 2.0,
+        }
+    }
+
+    /// FR-121 in one assertion: prose, unknown keys and key order all survive a
+    /// save that changed one thing. A space file is something the operator opens
+    /// in Obsidian, and an editor that reformats it is an editor they stop
+    /// trusting with the parts keeper does not understand.
+    #[test]
+    fn saving_a_space_leaves_every_other_byte_alone() {
+        let source = concat!(
+            "---\n",
+            "id: 01ABC\n",
+            "cssclass: board\n",
+            "keeper:\n",
+            "  space: tag:task\n",
+            "  sort: order asc\n",
+            "  icon: list-todo\n",
+            "  order: 2\n",
+            "  default: tasks\n",
+            "---\n",
+            "\n# Tasks\n",
+            "\nWhat is left, and what is in flight.\n"
+        );
+        let saved = render_edit(
+            "_spaces/tasks.md",
+            source,
+            &SpaceEdit {
+                sort: "order asc".to_owned(),
+                ..edit("Tasks", "tag:task -field:status=done")
+            },
+        );
+        assert!(saved.contains("cssclass: board"));
+        assert!(saved.contains("id: 01ABC"));
+        assert!(saved.contains("What is left, and what is in flight."));
+        let reread = read_one("_spaces/tasks.md", &saved);
+        assert_eq!(reread.query, "tag:task -field:status=done");
+        assert_eq!(reread.name, "Tasks");
+    }
+
+    /// Editing a seeded space must not un-seed it. `keeper.default` comes off
+    /// the file, never off the request, so renaming Tasks to "Backlog" leaves it
+    /// the Tasks default and Restore does not offer a second copy.
+    #[test]
+    fn editing_a_default_keeps_its_marker_and_retitles_the_heading() {
+        let source = render_note(by_key("tasks").expect("tasks"), "01ABC", "2026-08-14");
+        let saved = render_edit("_spaces/tasks.md", &source, &edit("Backlog", "tag:task"));
+        let reread = read_one("_spaces/tasks.md", &saved);
+        assert_eq!(reread.default_key.as_deref(), Some("tasks"));
+        assert_eq!(reread.name, "Backlog");
+        assert!(saved.contains("# Backlog"), "heading followed the title");
+    }
+
+    /// A body the operator wrote is theirs. `retitle_heading` refuses anything
+    /// but a lone matching heading, so the name changes in frontmatter and the
+    /// prose is left exactly as typed.
+    #[test]
+    fn renaming_does_not_touch_a_body_the_operator_wrote() {
+        let source = "---\nkeeper:\n  space: tag:ref\n---\n\n## Notes\n\nMine.\n";
+        let saved = render_edit("_spaces/refs.md", source, &edit("Sources", "tag:ref"));
+        assert!(saved.contains("## Notes\n\nMine.\n"));
+        assert_eq!(read_one("_spaces/refs.md", &saved).name, "Sources");
+    }
+
+    /// Zero is *unset*, so it is never written: a space nobody positioned keeps
+    /// the frontmatter it had rather than growing a key that claims it was
+    /// placed first. Same rule for an icon nobody chose.
+    #[test]
+    fn an_unset_position_and_a_missing_icon_write_no_key() {
+        let saved = render_new(
+            &SpaceEdit {
+                icon: Some("   ".to_owned()),
+                order: sort::DEFAULT_SPACE_ORDER,
+                ..edit("Archive", "tag:archive")
+            },
+            "01ABC",
+            "2026-08-14",
+        );
+        assert!(!saved.contains("icon:"), "{saved}");
+        assert!(!saved.contains("order:"), "{saved}");
+        assert!(
+            !saved.contains("default:"),
+            "a new space is nobody's default"
+        );
+        let reread = read_one("_spaces/archive.md", &saved);
+        assert_eq!(reread.order, sort::DEFAULT_SPACE_ORDER);
+        assert!(reread.icon.is_none());
+        assert!(reread.warnings.is_empty());
+    }
+
+    /// A hand-made space called "Tasks" lands beside the seeded one instead of
+    /// overwriting it — the collision is decided by the same fold [`claimed`]
+    /// uses, so `Tasks` and `tasks` are one name here too.
+    #[test]
+    fn a_new_space_never_lands_on_a_taken_name() {
+        let taken: BTreeSet<String> = ["_spaces/tasks.md", "_spaces/tasks-2.md"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(rel_for_new("Tasks", &taken), "_spaces/tasks-3.md");
+        assert_eq!(rel_for_new("  TASKS  ", &taken), "_spaces/tasks-3.md");
+    }
+
+    /// A name that folds away entirely still has to become a file, and `.md` is
+    /// not a filename. `naming::slug` already guarantees this for notes; the
+    /// assertion is here to catch a future rel_for_new that stops going through
+    /// it.
+    #[test]
+    fn a_name_that_folds_to_nothing_still_gets_a_filename() {
+        let rel = rel_for_new("???", &BTreeSet::new());
+        assert!(is_space_path(&rel), "{rel}");
+        assert_eq!(rel, format!("{SPACES_DIR}/{}.md", naming::slug("???")));
+    }
+
+    /// A save into a zone that never had `_spaces/` creates it. The step is
+    /// idempotent, so the same plan shape serves a first Restore and an
+    /// ordinary edit — one path, and no "does the directory exist" question at
+    /// the call site.
+    #[test]
+    fn a_save_makes_the_directory_before_it_writes_into_it() {
+        let plan = compile_save(
+            "_spaces/archive.md",
+            None,
+            &edit("Archive", "tag:archive"),
+            "01A",
+            "2026-08-14",
+        );
+        assert_eq!(
+            plan.steps.first(),
+            Some(&PlanStep::MkDir {
+                path: SPACES_DIR.to_owned()
+            })
+        );
+        let PlanStep::WriteFile { path, content } = &plan.steps[1] else {
+            panic!("second step writes the file: {:?}", plan.steps[1]);
+        };
+        assert_eq!(path, "_spaces/archive.md");
+        assert_eq!(read_one(path, content).query, "tag:archive");
+    }
+
+    /// A delete is a trash move, not an unlink: a space is a file somebody
+    /// wrote, and the whole plan being the irreversible step is AD-111 with
+    /// nothing before it to undo.
+    #[test]
+    fn a_delete_trashes_rather_than_unlinks() {
+        let plan = compile_delete("_spaces/prompts.md", "01TRASH");
+        assert_eq!(
+            plan.steps,
+            [PlanStep::TrashFile {
+                path: "_spaces/prompts.md".to_owned(),
+                trash_key: "01TRASH".to_owned()
+            }]
+        );
+    }
+
+    /// Seeding writes one file per default, each with its own id — a zip, so
+    /// too few ids seeds fewer spaces rather than giving two files one id.
+    #[test]
+    fn seeding_gives_every_default_its_own_file_and_id() {
+        let defaults = plan(SeedMode::FirstRun, None);
+        let ids: Vec<String> = (0..defaults.len()).map(|i| format!("01ID{i}")).collect();
+        let seeded = compile_seed(&defaults, &ids, "2026-08-14");
+        let written: Vec<&str> = seeded
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::WriteFile { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written.len(), DEFAULT_SESSION_SPACES.len());
+        assert!(written.iter().all(|rel| is_space_path(rel)), "{written:?}");
+
+        let short = compile_seed(&defaults, &ids[..2], "2026-08-14");
+        assert_eq!(short.steps.len(), 3, "mkdir plus two writes");
+    }
+
+    /// The containment rule. The executor only proves a path cannot escape the
+    /// zone, which would still let a delete take a session's own `about.md`.
+    #[test]
+    fn only_paths_directly_inside_the_spaces_directory_are_writable() {
+        assert!(is_space_path("_spaces/tasks.md"));
+        assert!(!is_space_path("_spaces/nested/tasks.md"));
+        assert!(!is_space_path("_spaces/.md"));
+        assert!(!is_space_path("_spaces/.hidden.md"));
+        assert!(!is_space_path("_spaces/tasks.txt"));
+        assert!(!is_space_path("_spaces"));
+        assert!(!is_space_path("active/2026-08-14-keeper/about.md"));
+        assert!(!is_space_path("../_spaces/tasks.md"));
     }
 }

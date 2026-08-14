@@ -31,6 +31,7 @@
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { SESSION_REFS_HEADING, SessionRefs } from "@/components/sessions/session-refs";
+import { SessionSpaces } from "@/components/sessions/session-spaces";
 import { SessionTree } from "@/components/sessions/session-tree";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,12 +39,16 @@ import type {
   SessionDetailVm,
   SessionEntryVm,
   SessionReferencesVm,
+  SessionSpaceFilesVm,
+  SessionSpaceVm,
   SessionTreeVm,
 } from "@/lib/ipc/client";
 import {
   listenSessionsChanged,
   sessionsDetail,
   sessionsRefs,
+  sessionsSpaceFiles,
+  sessionsSpaces,
   sessionsTree,
 } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
@@ -115,10 +120,19 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   const [detail, setDetail] = useState<SessionDetailVm | null>(null);
   const [tree, setTree] = useState<SessionTreeVm | null>(null);
   const [refs, setRefs] = useState<SessionReferencesVm | null>(null);
+  const [spaces, setSpaces] = useState<readonly SessionSpaceVm[]>([]);
+  const [spaceFiles, setSpaceFiles] = useState<readonly SessionSpaceFilesVm[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped by a write from the spaces section. The changed event covers writes
+  // that land in the zone's own tree, but a space definition is saved through a
+  // plan whose completion this surface hears about no sooner than the watcher
+  // does — and "no sooner" is a race, not a guarantee. An explicit re-read after
+  // a write keeps the section honest without waiting on the filesystem.
+  const [reload, setReload] = useState(0);
 
   // Read on mount and re-read on the changed event — an agent's write on
   // disk moves this surface without a keystroke (FR-234's detail half).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `reload` is a deliberate re-run trigger, not a read — the spaces section bumps it after a write so the two space reads happen again without waiting on the watcher.
   useEffect(() => {
     let live = true;
     const read = () => {
@@ -169,6 +183,43 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
           }
         },
       );
+      // The spaces are two more reads for the same reason (FR-261), and they
+      // stay two: the definitions are the zone's and change when someone edits
+      // one, while the selections are this session's and change whenever any
+      // file in it does. Folding them together would re-parse five queries on
+      // every keystroke an agent makes in a log file.
+      //
+      // They also fail locally — a zone with no `_spaces/` yet is the ordinary
+      // state of a session created before this shipped, and it must not blank
+      // the record. `[]` is the honest rendering: no spaces, and the section
+      // offers to restore the defaults.
+      sessionsSpaces(rootId).then(
+        (vm) => {
+          if (live) {
+            setSpaces(vm);
+          }
+        },
+        () => {
+          if (live) {
+            setSpaces([]);
+          }
+        },
+      );
+      sessionsSpaceFiles(rootId, sessionId).then(
+        (vm) => {
+          if (live) {
+            setSpaceFiles(vm);
+          }
+        },
+        () => {
+          if (live) {
+            // `[]`, not `null`: null means "still reading" to the section, and
+            // a read that already failed is not still reading. Every space then
+            // draws its own empty state rather than an eternal "Reading…".
+            setSpaceFiles([]);
+          }
+        },
+      );
     };
     read();
     let unlisten: (() => void) | null = null;
@@ -187,7 +238,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
       live = false;
       unlisten?.();
     };
-  }, [rootId, sessionId]);
+  }, [rootId, sessionId, reload]);
 
   // Files open in the strip through the one file target (AD-109). The path
   // is the entry's own `subpath`, composed in Rust (AD-65) — this surface
@@ -338,6 +389,19 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               </ul>
             </section>
           )}
+
+          {/* The zone's saved queries, read against this session (FR-261) —
+              AFTER the files, on the operator's own ordering. The tree is what
+              is there; this is what it means. A person who has just seen the
+              filenames can read a section called Tasks and know which of those
+              files it is talking about; the reverse order would ask them to
+              trust a grouping before seeing the thing grouped. */}
+          <SessionSpaces
+            rootId={rootId}
+            spaces={spaces}
+            selections={spaceFiles}
+            onChanged={() => setReload((n) => n + 1)}
+          />
 
           {/* What the session points at (FR-255) — after the files, because it
               is the same question asked the other way: what it holds, then what

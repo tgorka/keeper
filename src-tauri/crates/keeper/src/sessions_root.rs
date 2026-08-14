@@ -30,6 +30,7 @@ use keeper_core::sessions::model::{
 };
 use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
 use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, ABOUT};
+use keeper_core::sessions::spaces::{self, SessionSpace, SPACES_DIR};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
 use tauri::{AppHandle, Emitter};
@@ -873,6 +874,119 @@ pub fn ref_sources(root_id: &str, session_id: &str) -> Option<RefSources> {
         path: row.path,
         files,
         truncated,
+    })
+}
+
+/// One zone's `_spaces/` on disk: the definitions, and whether the directory
+/// exists at all.
+///
+/// The `Option` is the whole seeding rule in a type (FR-261). `None` means the
+/// directory has never been created and keeper may write its five defaults;
+/// `Some(vec![])` means the operator has one and emptied it, and keeper adds
+/// nothing to it uninvited. Collapsing the two into an empty vector is exactly
+/// the ambiguity `_spaces/` was chosen to avoid having a ledger file for.
+pub struct ZoneSpaces {
+    pub spaces: Vec<SessionSpace>,
+    /// The raw bytes of each, keyed by zone-relative path — what a save splices
+    /// against, so the edit path does not re-read a file the list just read.
+    pub sources: HashMap<String, String>,
+    /// Whether `_spaces/` exists.
+    pub seeded: bool,
+}
+
+/// Read a zone's `_spaces/` (FR-261).
+///
+/// Unbudgeted, unlike every other scan here, and the asymmetry is deliberate: a
+/// session's pool is however much prose the operator wrote, but `_spaces/` holds
+/// a handful of files keeper's own editor writes, each a frontmatter block and a
+/// heading. A budget would be a ceiling nothing can reach that still has to be
+/// explained in the failure text.
+pub fn zone_spaces(root_id: &str) -> Option<ZoneSpaces> {
+    let zone = zone_of(root_id)?;
+    Some(read_zone_spaces(&zone))
+}
+
+/// [`zone_spaces`] over a plain directory, so a test can hand it a folder.
+fn read_zone_spaces(zone: &Path) -> ZoneSpaces {
+    let dir = zone.join(SPACES_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // Unreadable and absent are one answer here on purpose: both mean
+        // keeper has no definitions to show, and a permission error on a
+        // directory keeper itself creates is not a case worth a second path.
+        return ZoneSpaces {
+            spaces: Vec::new(),
+            sources: HashMap::new(),
+            seeded: false,
+        };
+    };
+    let mut sources: HashMap<String, String> = HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !name.to_lowercase().ends_with(".md") {
+            continue;
+        }
+        if !entry.path().is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        sources.insert(format!("{SPACES_DIR}/{name}"), text);
+    }
+    let pairs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let spaces = spaces::read_all(&pairs);
+    drop(pairs);
+    ZoneSpaces {
+        spaces,
+        sources,
+        seeded: true,
+    }
+}
+
+/// One session's markdown pool with the two facts a space needs and the pool
+/// does not carry: when each file changed, and its bytes.
+///
+/// Returned as owned strings rather than as [`keeper_core::sessions::spaces::Candidate`]s
+/// because those borrow, and the caller has to hold the texts alive anyway to
+/// evaluate a `text:` term against them.
+pub struct SessionPool {
+    /// Session path, zone-relative — what a `relPath` is joined onto.
+    pub path: String,
+    /// `(zone-relative-within-session, text, mtime_ns)`, in name order.
+    pub files: Vec<(String, String, i128)>,
+}
+
+/// Read one session's pool for space evaluation (FR-261).
+///
+/// Reuses [`read_ref_sources`]'s scan — the same one read of the session root
+/// that decides the shape — and adds a stat per file. A folder-shaped session
+/// returns its `README.md` and its `refs/`+`prompts/` files, which is what makes
+/// the spaces list *work* rather than sit empty on a session nobody has migrated
+/// yet: a `tag:ref` query over an unmigrated session finds whatever those files
+/// declare, and finds nothing when they declare nothing, which is the honest
+/// answer either way.
+pub fn session_pool(root_id: &str, session_id: &str) -> Option<SessionPool> {
+    let row = row_of(root_id, session_id)?;
+    let zone = zone_of(root_id)?;
+    let dir = zone.join(&row.path);
+    let (sources, _truncated, _shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
+    let files = sources
+        .into_iter()
+        .map(|source| {
+            let mtime_ns = std::fs::metadata(dir.join(&source.rel))
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos() as i128);
+            (source.rel, source.text, mtime_ns)
+        })
+        .collect();
+    Some(SessionPool {
+        path: row.path,
+        files,
     })
 }
 

@@ -45,6 +45,16 @@ pub enum PlanStep {
     MoveDir { from: String, to: String },
     /// Move a directory into the zone's `.keeper/trash/<id>/`, recoverable.
     TrashDir { path: String, trash_key: String },
+    /// Move one file into the zone's `.keeper/trash/<id>/`, keeping its name,
+    /// recoverable.
+    ///
+    /// [`PlanStep::TrashDir`]'s twin rather than a `remove_file`, and for the
+    /// reason the trash exists at all: a space, a log entry and a prompt are
+    /// each a file somebody wrote, and a delete button that unlinks bytes is a
+    /// delete button nobody presses without a backup first. Keeping the basename
+    /// under the key is what makes the recovery obvious — `.keeper/trash/<id>/`
+    /// holds `tasks.md`, not an extension-less blob named after a ULID.
+    TrashFile { path: String, trash_key: String },
     /// Remove every entry under a directory except `.gitkeep`, writing one if
     /// absent — the zone's "empty the workspace" (FR-245 step 3).
     EmptyDirKeep { path: String },

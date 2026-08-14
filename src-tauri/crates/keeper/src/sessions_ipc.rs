@@ -1160,3 +1160,345 @@ pub fn sessions_unarchive(root_id: String, session_id: String) -> Result<(), Ipc
     let _ = (root_id, session_id);
     Err(unsupported())
 }
+
+/// One zone's space definitions, in rail order (FR-261).
+///
+/// Seeds on first sight: a zone with **no** `_spaces/` gets the five defaults
+/// written before the list answers, so the operator's first look at a session is
+/// the grouped one rather than an empty rail with a button on it. A zone that
+/// has the directory is theirs — an empty one stays empty, which is what makes a
+/// deleted space stay deleted without a ledger file (AD-121).
+///
+/// The seed is a write inside a read, which is worth flagging: it happens once
+/// per zone, ever, and the alternative is a first-run state where every session
+/// looks broken until someone finds the restore button.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_spaces(
+    root_id: String,
+) -> Result<Vec<keeper_core::sessions::vm::SessionSpaceVm>, IpcError> {
+    use keeper_core::sessions::spaces;
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let mut read =
+        crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+    if !read.seeded {
+        let defaults = spaces::plan(spaces::SeedMode::FirstRun, None);
+        let ids: Vec<String> = defaults
+            .iter()
+            .map(|_| crate::sync_ipc::new_ulid())
+            .collect();
+        let compiled = spaces::compile_seed(&defaults, &ids, &today());
+        let zone_for_run = zone.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::sessions_exec::run(&zone_for_run, compiled)
+        })
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("seed task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+        read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+    }
+    Ok(read.spaces.iter().map(space_vm).collect())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces(root_id: String) -> Result<Vec<()>, IpcError> {
+    let _ = root_id;
+    Err(unsupported())
+}
+
+/// Project one definition for the rail and the editor.
+///
+/// `notes_ipc::notes_spaces`' projection, key for key — the query parsed only to
+/// find out whether it parses, and the sort resolved once here so the form never
+/// has to work out what `bananas` falls back to (that rule lives in Rust and is
+/// tested there).
+#[cfg(desktop)]
+fn space_vm(
+    space: &keeper_core::sessions::spaces::SessionSpace,
+) -> keeper_core::sessions::vm::SessionSpaceVm {
+    use keeper_core::notes::{query, sort};
+
+    keeper_core::sessions::vm::SessionSpaceVm {
+        id: space.rel.clone(),
+        name: space.name.clone(),
+        query: space.query.clone(),
+        sort: space.sort.clone(),
+        sort_effective: sort::read(&space.sort).sort.canonical(),
+        icon: space.icon.clone(),
+        default_key: space.default_key.clone(),
+        order: space.order,
+        warnings: space.warnings.clone(),
+        error: query::parse(&space.query).err().map(|error| error.message),
+    }
+}
+
+/// What every space in the zone selected out of one session (FR-261).
+///
+/// One payload rather than one call per space: the session's pool is read once
+/// and evaluated N times, which is the same trade AD-114 already made for the
+/// board. N round trips would each re-read the same files off the drive to
+/// answer a different query about them.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_space_files(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+) -> Result<Vec<keeper_core::sessions::vm::SessionSpaceFilesVm>, IpcError> {
+    use keeper_core::sessions::pool::{read_one as read_pool_one, PoolFile};
+    use keeper_core::sessions::spaces::{select, Candidate};
+    use keeper_core::sessions::vm::{SessionSpaceFileVm, SessionSpaceFilesVm};
+
+    let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let pool = crate::sessions_root::session_pool(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+
+    // The zone subfolder, so every row carries a path the frontend can open
+    // without composing one (AD-65) — `sessions_tree`'s rule, and its spelling.
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone_prefix = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let prefix = format!("{zone_prefix}/{}", pool.path);
+
+    let entries: Vec<_> = pool
+        .files
+        .iter()
+        .map(|(rel, text, _)| read_pool_one(PoolFile { rel, text }))
+        .collect();
+    let candidates: Vec<Candidate<'_>> = entries
+        .iter()
+        .zip(&pool.files)
+        .map(|(entry, (_, text, mtime_ns))| Candidate {
+            entry,
+            mtime_ns: *mtime_ns,
+            text,
+        })
+        .collect();
+    let now = chrono::Local::now().timestamp_millis();
+
+    Ok(read
+        .spaces
+        .iter()
+        .map(|space| {
+            let selection = select(space, &candidates, now);
+            SessionSpaceFilesVm {
+                space_id: space.rel.clone(),
+                files: selection
+                    .picked
+                    .iter()
+                    .filter_map(|index| candidates.get(*index))
+                    .map(|candidate| SessionSpaceFileVm {
+                        id: candidate.entry.id.clone(),
+                        rel_path: candidate.entry.rel.clone(),
+                        subpath: format!("{prefix}/{}", candidate.entry.rel),
+                        title: candidate.entry.title.clone(),
+                        tags: candidate.entry.tags.clone(),
+                        // Milliseconds on the wire, nanoseconds in the domain:
+                        // the sort needs the precision, a rendered "2 hours ago"
+                        // does not, and an i64 of milliseconds is what every
+                        // other VM here already carries.
+                        mtime_ms: i64::try_from(candidate.mtime_ns / 1_000_000).unwrap_or(0),
+                        unstable_identity: candidate.entry.unstable_identity,
+                    })
+                    .collect(),
+                error: selection.error,
+            }
+        })
+        .collect())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_space_files(root_id: String, session_id: String) -> Result<Vec<()>, IpcError> {
+    // The desktop twin takes `state` too; a mobile twin that refuses does not
+    // need it, and asking for it would make the mobile build depend on
+    // `AppState` for a function that never reads it.
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
+/// Create or rewrite one space (FR-261).
+///
+/// A broken query is refused **at the edge**, exactly as `notes_space_save`
+/// refuses one and for the same reason: a stored space that selects nothing
+/// silently is worse than a save that says no. The editor's own refusal to save
+/// an empty chip set sits on top of this; this is the backstop under it.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_space_save(
+    root_id: String,
+    space: keeper_core::sessions::vm::SessionSpaceReq,
+) -> Result<String, IpcError> {
+    use keeper_core::notes::query;
+    use keeper_core::sessions::spaces;
+
+    query::parse(&space.query).map_err(|error| IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.message,
+        account_id: None,
+        retriable: false,
+    })?;
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+
+    let edit = spaces::SpaceEdit {
+        name: space.name.trim().to_owned(),
+        query: space.query.clone(),
+        sort: space.sort.clone(),
+        icon: space.icon.clone(),
+        order: space.order,
+    };
+    // An id names a file that must already be there. A save against one that is
+    // gone — deleted in another window, or on the far side of a sync — is
+    // refused rather than quietly recreated: recreating it would resurrect a
+    // space the operator threw away, in the one directory whose contents *are*
+    // the ledger.
+    let (rel, source) = match space.id {
+        Some(id) => {
+            if !spaces::is_space_path(&id) {
+                return Err(IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!("not a space path: {id}"),
+                    account_id: None,
+                    retriable: false,
+                });
+            }
+            let Some(source) = read.sources.get(&id).cloned() else {
+                return Err(IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: "that space is no longer there; nothing was written".to_owned(),
+                    account_id: None,
+                    retriable: false,
+                });
+            };
+            (id, Some(source))
+        }
+        None => {
+            let taken = read.sources.keys().cloned().collect();
+            (spaces::rel_for_new(&edit.name, &taken), None)
+        }
+    };
+
+    let compiled = spaces::compile_save(
+        &rel,
+        source.as_deref(),
+        &edit,
+        &crate::sync_ipc::new_ulid(),
+        &today(),
+    );
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("space-save task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(rel)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_space_save(root_id: String, space: ()) -> Result<String, IpcError> {
+    let _ = (root_id, space);
+    Err(unsupported())
+}
+
+/// Remove one space, recoverably (FR-261).
+///
+/// The path is checked against [`keeper_core::sessions::spaces::is_space_path`]
+/// before anything is compiled. The executor's own check only proves a path
+/// cannot escape the zone, which would still happily accept a session's
+/// `about.md`.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_space_delete(root_id: String, space_id: String) -> Result<(), IpcError> {
+    use keeper_core::sessions::spaces;
+
+    if !spaces::is_space_path(&space_id) {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("not a space path: {space_id}"),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let compiled = spaces::compile_delete(&space_id, &crate::sync_ipc::new_ulid());
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("space-delete task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_space_delete(root_id: String, space_id: String) -> Result<(), IpcError> {
+    let _ = (root_id, space_id);
+    Err(unsupported())
+}
+
+/// Put back whichever defaults are missing (FR-261).
+///
+/// Fills holes; never overwrites. A default already present **by key or by
+/// folded name** is left exactly as the operator left it, so pressing this after
+/// renaming Tasks to "Backlog" does not hand them a second Tasks.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_spaces_restore(
+    root_id: String,
+) -> Result<keeper_core::sessions::vm::SessionSpacesRestoredVm, IpcError> {
+    use keeper_core::sessions::spaces;
+    use keeper_core::sessions::vm::SessionSpacesRestoredVm;
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let existing = read.seeded.then_some(read.spaces.as_slice());
+    let missing = spaces::plan(spaces::SeedMode::Restore, existing);
+    if missing.is_empty() {
+        return Ok(SessionSpacesRestoredVm { names: Vec::new() });
+    }
+    let names: Vec<String> = missing.iter().map(|space| space.name.to_owned()).collect();
+    let ids: Vec<String> = missing
+        .iter()
+        .map(|_| crate::sync_ipc::new_ulid())
+        .collect();
+    let compiled = spaces::compile_seed(&missing, &ids, &today());
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("restore task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(SessionSpacesRestoredVm { names })
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
+    let _ = root_id;
+    Err(unsupported())
+}

@@ -216,6 +216,11 @@ export type { SessionReferenceVm } from "./gen/SessionReferenceVm";
 export type { SessionRefVm } from "./gen/SessionRefVm";
 export type { SessionRootVm } from "./gen/SessionRootVm";
 export type { SessionRowVm } from "./gen/SessionRowVm";
+export type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
+export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
+export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
+export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
+export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
@@ -351,6 +356,10 @@ import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
 import type { SessionRefVm } from "./gen/SessionRefVm";
 import type { SessionRootVm } from "./gen/SessionRootVm";
 import type { SessionRowVm } from "./gen/SessionRowVm";
+import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
+import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
+import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
+import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
@@ -4903,6 +4912,110 @@ export async function sessionsRefs(
   sessionId: string,
 ): Promise<SessionReferencesVm> {
   return await invoke<SessionReferencesVm>("sessions_refs", { rootId, sessionId });
+}
+
+/**
+ * Every space the zone defines (FR-261) — the saved queries a flat session is
+ * read through, from `_spaces/*.md` beside `_template/`.
+ *
+ * Zone-wide rather than per-session, because the five are the same for every
+ * session in the root: `tag:task`, `tag:log`, `tag:ref` and the rest are
+ * questions about a session's shape, not about one session.
+ *
+ * **A zone keeper has never seen gets its five defaults written before this
+ * answers.** A read that writes, once per zone ever, and deliberately: the
+ * alternative first-run state is every session looking empty until someone
+ * finds a restore button they have no reason to press.
+ *
+ * A space whose query does not parse comes back with its `error` set rather
+ * than being dropped — the file is hand- and agent-editable, so a broken one is
+ * expected and must not take the section down. It then selects **nothing**; it
+ * never widens to the whole session.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsSpaces(rootId: string): Promise<SessionSpaceVm[]> {
+  return await invoke<SessionSpaceVm[]>("sessions_spaces", { rootId });
+}
+
+/**
+ * What each of those spaces selects out of ONE session (FR-261) — the other
+ * half of {@link sessionsSpaces}.
+ *
+ * Two payloads on purpose: the definitions change when someone edits a space,
+ * the selections change whenever any file in the session does, and binding them
+ * would re-read every `_spaces/*.md` off the drive on every file write.
+ *
+ * One call for all of them, not one per space: the session's pool is read once
+ * and evaluated N times. Every row already carries the profile-relative
+ * `subpath` a file target takes (AD-65), so nothing here joins a path.
+ *
+ * A space whose query does not parse comes back with `error` set and `files`
+ * empty — the section renders the sentence rather than a suspiciously complete
+ * list.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsSpaceFiles(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionSpaceFilesVm[]> {
+  return await invoke<SessionSpaceFilesVm[]>("sessions_space_files", { rootId, sessionId });
+}
+
+/**
+ * Create or rewrite one space (FR-261). Resolves to its id — the zone-relative
+ * path, which for a create is the name keeper derived.
+ *
+ * `space.id` absent creates a file named after the name; present rewrites that
+ * exact file and **never moves it**. A rename therefore rewrites `title` and,
+ * only when the body is exactly the old name as a heading, that heading — the
+ * path is the id here, so moving the file would break every reference to it.
+ *
+ * There is no `defaultKey` to send: `keeper.default` is read off the file and
+ * written back unchanged, so a save cannot promote a hand-written space into a
+ * seeded one.
+ *
+ * Rejects with: `invalidInput` (an unparseable query — refused at the edge, as
+ * `notes_space_save` refuses one, because a stored space that silently selects
+ * nothing is worse than a save that says no), `internal` (a save against a
+ * space that has since been deleted is refused rather than recreating it),
+ * `unsupported`.
+ */
+export async function sessionsSpaceSave(rootId: string, space: SessionSpaceReq): Promise<string> {
+  return await invoke<string>("sessions_space_save", { rootId, space });
+}
+
+/**
+ * Remove one space (FR-261). The file is moved to the zone's own trash, not
+ * unlinked — a space is a markdown file someone wrote, and `.keeper/trash/`
+ * keeps its name so recovering it is a `mv` rather than an archaeology.
+ *
+ * Deleting a seeded default is allowed and is how you get rid of one you do not
+ * want; {@link sessionsSpacesRestore} is how you get it back.
+ *
+ * Rejects with: `invalidInput` (a path that is not directly inside `_spaces/`),
+ * `internal`, `unsupported`.
+ */
+export async function sessionsSpaceDelete(rootId: string, spaceId: string): Promise<void> {
+  await invoke<null>("sessions_space_delete", { rootId, spaceId });
+}
+
+/**
+ * Re-create the default spaces this zone is missing (FR-261), and report which
+ * ones by name.
+ *
+ * Only what is missing: a default that is there is left alone, and so is a
+ * space of the operator's own already carrying a default's key. Names rather
+ * than a count, because "3 restored" and "About, Log and Prompts restored" cost
+ * the same to send and only one of them says whether keeper agreed about what
+ * was missing. An empty list is the ordinary answer on a zone with nothing
+ * missing, and it is a success rather than a refusal.
+ *
+ * Rejects with: `internal` (the zone could not be written to), `unsupported`.
+ */
+export async function sessionsSpacesRestore(rootId: string): Promise<SessionSpacesRestoredVm> {
+  return await invoke<SessionSpacesRestoredVm>("sessions_spaces_restore", { rootId });
 }
 
 /**

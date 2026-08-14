@@ -4,12 +4,15 @@ import type {
   SessionDetailVm,
   SessionEntryVm,
   SessionReferencesVm,
+  SessionSpaceVm,
   SessionTreeVm,
 } from "@/lib/ipc/client";
 
 const sessionsDetail = vi.fn();
 const sessionsTree = vi.fn();
 const sessionsRefs = vi.fn();
+const sessionsSpaces = vi.fn();
+const sessionsSpaceFiles = vi.fn();
 const listenSessionsChanged = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
@@ -17,6 +20,16 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsDetail: (rootId: unknown, sessionId: unknown) => sessionsDetail(rootId, sessionId),
   sessionsTree: (rootId: unknown, sessionId: unknown) => sessionsTree(rootId, sessionId),
   sessionsRefs: (rootId: unknown, sessionId: unknown) => sessionsRefs(rootId, sessionId),
+  sessionsSpaces: (rootId: unknown) => sessionsSpaces(rootId),
+  sessionsSpaceFiles: (rootId: unknown, sessionId: unknown) =>
+    sessionsSpaceFiles(rootId, sessionId),
+  // The spaces section's write path, unreachable from these cases but imported
+  // by the module under test — a mock factory that omits an export makes the
+  // import itself throw, not the call.
+  sessionsSpaceDelete: vi.fn(),
+  sessionsSpacesRestore: vi.fn(),
+  sessionsSpaceSave: vi.fn(),
+  notesSpaceTerms: vi.fn(),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
@@ -42,6 +55,7 @@ import {
   SESSION_REFS_EMPTY,
   SESSION_REFS_HEADING,
 } from "@/components/sessions/session-refs";
+import { SESSION_SPACES_EMPTY, SESSION_SPACES_HEADING } from "@/components/sessions/session-spaces";
 import { SESSION_TREE_EMPTY } from "@/components/sessions/session-tree";
 import { panelsStore } from "@/lib/stores/panels";
 
@@ -142,10 +156,35 @@ function refs(over: Partial<SessionReferencesVm> = {}): SessionReferencesVm {
   };
 }
 
+/**
+ * One space, for the cases about where the section sits.
+ *
+ * The default below is a zone with none, which is the ordinary state of a
+ * session that predates spaces — and the state every other case in this file
+ * wants, because a section listing files would put a second copy of each
+ * filename on the surface and make "the tree shows X" ambiguous.
+ */
+function space(): SessionSpaceVm {
+  return {
+    id: "_spaces/log.md",
+    name: "Log",
+    query: "tag:log",
+    sort: "modified desc",
+    sortEffective: "modified desc",
+    icon: null,
+    defaultKey: "log",
+    order: 3,
+    warnings: [],
+    error: null,
+  };
+}
+
 beforeEach(() => {
   sessionsDetail.mockResolvedValue(detail());
   sessionsTree.mockResolvedValue(tree());
   sessionsRefs.mockResolvedValue(refs());
+  sessionsSpaces.mockResolvedValue([]);
+  sessionsSpaceFiles.mockResolvedValue([]);
   listenSessionsChanged.mockResolvedValue(() => {});
   panelsStore.setState(panelsStore.getInitialState(), true);
 });
@@ -219,6 +258,10 @@ describe("SessionDetail", () => {
     // page would still fail here.
     const order = [
       SESSION_DETAIL_FILES_HEADING,
+      // After the files, on the operator's own instruction: the tree is what the
+      // session holds and this is a reading of it, so the contents come before
+      // keeper's grouping of them.
+      SESSION_SPACES_HEADING,
       SESSION_REFS_HEADING,
       SESSION_DETAIL_LOG_HEADING,
     ].map((name) => screen.getByRole("region", { name }));
@@ -342,6 +385,40 @@ describe("SessionDetail", () => {
     const log = await screen.findByRole("region", { name: SESSION_DETAIL_LOG_HEADING });
     expect(within(log).getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByText(SESSION_REFS_EMPTY)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  /**
+   * Two reads, and they stay two (FR-261): the definitions belong to the zone
+   * and change when someone edits one; the selections belong to this session and
+   * change whenever any file in it does. Folding them together would re-parse
+   * five queries every time an agent touches a log file.
+   */
+  it("reads the zone's spaces and this session's selections as two calls", async () => {
+    sessionsSpaces.mockResolvedValue([space()]);
+    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    expect(within(section).getByText("Log")).toBeInTheDocument();
+    // The zone id alone for the definitions; the session too for the selections.
+    expect(sessionsSpaces).toHaveBeenCalledWith("tgdrive");
+    expect(sessionsSpaceFiles).toHaveBeenCalledWith("tgdrive", "01J5AAAAAAAAAAAAAAAAAAAAAA");
+  });
+
+  /**
+   * A zone with no `_spaces/` yet is the ordinary state of every session created
+   * before this shipped — so the read failing must leave the record standing and
+   * offer the defaults, not blank the surface.
+   */
+  it("keeps the record when the spaces read fails, and offers the defaults", async () => {
+    sessionsSpaces.mockRejectedValue(new Error("no such directory"));
+    sessionsSpaceFiles.mockRejectedValue(new Error("no such directory"));
+    mount();
+
+    const log = await screen.findByRole("region", { name: SESSION_DETAIL_LOG_HEADING });
+    expect(within(log).getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByText(SESSION_SPACES_EMPTY)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

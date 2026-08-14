@@ -791,8 +791,13 @@ export function SpaceEditor({
  *
  * `aria-pressed` is right here and wrong on a tag chip: this control has two
  * states and its name does not have to carry a third.
+ *
+ * Exported for the sessions space editor (FR-261), which edits the same kind of
+ * object with the same icon set. A second copy of a two-state button is the
+ * kind of duplication nobody notices rotting — one of them would keep
+ * `aria-pressed` and the other would grow a `role`.
  */
-function IconChoice({
+export function IconChoice({
   name,
   selected,
   onSelect,
@@ -829,8 +834,12 @@ function IconChoice({
  * will spend an afternoon looking for. Widening these to three states is a
  * bigger question about what a negated lens means (Story 43.3 left it open on
  * purpose), so they are two-state here: present, or taken off.
+ *
+ * Exported for the sessions space editor, for {@link IconChoice}'s reason: the
+ * `data-slot="filter-chip"` marker is what every chip test in the app finds
+ * these by, and two definitions of it would drift.
  */
-function FixedTerm({ label, onRemove }: { label: string; onRemove: () => void }) {
+export function FixedTerm({ label, onRemove }: { label: string; onRemove: () => void }) {
   return (
     <span
       data-slot="filter-chip"

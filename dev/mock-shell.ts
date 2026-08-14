@@ -36,7 +36,14 @@
  */
 
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { FileSizeVm, FilesEntryVm, FilesListingVm } from "@/lib/ipc/client";
+import type {
+  FileSizeVm,
+  FilesEntryVm,
+  FilesListingVm,
+  SessionSpaceFilesVm,
+  SessionSpaceFileVm,
+  SessionSpaceVm,
+} from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -343,6 +350,163 @@ const SESSION_TASKS = [
 ];
 
 /**
+ * The zone's five default spaces, plus the two failures the healthy five cannot
+ * show: one whose query will not parse (`error`, selects nothing) and one whose
+ * `sort` keeper could not read (`warnings`, still selects). Those two states
+ * render differently and are the whole reason the VM carries two fields, so a
+ * fixture without them shows the section that never has a bad day.
+ *
+ * Annotated rather than inferred, and mutable rather than `as const`, for the
+ * reason the Files listing above is annotated: the save and delete handlers
+ * write into this array, so its element type has to be the wire type instead of
+ * whatever the first five literals happened to imply (which had `icon: string`
+ * and refused the `null` a space with no icon carries).
+ */
+const SESSION_SPACES: SessionSpaceVm[] = [
+  {
+    id: "_spaces/about.md",
+    name: "About",
+    query: "tag:about",
+    sort: "title asc",
+    sortEffective: "title asc",
+    icon: "info",
+    defaultKey: "about",
+    order: 1,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/tasks.md",
+    name: "Tasks",
+    query: "tag:task",
+    sort: "order asc",
+    sortEffective: "order asc",
+    icon: "square-check",
+    defaultKey: "tasks",
+    order: 2,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/log.md",
+    name: "Log",
+    query: "tag:log",
+    sort: "modified desc",
+    sortEffective: "modified desc",
+    icon: "clock",
+    defaultKey: "log",
+    order: 3,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/refs.md",
+    name: "References",
+    // An unreadable `sort` is a WARNING: the space still selects what it
+    // selects and simply falls back, so the section lists normally under a
+    // quieter sentence rather than sending anyone to fix a query that is fine.
+    query: "tag:ref",
+    sort: "sideways asc",
+    sortEffective: "modified desc",
+    icon: "link",
+    defaultKey: "refs",
+    order: 4,
+    warnings: ["Couldn't read sort `sideways asc`; using modified desc."],
+    error: null,
+  },
+  {
+    id: "_spaces/prompts.md",
+    name: "Prompts",
+    // A broken query is an ERROR and selects NOTHING — never everything. A
+    // saved view that silently widened to the whole session is how a bulk
+    // action becomes a data-loss story.
+    query: "tag:prompt AND",
+    sort: "title asc",
+    sortEffective: "title asc",
+    icon: "message-square",
+    defaultKey: "prompts",
+    order: 5,
+    warnings: [],
+    error: "Unexpected end of query after `AND`.",
+  },
+];
+
+function spaceFile(
+  relPath: string,
+  title: string,
+  tags: string[],
+  minutesAgo: number,
+): SessionSpaceFileVm {
+  return {
+    id: `path:${relPath}`,
+    relPath,
+    subpath: `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    title,
+    tags,
+    mtimeMs: ago(minutesAgo),
+    // Path-identified, because that is the ordinary state of a zone Obsidian
+    // also edits: keeper never stamps an `id:` into a file it did not author.
+    unstableIdentity: true,
+  };
+}
+
+/**
+ * What each space selected out of the mock session — same files as the tree, so
+ * the two sections agree with each other, which is the first thing a person
+ * scrolling past them checks.
+ *
+ * `prompts` answers an empty list and carries its own error: the broken query
+ * above selects nothing, and the section prints Rust's sentence rather than
+ * inventing a second one for the same state.
+ */
+const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
+  {
+    spaceId: "_spaces/about.md",
+    files: [spaceFile("about.md", "About this session", ["about"], 45)],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/tasks.md",
+    files: [
+      spaceFile(
+        "task-migrate-the-live-zone.md",
+        "Migrate the live zone",
+        ["task", "migration"],
+        30,
+      ),
+      spaceFile(
+        "task-task-board-columns.md",
+        "Task board — four columns, drag to reorder",
+        ["task", "ui"],
+        30,
+      ),
+      spaceFile("task-search-everywhere.md", "Search everywhere (⌘F, ⌘⇧F)", ["task"], 30),
+      spaceFile("task-named-templates.md", "Named templates", ["task"], 30),
+    ],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/log.md",
+    files: [
+      spaceFile("2026-08-13-0910-spaces-and-the-board.md", "Spaces and the board", ["log"], 12),
+      spaceFile("2026-08-12-1740-flat-pool-lands.md", "Flat pool lands", ["log"], 45),
+      spaceFile("2026-08-12-0900-opened-the-session.md", "Opened the session", ["log"], 220),
+    ],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/refs.md",
+    files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/prompts.md",
+    files: [],
+    error: "Unexpected end of query after `AND`.",
+  },
+];
+
+/**
  * A CSV wider than any pane, so an embedded table can be LOOKED at under the
  * one condition that matters: more columns than the note has room for, and one
  * value long enough that no cap could show it whole.
@@ -622,6 +786,9 @@ const ANSWERS: Record<string, unknown> = {
       skips: [],
     },
   ],
+  sessions_spaces: SESSION_SPACES,
+  sessions_space_files: SESSION_SPACE_FILES,
+  sessions_spaces_restore: { names: [] },
 };
 
 /**
@@ -720,6 +887,51 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       ? FOLDER_MIGRATION
       : { needed: false, creates: [], rewrites: [], trashes: [] },
   sessions_migrate: () => null,
+  // The two space writes MUTATE the fixture rather than answering and forgetting.
+  // A shell that accepted a save and then re-answered the old five would make
+  // the editor look broken in exactly the way it is being looked at for — the
+  // whole flow under test is press Save, watch the section re-read. Statefulness
+  // in a viewing aid is a feature when the thing being viewed is a round trip.
+  sessions_space_save: (payload) => {
+    const req = (payload.space ?? {}) as Record<string, unknown>;
+    const id = typeof req.id === "string" ? req.id : `_spaces/${String(req.name)}.md`;
+    const saved = {
+      id,
+      name: String(req.name ?? ""),
+      query: String(req.query ?? ""),
+      sort: String(req.sort ?? "modified desc"),
+      sortEffective: String(req.sort ?? "modified desc"),
+      icon: (req.icon ?? null) as string | null,
+      // Never invented: `defaultKey` says a space is one of the five keeper
+      // knows how to restore, and a hand-made one is not, no matter what it is
+      // called. Claiming otherwise here would make restore look like it had
+      // opinions about a file the operator wrote.
+      defaultKey: null,
+      order: Number(req.order ?? 0),
+      warnings: [],
+      error: null,
+    };
+    const at = SESSION_SPACES.findIndex((space) => space.id === id);
+    if (at === -1) {
+      SESSION_SPACES.push(saved);
+      SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null });
+    } else {
+      SESSION_SPACES[at] = { ...SESSION_SPACES[at], ...saved };
+    }
+    return id;
+  },
+  sessions_space_delete: (payload) => {
+    const id = String(payload.spaceId ?? "");
+    const at = SESSION_SPACES.findIndex((space) => space.id === id);
+    if (at !== -1) {
+      SESSION_SPACES.splice(at, 1);
+    }
+    const filesAt = SESSION_SPACE_FILES.findIndex((row) => row.spaceId === id);
+    if (filesAt !== -1) {
+      SESSION_SPACE_FILES.splice(filesAt, 1);
+    }
+    return null;
+  },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
     if (row === undefined) {

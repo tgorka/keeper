@@ -185,6 +185,22 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             }
             std::fs::rename(&source, &trash).map_err(|e| failed(format!("trash {path}: {e}")))
         }
+        PlanStep::TrashFile { path, trash_key } => {
+            let source = zone.join(rel(path)?);
+            // The basename rides along, so what lands in the trash is
+            // `.keeper/trash/<key>/tasks.md` — recoverable by looking at it.
+            let name = source
+                .file_name()
+                .ok_or_else(|| failed(format!("trash {path}: not a file name")))?
+                .to_owned();
+            let dir = zone.join(".keeper/trash").join(trash_key);
+            let target = dir.join(&name);
+            if !source.exists() && target.exists() {
+                return Ok(()); // already trashed
+            }
+            std::fs::create_dir_all(&dir).map_err(|e| failed(format!("trash {path}: {e}")))?;
+            std::fs::rename(&source, &target).map_err(|e| failed(format!("trash {path}: {e}")))
+        }
         PlanStep::EmptyDirKeep { path } => {
             let dir = zone.join(rel(path)?);
             if !dir.exists() {
