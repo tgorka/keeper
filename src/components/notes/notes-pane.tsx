@@ -255,6 +255,13 @@ export function NotesPane() {
       if (!mod || event.altKey) {
         return;
       }
+      // Something closer to the keystroke already answered it — an open editor
+      // taking `⌘F` for its own find (FR-267). This listener is on `window` and
+      // so is always last; standing down is how a pane-wide chord yields to the
+      // focused document without either side knowing the other exists.
+      if (event.defaultPrevented) {
+        return;
+      }
       if (!event.shiftKey && event.key === "f") {
         event.preventDefault();
         searchRef.current?.focus();

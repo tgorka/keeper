@@ -184,6 +184,17 @@ pub const MIN_PUSH_INTERVAL_MS: u64 = 5_000;
 /// spelled once, here.
 pub const DEFAULT_RECORDINGS_SUBFOLDER: &str = "recordings";
 
+/// Where LLM work sessions live inside a sessions-flagged folder, by default
+/// (AD-107). Its own constant beside [`DEFAULT_NOTES_SUBFOLDER`] and
+/// [`DEFAULT_RECORDINGS_SUBFOLDER`] for the reason this module exists: one JSON
+/// blob has to mean the same thing to the app, to `keeper-syncd` and to
+/// whatever reads `sync.db` next, so the default is spelled once, here.
+///
+/// The value is the zone name both live drives use (`60-sessions/` on tgdrive
+/// and neuradrive), not an invention of keeper's — the flag adopts a layout the
+/// operator already runs.
+pub const DEFAULT_SESSIONS_SUBFOLDER: &str = "60-sessions";
+
 /// When a notes-flagged profile commits, and when it pushes (FR-115, AD-62).
 ///
 /// A knob on the profile rather than a scheduler of its own: the 1 Hz
@@ -547,6 +558,114 @@ impl RecordingsConfig {
     }
 }
 
+/// The sessions flag on a profile, and where the zone lives (AD-107, FR-222).
+///
+/// `Some` on a [`SyncProfile`] means "this synced folder contains a sessions
+/// zone" — the `60-sessions/` layout: `active/`, `archive/YYYY/`, `_template/`,
+/// one folder per LLM work session. The root list is a filter over the profile
+/// list and the root id *is* the profile id, exactly as [`NotesConfig`] made a
+/// vault.
+///
+/// This crate stores the flag and understands nothing behind it. Session
+/// discovery, the promote table, lineage and freshness are `keeper-core`'s; the
+/// engine sees a folder with files in it, exactly as it does for every other
+/// profile. In particular the zone's `workspace/` subtrees are kept out of
+/// version control by the drive's own ignore rules, not by anything this crate
+/// does with the flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsConfig {
+    /// The zone root, relative to `local_path`. Never empty, never absolute,
+    /// never escaping, and never overlapping this profile's notes vault or
+    /// recordings root — see [`SessionsConfig::validate`] for why each is
+    /// refused rather than corrected.
+    #[serde(default = "default_sessions_subfolder")]
+    pub subfolder: String,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            subfolder: DEFAULT_SESSIONS_SUBFOLDER.to_owned(),
+        }
+    }
+}
+
+impl SessionsConfig {
+    /// The subfolder rules, split out of [`SyncProfile::validate`] for the
+    /// reason [`NotesConfig::validate`] is: they are about this field and not
+    /// about the profile.
+    ///
+    /// The profile's notes and recordings blocks are passed IN rather than
+    /// reached for, because the overlap rules are rules about pairs: one folder
+    /// cannot be both a vault and a sessions zone (the notes indexer and the
+    /// sessions indexer would each claim the same markdown), and cannot be both
+    /// a recordings root and a sessions zone (the recorder would write media
+    /// into a tree whose contract says media belongs elsewhere).
+    ///
+    /// Public where `NotesConfig::validate` is private, for the reason
+    /// [`RecordingsConfig::validate`] is: checking a *candidate* block against
+    /// a stored profile is a thing the settings path does before there is a
+    /// `SyncProfile` to validate.
+    ///
+    /// Every rule REFUSES rather than corrects, exactly as the notes rules do
+    /// and for the same reason: a value here is something a person typed, and a
+    /// person who typed it is looking at the field.
+    pub fn validate(
+        &self,
+        notes: Option<&NotesConfig>,
+        recordings: Option<&RecordingsConfig>,
+    ) -> Result<()> {
+        let subfolder = self.subfolder.trim();
+        if subfolder.is_empty() {
+            return Err(SyncError::Config(
+                "sessions subfolder must not be empty: a sessions zone is a folder inside the \
+                 profile, never the profile root"
+                    .into(),
+            ));
+        }
+        // `Path::join` with an absolute right-hand side DISCARDS the left one,
+        // so an absolute subfolder would not fail loudly — the zone root would
+        // quietly point somewhere outside the synced folder entirely. Tested as
+        // a string as well as through `is_absolute`, because absoluteness is
+        // platform-shaped (`C:\x` and `\\server\share` are absolute only to
+        // Windows) and one profile row has to mean the same thing on every
+        // machine that reads it.
+        if Path::new(subfolder).is_absolute()
+            || subfolder.starts_with('/')
+            || subfolder.starts_with('\\')
+        {
+            return Err(SyncError::Config(format!(
+                "sessions subfolder must be relative to the profile folder, got {subfolder}"
+            )));
+        }
+        if subfolder.split(['/', '\\']).any(|c| c == "..") {
+            return Err(SyncError::Config(format!(
+                "sessions subfolder must not escape the profile folder: {subfolder}"
+            )));
+        }
+        if let Some(notes) = notes {
+            let vault = notes.subfolder.trim();
+            if subfolders_overlap(subfolder, vault) {
+                return Err(SyncError::Config(format!(
+                    "sessions subfolder {subfolder} overlaps notes subfolder {vault}: one \
+                     folder cannot be both a vault and a sessions zone"
+                )));
+            }
+        }
+        if let Some(recordings) = recordings {
+            let rec = recordings.subfolder.trim();
+            if subfolders_overlap(subfolder, rec) {
+                return Err(SyncError::Config(format!(
+                    "sessions subfolder {subfolder} overlaps recordings subfolder {rec}: one \
+                     folder cannot be both a recordings root and a sessions zone"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The path components of a profile-relative subfolder.
 ///
 /// Empty and `.` components are dropped so `./a//b` compares as `a/b`, and both
@@ -730,6 +849,18 @@ pub struct SyncProfile {
     /// `None` is "holds no recordings", never "recordings with the defaults".
     #[serde(default)]
     pub recordings: Option<RecordingsConfig>,
+    /// This folder contains a sessions zone, and where inside it (AD-107).
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for `notes`
+    /// and `recordings` above and for the same reason: a row written by a
+    /// keeper that had never heard of sessions simply has no `sessions` key, so
+    /// it loads as `None` and says nothing. No SQL change, no schema bump,
+    /// nothing to run on upgrade, and a row written by this keeper still loads
+    /// on the older one.
+    ///
+    /// `None` is "holds no sessions zone", never "sessions with the defaults".
+    #[serde(default)]
+    pub sessions: Option<SessionsConfig>,
 }
 
 fn default_lfs_threshold() -> u64 {
@@ -749,6 +880,9 @@ fn default_subfolder() -> String {
 }
 fn default_recordings_subfolder() -> String {
     DEFAULT_RECORDINGS_SUBFOLDER.to_owned()
+}
+fn default_sessions_subfolder() -> String {
+    DEFAULT_SESSIONS_SUBFOLDER.to_owned()
 }
 fn default_journal_template() -> String {
     DEFAULT_JOURNAL_TEMPLATE.to_owned()
@@ -786,6 +920,7 @@ impl SyncProfile {
             enabled: true,
             notes: None,
             recordings: None,
+            sessions: None,
         }
     }
 
@@ -840,6 +975,20 @@ impl SyncProfile {
         self.recordings
             .as_ref()
             .map(|recordings| self.local_path.join(recordings.subfolder.trim()))
+    }
+
+    /// The sessions zone root — `local_path` joined with the sessions
+    /// subfolder — or `None` when this profile holds no sessions zone.
+    ///
+    /// Beside [`Self::vault_root`] and [`Self::recordings_root`] and for the
+    /// same reason: the flag and the folder are stored apart, so "where does
+    /// this profile's sessions zone live" gets one answer rather than one per
+    /// caller. [`Self::validate`] has already refused a subfolder that is
+    /// absolute or escaping, so the join cannot leave `local_path`.
+    pub fn sessions_root(&self) -> Option<PathBuf> {
+        self.sessions
+            .as_ref()
+            .map(|sessions| self.local_path.join(sessions.subfolder.trim()))
     }
 
     /// Keychain key for this profile's remote credential. Never the secret.
@@ -909,6 +1058,12 @@ impl SyncProfile {
         // yet would report the wrong problem.
         if let Some(recordings) = &self.recordings {
             recordings.validate(self.notes.as_ref())?;
+        }
+        // After both, and given both: the sessions overlap rules compare
+        // against the notes and recordings subfolders, and comparing against
+        // one that has not been checked yet would report the wrong problem.
+        if let Some(sessions) = &self.sessions {
+            sessions.validate(self.notes.as_ref(), self.recordings.as_ref())?;
         }
         Ok(())
     }
@@ -1500,6 +1655,110 @@ mod tests {
                 "{vault} and {rec} are siblings, not one inside the other"
             );
         }
+    }
+
+    /// A profile row written before the sessions field existed loads as
+    /// `sessions: None` and re-serializes without the key — `#[serde(default)]`
+    /// IS the migration (AD-107), exactly as it was for notes and recordings.
+    #[test]
+    fn a_profile_without_a_sessions_key_loads_and_says_nothing() {
+        let p = profile();
+        let json = serde_json::to_string(&p).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.sessions, None, "no key means no zone, never defaults");
+
+        let flagged = SessionsConfig::default();
+        assert_eq!(flagged.subfolder, DEFAULT_SESSIONS_SUBFOLDER);
+        assert_eq!(
+            flagged.subfolder, "60-sessions",
+            "the default is the zone name the live drives already use"
+        );
+    }
+
+    /// The sessions subfolder rules mirror the notes rules: refused, never
+    /// corrected, because a person typed the value and is looking at the field.
+    #[test]
+    fn a_sessions_subfolder_that_is_empty_absolute_or_escaping_is_refused() {
+        for bad in ["", "  ", "/abs", "\\abs", "a/../b", ".."] {
+            let mut p = profile();
+            p.sessions = Some(SessionsConfig {
+                subfolder: bad.to_owned(),
+            });
+            assert!(
+                matches!(p.validate(), Err(SyncError::Config(_))),
+                "{bad:?} must be a typed config error"
+            );
+        }
+        let mut p = profile();
+        p.sessions = Some(SessionsConfig::default());
+        assert!(p.validate().is_ok());
+        p.sessions = Some(SessionsConfig {
+            subfolder: "zones/60-sessions".to_owned(),
+        });
+        assert!(p.validate().is_ok(), "a nested zone root is ordinary");
+    }
+
+    /// One folder cannot be both a vault and a sessions zone, nor both a
+    /// recordings root and a sessions zone: two indexers over one tree, each
+    /// with its own idea of what belongs in it. Symmetric, because which one
+    /// was configured first says nothing about which one is wrong.
+    #[test]
+    fn sessions_may_not_overlap_notes_or_recordings_in_either_direction() {
+        for (vault, zone) in [
+            ("60-sessions", "60-sessions"),
+            ("zone", "zone/60-sessions"),
+            ("zone/notes", "zone"),
+        ] {
+            let mut p = profile();
+            p.notes = Some(NotesConfig {
+                subfolder: vault.to_owned(),
+                ..NotesConfig::default()
+            });
+            p.sessions = Some(SessionsConfig {
+                subfolder: zone.to_owned(),
+            });
+            let err = p
+                .validate()
+                .expect_err("an overlapping pair must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains(vault) && message.contains(zone),
+                "the message must name both folders, got: {message}"
+            );
+        }
+        let mut p = profile();
+        p.recordings = Some(RecordingsConfig::default());
+        p.sessions = Some(SessionsConfig {
+            subfolder: "recordings/sessions".to_owned(),
+        });
+        assert!(
+            matches!(p.validate(), Err(SyncError::Config(_))),
+            "a zone inside the recordings root must be refused"
+        );
+    }
+
+    /// Component-wise, not `starts_with`: `60-sessions` beside `60-sessions-x`
+    /// are siblings. And the live layout — notes in `10-notes`, sessions in
+    /// `60-sessions`, recordings under `40-media` — must validate as the
+    /// ordinary case it is.
+    #[test]
+    fn the_live_drive_layout_validates() {
+        let mut p = profile();
+        p.notes = Some(NotesConfig {
+            subfolder: "10-notes".to_owned(),
+            ..NotesConfig::default()
+        });
+        p.recordings = Some(RecordingsConfig {
+            subfolder: "40-media/recordings".to_owned(),
+            ..RecordingsConfig::default()
+        });
+        p.sessions = Some(SessionsConfig::default());
+        assert!(p.validate().is_ok(), "tgdrive's own layout must be legal");
+        assert_eq!(
+            p.sessions_root(),
+            Some(p.local_path.join("60-sessions")),
+            "the root is the join, and validate already fenced it"
+        );
     }
 
     #[test]

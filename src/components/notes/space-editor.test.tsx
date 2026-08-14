@@ -111,6 +111,11 @@ beforeEach(() => {
     flags: [],
     origin: null,
     text: null,
+    // Empty rather than absent, and the type is why: `NoteSpaceTermsVm::Chips`
+    // is exhaustive on purpose, so every fixture has to say what it holds of
+    // every term kind. A default would have let a real decomposition lose its
+    // `field:` terms here and go unnoticed.
+    fields: [],
   });
 });
 
@@ -211,6 +216,7 @@ describe("editing a space changes what it selects", () => {
       flags: ["pinned"],
       origin: "agent",
       text: "quarterly review",
+      fields: [],
     });
     open(space({ query: 'tag:client/acme is:pinned origin:agent text:"quarterly review"' }));
 
@@ -230,6 +236,7 @@ describe("editing a space changes what it selects", () => {
       flags: ["pinned"],
       origin: null,
       text: null,
+      fields: [],
     });
     open(space({ query: "tag:client/acme is:pinned" }));
 
@@ -238,6 +245,89 @@ describe("editing a space changes what it selects", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().query).toBe("tag:client/acme");
+  });
+
+  /**
+   * The `field:` chip's reason for existing (Story 45.x, PR 4): a board's
+   * columns are `field:status=…` terms, and until this arm existed a space
+   * holding one decomposed as `Unrepresentable` and could not be edited at all.
+   *
+   * Opened and saved with nothing touched, the query that reaches Rust is the
+   * query that came off disk. That is the same guarantee the read-only arm
+   * gives below, asserted here for a query the chips DO hold — because a chip
+   * that re-emits its term differently is the silent rewrite the whole
+   * `NoteSpaceTermsVm` split exists to prevent (FR-121).
+   */
+  it("round-trips a field term through the chips byte for byte", async () => {
+    mockTerms.mockResolvedValue({
+      kind: "chips",
+      tags: [{ tag: "task", term: "include" }],
+      flags: [],
+      origin: null,
+      text: null,
+      fields: [{ key: "status", op: "=", value: "todo" }],
+    });
+    open(space({ query: "tag:task field:status=todo" }));
+
+    expect(await screen.findByText("status = todo")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().query).toBe("tag:task field:status=todo");
+  });
+
+  /**
+   * Removal is BY POSITION, and this is the case that says why: two terms over
+   * the same key are a legal and ordinary pair — "not done and not deferred" is
+   * one board column — so a chip removed by matching on its key would take both
+   * and quietly widen the space.
+   */
+  it("removes one field chip without taking its twin over the same key", async () => {
+    mockTerms.mockResolvedValue({
+      kind: "chips",
+      tags: [],
+      flags: [],
+      origin: null,
+      text: null,
+      fields: [
+        { key: "status", op: "!=", value: "done" },
+        { key: "status", op: "!=", value: "deferred" },
+      ],
+    });
+    open(space({ query: "field:status!=done field:status!=deferred" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Remove status != done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().query).toBe("field:status!=deferred");
+  });
+
+  /**
+   * A field term is a term. Before the chip arm existed this query had no chip
+   * representation at all, so "is this draft empty?" had never been asked of a
+   * draft whose only content was a `field:`; answering yes would disable Save
+   * on a space that plainly selects something.
+   */
+  it("counts a field term as a term for the empty check", async () => {
+    mockTerms.mockResolvedValue({
+      kind: "chips",
+      tags: [],
+      flags: [],
+      origin: null,
+      text: null,
+      fields: [{ key: "status", op: "=", value: "todo" }],
+    });
+    open(space({ query: "field:status=todo" }));
+
+    await screen.findByRole("button", { name: "Remove status = todo" });
+    expect(screen.queryByText(SPACE_NO_TERMS)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove status = todo" }));
+
+    expect(screen.getByText(SPACE_NO_TERMS)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
   });
 });
 
@@ -613,6 +703,7 @@ describe("a space with no terms left", () => {
       flags: ["pinned"],
       origin: null,
       text: null,
+      fields: [],
     });
     open(space({ query: "is:pinned" }));
 

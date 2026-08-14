@@ -31,6 +31,7 @@
  */
 import type { ensureSyntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
+import type { NoteWidgetOptions } from "@/components/notes/editor/note-widget";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
 
 /** What the decoration layer needs to resolve embeds inside the document. */
@@ -61,6 +62,18 @@ export interface MarkdownPreviewOptions {
   /** List a folder for a gallery block. Absent, the block says keeper is not
    *  listing here rather than drawing an empty grid. */
   listFolder?: (folder: string) => Promise<NoteGalleryVm>;
+  /**
+   * Mount a widget block's panel (FR-264). Absent, the real React host is used
+   * — the same default the editor takes.
+   *
+   * A widget in a preview is read-only in the way that matters: a board still
+   * moves a card, because moving a card writes the card's own file rather than
+   * this document, and refusing that here would make the same block behave
+   * differently depending on which pane it was drawn in. What a preview does
+   * not offer is editing the callout itself, which is the raw view's job
+   * (AD-88) — the same rule the gallery's pins already follow.
+   */
+  mountWidget?: NoteWidgetOptions["mount"];
 }
 
 /** A mounted preview, or the sentence explaining why there is not one. */
@@ -120,6 +133,7 @@ export async function mountMarkdownPreview(
         onOpenLink: options.onOpenLink,
         onOpenUrl: options.onOpenUrl,
         listFolder: options.listFolder,
+        mountWidget: options.mountWidget,
       }),
     ],
   });

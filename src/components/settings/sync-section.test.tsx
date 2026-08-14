@@ -136,6 +136,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     notesSubfolder: null,
     recordings: false,
     recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -575,9 +577,12 @@ describe("SyncSection add-profile form", () => {
         notes: false,
         notesSubfolder: null,
         // The recordings switch is off and untouched, so the save says "this
-        // folder holds none" and names no subfolder at all (Story 41.7).
+        // folder holds none" and names no subfolder at all (Story 41.7). The
+        // sessions switch follows the same rule (FR-222).
         recordings: false,
         recordingsSubfolder: null,
+        sessions: false,
+        sessionsSubfolder: null,
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.

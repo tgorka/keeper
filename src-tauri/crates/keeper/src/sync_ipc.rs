@@ -24,7 +24,7 @@ use keeper_sync::export::{self, ExportRefusal};
 use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
-    DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SETTLE_MS,
+    DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER, DEFAULT_SETTLE_MS,
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
@@ -152,6 +152,18 @@ pub struct SyncProfileVm {
     /// here instead means the form prefills from the value that would actually be
     /// used (AD-34-8) and never spells `recordings` at all.
     pub recordings_subfolder: String,
+    /// Whether this folder contains a sessions zone (FR-222, AD-107).
+    ///
+    /// Beside the notes and recordings flags above and meaning the same kind of
+    /// thing: a sessions root is not a configured object with a life of its
+    /// own, it is this flag plus a subfolder on a profile that already exists.
+    pub sessions: bool,
+    /// The sessions subfolder that would be **in force**: the stored one when
+    /// this folder holds sessions, and `SessionsConfig`'s own default when it
+    /// does not. Never `None`, following `recordings_subfolder` directly above
+    /// rather than `notes_subfolder` — the form prefills from the value that
+    /// would actually be used, and `60-sessions` is spelled once, in Rust.
+    pub sessions_subfolder: String,
 }
 
 impl From<&SyncProfile> for SyncProfileVm {
@@ -187,6 +199,11 @@ impl From<&SyncProfile> for SyncProfileVm {
             recordings_subfolder: p.recordings.as_ref().map_or_else(
                 || DEFAULT_RECORDINGS_SUBFOLDER.to_owned(),
                 |recordings| recordings.subfolder.clone(),
+            ),
+            sessions: p.sessions.is_some(),
+            sessions_subfolder: p.sessions.as_ref().map_or_else(
+                || DEFAULT_SESSIONS_SUBFOLDER.to_owned(),
+                |sessions| sessions.subfolder.clone(),
             ),
         }
     }
@@ -491,6 +508,20 @@ pub struct SyncProfileReq {
     /// on the caller's behalf.
     #[serde(default)]
     pub recordings_subfolder: Option<String>,
+    /// Flag or unflag this folder as holding a sessions zone (FR-222, AD-107).
+    /// `None` leaves the flag alone under exactly the rule `notes` and
+    /// `recordings` follow above: a caller with no control for it must not be
+    /// able to clear it, and clearing it would take a whole zone off the
+    /// Sessions surface while every file stayed where it was.
+    #[serde(default)]
+    pub sessions: Option<bool>,
+    /// The sessions subfolder to pin. `None` keeps whatever is stored — or,
+    /// when this flags the folder for the first time, lets `SessionsConfig`'s
+    /// own default (`60-sessions`) stand. Follows `recordings_subfolder`'s
+    /// verbatim rule, not `notes_subfolder`'s tidying: the validator refuses by
+    /// name, and a silent correction would save against a folder nobody named.
+    #[serde(default)]
+    pub sessions_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -812,6 +843,32 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
             }
         }
     }
+    // The sessions flag (FR-222, AD-107) — the recordings block directly above,
+    // applied a third time and deliberately not reinvented. Unflagging REMOVES
+    // the block rather than storing an empty one, because `None` is "holds no
+    // sessions zone" and a default-filled block would put a Sessions surface
+    // over a folder nobody flagged. Unflagging removes no files — it is a flag
+    // write and nothing else.
+    match req.sessions {
+        Some(true) => {
+            let mut config = profile.sessions.clone().unwrap_or_default();
+            if let Some(subfolder) = sessions_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.sessions = Some(config);
+        }
+        Some(false) => profile.sessions = None,
+        // Not expressed: as above, a subfolder edit on its own still lands on a
+        // folder that already holds a zone, and says nothing about one that
+        // does not.
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.sessions.as_mut(), sessions_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -850,6 +907,16 @@ fn recordings_subfolder(req: &SyncProfileReq) -> Option<String> {
         .map(|raw| raw.trim().to_owned())
 }
 
+/// The sessions subfolder a request expresses, or `None` when it expresses
+/// none. Verbatim after a whitespace trim, for the reason
+/// [`recordings_subfolder`] is: `SessionsConfig::validate` refuses bad shapes
+/// by name, and correcting them here would hide the refusal.
+fn sessions_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.sessions_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
+}
+
 fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
     crate::sync::engine(Arc::clone(&state.platform)).map_err(|err| sync_ipc_error(&err))
 }
@@ -877,6 +944,7 @@ pub async fn sync_statuses(
 /// Create or update a profile, returning the stored result.
 #[tauri::command]
 pub async fn sync_profile_save(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     req: SyncProfileReq,
 ) -> Result<SyncProfileVm, IpcError> {
@@ -895,6 +963,11 @@ pub async fn sync_profile_save(
     engine
         .upsert_profile(&profile)
         .map_err(|e| sync_ipc_error(&e))?;
+    // The sessions flag rides this save (FR-222), and the root registry is a
+    // filter over the profile list (AD-107) — so the registry re-reads here,
+    // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
+    // when nothing sessions-shaped changed.
+    crate::sessions_root::refresh(&app);
     Ok(SyncProfileVm::from(&profile))
 }
 
@@ -2040,6 +2113,17 @@ fn vault_and_scope(profile: &SyncProfile) -> (Option<crate::notes_vault::Vault>,
     let scope = WriteScope::new(
         &profile.name,
         vault.as_ref().map(|vault| vault.config.subfolder.as_str()),
+    )
+    // The workspace fence (Phase 7, AD-113): with the sessions zone named,
+    // the scope refuses every write under a session's `workspace/` — scratch
+    // keeper reads and never touches. From the stored profile rather than the
+    // registry, because the fence must hold even while the sessions registry
+    // is still starting: an unregistered zone widens nothing.
+    .with_sessions(
+        profile
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.subfolder.as_str()),
     );
     (vault, scope)
 }
@@ -2105,6 +2189,57 @@ fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<Sync
     let engine = engine_of(state)?;
     let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
     Ok(find_profile(&profiles, id)?.clone())
+}
+
+// ---------------------------------------------------------------------------
+// What the sessions tree borrows (Phase 7, FR-254, AD-117)
+// ---------------------------------------------------------------------------
+//
+// A sessions root IS a sync profile (AD-107), so the session tree needs the
+// same three facts a listing needs: the profile, its write scope, and one
+// `pending` answer. These three re-export the machinery above rather than
+// letting `sessions_ipc` build its own — the whole point of the tree's sync
+// mark is that it is not a second opinion, and it stops being one the moment
+// the sessions surface starts asking git its own questions.
+//
+// Nothing new is computed here. Each is one line over a private helper,
+// visible to the crate and to nobody else.
+
+/// The profile behind one sessions root.
+pub(crate) fn sessions_profile(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<SyncProfile, IpcError> {
+    routable_profile(state, root_id)
+}
+
+/// The live vault and the write scope over it — including the AD-113 fence,
+/// which is what the tree renders its read-only lock from.
+pub(crate) fn sessions_scope(
+    profile: &SyncProfile,
+) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
+    vault_and_scope(profile)
+}
+
+/// One `Engine::pending` answer for the whole tree, the engine's own words on
+/// failure.
+pub(crate) async fn sessions_pending(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<Vec<keeper_sync::engine::PendingFile>, String> {
+    let engine = engine_of(state).map_err(|error| error.message)?;
+    engine
+        .pending(root_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The five sentences, verbatim — [`sync_mark`], for the sessions tree.
+pub(crate) fn sessions_sync_mark(
+    status: &browse::EntrySyncStatus,
+    engine_failure: Option<&str>,
+) -> FilesEntrySyncVm {
+    sync_mark(status, engine_failure)
 }
 
 /// Save one file inside a synced folder (Story 45.3, FR-175, AD-89, AD-65;
@@ -2563,6 +2698,8 @@ mod tests {
             notes_subfolder: None,
             recordings: None,
             recordings_subfolder: None,
+            sessions: None,
+            sessions_subfolder: None,
         }
     }
 
@@ -2572,7 +2709,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 18] = [
+    const EXPRESSED: [&str; 19] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -2596,6 +2733,9 @@ mod tests {
         // that switch is the whole of what makes a folder a recording
         // destination.
         "recordings",
+        // Expressed from birth (FR-222): the Sync form shipped its switch in the
+        // same change that added the field, so it never had a PRESERVED phase.
+        "sessions",
     ];
 
     /// A field no request can express, which `parse_req` must therefore never
@@ -2679,6 +2819,10 @@ mod tests {
         // that does not overlap the vault just configured above.
         edit.recordings = Some(true);
         edit.recordings_subfolder = Some("media/sessions".into());
+        // And flagging it as a sessions zone moves `sessions` from `None`,
+        // overlapping neither of the two subfolders above.
+        edit.sessions = Some(true);
+        edit.sessions_subfolder = Some("60-sessions".into());
         let merged = parse_req(&edit, Some(&prior)).expect("valid");
 
         let before = json_fields(&prior);

@@ -17,6 +17,7 @@ const desktopCapabilities: CapabilitiesVm = {
   recording: true,
   sync: true,
   notes: true,
+  sessions: true,
   overlayTitleBar: true,
 };
 
@@ -39,6 +40,7 @@ describe("capabilitiesStore", () => {
       recording: false,
       sync: false,
       notes: false,
+      sessions: false,
       overlayTitleBar: false,
     });
   });

@@ -1,0 +1,64 @@
+//! The pure sessions domain (Phase 7, AD-108).
+//!
+//! A session is a **directory with a contract**: `active/YYYY-MM-DD-<slug>/`
+//! or `archive/YYYY/YYYY-MM-DD-<slug>/` inside a sessions-flagged synced
+//! folder's zone (default `60-sessions/`), shaped by the zone's `_template/`.
+//! Both live drives (tgdrive, neuradrive) already run this layout; keeper
+//! adopts it, never invents it.
+//!
+//! There are **two** such contracts, and [`shape`] decides which one a given
+//! folder follows:
+//!
+//! - **Folder** — the original: `README.md` holds the record, and `refs/` and
+//!   `prompts/` hold their kinds by sitting there.
+//! - **Flat** — one markdown pool at the session root, every file declaring its
+//!   own kind as a tag (AD-120), read by [`pool`].
+//!
+//! `workspace/` (unversioned scratch) and `artifacts/` (promoted output) are in
+//! both, because they are the parts that are not markdown. Neither contract is
+//! deprecated on a timetable: these are folders on the operator's drives, and a
+//! session nobody migrates has to keep working.
+//!
+//! Everything here is a *rule* rather than an *effect*, exactly as
+//! [`crate::notes`] is: which directory names are sessions, what folder name a
+//! title produces, what the README's `## Promote` table says, how two READMEs
+//! reference each other as a lineage, and what a session row derives from
+//! plain facts. It takes bytes and paths and returns values. It never opens a
+//! file, never spawns a task, and never learns that a profile id means
+//! anything to git — session IO lives in the `keeper` shell on `keeper-sync`'s
+//! watcher (AD-108). Frontmatter is [`crate::notes::frontmatter`]'s — one
+//! parser, one writer, byte-preserving (AD-109); a fork here would be a
+//! defect.
+//!
+//! The one hard invariant, stated once and enforced everywhere: **files are
+//! the only truth** (AD-110). Status is folder location, freshness is a fold
+//! over supplied `(path, mtime)` facts, lineage is frontmatter on both ends,
+//! promotion is the README's own table. Any state a Finder edit could desync
+//! is a design defect, not a feature.
+
+pub mod add_ref;
+pub mod files;
+pub mod migrate;
+pub mod model;
+pub mod pattern;
+pub mod plan;
+pub mod pool;
+pub mod promote;
+pub mod refs;
+pub mod search;
+pub mod shape;
+pub mod spaces;
+pub mod tasks;
+pub mod template;
+pub mod vm;
+
+/// Everything the sessions domain can refuse to do.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionsError {
+    #[error("no such session: {0}")]
+    NotFound(String),
+    #[error("sessions root {0} is not indexed")]
+    RootUnknown(String),
+    #[error("invalid session name: {0}")]
+    Name(String),
+}

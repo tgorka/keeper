@@ -2,6 +2,7 @@ import {
   Archive,
   Cable,
   Film,
+  FlaskConical,
   FolderSync,
   FolderTree,
   MessageSquare,
@@ -107,6 +108,12 @@ const FILES_VIEW: SidebarView = { label: "Files", icon: FolderTree, view: "files
  * answers "unsupported on this platform" is a worse answer than no row. */
 const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen, view: "notes" };
 
+/** The capability-gated Sessions nav entry (Phase 7, FR-223, FR-251). Beside
+ * Notes and gated the same way, because it is the same construction — a
+ * sessions root is a folder keeper already syncs plus a flag (AD-107) — and a
+ * user who knows one gate already knows the other (UX-DR92). */
+const SESSIONS_VIEW: SidebarView = { label: "Sessions", icon: FlaskConical, view: "sessions" };
+
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings, view: "settings" };
 
@@ -204,6 +211,8 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   // A vault is a folder keeper already syncs (AD-54), so notes exists only where
   // folder sync does (Story 37.1, FR-122) — the entry is absent, not disabled.
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
+  // A sessions root is the same construction (AD-107, FR-223) — same gate.
+  const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
   // Splice the gated entries in before Settings, each only when supported.
   const views: SidebarView[] = [
     ...BASE_VIEWS,
@@ -216,6 +225,7 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
     // entries do.
     ...(sync ? [SYNC_VIEW, FILES_VIEW] : []),
     ...(notes ? [NOTES_VIEW] : []),
+    ...(sessions ? [SESSIONS_VIEW] : []),
     SETTINGS_VIEW,
   ];
 

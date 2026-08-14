@@ -83,15 +83,6 @@ import {
   Clapperboard,
   Copy,
   ExternalLink,
-  FileBraces,
-  FileCode,
-  FileHeadphone,
-  FileImage,
-  FilePlay,
-  FileQuestionMark,
-  FileSpreadsheet,
-  FileText,
-  FileType,
   Folder,
   FolderOpen,
   FolderSearch,
@@ -168,8 +159,7 @@ import {
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
-import type { IconName } from "@/lib/viewers";
-import { resolveViewer } from "@/lib/viewers";
+import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
 /**
  * The height a tree row is assumed to be until it has been mounted once: an
@@ -363,37 +353,19 @@ export const FILES_SIZE_BASE_NOTE = "Sizes are decimal: 1 kB is 1000 bytes, the 
  * The glyph for each of the viewer registry's icon names (Story 45.5, FR-178).
  *
  * **This replaced a `Record<FilesEntryVm["kind"], LucideIcon>` that lived here
- * from 43.8 until this story.** That map was keyed on the five-value attachment
+ * from 43.8 until 45.5.** That map was keyed on the five-value attachment
  * vocabulary, so every text file, source file, CSV, JSON and PDF in a synced
  * folder drew the same blank page — the pane could already tell a video from an
- * image and could not tell a spreadsheet from an executable. Keying on the
- * registry's icon names instead is what makes "adding a format is a row"
- * (AD-87) true of the glyph as well as of the viewer: a new format arrives with
- * an icon name and this pane renders it without being edited.
+ * image and could not tell a spreadsheet from an executable.
  *
- * Keyed on {@link IconName} rather than on `string`, which keeps the property
- * the map it replaced was written for: a name added to the registry's union
- * fails THIS FILE to compile rather than rendering an empty cell.
- *
- * The lucide identifiers are the canonical ones rather than the older aliases
- * `FileVideo` / `FileAudio` / `FileJson` / `FileQuestion` that 43.8 imported.
- * Same glyphs — lucide re-exports the old names — but the alias renders a class
- * that does not match what the import is called (`FileVideo` draws
- * `lucide-file-play`), which is a thing to discover twice: once when reading
- * this table and once when a test asks what a row drew.
+ * **The table itself moved to `@/lib/viewers` in FR-254**, when the session
+ * tree became the second surface drawing file rows: a glyph is a property of
+ * the format, so it belongs with the registry that answers every other question
+ * about the format, and importing it from a pane would have pulled this file's
+ * dialogs and stores into a tree that wanted one icon. Re-exported here so the
+ * 45.5-era call sites and their tests keep their import.
  */
-const VIEWER_ICON: Record<IconName, LucideIcon> = {
-  "file-video": FilePlay,
-  "file-image": FileImage,
-  "file-audio": FileHeadphone,
-  "file-text": FileText,
-  "file-code": FileCode,
-  "file-table": FileSpreadsheet,
-  "file-json": FileBraces,
-  "file-document": FileType,
-  folder: Folder,
-  "file-question": FileQuestionMark,
-};
+export { VIEWER_ICON } from "@/lib/viewers";
 
 /**
  * The glyph for a folder keeper itself put somewhere (Story 45.5, FR-178).

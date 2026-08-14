@@ -70,6 +70,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     // Resolved by Rust even for a folder that holds no recordings: it is the
     // subfolder flagging it would use (Story 41.7).
     recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -209,6 +211,8 @@ describe("actions", () => {
       notesSubfolder: null,
       recordings: false,
       recordingsSubfolder: null,
+      sessions: false,
+      sessionsSubfolder: null,
     });
 
     expect(result).toEqual(saved);
@@ -242,6 +246,8 @@ describe("actions", () => {
         notesSubfolder: null,
         recordings: false,
         recordingsSubfolder: null,
+        sessions: false,
+        sessionsSubfolder: null,
       }),
     ).rejects.toMatchObject({ message: "local path must be absolute" });
     // A rejected write is the caller's to surface; it is not a read failure.

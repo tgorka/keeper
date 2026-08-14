@@ -83,6 +83,7 @@ beforeEach(() => {
     flags: [],
     origin: null,
     text: null,
+    fields: [],
   });
   mockDeletePlan.mockReset();
   mockDelete.mockReset();

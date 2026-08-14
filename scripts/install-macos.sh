@@ -2,10 +2,15 @@
 #
 # Build the app on a macOS host, SIGN it, and install it into /Applications there.
 #
-# The counterpart of `check-macos.sh`, and for the same reason: the `keeper`
-# shell crate cannot be built on Linux (Tauri needs GTK/glib) and the recording
-# sidecar cannot be built anywhere but macOS (Swift + Xcode). So a Linux
+# The counterpart of `check-macos.sh`, and for the same reason: the recording
+# sidecar is Swift + Xcode, the bundle is a `.app`, and signing needs an
+# identity in a macOS keychain. None of those cross-compile, so a Linux
 # workstation that wants a running Mac app has to build it on the Mac.
+#
+# Note the reason is the BUNDLE, not the shell crate: `cargo build -p keeper`
+# succeeds on Linux (GTK/glib are present in the dev container), which is what
+# makes `bun run dev` and the Rust suite usable there. Only this last mile —
+# sidecar, bundle, signature — is Mac-bound.
 #
 # The build runs inside the Mac's GUI login session, because that is the only
 # session that can reach the signing identity's private key. A Terminal.app

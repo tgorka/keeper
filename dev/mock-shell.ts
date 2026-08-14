@@ -1,11 +1,21 @@
 /**
  * A fake shell, so the real frontend can be looked at without Tauri.
  *
- * **Why this exists.** The `keeper` shell crate does not build on Linux (AD-55,
- * AD-56), so for five epics the only way to see this app was to build it on a
- * Mac and look at it there — a fifteen-minute round trip that made visual work
- * effectively impossible and is the honest reason the UI stayed characterless.
- * Every design decision was made by reading code.
+ * **Why this exists.** For five epics the only way to see this app was to build
+ * it on a Mac and look at it there — a fifteen-minute round trip that made
+ * visual work effectively impossible and is the honest reason the UI stayed
+ * characterless. Every design decision was made by reading code.
+ *
+ * That round trip was never a *Linux* limitation, whatever earlier revisions of
+ * this comment claimed (they cited AD-55 and AD-56, which are about
+ * `keeper_core` being tauri-free and sync-free and say nothing about any
+ * platform). The `keeper` shell crate builds here — `cargo build -p keeper`
+ * produces an ELF. What is genuinely Mac-only is narrower: the recording
+ * sidecar (Swift + Xcode) and code signing. Running the built binary needs a
+ * DISPLAY, which is a different problem with a different fix.
+ *
+ * Keeping the false version cost real time: it steered agents into a Mac round
+ * trip for work a `bun run dev` in this container would have shown in seconds.
  *
  * `mockIPC` answers `invoke` in the browser, so `bun run dev` serves the REAL
  * components, the real stores, the real CSS — everything except Rust. That is
@@ -26,7 +36,14 @@
  */
 
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { FileSizeVm, FilesEntryVm, FilesListingVm } from "@/lib/ipc/client";
+import type {
+  FileSizeVm,
+  FilesEntryVm,
+  FilesListingVm,
+  SessionSpaceFilesVm,
+  SessionSpaceFileVm,
+  SessionSpaceVm,
+} from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -220,6 +237,378 @@ const CHILDREN: Record<string, FilesEntryVm[]> = {
 };
 
 /**
+ * One session's file tree, in the FLAT shape (`shape.rs`): every markdown file
+ * sits at the root and declares its kind in frontmatter, and the only two
+ * directories left are `artifacts/` (versioned) and `workspace/` (scratch).
+ *
+ * The fixture's whole job is to be the case that is hard to look at: a pile of
+ * dated filenames that means nothing until something reads the tags. If the
+ * detail renders this legibly — files first, kinds grouped, log at the bottom —
+ * it renders the live zone legibly.
+ *
+ * `workspace/` carries `locked` with the fence's own sentence, because a lock
+ * with no reason is the bug AD-113's refusal text exists to prevent, and a
+ * viewing aid that quietly dropped it would hide the one row whose rendering is
+ * least obvious.
+ *
+ * `undeletable` is computed here rather than passed in, mirroring what
+ * `files::check_deletable` answers in Rust (FR-262): the two shape files and
+ * every directory refuse, everything else is deletable. It is a re-statement of
+ * a Rust rule and therefore exactly the kind of thing that drifts — which is
+ * survivable in a viewing aid whose whole purpose is to show what the rows look
+ * like, and would not be anywhere else.
+ */
+function sessionEntry(
+  relPath: string,
+  isDir: boolean,
+  bytes: number | null,
+  minutesAgo: number,
+  locked: string | null = null,
+) {
+  const cut = relPath.lastIndexOf("/");
+  return {
+    name: relPath.slice(cut + 1),
+    relPath,
+    parent: cut === -1 ? "" : relPath.slice(0, cut),
+    depth: relPath.split("/").length,
+    isDir,
+    subpath: `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    absolutePath: `/Volumes/merope/tgdrive/60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    size: bytes === null ? null : { bytes, label: `${(bytes / 1000).toFixed(1)} kB` },
+    mtimeMs: ago(minutesAgo),
+    sync: { status: "synced", detail: null },
+    locked,
+    undeletable: isDir
+      ? "keeper deletes one file at a time. Removing a folder takes everything inside it with it, which is a bigger promise than this tree makes — do it in Finder."
+      : relPath === "AGENTS.md" || relPath === "about.md"
+        ? `${relPath} is what tells keeper this session is a flat one: deleting it would silently turn the session back into the old folder shape.`
+        : null,
+  };
+}
+
+const SESSION_ENTRIES = [
+  sessionEntry("AGENTS.md", false, 2_140, 220),
+  sessionEntry("about.md", false, 1_860, 45),
+  sessionEntry("2026-08-12-0900-opened-the-session.md", false, 720, 220),
+  sessionEntry("2026-08-12-1740-flat-pool-lands.md", false, 1_310, 45),
+  sessionEntry("2026-08-13-0910-spaces-and-the-board.md", false, 980, 12),
+  sessionEntry("task-migrate-the-live-zone.md", false, 410, 30),
+  sessionEntry("task-task-board-columns.md", false, 380, 30),
+  sessionEntry("task-search-everywhere.md", false, 350, 30),
+  sessionEntry("task-named-templates.md", false, 330, 30),
+  sessionEntry("prompt-01-scope.md", false, 640, 220),
+  sessionEntry("ref-inputs.md", false, 520, 100),
+  sessionEntry("stray-thought.md", false, 180, 8),
+  sessionEntry("artifacts", true, null, 45),
+  sessionEntry("artifacts/flat-contract.md", false, 4_400, 45),
+  sessionEntry("workspace", true, null, 3, "workspace/ is scratch: keeper never writes here."),
+  sessionEntry(
+    "workspace/scratch.md",
+    false,
+    900,
+    3,
+    "workspace/ is scratch: keeper never writes here.",
+  ),
+];
+
+/**
+ * The board's four columns, each holding at least one card, plus the two cases
+ * the columns alone would not show: a card whose `order:` keeper defaulted
+ * (`orderIsOwn: false`) and a card with no ULID (`path:` identity, flagged).
+ * Both render differently, and both come from files a person hand-wrote — which
+ * is the ordinary case in a zone Obsidian also edits.
+ */
+/**
+ * What the three markdown widgets select, in a vault rather than in a session
+ * (FR-264).
+ *
+ * Deliberately a second fixture and not `SESSION_TASKS` reshaped: a widget board
+ * lives in an ordinary note, addresses its cards by note id, and — unlike a
+ * session's closed four — may hold any word at all in `status:`. The `blocked`
+ * card is here for that: it is what the board's "Not in a column" row exists to
+ * show, and in a vault it is the common case rather than the exception.
+ */
+const WIDGET_NOTES = [
+  {
+    id: "w1",
+    path: "projects/keeper/task-widgets.md",
+    title: "Markdown widgets in any note",
+    snippet: "Callout syntax, a StateField, one React host.",
+    tags: ["task"],
+    updatedMs: ago(30),
+    status: "todo" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w2",
+    path: "projects/keeper/task-add-ref.md",
+    title: "The add-a-reference picker",
+    snippet: "Disk, note, recording — and the promotion offer.",
+    tags: ["task", "ui"],
+    updatedMs: ago(90),
+    status: "in-preparation" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w3",
+    path: "projects/keeper/task-search.md",
+    title: "Search everywhere",
+    snippet: "⌘F in the document, ⌘⇧F across all of it.",
+    tags: ["task"],
+    updatedMs: ago(200),
+    status: "blocked" as string,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w4",
+    path: "projects/keeper/task-spaces.md",
+    title: "Spaces replace the folders",
+    snippet: "Five defaults, all of them files.",
+    tags: ["task"],
+    updatedMs: ago(400),
+    status: "done" as string,
+    order: 1,
+    orderIsOwn: true,
+  },
+  {
+    id: "w5",
+    path: "projects/keeper/log/2026-08-13-1420-board.md",
+    title: "The board landed",
+    snippet: "Four columns, drag, and the column menu for everybody else.",
+    tags: ["log"],
+    updatedMs: ago(60),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w6",
+    path: "projects/keeper/log/2026-08-12-0930-flat.md",
+    title: "Flat contract",
+    snippet: "One pool of markdown; the kind is a tag.",
+    tags: ["log"],
+    updatedMs: ago(1_500),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+  {
+    id: "w7",
+    path: "projects/keeper/ref-live-zone.md",
+    title: "The live 60-sessions zone",
+    snippet: "/Volumes/merope/tgdrive/60-sessions — read-only from the container.",
+    tags: ["ref"],
+    updatedMs: ago(2_000),
+    status: null as string | null,
+    order: 0,
+    orderIsOwn: false,
+  },
+];
+
+const SESSION_TASKS = [
+  {
+    id: "01J8AAAAAAAAAAAAAAAAAAAAAA",
+    relPath: "task-migrate-the-live-zone.md",
+    title: "Migrate the live zone",
+    status: "in-preparation",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task", "migration"],
+    unstableIdentity: false,
+  },
+  {
+    id: "01J8BBBBBBBBBBBBBBBBBBBBBB",
+    relPath: "task-task-board-columns.md",
+    title: "Task board — four columns, drag to reorder",
+    status: "todo",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task", "ui"],
+    unstableIdentity: false,
+  },
+  {
+    id: "path:task-search-everywhere.md",
+    relPath: "task-search-everywhere.md",
+    title: "Search everywhere (⌘F, ⌘⇧F)",
+    status: "todo",
+    order: 0,
+    orderIsOwn: false,
+    tags: ["task"],
+    unstableIdentity: true,
+  },
+  {
+    id: "01J8CCCCCCCCCCCCCCCCCCCCCC",
+    relPath: "task-named-templates.md",
+    title: "Named templates",
+    status: "done",
+    order: 1,
+    orderIsOwn: true,
+    tags: ["task"],
+    unstableIdentity: false,
+  },
+];
+
+/**
+ * The zone's five default spaces, plus the two failures the healthy five cannot
+ * show: one whose query will not parse (`error`, selects nothing) and one whose
+ * `sort` keeper could not read (`warnings`, still selects). Those two states
+ * render differently and are the whole reason the VM carries two fields, so a
+ * fixture without them shows the section that never has a bad day.
+ *
+ * Annotated rather than inferred, and mutable rather than `as const`, for the
+ * reason the Files listing above is annotated: the save and delete handlers
+ * write into this array, so its element type has to be the wire type instead of
+ * whatever the first five literals happened to imply (which had `icon: string`
+ * and refused the `null` a space with no icon carries).
+ */
+const SESSION_SPACES: SessionSpaceVm[] = [
+  {
+    id: "_spaces/about.md",
+    name: "About",
+    query: "tag:about",
+    sort: "title asc",
+    sortEffective: "title asc",
+    icon: "info",
+    defaultKey: "about",
+    order: 1,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/tasks.md",
+    name: "Tasks",
+    query: "tag:task",
+    sort: "order asc",
+    sortEffective: "order asc",
+    icon: "square-check",
+    defaultKey: "tasks",
+    order: 2,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/log.md",
+    name: "Log",
+    query: "tag:log",
+    sort: "modified desc",
+    sortEffective: "modified desc",
+    icon: "clock",
+    defaultKey: "log",
+    order: 3,
+    warnings: [],
+    error: null,
+  },
+  {
+    id: "_spaces/refs.md",
+    name: "References",
+    // An unreadable `sort` is a WARNING: the space still selects what it
+    // selects and simply falls back, so the section lists normally under a
+    // quieter sentence rather than sending anyone to fix a query that is fine.
+    query: "tag:ref",
+    sort: "sideways asc",
+    sortEffective: "modified desc",
+    icon: "link",
+    defaultKey: "refs",
+    order: 4,
+    warnings: ["Couldn't read sort `sideways asc`; using modified desc."],
+    error: null,
+  },
+  {
+    id: "_spaces/prompts.md",
+    name: "Prompts",
+    // A broken query is an ERROR and selects NOTHING — never everything. A
+    // saved view that silently widened to the whole session is how a bulk
+    // action becomes a data-loss story.
+    query: "tag:prompt AND",
+    sort: "title asc",
+    sortEffective: "title asc",
+    icon: "message-square",
+    defaultKey: "prompts",
+    order: 5,
+    warnings: [],
+    error: "Unexpected end of query after `AND`.",
+  },
+];
+
+function spaceFile(
+  relPath: string,
+  title: string,
+  tags: string[],
+  minutesAgo: number,
+): SessionSpaceFileVm {
+  return {
+    id: `path:${relPath}`,
+    relPath,
+    subpath: `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`,
+    title,
+    tags,
+    mtimeMs: ago(minutesAgo),
+    // Path-identified, because that is the ordinary state of a zone Obsidian
+    // also edits: keeper never stamps an `id:` into a file it did not author.
+    unstableIdentity: true,
+  };
+}
+
+/**
+ * What each space selected out of the mock session — same files as the tree, so
+ * the two sections agree with each other, which is the first thing a person
+ * scrolling past them checks.
+ *
+ * `prompts` answers an empty list and carries its own error: the broken query
+ * above selects nothing, and the section prints Rust's sentence rather than
+ * inventing a second one for the same state.
+ */
+const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
+  {
+    spaceId: "_spaces/about.md",
+    files: [spaceFile("about.md", "About this session", ["about"], 45)],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/tasks.md",
+    files: [
+      spaceFile(
+        "task-migrate-the-live-zone.md",
+        "Migrate the live zone",
+        ["task", "migration"],
+        30,
+      ),
+      spaceFile(
+        "task-task-board-columns.md",
+        "Task board — four columns, drag to reorder",
+        ["task", "ui"],
+        30,
+      ),
+      spaceFile("task-search-everywhere.md", "Search everywhere (⌘F, ⌘⇧F)", ["task"], 30),
+      spaceFile("task-named-templates.md", "Named templates", ["task"], 30),
+    ],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/log.md",
+    files: [
+      spaceFile("2026-08-13-0910-spaces-and-the-board.md", "Spaces and the board", ["log"], 12),
+      spaceFile("2026-08-12-1740-flat-pool-lands.md", "Flat pool lands", ["log"], 45),
+      spaceFile("2026-08-12-0900-opened-the-session.md", "Opened the session", ["log"], 220),
+    ],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/refs.md",
+    files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
+    error: null,
+  },
+  {
+    spaceId: "_spaces/prompts.md",
+    files: [],
+    error: "Unexpected end of query after `AND`.",
+  },
+];
+
+/**
  * A CSV wider than any pane, so an embedded table can be LOOKED at under the
  * one condition that matters: more columns than the note has room for, and one
  * value long enough that no cap could show it whole.
@@ -357,6 +746,171 @@ const ANSWERS: Record<string, unknown> = {
     echoCancellation: true,
   },
   notes_capture_windows: [],
+  // Sessions. Until now this whole feature fell through to `fallback`, which
+  // answers `null` for `sessions_detail` and blanks the pane — so the one
+  // surface being built was the one surface the viewing aid could not show.
+  sessions_roots: [
+    {
+      id: "p1",
+      name: "tgdrive",
+      subfolder: "60-sessions",
+      root: "/Volumes/merope/tgdrive/60-sessions",
+      indexed: true,
+      activeCount: 1,
+      unreadCount: 0,
+    },
+  ],
+  sessions_list: [
+    {
+      id: "01J8SESSIONAAAAAAAAAAAAAAA",
+      path: "active/2026-08-12-keeper-sessions",
+      title: "Keeper — sessions, round two",
+      status: "active",
+      archivedYear: null,
+      workspaceMs: ago(3),
+      recordMs: ago(12),
+      lastLogDate: "2026-08-13",
+      lastLogLine: "Spaces and the board",
+      snippet: "Flat markdown pool, spaces as saved queries, a task board.",
+      tags: ["keeper", "sessions"],
+      pinned: true,
+      unread: false,
+      origin: "local",
+      headRev: "rev-mock",
+      conflict: false,
+      lineage: false,
+    },
+    // The folder-shaped session, without which the migrate verb has nothing to
+    // act on: every fixture being already-flat would show only the branch that
+    // does nothing. Its row is deliberately ordinary — a session that predates
+    // the flat contract is not a broken one, and must not render as a warning.
+    {
+      id: "01J8SESSIONBBBBBBBBBBBBBBB",
+      path: "active/2026-06-30-old-shape",
+      title: "Before the flat contract",
+      status: "active",
+      archivedYear: null,
+      workspaceMs: null,
+      recordMs: ago(9_000),
+      lastLogDate: "2026-07-02",
+      lastLogLine: "Wrapped the first pass",
+      snippet: "A session from when refs/ and prompts/ were directories.",
+      tags: ["keeper"],
+      pinned: false,
+      unread: false,
+      origin: "local",
+      headRev: "rev-mock",
+      conflict: false,
+      lineage: false,
+    },
+  ],
+  sessions_detail: {
+    id: "01J8SESSIONAAAAAAAAAAAAAAA",
+    path: "active/2026-08-12-keeper-sessions",
+    title: "Keeper — sessions, round two",
+    status: "active",
+    archivedYear: null,
+    pinned: true,
+    tags: ["keeper", "sessions"],
+    properties: [
+      { key: "owner", value: "tgorka" },
+      { key: "stack", value: "#118" },
+    ],
+    continues: [],
+    continuedBy: [],
+    summary: "Flat markdown pool, spaces as saved queries, a task board.",
+    // Newest first — the projection reverses, the files do not (FR-233).
+    log: [
+      {
+        date: "2026-08-13",
+        title: "Spaces and the board",
+        body: "Five default spaces parse. The board reuses `order: f64`.",
+      },
+      {
+        date: "2026-08-12",
+        title: "Flat pool lands",
+        body: "`shape.rs` decides the contract; `pool.rs` reads it.",
+      },
+      { date: "2026-08-12", title: "Opened the session", body: "" },
+    ],
+    shape: "flat",
+    // One untagged file, because a clean fixture would never show the state the
+    // `unfiled` list exists for — and a half-migrated session is the state the
+    // operator will actually meet.
+    unfiled: ["stray-thought.md"],
+    tasks: SESSION_TASKS,
+  },
+  sessions_tree: { entries: SESSION_ENTRIES, truncated: false },
+  sessions_refs: {
+    refs: [
+      {
+        kind: "missing",
+        target: "refs/gone.md",
+        label: "refs/gone.md",
+        source: "ref-inputs.md",
+        panelTarget: null,
+        url: null,
+        notice: "Looked in the session folder and in 10-notes; no such file.",
+      },
+      {
+        kind: "note",
+        target: "[[Keeper work]]",
+        label: "Keeper work",
+        source: "ref-inputs.md",
+        panelTarget: null,
+        url: null,
+        notice: null,
+      },
+      {
+        kind: "external",
+        target: "https://github.com/tgorka/keeper",
+        label: "keeper on GitHub",
+        source: "about.md",
+        panelTarget: null,
+        url: "https://github.com/tgorka/keeper",
+        notice: null,
+      },
+    ],
+    missing: 1,
+    truncated: false,
+  },
+  sessions_patterns: [
+    {
+      id: "_template",
+      kind: "template",
+      label: "Zone template",
+      detail: "AGENTS.md, about.md, a seed log and a seed prompt.",
+      mtimeMs: ago(1_440),
+      copies: [
+        { relPath: "AGENTS.md", isDir: false },
+        { relPath: "about.md", isDir: false },
+      ],
+      skips: [],
+    },
+    // A named template (FR-266) — `_template/<name>/`, addressed by the path
+    // it copies out of, sorted by name rather than by mtime.
+    {
+      id: "_template/interview",
+      kind: "template",
+      label: "interview",
+      detail: "a named template — copied whole",
+      mtimeMs: ago(4_320),
+      copies: [
+        { relPath: "AGENTS.md", isDir: false },
+        { relPath: "about.md", isDir: false },
+        { relPath: "2026-08-01-0900-questions.md", isDir: false },
+      ],
+      skips: [],
+    },
+  ],
+  sessions_spaces: SESSION_SPACES,
+  sessions_space_files: SESSION_SPACE_FILES,
+  sessions_spaces_restore: { names: [] },
+  // The install verb answers with the directory it wrote (FR-268). The mock
+  // zone above already HAS a `_template`, so the picker's offer stays hidden
+  // here — the fixture exists so a hand-driven call does not fall through to
+  // the name-guessing default and come back as a list.
+  sessions_template_install: "_template",
 };
 
 /**
@@ -395,7 +949,335 @@ function fallback(command: string): unknown {
  * relationship the app relies on (FR-98: a note's title IS its first body
  * line). A fixture whose body and title disagree tests the mock, not the app.
  */
+/**
+ * The pre-flat session, as `pool.rs` never sees it: `log` comes from the
+ * README's `### ` entries, `unfiled` and `tasks` are empty because neither
+ * exists before the migration, and `shape` says so. Everything the flat detail
+ * shows is absent here, which is the point — this is the fixture that proves
+ * the detail degrades instead of erroring on a session it cannot group.
+ */
+const FOLDER_DETAIL = {
+  id: "01J8SESSIONBBBBBBBBBBBBBBB",
+  path: "active/2026-06-30-old-shape",
+  title: "Before the flat contract",
+  status: "active",
+  archivedYear: null,
+  pinned: false,
+  tags: ["keeper"],
+  properties: [{ key: "owner", value: "tgorka" }],
+  continues: [],
+  continuedBy: [],
+  summary: "A session from when refs/ and prompts/ were directories.",
+  log: [
+    { date: "2026-07-02", title: "Wrapped the first pass", body: "Promoted two artifacts." },
+    { date: "2026-06-30", title: "", body: "" },
+  ],
+  shape: "folder",
+  unfiled: [],
+  tasks: [],
+};
+
+/**
+ * What migrating that session would do — the same three lists the real preview
+ * returns, session-relative. The empty-title `### 2026-06-30 — ` entry becomes
+ * `2026-06-30-0000-untitled.md` rather than being dropped, because a heading
+ * the operator typed is content even when they typed nothing after it.
+ */
+const FOLDER_MIGRATION = {
+  needed: true,
+  creates: [
+    "about.md",
+    "2026-06-30-0000-untitled.md",
+    "2026-07-02-0001-wrapped-the-first-pass.md",
+    "refs/inputs.md",
+    "prompts/01-scope.md",
+    "AGENTS.md",
+  ],
+  rewrites: ["README.md"],
+  trashes: ["refs", "prompts"],
+};
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // Two sessions, two shapes: a table would answer the flat one for both and
+  // the folder-shaped row would render as something it is not.
+  sessions_detail: (payload) =>
+    payload.sessionId === FOLDER_DETAIL.id ? FOLDER_DETAIL : ANSWERS.sessions_detail,
+  // `needed: false` is not an error and not an empty preview — it is the answer
+  // for every session that already holds the contract, which is most of them.
+  sessions_migrate_preview: (payload) =>
+    payload.sessionId === FOLDER_DETAIL.id
+      ? FOLDER_MIGRATION
+      : { needed: false, creates: [], rewrites: [], trashes: [] },
+  sessions_migrate: () => null,
+  // The two space writes MUTATE the fixture rather than answering and forgetting.
+  // A shell that accepted a save and then re-answered the old five would make
+  // the editor look broken in exactly the way it is being looked at for — the
+  // whole flow under test is press Save, watch the section re-read. Statefulness
+  // in a viewing aid is a feature when the thing being viewed is a round trip.
+  sessions_space_save: (payload) => {
+    const req = (payload.space ?? {}) as Record<string, unknown>;
+    const id = typeof req.id === "string" ? req.id : `_spaces/${String(req.name)}.md`;
+    const saved = {
+      id,
+      name: String(req.name ?? ""),
+      query: String(req.query ?? ""),
+      sort: String(req.sort ?? "modified desc"),
+      sortEffective: String(req.sort ?? "modified desc"),
+      icon: (req.icon ?? null) as string | null,
+      // Never invented: `defaultKey` says a space is one of the five keeper
+      // knows how to restore, and a hand-made one is not, no matter what it is
+      // called. Claiming otherwise here would make restore look like it had
+      // opinions about a file the operator wrote.
+      defaultKey: null,
+      order: Number(req.order ?? 0),
+      warnings: [],
+      error: null,
+    };
+    const at = SESSION_SPACES.findIndex((space) => space.id === id);
+    if (at === -1) {
+      SESSION_SPACES.push(saved);
+      SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null });
+    } else {
+      SESSION_SPACES[at] = { ...SESSION_SPACES[at], ...saved };
+    }
+    return id;
+  },
+  sessions_space_delete: (payload) => {
+    const id = String(payload.spaceId ?? "");
+    const at = SESSION_SPACES.findIndex((space) => space.id === id);
+    if (at !== -1) {
+      SESSION_SPACES.splice(at, 1);
+    }
+    const filesAt = SESSION_SPACE_FILES.findIndex((row) => row.spaceId === id);
+    if (filesAt !== -1) {
+      SESSION_SPACE_FILES.splice(filesAt, 1);
+    }
+    return null;
+  },
+  // The three file verbs mutate `SESSION_ENTRIES` for the reason the space
+  // writes mutate theirs: what is being looked at IS the round trip. A create
+  // that answered a path the tree then failed to show would look exactly like
+  // the bug this aid exists to rule out.
+  //
+  // The names are keeper's own rules restated in TypeScript — slug, counter,
+  // stamp — and that is a copy of `files::new_named`/`new_stamped`. Acceptable
+  // here and nowhere else: this file never runs in the app, and a mock that
+  // returns a name the real one would not is still a mock that renders a row.
+  sessions_file_new: (payload) => {
+    const parent = String(payload.parent ?? "");
+    const kind = String(payload.kind ?? "md");
+    const slug =
+      String(payload.title ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "untitled";
+    const relPath = `${parent === "" ? "" : `${parent}/`}${slug}.${kind}`;
+    SESSION_ENTRIES.push(sessionEntry(relPath, false, 120, 0));
+    return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
+  },
+  sessions_file_new_kind: (payload) => {
+    const kind = String(payload.kind ?? "log");
+    const slug =
+      String(payload.title ?? "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "untitled";
+    // The stamp the real namer writes, from the clock this file already fakes
+    // against — `YYYY-MM-DD-HHMM-<slug>.md`, which is what makes a log folder
+    // sort itself.
+    const now = new Date(ago(0));
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const relPath = `${stamp}-${slug}.md`;
+    SESSION_ENTRIES.push(sessionEntry(relPath, false, 96, 0));
+    void kind;
+    return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
+  },
+  sessions_file_delete: (payload) => {
+    const rel = String(payload.rel ?? "");
+    const at = SESSION_ENTRIES.findIndex((entry) => entry.relPath === rel);
+    if (at !== -1) {
+      SESSION_ENTRIES.splice(at, 1);
+    }
+    return null;
+  },
+  // The move Rust makes by writing two frontmatter keys, faked by mutating the
+  // fixture the detail answers from — so a drag in `bun dev` lands where it was
+  // dropped and stays there across the re-read the board does afterwards. The
+  // numbering is the real `drop_order`'s: midpoint between neighbours, a whole
+  // step past the ends, and 1 (never 0) into an empty column, because 0 is what
+  // a file with no `order:` reads as.
+  sessions_task_move: (payload) => {
+    const rel = String(payload.rel ?? "");
+    const status = String(payload.status ?? "");
+    const index = Number(payload.index ?? 0);
+    const card = SESSION_TASKS.find((task) => task.relPath === rel);
+    if (card === undefined) {
+      return null;
+    }
+    const column = SESSION_TASKS.filter(
+      (task) => task.status === status && task.relPath !== rel,
+    ).sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+    const at = Math.min(Math.max(index, 0), column.length);
+    const before = at > 0 ? column[at - 1]?.order : undefined;
+    const after = column[at]?.order;
+    card.status = status;
+    card.order =
+      before === undefined && after === undefined
+        ? 1
+        : before === undefined
+          ? (after as number) - 1
+          : after === undefined
+            ? before + 1
+            : before + (after - before) / 2;
+    // A card keeper has now written an `order:` into owns that number, whatever
+    // it read as before — which is the one thing the real write changes about
+    // how the card renders.
+    card.orderIsOwn = true;
+    return null;
+  },
+  // The reference picker (FR-265). Candidates come from the SAME fixture the
+  // tree renders, plus two vault rows, so a file created in `bun dev` is
+  // referenceable a moment later — the one behaviour a viewing aid can show
+  // that a screenshot cannot.
+  //
+  // The filter here is a crude prefix of `add_ref::matches`: it understands
+  // `tag:` and ANDs plain words, and it does NOT walk the tag hierarchy. That
+  // is a stated limit, not an oversight — a second matcher that agreed with
+  // Rust in every corner would be a second matcher to keep in step, and the
+  // budget/truncation reasoning that makes the real one live in Rust does not
+  // apply to sixteen rows.
+  sessions_ref_candidates: (payload) => {
+    const query = String(payload.query ?? "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((word) => word !== "");
+    const rows = [
+      ...SESSION_ENTRIES.filter((entry) => !entry.isDir).map((entry) => ({
+        kind: "file",
+        target: entry.relPath,
+        label: entry.name,
+        detail: entry.parent,
+        tags: [] as string[],
+        mtimeMs: entry.mtimeMs,
+        // The write fence's own answer (AD-113), read off the row that already
+        // carries it rather than recomputed from the path.
+        promotable: entry.locked !== null,
+      })),
+      {
+        kind: "note",
+        target: "Keeper work",
+        label: "Keeper work",
+        detail: "10-notes/projects",
+        tags: ["project/keeper", "work"],
+        mtimeMs: ago(90),
+        promotable: false,
+      },
+      {
+        kind: "recording",
+        target: "Standup 2026-08-12",
+        label: "Standup 2026-08-12",
+        detail: "30-recordings",
+        tags: ["work"],
+        mtimeMs: ago(2_880),
+        promotable: false,
+      },
+    ];
+    const targets = SESSION_ENTRIES.filter(
+      (entry) => !entry.isDir && entry.relPath.endsWith(".md") && entry.parent === "",
+    ).map((entry) => entry.relPath);
+    return {
+      candidates: rows.filter((row) =>
+        query.every((word) =>
+          word.startsWith("tag:")
+            ? row.tags.some((tag) => tag.toLowerCase().includes(word.slice(4)))
+            : `${row.label} ${row.detail}`.toLowerCase().includes(word),
+        ),
+      ),
+      targets,
+      defaultTarget: "references.md",
+      truncated: false,
+    };
+  },
+  sessions_ref_add: (payload) => {
+    const req = (payload.req ?? {}) as Record<string, unknown>;
+    const kind = String(req.kind ?? "file");
+    const target = String(req.target ?? "");
+    const label = req.label === null || req.label === undefined ? null : String(req.label);
+    const promoted =
+      req.promote === true ? `artifacts/${target.slice(target.lastIndexOf("/") + 1)}` : null;
+    const dest = promoted ?? target;
+    // The three forms `add_ref::line` writes, restated — the same acceptable
+    // copy as `sessions_file_new`'s namer, for the same reason: this file never
+    // runs in the app, and a mock that echoes a plausible line is still a mock
+    // that renders the confirmation.
+    const line =
+      kind === "note" || kind === "recording"
+        ? label === null
+          ? `- [[${target}]]`
+          : `- [[${target}|${label}]]`
+        : kind === "external"
+          ? label === null
+            ? `- ${target}`
+            : `- [${label}](${target})`
+          : `- [${label ?? dest.slice(dest.lastIndexOf("/") + 1)}](${dest})`;
+    const file = String(req.file ?? "references.md");
+    if (!SESSION_ENTRIES.some((entry) => entry.relPath === file)) {
+      SESSION_ENTRIES.push(sessionEntry(file, false, 140, 0));
+    }
+    if (promoted !== null && !SESSION_ENTRIES.some((entry) => entry.relPath === promoted)) {
+      SESSION_ENTRIES.push(sessionEntry(promoted, false, 900, 0));
+    }
+    return { file, line, promoted };
+  },
+  // The three markdown widgets (FR-264). The mock answers by tag and ignores
+  // the callout's argument, and that is a stated limit rather than an oversight:
+  // parsing a query here would be the second parser AD-20 forbids, and the one
+  // thing `bun dev` needs from this command is that a `> [!board]` in a note
+  // draws cards a person can drag.
+  notes_widget: (payload) => {
+    const kind = String(payload.kind ?? "board");
+    const tag = kind === "board" ? "task" : kind === "log" ? "log" : "ref";
+    const rows = WIDGET_NOTES.filter((row) => row.tags.includes(tag));
+    // Rust's own order per kind: a board by `order` then title, a log by path
+    // descending (the filename carries the date), references by title.
+    return kind === "board"
+      ? [...rows].sort((a, b) => a.order - b.order || a.title.localeCompare(b.title))
+      : kind === "log"
+        ? [...rows].sort((a, b) => b.path.localeCompare(a.path))
+        : [...rows].sort((a, b) => a.title.localeCompare(b.title));
+  },
+  // The same arithmetic `sessions_task_move` fakes, over note ids instead of
+  // paths — which is the one difference between the two write paths that a
+  // surface can see.
+  notes_widget_move: (payload) => {
+    const noteId = String(payload.noteId ?? "");
+    const status = String(payload.status ?? "");
+    const index = Number(payload.index ?? 0);
+    const card = WIDGET_NOTES.find((row) => row.id === noteId);
+    if (card === undefined) {
+      return null;
+    }
+    const column = WIDGET_NOTES.filter(
+      (row) => row.tags.includes("task") && row.status === status && row.id !== noteId,
+    ).sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+    const at = Math.min(Math.max(index, 0), column.length);
+    const before = at > 0 ? column[at - 1]?.order : undefined;
+    const after = column[at]?.order;
+    card.status = status;
+    card.order =
+      before === undefined && after === undefined
+        ? 1
+        : before === undefined
+          ? (after as number) - 1
+          : after === undefined
+            ? before + 1
+            : before + (after - before) / 2;
+    card.orderIsOwn = true;
+    return null;
+  },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
     if (row === undefined) {

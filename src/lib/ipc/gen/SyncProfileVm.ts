@@ -85,4 +85,20 @@ recordings: boolean,
  * here instead means the form prefills from the value that would actually be
  * used (AD-34-8) and never spells `recordings` at all.
  */
-recordingsSubfolder: string, };
+recordingsSubfolder: string, 
+/**
+ * Whether this folder contains a sessions zone (FR-222, AD-107).
+ *
+ * Beside the notes and recordings flags above and meaning the same kind of
+ * thing: a sessions root is not a configured object with a life of its
+ * own, it is this flag plus a subfolder on a profile that already exists.
+ */
+sessions: boolean, 
+/**
+ * The sessions subfolder that would be **in force**: the stored one when
+ * this folder holds sessions, and `SessionsConfig`'s own default when it
+ * does not. Never `None`, following `recordings_subfolder` directly above
+ * rather than `notes_subfolder` — the form prefills from the value that
+ * would actually be used, and `60-sessions` is spelled once, in Rust.
+ */
+sessionsSubfolder: string, };

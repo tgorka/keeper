@@ -169,6 +169,8 @@ function profile(p: Partial<SyncProfileVm> & Pick<SyncProfileVm, "id" | "name">)
     notesSubfolder: null,
     recordings: false,
     recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     ...p,
   } as SyncProfileVm;
 }

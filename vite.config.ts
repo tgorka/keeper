@@ -5,9 +5,8 @@ import { defineConfig } from "vite";
 
 const host = process.env.TAURI_DEV_HOST;
 
-// The `keeper` shell crate does not build on Linux, so the frontend cannot be
-// LOOKED AT anywhere but a Mac — which is the honest reason several epics of UI
-// decisions were made by reading code instead of seeing the result.
+// A viewing aid for the frontend, no Rust required — see `dev/mock-shell.ts`
+// for what it serves and what it deliberately does not.
 //
 // This injects a fake IPC shell into the DEV SERVER ONLY (`apply: "serve"`), so
 // it cannot reach a production bundle by any path. It lives outside `src/`

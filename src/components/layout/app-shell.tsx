@@ -19,6 +19,7 @@ import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPane } from "@/components/notes/notes-pane";
 import { RecordingsPane } from "@/components/recordings/recordings-pane";
 import { SearchOverlay } from "@/components/search/search-overlay";
+import { SessionsPane } from "@/components/sessions/sessions-pane";
 import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
 import { KeyBackupDialog } from "@/components/settings/key-backup-dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -39,6 +40,7 @@ import { useQuickSwitcher } from "@/hooks/use-quick-switcher";
 import { useRecordingHotkey } from "@/hooks/use-recording-hotkey";
 import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
+import { useSessionsShortcut } from "@/hooks/use-sessions-shortcut";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
@@ -88,6 +90,9 @@ export function AppShell() {
   // chord self-gates on the `notes` capability, so none of them is a dead key
   // where notes cannot exist.
   useNotesShortcut();
+  // Wire ⌘7 to the Sessions board and ⌘⌥L to log-today (Phase 7, FR-251);
+  // self-gated on the sessions capability by the same rule.
+  useSessionsShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
@@ -185,6 +190,8 @@ export function AppShell() {
   // A notes vault is a folder keeper already syncs (AD-54, FR-122): same rule, so
   // a stale "notes" primary-view can never show the pane where no vault can exist.
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
+  // A sessions root is the same construction (AD-107, FR-223): same rule again.
+  const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
   // Where the platform floats the window controls over the webview (desktop macOS,
   // via the macOS-only `titleBarStyle`/`hiddenTitle` keys) the app owes the window
   // its own drag region; under a real title bar the same band would be empty space
@@ -307,6 +314,20 @@ export function AppShell() {
                 </>
               ) : notes && primaryView === "notes" ? (
                 <NotesPane />
+              ) : sessions && primaryView === "sessions" ? (
+                // Phase 7: the board over the sessions zones sync holds, gated
+                // on the same construction as notes — a stale "sessions"
+                // primary-view can never show a board this build cannot fill.
+                //
+                // The panel strip sits beside it exactly as it does beside
+                // Files (Story 45.1): the board is the browser and the strip
+                // is the document area, so opening a session's README is a
+                // click into the same editor every other surface uses
+                // (AD-109, UX-DR91).
+                <>
+                  <SessionsPane />
+                  <PanelStrip />
+                </>
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

@@ -45,6 +45,7 @@ export type PrimaryView =
   | "sync"
   | "files"
   | "notes"
+  | "sessions"
   | "settings";
 
 export interface PrimaryViewState {

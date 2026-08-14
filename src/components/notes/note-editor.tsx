@@ -448,6 +448,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         commands,
         markdown,
         autocomplete,
+        cmSearch,
         preview,
         wikilink,
         tags,
@@ -461,6 +462,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         import("@codemirror/commands"),
         import("@codemirror/lang-markdown"),
         import("@codemirror/autocomplete"),
+        import("@codemirror/search"),
         import("./editor/live-preview"),
         import("./editor/wikilink"),
         import("./editor/tag-complete"),
@@ -509,10 +511,20 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             // to prevent — and because the notes pane had the same gap.
             view.EditorView.contentAttributes.of({ "aria-label": "Note" }),
             commands.history(),
+            // In-document find (FR-267). `⌘F` is claimed app-wide by the
+            // shortcut hook, which stands down when an editor has focus — so
+            // this panel gets the chord only while the caret is in it, and the
+            // notes pane's own `⌘F` (focus the filter field) still fires from
+            // everywhere else. CodeMirror's own keymap is what receives it,
+            // rather than a synthesised event, because the panel it opens is
+            // CodeMirror's and only its own commands can drive it.
+            cmSearch.search({ top: true }),
+            cmSearch.highlightSelectionMatches(),
             view.keymap.of([
               ...commands.defaultKeymap,
               ...commands.historyKeymap,
               ...autocomplete.completionKeymap,
+              ...cmSearch.searchKeymap,
               ...indent.indentBindings,
               {
                 // ⌘S has no save semantic to attach to, so it force-flushes. A

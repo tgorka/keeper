@@ -69,6 +69,16 @@ sync: boolean,
  */
 notes: boolean, 
 /**
+ * Sessions (Phase 7, FR-223) can run here: `sync && desktop`, computed in
+ * the shell like every other flag in this struct. It sits beside `notes`
+ * because it is the same construction — a sessions root is a folder keeper
+ * already syncs plus a flag (AD-107), so a build without folder sync has
+ * nowhere to put one, and iOS gets `false` for both. When it is `false`
+ * every sessions affordance is **absent** from the DOM rather than
+ * disabled, which is the whole of FR-223.
+ */
+sessions: boolean, 
+/**
  * The window's title bar is a transparent overlay over the webview, so the
  * native window controls float over page content (Story 34.2, AD-34-2):
  * `true` only on desktop macOS, the only platform where `tauri.conf.json`'s

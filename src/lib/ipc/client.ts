@@ -139,6 +139,7 @@ export type { NoteRowVm } from "./gen/NoteRowVm";
 export type { NoteSearchBatch } from "./gen/NoteSearchBatch";
 export type { NoteSearchHitVm } from "./gen/NoteSearchHitVm";
 export type { NoteSearchReq } from "./gen/NoteSearchReq";
+export type { NoteSpaceFieldVm } from "./gen/NoteSpaceFieldVm";
 export type { NoteSpaceReq } from "./gen/NoteSpaceReq";
 export type { NoteSpaceTagVm } from "./gen/NoteSpaceTagVm";
 export type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
@@ -202,6 +203,33 @@ export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
+export type { SessionDetailVm } from "./gen/SessionDetailVm";
+export type { SessionEntryVm } from "./gen/SessionEntryVm";
+export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
+export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
+export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
+export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
+export type { SessionPatternVm } from "./gen/SessionPatternVm";
+export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
+export type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
+export type { SessionRefAddReq } from "./gen/SessionRefAddReq";
+export type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
+export type { SessionRefCandidateVm } from "./gen/SessionRefCandidateVm";
+export type { SessionReferencesVm } from "./gen/SessionReferencesVm";
+export type { SessionReferenceVm } from "./gen/SessionReferenceVm";
+export type { SessionRefVm } from "./gen/SessionRefVm";
+export type { SessionRootVm } from "./gen/SessionRootVm";
+export type { SessionRowVm } from "./gen/SessionRowVm";
+export type { SessionSearchBatch } from "./gen/SessionSearchBatch";
+export type { SessionSearchHitVm } from "./gen/SessionSearchHitVm";
+export type { SessionSearchReq } from "./gen/SessionSearchReq";
+export type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
+export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
+export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
+export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
+export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+export type { SessionTaskVm } from "./gen/SessionTaskVm";
+export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
 export type { SlidesVm } from "./gen/SlidesVm";
@@ -240,6 +268,8 @@ export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { WidgetKind } from "./gen/WidgetKind";
+export type { WidgetRow } from "./gen/WidgetRow";
 export type { WordBlockStyle } from "./gen/WordBlockStyle";
 export type { WordBlockVm } from "./gen/WordBlockVm";
 export type { WordRunVm } from "./gen/WordRunVm";
@@ -329,6 +359,23 @@ import type { ResolveSupportVm } from "./gen/ResolveSupportVm";
 import type { RoomListBatch } from "./gen/RoomListBatch";
 import type { SearchFilterVm } from "./gen/SearchFilterVm";
 import type { SearchHitVm } from "./gen/SearchHitVm";
+import type { SessionDetailVm } from "./gen/SessionDetailVm";
+import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
+import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
+import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
+import type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
+import type { SessionReferencesVm } from "./gen/SessionReferencesVm";
+import type { SessionRefVm } from "./gen/SessionRefVm";
+import type { SessionRootVm } from "./gen/SessionRootVm";
+import type { SessionRowVm } from "./gen/SessionRowVm";
+import type { SessionSearchBatch } from "./gen/SessionSearchBatch";
+import type { SessionSearchReq } from "./gen/SessionSearchReq";
+import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
+import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
+import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
+import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
@@ -349,6 +396,8 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { WidgetKind } from "./gen/WidgetKind";
+import type { WidgetRow } from "./gen/WidgetRow";
 
 /**
  * Structural guard for the {@link IpcError} envelope so we can rethrow it
@@ -3869,6 +3918,62 @@ export async function notesSpaceTerms(query: string): Promise<NoteSpaceTermsVm> 
 }
 
 /**
+ * The rows one markdown widget draws (FR-264) — a `> [!board]`, `> [!log]` or
+ * `> [!refs]` callout in any note, not only in a session.
+ *
+ * `argument` is the callout's own text, verbatim and unparsed: Rust decides what
+ * an empty argument means (the kind's default query) and what a non-empty one
+ * means (it replaces the default). Nothing here composes a query (AD-65), which
+ * is also why a board in a note and a session's board cannot drift apart in what
+ * they select.
+ *
+ * Rejects with: `invalidInput` (the callout's query does not parse — a broken
+ * query is an error rather than an empty widget, because "no rows" and "your
+ * query is wrong" look identical on screen), `unsupported`, `internal`.
+ */
+export async function notesWidget(
+  vaultId: string,
+  kind: WidgetKind,
+  argument: string,
+): Promise<WidgetRow[]> {
+  return await invoke<WidgetRow[]>("notes_widget", { vaultId, kind, argument });
+}
+
+/**
+ * Drag a card between the columns of a board widget: `status` says which column,
+ * `index` says where in it (`0` = top).
+ *
+ * `status` is the column's own word rather than a member of a closed set — a
+ * board in an ordinary note has no fixed column vocabulary, and the four session
+ * statuses are one such vocabulary rather than the only one.
+ *
+ * Deliberately not the same command as {@link sessionsTaskMove}: a session's
+ * move runs through the sessions plan executor, a note's is written through the
+ * vault's own writer with its own trash and sync ledger. Only the arithmetic is
+ * shared, in Rust, which is the part that could have drifted.
+ *
+ * Rejects with: `invalidInput` (an unknown note, or an unparseable query),
+ * `unsupported`, `internal`.
+ */
+export async function notesWidgetMove(
+  vaultId: string,
+  kind: WidgetKind,
+  argument: string,
+  noteId: string,
+  status: string,
+  index: number,
+): Promise<void> {
+  return await invoke<void>("notes_widget_move", {
+    vaultId,
+    kind,
+    argument,
+    noteId,
+    status,
+    index,
+  });
+}
+
+/**
  * Create a note (FR-98, FR-160). Every field of `req` is optional-shaped because
  * there is no dialog anywhere in this path (UX-DR35): a title comes from the
  * first line if it is not supplied, and the destination is a rule rather than a
@@ -4762,4 +4867,608 @@ export async function listenNotesCaptureWindows(onChanged: () => void): Promise<
   return await listen<null>(NOTES_CAPTURE_WINDOWS_EVENT, () => {
     onChanged();
   });
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (Phase 7, AD-114)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every registered sessions root — a sessions-flagged sync profile whose zone
+ * exists on disk (FR-222, FR-224, AD-107). The root list IS a filter over the
+ * profile list, so there is nothing else to read and no second registry.
+ *
+ * Rejects with: `unsupported` (mobile), `internal`.
+ */
+export async function sessionsRoots(): Promise<SessionRootVm[]> {
+  return await invoke<SessionRootVm[]>("sessions_roots");
+}
+
+/**
+ * The board rows for one root (FR-228): active before archived, pinned first
+ * within status, then newest record change first. A registered-but-unscanned
+ * root answers `[]` — its `SessionRootVm.indexed` says why.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsList(rootId: string): Promise<SessionRowVm[]> {
+  return await invoke<SessionRowVm[]>("sessions_list", { rootId });
+}
+
+/**
+ * Ask one root to rescan its zone now — the sessions "Rebuild index" verb
+ * (FR-225). Resolves when the request is queued; the result arrives as a
+ * {@link SESSIONS_CHANGED_EVENT} like every other change.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsRescan(rootId: string): Promise<void> {
+  await invoke<void>("sessions_rescan", { rootId });
+}
+
+/**
+ * "This root's session set changed — re-read it." The payload is the root id
+ * and nothing else: the listener re-reads through {@link sessionsList} rather
+ * than trusting a payload, which at zone scale costs one list read and cannot
+ * drift (AD-114).
+ */
+export const SESSIONS_CHANGED_EVENT = "keeper://sessions-changed";
+
+/** Subscribe to the sessions-changed event; the callback gets the root id. */
+export async function listenSessionsChanged(
+  onChanged: (rootId: string) => void,
+): Promise<() => void> {
+  return await listen<string>(SESSIONS_CHANGED_EVENT, (event) => {
+    onChanged(event.payload);
+  });
+}
+
+/**
+ * One session's *record* (FR-233): header facts, the user-tier properties and
+ * the rendered log NEWEST FIRST (the review order — the file on disk stays
+ * newest-last). Composed fresh from disk on every call; re-read on the
+ * changed event.
+ *
+ * The session's files are {@link sessionsTree}, read separately, so a log
+ * re-read does not pay for a directory walk and a git query.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsDetail(rootId: string, sessionId: string): Promise<SessionDetailVm> {
+  return await invoke<SessionDetailVm>("sessions_detail", { rootId, sessionId });
+}
+
+/**
+ * One session's own file tree (FR-254) — the session folder as the small
+ * workspace it is: the zone's four sections in the zone's own order, each
+ * nested, everything else after them.
+ *
+ * The whole subtree comes back in one call, flat, each entry carrying
+ * `parent` and `depth` for the renderer to nest on. Every entry already
+ * carries the facts the row needs and the frontend cannot derive: the
+ * profile-relative `subpath` (AD-65 — never joined here), the SAME sync mark
+ * and sentence the Files tab renders, and `locked` — the workspace fence's
+ * own refusal sentence, on exactly the paths a write would refuse (AD-113).
+ *
+ * `truncated` means the walk hit its budget: a session's `workspace/` can
+ * hold a `node_modules`, and a prefix that looked complete would be a lie.
+ *
+ * Rejects with: `internal` (unknown root/session, an unreadable exclude
+ * pattern), `unsupported` (mobile). An engine that cannot answer is NOT a
+ * rejection — the files come back marked unknown, with the engine's words.
+ */
+export async function sessionsTree(rootId: string, sessionId: string): Promise<SessionTreeVm> {
+  return await invoke<SessionTreeVm>("sessions_tree", { rootId, sessionId });
+}
+
+/**
+ * What one session points at (FR-255) — the other half of {@link sessionsTree}.
+ *
+ * The tree lists what a session *holds*; this lists what it *names*, which the
+ * zone's own contract makes a different set on purpose: big files live in their
+ * own zone and a session references them by repo-root-relative path. So the
+ * thing that breaks is the pointer, and `missing` is the count that says so.
+ *
+ * Every row is already resolved in Rust against the resolver that owns the
+ * question — the vault index for a note, the frontmatter `session:` key for a
+ * recording, the disk for a file, the board's rows for a session — and carries
+ * a ready `panelTarget` (AD-109) or a `url` for the system browser. Nothing
+ * here is classified from a file extension and nothing here joins a path.
+ *
+ * A missing row carries `notice`: what keeper looked for, named, so a moved
+ * file is one `mv` away rather than a search of the whole drive.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsRefs(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionReferencesVm> {
+  return await invoke<SessionReferencesVm>("sessions_refs", { rootId, sessionId });
+}
+
+/**
+ * Everything the operator could reference from this session (FR-265) — the
+ * write half of {@link sessionsRefs}.
+ *
+ * Three sources in one list: the session's own files first (a reference is most
+ * often to something the sitting just produced), then the vault's notes and
+ * recordings, newest first. Which source a row came from is its `kind`, in the
+ * same words the references list already prints.
+ *
+ * **`query` is filtered in Rust**, not here. The list is budgeted, so filtering
+ * a returned prefix would search the wrong 500 — and `tag:x` is the tag
+ * hierarchy's question, which belongs beside the index that answers it (AD-7).
+ * Pass the operator's raw input; keeper decides what it means.
+ *
+ * `promotable` is the workspace fence's own answer, so an offer to copy into
+ * `artifacts/` never appears on a file keeper would then refuse to copy.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsRefCandidates(
+  rootId: string,
+  sessionId: string,
+  query: string,
+): Promise<SessionRefCandidatesVm> {
+  return await invoke<SessionRefCandidatesVm>("sessions_ref_candidates", {
+    rootId,
+    sessionId,
+    query,
+  });
+}
+
+/**
+ * Write one reference into one of the session's markdown files (FR-265).
+ *
+ * The markdown is composed in Rust, because the syntax a reference is written in
+ * is the syntax {@link sessionsRefs} reads back and a second author of that
+ * contract is how the two drift (AD-65). What comes back is the line as written,
+ * so the confirmation shows what landed rather than what was requested.
+ *
+ * The append is guarded on the target's current bytes: an agent writing the same
+ * file turns into a refusal the operator can retry rather than a lost line.
+ *
+ * `promote: true` on a `workspace/` target copies it into `artifacts/` first and
+ * points the line at the copy — `workspace/` is scratch that the archive verb
+ * empties, so a reference into it is a dangling link with a date on it.
+ *
+ * Rejects with: `internal` (unknown root/session, a refused pick, a target that
+ * is not markdown, a failed write), `unsupported` (mobile).
+ */
+export async function sessionsRefAdd(
+  rootId: string,
+  sessionId: string,
+  req: SessionRefAddReq,
+): Promise<SessionRefAddedVm> {
+  return await invoke<SessionRefAddedVm>("sessions_ref_add", { rootId, sessionId, req });
+}
+
+/**
+ * Run a content scan over every session in one zone, streaming hits as they are
+ * found (FR-267), and resolve with the subscription id.
+ *
+ * The twin of {@link notesSearch} rather than a widening of it, because a zone
+ * can never be a vault: a subfolder flagged as both is refused at profile
+ * validation, so `notes_search` cannot reach a session file whatever id it is
+ * handed. Two searches, one matcher — the folding is
+ * `keeper_core::notes::search::find`'s in both.
+ *
+ * A hit names its session as well as its file, because `about.md` names nothing
+ * on its own when every session has one.
+ *
+ * Starting a scan **cancels** the previous one for the same root: a second scan
+ * of one zone is always a newer query for the same field. Batches already in
+ * flight can still land, so a caller that keys on the query must still drop
+ * stale ones.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsSearch(
+  rootId: string,
+  req: SessionSearchReq,
+  onBatch: (batch: SessionSearchBatch) => void,
+): Promise<string> {
+  return await subscribeWithStringId<SessionSearchBatch>("sessions_search", onBatch, {
+    rootId,
+    req,
+  });
+}
+
+/**
+ * Stop a running zone scan (FR-267).
+ *
+ * Idempotent: a scan that already finished, or one that was superseded by a
+ * newer query, is not an error to cancel — the caller unmounting has no way to
+ * know which of those happened and should not have to.
+ *
+ * Rejects with: `unsupported` (mobile).
+ */
+export async function sessionsSearchCancel(subscriptionId: string): Promise<void> {
+  await invoke<void>("sessions_search_cancel", { subscriptionId });
+}
+
+/**
+ * Every space the zone defines (FR-261) — the saved queries a flat session is
+ * read through, from `_spaces/*.md` beside `_template/`.
+ *
+ * Zone-wide rather than per-session, because the five are the same for every
+ * session in the root: `tag:task`, `tag:log`, `tag:ref` and the rest are
+ * questions about a session's shape, not about one session.
+ *
+ * **A zone keeper has never seen gets its five defaults written before this
+ * answers.** A read that writes, once per zone ever, and deliberately: the
+ * alternative first-run state is every session looking empty until someone
+ * finds a restore button they have no reason to press.
+ *
+ * A space whose query does not parse comes back with its `error` set rather
+ * than being dropped — the file is hand- and agent-editable, so a broken one is
+ * expected and must not take the section down. It then selects **nothing**; it
+ * never widens to the whole session.
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsSpaces(rootId: string): Promise<SessionSpaceVm[]> {
+  return await invoke<SessionSpaceVm[]>("sessions_spaces", { rootId });
+}
+
+/**
+ * What each of those spaces selects out of ONE session (FR-261) — the other
+ * half of {@link sessionsSpaces}.
+ *
+ * Two payloads on purpose: the definitions change when someone edits a space,
+ * the selections change whenever any file in the session does, and binding them
+ * would re-read every `_spaces/*.md` off the drive on every file write.
+ *
+ * One call for all of them, not one per space: the session's pool is read once
+ * and evaluated N times. Every row already carries the profile-relative
+ * `subpath` a file target takes (AD-65), so nothing here joins a path.
+ *
+ * A space whose query does not parse comes back with `error` set and `files`
+ * empty — the section renders the sentence rather than a suspiciously complete
+ * list.
+ *
+ * Rejects with: `internal` (unknown root/session), `unsupported` (mobile).
+ */
+export async function sessionsSpaceFiles(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionSpaceFilesVm[]> {
+  return await invoke<SessionSpaceFilesVm[]>("sessions_space_files", { rootId, sessionId });
+}
+
+/**
+ * Create or rewrite one space (FR-261). Resolves to its id — the zone-relative
+ * path, which for a create is the name keeper derived.
+ *
+ * `space.id` absent creates a file named after the name; present rewrites that
+ * exact file and **never moves it**. A rename therefore rewrites `title` and,
+ * only when the body is exactly the old name as a heading, that heading — the
+ * path is the id here, so moving the file would break every reference to it.
+ *
+ * There is no `defaultKey` to send: `keeper.default` is read off the file and
+ * written back unchanged, so a save cannot promote a hand-written space into a
+ * seeded one.
+ *
+ * Rejects with: `invalidInput` (an unparseable query — refused at the edge, as
+ * `notes_space_save` refuses one, because a stored space that silently selects
+ * nothing is worse than a save that says no), `internal` (a save against a
+ * space that has since been deleted is refused rather than recreating it),
+ * `unsupported`.
+ */
+export async function sessionsSpaceSave(rootId: string, space: SessionSpaceReq): Promise<string> {
+  return await invoke<string>("sessions_space_save", { rootId, space });
+}
+
+/**
+ * Remove one space (FR-261). The file is moved to the zone's own trash, not
+ * unlinked — a space is a markdown file someone wrote, and `.keeper/trash/`
+ * keeps its name so recovering it is a `mv` rather than an archaeology.
+ *
+ * Deleting a seeded default is allowed and is how you get rid of one you do not
+ * want; {@link sessionsSpacesRestore} is how you get it back.
+ *
+ * Rejects with: `invalidInput` (a path that is not directly inside `_spaces/`),
+ * `internal`, `unsupported`.
+ */
+export async function sessionsSpaceDelete(rootId: string, spaceId: string): Promise<void> {
+  await invoke<null>("sessions_space_delete", { rootId, spaceId });
+}
+
+/**
+ * Re-create the default spaces this zone is missing (FR-261), and report which
+ * ones by name.
+ *
+ * Only what is missing: a default that is there is left alone, and so is a
+ * space of the operator's own already carrying a default's key. Names rather
+ * than a count, because "3 restored" and "About, Log and Prompts restored" cost
+ * the same to send and only one of them says whether keeper agreed about what
+ * was missing. An empty list is the ordinary answer on a zone with nothing
+ * missing, and it is a success rather than a refusal.
+ *
+ * Rejects with: `internal` (the zone could not be written to), `unsupported`.
+ */
+export async function sessionsSpacesRestore(rootId: string): Promise<SessionSpacesRestoredVm> {
+  return await invoke<SessionSpacesRestoredVm>("sessions_spaces_restore", { rootId });
+}
+
+/**
+ * Write keeper's own default template into this zone (FR-268), and resolve with
+ * the zone-relative folder it landed in.
+ *
+ * A zone that has a `_template/` is never touched by a create — keeper copies
+ * what it finds and does not improve on it — so adopting an updated default is
+ * something you ask for. This is the ask.
+ *
+ * `name` is `undefined` for the zone's own `_template/` and a label for a named
+ * one, which is how a zone keeps its template *and* gains keeper's beside it.
+ *
+ * What lands is a **skeleton** — the navigation contract and an empty record —
+ * and not the seed log and seed prompt, which keeper composes fresh per create
+ * with that session's own title. There is no `title` here for the same reason:
+ * a template has no title, and the one this used to take was frozen into every
+ * session made from the result.
+ *
+ * Anything already there under one of the template's two names is moved to
+ * `.keeper/trash/` before it is rewritten — an `AGENTS.md` somebody improved by
+ * hand is recoverable, not gone — and files the template does not name are left
+ * alone, including a seed the operator wrote themselves.
+ *
+ * Rejects with: `internal` (unknown zone, a name with nothing to slug, a failed
+ * write), `unsupported`.
+ */
+export async function sessionsTemplateInstall(rootId: string, name?: string): Promise<string> {
+  return await invoke<string>("sessions_template_install", {
+    rootId,
+    name: name ?? null,
+  });
+}
+
+/** What {@link sessionsFileNew} will write. The set is closed in Rust. */
+export type SessionFileKind = "md" | "csv" | "json";
+
+/**
+ * Make one file inside a session (FR-262), and resolve with the profile-relative
+ * subpath that opens it.
+ *
+ * `parent` is session-relative and `""` for the session's own root — the pool,
+ * where a flat session's markdown belongs. The FILENAME is derived in Rust from
+ * `title`, against a directory listing read at that moment (AD-65): a name
+ * composed here would be a second namer, and the two would disagree about
+ * collisions the instant an agent wrote a file between the read and the create.
+ *
+ * A new `.md` declares no kind, so it lands in the detail's *unfiled* list and
+ * is told so — keeper does not know what an operator's new file is, and guessing
+ * `log` would file a stray thought as history. {@link sessionsFileNewKind} is
+ * the verb for the two it does know.
+ *
+ * Rejects with: `internal` (unknown root or session; a path inside `workspace/`,
+ * which is scratch keeper never writes to; an extension outside the closed set),
+ * `unsupported`.
+ */
+export async function sessionsFileNew(
+  rootId: string,
+  sessionId: string,
+  parent: string,
+  title: string,
+  kind: SessionFileKind,
+): Promise<string> {
+  return await invoke<string>("sessions_file_new", { rootId, sessionId, parent, title, kind });
+}
+
+/**
+ * Make a correctly-named, correctly-tagged log, prompt, ref or task in a flat
+ * session's pool (FR-262), and resolve with the subpath that opens it.
+ *
+ * **{@link sessionsLogToday}'s flat twin.** That command appends a dated heading
+ * to a folder-shaped session's `README.md`, which is where its log lives; a flat
+ * session has no `## Log` to append to and its log is a *file*. Callers pick on
+ * `detail.shape` rather than offering both — one verb, two contracts.
+ *
+ * The name (`YYYY-MM-DD-HHMM-slug.md`) and the frontmatter tag are what decide
+ * whether the zone's spaces will ever list the file, which is why keeper spells
+ * both rather than leaving them to whoever is typing.
+ *
+ * Rejects with: `internal` (unknown root or session, or `about` — a session has
+ * one record and a second would give the shape reader two answers),
+ * `unsupported`.
+ */
+export async function sessionsFileNewKind(
+  rootId: string,
+  sessionId: string,
+  kind: string,
+  title: string,
+): Promise<string> {
+  return await invoke<string>("sessions_file_new_kind", { rootId, sessionId, kind, title });
+}
+
+/**
+ * Remove one file from a session (FR-262) — a trash move, not an unlink.
+ *
+ * `rel` is session-relative, as it arrives on {@link SessionEntryVm}. `about.md`
+ * and `AGENTS.md` are refused: they are the two names the shape reader keys on,
+ * so deleting one turns a flat session back into a folder-shaped one and hides
+ * every log behind a section that no longer exists.
+ *
+ * Rejects with: `internal` (unknown root or session, a refused path, a file
+ * inside `workspace/`), `unsupported`.
+ */
+export async function sessionsFileDelete(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_file_delete", { rootId, sessionId, rel });
+}
+
+/**
+ * Move one task card to a column and a position in it (FR-263).
+ *
+ * `rel` is the card's session-relative path, as it arrives on
+ * {@link SessionTaskVm}. `status` is one of the four the board's columns are
+ * named for; `index` is the position among the cards **already in that column
+ * with this card removed**, so `0` is the top and the column's length is the
+ * bottom.
+ *
+ * The move is two frontmatter keys on one file — `status:` and `order:` — each
+ * written so every other byte survives. Nothing else is told a card moved, which
+ * is why a board is safe to render anywhere the same files are visible.
+ *
+ * The column is re-read in Rust before the write, so the index is resolved
+ * against what is on disk now rather than against the board as it was rendered:
+ * a session an agent has been writing to is the ordinary case, not the edge one.
+ *
+ * Rejects with: `internal` (unknown root or session, an unknown status, a card
+ * that has since been moved or deleted, a refused path), `unsupported`.
+ */
+export async function sessionsTaskMove(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+  status: string,
+  index: number,
+): Promise<void> {
+  await invoke<null>("sessions_task_move", { rootId, sessionId, rel, status, index });
+}
+
+/**
+ * Everything a new session can be shaped from (FR-253): the zone's own
+ * `_template/` first, then every session in the root, newest change first.
+ * Each pattern carries its own preview — what creating from it copies, and
+ * what it leaves behind with the reason — computed from the SAME rule the
+ * plan runs on, so the picker cannot promise a file the plan will not write
+ * (AD-116).
+ *
+ * A zone with no `_template/` answers with sessions alone; a brand-new zone
+ * answers `[]`, which is the honest "there is nothing to copy yet".
+ *
+ * Rejects with: `internal` (unknown root id), `unsupported` (mobile).
+ */
+export async function sessionsPatterns(rootId: string): Promise<SessionPatternVm[]> {
+  return await invoke<SessionPatternVm[]>("sessions_patterns", { rootId });
+}
+
+/**
+ * Create a session (FR-238, FR-239): the one question is the title; the
+ * folder, date prefix, collision counter, minted id and stamped README are
+ * keeper's. Resolves to the new session's ref.
+ *
+ * `patternId` names what it is shaped from — `"_template"` for the zone
+ * template, or a session's id to continue that session (structure only: its
+ * prompts and ref pointers, its README's headings, never its prose, with
+ * `continues`/`continued-by` written on both ends — archived sources
+ * included, because files are truth, AD-112). Omitted, the zone template is
+ * used when it exists and an empty skeleton when it does not.
+ *
+ * Rejects with: `internal` (unknown root or pattern, a plan refusal — re-plan
+ * and retry when `retriable`), `unsupported` (mobile).
+ */
+export async function sessionsCreate(
+  rootId: string,
+  title: string,
+  patternId?: string,
+): Promise<SessionRefVm> {
+  return await invoke<SessionRefVm>("sessions_create", {
+    rootId,
+    title,
+    patternId: patternId ?? null,
+  });
+}
+
+/**
+ * Append (or find) today's `### YYYY-MM-DD — ` entry under the session's
+ * `## Log` (FR-240), newest last per the zone's convention. Resolves to the
+ * session's ref so the caller opens the README; a second call the same day
+ * writes nothing and still resolves.
+ *
+ * Rejects with: `internal` (a concurrent edit refused the guarded write —
+ * retriable), `unsupported`.
+ */
+export async function sessionsLogToday(rootId: string, sessionId: string): Promise<SessionRefVm> {
+  return await invoke<SessionRefVm>("sessions_log_today", { rootId, sessionId });
+}
+
+/**
+ * What {@link sessionsMigrate} would do, before it does any of it (FR-257) —
+ * every path it would create, rewrite and trash, session-relative.
+ *
+ * Pure: it compiles the plan and throws it away. `needed: false` means the
+ * session already reads as flat and the button should say so rather than offer
+ * a no-op run.
+ *
+ * Rejects with: `internal` (unknown root or session), `unsupported`.
+ */
+export async function sessionsMigratePreview(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionMigrationVm> {
+  return await invoke<SessionMigrationVm>("sessions_migrate_preview", { rootId, sessionId });
+}
+
+/**
+ * Convert one folder-shaped session to the flat contract (FR-257): the README's
+ * record becomes `about.md`, each `### ` log entry becomes its own stamped
+ * file, `refs/` and `prompts/` are hoisted into the root pool with their kind
+ * as a tag, and the two directories are trashed last.
+ *
+ * Journaled and idempotent — a crash mid-run resumes from the journal, and a
+ * session that is already flat resolves without writing. **Never automatic**:
+ * only the operator triggers it.
+ *
+ * Rejects with: `internal` (unknown root or session; a failed step — the
+ * journal survives and the run is retriable), `unsupported`.
+ */
+export async function sessionsMigrate(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_migrate", { rootId, sessionId });
+}
+
+/**
+ * Pin or unpin a session (FR-232): one frontmatter boolean through the one
+ * byte-preserving writer; the row updates via the changed event.
+ *
+ * Rejects with: `internal`, `unsupported`.
+ */
+export async function sessionsSetPinned(
+  rootId: string,
+  sessionId: string,
+  pinned: boolean,
+): Promise<void> {
+  await invoke<void>("sessions_set_pinned", { rootId, sessionId, pinned });
+}
+
+/**
+ * Archive a session (FR-245): run the checklist's settled decision — the
+ * promote copies, optionally the workspace emptying — and move the folder to
+ * `archive/<year>/` as the last, journaled, crash-resumable step (NFR-38).
+ *
+ * Rejects with: `internal` (not active; a refusal — retriable), `unsupported`.
+ */
+export async function sessionsArchive(
+  rootId: string,
+  sessionId: string,
+  promotes: [string, string][],
+  emptyWorkspace: boolean,
+): Promise<void> {
+  await invoke<void>("sessions_archive", { rootId, sessionId, promotes, emptyWorkspace });
+}
+
+/**
+ * Delete a session into the zone's `.keeper/trash/<id>/` (FR-247):
+ * recoverable, never an unlink, workspace included.
+ *
+ * Rejects with: `internal`, `unsupported`.
+ */
+export async function sessionsDelete(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_delete", { rootId, sessionId });
+}
+
+/**
+ * Move an archived session back to `active/` (FR-248). Lineage is never
+ * rewritten — prefer a continuation ({@link sessionsCreate} naming the
+ * archived session as its pattern).
+ *
+ * Rejects with: `internal` (not archived), `unsupported`.
+ */
+export async function sessionsUnarchive(rootId: string, sessionId: string): Promise<void> {
+  await invoke<void>("sessions_unarchive", { rootId, sessionId });
 }

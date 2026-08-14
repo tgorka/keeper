@@ -244,6 +244,23 @@ export const SYNC_RECORDINGS_NOTE =
 export const SYNC_RECORDINGS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
 
 /**
+ * The sessions control (Phase 7, FR-222, AD-107).
+ *
+ * The recordings control directly above, applied a third time and deliberately
+ * not reinvented: same place in the form, same switch-and-subfolder shape, same
+ * kind of sentence — the established vocabulary for "this folder also holds X".
+ *
+ * As with recordings, no default subfolder is spelled here: it comes off
+ * `SyncProfileVm.sessionsSubfolder`, which Rust resolves to the stored value or
+ * to `SessionsConfig`'s own default (`60-sessions`) — see {@link formValuesFor}.
+ */
+export const SYNC_SESSIONS_LABEL = "This folder has sessions";
+export const SYNC_SESSIONS_NOTE =
+  "keeper lists LLM work sessions from a subfolder of this folder — one folder per session, with a README, promoted artifacts and reusable prompts. keeper adopts the layout that is there; it does not create one.";
+export const SYNC_SESSIONS_SUBFOLDER_LABEL = "Sessions subfolder";
+export const SYNC_SESSIONS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
+
+/**
  * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
  * which overrides AD-34-7). The token is written to the OS keychain in a second
  * call once the profile has an id, and an edit form reads it back as it opens
@@ -397,6 +414,18 @@ interface SyncFormValues {
    * name, which is the answer rather than an obstacle to route around.
    */
   recordingsSubfolder: string;
+  /**
+   * Whether this folder holds a sessions zone (FR-222, AD-107). Like the
+   * recordings pair above it IS part of `SyncProfileReq`, so it rides the
+   * profile save and needs no second write and no profile id first.
+   */
+  sessions: boolean;
+  /**
+   * Where inside the folder the sessions zone lives; only meaningful when
+   * flagged. Empty follows the recordings rule exactly: unanswered on an add
+   * (keeper's default stands), a deliberate clear on an edit (refused by name).
+   */
+  sessionsSubfolder: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -423,6 +452,9 @@ const EMPTY_FORM: SyncFormValues = {
   // profile to have resolved it yet. The empty box is how this form says
   // "keeper picks", exactly as the two numeric knobs above do.
   recordingsSubfolder: "",
+  sessions: false,
+  // Empty for the recordings reason directly above.
+  sessionsSubfolder: "",
 };
 
 /**
@@ -468,6 +500,10 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // there is no `SYNC_RECORDINGS_DEFAULT_SUBFOLDER` beside the notes one.
     recordings: profile.recordings,
     recordingsSubfolder: profile.recordingsSubfolder,
+    // Straight off the profile, exactly as recordings above: the VM carries the
+    // flag and the subfolder that would be in force (AD-34-8).
+    sessions: profile.sessions,
+    sessionsSubfolder: profile.sessionsSubfolder,
   };
 }
 
@@ -796,6 +832,8 @@ export function AddFolderForm({
     const notesSubfolder = form.notesSubfolder.trim();
     const recordings = form.recordings;
     const recordingsSubfolder = form.recordingsSubfolder.trim();
+    const sessions = form.sessions;
+    const sessionsSubfolder = form.sessionsSubfolder.trim();
     try {
       const saved = await saveSyncProfile({
         // Present updates that profile, absent creates one — the only field
@@ -863,6 +901,12 @@ export function AddFolderForm({
         // a folder the owner did not name.
         recordingsSubfolder:
           !recordings || (recordingsSubfolder === "" && !editing) ? null : recordingsSubfolder,
+        // The sessions flag, on the recordings block's exact terms (AD-107):
+        // always expressed because the switch is on screen, `false` REMOVES the
+        // block, and the subfolder follows the recordings empty-box rules.
+        sessions,
+        sessionsSubfolder:
+          !sessions || (sessionsSubfolder === "" && !editing) ? null : sessionsSubfolder,
       });
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
@@ -1141,6 +1185,44 @@ export function AddFolderForm({
           {form.localPath !== "" && form.recordingsSubfolder.trim() !== "" && (
             <p className="truncate font-mono text-muted-foreground text-xs">
               {`${form.localPath}/${form.recordingsSubfolder.trim()}`}
+            </p>
+          )}
+        </>
+      )}
+      {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
+          holds X" row, on the recordings control's exact shape. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
+        <Switch
+          id={`${fieldId}-sessions`}
+          checked={form.sessions}
+          disabled={disabled || saving}
+          onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
+      {form.sessions && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-sessions-subfolder`}>{SYNC_SESSIONS_SUBFOLDER_LABEL}</Label>
+            <Input
+              id={`${fieldId}-sessions-subfolder`}
+              className="w-56"
+              value={form.sessionsSubfolder}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
+              }
+            />
+          </div>
+          {/* Only while adding, for the recordings reason: no stored profile has
+              told this form what keeper would pick. */}
+          {!editing && (
+            <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
+          )}
+          {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
+            <p className="truncate font-mono text-muted-foreground text-xs">
+              {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
             </p>
           )}
         </>

@@ -129,6 +129,10 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // --- What the folder contains -------------------------------------------
     ("notes", FolderFieldRule::Allowed),
     ("recordings", FolderFieldRule::Allowed),
+    // A sessions zone is a fact about the repository's layout, exactly as a
+    // vault is: every clone holds the same `60-sessions/` tree, so a folder
+    // file may say so and every machine that syncs it agrees (AD-107).
+    ("sessions", FolderFieldRule::Allowed),
 ];
 
 /// What a folder file may do with one canonical profile key.
@@ -823,6 +827,9 @@ subfolder = "40-notes"
 
 [folder.recordings]
 subfolder = "40-media/recordings"
+
+[folder.sessions]
+subfolder = "60-sessions"
 "#,
             &tier(),
         );
@@ -844,6 +851,11 @@ subfolder = "40-media/recordings"
             "40-media/recordings"
         );
         assert_eq!(
+            p.sessions.as_ref().expect("sessions").subfolder,
+            "60-sessions",
+            "a folder may declare that it holds a sessions zone"
+        );
+        assert_eq!(
             outcome.owned.iter().map(String::as_str).collect::<Vec<_>>(),
             vec![
                 "branch",
@@ -853,6 +865,7 @@ subfolder = "40-media/recordings"
                 "lfsThresholdBytes",
                 "notes",
                 "recordings",
+                "sessions",
                 "tags",
             ]
         );

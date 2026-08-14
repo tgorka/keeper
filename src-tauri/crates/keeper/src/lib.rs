@@ -38,6 +38,11 @@ mod recorder;
 #[cfg(desktop)]
 mod recording_protocol;
 #[cfg(desktop)]
+mod sessions_exec;
+mod sessions_ipc;
+#[cfg(desktop)]
+mod sessions_root;
+#[cfg(desktop)]
 mod sync;
 #[cfg(desktop)]
 mod sync_ipc;
@@ -642,6 +647,13 @@ pub fn run() {
             #[cfg(desktop)]
             notes_vault::start(app.handle());
 
+            // Build the sessions-root registry beside it (Phase 7, AD-107/108):
+            // the same construction over the same engine tap, and the same quiet
+            // return where no engine exists — `CapabilitiesVm.sessions` is
+            // already false there.
+            #[cfg(desktop)]
+            sessions_root::start(app.handle());
+
             Ok(())
         });
 
@@ -912,6 +924,35 @@ pub fn run() {
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,
+        sessions_ipc::sessions_roots,
+        sessions_ipc::sessions_list,
+        sessions_ipc::sessions_rescan,
+        sessions_ipc::sessions_detail,
+        sessions_ipc::sessions_tree,
+        sessions_ipc::sessions_refs,
+        sessions_ipc::sessions_patterns,
+        sessions_ipc::sessions_create,
+        sessions_ipc::sessions_log_today,
+        sessions_ipc::sessions_migrate_preview,
+        sessions_ipc::sessions_migrate,
+        sessions_ipc::sessions_set_pinned,
+        sessions_ipc::sessions_archive,
+        sessions_ipc::sessions_delete,
+        sessions_ipc::sessions_unarchive,
+        sessions_ipc::sessions_spaces,
+        sessions_ipc::sessions_space_files,
+        sessions_ipc::sessions_space_save,
+        sessions_ipc::sessions_space_delete,
+        sessions_ipc::sessions_spaces_restore,
+        sessions_ipc::sessions_template_install,
+        sessions_ipc::sessions_file_new,
+        sessions_ipc::sessions_file_new_kind,
+        sessions_ipc::sessions_file_delete,
+        sessions_ipc::sessions_task_move,
+        sessions_ipc::sessions_ref_candidates,
+        sessions_ipc::sessions_ref_add,
+        sessions_ipc::sessions_search,
+        sessions_ipc::sessions_search_cancel,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,
@@ -929,6 +970,8 @@ pub fn run() {
         notes_ipc::notes_space_validate,
         notes_ipc::notes_space_terms,
         notes_ipc::notes_spaces_restore_defaults,
+        notes_ipc::notes_widget,
+        notes_ipc::notes_widget_move,
         notes_ipc::notes_create,
         notes_ipc::notes_journal_today,
         notes_ipc::notes_templates,
