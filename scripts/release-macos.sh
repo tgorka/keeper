@@ -100,9 +100,38 @@ KEEPER_BUNDLES=app,dmg bash "$SCRIPT_DIR/build-macos-signed.sh"
 # A gzipped tar of the .app, which is the shape Tauri's macOS updater expects and
 # the shape v0.4.2/v0.5.0/v0.6.1 shipped. Built from the bundle that was just
 # verified, so the update installs a properly signed app rather than an ad-hoc one.
+#
+# `--no-mac-metadata` is load-bearing, and its absence is invisible from this
+# machine. macOS `tar` stores extended attributes as sidecar AppleDouble members
+# — `._keeper.app`, `keeper.app/._Contents`, one per directory — and then hides
+# them again when *it* reads the archive, merging them back into the file they
+# describe. So `tar tzf` here lists a clean tree while the archive really holds
+# twenty members, ten of them `._`.
+#
+# Tauri's updater unpacks with the Rust `tar` crate, which does no such merging.
+# It meets `._keeper.app` as an ordinary member and dies: "failed to unpack
+# `._keeper.app` into …", which is what v0.8.8 shipped. The payload had been
+# built this way since v0.4.2 and nobody had seen it, because until v0.6.5 the
+# updater could not fetch `latest.json` at all — the fetch failure masked an
+# unpack failure waiting behind it.
 say "packing the updater payload"
 rm -f "$TARBALL" "$TARBALL.sig"
-tar czf "$TARBALL" -C "$(dirname "$APP")" "$(basename "$APP")"
+tar --no-mac-metadata -czf "$TARBALL" -C "$(dirname "$APP")" "$(basename "$APP")"
+
+# Proof, not intent: read the archive with something that does not merge
+# AppleDouble members, because the tool that wrote them is exactly the tool that
+# would hide them from this check.
+say "checking the payload the way the updater will read it"
+python3 - "$TARBALL" <<'PY'
+import sys, tarfile
+names = tarfile.open(sys.argv[1]).getnames()
+bad = [n for n in names if n.startswith("._") or "/._" in n]
+if bad:
+    print(f"FAIL: {len(bad)} AppleDouble member(s) the updater cannot unpack, "
+          f"starting with {bad[0]}", file=sys.stderr)
+    sys.exit(1)
+print(f"    {len(names)} members, no AppleDouble sidecars")
+PY
 
 say "signing it with the updater key"
 bunx tauri signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
