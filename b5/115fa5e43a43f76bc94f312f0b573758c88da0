@@ -1,0 +1,19 @@
+scripts/release-macos.sh
+  s_45b1426f60f163::t_56c9249ec5ecb2 103-116,119-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "b5115fa5e43a43f76bc94f312f0b573758c88da0",
+  "prompts": {},
+  "sessions": {
+    "s_45b1426f60f163": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08e999c8-c890-418c-ab79-ca9ea3a5bd7c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
