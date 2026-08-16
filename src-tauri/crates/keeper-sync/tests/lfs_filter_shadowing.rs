@@ -45,9 +45,20 @@ use keeper_sync::lfs::pointer::Pointer;
 /// through `current_exe()`, so it must be inert on a normal run.
 const CHILD_ENV: &str = "KEEPER_SYNC_LFS_SHADOW_CHILD";
 
-/// What `git lfs install` writes into `~/.gitconfig`, with a program that is not
-/// on `PATH` — which is the desktop-launch case, not a contrived one.
-const GLOBAL_GIT_LFS_CONFIG: &str = "[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\trequired = true\n";
+/// What `git lfs install` writes into `~/.gitconfig`, except that the program is
+/// spelled so that no machine can have it.
+///
+/// The field config says plain `git-lfs`, and the failure there is that it cannot
+/// be **launched** — a desktop launch inherits Finder's `PATH`, which has no
+/// Homebrew in it. Spelling `git-lfs` here would make the measurement depend on
+/// the host: the macOS CI runner ships a working `git-lfs`, its handshake
+/// succeeds, and it then cleans the payload back into the very pointer the index
+/// holds — so the entry reads CLEAN and nothing fails. That is the *silent* half
+/// of the same defect (another installation's driver quietly becomes the filter
+/// for a folder keeper manages, storing objects keeper's journal knows nothing
+/// about), and it is the second reason the whole section goes rather than only
+/// the key that crashes.
+const GLOBAL_GIT_LFS_CONFIG: &str = "[filter \"lfs\"]\n\tprocess = keeper-test-no-such-git-lfs filter-process\n\tclean = keeper-test-no-such-git-lfs clean -- %f\n\tsmudge = keeper-test-no-such-git-lfs smudge -- %f\n\trequired = true\n";
 
 #[test]
 fn a_global_git_lfs_driver_does_not_break_status() {
