@@ -452,10 +452,8 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         preview,
         wikilink,
         tags,
-        slash,
         indent,
-        emoji,
-        format,
+        writing,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -466,10 +464,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         import("./editor/live-preview"),
         import("./editor/wikilink"),
         import("./editor/tag-complete"),
-        import("./editor/slash-menu"),
         import("./editor/indent-keymap"),
-        import("./editor/emoji-complete"),
-        import("./editor/format-commands"),
+        // The slash menu, emoji and the toolbar's translation, which this editor
+        // no longer owns: Story 50.3 moved them into one module a file viewer
+        // imports too, so a session log gets the same three tools rather than a
+        // second copy of them.
+        import("./editor/writing-tools"),
       ]);
       if (disposed) {
         return;
@@ -555,21 +555,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
               },
             ]),
             markdown.markdown({ base: markdown.markdownLanguage }),
-            autocomplete.autocompletion({
-              override: [
-                wikilink.wikilinkSource(vaultId),
-                tags.tagCompleteSource(async () => {
-                  cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
-                  return cachedTags;
-                }),
-                slash.slashMenuSource(),
-                emoji.emojiCompleteSource(),
-              ],
-            }),
-            // The other half of Story 45.11: a shortcode somebody typed in full
-            // becomes its character as the closing colon lands, so `:tada:`
-            // never has to be recognised as a menu interaction.
-            emoji.emojiShortcodeCommit(),
+            writing.markdownWritingTools([
+              wikilink.wikilinkSource(vaultId),
+              tags.tagCompleteSource(async () => {
+                cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
+                return cachedTags;
+              }),
+            ]),
             preview.livePreview({
               vaultId,
               assetUrl: (rel) =>
@@ -649,7 +641,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         // formatting action IS the user's edit, so it belongs in the undo
         // history and it has to reach Rust through the update listener.
         runFormat: (action: FormatAction) => {
-          format.formatCommand(action)(editorView);
+          writing.runFormatAction(editorView, action);
         },
         focus: () => editorView.focus(),
         destroy: () => editorView.destroy(),

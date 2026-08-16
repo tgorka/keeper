@@ -8,10 +8,37 @@
  * surfaces end up with different tab behaviour". Story 43.1 fixed Tab once, in
  * `editor/indent-keymap.ts`, and it should not need fixing twice — so this
  * module imports that exact binding set rather than restating it, and the same
- * is true of history, the default keymap and completion acceptance. What the
- * note editor adds on top (live preview, wikilinks, the slash menu, the notes
- * store) is markdown-and-a-note specific and deliberately stays there; what is
- * common is here.
+ * is true of history, the default keymap and completion acceptance.
+ *
+ * # The writing tools moved in, and the sentence that used to stop them
+ *
+ * This paragraph used to say that the slash menu, emoji completion and the
+ * format toolbar were "markdown-and-a-note specific and deliberately stay
+ * there". The rule above it is unchanged; its **premise** is what Story 50.3
+ * measured and rejected. A session log is markdown a person writes prose into,
+ * and FR-233 promised it the toolbar, the slash menu and completion since phase
+ * 7 — so those three MOVED into `notes/editor/writing-tools.ts`, which both
+ * this host and the note editor import. Neither owns them and neither has a
+ * copy.
+ *
+ * They are mounted only when the caller says so ([`writingTools`]), and the
+ * caller says so only for a markdown buffer a save can follow. Both halves are
+ * somebody else's answer, asked rather than re-derived: the registry's own
+ * `format` verdict decides what markdown is (AD-87 — never a second extension
+ * sniff), and whether a save can follow is `TextFileFrame`'s `savable`, which
+ * reads the FORMAT's verdict, the size guard, and — since the fix to this
+ * story — the LOCATION's verdict that `keeper_sync::files_write` composed and
+ * the listing row carried. That last one is what actually keeps the tools off
+ * a session's `workspace/` file (AD-113): it is ordinary markdown of an
+ * ordinary writable format, so nothing about the file itself withholds
+ * anything, and only the fence does.
+ *
+ * What did NOT move is live preview, the notes store, wikilink and tag
+ * completion. The first two need a note id, a subscription and an autosave that
+ * a file has none of; the second two need vault coordinates a sessions zone can
+ * never produce. AD-88 also still holds — the rendered tab is read-only, so
+ * these tools belong to the Source tab, which is the only tab that mounts this
+ * host at all.
  *
  * # Everything CodeMirror is behind a dynamic import, and that is load-bearing
  *
@@ -50,6 +77,7 @@ import type * as CodeMirrorState from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import type * as CodeMirrorView from "@codemirror/view";
 import type { EditorView } from "@codemirror/view";
+import type { FormatAction } from "../notes/editor/format-commands";
 
 /**
  * The largest file this surface will edit, in bytes.
@@ -269,6 +297,23 @@ export interface TextEditorMount {
   setContent: (next: string) => void;
   /** Turn editing on or off without rebuilding the view or losing the caret. */
   setReadOnly: (readOnly: boolean) => void;
+  /**
+   * Run a format-toolbar action over the current selection, or `null` when this
+   * buffer was not given the writing tools (Story 50.3).
+   *
+   * Null rather than a no-op function: a toolbar whose presses land nowhere is
+   * the shape of defect this epic keeps finding, and the surface that renders
+   * the toolbar decides from the same flag that put the extensions in the view,
+   * so the two cannot disagree about whether a press has anywhere to go.
+   *
+   * The null is necessary and was never sufficient, which is what the fix to
+   * this story found. It can only speak once a mount EXISTS, and the mount is
+   * six dynamic imports away from the render that decides whether to draw a
+   * toolbar — so the surface gates on a live mount as well (`mounted` in
+   * `text-viewer.tsx`), and this field answers for the case that gate cannot
+   * see: a mount that was built without the writing extensions.
+   */
+  runFormat: ((action: FormatAction) => void) | null;
   destroy: () => void;
   /** The live view. Exposed so a test can drive the real thing. */
   view: EditorView;
@@ -284,6 +329,17 @@ export interface TextEditorMountOptions {
   onChange: (next: string) => void;
   /** `Mod-s`. The surface decides what saving means; this only asks. */
   onSave: () => void;
+  /**
+   * Whether this buffer gets the markdown writing tools — the slash menu, emoji
+   * completion and the toolbar's translation (Story 50.3, FR-233).
+   *
+   * The caller's decision and never derived here: it is markdown when the
+   * registry's `format` says so (AD-87) and writable when a save can follow it,
+   * and both of those facts live above this module. Required rather than
+   * defaulted, so a new surface that mounts an editor has to answer the
+   * question rather than inherit whichever answer suited the first one.
+   */
+  writingTools: boolean;
   /**
    * Called once the grammar has landed, or has failed to. Exists so a test can
    * wait for the asynchronous half instead of sleeping, and so the surface can
@@ -329,12 +385,16 @@ export async function mountTextEditor(options: TextEditorMountOptions): Promise<
   // opens a file should not download, and quick capture (NFR-27, 300 ms) must
   // not pay for them at all. A static import here would pull the whole editor
   // into any chunk that can render a file row.
-  const [state, view, commands, language, indent] = await Promise.all([
+  const [state, view, commands, language, indent, writing] = await Promise.all([
     import("@codemirror/state"),
     import("@codemirror/view"),
     import("@codemirror/commands"),
     import("@codemirror/language"),
     import("../notes/editor/indent-keymap"),
+    // In the same wave rather than after it, so the tools cost a chunk fetch
+    // and never a second round trip — and `null` when they were not asked for,
+    // so a `.rs` file does not download the emoji table to not use it.
+    options.writingTools ? import("../notes/editor/writing-tools") : null,
   ]);
 
   const grammar = new state.Compartment();
@@ -378,6 +438,11 @@ export async function mountTextEditor(options: TextEditorMountOptions): Promise<
             },
           },
         ]),
+        // Story 50.3's three tools, or nothing at all. `[]` is the whole of the
+        // "not markdown, or not writable" case: an absent extension cannot be
+        // triggered, so there is no state in which a `/` opens a menu over a
+        // file the reader was told they cannot change.
+        writing === null ? [] : writing.markdownWritingTools(),
         grammar.of([]),
         editable.of(readOnlyExtensions(view, state, options.readOnly)),
         view.EditorView.updateListener.of((update) => {
@@ -452,6 +517,11 @@ export async function mountTextEditor(options: TextEditorMountOptions): Promise<
         effects: editable.reconfigure(readOnlyExtensions(view, state, readOnly)),
       });
     },
+    // The same translation the note editor performs, from the same module —
+    // which is the point of Story 50.3. Non-null exactly when the extensions
+    // are in the view, so a surface cannot render a toolbar over an editor that
+    // never loaded the commands behind it.
+    runFormat: writing === null ? null : (action) => writing.runFormatAction(editorView, action),
     destroy: () => editorView.destroy(),
     view: editorView,
   };

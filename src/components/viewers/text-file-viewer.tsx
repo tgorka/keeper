@@ -181,6 +181,11 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           entry={entry}
           state={state}
           writeCaveat={file.writeCaveat}
+          // The location's verdict, straight off the listing row the panel
+          // opened this file from — Rust's own refusal sentence, which is what
+          // keeps a session's `workspace/` file (AD-113) read-only and toolless
+          // from the first frame instead of from the first refused save.
+          writeRefusal={file.writeRefusal}
           csv={csv}
           preview={preview}
         />

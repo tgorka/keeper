@@ -15,7 +15,7 @@
  * dispatch against. Both are asserted below by typing, not by calling.
  */
 import type { EditorView } from "@codemirror/view";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withRangeRects } from "@/test/layout";
@@ -94,17 +94,21 @@ function type(node: HTMLElement, text: string): void {
 function Controlled({
   initial,
   language = null,
+  fileName = "config.toml",
   readOnly,
   sizeLabel,
   onChange,
   onSave,
+  writingTools,
 }: {
   initial: string;
   language?: string | null;
+  fileName?: string;
   readOnly?: boolean;
   sizeLabel?: string;
   onChange?: (next: string) => void;
   onSave?: (next: string) => void;
+  writingTools?: boolean;
 }) {
   const [text, setText] = useState(initial);
   return (
@@ -112,8 +116,9 @@ function Controlled({
       <TextEditorSurface
         content={text}
         language={language}
-        fileName="config.toml"
+        fileName={fileName}
         sizeLabel={sizeLabel}
+        writingTools={writingTools}
         readOnly={readOnly}
         onChange={(next) => {
           setText(next);
@@ -467,5 +472,96 @@ describe("TextEditorSurface, when a grammar will not load", () => {
     } finally {
       info.mockRestore();
     }
+  });
+});
+
+/**
+ * Story 50.3, the surface's own half of the rule.
+ *
+ * `text-file-viewer.test.tsx` proves the shipped path: a session log opened
+ * through the registry has the toolbar, the menu and the emoji. What only this
+ * suite can prove is the guard BELOW that decision — this component refuses the
+ * tools over a buffer nobody can write even when its caller asks for them,
+ * because it is mounted over buffers no `sync_read_text` produced (a note embed,
+ * a paste) and "the toolbar edits nothing" must not depend on which caller you
+ * are. The positive case is asserted beside it deliberately: an absence test
+ * with no present case beside it stays green against a build that has no toolbar
+ * anywhere.
+ */
+describe("TextEditorSurface, and the writing tools", () => {
+  it("mounts the toolbar over a writable markdown buffer, and its press lands", async () => {
+    render(<Controlled initial="alpha" language="markdown" fileName="README.md" writingTools />);
+    await content("alpha");
+    const view = await liveView();
+    view.dispatch({ selection: { anchor: 0, head: "alpha".length } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+
+    // Read back through the host's buffer, not the view: what a toolbar owes is
+    // an edit the surface REPORTS, because that is the only text a save can see.
+    await waitFor(() => expect(screen.getByTestId("buffer")).toHaveTextContent("**alpha**"));
+  });
+
+  it("withholds them from a buffer nobody can write", async () => {
+    render(
+      <Controlled initial="alpha" language="markdown" fileName="README.md" writingTools readOnly />,
+    );
+    await content("alpha");
+
+    // Absent rather than present-and-failing. A read-only markdown buffer is the
+    // `workspace/` case (AD-113) and the oversize case, and a toolbar over
+    // either would be a control that announces its own refusal.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+  });
+
+  it("withholds them from a buffer whose caller never asked", async () => {
+    render(<Controlled initial="alpha" language="markdown" fileName="README.md" />);
+    await content("alpha");
+
+    // The registry's `format` verdict lives above this component, so the default
+    // is off: a surface that has not thought about it gets the plain editor it
+    // had before Story 50.3.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+  });
+
+  it("draws no toolbar over the host until the editor is inside it", async () => {
+    // The window the commit's own claim denied. `writingTools` is known at the
+    // first render and the editor is six dynamic imports away, so a toolbar
+    // drawn from the flag alone is live and clickable over an empty host — and
+    // every press in that window reaches a null mount and is swallowed, which
+    // is exactly the shape `TextEditorMount.runFormat`'s null was chosen to
+    // prevent. Asserted synchronously, before a single microtask has run.
+    render(<Controlled initial="alpha" language="markdown" fileName="README.md" writingTools />);
+
+    expect(document.querySelector(".cm-editor")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+
+    // …and it does arrive, so this is a claim about WHEN rather than a test
+    // that would pass over a build with no toolbar at all.
+    await content("alpha");
+    await screen.findByRole("button", { name: "Bold" });
+  });
+
+  it("takes the toolbar away for the whole of a rebuild, not just its start", async () => {
+    // The second, guaranteed instance: the extension list is fixed at
+    // construction, so a change to `language` tears the view down and builds
+    // another asynchronously — with `writingTools` true throughout. The cleanup
+    // nulls the mount, so between it and the next resolve there is nothing for
+    // a press to land in.
+    const { rerender } = render(
+      <Controlled initial="alpha" language="markdown" fileName="README.md" writingTools />,
+    );
+    await content("alpha");
+    await screen.findByRole("button", { name: "Bold" });
+
+    rerender(<Controlled initial="alpha" language="toml" fileName="README.md" writingTools />);
+
+    // Synchronous again: React has run the cleanup and started the new mount,
+    // and the new mount cannot have resolved.
+    expect(document.querySelector(".cm-editor")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+
+    await content("alpha");
+    await screen.findByRole("button", { name: "Bold" });
   });
 });

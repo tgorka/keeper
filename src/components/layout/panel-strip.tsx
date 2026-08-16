@@ -245,6 +245,13 @@ function FilePanelBody({ profileId, relativePath }: { profileId: string; relativ
     // manage. Composed in Rust and carried on the listing row, so the panel
     // neither words it nor decides when it applies.
     writeCaveat: entry.write.caveat,
+    // And the other verdict on the same row: why keeper will not write HERE.
+    // `reason` is `Some` exactly when `writable` is false, so the conditional
+    // is reading the pair as Rust guarantees it rather than defending against
+    // it. The workspace fence (AD-113) arrives this way — `sync_browse` builds
+    // the scope with the profile's sessions zone named, so a `workspace/` file
+    // is refused on the listing, before any surface offers to edit it.
+    writeRefusal: entry.write.writable ? null : entry.write.reason,
   };
   const { entry: viewerEntry, Component } = viewerComponentFor(file);
   return <Component file={file} entry={viewerEntry} />;

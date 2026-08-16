@@ -27,7 +27,9 @@
  * round trip — keystroke, `onChange`, parent state, prop back in — a no-op, and
  * an outside write (45.4's CSV cell edit, a reload) a single minimal dispatch.
  */
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { FormatAction } from "@/components/notes/editor/format-commands";
+import { FormatToolbar } from "@/components/notes/format-toolbar";
 import { isOversizeForEditing, mountTextEditor, type TextEditorMount } from "./text-editor-host";
 
 export interface TextEditorSurfaceProps {
@@ -67,6 +69,16 @@ export interface TextEditorSurfaceProps {
   path?: string;
   /** The profile or vault this file sits in, for the same labelling reason. */
   vault?: string | null;
+  /**
+   * Whether this buffer is markdown a save can follow, and therefore gets the
+   * format toolbar, the slash menu and emoji completion (Story 50.3, FR-233).
+   *
+   * The caller's verdict, not this component's: markdown is what the registry's
+   * `format` says it is (AD-87), and whether a save can follow is the frame's
+   * question. Absent means no — a surface that has not thought about it gets the
+   * plain editor it had before this story.
+   */
+  writingTools?: boolean;
 }
 
 /**
@@ -90,9 +102,21 @@ export function TextEditorSurface({
   onSave,
   path,
   vault,
+  writingTools = false,
 }: TextEditorSurfaceProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const mountRef = useRef<TextEditorMount | null>(null);
+  // Whether there is a live editor behind `mountRef` *right now*, as state
+  // rather than as the ref itself, because the toolbar's presence is a render
+  // decision and a ref does not cause one. The two windows this closes are the
+  // reason it exists: the boot effect assigns `mountRef.current` only after six
+  // dynamic imports have resolved, and the cleanup nulls it again at the start
+  // of every rebuild — so a toolbar drawn from `tools` alone is clickable over
+  // no editor for the whole of both, and every press in that window is
+  // swallowed. That is the exact "toolbar whose presses land nowhere" shape
+  // {@link TextEditorMount.runFormat}'s null exists to prevent, and the null
+  // alone cannot prevent it because it is not what the toolbar is drawn from.
+  const [mounted, setMounted] = useState(false);
   // The callbacks and the buffer as the *editor* should see them right now.
   // Held in a ref rather than closed over at construction because the editor
   // outlives every render: a handler captured in the boot effect would report
@@ -103,10 +127,29 @@ export function TextEditorSurface({
   const locked = readOnly || oversize;
   latest.current = { content, onChange, onSave, readOnly: locked };
 
-  // Keyed on `language` as well as nothing else: a grammar cannot be swapped
-  // into a live view without a compartment handle, and swapping the FILE under
-  // an editor is not a thing this component does — 45.4 remounts it. Rebuilding
-  // on a language change is therefore both correct and rare.
+  // One value feeds both the extensions and the toolbar, so the control and the
+  // commands behind it cannot come to disagree. `locked` is in it because a
+  // buffer nobody can write is a buffer no formatting action can land in — and
+  // that is the `workspace/` case (AD-113) as well as the oversize one.
+  const tools = writingTools && !locked;
+
+  const runFormat = useCallback((action: FormatAction) => {
+    // Optional twice over, and both are defence rather than a live path: the
+    // toolbar is drawn only when `tools` AND `mounted` are true, so there is a
+    // mount, and the same `tools` built that mount with the writing extensions
+    // in it, so its translation is non-null. The swallow is kept rather than a
+    // throw because a press can only arrive between renders, never between a
+    // cleanup and the render that follows it.
+    mountRef.current?.runFormat?.(action);
+  }, []);
+
+  // Keyed on `language` and on whether the tools are wanted: an extension list
+  // is fixed at construction, so a buffer that becomes read-only past the size
+  // limit has to be rebuilt to lose the tools rather than keep a slash menu no
+  // insertion can follow. A grammar cannot be swapped into a live view without
+  // a compartment handle, and swapping the FILE under an editor is not a thing
+  // this component does — 45.4 remounts it. Both rebuilds are therefore correct
+  // and rare.
   useEffect(() => {
     const host = hostRef.current;
     if (host === null) {
@@ -119,6 +162,7 @@ export function TextEditorSurface({
         content: latest.current.content,
         language,
         readOnly: latest.current.readOnly,
+        writingTools: tools,
         onChange: (next) => {
           // Belt as well as braces. `EditorView.editable` already blocks user
           // input, but a programmatic dispatch from a future extension would
@@ -144,13 +188,22 @@ export function TextEditorSurface({
       // The prop may have moved while the editor chunk was in flight.
       mount.setContent(latest.current.content);
       mount.setReadOnly(latest.current.readOnly);
+      // Beside the assignment and never apart from it: this is the render the
+      // toolbar is allowed to appear on, and the whole point is that it is the
+      // one where a press has somewhere to go.
+      setMounted(true);
     })();
     return () => {
       disposed = true;
       mountRef.current?.destroy();
       mountRef.current = null;
+      // Cleared here for the rebuild case, which is the guaranteed one: a
+      // change to `language` or `tools` tears the view down while `tools` may
+      // still be true, and without this the toolbar would sit over an empty
+      // host for the whole of the next async mount.
+      setMounted(false);
     };
-  }, [language]);
+  }, [language, tools]);
 
   useEffect(() => {
     mountRef.current?.setContent(content);
@@ -174,6 +227,22 @@ export function TextEditorSurface({
             : `This file is ${sizeLabel}, too large to edit, so it is open read-only and only the first part of it is shown.`}
         </p>
       ) : null}
+      {/* Directly over the text it formats, below the oversize banner and above
+          the editor — the note editor's own placement, so a person who learned
+          the toolbar in Notes finds it in the same place over a session log.
+
+          Here rather than in `TextFileFrame`'s save bar: a toolbar acts on a
+          live view, and the view is mounted by this component. Hoisting the
+          control two levels up would mean passing an editor handle upward, and
+          the handle a parent holds is exactly how a press lands in a view that
+          has since been replaced by the rendered tab (AD-88).
+
+          `mounted` and not `tools` alone: `tools` is known at the first render
+          and the editor is not, so drawing from `tools` puts a live control
+          over nothing for the length of six dynamic imports, and again for the
+          length of every rebuild. The toolbar appears when the thing it acts
+          on does. */}
+      {tools && mounted ? <FormatToolbar onAction={runFormat} /> : null}
       {/* `group`, not the `fieldset` the linter suggests: a fieldset groups
           form controls, and this is the mount point for a composite widget
           whose own `role="textbox"` CodeMirror puts on `.cm-content` inside.

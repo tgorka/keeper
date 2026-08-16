@@ -76,6 +76,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "4.3 MB",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -122,6 +123,31 @@ describe("the registry's three media ids really mount this viewer", () => {
       expect(screen.getByTestId(MEDIA_VIEWER_TESTID)).toHaveAttribute("data-viewer", viewer);
       unmount();
     }
+  });
+
+  it("draws the same element for a file keeper refuses to write", () => {
+    // `writeRefusal` is the LOCATION's verdict and rides on every `ViewerFile`
+    // now. A recording inside a session's `workspace/` is exactly that case,
+    // and this viewer offers no write at all — so the refusal must change
+    // nothing here, and must not appear on screen as a banner about a control
+    // this surface does not have.
+    const { container: plain, unmount } = render(
+      <MediaViewer file={target()} entry={resolveViewer(target())} />,
+    );
+    const html = plain.innerHTML;
+    unmount();
+
+    const fenced = target({
+      writeRefusal:
+        "2026/08/screen-0000.mov is inside a session's workspace — keeper reads it but " +
+        "never writes there.",
+    });
+    const { container: refused } = render(
+      <MediaViewer file={fenced} entry={resolveViewer(fenced)} />,
+    );
+
+    expect(refused.textContent).not.toContain("never writes there");
+    expect(refused.innerHTML).toBe(html);
   });
 
   it("points every element at the profile's own scheme, never at an absolute path", () => {

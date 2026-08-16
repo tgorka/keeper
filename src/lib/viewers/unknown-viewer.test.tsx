@@ -46,6 +46,7 @@ function unknownFile(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "1.2 MB",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -113,6 +114,26 @@ describe("the unknown viewer says what the file is", () => {
     );
     expect(recognised.textContent).toContain("PDF");
     expect(recognised.textContent).toContain("cannot show it here yet");
+  });
+
+  it("draws the same card for a file keeper refuses to write", () => {
+    // `writeRefusal` rides on every `ViewerFile` now, and this viewer offers no
+    // write at all — no editor, no Save, nothing a refusal could take away. So
+    // it must ignore the field rather than grow a banner about a control it
+    // does not have, and it must not spill the sentence's path into a surface
+    // FR-145 keeps paths out of.
+    const sentence =
+      "60-sessions/active/2026-08-10-keeper/workspace/board.sketchpad is inside a session's " +
+      "workspace — keeper reads it but never writes there.";
+    const { container: plain } = render(
+      <UnknownViewer file={unknownFile()} entry={UNKNOWN_ENTRY} />,
+    );
+    const { container: refused } = render(
+      <UnknownViewer file={unknownFile({ writeRefusal: sentence })} entry={UNKNOWN_ENTRY} />,
+    );
+
+    expect(refused.textContent).not.toContain("never writes there");
+    expect(refused.innerHTML).toBe(plain.innerHTML);
   });
 });
 

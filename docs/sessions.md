@@ -414,17 +414,39 @@ parsing markdown — and says so when it stops early.
 
 ## Editing
 
-Opening a session opens its record in the same editor every other keeper surface uses —
-markdown with live preview, the raw/rendered toggle, mermaid, tables, embeds. Any text
-file in the session opens the same way; `workspace/` files open read-only. An agent
-editing a file on disk shows up live: the row updates, and an open buffer takes clean
-external writes silently or raises the diff bar when dirty — the notes pipeline,
-unchanged.
+A session's text files open in keeper's own editor, in the panel beside the board. A
+markdown file gets two tabs: **Source**, which is where you write, and a rendered tab
+that draws the markdown — mermaid included — and is deliberately read-only, so the
+characters in the file and the picture of them can never disagree. Every other text
+format gets the code editor: line numbers, a grammar, byte-for-byte line endings.
+`workspace/` files open read-only, because that folder refuses every write.
+
+**A session log writes like a note.** On the Source tab a markdown file has the format
+toolbar, the `/` command menu and `:shortcode:` emoji completion. Not copies of the
+ones in Notes — *the same ones*: they live in one module both editors import, so a table
+inserted from `/` in a session log and one inserted in a note are the same bytes, and a
+change to either is a change to both. There is no autosave for a file, on purpose: `⌘S`
+or the Save button is the write, and the header says whether the buffer differs from the
+disk.
+
+**What still needs a vault, and why it always will.** Wikilink completion, tag
+completion, `![[…]]` embeds and the CSV table are addressed by a notes vault plus a
+vault-relative path. A sessions zone can never be inside a notes vault — keeper refuses
+that layout in either direction, because the notes indexer and the sessions indexer would
+each claim the same markdown — so a session file has no vault coordinates to offer them.
+They are therefore absent rather than present and failing. The properties panel,
+attachments, backlinks, note history and the conflict resolver are note surfaces for a
+related reason: each is addressed by a note id, which a file does not have.
+
+An agent editing a session file on disk shows up in the tree, and in the log the agent
+appends to. An open file buffer is not a subscription, though: a file you are looking at
+is re-read when you open it again, not while you watch it.
 
 ## Spaces, tasks and the log
 
-Below Files, a flat session shows three more surfaces. All three read the same pool, and
-none of them stores anything except the fold you leave a space in.
+Below Files, a session shows three more surfaces. All three read the same pool, and
+none of them stores anything except the fold you leave a space in. (The board is the
+flat contract's alone — see **Tasks** below.)
 
 **Spaces** are the zone's saved queries, one markdown file each under
 `60-sessions/_spaces/`. Five ship by default — About, Tasks, Log, References, Prompts —

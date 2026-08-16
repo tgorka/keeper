@@ -143,6 +143,25 @@ keeper is a note keeper has taken hostage.
 Sessions use all three, but nothing about them is session-specific: a board is a widget
 that happens to be useful in a session, not a session feature that leaked.
 
+## The writing tools
+
+Three affordances sit over the note body: the **format toolbar** above it, the `/`
+**command menu** at the start of an empty line, and `:shortcode:` **emoji** — either
+picked from the menu or typed straight through, where the closing colon turns `:tada:`
+into 🎉.
+
+Since Story 50.3 those three are not the note editor's private property. They live in one
+module, and keeper's file editor imports the same one — so a markdown file opened from
+Files or from a session has the same toolbar, the same `/` commands and the same emoji, to
+the byte. A second copy would have been a second set of behaviours nobody noticed drifting
+apart.
+
+What stayed here is what needs a **vault**: wikilink and tag completion, `![[…]]` embeds
+and the CSV table are all addressed by a vault plus a vault-relative path, and a file
+outside a vault has neither. Live preview stayed too — a note autosaves against a
+subscription, and a file is saved by hand, so one editor showing both would be two
+contracts wearing one face.
+
 ## Finding text
 
 `⌘F` finds inside the note you have open — the editor's own find, so it reaches text below

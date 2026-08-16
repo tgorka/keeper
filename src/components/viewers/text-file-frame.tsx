@@ -39,6 +39,15 @@
  * was not truncated on the way in. A header whose only reason to exist is a
  * control that is not there is chrome for its own sake, and a reserved status
  * slot that can never say anything is 8px of nothing.
+ *
+ * # The writing tools are decided here and mounted two levels down
+ *
+ * Story 50.3 gives a markdown file the format toolbar, the slash menu and emoji
+ * completion (FR-233). The DECISION is here, because this is the one place that
+ * holds both halves of it — the registry row that says what the format is, and
+ * the same `savable` flag the Save button stands on. The MOUNT is in the raw
+ * editor, because a toolbar acts on a live view and this frame holds none: what
+ * travels down is a boolean, never an editor handle.
  */
 import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
@@ -142,6 +151,25 @@ export interface TextFileFrameProps {
    * it replaced.
    */
   writeCaveat?: string | null;
+  /**
+   * Why keeper will not write this file's LOCATION, or `null` (Story 45.3's
+   * `FilesWriteVm`, threaded by Story 50.3's fix).
+   *
+   * The half of 45.2's two questions this frame used to be missing. It had the
+   * FORMAT's verdict (`entry.writable`) and it discovered the LOCATION's only
+   * by attempting a save and rendering Rust's refusal afterwards — which is
+   * honest for a volume that goes read-only under the reader's hands, and
+   * wrong for a fence that was already known when the row was listed. A
+   * session's `workspace/` file (AD-113) is the case: markdown, writable
+   * format, and every write refused. Without this it got the Save button, the
+   * format toolbar, the slash menu and emoji completion over a buffer nothing
+   * would ever accept.
+   *
+   * Rust's own sentence, rendered verbatim in the read-only notice. A default
+   * of `null` for the note embed, which addresses a vault rather than a
+   * profile and holds no such verdict.
+   */
+  writeRefusal?: string | null;
   /** Test seam for 44.16's backend, handed straight through. */
   csvOptions?: CsvTableOptions;
 }
@@ -151,6 +179,7 @@ export function TextFileFrame({
   entry,
   state,
   writeCaveat = null,
+  writeRefusal = null,
   csv,
   preview,
   csvOptions,
@@ -197,20 +226,46 @@ export function TextFileFrame({
   // hand. The day somebody adds a text-shaped format keeper must not rewrite,
   // the reader gets a sentence instead of an editor that silently refuses.
   //
-  // The LOCATION's answer arrives two ways. A file this surface cannot address
-  // never gets this far — the loader has already returned no VM and its own
-  // sentence. A file keeper cannot write to is Rust's answer, and it arrives as
-  // a refused save carrying Rust's own words, in the banner below. Guessing it
-  // here would mean the frontend deciding which volumes are writable.
+  // The LOCATION's answer is `writeRefusal`, and it is Rust's — composed by
+  // `keeper_sync::files_write::WriteRefusal` and carried on the listing row
+  // the panel opened, so consulting it is not the frontend deciding which
+  // volumes are writable; re-deriving it here would be. Story 50.3 shipped
+  // without it and the hole was exact: a session's `workspace/` file (AD-113)
+  // is markdown, of a writable format, that every write refuses, so it got the
+  // toolbar, the menu, the completion and a Save button, and was not even
+  // marked read-only. A refusal that only exists AFTER a save is attempted can
+  // be the whole answer for a volume that goes read-only under the reader's
+  // hands; it cannot be the answer for a fence that was known when the row was
+  // listed.
+  //
+  // Format first when both speak: the format's no is about the file itself and
+  // survives moving it, and a reader who is told the deeper fact acts on it.
   const refusal = entry.writable
-    ? null
+    ? writeRefusal
     : `keeper does not write ${entry.label} files: a lossy round trip through this format is how people lose work`;
 
-  // Story 46.13: the bar exists exactly when a Save could land. `refusal` is the
-  // format's no; `vm.oversize` means only a prefix was read and the loader
-  // declines a save that would truncate the rest — offering a button that
-  // announces its own refusal is the shape 45.2 spent a paragraph rejecting.
+  // Story 46.13: the bar exists exactly when a Save could land. `refusal` is
+  // every standing no — the format's and the location's; `vm.oversize` means
+  // only a prefix was read and the loader declines a save that would truncate
+  // the rest — offering a button that announces its own refusal is the shape
+  // 45.2 spent a paragraph rejecting.
   const savable = refusal === null && !vm.oversize;
+
+  // Story 50.3's verdict, and both halves of it are here.
+  //
+  // MARKDOWN is `entry.format`, the registry's own answer (AD-87). Never the
+  // file name: `src/lib/viewers` owns extension-to-format and a second sniff
+  // here is how one surface comes to think a `.mkd` is prose and another does
+  // not.
+  //
+  // WRITABLE is `savable`, the same flag that decides whether Save exists. That
+  // equality is the point rather than a convenience: FR-233's tools are ways of
+  // writing text, and offering them where no save can follow would be the
+  // shape 45.2 spent a paragraph rejecting — a control that announces its own
+  // refusal. Since `savable` now reads the location too, `workspace/` markdown
+  // is inside that rule rather than beside it: the tools are off it because
+  // keeper will not write there, which is the reason a reader would give.
+  const writingTools = entry.format === "markdown" && savable;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -274,6 +329,7 @@ export function TextFileFrame({
           onSave={() => save()}
           csv={csv}
           preview={preview}
+          writingTools={writingTools}
           onExternalWrite={() => void reload()}
           editor={TextEditorSurface}
           csvOptions={csvOptions}

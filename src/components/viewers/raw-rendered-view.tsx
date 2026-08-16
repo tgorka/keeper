@@ -65,6 +65,10 @@ export interface RawEditorProps {
   onSave?: (next: string) => void | Promise<void>;
   path?: string;
   vault?: string | null;
+  /** Whether this buffer gets Story 50.3's markdown writing tools. The Source
+   *  tab's editor is the only place they can mount, which is why this shape
+   *  names them at all: the rendered half is read-only (AD-88). */
+  writingTools?: boolean;
 }
 
 /** What 44.16's CSV commands understand. A **notes vault** id and a target
@@ -102,6 +106,17 @@ export interface RawRenderedViewProps {
   csv?: CsvCoordinates | null;
   /** What the markdown preview resolves embeds against. */
   preview?: MarkdownPreviewOptions;
+  /**
+   * Whether the Source tab's editor gets the markdown writing tools — the format
+   * toolbar, the slash menu and emoji completion (Story 50.3, FR-233).
+   *
+   * Passed straight through to the raw editor and nowhere else. That IS the
+   * Source/rendered split doing the deciding: the rendered half of a markdown
+   * file is a read-only preview (AD-88), and it is not mounted at the same time
+   * as the editor, so a tab switch removes the tools by removing the view they
+   * were mounted in rather than by a second rule about tabs.
+   */
+  writingTools?: boolean;
   /** The rendered view wrote the file; the host's buffer is now stale. */
   onExternalWrite?: () => void;
   /** 45.6's editor. See the module comment for why it is injected. */
@@ -359,6 +374,7 @@ export function RawRenderedView({
   onSave,
   csv,
   preview,
+  writingTools,
   onExternalWrite,
   editor: Editor,
   csvOptions,
@@ -490,6 +506,7 @@ export function RawRenderedView({
             readOnly={readOnly}
             onChange={onChange}
             onSave={onSave}
+            writingTools={writingTools}
           />
         ) : rendered === "markdown" ? (
           <MarkdownPane text={content} options={preview} onOutcome={onOutcome} />
