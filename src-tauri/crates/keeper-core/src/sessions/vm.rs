@@ -536,6 +536,44 @@ pub struct SessionSpaceFileVm {
     pub unstable_identity: bool,
 }
 
+/// One file inside a template's directory — a row of the Templates list
+/// (FR-269, FR-270).
+///
+/// Thinner than [`SessionSpaceFileVm`] on purpose: a template is a skeleton, not
+/// a pool, so nothing here has an id, a kind or a tag set. What the list needs
+/// is a label, a path that opens the file, and the one fact a filename hides.
+///
+/// A template's files are NOT projected through [`SessionEntryVm`] either. That
+/// type answers a session's tree — sync mark, write permission, nesting — and a
+/// template holds neither a workspace nor a sub-tree the list draws. Reusing it
+/// would mean composing four fields the Templates list has nothing to say about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTemplateEntryVm {
+    /// **Profile-relative**, composed in Rust (AD-65) exactly as
+    /// [`SessionSpaceFileVm::subpath`] is: the zone subfolder, `_template`, the
+    /// template's own name when it has one, and the file.
+    ///
+    /// Composed here rather than joined in the webview because the webview does
+    /// not know the zone's subfolder, and because a second joiner is how the
+    /// picker's path and the list's path start to disagree about the same file.
+    /// The row hands this straight to a file target and joins nothing.
+    pub subpath: String,
+    /// The file's own basename — the row's label.
+    ///
+    /// Sent beside [`Self::subpath`] rather than sliced off it in TypeScript: a
+    /// basename is a path operation, and AD-65 does not have an exception for
+    /// the easy ones.
+    pub name: String,
+    /// Last modified, from the shell's stat — what the newest-first order is on.
+    ///
+    /// `number`, like [`SessionSpaceFileVm::mtime_ms`]: ts-rs maps a bare `i64`
+    /// to `bigint`, which does not survive `JSON.parse`.
+    #[ts(type = "number")]
+    pub mtime_ms: i64,
+}
+
 /// What the editor sends to save one session space (FR-261).
 ///
 /// [`crate::notes::vm::NoteSpaceReq`]'s twin, minus `limit` and `template` for

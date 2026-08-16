@@ -181,6 +181,59 @@ made.
   no minute — freezing either would name every session after the moment you pressed the
   button — so the seeds stay something keeper writes per create, with that session's own
   title. Add your own afterwards if you want different ones; a create will prefer yours.
+- **Templates** — a mode on the board, sitting with the status chips rather than as a
+  fourth button in the pane header. The chip is a toggle: press it again to come back to the
+  session rows, or press a status chip, whichever you reach for. It lists every template the
+  zone has — its own `_template/` and each named one — and under each, every file inside it,
+  newest change first. That listing is the same walk the picker previews a create from, so
+  the room and a new session cannot disagree about what a template holds: a file in a
+  subdirectory is a row too, carrying its path within the template. When such a row is too
+  narrow for the whole path it gives way on the directory and keeps the filename —
+  `prompts/hand-off.md` never shortens to `prompts/pro…`, because the filename is what you
+  came to press. The one difference is the create's, not the room's — a new session gets a
+  *stamped* record rather than a copied one, so `about.md` is a row here and never under
+  *Copies*. Press a file to open it in the panel beside the board: the same editor a
+  session's record opens in, because editing a template is editing a file and nothing more.
+  A template whose directory has since been removed in Finder lists as empty rather than as
+  an error; the list re-reads after every write, and your own edit is not a fault. If the
+  read of the zone's templates is refused outright, the room is not drawn at all and
+  keeper's own sentence sits in the pane's alert region instead of a spinner that never
+  resolves; leaving the room and coming back re-runs the read, and that is the retry.
+  The list's own header carries **New template**, which is *Write keeper's template into
+  this zone* with a name — the way to gain keeper's skeleton as a named template beside
+  the one you already have. Typing the name a named template already has is **refused in
+  the list**, without asking Rust: case-insensitively, because the drives this syncs to
+  are, and because the command underneath would move that template's own `AGENTS.md` and
+  `about.md` into `.keeper/trash/` and write keeper's in their place — recoverable, and
+  still not what "one beside it" means. The refusal is on the name as typed, so a name
+  that only *folds* onto an existing one (`Interview Kit` where `_template/interview-kit`
+  is) does reach the command, and does trash-then-write those two files. The search box and
+  the Pinned/Unread filters are hidden in this mode: they filter session rows, and a
+  template has no status.
+- **Rename a template** — offered on a **named** template's row, and only there. The name
+  you type is folded to a directory name exactly as *New template* folds it, the move
+  runs as one journaled plan — so the drive gets a single commit with keeper's provenance
+  on it, rather than a rename keeper's watcher reads as somebody else's write — and the
+  row comes back under its new name after the rescan. A blank name is refused, and so is a
+  name with no letters or digits in it: `###` is not a folder name, and keeper will not
+  invent one for you. A name that is already taken by **another** template is
+  **refused**, not merged and not trashed: *New template* may write over what it finds,
+  because keeper's skeleton is what you asked for and the displaced bytes go to
+  `.keeper/trash/`, but a rename has no such mandate and burying one template under
+  another is not something a keystroke should be able to do. Retyping a name that already
+  folds to the directory's own — `Interview` over a directory called `interview` — writes
+  nothing and is not an error. The mirror case is a real move: a hand-made
+  `_template/Interview/` renamed to `interview` normalises the directory itself, and
+  keeper allows it on macOS too, where the destination "already exists" only because it
+  *is* the source. A hand-made `Interview Kit` retyped verbatim likewise moves — to
+  `interview-kit` — and pressing rename twice after it worked is refused, because the
+  template it named has moved. Read the list again rather than trying again.
+
+  **The zone's own `_template/` cannot be renamed**, and that is the point of it. Its
+  name *is* the contract: `_template/` is what a create copies from and what the scan
+  skips (see *What keeper promises*), and a zone has exactly one of it. Renaming it
+  would not give you a differently-named zone template — it would give you a zone with
+  none. Name templates *inside* it instead, one per way you work.
 - **New like this** — the same door, opened with this row already chosen as the pattern.
   Not a second create verb: the title is still asked and the preview still shown.
 - **Log today** — in a folder-shaped session, appends `### YYYY-MM-DD — ` under `## Log`,

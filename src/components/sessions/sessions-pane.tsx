@@ -26,6 +26,7 @@ import {
   SessionPatternPicker,
 } from "@/components/sessions/session-pattern-picker";
 import { SessionRow } from "@/components/sessions/session-row";
+import { SessionTemplates } from "@/components/sessions/session-templates";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
@@ -81,6 +82,26 @@ export const SESSIONS_NEW_LABEL = "New session";
 export const SESSIONS_NEW_TITLE_LABEL = "Session title";
 export const SESSIONS_NEW_CONFIRM_LABEL = "Create";
 
+/**
+ * The templates chip's label — the room, named as the operator named it.
+ *
+ * A peer of the status chips in the row and nothing like one underneath: see
+ * `SessionsBoardMode`. It is not a fourth `STATUS_CHOICES` entry because those
+ * values are matched against `row.status`, and a template has no status.
+ */
+export const SESSIONS_TEMPLATES_LABEL = "Templates";
+
+/**
+ * What a refused pattern read says.
+ *
+ * The read backs two surfaces — the create row's picker and the Templates room —
+ * so the sentence names what could not be read rather than which surface asked
+ * for it, and it lands in the pane's one alert region beside a failed rows read.
+ * Rust's own words come first when it gave any; this is the fallback.
+ */
+export const SESSIONS_PATTERNS_FAILED =
+  "keeper couldn't read what this zone can make a session from.";
+
 /** The status chips, in board order. */
 const STATUS_CHOICES: { value: SessionsStatusFilter; label: string }[] = [
   { value: "all", label: "All" },
@@ -107,10 +128,16 @@ export function SessionsPane() {
   const pinnedOnly = useSessionsListStore((s) => s.pinnedOnly);
   const unreadOnly = useSessionsListStore((s) => s.unreadOnly);
   const error = useSessionsListStore((s) => s.error);
+  const mode = useSessionsListStore((s) => s.mode);
   const setText = useSessionsListStore((s) => s.setText);
   const setStatus = useSessionsListStore((s) => s.setStatus);
   const setPinnedOnly = useSessionsListStore((s) => s.setPinnedOnly);
   const setUnreadOnly = useSessionsListStore((s) => s.setUnreadOnly);
+  const setMode = useSessionsListStore((s) => s.setMode);
+
+  // Which room the board is in, read once and named: the templates list stands
+  // in for the rows, and the controls that only filter rows stand down.
+  const showingTemplates = mode === "templates";
 
   const filtered = rows === null ? [] : filterRows(rows, { text, status, pinnedOnly, unreadOnly });
   const anyFilter = text.trim() !== "" || status !== "all" || pinnedOnly || unreadOnly;
@@ -160,7 +187,28 @@ export function SessionsPane() {
   // event brings the row, and the README opens with the caret ready.
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
-  const [patterns, setPatterns] = useState<SessionPatternVm[] | null>(null);
+  /**
+   * Every pattern the zone offers, tagged with the root it was read for, or
+   * `null` before the first answer for that root.
+   *
+   * The tag is the `rowsRootId` stale-guard the rows mirror already uses, and it
+   * is here for the same reason: the read is one directory walk PER pattern, so
+   * a root switch leaves the previous zone's list in hand for the whole round
+   * trip. Untagged, the Templates room drew root A's template headings under
+   * root B — with LIVE Rename buttons, each one addressing root B's id with
+   * root A's folder name — for the duration of B's read.
+   */
+  const [patterns, setPatterns] = useState<{
+    rootId: string;
+    list: SessionPatternVm[];
+  } | null>(null);
+  /**
+   * Rust's refusal of that read, or `null`. Local rather than the rows mirror's
+   * `error`: a rows re-read clears that slot, and it would take a pattern-read
+   * failure nobody retried with it. Both sentences land in the one alert region
+   * below.
+   */
+  const [patternsError, setPatternsError] = useState<string | null>(null);
   const [patternId, setPatternId] = useState<string | null>(null);
   // The palette's New Session bumps the nonce; the board answers by opening
   // its create row — the vault-switcher idiom (FR-251). A row's "New like
@@ -177,11 +225,12 @@ export function SessionsPane() {
     }
   }, [createNonce, createPatternId]);
 
-  // Read the patterns when the row opens, and again whenever the zone changes
-  // under it — a session created a minute ago is a pattern a minute later, and
-  // a stale list would offer an id the shell no longer resolves. The read is
-  // one directory walk per pattern; it belongs to the open row, not the pane,
-  // so a board nobody is creating on does no walking at all.
+  // Read the patterns when the create row opens or the Templates room does, and
+  // again whenever the zone changes under either — a session created a minute
+  // ago is a pattern a minute later, and a stale list would offer an id the
+  // shell no longer resolves. The read is one directory walk per pattern; it
+  // belongs to those two surfaces, not to the pane, so a board nobody is
+  // creating on and nobody has opened Templates on does no walking at all.
   const rowsRootId = useSessionsListStore((s) => s.rowsRootId);
   const rowCount = rows?.length ?? 0;
   const rootId = activeRoot?.id ?? null;
@@ -190,55 +239,95 @@ export function SessionsPane() {
   // nonce is that missing signal — one number, bumped by the only verb that
   // needs it, rather than a second copy of the read with its own defaulting.
   const [installNonce, setInstallNonce] = useState(0);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `rowsRootId`/`rowCount`/`installNonce` are re-run triggers, not reads — the zone's changed event re-reads the rows, and this re-reads the patterns behind them so an open picker cannot offer an id the shell no longer resolves.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `rowsRootId`/`rowCount`/`installNonce` are re-run triggers, not reads — the zone's changed event re-reads the rows, and this re-reads the patterns behind them so neither an open picker nor the Templates room can show a template the shell no longer resolves.
   useEffect(() => {
-    if (!creating || rootId === null) {
+    if ((!creating && !showingTemplates) || rootId === null) {
       return;
     }
     let live = true;
-    void sessionsPatterns(rootId).then((list) => {
-      if (!live) {
-        return;
-      }
-      setPatterns(list);
-      // Default to the zone's own answer, and fall back to the newest pattern
-      // in a zone with no `_template/`. Resolving in the setter keeps a
-      // user's choice through a re-read: only an id that stopped existing is
-      // replaced.
-      setPatternId((current) =>
-        current !== null && list.some((pattern) => pattern.id === current)
-          ? current
-          : (list[0]?.id ?? null),
-      );
-    });
+    // Cleared as the read starts, so re-entering the room is a retry that says
+    // nothing about the attempt before it.
+    setPatternsError(null);
+    sessionsPatterns(rootId)
+      .then((list) => {
+        if (!live) {
+          return;
+        }
+        setPatterns({ rootId, list });
+        // Default to the zone's own answer, and fall back to the newest pattern
+        // in a zone with no `_template/`. Resolving in the setter keeps a
+        // user's choice through a re-read: only an id that stopped existing is
+        // replaced.
+        setPatternId((current) =>
+          current !== null && list.some((pattern) => pattern.id === current)
+            ? current
+            : (list[0]?.id ?? null),
+        );
+      })
+      // A rejection used to be an unhandled one, back when this read only filled
+      // a `<Select>` inside a create row the operator had just opened. It now
+      // gates a whole board mode: the Templates room waits on `patterns`, so a
+      // refusal with no catch left that room on "Reading templates…" forever,
+      // with nothing said and nothing to press.
+      .catch((raw: unknown) => {
+        if (!live) {
+          return;
+        }
+        setPatternsError(syncErrorMessage(raw, SESSIONS_PATTERNS_FAILED));
+      });
     return () => {
       live = false;
     };
     // `rowsRootId`/`rowCount` are the zone's own change signal, mirrored: the
     // changed event re-reads the rows, which re-reads the patterns.
-  }, [creating, rootId, rowsRootId, rowCount, installNonce]);
+  }, [creating, showingTemplates, rootId, rowsRootId, rowCount, installNonce]);
 
-  // Adopt keeper's default as the zone's own `_template/` (FR-268). The picker
-  // decides whether to offer this — it holds the list that answers "does this
-  // zone have a template" — and the pane owns the call, because the pane owns
-  // the read that has to happen afterwards. The write goes through the same
-  // plan/journal/exec path every lifecycle verb uses, so the zone's history
-  // records it exactly as it records a create.
+  // The list, resolved against the root asking for it — the `openSessionId`
+  // idiom two blocks up, and the same reason: state derived at render cannot
+  // lag behind the root the way an effect chasing it can. A switch answers
+  // `null` until the new read lands, which is what both consumers already draw
+  // as "not here yet".
+  const patternList = patterns !== null && patterns.rootId === rootId ? patterns.list : null;
+
+  // Write a template into the zone (FR-268, FR-270): keeper's own skeleton as
+  // the zone's `_template/` when no name is given, a named `_template/<name>/`
+  // when one is. The name argument has existed on the command since it was
+  // written and was dropped here; the Templates room is the surface that has a
+  // name to pass. Both callers land on this one function because both need the
+  // same thing afterwards — the pattern re-read the nonce triggers.
+  //
+  // The picker decides whether to OFFER the nameless one — it holds the list
+  // that answers "does this zone have a template" — and the pane owns the call.
+  // The write goes through the same plan/journal/exec path every lifecycle verb
+  // uses, so the zone's history records it exactly as it records a create.
+  //
+  // Resolves with Rust's refusal sentence, or `null` when the write landed:
+  // `installError` is where the create row shows it, and the returned sentence
+  // is how the Templates room says it in its own live region without keeping a
+  // second copy of this catch.
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
-  const installTemplate = useCallback(() => {
-    if (rootId === null) {
-      return;
-    }
-    setInstalling(true);
-    setInstallError(null);
-    sessionsTemplateInstall(rootId)
-      .then(() => setInstallNonce((n) => n + 1))
-      .catch((raw: unknown) =>
-        setInstallError(syncErrorMessage(raw, SESSION_PATTERN_INSTALL_FAILED)),
-      )
-      .finally(() => setInstalling(false));
-  }, [rootId]);
+  const installTemplate = useCallback(
+    (name?: string): Promise<string | null> => {
+      if (rootId === null) {
+        return Promise.resolve(null);
+      }
+      setInstalling(true);
+      setInstallError(null);
+      return sessionsTemplateInstall(rootId, name)
+        .then(() => {
+          setInstallNonce((n) => n + 1);
+          return null;
+        })
+        .catch((raw: unknown) => {
+          const refusal = syncErrorMessage(raw, SESSION_PATTERN_INSTALL_FAILED);
+          setInstallError(refusal);
+          return refusal;
+        })
+        .finally(() => setInstalling(false));
+    },
+    [rootId],
+  );
 
   const closeCreate = useCallback(() => {
     setCreating(false);
@@ -337,10 +426,14 @@ export function SessionsPane() {
             </Button>
           </div>
           <SessionPatternPicker
-            patterns={patterns}
+            patterns={patternList}
             value={patternId}
             onChange={setPatternId}
-            onInstallTemplate={installTemplate}
+            // Wrapped rather than passed: the picker hands its `onClick` straight
+            // to this prop, so a bare reference would arrive with a MouseEvent
+            // where the template's name goes. The create row's offer is always
+            // the zone's own `_template/`, which is the nameless call.
+            onInstallTemplate={() => void installTemplate()}
             installing={installing}
             installError={installError}
           />
@@ -373,56 +466,96 @@ export function SessionsPane() {
       {/* The filter row, above the fold (UX-DR85). */}
       {activeRoot !== null && (
         <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
-          <InputGroup>
-            <InputGroupInput
-              placeholder="Search sessions"
-              aria-label="Search sessions"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-            />
-          </InputGroup>
-          <div className="flex items-center gap-1">
+          {/* Search filters session rows; in the Templates room it would be
+              inert chrome, so it stands down rather than lying about what it
+              does. Same for Pinned and Unread below. */}
+          {!showingTemplates && (
+            <InputGroup>
+              <InputGroupInput
+                placeholder="Search sessions"
+                aria-label="Search sessions"
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+              />
+            </InputGroup>
+          )}
+          {/* Wraps rather than clips: six controls in one row, in a pane whose
+              width is the user's business. */}
+          <div className="flex flex-wrap items-center gap-1">
             {STATUS_CHOICES.map((choice) => (
               <Button
                 key={choice.value}
                 type="button"
                 size="sm"
-                variant={status === choice.value ? "secondary" : "ghost"}
-                onClick={() => setStatus(choice.value)}
+                // Nothing reads as chosen while Templates is open: a status chip
+                // is a slice of the rows, and the rows are not what is showing.
+                variant={!showingTemplates && status === choice.value ? "secondary" : "ghost"}
+                onClick={() => {
+                  setStatus(choice.value);
+                  // A status is an answer about sessions, so asking for one is
+                  // also the way back out of the Templates room.
+                  setMode("sessions");
+                }}
               >
                 {choice.label}
               </Button>
             ))}
+            {/* A peer of the three above, where the operator asked for it — and
+                a mode underneath, not a fourth filter value.
+
+                A toggle, like the Pinned and Unread chips it sits in a row with,
+                and for their reason: a chip that draws itself as chosen and does
+                nothing when pressed again leaves the way out of the room stated
+                in a comment and nowhere in the UI. `aria-pressed` says the same
+                thing to a screen reader that `variant` says to an eye. */}
+            <Button
+              type="button"
+              size="sm"
+              variant={showingTemplates ? "secondary" : "ghost"}
+              aria-pressed={showingTemplates}
+              onClick={() => setMode(showingTemplates ? "sessions" : "templates")}
+            >
+              {SESSIONS_TEMPLATES_LABEL}
+            </Button>
             <span className="min-w-0 flex-1" />
-            <Button
-              type="button"
-              size="sm"
-              variant={pinnedOnly ? "secondary" : "ghost"}
-              aria-pressed={pinnedOnly}
-              onClick={() => setPinnedOnly(!pinnedOnly)}
-            >
-              Pinned
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant={unreadOnly ? "secondary" : "ghost"}
-              aria-pressed={unreadOnly}
-              onClick={() => setUnreadOnly(!unreadOnly)}
-            >
-              Unread
-            </Button>
+            {!showingTemplates && (
+              <>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={pinnedOnly ? "secondary" : "ghost"}
+                  aria-pressed={pinnedOnly}
+                  onClick={() => setPinnedOnly(!pinnedOnly)}
+                >
+                  Pinned
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={unreadOnly ? "secondary" : "ghost"}
+                  aria-pressed={unreadOnly}
+                  onClick={() => setUnreadOnly(!unreadOnly)}
+                >
+                  Unread
+                </Button>
+              </>
+            )}
           </div>
         </div>
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-3">
-        {error !== null && (
+        {(error !== null || patternsError !== null) && (
           <div
             role="alert"
             className="mb-2 rounded-md bg-destructive/10 p-3 text-destructive text-sm"
           >
-            {error}
+            {/* Two reads can fail at once — the rows and the pattern list — and
+                they are two sentences, not one. Both land in the region the pane
+                already has for a read that failed, rather than growing a second
+                alert beside it. */}
+            {error !== null && <p>{error}</p>}
+            {patternsError !== null && <p>{patternsError}</p>}
           </div>
         )}
         {roots !== null && roots.length === 0 ? (
@@ -430,6 +563,26 @@ export function SessionsPane() {
             <p className="font-medium text-sm">{SESSIONS_NO_ROOT_TITLE}</p>
             <p className="max-w-md text-muted-foreground text-sm">{SESSIONS_NO_ROOT_BODY}</p>
           </div>
+        ) : showingTemplates && activeRoot !== null ? (
+          // The templates room takes the list's place rather than sitting above
+          // it: it is a different thing to look at, not a section of the board.
+          // The nonce this hands down is the same one the create row's install
+          // bumps — a rename lands in the same re-read a create does.
+          //
+          // Not drawn at all once the read is refused: the room's only waiting
+          // line means "the answer has not arrived yet", and after a refusal it
+          // is not coming. The sentence above says why, and leaving the room and
+          // coming back re-runs the read — which is the retry, and is why the chip
+          // had to become a toggle before this branch could exist.
+          patternsError === null && (
+            <SessionTemplates
+              rootId={activeRoot.id}
+              patterns={patternList}
+              onInstallTemplate={installTemplate}
+              installing={installing}
+              onChanged={() => setInstallNonce((n) => n + 1)}
+            />
+          )
         ) : rows !== null && filtered.length === 0 && anyFilter ? (
           <p className="py-8 text-center text-muted-foreground text-sm">
             {SESSIONS_NO_MATCH_LABEL}

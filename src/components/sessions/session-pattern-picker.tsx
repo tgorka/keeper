@@ -43,7 +43,7 @@ export const SESSION_PATTERN_LABEL = "Start from";
  * being built. A prefix rather than an equality for the reason FR-266 exists —
  * `_template/interview` is a template too.
  */
-const TEMPLATE_ID_PREFIX = "_template";
+export const TEMPLATE_ID_PREFIX = "_template";
 
 /** The preview's two headings, stated as consequences rather than as nouns. */
 export const SESSION_PATTERN_COPIES_LABEL = "Copies";

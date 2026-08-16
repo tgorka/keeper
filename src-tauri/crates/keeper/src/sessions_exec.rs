@@ -166,7 +166,12 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             if !source.exists() && target.exists() {
                 return Ok(()); // already moved
             }
-            if target.exists() {
+            // A target that exists AND is a different directory is the refusal
+            // this step is here to make. A target that exists and IS the source
+            // is not: on APFS and NTFS `_template/interview` exists the moment
+            // `_template/Interview` does, so a case-only rename — the one that
+            // normalises a hand-made name — would be refused by its own source.
+            if target.exists() && !same_directory(&target, &source) {
                 return Err(ExecError::Refused(format!(
                     "{to} already exists; nothing was moved"
                 )));
@@ -228,6 +233,31 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             Ok(())
         }
     }
+}
+
+/// Whether two paths are the **same** directory on the disk, rather than two
+/// spellings of it that only look different.
+///
+/// Asked wherever a move has to tell "the destination is taken" from "the
+/// destination IS the source". On APFS and NTFS `_template/interview` exists the
+/// moment `_template/Interview` does, so a case-only rename would be refused by
+/// the very directory it is renaming; `exists()` alone cannot tell those apart.
+///
+/// `canonicalize` is the filesystem's own answer, which is why it is the one
+/// asked: a lowercased path comparison would invent case-insensitivity on ext4,
+/// where two such names are two directories and the refusal is correct. A path
+/// that is not there canonicalises to nothing and is never "the same", so an
+/// absent destination is not a collision either way.
+///
+/// Shared with [`crate::sessions_ipc`], which makes the same distinction one
+/// layer up so the operator gets a sentence instead of an executor refusal.
+/// Two copies of this would be two chances for the two layers to disagree about
+/// which moves a zone accepts.
+pub(crate) fn same_directory(left: &Path, right: &Path) -> bool {
+    std::fs::canonicalize(left)
+        .ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
 }
 
 /// A zone-relative plan path, refused if it escapes — the executor's own
@@ -442,5 +472,70 @@ mod tests {
             }],
         };
         assert!(matches!(run(zone.path(), plan), Err(ExecError::Refused(_))));
+    }
+
+    /// The refusal the `MoveDir` guard exists for, unchanged by the
+    /// source-identity carve-out beside it: a target that is a *different*
+    /// directory is a neighbour, and a move must not eat one. Asserted on the
+    /// sentence, because the IPC layer shows it to the operator.
+    #[test]
+    fn a_move_onto_a_different_directory_is_still_refused() {
+        let zone = zone();
+        for name in ["_template/interview", "_template/kick-off"] {
+            std::fs::create_dir_all(zone.path().join(name)).expect("mkdir");
+        }
+        std::fs::write(zone.path().join("_template/kick-off/about.md"), "theirs").expect("write");
+        let plan = Plan {
+            verb: "template-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveDir {
+                from: "_template/interview".to_owned(),
+                to: "_template/kick-off".to_owned(),
+            }],
+        };
+        let error = run(zone.path(), plan).expect_err("refuses");
+        assert!(matches!(
+            &error,
+            ExecError::Refused(said)
+                if said == "_template/kick-off already exists; nothing was moved"
+        ));
+        assert!(zone.path().join("_template/interview").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(zone.path().join("_template/kick-off/about.md")).expect("read"),
+            "theirs",
+            "the neighbour was not touched"
+        );
+    }
+
+    /// The carve-out: a target that *resolves to the source* is not a
+    /// collision, so the move runs instead of being refused by the directory it
+    /// is renaming.
+    ///
+    /// The case that motivates it — `_template/Interview/` → `interview` on
+    /// APFS — cannot be reproduced on a case-sensitive volume, so what is
+    /// asserted here is the property the carve-out rests on, spelled a way any
+    /// filesystem can produce: two paths for one directory. On macOS the two
+    /// paths differ in case instead, and the branch taken is this one.
+    #[test]
+    fn a_move_whose_target_resolves_to_the_source_is_not_a_collision() {
+        let zone = zone();
+        let dir = zone.path().join("_template/interview");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("about.md"), "mine").expect("write");
+        let plan = Plan {
+            verb: "template-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveDir {
+                from: "_template/interview".to_owned(),
+                to: "_template/./interview".to_owned(),
+            }],
+        };
+        run(zone.path(), plan).expect("the source is not its own collision");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("about.md")).expect("read"),
+            "mine",
+            "renaming a directory onto itself keeps it"
+        );
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
     }
 }

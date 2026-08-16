@@ -316,6 +316,27 @@ pub fn zone_skeleton(date: &str, id: &str) -> Vec<TemplateFile> {
     ]
 }
 
+/// Whether a name a person typed folds to a directory name at all — the
+/// question that has to be asked *before* [`crate::notes::naming::slug`], not
+/// after it.
+///
+/// `slug` must always answer with a usable filename, because a note it refused
+/// to name would be a note that was lost; a fold that leaves nothing therefore
+/// comes back as `untitled` rather than empty. A *template* has the opposite
+/// mandate: a name with nothing in it is a name to refuse, and once `slug` has
+/// substituted its fallback there is no way left to tell "###" from a template
+/// somebody really called *Untitled*. So the shell asks this first.
+///
+/// The fold's own verdict rather than a re-derived `chars().any(is_alphanumeric)`
+/// — which is close and not the rule. The fold drops combining marks, and
+/// several of those are alphabetic to `char::is_alphanumeric` (Devanagari vowel
+/// signs among them), so a name written only in marks passes that test and still
+/// slugs to nothing. Asking the stem is the only test that cannot drift from
+/// what the slugger will actually do.
+pub fn nameable(name: &str) -> bool {
+    !crate::notes::naming::slug_stem(name).is_empty()
+}
+
 /// Write this template into a zone's `_template/` — the verb that updates the
 /// drive's own copy (FR-268).
 ///
@@ -358,6 +379,34 @@ pub fn compile_install(
         verb: "template-install".to_owned(),
         session: dest.to_owned(),
         steps,
+    }
+}
+
+/// Rename a named template — one directory move, and nothing else (FR-271).
+///
+/// `from` and `to` are zone-relative (`_template/<name>`), decided by the shell,
+/// which is the only side that can see whether the source is a directory and
+/// whether the destination is taken. The refusals live there for that reason
+/// (AD-108); what is left here is the *shape* of the write, and it is one step.
+///
+/// **Why a compiled plan at all**, for a move a single `fs::rename` would do:
+/// the zone is a synced drive whose history keeper owns, so the write has to
+/// carry a journal row and land as one keeper-provenanced commit like every
+/// other lifecycle verb. [`compile_unarchive`](super::plan::compile_unarchive)
+/// is the precedent — also a one-`MoveDir` verb, also compiled rather than
+/// hand-run — and following it is what keeps resume "re-run the remaining
+/// steps" instead of a second recovery story for renames.
+///
+/// `MoveDir` is idempotent by contract: a resumed journal whose move already
+/// happened succeeds, so the rename replays safely.
+pub fn compile_rename(from: &str, to: &str) -> super::plan::Plan {
+    super::plan::Plan {
+        verb: "template-rename".to_owned(),
+        session: from.to_owned(),
+        steps: vec![super::plan::PlanStep::MoveDir {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }],
     }
 }
 
@@ -488,6 +537,42 @@ mod tests {
             .collect();
         assert_eq!(writes.len(), files.len());
         assert!(!writes.iter().any(|path| path.ends_with("stray.md")));
+    }
+
+    /// A rename is a location change and nothing else: one move, the two names
+    /// in the two fields, and a verb the journal can name. Anything extra in
+    /// this plan would be a rename that also edited the template it moved.
+    #[test]
+    fn a_rename_is_one_move_and_nothing_else() {
+        let plan = compile_rename("_template/interview", "_template/kick-off");
+        assert_eq!(plan.verb, "template-rename");
+        // The session a journal row is about is the path *before* the plan runs.
+        assert_eq!(plan.session, "_template/interview");
+        assert_eq!(
+            plan.steps,
+            vec![crate::sessions::plan::PlanStep::MoveDir {
+                from: "_template/interview".to_owned(),
+                to: "_template/kick-off".to_owned(),
+            }],
+            "from and to must not be swapped: this move is not reversible by resume"
+        );
+    }
+
+    /// The trap [`nameable`] exists for, asserted from both sides: the slugger
+    /// answers `untitled` for a name with nothing in it, so a caller that
+    /// slugged first and then tested for empty would mint `_template/untitled`
+    /// and call it the operator's name. That shipped once.
+    #[test]
+    fn a_name_with_nothing_in_it_is_refused_before_the_fallback_hides_it() {
+        assert!(!nameable("###"));
+        assert!(!nameable("   "));
+        assert!(!nameable("🎉"));
+        // …and this is why the test cannot be "did the slug come back empty".
+        assert_eq!(crate::notes::naming::slug("###"), "untitled");
+        // A name somebody really typed still passes, fallback word included.
+        assert!(nameable("Kick Off"));
+        assert!(nameable("untitled"));
+        assert!(nameable("v1.2"));
     }
 
     /// `AGENTS.md` is a contract with a reader who has no other context, so the

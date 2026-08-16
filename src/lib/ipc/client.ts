@@ -229,6 +229,7 @@ export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 export type { SessionTaskVm } from "./gen/SessionTaskVm";
+export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
@@ -375,6 +376,7 @@ import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
 import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
@@ -5222,6 +5224,104 @@ export async function sessionsTemplateInstall(rootId: string, name?: string): Pr
     rootId,
     name: name ?? null,
   });
+}
+
+/**
+ * Every file inside one template's directory (FR-269, FR-270) — the rows the
+ * Templates list draws, newest change first.
+ *
+ * `name` is `undefined` for the zone's own `_template/` and the template's
+ * on-disk name for a named one, exactly as {@link sessionsTemplateInstall} takes
+ * it. You already have that name and must not derive it: a named template's
+ * {@link SessionPatternVm}`.label` **is** its folder name, so pass the label back
+ * verbatim — do not slug it and do not slice it out of `id`. It is used verbatim
+ * on the Rust side, so `_template/Interview Kit/` — a template the operator made
+ * by hand — addresses correctly.
+ *
+ * Each row's `subpath` is **profile-relative and already composed in Rust**
+ * (AD-65): hand it straight to a file target — `{ kind: "file", profileId:
+ * rootId, relativePath: entry.subpath }` — and never join one here. The webview
+ * does not know the zone's subfolder, and `name` is composed there for the same
+ * reason: slicing a path is still a path operation.
+ *
+ * **The rows are the whole template, subdirectories included** — the same walk
+ * the picker's *Copies* preview is built from, so the room and the create cannot
+ * disagree about what a template holds. One intended difference remains, and it
+ * is the create's rather than the walk's: *Copies* omits `about.md`, because a
+ * new session gets a stamped record rather than a copied one, while this list
+ * shows it — editing a template's record is what the room is for.
+ *
+ * `name` is the file's path **relative to the template**, not a basename: a
+ * folder-shaped template shows `prompts/hand-off.md`, and two files of the same
+ * basename in two subdirectories are two distinguishable rows. Render it as
+ * given. Directories and `.gitkeep` are not rows.
+ *
+ * A template that is not there resolves `[]` rather than rejecting. A directory
+ * somebody removed in Finder is an empty room, not a fault, so re-reading after
+ * a write never turns the operator's own edit into an error banner.
+ *
+ * Rejects with: `internal` (unknown zone, a name keeper will not join — one
+ * carrying a separator, a name that is `.` or `..`, or one beginning with a dot
+ * or an underscore; an interior dot is fine, so `v1.2` addresses), `unsupported`.
+ */
+export async function sessionsTemplateEntries(
+  rootId: string,
+  name?: string,
+): Promise<SessionTemplateEntryVm[]> {
+  return await invoke<SessionTemplateEntryVm[]>("sessions_template_entries", {
+    rootId,
+    name: name ?? null,
+  });
+}
+
+/**
+ * Rename one named template (FR-271), resolving with its new id —
+ * `_template/<slug>`, the spelling {@link sessionsPatterns} answers with once the
+ * rescan lands, so the caller re-selects the row it just renamed without
+ * composing an id (AD-65).
+ *
+ * `name` addresses the template as it is on disk — its {@link SessionPatternVm}
+ * `.label`, passed back verbatim, exactly as {@link sessionsTemplateEntries} takes
+ * it. `newName` is a label a person typed, and it is slugged in Rust exactly as
+ * {@link sessionsTemplateInstall} slugs the name it creates.
+ *
+ * **Not idempotent.** A `newName` whose slug already IS the directory's own name
+ * resolves without writing, so `interview` re-typed as `Interview` is free. A
+ * name that folds to anything else is a real move even when it looks like the
+ * name already there — a hand-made `Interview Kit` re-typed verbatim moves to
+ * `interview-kit` — and a genuine double-submit after a rename that succeeded is
+ * **refused**, because the source it names is gone. So treat a rejection as
+ * "re-read the list", never as "retry the call".
+ *
+ * The refusals, and what each one means for you:
+ *
+ * - **an empty `name`** — that is the zone's own `_template/`, whose directory
+ *   name IS the contract every create looks for. Offer rename on named templates
+ *   only: a zone has exactly one zone template, and it has no other name to have.
+ * - **an empty `newName`** — refused before anything is computed, because an
+ *   empty name means the zone's own `_template/` to the installer and would mean
+ *   a move onto the contract here. Keep the form's own guard in front of it.
+ * - **`newName` slugs to nothing** (`"###"`) — the field needs letters or digits.
+ *   Keep the form's own guard in front of this one so the common case never
+ *   round-trips.
+ * - **the source is not a directory** — your list is stale; something removed the
+ *   template under you. Re-read it rather than retrying.
+ * - **the destination is a different directory that already exists** — refused,
+ *   not merged and not trashed. Install may write over what it finds because
+ *   keeper's skeleton is what was asked for; a rename must not eat a neighbour.
+ *   Both directories are untouched, so ask for a different name. "A different
+ *   directory" is the literal test — on macOS the destination of a case-only
+ *   rename exists because it *is* the source, and that rename is allowed.
+ *
+ * Rejects with: `internal` (any of the five above, an unknown zone, a failed
+ * move), `unsupported`.
+ */
+export async function sessionsTemplateRename(
+  rootId: string,
+  name: string,
+  newName: string,
+): Promise<string> {
+  return await invoke<string>("sessions_template_rename", { rootId, name, newName });
 }
 
 /** What {@link sessionsFileNew} will write. The set is closed in Rust. */

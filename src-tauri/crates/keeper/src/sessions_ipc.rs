@@ -624,7 +624,11 @@ fn newest_mtime_ms(dir: &std::path::Path, files: &[(String, bool)]) -> Option<i6
                 .and_then(|time| {
                     time.duration_since(std::time::UNIX_EPOCH)
                         .ok()
-                        .map(|since| since.as_millis() as i64)
+                        // Checked, like `sessions_space_files` and
+                        // `sessions_template_entries`: a cast would wrap a
+                        // future-dated file negative, and `max()` would then
+                        // read the wrap as "oldest" and order the picker by it.
+                        .map(|since| i64::try_from(since.as_millis()).unwrap_or(0))
                 })
         })
         .max()
@@ -1763,6 +1767,101 @@ pub fn sessions_spaces_restore(root_id: String) -> Result<(), IpcError> {
     Err(unsupported())
 }
 
+/// The zone-relative directory a *new* template name means — `_template` for
+/// the zone's own, `_template/<slug>` for a named one — or the refusal for a
+/// name with nothing in it a folder can be called after.
+///
+/// **Minting, not addressing.** This runs the name through
+/// [`keeper_core::notes::naming::slug`] because the caller is about to create a
+/// directory out of something a person typed; [`template_at`] is its twin for
+/// the verbs that must find a directory somebody already has. Shared by install
+/// and by rename's destination rather than copied into each: the refusal is one
+/// sentence, and two copies of it are two chances for the two verbs to disagree
+/// about which names a zone accepts.
+#[cfg(desktop)]
+fn template_mint(name: Option<&str>) -> Result<String, IpcError> {
+    use keeper_core::sessions::{model, template};
+
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(model::TEMPLATE_DIR.to_owned()),
+        Some(raw) => {
+            // The typed name is tested BEFORE it is slugged, and that order is
+            // the whole guard. `naming::slug` never answers empty — a note it
+            // refused to name would be a note that was lost, so it substitutes
+            // `untitled` — which made the old `slug(raw).is_empty()` test dead
+            // code: `###` minted `_template/untitled` and a rename moved the
+            // operator's template into a directory they never typed. Asking the
+            // fold is the domain's own question (AD-108), not a re-derived
+            // "contains a letter or digit" that would drift from it.
+            if !template::nameable(raw) {
+                return Err(IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!(
+                        "\"{raw}\" has nothing in it a folder can be named after — a named \
+                         template needs letters or digits."
+                    ),
+                    account_id: None,
+                    retriable: false,
+                });
+            }
+            Ok(format!(
+                "{}/{}",
+                model::TEMPLATE_DIR,
+                keeper_core::notes::naming::slug(raw)
+            ))
+        }
+    }
+}
+
+/// The zone-relative directory an *existing* template name means, verbatim.
+///
+/// **Addressing, not minting** — and the difference is worth two functions. A
+/// name that arrives here identifies a directory that is already on the drive,
+/// and `_template/Interview Kit/` is a template these docs invite an operator to
+/// make by hand. Slugging it would send the read to `_template/interview-kit`:
+/// an empty room for a template with files in it, and — if both names existed —
+/// a rename that moved the wrong directory.
+///
+/// The guard is the domain's own.
+/// [`keeper_core::sessions::pattern::could_be_named_template`] answers
+/// "may keeper join this segment onto a zone root under `_template/`", which is
+/// the same predicate [`named_templates`] filtered the picker's rows by; so a row
+/// the picker showed is a row these verbs can address, and a `..` from the
+/// webview is refused before anything is opened.
+///
+/// The caller has this name without composing it: a named template's
+/// `SessionPatternVm.label` **is** its folder name
+/// ([`keeper_core::sessions::pattern::NAMED_TEMPLATE_DETAIL`]'s own note), so the
+/// Templates list passes the label straight back and joins nothing (AD-65).
+#[cfg(desktop)]
+fn template_at(name: Option<&str>) -> Result<String, IpcError> {
+    use keeper_core::sessions::{model, pattern};
+
+    match name.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(model::TEMPLATE_DIR.to_owned()),
+        Some(raw) if pattern::could_be_named_template(raw, true) => {
+            Ok(format!("{}/{raw}", model::TEMPLATE_DIR))
+        }
+        Some(raw) => Err(IpcError {
+            code: IpcErrorCode::Internal,
+            // What `pattern::safe_segment` actually refuses, said in its own
+            // order. The sentence used to promise "no dots", which is not the
+            // rule — `v1.2` is a legal template name, and only a name that IS
+            // `.` or `..`, or begins with a dot, is turned away. A refusal that
+            // overstates the rule teaches the operator to avoid names keeper
+            // accepts.
+            message: format!(
+                "\"{raw}\" is not a name keeper will look for under {}/ — a template's directory \
+                 name carries no separators, is not \".\" or \"..\", and does not begin with a \
+                 dot or an underscore.",
+                model::TEMPLATE_DIR
+            ),
+            account_id: None,
+            retriable: false,
+        }),
+    }
+}
+
 /// Write keeper's own template into this zone's `_template/` (FR-268).
 ///
 /// **The zone's template is the operator's, and this verb says so out loud.** A
@@ -1794,27 +1893,12 @@ pub async fn sessions_template_install(
     root_id: String,
     name: Option<String>,
 ) -> Result<String, IpcError> {
-    use keeper_core::sessions::{model, template};
+    use keeper_core::sessions::template;
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
-    let dest = match name.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        None => model::TEMPLATE_DIR.to_owned(),
-        Some(raw) => {
-            let slug = keeper_core::notes::naming::slug(raw);
-            if slug.is_empty() {
-                return Err(IpcError {
-                    code: IpcErrorCode::Internal,
-                    message: format!(
-                        "\"{raw}\" has nothing in it a folder can be named after — a named \
-                         template needs letters or digits."
-                    ),
-                    account_id: None,
-                    retriable: false,
-                });
-            }
-            format!("{}/{slug}", model::TEMPLATE_DIR)
-        }
-    };
+    // Minted, not addressed: the name came out of a text field, so it is
+    // slugged before it becomes a directory (see [`template_mint`]).
+    let dest = template_mint(name.as_deref())?;
 
     let date = today();
     // The skeleton, not a rendered session: `_template/` gets the contract and
@@ -1854,6 +1938,304 @@ pub fn sessions_template_install(
     name: Option<String>,
 ) -> Result<String, IpcError> {
     let _ = (root_id, name);
+    Err(unsupported())
+}
+
+/// Every file inside one template's directory (FR-269, FR-270).
+///
+/// The Templates list is a room the operator walks into, and a template's rows
+/// are its files: pressing one opens it in the same editor a session's record
+/// opens in. So this is a listing and nothing more — no parse, no kinds, no
+/// tags. A template is a skeleton, and the only questions the list asks about it
+/// are what is in here and which of it changed last.
+///
+/// `name` is `None` for the zone's own `_template/` and `Some(name)` for a named
+/// one — the same argument [`sessions_template_install`] takes, so the two verbs
+/// address a template the same way. The name is used verbatim
+/// ([`template_at`]), because it identifies a directory that already exists.
+///
+/// **The same walk the picker previews from.** A template's rows are
+/// [`pattern_files`] minus the directories the zone skeleton keeps and does not
+/// copy — [`pattern_vm`]'s own composition — so "what is in this template" is
+/// asked once. A second reader of the same directory is how the room and the
+/// create came to disagree: this listing was non-recursive, so a folder-shaped
+/// template's `prompts/*.md` were an empty room; it dropped `_`-prefixed files a
+/// create carries; and its file test was lstat-shaped, so a symlinked file was
+/// missing from the room and present in every session made from it.
+///
+/// The walk, and not the pattern's *decision* about it: the picker's *Copies*
+/// list is this same walk put through
+/// [`keeper_core::sessions::pattern::apply`], which stamps a record rather than
+/// copying it, so `about.md` is a row here and never a row there. That is the
+/// one intended difference between the two surfaces — the room is where a
+/// template's record is edited, which is the whole of FR-270 — and it is a
+/// difference in what the create does with a file, not in what the directory
+/// holds. Only directories and `.gitkeep` are dropped here: a row is pressed to
+/// open a file, and neither of those opens anything.
+///
+/// Every `subpath` is profile-relative and composed HERE (AD-65): the zone
+/// subfolder, the template directory and the file's template-relative path,
+/// joined once in Rust exactly as [`sessions_space_files`] joins a space's rows.
+/// The webview does not know the zone's subfolder, and a second joiner is how
+/// the picker's path and this list's path start to disagree about the same file.
+///
+/// **A directory that is not there answers `Ok(vec![])`.** A template someone
+/// removed in Finder under us is an empty room, not a fault: this list re-reads
+/// after every write, and an error banner over a directory that is simply gone
+/// would be keeper reporting the operator's own edit as a failure.
+///
+/// Rejects with: `internal` (unknown root, a name keeper will not join),
+/// `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_template_entries(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    name: Option<String>,
+) -> Result<Vec<keeper_core::sessions::vm::SessionTemplateEntryVm>, IpcError> {
+    use keeper_core::sessions::{model, pattern, vm::SessionTemplateEntryVm};
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let rel = template_at(name.as_deref())?;
+
+    // The zone subfolder, so every row carries a path the frontend can open
+    // without composing one (AD-65) — `sessions_space_files`' mechanism, and its
+    // spelling.
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone_prefix = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let prefix = format!("{zone_prefix}/{rel}");
+
+    // One walk, shared with the picker — see this command's own doc. `excluded`
+    // is `pattern_vm`'s: the zone skeleton leaves its named templates out of
+    // what it copies, so the room must leave them out of what it lists, and a
+    // named template excludes nothing (a `prompts/` of its own is its own).
+    //
+    // An absent directory walks to nothing, so a template the operator removed
+    // in Finder is still an empty room rather than an error banner.
+    let dir = zone.join(&rel);
+    let excluded = if rel == model::TEMPLATE_DIR {
+        named_templates(&zone)
+    } else {
+        Vec::new()
+    };
+    let files = pattern::without_dirs(&pattern_files(&dir), &excluded);
+    let mut out: Vec<SessionTemplateEntryVm> = files
+        .iter()
+        // A row is pressed to open a file, so a directory is not a row — it is
+        // the structure the rows are named after. A `.gitkeep` is not a row
+        // either, and for the picker's own reason: it holds an empty directory
+        // open and there is nothing in it to read.
+        .filter(|(path, is_dir)| !*is_dir && !pattern::is_placeholder(path))
+        .map(|(path, _)| {
+            // Checked, not `as i64` — `sessions_space_files`' spelling. A
+            // future-dated file whose millisecond count does not fit wraps
+            // negative under a cast and then sorts to the bottom of a
+            // newest-first list, which is the one place the wrap would be read
+            // as an answer rather than as a fault.
+            let mtime_ms = std::fs::metadata(dir.join(path))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(0));
+            SessionTemplateEntryVm {
+                subpath: format!("{prefix}/{path}"),
+                // Template-relative rather than a basename, now that the walk
+                // reaches into subdirectories: `prompts/hand-off.md` and
+                // `refs/hand-off.md` are two rows, and labelling both
+                // `hand-off.md` would make the room ambiguous about which file
+                // a press opens. Still composed in Rust — slicing a path in the
+                // webview is still a path operation (AD-65).
+                name: path.clone(),
+                mtime_ms,
+            }
+        })
+        .collect();
+    // Newest first, ties broken by name — the sessions tree's own recent order,
+    // because a template is edited one file at a time and the file touched last
+    // is the one the operator came back for. A tie-break at all because two
+    // files written in the same millisecond are not an order.
+    out.sort_by(|a, b| {
+        b.mtime_ms
+            .cmp(&a.mtime_ms)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_entries(
+    root_id: String,
+    name: Option<String>,
+) -> Result<Vec<()>, IpcError> {
+    // The desktop twin takes `state` too; a mobile twin that refuses does not
+    // need it, and asking for it would make the mobile build depend on
+    // `AppState` for a function that never reads it — `sessions_space_files`'
+    // stub, and its reason.
+    let _ = (root_id, name);
+    Err(unsupported())
+}
+
+/// Rename one named template (FR-271).
+///
+/// **Why a verb and not a text field over `std::fs::rename`.** The zone lives on
+/// a synced drive whose history keeper owns, so a directory renamed behind
+/// keeper's back is a write its watcher sees as somebody else's. This goes
+/// through the same plan/journal/exec path every other lifecycle verb uses, and
+/// the drive gets one commit with keeper's provenance on it.
+///
+/// `name` addresses the template as it is on disk ([`template_at`]); `new_name`
+/// is minted, so it is slugged exactly as [`sessions_template_install`] slugs the
+/// name it creates. Resolves to the new id, `_template/<slug>` — the spelling
+/// `sessions_patterns` answers with after the rescan, so the caller can select
+/// the row it just renamed without composing an id (AD-65).
+///
+/// **The zone's own `_template/` cannot be renamed**, and an empty `name` means
+/// exactly that directory. Its name IS the contract:
+/// [`keeper_core::sessions::model::TEMPLATE_DIR`] is what a create copies from
+/// and what the scan skips, and a zone has one of it. Renaming it would not
+/// produce a differently-named zone template; it would produce a zone with none.
+///
+/// **It refuses rather than merges.** Install may trash-then-write, because the
+/// operator asked for keeper's skeleton and the displaced bytes land somewhere
+/// recoverable. A rename has no such mandate: moving onto a name that is taken
+/// would bury one operator's template under another's, so a collision is a
+/// refusal and both directories stay where they are. "Taken" means a *different*
+/// directory, decided by identity rather than by spelling — see the check
+/// itself: on a case-insensitive volume the destination of a case-only rename
+/// exists because it IS the source.
+///
+/// **An empty `new_name` is refused here**, before [`template_mint`] is asked.
+/// Mint's "empty means the zone's own `_template/`" rule is right for install
+/// and wrong for a destination: it would compute a move of a named template on
+/// top of the zone contract, stopped only incidentally by the collision check
+/// and reported under a directory name the operator never typed.
+///
+/// **Not idempotent, and the caller needs the shape of that.** A `new_name`
+/// whose slug already IS the directory's own name resolves without writing — a
+/// journal row and a commit for a no-op move would be noise on a synced drive.
+/// A name that folds to something else is a real move even when it looks like
+/// the name already there: a hand-made `_template/Interview Kit/` re-typed
+/// verbatim slugs to `interview-kit` and moves. And a genuine double-submit
+/// after a successful rename is refused, because the source it names has moved.
+/// So the caller's answer to a rejection is to re-read the list, never to retry
+/// the call.
+///
+/// Rejects with: `internal` (unknown root, the zone's own template, an empty
+/// `new_name`, a name with nothing to slug, a source that is not a directory, a
+/// destination that is a different directory already, a failed move),
+/// `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_rename(
+    root_id: String,
+    name: String,
+    new_name: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::{model, template};
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    // An empty `name` is the zone's own `_template/`, and that is the one name
+    // there is nothing to rename to.
+    let named = name.trim();
+    if named.is_empty() {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "the zone's own {}/ cannot be renamed — its name is the contract every create \
+                 looks for, and a zone has exactly one of it. Rename a template inside it \
+                 instead.",
+                model::TEMPLATE_DIR
+            ),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    // An empty `new_name` is refused before it is minted: `template_mint` reads
+    // an empty name as the zone's own `_template/`, which is right for install
+    // and would make this a move of a named template onto the zone contract.
+    // The collision check below happens to stop that, and stops it while naming
+    // a directory the operator never typed — so the missing name is said here,
+    // where the sentence can be about the field that was left blank.
+    let renamed = new_name.trim();
+    if renamed.is_empty() {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: "a rename needs a new name — the field was empty, so nothing was moved."
+                .to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    let from = template_at(Some(named))?;
+    let to = template_mint(Some(renamed))?;
+    // Reading what is on the drive is the shell's job — the domain opens nothing
+    // (AD-108) — so both refusals below are decided here and the compiler is
+    // handed a move it can just describe.
+    let source = zone.join(&from);
+    let target = zone.join(&to);
+    if !source.is_dir() {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "there is no template at {from} in this zone, so there is nothing to rename."
+            ),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    if to == from {
+        return Ok(to);
+    }
+    // "Already exists" has to mean a *different* directory. `from` is verbatim
+    // and `to` is slugged, so renaming a hand-made `_template/Interview/` to
+    // `interview` gets past the equality above — and then `exists()` answers
+    // true on APFS and NTFS about the source itself, refusing the one rename
+    // that normalises a name somebody typed by hand.
+    //
+    // The same predicate `MoveDir` guards itself with
+    // ([`crate::sessions_exec::same_directory`]), asked here so the operator
+    // reads a sentence rather than an executor refusal — and asked from the one
+    // definition, because two of them would be two chances for the edge and the
+    // executor to disagree about which moves this zone accepts.
+    if target.exists() && !crate::sessions_exec::same_directory(&target, &source) {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "{to} already exists — pick another name. A rename will not write over a \
+                 template somebody else made."
+            ),
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    let compiled = template::compile_rename(&from, &to);
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-rename task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(to)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_rename(
+    root_id: String,
+    name: String,
+    new_name: String,
+) -> Result<String, IpcError> {
+    let _ = (root_id, name, new_name);
     Err(unsupported())
 }
 
@@ -2832,4 +3214,126 @@ async fn run_zone_search(
         done: true,
         hits: scan.take(),
     });
+}
+
+/// The two name helpers, which are pure `&str -> Result<String>` and therefore
+/// the only part of this module a test can reach without a zone, a registry and
+/// a Tauri handle. They are also where the story's refusals are decided, so the
+/// matrix rows about names live here rather than in a UI test that can only see
+/// the sentence.
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::{template_at, template_mint};
+
+    /// Row 5's naming half: what a person types becomes keeper's folding of it,
+    /// which is the spelling `sessions_patterns` will answer with afterwards.
+    #[test]
+    fn a_typed_name_is_minted_as_keepers_own_folding() {
+        assert_eq!(
+            template_mint(Some("Kick Off")).expect("a name with letters mints"),
+            "_template/kick-off"
+        );
+        assert_eq!(
+            template_mint(Some("  Kick Off  ")).expect("surrounding space is trimmed, not refused"),
+            "_template/kick-off"
+        );
+        // A legal interior dot survives the fold as a separator, which is what
+        // makes `v1.2` a template name rather than a refusal.
+        assert_eq!(
+            template_mint(Some("v1.2")).expect("an interior dot is a legal name"),
+            "_template/v1-2"
+        );
+    }
+
+    /// Row 6, and the bug it was written for: `naming::slug` answers `untitled`
+    /// for a name with nothing in it, so a guard that read the *slug* never
+    /// fired and `###` minted `_template/untitled` — a directory the operator
+    /// never typed, which rename then moved their template into.
+    #[test]
+    fn a_name_with_no_alphanumerics_is_refused_rather_than_called_untitled() {
+        let refusal = template_mint(Some("###")).expect_err("### is not a folder name");
+        assert_eq!(
+            refusal.message,
+            "\"###\" has nothing in it a folder can be named after — a named template needs \
+             letters or digits."
+        );
+        assert!(
+            !refusal.retriable,
+            "a re-typed name is a new call, not a retry"
+        );
+        assert!(template_mint(Some("🎉")).is_err());
+    }
+
+    /// Row 8's Rust half. An absent name is the zone's own `_template/` on both
+    /// helpers — that is the rule install is built on — which is exactly why
+    /// `sessions_template_rename` refuses an empty `name` and an empty
+    /// `new_name` of its own before it asks either of these: to a rename, "the
+    /// zone contract" is not a name, it is the thing that must not be moved.
+    #[test]
+    fn an_absent_name_is_the_zones_own_template_on_both_helpers() {
+        assert_eq!(
+            template_mint(None).expect("no name is the zone template"),
+            "_template"
+        );
+        assert_eq!(
+            template_at(None).expect("no name is the zone template"),
+            "_template"
+        );
+        assert_eq!(
+            template_mint(Some("   ")).expect("whitespace trims to no name"),
+            "_template"
+        );
+        assert_eq!(
+            template_at(Some("   ")).expect("whitespace trims to no name"),
+            "_template"
+        );
+    }
+
+    /// Addressing is verbatim: a template the operator made by hand is found
+    /// under the name they gave it, because slugging the address would send the
+    /// read to an empty room — or, if both spellings existed, move the wrong
+    /// directory.
+    #[test]
+    fn an_existing_name_is_addressed_exactly_as_it_is_on_disk() {
+        assert_eq!(
+            template_at(Some("Interview Kit")).expect("a hand-made name is addressed verbatim"),
+            "_template/Interview Kit"
+        );
+        assert_eq!(
+            template_at(Some("v1.2")).expect("an interior dot addresses"),
+            "_template/v1.2"
+        );
+    }
+
+    /// A name from the webview is joined onto the zone root, so the traversal
+    /// cases are refused before anything is opened.
+    #[test]
+    fn a_name_that_could_escape_the_template_directory_is_refused() {
+        for name in ["..", ".", "a/b", "a\\b", "_house", ".hidden"] {
+            assert!(
+                template_at(Some(name)).is_err(),
+                "{name} must not address a directory under _template/"
+            );
+        }
+    }
+
+    /// The refusal has to describe the rule `pattern::safe_segment` actually
+    /// has. It used to promise "no dots" while accepting `v1.2`, which teaches
+    /// the operator to avoid names keeper takes.
+    #[test]
+    fn the_addressing_refusal_states_the_rule_it_actually_enforces() {
+        let refusal = template_at(Some("..")).expect_err(".. is not addressable");
+        assert!(
+            refusal
+                .message
+                .contains("does not begin with a dot or an underscore"),
+            "the sentence must name the leading-character rule: {}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains("no dots"),
+            "an interior dot is legal; the sentence must not forbid it: {}",
+            refusal.message
+        );
+    }
 }

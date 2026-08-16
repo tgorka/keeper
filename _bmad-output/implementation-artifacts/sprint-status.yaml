@@ -502,6 +502,11 @@ development_status:
   48-5-the-header-stops-hiding-everything: review
   48-6-a-remembered-folder-is-re-read-once: review
   epic-48-retrospective: optional
+  epic-49: in-progress
+  49-1-templates-are-a-room-you-can-enter: in-progress
+  49-2-a-space-you-can-write-into: backlog
+  49-3-spaces-fold-and-the-fold-has-a-default: backlog
+  epic-49-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
