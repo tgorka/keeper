@@ -73,6 +73,12 @@ const ARTIFACTS: &str = "artifacts";
 /// Plural, unlike a [`KindTag`], for the reason the spaces are plural: it
 /// collects them. And named rather than stamped, because a references file is
 /// not a sitting — a session grows one of these and appends to it for weeks.
+///
+/// The **name**, not the path. Which directory it sits in is the session's
+/// shape's answer, asked by `sessions_ref_candidates` through
+/// [`crate::sessions::shape::kind_dir`]: the session root under the flat
+/// contract, `refs/` under the folder one — where that shape's pool actually
+/// reads. This module composes no session paths, so the constant stays bare.
 pub const DEFAULT_REF_FILE: &str = "references.md";
 
 /// What the operator picked out of the picker.
@@ -422,8 +428,26 @@ pub fn appended(existing: &str, line: &str) -> String {
 /// The bytes a brand-new references file starts with — [`files::render_new`]'s
 /// output, tagged `ref` so the zone's References space lists it immediately,
 /// plus the first line.
+///
+/// `rel` is the destination **path**, session-relative, and the title is its
+/// BASENAME without the extension. Taking the path and folding it here rather
+/// than taking a title is the whole of the fix: since Story 50.1 a
+/// folder-shaped session's offered destination is `refs/references.md`, that
+/// string travels through the picker as `req.file`, and `render_new` writes
+/// whatever title it is handed verbatim into `title:` and into the H1. Handing
+/// it the path produced a file titled `refs/references` — which is the label
+/// every space, the index and the References list show for it, and bytes on the
+/// operator's disk. The caller holds a path and nothing else, so the fold
+/// belongs on this side of the call rather than being retyped at it.
 #[must_use]
-pub fn seeded(title: &str, id: &str, now: &str, line: &str) -> String {
+pub fn seeded(rel: &str, id: &str, now: &str, line: &str) -> String {
+    // `rsplit` before the trim, so the extension trim only ever sees a
+    // filename — `migrate::compile_migrate`'s own idiom for the same job.
+    let title = rel
+        .rsplit('/')
+        .next()
+        .unwrap_or(rel)
+        .trim_end_matches(".md");
     let head = files::render_new(NewFileKind::Markdown, Some(KindTag::Ref), title, id, now);
     appended(&head, line)
 }
@@ -869,7 +893,7 @@ mod tests {
     #[test]
     fn a_seeded_file_is_tagged_so_the_references_space_finds_it_at_once() {
         let text = seeded(
-            "References",
+            DEFAULT_REF_FILE,
             "01J5AAAAAAAAAAAAAAAAAAAAAA",
             "2026-08-14T10:00:00Z",
             "- [[Standup]]",
@@ -877,5 +901,56 @@ mod tests {
         assert!(text.contains("tags:"));
         assert!(text.contains("- ref"));
         assert!(text.ends_with("- [[Standup]]\n"));
+    }
+
+    /// Matrix row 11's other half (Story 50.1, FR-279).
+    ///
+    /// A folder-shaped session's destination is `refs/references.md`, and the
+    /// title `render_new` stamps is what every space, the index and the
+    /// References list show for the file. Titling it by the whole path put
+    /// `title: refs/references` into the operator's frontmatter and
+    /// `# refs/references` at the top of their file — so the fold is asserted
+    /// on both the frontmatter and the H1, and against the FLAT destination
+    /// too, which must be unchanged by the fix.
+    #[test]
+    fn a_seeded_file_is_titled_by_its_basename_and_never_by_its_path() {
+        let nested = seeded(
+            "refs/references.md",
+            "01J5AAAAAAAAAAAAAAAAAAAAAA",
+            "2026-08-14T10:00:00Z",
+            "- [[Standup]]",
+        );
+        assert!(
+            nested.contains("title: references\n"),
+            "the frontmatter names the file, not the path to it: {nested}"
+        );
+        assert!(
+            nested.contains("# references\n"),
+            "and so does the heading: {nested}"
+        );
+        assert!(
+            !nested.contains("refs/references"),
+            "no spelling of the path survives into the bytes: {nested}"
+        );
+
+        // The flat contract's destination has no directory to fold away, and
+        // its title is what it always was.
+        let flat = seeded(
+            DEFAULT_REF_FILE,
+            "01J5AAAAAAAAAAAAAAAAAAAAAA",
+            "2026-08-14T10:00:00Z",
+            "- [[Standup]]",
+        );
+        assert!(flat.contains("title: references\n"), "{flat}");
+
+        // A directory whose own name ends in the extension cannot eat the
+        // separator, because the split runs before the trim.
+        let awkward = seeded(
+            "a.md/notes.md",
+            "01J5AAAAAAAAAAAAAAAAAAAAAA",
+            "2026-08-14T10:00:00Z",
+            "- [[Standup]]",
+        );
+        assert!(awkward.contains("title: notes\n"), "{awkward}");
     }
 }

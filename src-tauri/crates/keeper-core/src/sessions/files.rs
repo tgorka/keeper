@@ -634,6 +634,69 @@ mod tests {
         );
     }
 
+    /// Matrix rows 7, 8 and 10 (Story 50.1), at the level this crate can reach.
+    ///
+    /// `sessions_file_new_kind` composes exactly these four calls, and the shell
+    /// crate does not build on every machine this repo is worked in — so the
+    /// composition is asserted here, where it is pure. What the command adds on
+    /// top is reading the session's own listing to decide its shape, and running
+    /// the plan.
+    ///
+    /// The round trip through the pool reader is the point, and it is the same
+    /// argument `a_stamped_name_round_trips_through_the_pool_reader` makes one
+    /// directory up: the directory is what puts the file where a folder-shaped
+    /// session's pool LOOKS, and the tag is what makes that file a reference
+    /// once it is read (AD-120). Either one alone produces a file no space
+    /// lists.
+    #[test]
+    fn a_folder_shaped_create_composes_the_directory_the_name_and_the_tag() {
+        use crate::sessions::shape::{kind_dir, Shape};
+
+        let subdir = kind_dir(Shape::Folder, KindTag::Ref)
+            .expect("a folder-shaped session has a home for a reference")
+            .expect("and it is a subdirectory, not the root");
+        let name = new_stamped("Inputs", "2026-08-16", "0900", &taken(&[]));
+        let rel = format!("{subdir}/{name}");
+        assert_eq!(rel, "refs/2026-08-16-0900-inputs.md");
+
+        let text = render_new(
+            NewFileKind::Markdown,
+            Some(KindTag::Ref),
+            "Inputs",
+            ULID,
+            "2026-08-16",
+        );
+        let pool = crate::sessions::pool::read(&[crate::sessions::pool::PoolFile {
+            rel: &rel,
+            text: &text,
+        }]);
+        let entry = pool.first().expect("one file in, one entry out");
+        assert_eq!(
+            entry.kind,
+            Some(KindTag::Ref),
+            "the tag is what the References space selects on"
+        );
+        assert_eq!(entry.rel, "refs/2026-08-16-0900-inputs.md");
+
+        // Row 10: `refs/` is created in the same journaled plan, ahead of the
+        // write, so a session that has never held a reference does not need a
+        // separate step somebody has to remember.
+        let plan = compile_new("active/s", &rel, &text).expect("refs/ is writable");
+        assert_eq!(
+            plan.steps.first(),
+            Some(&PlanStep::MkDir {
+                path: "active/s/refs".to_owned()
+            })
+        );
+        assert_eq!(plan.steps.len(), 2, "the directory, then the file");
+
+        // Row 8: the flat arm is unchanged — no subdirectory, a bare root name,
+        // and no `MkDir` for a directory that exists by definition.
+        assert_eq!(kind_dir(Shape::Flat, KindTag::Ref), Ok(None));
+        let flat = compile_new("active/s", &name, &text).expect("the session root is writable");
+        assert_eq!(flat.steps.len(), 1);
+    }
+
     #[test]
     fn a_delete_is_a_trash_move_and_the_whole_plan() {
         let plan = compile_delete("active/s", "notes.md", "01TRASH").expect("deletable");

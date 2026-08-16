@@ -138,6 +138,25 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   // does — and "no sooner" is a race, not a guarantee. An explicit re-read after
   // a write keeps the section honest without waiting on the filesystem.
   const [reload, setReload] = useState(0);
+  /**
+   * ONE create in flight across this whole session, not one per section.
+   *
+   * Two children offer a create — the Files heading's *New log* / *New prompt*
+   * / *New file* and every writable space's *New note in …* — and the two
+   * kind-creates both post `sessions_file_new_kind` with an EMPTY title. Rust
+   * names such a file `YYYY-MM-DD-HHMM-untitled.md` from the clock to the
+   * minute and `files::compile_new` emits a plain `WriteFile`, so two presses
+   * in the same minute compute `taken_in` before either write lands, resolve to
+   * one filename, and the second silently overwrites the first — a `tag: task`
+   * file becoming a `tag: log` one.
+   *
+   * The flag lives HERE because that is the lowest node both surfaces share:
+   * each of them held its own `useState` until Story 50.1's review, which
+   * removed only the presses within one component and left "New prompt above,
+   * New note below" reachable. Serialising in Rust is the real fix and is that
+   * crate's to make; this is what removes the press a person can perform.
+   */
+  const [writing, setWriting] = useState(false);
 
   /**
    * Restore the spaces' fold, and read the default it falls back to
@@ -435,6 +454,8 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
                 sessionId={sessionId}
                 shape={detail.shape}
                 entries={tree?.entries ?? []}
+                busy={writing}
+                onBusy={setWriting}
                 onChanged={() => setReload((n) => n + 1)}
               />
             </div>
@@ -482,11 +503,18 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
           <SessionSpaces
             rootId={rootId}
             sessionId={sessionId}
-            // The section lists under both contracts; only its create verb is
-            // flat-only, and the shape is a fact only this surface holds.
-            shape={detail.shape}
+            // The section lists AND writes under both contracts (Story 50.1):
+            // `sessions_file_new_kind` writes where the shape keeps the kind,
+            // and a kind this session's shape keeps no home for arrives as a
+            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
+            // does not travel: one reader of `shape::kind_dir`, in Rust.
             spaces={spaces}
             selections={spaceFiles}
+            // The same flag the Files heading above is handed — both surfaces
+            // offer a create that posts an empty title, and one filename is
+            // what they would collide on.
+            writing={writing}
+            onWriting={setWriting}
             onChanged={() => setReload((n) => n + 1)}
           />
 

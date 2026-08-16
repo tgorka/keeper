@@ -506,6 +506,24 @@ pub struct SessionSpaceFilesVm {
     /// Its query would not parse, already worded. `files` is then empty, and the
     /// section renders the sentence rather than a suspiciously complete list.
     pub error: Option<String>,
+    /// Why THIS session's contract keeps nowhere to put a file of the kind this
+    /// space creates, already worded — or `None` when it keeps somewhere, and
+    /// when the space names no creatable kind at all.
+    ///
+    /// [`crate::sessions::shape::KindHasNoHome`]'s own sentence, projected
+    /// rather than restated. [`SessionSpaceVm::new_file_kind`] answers what a
+    /// create here would write and is built for the ZONE, so it cannot know a
+    /// shape; this payload is per session, which is where the question "does
+    /// this session's contract keep a home for that kind" can be answered at
+    /// all. Carrying the sentence rather than a flag is the point:
+    /// `KindHasNoHome` exists to compose the refusal once, and a surface that
+    /// received `true` would have to write a second wording of it — which is
+    /// how "migrate the session" and "migrate it" become two products'
+    /// vocabulary for one rule.
+    ///
+    /// A create is **absent** where this is `Some`, never present-and-disabled,
+    /// and the sentence goes where the button would have been.
+    pub no_home: Option<String>,
 }
 
 /// One file a space selected — the card a space's section draws.
@@ -550,8 +568,8 @@ pub struct SessionSpaceFileVm {
     pub unstable_identity: bool,
 }
 
-/// One file inside a template's directory — a row of the Templates list
-/// (FR-269, FR-270).
+/// One entry inside a template's directory — one row of the Templates tree
+/// (FR-269, FR-270, FR-284): a file, or a folder.
 ///
 /// Thinner than [`SessionSpaceFileVm`] on purpose: a template is a skeleton, not
 /// a pool, so nothing here has an id, a kind or a tag set. What the list needs

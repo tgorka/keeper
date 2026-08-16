@@ -22,4 +22,24 @@ files: Array<SessionSpaceFileVm>,
  * Its query would not parse, already worded. `files` is then empty, and the
  * section renders the sentence rather than a suspiciously complete list.
  */
-error: string | null, };
+error: string | null, 
+/**
+ * Why THIS session's contract keeps nowhere to put a file of the kind this
+ * space creates, already worded — or `None` when it keeps somewhere, and
+ * when the space names no creatable kind at all.
+ *
+ * [`crate::sessions::shape::KindHasNoHome`]'s own sentence, projected
+ * rather than restated. [`SessionSpaceVm::new_file_kind`] answers what a
+ * create here would write and is built for the ZONE, so it cannot know a
+ * shape; this payload is per session, which is where the question "does
+ * this session's contract keep a home for that kind" can be answered at
+ * all. Carrying the sentence rather than a flag is the point:
+ * `KindHasNoHome` exists to compose the refusal once, and a surface that
+ * received `true` would have to write a second wording of it — which is
+ * how "migrate the session" and "migrate it" become two products'
+ * vocabulary for one rule.
+ *
+ * A create is **absent** where this is `Some`, never present-and-disabled,
+ * and the sentence goes where the button would have been.
+ */
+noHome: string | null, };

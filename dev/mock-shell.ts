@@ -577,6 +577,9 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     spaceId: "_spaces/about.md",
     files: [spaceFile("about.md", "About this session", ["about"], 45)],
     error: null,
+    // Flat mock session: every kind it can hold lives at the root, so no space
+    // has a reason to say otherwise.
+    noHome: null,
   },
   {
     spaceId: "_spaces/tasks.md",
@@ -597,6 +600,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
       spaceFile("task-named-templates.md", "Named templates", ["task"], 30),
     ],
     error: null,
+    noHome: null,
   },
   {
     spaceId: "_spaces/log.md",
@@ -606,16 +610,19 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
       spaceFile("2026-08-12-0900-opened-the-session.md", "Opened the session", ["log"], 220),
     ],
     error: null,
+    noHome: null,
   },
   {
     spaceId: "_spaces/refs.md",
     files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
     error: null,
+    noHome: null,
   },
   {
     spaceId: "_spaces/prompts.md",
     files: [],
     error: "Unexpected end of query after `AND`.",
+    noHome: null,
   },
 ];
 
@@ -1119,7 +1126,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const at = SESSION_SPACES.findIndex((space) => space.id === id);
     if (at === -1) {
       SESSION_SPACES.push(saved);
-      SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null });
+      SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null, noHome: null });
     } else {
       SESSION_SPACES[at] = {
         ...SESSION_SPACES[at],

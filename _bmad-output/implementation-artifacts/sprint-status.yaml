@@ -574,6 +574,39 @@ development_status:
   49-3-spaces-fold-and-the-fold-has-a-default: review
   epic-49-retrospective: optional
 
+  # ── EPIC 50, 2026-08-16: the owner ran the epic-49 build and reported three ──
+  # things missing. Each was measured on their machine before this epic existed,
+  # and one of them is a verdict on epic 49 itself:
+  #
+  #   1. No create button in a space. Their sessions are FOLDER-shaped; story
+  #      49.2's `shape === "flat"` gate suppresses every one. The gate's reason was
+  #      true (a folder-shaped pool cannot see the session root, where the writer
+  #      writes) and it treated a symptom. The counts they see are 0 because the
+  #      live README carries no frontmatter at all, so no space selects it.
+  #   2. No opening in a notes window. Story 49.2's note arm CANNOT EXECUTE IN ANY
+  #      VALID CONFIGURATION: `notePathForFile` resolves only when the vault
+  #      contains the zone, and `SessionsConfig::validate` refuses that containment
+  #      in either direction with a reason that has teeth (two indexers over one
+  #      tree). The arm, three matrix rows and a race guard were written for a
+  #      state the product forbids. Epic 50 deletes them and corrects 49.2's spec.
+  #      What the owner is actually missing is the editor CHROME — FR-233 has
+  #      promised the format toolbar, slash menu and properties panel since phase
+  #      7 and none of them has ever been on a file target.
+  #   3. No file/folder CRUD inside a template. Absent, no refusal to relax. The
+  #      plan vocabulary has every step but `MoveFile`.
+  #
+  # The lesson worth keeping: 49.2 shipped a branch nobody could reach and six
+  # review layers did not catch it, because every layer read the code and the spec
+  # and neither says what the CONFIG VALIDATOR refuses. A spec's "Block if" clause
+  # that names a configuration must be checked against the validator, not only
+  # against the code that reads it.
+  epic-50: in-progress
+  50-1-a-space-you-can-write-into-wherever-the-session-keeps-it: in-progress
+  50-2-a-templates-files-and-folders: backlog
+  50-3-one-editor-host-one-set-of-writing-tools: backlog
+  50-4-a-files-own-properties: backlog
+  epic-50-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

@@ -1,18 +1,14 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type {
-  NoteFolderVm,
-  NoteRowVm,
-  NoteVaultVm,
-  SessionSpaceFilesVm,
-  SessionSpaceVm,
-} from "@/lib/ipc/client";
+import { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import type { NoteVaultVm, SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
 
-// The section writes through three commands now; the editor it opens reaches
-// for two more, and the row's opener reaches the note index through Story
-// 45.18's bridge. All of them are stubbed at the IPC boundary so the real
-// components — the real refusals, the real copy, the real resolution rule — are
-// what these tests exercise.
+// The section writes through three commands, and the editor it opens reaches
+// for two more. All of them are stubbed at the IPC boundary so the real
+// components — the real refusals, the real copy, the real gates — are what
+// these tests exercise. The two note-index commands stay stubbed although the
+// section no longer calls either: not-called is the assertion that Story
+// 49.2's note arm has not come back (see row 15).
 vi.mock("@/lib/ipc/client", () => ({
   sessionsSpaceDelete: vi.fn(),
   sessionsSpacesRestore: vi.fn(),
@@ -20,9 +16,9 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsFileNewKind: vi.fn(),
   notesSpaceTerms: vi.fn(),
   notesTree: vi.fn(),
-  // The vault mirror hydrates itself from these two when this section is the
-  // first surface a window opens; a test that wants vaults seeds the store
-  // directly, which marks it hydrated and skips them.
+  // The mirror's own reads. The section no longer hydrates it — nothing here
+  // asks about vaults any more — so these stay stubbed only to keep a store a
+  // fixture seeds from reaching the real IPC layer.
   notesVaults: vi.fn(async () => []),
   notesVaultActive: vi.fn(async () => null),
   notesVaultSetActive: vi.fn(async () => undefined),
@@ -37,7 +33,6 @@ import {
   SESSION_SPACE_NEW_NOTE,
   SESSION_SPACE_NEW_NOTE_FAILED,
   SESSION_SPACE_SETTINGS_SUBTITLE,
-  SESSION_SPACE_VAULTS_UNKNOWN,
   SESSION_SPACES_EMPTY,
   SESSION_SPACES_LOADING,
   SESSION_SPACES_NEW,
@@ -74,7 +69,7 @@ const mockTerms = vi.mocked(notesSpaceTerms);
 const mockNewKind = vi.mocked(sessionsFileNewKind);
 const mockTree = vi.mocked(notesTree);
 const mockSetActive = vi.mocked(notesVaultSetActive);
-/** The mirror's own read — held so a case can keep the vault list UNKNOWN. */
+/** The mirror's own read — stubbed so seeding the store cannot trigger IPC. */
 const mockVaultsRead = vi.mocked(notesVaults);
 
 function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
@@ -95,7 +90,37 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
   };
 }
 
-function selection(spaceId: string, names: string[], error: string | null = null) {
+/**
+ * Rust's own refusal sentences, as the payload carries them.
+ *
+ * Written out here as FIXTURE data and never imported from the component:
+ * `shape::KindHasNoHome` composes these once and `shape.rs`'s own tests own
+ * their wording. What this file claims is narrower and is the only half that
+ * is the webview's — whatever sentence arrives on `noHome` is printed where
+ * the button would have been, and the button is gone. Story 50.1 shipped a
+ * TypeScript copy of the mapping AND of these sentences; the copy had already
+ * forked the wording, and importing a constant back out of the component would
+ * be this suite testing that copy against itself.
+ */
+const NO_TASK_HOME =
+  "a folder-shaped session keeps no task file: that contract has no directory to put one in, \
+and writing it anywhere else would produce a file no space in this session can list. Migrate the \
+session to the flat shape, where every kind is a tag on a file at the root.";
+
+const NO_LOG_FILE =
+  "a folder-shaped session's log is a `### ` entry under `## Log` in README.md, not a file — use \
+New log, which appends one there.";
+
+function selection(
+  spaceId: string,
+  names: string[],
+  error: string | null = null,
+  /**
+   * Why this session's contract keeps no home for the space's kind — Rust's
+   * answer, per session, which is what replaced the `shape` prop.
+   */
+  noHome: string | null = null,
+) {
   return {
     spaceId,
     files: names.map((relPath) => ({
@@ -108,6 +133,7 @@ function selection(spaceId: string, names: string[], error: string | null = null
       unstableIdentity: true,
     })),
     error,
+    noHome,
   } satisfies SessionSpaceFilesVm;
 }
 
@@ -146,57 +172,49 @@ function zoneInsideAVault(): void {
   notesVaultsStore.getState().setActiveVaultId("vault-2");
 }
 
-/** Vaults are configured and none of them holds this session's zone. */
-function zoneOutsideEveryVault(): void {
-  notesVaultsStore
-    .getState()
-    .setVaults([vault("vault-1", "p2", "60-sessions"), vault("vault-2", "p1", "notes")]);
-}
-
-/** A folder listing with more than one note in it, so a match on the wrong row —
- *  or one that keeps only the first — has something to fail against. */
-function folderWith(...notes: Array<{ id: string; path: string }>): NoteFolderVm {
-  return {
-    relDir: "active/s",
-    dirs: [],
-    notes: notes.map(
-      ({ id, path }) =>
-        ({
-          id,
-          path,
-          title: path,
-          snippet: "",
-          tags: [],
-          updatedMs: 0,
-          pinned: false,
-          archived: false,
-          unread: false,
-          conflict: false,
-        }) as unknown as NoteRowVm,
-    ),
-  };
+/**
+ * The section under a parent that owns the one create-in-flight flag.
+ *
+ * `writing` is a PROP now, not this component's state: the Files heading offers
+ * creates on the same session through the same command and with the same empty
+ * title, so the flag that removes the colliding press has to span both and
+ * `SessionDetail` holds it. This harness plays that parent, which is what keeps
+ * the in-flight case below a claim about the section's behaviour. That the two
+ * components actually share ONE flag is `session-detail.test.tsx`'s claim, and
+ * no harness can make it here.
+ *
+ * There is no `shape` prop any more: which kinds this session's contract has no
+ * home for arrives per space on `noHome`, composed by Rust.
+ */
+function Harness({
+  spaces,
+  selections,
+  onChanged,
+}: {
+  spaces: SessionSpaceVm[];
+  selections: SessionSpaceFilesVm[] | null;
+  onChanged: () => void;
+}) {
+  const [writing, setWriting] = useState(false);
+  return (
+    <SessionSpaces
+      rootId="p1"
+      sessionId="01J5AAAAAAAAAAAAAAAAAAAAAA"
+      spaces={spaces}
+      selections={selections}
+      writing={writing}
+      onWriting={setWriting}
+      onChanged={onChanged}
+    />
+  );
 }
 
 function open(
   spaces: SessionSpaceVm[],
   selections: SessionSpaceFilesVm[] | null,
-  // Flat unless a case says otherwise: the create verb is a flat-contract verb
-  // (`sessions_file_new_kind` writes into the session root, which a
-  // folder-shaped session's pool excludes), so every case about the control
-  // needs the shape that can carry it.
-  shape = "flat",
-): { onChanged: ReturnType<typeof vi.fn>; unmount: () => void } {
+): { onChanged: Mock; unmount: () => void } {
   const onChanged = vi.fn();
-  const view = render(
-    <SessionSpaces
-      rootId="p1"
-      sessionId="01J5AAAAAAAAAAAAAAAAAAAAAA"
-      shape={shape}
-      spaces={spaces}
-      selections={selections}
-      onChanged={onChanged}
-    />,
-  );
+  const view = render(<Harness spaces={spaces} selections={selections} onChanged={onChanged} />);
   return { onChanged, unmount: view.unmount };
 }
 
@@ -217,15 +235,13 @@ beforeEach(() => {
   mockNewKind.mockReset();
   mockNewKind.mockResolvedValue("60-sessions/active/s/untitled.md");
   mockTree.mockReset();
-  mockTree.mockResolvedValue(folderWith());
   mockSetActive.mockReset();
   mockSetActive.mockResolvedValue(undefined);
   mockVaultsRead.mockReset();
   mockVaultsRead.mockResolvedValue([]);
   resetNotesVaultsStoreForTest();
-  // Where a person pressing a space row actually is, so a test that expects
-  // the notes view is watching a switch rather than a value that was already
-  // right.
+  // Where a person pressing a space row actually is, so row 15's assertion
+  // that the view did NOT switch is watching something that could move.
   primaryViewStore.getState().setView("sessions");
   resetPanelsStoreForTest();
   // Nothing folded and nothing recorded: the fold is a document-wide store and
@@ -255,29 +271,44 @@ describe("SessionSpaces listing", () => {
   });
 
   /**
-   * Matrix row 10, and the half of the old single case that did not change.
+   * Matrix row 15 (Story 50.1), which was row 10 (Story 49.2) — and now the
+   * ONLY opener case there is.
    *
    * Opens through the ONE file target the tree and the Files pane use (AD-109),
-   * on the `subpath` Rust composed (AD-65) — a second path-join in TypeScript is
+   * on the `subpath` Rust composed (AD-65): a second path-join in TypeScript is
    * a second answer to where a file lives.
    *
-   * The zone is outside every configured vault here, which Story 49.2 does not
-   * treat as a failure: `notePathForFile` answers `null` and the file viewer is
-   * the only correct surface, so the section says nothing about it. Vaults are
-   * seeded rather than absent so this is "none of them holds this zone" — the
-   * configuration a person actually has — and not "keeper has not looked yet".
+   * **The fixture is the impossible one, deliberately.** The vault seeded here
+   * CONTAINS the session's zone — exactly the state Story 49.2's deleted note
+   * arm keyed on, and exactly the state `SessionsConfig::validate`
+   * (`keeper-sync/src/profile/mod.rs:648-654`) refuses to let anyone configure:
+   * "one folder cannot be both a vault and a sessions zone". Seeding it anyway
+   * is what makes this a regression test rather than a tautology. Put the arm
+   * back and this row resolves as a note, switches the primary view and reaches
+   * for the note index — all three of which are asserted against.
    */
-  it("opens a file on the path Rust composed, not one it joined itself", () => {
-    zoneOutsideEveryVault();
+  it("row 15: opens the file target, and never resolves a row as a note", async () => {
+    zoneInsideAVault();
     open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
 
     fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
 
-    expect(opened()).toEqual({
+    const target = {
       kind: "file",
       profileId: "p1",
       relativePath: "60-sessions/active/s/task-migrate.md",
-    });
+    };
+    // Landed on the press, with nothing awaited: the opener is one store write.
+    expect(opened()).toEqual(target);
+    // A macrotask, so an arm that had merely become asynchronous would still
+    // have run by the time the four assertions below look. The executor form,
+    // not `Promise.withResolvers`: the project compiles against `lib: ES2020`,
+    // where that constructor method does not exist.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(opened()).toEqual(target);
+    expect(primaryViewStore.getState().view).toBe("sessions");
+    expect(mockTree).not.toHaveBeenCalled();
+    expect(mockSetActive).not.toHaveBeenCalled();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
@@ -496,12 +527,14 @@ describe("SessionSpaces editing", () => {
 });
 
 /**
- * Matrix rows 1–8 (Story 49.2, FR-273).
+ * Matrix rows 1–8 (Story 49.2, FR-273) and 12–14 (Story 50.1, FR-277).
  *
- * Rows 1–6 are Rust's decision — `creatable_kind` owns whether a query names a
- * creatable kind, and its own tests own those cases. What this file can prove
- * is the half that is the webview's: the VM's answer becomes a control or
- * becomes nothing, and TypeScript never reads the query to second-guess it.
+ * Rows 1–6 of BOTH matrices are Rust's decision — `creatable_kind` owns whether
+ * a query names a creatable kind and `shape::kind_dir` owns where that kind
+ * lives, and each has its own tests. What this file can prove is the half that
+ * is the webview's: the VM's answer becomes a control or becomes nothing, the
+ * control is visible without a pointer, and a kind this session's contract has
+ * no home for is explained rather than silently missing.
  */
 describe("SessionSpaces new note", () => {
   it.each([
@@ -572,23 +605,169 @@ describe("SessionSpaces new note", () => {
   });
 
   /**
-   * The gate its sibling verb already has (`session-file-actions.tsx` refuses
-   * `New prompt` on the same shape).
+   * Row 12. The folder contract has no tasks file — `shape::kind_dir` refuses
+   * `(Folder, Task)` and `sessions_space_files` puts that refusal on the
+   * payload — so the control is absent, and the section says WHY, where the
+   * button would have been. Absent AND silent is the state the owner reported
+   * as "I only see the count".
    *
-   * `sessions_file_new_kind` writes `YYYY-MM-DD-HHMM-<slug>.md` into the
-   * session ROOT, and `sessions_root.rs::read_ref_sources` builds a
-   * folder-shaped session's pool from `README.md` plus `refs/` and `prompts/`
-   * only. So the file a space created there is in no space's candidate set and
-   * in no Unfiled list: the press writes, navigates, re-reads, and the space it
-   * was pressed in is exactly as empty as before, with nothing said.
+   * **The shape does not appear in this test, because it no longer reaches the
+   * component.** Story 50.1 fed a `shape` prop to a TypeScript copy of
+   * `kind_dir`, so this row tested that copy against a fixture of its own
+   * input; the day Rust gave the folder contract a tasks home it would have
+   * stayed green while the button stayed hidden. What is asserted now is the
+   * only thing the webview decides: a sentence on `noHome` suppresses the
+   * create and is printed instead of it.
    */
-  it("offers no create on a folder-shaped session, whose pool could never list it", () => {
-    open([space({ newFileKind: "task" })], [selection("_spaces/tasks.md", [])], "folder");
+  it("row 12: says a folder-shaped session keeps no tasks file, and offers no create", () => {
+    open([space({ newFileKind: "task" })], [selection("_spaces/tasks.md", [], null, NO_TASK_HOME)]);
 
     expect(screen.queryByRole("button", { name: /^New note in/ })).toBeNull();
-    // The LISTING is still true under the folder contract, so the section is
-    // not hidden — only its write verb is.
+    expect(screen.getByText(NO_TASK_HOME)).toBeInTheDocument();
+    // The LISTING is true under both contracts, so the section is not hidden —
+    // only its write verb is.
     expect(screen.getByRole("button", { name: `${SESSION_SPACE_EDIT} Tasks` })).toBeInTheDocument();
+  });
+
+  /**
+   * Row 12's other half. A folder-shaped session's log is a `## Log` heading in
+   * README.md, so the space carries the sentence that points at the verb which
+   * already appends one rather than growing a second log writer.
+   *
+   * A DIFFERENT sentence from the tasks one, which is the property the whole
+   * `no_home` projection buys: `KindHasNoHome` has three variants because
+   * "migrate the session" is right for a task and wrong for a log, and a
+   * boolean on the wire would have made this surface write the second wording.
+   */
+  it("row 12: points a folder-shaped Log space at the log verb rather than a file", () => {
+    open(
+      [space({ id: "_spaces/log.md", name: "Log", query: "tag:log", newFileKind: "log" })],
+      [selection("_spaces/log.md", [], null, NO_LOG_FILE)],
+    );
+
+    expect(screen.queryByRole("button", { name: /^New note in/ })).toBeNull();
+    expect(screen.getByText(NO_LOG_FILE)).toBeInTheDocument();
+    expect(screen.queryByText(NO_TASK_HOME)).toBeNull();
+  });
+
+  /**
+   * And the line belongs to the session's contract, not to the section: where
+   * every kind has a home, `no_home` is null on every space, nothing is
+   * explained away and both spaces keep their control.
+   */
+  it("says nothing about homes where every kind has one", () => {
+    open(
+      [
+        space({ newFileKind: "task" }),
+        space({ id: "_spaces/log.md", name: "Log", query: "tag:log", newFileKind: "log" }),
+      ],
+      [selection("_spaces/tasks.md", []), selection("_spaces/log.md", [])],
+    );
+
+    expect(screen.queryByText(NO_TASK_HOME)).toBeNull();
+    expect(screen.queryByText(NO_LOG_FILE)).toBeNull();
+    expect(screen.getAllByRole("button", { name: /^New note in/ })).toHaveLength(2);
+  });
+
+  /**
+   * One space refused and one offered, side by side in one payload.
+   *
+   * The two cases above each render a single space, so neither can tell "this
+   * space's create is suppressed" from "no create renders at all" — the shape
+   * of the bug the section shipped with. `no_home` is per space, and this is
+   * the assertion that it is read per space.
+   */
+  it("suppresses only the space whose kind has no home, and only its button", () => {
+    open(
+      [
+        space({ newFileKind: "task" }),
+        space({ id: "_spaces/refs.md", name: "References", query: "tag:ref", newFileKind: "ref" }),
+      ],
+      [selection("_spaces/tasks.md", [], null, NO_TASK_HOME), selection("_spaces/refs.md", [])],
+    );
+
+    const controls = screen.getAllByRole("button", { name: /^New note in/ });
+    expect(controls).toHaveLength(1);
+    expect(controls[0]).toBe(
+      screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` }),
+    );
+    expect(screen.getByText(NO_TASK_HOME)).toBeInTheDocument();
+  });
+
+  /**
+   * The answer has not arrived yet, so neither has the verb.
+   *
+   * While `selections` is null the section knows a space is called Tasks and
+   * does not yet know whether this session's contract keeps a home for a task
+   * — the same moment {@link SESSION_SPACES_LOADING} exists for. Offering the
+   * create then means drawing a button that vanishes a tick later on every
+   * folder-shaped session, which is a wrong answer shown confidently.
+   */
+  it("offers no create until Rust has answered whether the kind has a home", () => {
+    open([space({ newFileKind: "task" })], null);
+
+    expect(screen.queryByRole("button", { name: /^New note in/ })).toBeNull();
+    expect(screen.getByText(SESSION_SPACES_LOADING)).toBeInTheDocument();
+  });
+
+  /**
+   * Rows 13 and 14. The one verb a section exists to offer is not hidden behind
+   * a pointer — the owner's report was literally "I don't see the button".
+   *
+   * **One case, where the matrix has two rows.** Rows 13 and 14 differ only in
+   * the session's contract, and the contract no longer reaches this component:
+   * a folder-shaped session keeps references in `refs/`, so `kind_dir` answers
+   * a directory, so `no_home` is null — exactly as it is on a flat one. Feeding
+   * a `shape` prop to tell the two apart is what the deleted TypeScript mirror
+   * did, and it made the pair a test of the mirror. Row 13's shape-dependent
+   * half is the write below, whose subpath carries the `refs/` segment Rust
+   * composed; the mapping itself is `shape.rs`'s rows 1–3.
+   *
+   * jsdom applies no stylesheet, so `toBeVisible` cannot see a Tailwind
+   * `opacity-0`; the class is the fact. It is asserted against the two siblings
+   * that still carry it, so this cannot pass on a build that simply has no
+   * opacity classes left anywhere.
+   */
+  it("rows 13 and 14: the create is visible without hovering, wherever the kind has a home", () => {
+    open(
+      [space({ id: "_spaces/refs.md", name: "References", query: "tag:ref", newFileKind: "ref" })],
+      [selection("_spaces/refs.md", [])],
+    );
+
+    const create = screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` });
+    expect(create).toBeEnabled();
+    expect(create.className).not.toMatch(/\bopacity-0\b/);
+    for (const label of [SESSION_SPACE_EDIT, SESSION_SPACE_DELETE]) {
+      expect(screen.getByRole("button", { name: `${label} References` }).className).toMatch(
+        /\bopacity-0\b/,
+      );
+    }
+  });
+
+  /**
+   * Row 13's other half, and the whole point of Story 50.1: the press goes
+   * through on a folder-shaped session, where 49.2 suppressed it. WHERE the
+   * file lands is Rust's answer and `shape.rs`'s own tests own it; the subpath
+   * comes back with its `refs/` segment already on it, and this file opens that
+   * without composing anything.
+   */
+  it("row 13: writes into a folder-shaped session instead of suppressing the verb", async () => {
+    const written = "60-sessions/active/s/refs/2026-08-16-0900-untitled.md";
+    mockNewKind.mockResolvedValue(written);
+    const { onChanged } = open(
+      [space({ id: "_spaces/refs.md", name: "References", query: "tag:ref", newFileKind: "ref" })],
+      [selection("_spaces/refs.md", [])],
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` }));
+
+    await waitFor(() =>
+      expect(mockNewKind).toHaveBeenCalledWith("p1", "01J5AAAAAAAAAAAAAAAAAAAAAA", "ref", ""),
+    );
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(opened()).toEqual({ kind: "file", profileId: "p1", relativePath: written }),
+    );
   });
 
   /**
@@ -710,211 +889,6 @@ describe("SessionSpaces new note", () => {
     expect(
       await screen.findByText(`${SESSION_SPACE_NEW_NOTE} Tasks: ${SESSION_SPACE_NEW_NOTE_FAILED}`),
     ).toBeInTheDocument();
-  });
-});
-
-/**
- * Matrix rows 9, 11 and 12 (Story 49.2, FR-274) — the other half of row 10's
- * old single case.
- *
- * One opener serves the row click and the create, so a file made in a
- * vault-backed space opens in the same surface a row in that space opens in.
- * Two openers is how those two answers drift apart.
- */
-describe("SessionSpaces opens a row as a note", () => {
-  it("row 9: opens the note behind a row when the zone lives inside a vault", async () => {
-    zoneInsideAVault();
-    mockTree.mockResolvedValue(
-      folderWith(
-        { id: "note-other", path: "active/s/task-board.md" },
-        { id: "note-1", path: "active/s/task-migrate.md" },
-      ),
-    );
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-
-    await waitFor(() =>
-      expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-1" }),
-    );
-    expect(primaryViewStore.getState().view).toBe("notes");
-    // The file's own directory INSIDE the vault, not the profile-relative one:
-    // listing `60-sessions/active/s` would name a folder the vault does not have.
-    expect(mockTree).toHaveBeenCalledWith("vault-1", "active/s");
-    // And the vault was made active first, or the notes pane shows nothing: it
-    // only renders the open note while that note's vault is the active one.
-    expect(mockSetActive).toHaveBeenCalledWith("vault-1");
-  });
-
-  /**
-   * Row 11. The index has not caught up — Story 45.18 already worded this, and
-   * the section prints that sentence rather than inventing a second one. The
-   * file still opens: withholding bytes keeper can read because the nicer
-   * surface was unavailable would be keeper punishing the reader for a race.
-   */
-  it("row 11: says a vault file has no note yet, and still opens the file", async () => {
-    zoneInsideAVault();
-    mockTree.mockResolvedValue(folderWith({ id: "note-other", path: "active/s/task-board.md" }));
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-
-    expect(
-      await screen.findByText(/no note indexed at active\/s\/task-migrate\.md/),
-    ).toBeInTheDocument();
-    expect(opened()).toEqual({
-      kind: "file",
-      profileId: "p1",
-      relativePath: "60-sessions/active/s/task-migrate.md",
-    });
-    expect(primaryViewStore.getState().view).toBe("sessions");
-  });
-
-  it("row 12: opens a file it just created as a note, through that same opener", async () => {
-    zoneInsideAVault();
-    mockNewKind.mockResolvedValue("60-sessions/active/s/untitled.md");
-    mockTree.mockResolvedValue(
-      folderWith(
-        { id: "note-other", path: "active/s/task-board.md" },
-        { id: "note-new", path: "active/s/untitled.md" },
-      ),
-    );
-    open([space({ newFileKind: "task" })], [selection("_spaces/tasks.md", [])]);
-
-    fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` }));
-
-    await waitFor(() =>
-      expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-new" }),
-    );
-    expect(primaryViewStore.getState().view).toBe("notes");
-  });
-
-  /**
-   * The gesture, which row 9 cannot see: it asserts the ACTIVE panel's target,
-   * and that is the newly focused one either way.
-   *
-   * AD-90 gives a single click on a list row the replace gesture
-   * (`notes-pane.tsx:289-296`), and the file arm has always used it. Left as
-   * `openPanel`, one click on a row would grow the strip inside a vault and
-   * replace outside it — the same click meaning two things, decided by
-   * configuration the person pressing cannot see.
-   */
-  it("opens a row's note in the panel that was showing the row, not beside it", async () => {
-    zoneInsideAVault();
-    mockTree.mockResolvedValue(
-      folderWith(
-        { id: "note-other", path: "active/s/task-board.md" },
-        { id: "note-1", path: "active/s/task-migrate.md" },
-      ),
-    );
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
-    const strip = panelsStore.getState().panels.length;
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-
-    await waitFor(() =>
-      expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-1" }),
-    );
-    expect(panelsStore.getState().panels).toHaveLength(strip);
-  });
-
-  /**
-   * Two rows, two resolutions, landing out of order.
-   *
-   * `notes_tree` lists the file's OWN vault directory, so a row in a deep,
-   * crowded subfolder is genuinely slower than one at the vault root — a first
-   * click really can finish after a second. Without the press guard the loser
-   * takes the panel, the active vault, the primary view and the notice with it,
-   * and the person ends up on a file they did not click last.
-   */
-  it("ignores a row resolution that a later press has superseded", async () => {
-    zoneInsideAVault();
-    // The executor form, not `Promise.withResolvers`: `lib: ES2020`.
-    let landSlow!: (folder: NoteFolderVm) => void;
-    mockTree
-      .mockImplementationOnce(
-        () =>
-          new Promise<NoteFolderVm>((resolve) => {
-            landSlow = resolve;
-          }),
-      )
-      .mockResolvedValue(folderWith({ id: "note-board", path: "active/s/task-board.md" }));
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md", "task-board.md"])]);
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-    fireEvent.click(screen.getByRole("button", { name: /task-board/ }));
-
-    await waitFor(() =>
-      expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-board" }),
-    );
-
-    landSlow(folderWith({ id: "note-migrate", path: "active/s/task-migrate.md" }));
-    // A macrotask, so every microtask the stale chain still owes runs before
-    // the assertion — awaiting a resolved promise would only drain the queue as
-    // it stands, and this chain queues two more `.then`s.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-board" });
-  });
-});
-
-/**
- * `vaults: null` is "keeper has not looked yet", never "you have no vault"
- * (`notes-vaults.ts` keeps the two apart on purpose). Every other case in this
- * file seeds the mirror, which marks it hydrated — so these two are the only
- * ones that can see the window in which it is not.
- */
-describe("SessionSpaces opens a row before the vault list has landed", () => {
-  it("waits for the vault list rather than reading `not looked yet` as `no vault`", async () => {
-    // The executor form, not `Promise.withResolvers`: `lib: ES2020`.
-    let landVaults!: (vaults: NoteVaultVm[]) => void;
-    mockVaultsRead.mockReturnValue(
-      new Promise<NoteVaultVm[]>((resolve) => {
-        landVaults = resolve;
-      }),
-    );
-    mockTree.mockResolvedValue(
-      folderWith(
-        { id: "note-other", path: "active/s/task-board.md" },
-        { id: "note-1", path: "active/s/task-migrate.md" },
-      ),
-    );
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
-    const before = opened();
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-
-    // Nothing decided yet: the press is waiting on the read, not guessing.
-    expect(opened()).toEqual(before);
-
-    landVaults([vault("vault-1", "p1", "60-sessions"), vault("vault-2", "p2", "60-sessions")]);
-
-    await waitFor(() =>
-      expect(opened()).toEqual({ kind: "note", vaultId: "vault-1", noteId: "note-1" }),
-    );
-  });
-
-  /**
-   * The permanent case. `ensureNotesVaultsHydrated` is best-effort and leaves
-   * the mirror unhydrated on a rejected read, and this section calls it once on
-   * mount — so after one transient `notes_vaults` failure every row in a
-   * vault-backed zone would open as a file, silently, for the life of the
-   * mount. Silence belongs to the configuration, not to the failure.
-   */
-  it("says the vault list could not be read instead of opening the file in silence", async () => {
-    mockVaultsRead.mockRejectedValue({ message: "notes_vaults: broken pipe" });
-    open([space()], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
-
-    fireEvent.click(screen.getByRole("button", { name: /task-migrate/ }));
-
-    expect(await screen.findByText(SESSION_SPACE_VAULTS_UNKNOWN)).toBeInTheDocument();
-    // And the bytes are still shown: withholding a file keeper can read because
-    // the nicer surface could not be resolved would punish the reader twice.
-    expect(opened()).toEqual({
-      kind: "file",
-      profileId: "p1",
-      relativePath: "60-sessions/active/s/task-migrate.md",
-    });
   });
 });
 

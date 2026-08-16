@@ -74,6 +74,7 @@ import {
   SESSION_DETAIL_WORKSPACE_CAVEAT,
   SessionDetail,
 } from "@/components/sessions/session-detail";
+import { SESSION_FILE_NEW_PROMPT_LABEL } from "@/components/sessions/session-file-actions";
 import {
   SESSION_REFS_ALL_RESOLVED,
   SESSION_REFS_EMPTY,
@@ -449,7 +450,9 @@ describe("SessionDetail", () => {
    */
   it("reads the zone's spaces and this session's selections as two calls", async () => {
     sessionsSpaces.mockResolvedValue([space()]);
-    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+    ]);
     mount();
 
     const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
@@ -468,12 +471,15 @@ describe("SessionDetail", () => {
    * it would stay green while the real surface wrote into `undefined`.
    *
    * The flat contract, explicitly: this file's default fixture is
-   * folder-shaped, where the create is absent by design — see the case below.
+   * folder-shaped, where a Log space has no create by design — see the case
+   * below.
    */
   it("gives the spaces section the session a new note belongs to", async () => {
     sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
     sessionsSpaces.mockResolvedValue([space()]);
-    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+    ]);
     sessionsFileNewKind.mockResolvedValue("60-sessions/active/2026-08-10-keeper/untitled.md");
     mount();
 
@@ -491,21 +497,29 @@ describe("SessionDetail", () => {
   });
 
   /**
-   * The other half of that prop, and the reason it exists.
+   * The other half: a kind this session's contract keeps no home for.
    *
-   * A folder-shaped session's pool is `README.md` plus `refs/` and `prompts/`
-   * (`sessions_root.rs::read_ref_sources`), while `sessions_file_new_kind`
-   * writes its stamped file into the session ROOT. The created file would
-   * therefore be in no space's candidate set and in no Unfiled list — the space
-   * stays as empty as it was, with nothing said. `New prompt` refuses on this
-   * same shape (`session-file-actions.tsx`), and the section must agree.
+   * A folder-shaped session's log is a `## Log` heading inside README.md, not a
+   * file (`pool::log_view`), so `shape::kind_dir` refuses `(Folder, Log)`,
+   * `sessions_space_files` puts that refusal on the selection, and the section
+   * prints it where the button would have been. Absent AND explained: the
+   * silence was the reported defect.
    *
-   * Only this suite can see it: the section is handed a shape and would happily
-   * be handed the wrong one forever.
+   * **The sentence is on the payload, not composed anywhere in TypeScript.**
+   * Story 50.1 shipped a `shape` prop feeding a TS copy of `kind_dir` and a TS
+   * copy of the refusal's wording; both are gone. What this suite can still see
+   * that the section's own cannot is that the selections REACH the section —
+   * `session-spaces.test.tsx` hands itself the payload, so a dropped
+   * `selections` prop is invisible from there.
    */
-  it("offers no create in a folder-shaped session, whose pool could never list it", async () => {
+  it("prints the no-home sentence Rust put on the selection, and offers no create", async () => {
+    const noHome =
+      "a folder-shaped session's log is a `### ` entry under `## Log` in README.md, not a " +
+      "file — use New log, which appends one there.";
     sessionsSpaces.mockResolvedValue([space()]);
-    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome },
+    ]);
     mount();
 
     const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
@@ -513,6 +527,103 @@ describe("SessionDetail", () => {
     // verb is gone.
     expect(within(section).getByText("Log")).toBeInTheDocument();
     expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+    expect(within(section).getByText(noHome)).toBeInTheDocument();
+  });
+
+  /**
+   * And the fix itself, at the mount point: on the SAME folder-shaped fixture a
+   * References space is creatable, because `refs/` is a directory that shape's
+   * pool reads — so Rust answers `no_home: null` for it. This is the case that
+   * would have been red before Story 50.1 and the one the owner's report is
+   * about.
+   */
+  it("offers a create for References on a folder-shaped session", async () => {
+    sessionsSpaces.mockResolvedValue([
+      space({ id: "_spaces/refs.md", name: "References", query: "tag:ref", newFileKind: "ref" }),
+    ]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/refs.md", files: [], error: null, noHome: null },
+    ]);
+    sessionsFileNewKind.mockResolvedValue(
+      "60-sessions/active/2026-08-10-keeper/refs/2026-08-16-0900-untitled.md",
+    );
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    fireEvent.click(
+      within(section).getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` }),
+    );
+
+    await waitFor(() =>
+      expect(sessionsFileNewKind).toHaveBeenCalledWith(
+        "tgdrive",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        "ref",
+        "",
+      ),
+    );
+  });
+
+  /**
+   * ONE create in flight across the whole session, not one per section.
+   *
+   * The Files heading and every writable space both post
+   * `sessions_file_new_kind` with an EMPTY title, and Rust names such a file
+   * `YYYY-MM-DD-HHMM-untitled.md` from the clock to the minute; `compile_new`
+   * emits a plain `WriteFile`, so two presses in the same minute resolve to one
+   * filename and the second silently overwrites the first — a `tag: prompt`
+   * file becoming a `tag: log` one.
+   *
+   * **Only this suite can see it.** Story 50.1 shipped the guard as two
+   * independent `useState`s on two siblings, each with a green in-flight test in
+   * its own file, and each test passed while the cross-surface press stayed
+   * reachable. The flag now lives on their common parent, which is why the
+   * claim is asserted where both are mounted — and asserted in BOTH directions,
+   * because one shared flag and two flags that happen to agree once look the
+   * same from one press.
+   */
+  it("keeps one create in flight across the Files heading and the spaces below", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
+    sessionsSpaces.mockResolvedValue([space()]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+    ]);
+    // The executor form, not `Promise.withResolvers`: the project compiles
+    // against `lib: ES2020`, where that constructor method does not exist.
+    let land!: (subpath: string) => void;
+    const held = () =>
+      new Promise<string>((resolve) => {
+        land = resolve;
+      });
+    sessionsFileNewKind.mockImplementation(held);
+    mount();
+
+    const spaces = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    const files = await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
+    const newPrompt = within(files).getByRole("button", { name: SESSION_FILE_NEW_PROMPT_LABEL });
+    const newNote = within(spaces).getByRole("button", {
+      name: `${SESSION_SPACE_NEW_NOTE} Log`,
+    });
+
+    // Files heading first: the space's create goes down with it.
+    fireEvent.click(newPrompt);
+    expect(newNote).toBeDisabled();
+    fireEvent.click(newNote);
+    expect(sessionsFileNewKind).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      land("60-sessions/active/2026-08-10-keeper/2026-08-16-0900-untitled.md");
+    });
+    await waitFor(() => expect(newNote).toBeEnabled());
+
+    // And the other way round, which two agreeing-by-accident flags would fail.
+    fireEvent.click(newNote);
+    expect(newPrompt).toBeDisabled();
+    fireEvent.click(newPrompt);
+    expect(sessionsFileNewKind).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      land("60-sessions/active/2026-08-10-keeper/2026-08-16-0901-untitled.md");
+    });
+    await waitFor(() => expect(newPrompt).toBeEnabled());
   });
 
   /**

@@ -1525,7 +1525,8 @@ pub fn sessions_space_files(
     session_id: String,
 ) -> Result<Vec<keeper_core::sessions::vm::SessionSpaceFilesVm>, IpcError> {
     use keeper_core::sessions::pool::{read_one as read_pool_one, PoolFile};
-    use keeper_core::sessions::spaces::{select, Candidate};
+    use keeper_core::sessions::shape;
+    use keeper_core::sessions::spaces::{self, select, Candidate};
     use keeper_core::sessions::vm::{SessionSpaceFileVm, SessionSpaceFilesVm};
 
     let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
@@ -1541,6 +1542,15 @@ pub fn sessions_space_files(
         .map(|sessions| sessions.subfolder.trim().to_owned())
         .unwrap_or_default();
     let prefix = format!("{zone_prefix}/{}", pool.path);
+
+    // Which contract this session follows, from its own top-level names —
+    // `shape()`'s own input, and `sessions_file_new_kind`'s reading of it
+    // (`taken_in` + `shape::shape`), asked once here for every space in the
+    // payload. One extra `read_dir` of the session root per read, which is what
+    // it costs to stop TypeScript from owning a second copy of the mapping.
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let root_names: Vec<String> = taken_in(&zone_root.join(&pool.path)).into_iter().collect();
+    let session_shape = shape::shape(&root_names);
 
     let entries: Vec<_> = pool
         .files
@@ -1584,6 +1594,16 @@ pub fn sessions_space_files(
                     })
                     .collect(),
                 error: selection.error,
+                // The domain's refusal, projected rather than restated. The
+                // kind is `creatable_kind`'s answer — the same one `space_vm`
+                // puts on `new_file_kind`, so a space that offers no create
+                // asks nothing here — and the sentence is `KindHasNoHome`'s,
+                // which exists precisely so that one wording of "a folder-shaped
+                // session keeps no tasks file" reaches every surface. A boolean
+                // would hand the webview the job of writing a second one.
+                no_home: spaces::creatable_kind(&space.query)
+                    .and_then(|kind| shape::kind_dir(session_shape, kind).err())
+                    .map(|no_home| no_home.to_string()),
             }
         })
         .collect())
@@ -2442,7 +2462,7 @@ pub async fn sessions_file_new_kind(
     title: String,
 ) -> Result<String, IpcError> {
     use keeper_core::sessions::files;
-    use keeper_core::sessions::shape::{KindTag, KINDS};
+    use keeper_core::sessions::shape::{self, KINDS};
 
     let tag = KINDS
         .iter()
@@ -2454,16 +2474,6 @@ pub async fn sessions_file_new_kind(
             account_id: None,
             retriable: false,
         })?;
-    // `about` is the session's record, one per session, written by the template
-    // and edited in place — a second one would give `shape()` two answers.
-    if tag == KindTag::About {
-        return Err(IpcError {
-            code: IpcErrorCode::Internal,
-            message: "a session has one about.md — open it rather than making a second.".to_owned(),
-            account_id: None,
-            retriable: false,
-        });
-    }
 
     let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let row = crate::sessions_root::row_of(&root_id, &session_id)
@@ -2475,9 +2485,49 @@ pub async fn sessions_file_new_kind(
     } else {
         title.trim().to_owned()
     };
-    let dir = zone_root.join(&row.path);
+    let root = zone_root.join(&row.path);
+
+    // Which contract this session follows, from its own top-level names —
+    // `shape()`'s input, and the same listing a name collision is checked
+    // against, from ONE read of the directory. The row does not carry the
+    // shape and putting it there would make every board row pay for a fact one
+    // write verb needs.
+    let root_names = taken_in(&root);
+    let session_shape = shape::shape(&root_names.iter().cloned().collect::<Vec<_>>());
+    // `about` included: the record is one per session under both contracts, and
+    // a second one would give `shape()` two answers. The refusal is the
+    // domain's sentence rather than one written here, so the rule and the
+    // wording it is explained with cannot drift apart.
+    let subdir = shape::kind_dir(session_shape, tag).map_err(|no_home| IpcError {
+        code: IpcErrorCode::Internal,
+        message: no_home.to_string(),
+        account_id: None,
+        retriable: false,
+    })?;
+    // The containment rule is asked of the directory in its own right, exactly
+    // as `sessions_file_new` asks it of the `parent` it is handed: `check_dir`
+    // refuses `workspace/`, traversal and dotfolders, and a rule that only
+    // holds because the mapping happened to return a safe constant is not a
+    // rule (`files::check_dir`'s own argument). No second guard is written
+    // here; this is that one, asked.
+    if let Some(subdir) = subdir {
+        files::check_dir(subdir).map_err(file_verb_error)?;
+    }
+
     let today = today();
-    let rel = files::new_stamped(&title, &today, &now_hhmm(), &taken_in(&dir));
+    // The collision set is the DESTINATION's, not the session root's: two
+    // references created in the same minute collide with each other, and a
+    // stamped name that dodged a root-level file it will never sit beside
+    // would be avoiding the wrong collision.
+    let taken = match subdir {
+        Some(subdir) => taken_in(&root.join(subdir)),
+        None => root_names,
+    };
+    let name = files::new_stamped(&title, &today, &now_hhmm(), &taken);
+    let rel = match subdir {
+        Some(subdir) => format!("{subdir}/{name}"),
+        None => name,
+    };
 
     let (zone_root, session_path, subpath) =
         resolve_session_file(&state, &root_id, &session_id, &rel)?;
@@ -2488,6 +2538,9 @@ pub async fn sessions_file_new_kind(
         &crate::sync_ipc::new_ulid(),
         &today,
     );
+    // `compile_new` leads with `MkDir` whenever `rel` has a parent, so a
+    // session whose `refs/` does not exist yet gets it created in the same
+    // journaled plan rather than in a step somebody has to remember.
     let compiled = files::compile_new(&session_path, &rel, &content).map_err(file_verb_error)?;
     tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
         .await
@@ -2743,13 +2796,15 @@ pub fn sessions_ref_candidates(
     use keeper_core::sessions::add_ref::{self, DEFAULT_REF_FILE};
     use keeper_core::sessions::pool::{read_pool, PoolFile};
     use keeper_core::sessions::refs::RefKind;
+    use keeper_core::sessions::shape::{self, KindTag};
     use keeper_core::sessions::vm::{SessionRefCandidateVm, SessionRefCandidatesVm};
 
-    // Asked for its refusal, not its value: every reader below degrades to an
-    // empty list for an unknown session, and an empty picker is a worse answer
-    // than "no such session" for the one case that is actually a bug.
-    crate::sessions_root::row_of(&root_id, &session_id)
+    // Asked for its refusal as well as its path: every reader below degrades to
+    // an empty list for an unknown session, and an empty picker is a worse
+    // answer than "no such session" for the one case that is actually a bug.
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
         .ok_or_else(|| session_error(&session_id))?;
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     let zone = profile
         .sessions
@@ -2832,8 +2887,7 @@ pub fn sessions_ref_candidates(
     // Where a reference could go: the session's `ref`-tagged markdown first,
     // then its other markdown. Composed in Rust so the picker offers a list and
     // never a path it built itself (AD-65).
-    let (targets, default_target) = match crate::sessions_root::session_pool(&root_id, &session_id)
-    {
+    let targets = match crate::sessions_root::session_pool(&root_id, &session_id) {
         Some(pool_read) => {
             let pool = read_pool(
                 &pool_read
@@ -2855,14 +2909,35 @@ pub fn sessions_ref_candidates(
                     targets.push(entry.rel.clone());
                 }
             }
-            // The default is the constant whether or not the file exists: an
-            // existing `references.md` is the file the operator meant, and
-            // dodging it into `references-2.md` would split one list in two.
-            // `new_named`'s collision rule is for files a *title* names; this is
-            // a fixed name that keeps accumulating.
-            (targets, DEFAULT_REF_FILE.to_owned())
+            targets
         }
-        None => (Vec::new(), DEFAULT_REF_FILE.to_owned()),
+        None => Vec::new(),
+    };
+
+    // The default is the constant whether or not the file exists: an existing
+    // references file is the file the operator meant, and dodging it into
+    // `references-2.md` would split one list in two. `new_named`'s collision
+    // rule is for files a *title* names; this is a fixed name that keeps
+    // accumulating.
+    //
+    // WHERE that constant sits is the shape's answer, from the same mapping a
+    // space's create asks (Story 50.1, FR-279). Until then this was the bare
+    // name under both contracts, so on a folder-shaped session `Add reference`
+    // wrote `references.md` into the session ROOT — a real file, on the
+    // operator's disk, that the folder pool never reads
+    // (`sessions_root::read_ref_sources` takes `README.md` by name and then
+    // walks `refs/` and `prompts/`), invisible to every space and to the
+    // *Unfiled* notice alike. A write into a blind spot, and the very failure
+    // the spaces surface had suppressed its own create button to avoid.
+    //
+    // `Ref` has a home under both contracts, so the refusal arm is unreachable
+    // today; the session root is the honest answer if that ever changes,
+    // because this command only OFFERS a destination and `sessions_ref_add`
+    // re-checks whatever it is handed.
+    let top_level: Vec<String> = taken_in(&zone_root.join(&row.path)).into_iter().collect();
+    let default_target = match shape::kind_dir(shape::shape(&top_level), KindTag::Ref) {
+        Ok(Some(dir)) => format!("{dir}/{DEFAULT_REF_FILE}"),
+        Ok(None) | Err(_) => DEFAULT_REF_FILE.to_owned(),
     };
 
     Ok(SessionRefCandidatesVm {
@@ -2953,14 +3028,16 @@ pub async fn sessions_ref_add(
         // A brand-new references file is seeded with frontmatter and the `ref`
         // tag, so the References space lists it the moment it lands rather than
         // after somebody notices it is untagged.
+        //
+        // The DESTINATION, not a title composed here. `seeded` folds the path
+        // down to its basename, and it does so in the domain because the rule
+        // is about what `render_new` writes: until Story 50.1's review this
+        // call handed it `refs/references.md` minus the extension and the new
+        // file was titled `refs/references` — in its frontmatter, in its H1,
+        // and therefore in every space that lists it.
         None => (
             None,
-            add_ref::seeded(
-                rel.trim_end_matches(".md"),
-                &crate::sync_ipc::new_ulid(),
-                &today(),
-                &line,
-            ),
+            add_ref::seeded(&rel, &crate::sync_ipc::new_ulid(), &today(), &line),
         ),
     };
 

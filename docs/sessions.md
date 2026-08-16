@@ -280,12 +280,18 @@ The verbs on a row are open, open in the default app, reveal, and delete. **New 
 sits on the tree's header and makes a `.md`, `.csv` or `.json` in the folder you have
 selected, with **New log** and **New prompt** beside it for the two you make constantly —
 those write a correctly named, correctly tagged file rather than an empty one, because a
-log you have to name and tag by hand is a log you write later or not at all.
+log you have to name and tag by hand is a log you write later or not at all. Each lands
+where your session's shape keeps that kind: a prompt at the root of a flat session, in
+`prompts/` in a folder-shaped one; **New log** in a flat session writes a file, and in a
+folder-shaped one appends a heading to `README.md`, which is where that shape's log is.
 
 A delete moves the file into the zone's `.keeper/trash/`, never an unlink, and
 `workspace/` refuses every write with the fence's own sentence. There is still no rename
-and no move: renaming a file whose id is its path silently breaks the pins pointing at
-it, and that is a conversation this surface has not had yet.
+and no move **here**: renaming a file whose id is its path silently breaks the pins pointing
+at it, and that is a conversation this surface has not had yet. The exception is the
+Templates room, and it is an exception for a reason rather than an inconsistency — nothing
+points at a template's files, and a create copies them rather than referencing them, so
+there is no link graph for a rename to break there.
 
 Sessions are bounded by their own contract, so the whole tree is read in one pass rather
 than one call per folder. A workspace somebody let a package manager into can still
@@ -329,6 +335,12 @@ drive, notes, and recordings — by name and by tag, and it writes the pointer i
 session's own convention with the kind already classified, so a reference lands as the
 row it will always be rather than as a string keeper has to guess about later.
 
+You choose the file it is written into, and keeper offers one: `references.md` at the
+root of a flat session, `refs/references.md` in a folder-shaped one — the same rule the
+spaces' create follows, so the reference you just added is in the References space rather
+than in a file nothing reads. The file is created, tagged `ref` and seeded with
+frontmatter if it is not there yet.
+
 One case gets a question instead of a write: a target inside `workspace/`. That folder is
 scratch and dies with the session, so a pointer into it is a dangling link with a delay
 on it. Keeper offers to copy the file into `artifacts/` and reference that instead — an
@@ -364,28 +376,47 @@ query selects nothing and says so; an unreadable sort still runs the query.
 
 **A space you can write into.** A space whose query names exactly one kind carries its
 own **New note** button — Tasks, Log, References and Prompts do, and so does any space you
-write that asks for one of those tags. The file is tagged as it is created, so it lands in
-the space you made it from rather than in Unfiled, and it opens immediately. About never
-offers it: a session has one record, and a second `about.md` would leave keeper with two
-answers about what the session is. Nor does a space that asks for two things at once
-(`tag:log date:today` has no one file that still satisfies it tomorrow), or one whose query
-keeper cannot read — the button is absent there rather than present and refusing. Nor does
-any space in a **folder-shaped** session: that shape reads its pool from `README.md`,
-`refs/` and `prompts/`, and a tagged file in the session root would be in no space and in
-no Unfiled list — invisible from the moment it was written. Migrating to the flat contract
-is how such a session gets the button, exactly as it is for **New prompt**.
+write that asks for one of those tags. The button is always there, not revealed by
+hovering: it is the one thing a space exists to let you do. Edit and delete stay on
+hover, because they are maintenance. The file is tagged as it is created, so it lands in
+the space you made it from rather than in Unfiled, and it opens immediately.
+
+**Where the new file goes is your session's shape.** A flat session keeps everything in
+one pool, so the file is written at the session root. A folder-shaped session keeps
+references in `refs/` and prompts in `prompts/`, so that is where they are written —
+exactly the directories that shape reads its pool from, which is what makes the new file
+appear in the space you pressed. The directory is *where keeper puts it*; the tag is what
+makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` is still
+unfiled, in either shape, and keeper will say so rather than guessing from the folder.
+
+Two spaces are told plainly that they have no button, in one line where the button
+would have been — both of them a folder-shaped session's:
+
+- **Tasks.** That contract has no tasks file — the board is the flat one's — so there is
+  nowhere to put one. *Convert to flat* is how such a session gets tasks.
+- **Log.** That shape's log is a `### ` entry under `## Log` inside `README.md`, not a
+  file at all, and **New log** on the Files header already writes one there.
+
+Three others simply have no button, with nothing said, because the reason is their own
+query rather than your session: **About** in either shape (a session has one record, and
+a second `about.md` would leave keeper with two answers about what the session is), a
+space that asks for two things at once (`tag:log date:today` has no one file that still
+satisfies it tomorrow), and one whose query keeper cannot read — that one already carries
+its own fault line. Absent rather than present and refusing, in all three.
 
 **What a row opens as.** A row is a single click and behaves like one everywhere: it
 replaces what the panel you pressed in was showing rather than adding a panel beside it.
-*Which* surface it opens in depends on where the zone lives. If the zone is inside a
-registered notes vault, the row opens the full note editor — the same editor, the same
-properties, the same history the Notes tab gives you — because that file *is* a note and
-the space was only a way of finding it. If the zone is outside every vault, the row opens
-the file viewer, and keeper says nothing about it: that is a configuration, not a failure,
-and a sentence explaining it every time you clicked a row would be keeper apologising for
-your setup. The two cases keeper does speak up about are a file inside a vault that the
-note index has not caught up with yet, and a vault list keeper could not read at all —
-both open the file viewer and say which of the two happened.
+It opens **the file**, in keeper's file viewer, which is the same target the tree and the
+Files pane use.
+
+**A session file is not a vault note, and cannot be made into one.** keeper refuses to
+let one folder be both a notes vault and a sessions zone — in either direction, whichever
+contains which — because two indexers claiming one tree is a configuration nobody can
+reason about afterwards. Try it and the profile is rejected with those words: *"one folder
+cannot be both a vault and a sessions zone"*. So there is no arrangement in which a space
+row is a note, and nothing to configure your way into. Notes and sessions meet through
+**references** instead: add a reference to a note from a session, and the wikilink is the
+link between them.
 
 **A space you can shut.** A space folds and unfolds from its own title — the title is the
 control, not a chevron beside it: the header of a ~208px card already carries the space's

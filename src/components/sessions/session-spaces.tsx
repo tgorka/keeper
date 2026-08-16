@@ -24,25 +24,51 @@
  * saying nothing.
  *
  * Every row opens on the `subpath` Rust composed (AD-65) — this file never
- * joins a path and never writes a query. WHICH surface it opens in is Story
- * 45.18's question, not a second one: a file that lives inside a notes vault
- * opens as its note, and one that does not keeps the ONE file target the tree
- * and the Files pane use (AD-109, UX-DR91). Being outside a vault is an
- * ordinary configuration, not a failure, so the fallback says nothing.
+ * joins a path and never writes a query. It opens the ONE file target the tree
+ * and the Files pane use (AD-109, UX-DR91), and only that.
  *
- * A space can also be written INTO (Story 49.2, FR-273): when Rust says the
- * query names exactly one creatable kind AND the session follows the flat
- * contract, the header carries a create control that writes a file that space
- * will list. The kind arrives on the VM — TypeScript never parses
- * `keeper.space`, the rule the notes actions already state.
+ * **There is no "open it as a note" arm, and there cannot be.** Story 49.2
+ * added one; Story 50.1 removed it because no configuration reaches it.
+ * `@/lib/vault-link` resolves a file to a note only when a notes vault CONTAINS
+ * it, and `SessionsConfig::validate` (`keeper-sync/src/profile/mod.rs:648-654`)
+ * refuses a sessions zone that overlaps a notes vault in either direction —
+ * "one folder cannot be both a vault and a sessions zone". A session file is
+ * therefore never a vault note, and a branch no configuration can reach is a
+ * claim the code cannot keep. The text viewer still uses the bridge, for files
+ * that genuinely are in a vault.
  *
- * The shape half of that gate is the sibling verb's, for the sibling verb's
- * reason (`session-file-actions.tsx` gates `New prompt` the same way): a
- * folder-shaped session's pool is `README.md` plus `refs/` and `prompts/`
- * (`sessions_root.rs::read_ref_sources`), while `sessions_file_new_kind` writes
- * a stamped file into the session ROOT. Offering the control there would write
- * a file no space in that session can ever list — a create whose whole result
- * is invisible. Absent, not disabled: the `showNoteInFiles` precedent again.
+ * A space can also be written INTO (Story 49.2, FR-273; Story 50.1, FR-277):
+ * when Rust says the query names exactly one creatable kind, the header carries
+ * a create control that writes a file that space will list. The kind arrives on
+ * the VM — TypeScript never parses `keeper.space`, the rule the notes actions
+ * already state.
+ *
+ * **Where that file goes is the shape's answer, and Rust's.**
+ * `sessions_file_new_kind` asks `keeper_core::sessions::shape::kind_dir`, which
+ * keeps a flat session's files at its root and a folder-shaped session's
+ * references in `refs/` and prompts in `prompts/` — the directories that
+ * shape's pool actually reads. Until 50.1 it always wrote the root, so this
+ * section suppressed the control on every folder-shaped session; that gate is
+ * gone because the write is fixed. What survives is the narrower fact that a
+ * shape can keep no home for a kind at all — the folder contract has no tasks
+ * file, and its log is a `## Log` heading rather than a file — and there the
+ * section says so in one line rather than offering nothing and explaining
+ * nothing.
+ *
+ * **That line is Rust's, not this file's.** `sessions_space_files` asks
+ * `kind_dir` for this session's shape and puts `KindHasNoHome`'s own sentence
+ * on `SessionSpaceFilesVm.noHome`; the section prints it. This file holds no
+ * reading of the mapping and no wording of the refusal — the TypeScript mirror
+ * that used to live here was a second reader of one contract, and it had
+ * already forked the sentence on the day it was written. The shape does not
+ * travel to this component at all any more.
+ *
+ * **The create is the one control here that does not hide.** Edit and Delete
+ * are maintenance and keep the rail's hover-reveal (`space-list.tsx`); create
+ * is the verb a person comes to a space for, and the report that opened Story
+ * 50.1 was literally "I don't see the button". The session create verbs the
+ * same person already knows (`session-file-actions.tsx`) are always-visible
+ * labelled buttons.
  *
  * And a space can be SHUT (Story 49.3, FR-275, FR-276). Each one renders
  * through `FoldSection`, the app's one fold mechanism, with its title as the
@@ -54,7 +80,7 @@
  * ones they never touched.
  */
 import { FilePlus, FolderPlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { spaceIcon } from "@/components/notes/space-icons";
 import { SessionSpaceEditor } from "@/components/sessions/session-space-editor";
@@ -71,13 +97,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { formatDraftAge } from "@/lib/format-time";
-import type { NoteVaultVm, SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
+import type { SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
 import { sessionsFileNewKind, sessionsSpaceDelete, sessionsSpacesRestore } from "@/lib/ipc/client";
-import {
-  ensureNotesVaultsHydrated,
-  notesVaultsStore,
-  useNotesVaultsStore,
-} from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
 import {
   isSpaceFolded,
@@ -87,7 +108,6 @@ import {
 } from "@/lib/stores/session-spaces-fold";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
-import { notePathForFile, openNoteForFile } from "@/lib/vault-link";
 
 /** The section heading. */
 export const SESSION_SPACES_HEADING = "Spaces";
@@ -156,18 +176,6 @@ export const SESSION_SPACE_NEW_NOTE = "New note in";
 export const SESSION_SPACE_NEW_NOTE_FAILED =
   "keeper couldn't create that note. Nothing was written.";
 
-/**
- * What a row says when keeper could not read the vault list at all.
- *
- * Being outside every vault is a configuration and stays silent; not KNOWING
- * is a failure and does not. Without this sentence the two collapse into the
- * same silent file target, and the person whose zone IS a vault is shown the
- * file surface with nothing on screen saying why — the exact behaviour Story
- * 49.2 exists to remove, wearing the fallback's clothes.
- */
-export const SESSION_SPACE_VAULTS_UNKNOWN =
-  "keeper couldn't read the notes vaults, so this opened as a file.";
-
 /** What the delete confirmation asks and answers. */
 export const SESSION_SPACE_DELETE_TITLE = "Delete this space?";
 export const SESSION_SPACE_DELETE_BODY =
@@ -210,13 +218,27 @@ export interface SessionSpacesProps {
    */
   sessionId: string;
   /**
-   * Which contract this session follows — the create control branches on it.
+   * Whether a create is already in flight ANYWHERE on this session, and the
+   * way to claim or release that.
    *
-   * The section itself renders under both shapes: a folder-shaped session's
-   * pool is still read through the zone's spaces, so the LISTINGS are true
-   * there. Writing is what is not. See the shape paragraph at the top.
+   * **One flag across two components, held by `SessionDetail`.**
+   * `sessions_file_new_kind` names the file from the clock to the minute and
+   * from an empty title, so two creates started in the same minute compute
+   * `taken_in` before either write lands and both resolve to
+   * `YYYY-MM-DD-HHMM-untitled.md` — `files::compile_new` emits a plain
+   * `WriteFile`, so the second silently overwrites the first and the `tag:
+   * task` file becomes a `tag: log` one.
+   *
+   * The Files heading (`session-file-actions.tsx`) offers *New log* and *New
+   * prompt* on the same session at the same time, and both post an empty title
+   * through the same command — so a flag private to this section would leave
+   * "New prompt up there, New note down here, in the same minute" as a press a
+   * person can actually perform. Two sibling `useState`s were exactly that.
+   * Serialising in Rust is the real fix and is that crate's to make; one flag
+   * on their common parent is what removes the reachable press.
    */
-  shape: string;
+  writing: boolean;
+  onWriting: (writing: boolean) => void;
   /** The zone's definitions, in rail order — read by the detail surface. */
   spaces: readonly SessionSpaceVm[];
   /**
@@ -231,44 +253,17 @@ export interface SessionSpacesProps {
 export function SessionSpaces({
   rootId,
   sessionId,
-  shape,
+  writing,
+  onWriting,
   spaces,
   selections,
   onChanged,
 }: SessionSpacesProps) {
   const [editing, setEditing] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  /**
-   * ONE create in flight across the whole section, not one per space.
-   *
-   * `sessions_file_new_kind` names the file from the clock to the minute and
-   * from an empty title, so two creates started in the same minute compute
-   * `taken_in` before either write lands and both resolve to
-   * `YYYY-MM-DD-HHMM-untitled.md` — `files::compile_new` emits a plain
-   * `WriteFile`, so the second silently overwrites the first and the `tag:
-   * task` file becomes a `tag: log` one. Per-space flags are what made that
-   * reachable from the UI; the Files heading has always shared one `busy` for
-   * the same reason (`session-file-actions.tsx`). Serialising in Rust is the
-   * real fix and is that crate's to make; one flag here is what removes the
-   * press a person can actually perform.
-   */
-  const [writing, setWriting] = useState(false);
   const [deleting, setDeleting] = useState<SessionSpaceVm | null>(null);
   const [restoring, setRestoring] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const vaults = useNotesVaultsStore((each) => each.vaults);
-  /** Which row press is the current one — see {@link openSpaceFile}. */
-  const openSeq = useRef(0);
-
-  // The same hydration the text viewer does, for the same reason: Sessions can
-  // be the first surface a window opens and nothing else here reads the vault
-  // list, so without this every row would resolve to "no vault" until the
-  // person had visited Notes — a feature that works for whoever wrote it and
-  // nobody else.
-  useEffect(() => {
-    void ensureNotesVaultsHydrated();
-  }, []);
-
   // Every tag every file in this session carries, for the editor's chooser. The
   // session's own rather than the zone's, and taken from what the spaces already
   // selected rather than from a sixth command: the pool was read once to answer
@@ -335,95 +330,32 @@ export function SessionSpaces({
 
   /**
    * Open one of this session's files — the ONE opener the row click and the
-   * create both go through (Story 49.2, FR-274).
+   * create both go through (FR-274).
    *
-   * **Note first, file honestly.** `notePathForFile` is synchronous precisely
-   * so a caller can ask whether the note EXISTS before committing to a
-   * surface: inside a registered vault the full editor is what the person
-   * meant by "open the note", and outside every vault the file target is not a
-   * degraded answer, it is the only correct one — which is why that arm says
-   * nothing. Guessing the notes view for a zone that is not a vault would land
-   * them in a pane with nothing in it.
+   * The ONE file target the tree and the Files pane use (AD-109, UX-DR91), on
+   * the `subpath` Rust composed (AD-65): a second path-join here would be a
+   * second answer to where a file lives.
    *
-   * **`null` vaults is not an empty vault list.** `notes-vaults.ts` keeps that
-   * distinction on purpose — "you have no vault" versus "keeper has not
-   * looked" — and collapsing it here would open the FILE surface for a
-   * vault-backed zone during the hydration window, and forever after a
-   * rejected `notes_vaults` read, since the mount's one best-effort attempt
-   * leaves the mirror unhydrated. So an unknown list is awaited rather than
-   * read as empty, and if it is STILL unknown the fallback speaks
-   * ({@link SESSION_SPACE_VAULTS_UNKNOWN}) instead of pretending to be the
-   * ordinary out-of-vault case.
+   * **Story 49.2's note arm is gone (Story 50.1).** It opened a row as a vault
+   * note whenever `@/lib/vault-link` placed the file inside a registered vault
+   * — and `SessionsConfig::validate` refuses a sessions zone that overlaps a
+   * notes vault in either direction, so that placement is a configuration the
+   * product does not allow to exist. With the arm went the press guard and the
+   * vault-list hydration it needed: this opener is one synchronous store write
+   * with nothing to race and nothing to say.
    *
-   * A vault-backed file that the index cannot place still opens: `openNoteForFile`
-   * hands back Story 45.18's own sentence, this prints it, and the file viewer
-   * shows the bytes. Refusing to open anything because the nicer surface was
-   * unavailable would be keeper withholding a file it can read.
-   *
-   * **`"replace"`, both arms.** A row is a single click and AD-90 gives a
-   * single click the replace gesture; the file arm always used it, so the note
-   * arm asks for it too. Otherwise one click grows the strip inside a vault
-   * and replaces outside it.
+   * `"replace"` is `setActiveTarget`'s own gesture, which is what AD-90 gives a
+   * single click on a list row.
    */
   const openSpaceFile = useCallback(
     (subpath: string) => {
-      // The `requestSeq` idiom this codebase already uses for a race it cannot
-      // order (`command-palette.tsx`, `recording-audio-controls.tsx`): resolving
-      // a row costs one or two IPC round trips whose price depends on how
-      // crowded that file's own vault directory is, so two rows clicked in
-      // succession really can finish out of order — and the loser would take
-      // the panel, the active vault, the primary view and the notice with it.
-      openSeq.current += 1;
-      const press = openSeq.current;
-      // Superseded is `press !== openSeq.current`, checked at every point this
-      // resolution would touch shared state.
-      const asFile = () =>
-        panelsStore.getState().setActiveTarget({
-          kind: "file",
-          profileId: rootId,
-          relativePath: subpath,
-        });
-      const decide = (known: readonly NoteVaultVm[]) => {
-        if (press !== openSeq.current) {
-          return;
-        }
-        if (notePathForFile(known, rootId, subpath) === null) {
-          asFile();
-          return;
-        }
-        void openNoteForFile(known, rootId, subpath, {
-          gesture: "replace",
-          // Inside the bridge too, not only out here: the vault switch and the
-          // panel target both happen in there, past the awaits.
-          stillWanted: () => press === openSeq.current,
-        }).then((sentence) => {
-          if (press !== openSeq.current || sentence === null) {
-            return;
-          }
-          setNotice(sentence);
-          asFile();
-        });
-      };
-      // A new press, so whatever the last one said is no longer the answer.
-      setNotice(null);
-      if (vaults !== null) {
-        decide(vaults);
-        return;
-      }
-      void ensureNotesVaultsHydrated().then(() => {
-        const known = notesVaultsStore.getState().vaults;
-        if (known !== null) {
-          decide(known);
-          return;
-        }
-        if (press !== openSeq.current) {
-          return;
-        }
-        setNotice(SESSION_SPACE_VAULTS_UNKNOWN);
-        asFile();
+      panelsStore.getState().setActiveTarget({
+        kind: "file",
+        profileId: rootId,
+        relativePath: subpath,
       });
     },
-    [vaults, rootId],
+    [rootId],
   );
 
   const edited = spaces.find((space) => space.id === editing) ?? null;
@@ -484,9 +416,8 @@ export function SessionSpaces({
             nowMs={nowMs}
             rootId={rootId}
             sessionId={sessionId}
-            shape={shape}
             writing={writing}
-            onWriting={setWriting}
+            onWriting={onWriting}
             onOpen={openSpaceFile}
             onNotice={setNotice}
             onChanged={onChanged}
@@ -549,7 +480,6 @@ function SpaceSection({
   nowMs,
   rootId,
   sessionId,
-  shape,
   writing,
   onWriting,
   onOpen,
@@ -564,9 +494,7 @@ function SpaceSection({
   nowMs: number;
   rootId: string;
   sessionId: string;
-  /** The session's contract — the create is a flat-shape verb. */
-  shape: string;
-  /** Whether ANY space in this section already has a create in flight. */
+  /** Whether ANY create on this session already has one in flight. */
   writing: boolean;
   /** Claim or release that one flag. */
   onWriting: (writing: boolean) => void;
@@ -588,15 +516,22 @@ function SpaceSection({
       : null;
   const Glyph = spaceIcon(space.icon);
   const files = selection?.files ?? [];
-  // Rust's answer, and the only thing that decides whether this space can be
-  // written into — the query above is never parsed here.
+  // Rust's answer, and the only thing that decides whether this space's QUERY
+  // can be written into — the query is never parsed here.
   const kind = space.newFileKind;
-  // …and the shape, which the query cannot know about. A folder-shaped
-  // session's pool excludes root-level markdown, and the root is where
-  // `sessions_file_new_kind` writes, so a create there produces a file this
-  // space can never list. `New prompt` refuses on the same shape for the same
-  // family of reason.
-  const creatable = kind !== null && shape === "flat";
+  // …and whether this session's contract keeps anywhere to put that kind, in
+  // Rust's own words. `shape::kind_dir` decides it, `sessions_space_files`
+  // projects its `KindHasNoHome` sentence onto this payload, and this file
+  // prints it. There is deliberately no TypeScript reading of the mapping: a
+  // second one drifts, and the copy that lived here had already forked the
+  // refusal's wording on the day it was written.
+  //
+  // Absent AND explained, rather than absent in silence: a section that offers
+  // nothing and says nothing is the report that opened this story. While the
+  // selections have not arrived there is no answer yet, so the verb waits with
+  // the rows rather than appearing and then vanishing.
+  const noHome = selection?.noHome ?? null;
+  const creatable = kind !== null && selection !== null && noHome === null;
 
   // Whether this space is folded, and where that is remembered (Story 49.3,
   // FR-275). Keyed by root and space id rather than by session: the definition
@@ -688,11 +623,20 @@ function SpaceSection({
           {!broken && !loading && (
             <span className="shrink-0 text-muted-foreground text-xs">{files.length}</span>
           )}
-          {/* Always in the DOM, revealed on hover or focus: an affordance that
-              only exists under a pointer is one a keyboard cannot reach. The
-              destructive one is last, so a hand travelling along the row reaches
-              edit before delete, and create is first because it is what a person
-              comes to a space to do — the other two are maintenance.
+          {/* Edit and Delete are in the DOM always and revealed on hover or
+              focus — the notes rail's pattern for a per-space row control
+              (`space-list.tsx`), and `focus-visible:opacity-100` is what keeps
+              an affordance that only exists under a pointer reachable from a
+              keyboard. The destructive one is last, so a hand travelling along
+              the row reaches edit before delete.
+
+              **Create does not hide** (Story 50.1). It is first because it is
+              what a person comes to a space to DO, and hover-reveal is the
+              wrong pattern for the one verb a section exists to offer: the
+              report that opened this story was "I don't see the button", and
+              the session create verbs the same person already knows
+              (`session-file-actions.tsx`) are always-visible labelled buttons.
+              Maintenance may hide; the verb may not.
 
               In `actions`, which is OUTSIDE the folded region (Story 49.3,
               `sidebar-group.tsx:20-25`): a space you have shut is still a space
@@ -705,9 +649,9 @@ function SpaceSection({
               word wide — which is also why the disclosure is the title rather
               than a fourth button. When the space cannot be written into,
               create is ABSENT and not disabled — a control that exists only to
-              refuse teaches nothing (the `showNoteInFiles` precedent). That
-              covers both halves of `creatable`: no kind, and the folder
-              contract. */}
+              refuse teaches nothing (the `showNoteInFiles` precedent) — and
+              when the reason is this session's shape, {@link noHome} says it in
+              the notice below rather than leaving a gap. */}
           {creatable && (
             <button
               type="button"
@@ -716,7 +660,6 @@ function SpaceSection({
               disabled={writing}
               className={cn(
                 "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-                "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
                 "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
               )}
             >
@@ -774,6 +717,16 @@ function SpaceSection({
               sentence for the same state. */}
           {selection?.error != null && selection.error !== space.error && (
             <p className="text-destructive text-xs">{selection.error}</p>
+          )}
+          {/* Why this space offers no create, when the reason is the session's
+              own contract rather than its query. Muted, not destructive:
+              nothing is broken and nothing failed — this shape simply keeps
+              that kind somewhere other than in a file, and the person is
+              entitled to know which. */}
+          {noHome !== null && (
+            <p data-slot="space-no-home" className="text-muted-foreground text-xs">
+              {noHome}
+            </p>
           )}
         </>
       }

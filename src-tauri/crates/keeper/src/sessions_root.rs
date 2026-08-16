@@ -29,7 +29,9 @@ use keeper_core::sessions::model::{
     WORKSPACE_DIR,
 };
 use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
-use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, ABOUT};
+use keeper_core::sessions::shape::{
+    shape as shape_of, KindTag, Shape, ABOUT, PROMPTS_DIR, REFS_DIR,
+};
 use keeper_core::sessions::spaces::{self, SessionSpace, SPACES_DIR};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
@@ -1009,7 +1011,12 @@ pub fn session_pool(root_id: &str, session_id: &str) -> Option<SessionPool> {
 const REF_SCAN_BUDGET: usize = 10 * 1024 * 1024;
 
 /// Where references are read from, after the README, in reading order.
-const REF_DIRS: [&str; 2] = ["refs", "prompts"];
+///
+/// The domain's own constants, not a third spelling of two folder names: this
+/// array is the READER that `shape::kind_dir` writes for, and the day the two
+/// disagree a create lands where the pool does not look — the exact defect the
+/// mapping was made public to prevent.
+const REF_DIRS: [&str; 2] = [REFS_DIR, PROMPTS_DIR];
 
 /// [`ref_sources`] over a plain directory — the half that is about files rather
 /// than about which session, so a test can hand it a folder.

@@ -195,3 +195,35 @@ coordinator, each file restored and the restore verified by `git status` being e
 appear in Tasks rather than in Unfiled; press a row and get the note editor with its properties and
 backlinks, not the plain file viewer; do the same in a zone outside every vault and get the file
 viewer with no sentence; open a folder-shaped session and find no create control on any space.
+
+## Superseded
+
+Story 50.1 removed two of this story's claims. Recorded here rather than dropped, because both
+were argued for at the time and the arguments are what changed.
+
+**1. The note arm, and the acceptance sentence that promised it.** This spec said a space row
+opens as a vault note when the zone lives inside a registered notes vault, and matrix rows 9, 11
+and 12 tested that arm. No configuration reaches it. `notePathForFile` resolves a file only when a
+vault CONTAINS it, and `SessionsConfig::validate` (`keeper-sync/src/profile/mod.rs:648-654`)
+refuses a sessions zone that overlaps a notes vault in either direction — *"one folder cannot be
+both a vault and a sessions zone"*, because two indexers claiming one tree is a state nobody can
+reason about afterwards. So the acceptance sentence described a machine that cannot be configured,
+and the arm was a promise the product forbids keeping. 50.1 deleted the arm, the
+`SESSION_SPACE_VAULTS_UNKNOWN` fallback, the `stillWanted` press guard and the vault-list
+hydration that existed only for them, along with rows 9, 11 and 12. Row 10 survives as the one
+opener case, now seeded with the impossible vault-contains-zone fixture so that re-adding the arm
+turns it red. `src/lib/vault-link/**` is untouched: the text viewer still resolves files that
+genuinely are in a vault.
+
+**2. The flat-shape half of the create gate.** Design Notes deviation 1 recorded that the control
+is gated on `shape === "flat"` because `sessions_file_new_kind` writes into the session ROOT while
+a folder-shaped pool reads `README.md` plus `refs/` and `prompts/`. The premise was exactly true
+and the remedy treated the symptom: the fix is to write where the pool reads. 50.1 made the writer
+shape-aware through `keeper_core::sessions::shape::kind_dir`, so References and Prompts are
+creatable in a folder-shaped session and the blanket gate is gone. What survives is narrower and
+now stated where the person is looking: the folder contract has no tasks file, and its log is a
+`## Log` heading rather than a file.
+
+The same correction applies to `session-file-actions.tsx`'s `New prompt` gate, whose recorded
+reason ("the kind is the directory; a tagged file there would be filed twice") was never true of
+the reader — `pool::read_one` derives a kind from tags alone (AD-120).

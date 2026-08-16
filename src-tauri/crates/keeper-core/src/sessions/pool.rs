@@ -628,6 +628,35 @@ mod tests {
         assert_eq!(pool.unfiled[0].rel, "README.md");
     }
 
+    /// AD-120, from the read side, and the guard Story 50.1 owes its own fix.
+    ///
+    /// 50.1 teaches the create verb where a folder-shaped session keeps each
+    /// kind — `refs/` for a reference, `prompts/` for a prompt
+    /// (`shape::kind_dir`). The risk that change introduces is that somebody
+    /// concludes the directory is now what makes a file a reference, and drops
+    /// the tag from the write. It does not: the reader derives the kind from
+    /// tags alone and never looks at the path, so an untagged file in `refs/`
+    /// is *unfiled* — present in the pool, listed by no space, and named by the
+    /// detail's Unfiled notice. The directory is where a create PUTS a file;
+    /// the tag is what makes it that kind.
+    #[test]
+    fn a_file_in_refs_without_the_tag_is_still_unfiled() {
+        let pool = read_pool(&[
+            file("refs/tagged.md", "---\ntags: [ref]\n---\n# Tagged\n"),
+            file("refs/bare.md", "# Someone wrote this by hand\n"),
+            file("prompts/bare.md", "# And this one\n"),
+        ]);
+
+        assert_eq!(pool.refs.len(), 1, "only the tagged one is a reference");
+        assert_eq!(pool.refs[0].rel, "refs/tagged.md");
+        assert!(pool.prompts.is_empty(), "`prompts/` confers nothing either");
+        let unfiled: Vec<&str> = pool.unfiled.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(unfiled, ["prompts/bare.md", "refs/bare.md"]);
+        // Said once more at the level the mistake would be made at: `read_one`
+        // is handed the `refs/` prefix and still answers `None`.
+        assert_eq!(read_one(file("refs/bare.md", "# x\n")).kind, None);
+    }
+
     /// Inline tags count: one tag set, however it was written.
     #[test]
     fn an_inline_tag_declares_a_kind_too() {

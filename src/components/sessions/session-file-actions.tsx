@@ -29,6 +29,14 @@
  * about collisions the moment an agent wrote a file between the read and the
  * create.
  *
+ * **The in-flight flag is not this component's.** Every create here posts an
+ * empty title, and so does the create in every writable space below
+ * ({@link "@/components/sessions/session-spaces"}); Rust names such a file from
+ * the clock to the minute, so two of them started in the same minute resolve to
+ * one filename and the second write wins. The flag that removes that press has
+ * to span both surfaces, so `SessionDetail` holds it and both children are
+ * handed it.
+ *
  * The two menus are native `<select>` elements, matching
  * {@link "@/components/sessions/session-space-editor"} rather than the Radix
  * `Select` used elsewhere in the app. One of them must offer the session's own
@@ -100,6 +108,21 @@ export interface SessionFileActionsProps {
    * destination keeper is going to refuse is a control that exists to fail.
    */
   entries: readonly SessionEntryVm[];
+  /**
+   * Whether a create is already in flight ANYWHERE on this session, and the
+   * way to claim or release that.
+   *
+   * **Held by `SessionDetail`, shared with `SessionSpaces`.** Both surfaces
+   * post `sessions_file_new_kind` with an empty title, which names the file
+   * from the clock to the minute — so *New prompt* here and *New note* in a
+   * space, pressed in the same minute, both resolve to
+   * `YYYY-MM-DD-HHMM-untitled.md` and the second `WriteFile` silently
+   * overwrites the first. A flag private to this component only removed half
+   * of that press. See {@link "@/components/sessions/session-spaces"}'s
+   * `writing` prop, which is the same flag.
+   */
+  busy: boolean;
+  onBusy: (busy: boolean) => void;
   /** Re-read the surface after a write, without waiting on the watcher. */
   onChanged: () => void;
 }
@@ -109,6 +132,8 @@ export function SessionFileActions({
   sessionId,
   shape,
   entries,
+  busy,
+  onBusy,
   onChanged,
 }: SessionFileActionsProps) {
   const titleId = useId();
@@ -118,7 +143,6 @@ export function SessionFileActions({
   const [title, setTitle] = useState("");
   const [kind, setKind] = useState<SessionFileKind>("md");
   const [parent, setParent] = useState("");
-  const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   // Open what was just written, through the one file target (AD-109), on the
@@ -139,14 +163,14 @@ export function SessionFileActions({
 
   const newKind = useCallback(
     (tag: string, fallback: string) => {
-      setBusy(true);
+      onBusy(true);
       setNotice(null);
       sessionsFileNewKind(rootId, sessionId, tag, "")
         .then(opened)
         .catch((raw: unknown) => setNotice(syncErrorMessage(raw, fallback)))
-        .finally(() => setBusy(false));
+        .finally(() => onBusy(false));
     },
-    [rootId, sessionId, opened],
+    [rootId, sessionId, opened, onBusy],
   );
 
   const newLog = useCallback(() => {
@@ -157,18 +181,18 @@ export function SessionFileActions({
     // The folder contract's log is a heading inside README.md, and this is the
     // command that writes one. It answers with nothing to open — the README was
     // already reachable — so this arm only re-reads.
-    setBusy(true);
+    onBusy(true);
     setNotice(null);
     sessionsLogToday(rootId, sessionId)
       .then(() => onChanged())
       .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_LOG_FAILED)))
-      .finally(() => setBusy(false));
-  }, [shape, rootId, sessionId, onChanged, newKind]);
+      .finally(() => onBusy(false));
+  }, [shape, rootId, sessionId, onChanged, newKind, onBusy]);
 
   const newPrompt = useCallback(() => newKind("prompt", SESSION_FILE_NEW_PROMPT_FAILED), [newKind]);
 
   const create = useCallback(() => {
-    setBusy(true);
+    onBusy(true);
     setNotice(null);
     sessionsFileNew(rootId, sessionId, parent, title, kind)
       .then((subpath) => {
@@ -177,8 +201,8 @@ export function SessionFileActions({
         opened(subpath);
       })
       .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_FAILED)))
-      .finally(() => setBusy(false));
-  }, [rootId, sessionId, parent, title, kind, opened]);
+      .finally(() => onBusy(false));
+  }, [rootId, sessionId, parent, title, kind, opened, onBusy]);
 
   const folders = entries.filter((entry) => entry.isDir && entry.locked === null);
 
@@ -189,16 +213,23 @@ export function SessionFileActions({
           <NotebookPen aria-hidden className="size-3.5" />
           {SESSION_FILE_NEW_LOG_LABEL}
         </Button>
-        {/* A prompt is a flat-contract kind. A folder-shaped session keeps its
-            prompts in `prompts/`, where the kind is the directory; a tagged file
-            there would be filed twice and the two answers could disagree.
-            Migration is how such a session gets this button. */}
-        {shape === "flat" && (
-          <Button type="button" variant="ghost" size="sm" onClick={newPrompt} disabled={busy}>
-            <MessageSquarePlus aria-hidden className="size-3.5" />
-            {SESSION_FILE_NEW_PROMPT_LABEL}
-          </Button>
-        )}
+        {/* Offered under both contracts (Story 50.1). The gate that used to sit
+            here was `shape === "flat"`, and its recorded reason —
+            "a folder-shaped session keeps its prompts in `prompts/`, where the
+            kind is the directory; a tagged file there would be filed twice" —
+            was never true of the reader: `pool::read_one` derives a kind from
+            tags alone (AD-120) and never looks at the path, so a tagged file in
+            `prompts/` is filed once and an untagged one is filed not at all.
+            The real reason was the writer: `sessions_file_new_kind` wrote into
+            the session ROOT, which a folder-shaped session's pool does not
+            read. It now asks `shape::kind_dir` and writes into `prompts/`, so
+            the gate is a leftover and not a guard. A kind this shape genuinely
+            has no home for is refused by Rust with its own sentence, which
+            lands in the notice below. */}
+        <Button type="button" variant="ghost" size="sm" onClick={newPrompt} disabled={busy}>
+          <MessageSquarePlus aria-hidden className="size-3.5" />
+          {SESSION_FILE_NEW_PROMPT_LABEL}
+        </Button>
         <Button
           type="button"
           variant="ghost"

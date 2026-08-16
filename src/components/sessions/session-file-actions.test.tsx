@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntryVm } from "@/lib/ipc/client";
 
@@ -58,18 +59,34 @@ function entries(): SessionEntryVm[] {
   ];
 }
 
-function mount(over: Partial<React.ComponentProps<typeof SessionFileActions>> = {}) {
-  const onChanged = vi.fn();
-  const result = render(
+/**
+ * The heading under a parent that owns the one create-in-flight flag.
+ *
+ * `busy` is a PROP now, not this component's state: every writable space below
+ * offers a create through the same command and with the same empty title, so
+ * the flag that removes the colliding press has to span both surfaces and
+ * `SessionDetail` holds it. This harness plays that parent. That the two
+ * components actually share ONE flag is `session-detail.test.tsx`'s claim.
+ */
+function Harness(over: Partial<React.ComponentProps<typeof SessionFileActions>>) {
+  const [busy, setBusy] = useState(false);
+  return (
     <SessionFileActions
       rootId="tgdrive"
       sessionId="active/2026-08-10-keeper"
       shape="flat"
       entries={entries()}
-      onChanged={onChanged}
+      busy={busy}
+      onBusy={setBusy}
+      onChanged={() => {}}
       {...over}
-    />,
+    />
   );
+}
+
+function mount(over: Partial<React.ComponentProps<typeof SessionFileActions>> = {}) {
+  const onChanged = vi.fn();
+  const result = render(<Harness onChanged={onChanged} {...over} />);
   return { ...result, onChanged };
 }
 
@@ -125,12 +142,37 @@ describe("SessionFileActions", () => {
     expect(panelsStore.getState().panels.find((p) => p.target?.kind === "file")).toBeUndefined();
   });
 
-  it("offers no prompt button where a prompt is a folder, not a tag", () => {
+  /**
+   * The gate this replaces (Story 50.1). `New prompt` used to be absent under
+   * `shape === "folder"`, and the reason recorded beside it — "a folder-shaped
+   * session keeps its prompts in `prompts/`, where the kind is the directory;
+   * a tagged file there would be filed twice" — was never true of the reader:
+   * `pool::read_one` derives a kind from tags alone (AD-120). The real reason
+   * was the writer, which put its stamped file in the session ROOT; it now asks
+   * `shape::kind_dir` and writes into `prompts/`, which is exactly where that
+   * shape's pool reads. So the button is offered, and it sends the same kind it
+   * sends on a flat session — where the file lands is Rust's answer and
+   * `shape.rs`'s own tests own it.
+   *
+   * This case is what fails if someone re-adds the gate.
+   */
+  it("offers the prompt button on a folder-shaped session, where prompts/ is read", async () => {
     mount({ shape: "folder" });
-    expect(
-      screen.queryByRole("button", { name: SESSION_FILE_NEW_PROMPT_LABEL }),
-    ).not.toBeInTheDocument();
-    // The other two survive: a folder session still logs and still adds files.
+
+    const prompt = screen.getByRole("button", { name: SESSION_FILE_NEW_PROMPT_LABEL });
+    expect(prompt).toBeInTheDocument();
+    prompt.click();
+
+    await waitFor(() => {
+      expect(sessionsFileNewKind).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "prompt",
+        "",
+      );
+    });
+    // The other two are unchanged: a folder session still logs — through the
+    // README, which the case above owns — and still adds files.
     expect(screen.getByRole("button", { name: SESSION_FILE_NEW_LOG_LABEL })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: SESSION_FILE_NEW_LABEL })).toBeInTheDocument();
   });
