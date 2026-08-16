@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   SessionDetailVm,
@@ -15,6 +15,9 @@ const sessionsSpaces = vi.fn();
 const sessionsSpaceFiles = vi.fn();
 const sessionsFileNewKind = vi.fn();
 const listenSessionsChanged = vi.fn();
+// The fold default the detail reads on mount (Story 49.3): named here rather
+// than stubbed inline, because the restore cases below turn it on and off.
+const sessionsSpacesFoldedGet = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
@@ -52,6 +55,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesTree: vi.fn(),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
+  sessionsSpacesFoldedGet: () => sessionsSpacesFoldedGet(),
   revealPath: (path: unknown) => revealPath(path),
 }));
 
@@ -81,8 +85,18 @@ import {
   SESSION_SPACES_HEADING,
 } from "@/components/sessions/session-spaces";
 import { SESSION_TREE_EMPTY } from "@/components/sessions/session-tree";
+import { writeCookie } from "@/components/ui/cookie-writer";
 import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  readSessionSpacesFold,
+  resetSessionSpacesFoldForTest,
+  SESSION_SPACES_FOLD_COOKIE,
+  sessionSpacesFoldCookie,
+  sessionSpacesFoldStore,
+  setSpacesFoldedDefault,
+  spaceFoldKey,
+} from "@/lib/stores/session-spaces-fold";
 
 const NOW = Date.now();
 
@@ -190,9 +204,11 @@ function refs(over: Partial<SessionReferencesVm> = {}): SessionReferencesVm {
  * The default below is a zone with none, which is the ordinary state of a
  * session that predates spaces — and the state every other case in this file
  * wants, because a section listing files would put a second copy of each
- * filename on the surface and make "the tree shows X" ambiguous.
+ * filename on the surface and make "the tree shows X" ambiguous. The overrides
+ * are for the fold cases, which need a second space to tell an untouched one
+ * apart from a recorded one.
  */
-function space(): SessionSpaceVm {
+function space(over: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
   return {
     id: "_spaces/log.md",
     name: "Log",
@@ -205,6 +221,7 @@ function space(): SessionSpaceVm {
     warnings: [],
     error: null,
     newFileKind: "log",
+    ...over,
   };
 }
 
@@ -215,12 +232,18 @@ beforeEach(() => {
   sessionsSpaces.mockResolvedValue([]);
   sessionsSpaceFiles.mockResolvedValue([]);
   listenSessionsChanged.mockResolvedValue(() => {});
+  // Unfolded, which is the registry's own default. A case that wants the other
+  // answer says so.
+  sessionsSpacesFoldedGet.mockResolvedValue(false);
   panelsStore.setState(panelsStore.getInitialState(), true);
   resetNotesVaultsStoreForTest();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  resetSessionSpacesFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing the fold this suite wrote
+  document.cookie = `${SESSION_SPACES_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 function mount() {
@@ -506,5 +529,159 @@ describe("SessionDetail", () => {
     expect(within(log).getAllByRole("listitem")).toHaveLength(2);
     expect(screen.getByText(SESSION_SPACES_EMPTY)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Matrix row 5 (Story 49.3, FR-275, FR-276) — the hydration, at the mount point.
+ *
+ * **Why this cannot live in the store's own suite (DW-172).** A `hydrate…` that
+ * nothing calls is invisible from below: `session-spaces-fold.test.ts` passes
+ * in full with the restore never wired up, and the person gets a fold that
+ * forgets itself every time they leave the session. Story 48.1's mutation M3
+ * measured exactly this — deleting `hydrateColumnFold` from `AppShell` killed
+ * one test, the one at the mount point. So the restore is asserted HERE, by
+ * mounting the real surface twice with nothing carried across but the cookie.
+ */
+describe("SessionDetail restores the spaces' fold", () => {
+  const LOG = spaceFoldKey("tgdrive", "_spaces/log.md");
+
+  it("row 5: finds a folded space folded after a remount, from the cookie alone", async () => {
+    sessionsSpaces.mockResolvedValue([space()]);
+    const first = mount();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Collapse Log" }));
+    const written = document.cookie;
+    expect(readSessionSpacesFold(written).get(LOG)).toBe(true);
+    first.unmount();
+
+    // A cold start: nothing in memory, and no test-side hydrate either. If the
+    // detail stops calling it, this is the assertion that goes red.
+    resetSessionSpacesFoldForTest();
+    mount();
+
+    expect(await screen.findByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /** The other half of the same call: the SETTING reaches the fold, so a space
+   *  nobody has touched arrives the way `sessions.spaces_folded` says. */
+  it("hands the default it read to a space with nothing recorded", async () => {
+    sessionsSpacesFoldedGet.mockResolvedValue(true);
+    sessionsSpaces.mockResolvedValue([space()]);
+
+    mount();
+
+    expect(await screen.findByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(sessionsSpacesFoldedGet).toHaveBeenCalled();
+  });
+
+  /**
+   * The race the restore used to lose (finding 1). `readSessionSpacesFold`
+   * needs no IPC, but the spaces payload arrives from its own `invoke` — so a
+   * restore gated behind `sessions_spaces_folded_get` let the spaces win and
+   * paint every hand-folded space OPEN before snapping it shut. Here the
+   * setting read never resolves at all: the fold the person made is on screen
+   * anyway, which it cannot be if the cookie waits for Rust.
+   */
+  it("restores a folded space before the setting read has resolved", async () => {
+    sessionsSpacesFoldedGet.mockReturnValue(new Promise<boolean>(() => {}));
+    sessionsSpaces.mockResolvedValue([space()]);
+    writeCookie(sessionSpacesFoldCookie(new Map([[LOG, true]])));
+
+    mount();
+
+    expect(await screen.findByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /**
+   * The latch is about the COOKIE, not the setting. A second detail must not
+   * overwrite a fold somebody has changed since the first — and it must still
+   * arrive on the setting they changed in Settings meanwhile, or a switch they
+   * just flipped would look like it had done nothing until the next restart.
+   */
+  it("picks up a setting changed since the first detail mounted", async () => {
+    sessionsSpaces.mockResolvedValue([space()]);
+    const first = mount();
+    expect(await screen.findByRole("button", { name: "Collapse Log" })).toBeInTheDocument();
+    first.unmount();
+
+    sessionsSpacesFoldedGet.mockResolvedValue(true);
+    mount();
+
+    expect(await screen.findByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /**
+   * Settings moves the fallback the moment the switch does. A read this detail
+   * issued BEFORE that flip is older news than the flip, and applying it would
+   * silently undo it — the protection the `hydrate…` latch used to give for
+   * free, back when the fallback was seeded inside it.
+   */
+  it("does not let a read in flight undo a setting flipped while it was out", async () => {
+    let answer: (value: boolean) => void = () => {};
+    sessionsSpacesFoldedGet.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    sessionsSpaces.mockResolvedValue([space()]);
+    mount();
+    expect(await screen.findByRole("button", { name: "Collapse Log" })).toBeInTheDocument();
+
+    // The switch in Settings, while this detail's read is still out.
+    act(() => setSpacesFoldedDefault(true));
+    expect(screen.getByRole("button", { name: "Expand Log" })).toBeInTheDocument();
+
+    // Resolved inside `act`, so the read's `.then` has certainly run by the
+    // assertion: what is being measured is that it changed nothing.
+    await act(async () => {
+      answer(false);
+    });
+
+    expect(sessionSpacesFoldStore.getState().defaultFolded).toBe(true);
+    expect(screen.getByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /**
+   * A read that fails leaves every space where the person left it: the ones
+   * nobody has touched reachable, and the ones somebody folded still folded.
+   * Folding sections because keeper could not reach its own settings table
+   * would be a refusal dressed as a preference.
+   *
+   * Log carries a RECORD on purpose — that is what tells "hydrated, and the
+   * fallback stood" apart from "never hydrated at all", since an un-hydrated
+   * store answers unfolded for both. Without it the case stays green with the
+   * whole restore deleted.
+   */
+  it("leaves untouched spaces open when the setting cannot be read, and folded ones folded", async () => {
+    sessionsSpacesFoldedGet.mockRejectedValue(new Error("no registry"));
+    sessionsSpaces.mockResolvedValue([space(), space({ id: "_spaces/tasks.md", name: "Tasks" })]);
+    writeCookie(sessionSpacesFoldCookie(new Map([[LOG, true]])));
+
+    mount();
+
+    expect(await screen.findByRole("button", { name: "Collapse Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Expand Log" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 });

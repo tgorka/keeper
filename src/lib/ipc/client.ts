@@ -2670,6 +2670,32 @@ export async function menuBarPresenceSet(enabled: boolean): Promise<void> {
 }
 
 /**
+ * Read the default fold state of a session's spaces (Story 49.3, FR-276). Reads the
+ * persisted `sessions.spaces_folded` setting; off by default (spaces arrive unfolded).
+ *
+ * The DEFAULT, not the fold. A space somebody folded or unfolded by hand keeps their
+ * answer in the `keeper_session_spaces_fold` cookie — chrome they arranged, which never
+ * travels through IPC. This value only decides what a space with nothing recorded does.
+ * Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function sessionsSpacesFoldedGet(): Promise<boolean> {
+  return await invoke<boolean>("sessions_spaces_folded_get");
+}
+
+/**
+ * Set the default fold state of a session's spaces (Story 49.3, FR-276). Persists the
+ * choice into `sessions.spaces_folded`; only ever called from an explicit user toggle in
+ * Settings.
+ *
+ * Changing it moves only the spaces nobody has touched: a space with a recorded fold
+ * keeps it, because the cookie is the person's own answer and this is merely the one
+ * they never gave. Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function sessionsSpacesFoldedSet(folded: boolean): Promise<void> {
+  await invoke<void>("sessions_spaces_folded_set", { folded });
+}
+
+/**
  * Read whether a Network label is currently muted (Story 10.2). Reads the persisted
  * `muted_networks` table. Rejects with the {@link IpcError} envelope on failure.
  */

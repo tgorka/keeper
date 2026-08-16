@@ -837,6 +837,8 @@ pub fn run() {
                 ipc::launch_at_login_set,
                 ipc::menu_bar_presence_get,
                 ipc::menu_bar_presence_set,
+                ipc::sessions_spaces_folded_get,
+                ipc::sessions_spaces_folded_set,
                 ipc::debug_mode_get,
                 ipc::debug_mode_set,
                 ipc::debug_log_tail,

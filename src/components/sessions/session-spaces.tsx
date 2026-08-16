@@ -43,9 +43,19 @@
  * a stamped file into the session ROOT. Offering the control there would write
  * a file no space in that session can ever list — a create whose whole result
  * is invisible. Absent, not disabled: the `showNoteInFiles` precedent again.
+ *
+ * And a space can be SHUT (Story 49.3, FR-275, FR-276). Each one renders
+ * through `FoldSection`, the app's one fold mechanism, with its title as the
+ * disclosure and its header — count, lamp, create, edit, delete, and whatever
+ * they had to say — outside the folded region. Where the fold is remembered and
+ * what an untouched space does are two different questions with two different
+ * answers, and {@link "@/lib/stores/session-spaces-fold"} holds both: a cookie
+ * for the spaces this person arranged, and `sessions.spaces_folded` for the
+ * ones they never touched.
  */
 import { FilePlus, FolderPlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FoldSection } from "@/components/layout/sidebar-group";
 import { spaceIcon } from "@/components/notes/space-icons";
 import { SessionSpaceEditor } from "@/components/sessions/session-space-editor";
 import {
@@ -69,6 +79,12 @@ import {
   useNotesVaultsStore,
 } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  isSpaceFolded,
+  setSpaceFolded,
+  spaceFoldKey,
+  useSessionSpacesFold,
+} from "@/lib/stores/session-spaces-fold";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 import { notePathForFile, openNoteForFile } from "@/lib/vault-link";
@@ -162,8 +178,26 @@ export const SESSION_SPACE_DELETE_FAILED = "keeper couldn't delete this space.";
 /** One row, for tests that need to find one by path. */
 export const SESSION_SPACE_FILE_TESTID = "session-space-file";
 
-/** One section, for tests that need to find one by space id. */
-export const SESSION_SPACE_SECTION_TESTID = "session-space";
+/**
+ * The id prefix of one space's folded region (Story 49.3).
+ *
+ * The disclosure's `aria-controls` points at it, so it has to be unique in the
+ * document — a space id is, within a zone, and only one zone's spaces are on
+ * screen at a time. It replaces the section's old `data-testid`: the section is
+ * now a `<section aria-label={space.name}>`, which a test finds by its name.
+ *
+ * **The space id is percent-encoded onto it, never pasted.** A space id is its
+ * zone-relative path — `_spaces/<filename>.md` — and a hand-written space file
+ * may be called `my tasks.md`, so the pasted form `session-space-_spaces/my
+ * tasks.md` is TWO IDREFs to an HTML parser: `aria-controls` then resolves to
+ * nothing and the disclosure controls nothing for assistive technology while
+ * working perfectly for a pointer, which is the worst shape this bug could
+ * have. `encodeURIComponent` and not a slug: it is reversible, so two spaces
+ * whose names differ only in the characters a slug would strip — `my tasks.md`
+ * and `my-tasks.md` — keep two different ids instead of both pointing at the
+ * first region rendered.
+ */
+export const SESSION_SPACE_FOLD_ID = "session-space";
 
 export interface SessionSpacesProps {
   rootId: string;
@@ -564,6 +598,14 @@ function SpaceSection({
   // family of reason.
   const creatable = kind !== null && shape === "flat";
 
+  // Whether this space is folded, and where that is remembered (Story 49.3,
+  // FR-275). Keyed by root and space id rather than by session: the definition
+  // belongs to the zone, so a person who shut Tasks meant Tasks, not Tasks in
+  // this one session. A space with nothing recorded follows
+  // `sessions.spaces_folded`, which is what {@link isSpaceFolded} composes.
+  const foldKey = spaceFoldKey(rootId, space.id);
+  const folded = useSessionSpacesFold((state) => isSpaceFolded(state, foldKey));
+
   /**
    * Write a file this space will list, and open it (Story 49.2, FR-273).
    *
@@ -603,107 +645,139 @@ function SpaceSection({
   }, [kind, rootId, sessionId, space.name, onOpen, onNotice, onChanged, onWriting]);
 
   return (
-    <div
-      data-testid={`${SESSION_SPACE_SECTION_TESTID}-${space.id}`}
-      className="group flex flex-col gap-1 rounded-md border border-border px-3 py-2"
-    >
-      <div className="flex min-w-0 items-center gap-2">
-        {/* A space whose query keeper cannot read is a fault and gets the fault
-            lamp; a healthy one gets a spacer of the same width so the glyph
-            column does not shuffle sideways. The failure is already in the
-            heading's own text below, so the lamp stays silent rather than
-            saying it twice (UX-DR43). */}
-        {broken ? (
-          <Lamp state="fault" label={null} data-slot="space-dot" />
-        ) : (
-          <span aria-hidden="true" data-slot="space-dot" className="size-1.5 shrink-0" />
-        )}
-        <Glyph
-          aria-hidden="true"
-          data-slot="space-icon"
-          data-space-icon={space.icon ?? "none"}
-          className="size-4 shrink-0 text-muted-foreground"
-        />
-        <h4 className="min-w-0 truncate font-medium text-sm">{space.name}</h4>
-        {!broken && !loading && (
-          <span className="shrink-0 text-muted-foreground text-xs">{files.length}</span>
-        )}
-        <span className="flex-1" />
-        {/* Always in the DOM, revealed on hover or focus: an affordance that
-            only exists under a pointer is one a keyboard cannot reach. The
-            destructive one is last, so a hand travelling along the row reaches
-            edit before delete, and create is first because it is what a person
-            comes to a space to do — the other two are maintenance.
+    <FoldSection
+      label={space.name}
+      // The space's OWN glyph, not a chevron — the one place this section
+      // departs from the notes rail's three folds. At ~208px of card width the
+      // header already carries a count and three controls, and a chevron
+      // beside the glyph would spend 14 more of the pixels the space's name is
+      // truncating out of (Story 49.2's arithmetic). What tells a person a
+      // folded space is folded rather than empty is the count, which stays in
+      // the header: "12" over no rows is a fold, and an empty space says so in
+      // words. `aria-expanded` states it outright for anyone not reading
+      // pixels.
+      icon={Glyph}
+      // The two attributes the notes rail's glyph carries (`space-list.tsx`),
+      // because they say what the pixels cannot: `data-space-icon` is the
+      // STORED name, and an icon this build no longer knows draws the same
+      // fallback glyph as no icon at all.
+      iconProps={{ "data-slot": "space-icon", "data-space-icon": space.icon ?? "none" }}
+      folded={folded}
+      onToggle={() => setSpaceFolded(foldKey, !folded)}
+      // Encoded, not pasted: a space id is a path and may hold whitespace —
+      // see {@link SESSION_SPACE_FOLD_ID}.
+      id={`${SESSION_SPACE_FOLD_ID}-${encodeURIComponent(space.id)}`}
+      // A card title, not the register's label: this name is what the person
+      // typed into `keeper.space`, and 11px uppercase would shout it in the
+      // same voice as the SPACES heading above it.
+      labelClassName="font-medium text-sm"
+      className="group gap-1 rounded-md border border-border px-3 py-2"
+      bodyClassName="flex flex-col gap-1"
+      actions={
+        <>
+          {/* A space whose query keeper cannot read is a fault and gets the
+              fault lamp; a healthy one gets a spacer of the same width so the
+              count does not shuffle sideways. The failure is already in the
+              subtitle's own text, so the lamp stays silent rather than saying
+              it twice (UX-DR43). */}
+          {broken ? (
+            <Lamp state="fault" label={null} data-slot="space-dot" />
+          ) : (
+            <span aria-hidden="true" data-slot="space-dot" className="size-1.5 shrink-0" />
+          )}
+          {!broken && !loading && (
+            <span className="shrink-0 text-muted-foreground text-xs">{files.length}</span>
+          )}
+          {/* Always in the DOM, revealed on hover or focus: an affordance that
+              only exists under a pointer is one a keyboard cannot reach. The
+              destructive one is last, so a hand travelling along the row reaches
+              edit before delete, and create is first because it is what a person
+              comes to a space to do — the other two are maintenance.
 
-            Three controls and no more: the row already holds a dot, a glyph, a
-            truncating name and a count, and at the narrowest card this app
-            draws a fourth button would leave the space's own name about a word
-            wide. When the space cannot be written into, create is ABSENT and
-            not disabled — a control that exists only to refuse teaches nothing
-            (the `showNoteInFiles` precedent). That covers both halves of
-            `creatable`: no kind, and the folder contract. */}
-        {creatable && (
+              In `actions`, which is OUTSIDE the folded region (Story 49.3,
+              `sidebar-group.tsx:20-25`): a space you have shut is still a space
+              you can write into, and a create whose button vanished with the
+              rows would make folding a way to lose a verb.
+
+              Three controls and no more: the row already holds a glyph, a
+              truncating name, a dot and a count, and at the narrowest card this
+              app draws a fourth button would leave the space's own name about a
+              word wide — which is also why the disclosure is the title rather
+              than a fourth button. When the space cannot be written into,
+              create is ABSENT and not disabled — a control that exists only to
+              refuse teaches nothing (the `showNoteInFiles` precedent). That
+              covers both halves of `creatable`: no kind, and the folder
+              contract. */}
+          {creatable && (
+            <button
+              type="button"
+              aria-label={`${SESSION_SPACE_NEW_NOTE} ${space.name}`}
+              onClick={newNote}
+              disabled={writing}
+              className={cn(
+                "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+                "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              )}
+            >
+              <FilePlus aria-hidden="true" className="size-3.5" />
+            </button>
+          )}
           <button
             type="button"
-            aria-label={`${SESSION_SPACE_NEW_NOTE} ${space.name}`}
-            onClick={newNote}
-            disabled={writing}
+            aria-label={`${SESSION_SPACE_EDIT} ${space.name}`}
+            onClick={onEdit}
             className={cn(
               "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
               "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
               "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            <FilePlus aria-hidden="true" className="size-3.5" />
+            <Pencil aria-hidden="true" className="size-3.5" />
           </button>
-        )}
-        <button
-          type="button"
-          aria-label={`${SESSION_SPACE_EDIT} ${space.name}`}
-          onClick={onEdit}
-          className={cn(
-            "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-            "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-            "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+          <button
+            type="button"
+            aria-label={`${SESSION_SPACE_DELETE} ${space.name}`}
+            onClick={onDelete}
+            className={cn(
+              "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+              "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+              "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+            )}
+          >
+            <Trash2 aria-hidden="true" className="size-3.5" />
+          </button>
+        </>
+      }
+      // Outside the folded region, with the header controls it belongs to: a
+      // space that is broken is broken whether or not its rows are showing, and
+      // a fault whose only explanation folds away with the thing it is about is
+      // a lamp nobody can read.
+      notice={
+        <>
+          {subtitle !== null && (
+            <p
+              data-slot="space-subtitle"
+              // The whole of what Rust said, on the title, for a pointer; the
+              // keyboard path to it is the pencil, whose form lists every warning
+              // in full. A line in a section this narrow cannot hold one of them,
+              // and the editor is where the value gets fixed anyway.
+              title={misread ? space.warnings.join(" ") : (space.error ?? undefined)}
+              className="text-destructive text-xs"
+            >
+              {subtitle}
+            </p>
           )}
-        >
-          <Pencil aria-hidden="true" className="size-3.5" />
-        </button>
-        <button
-          type="button"
-          aria-label={`${SESSION_SPACE_DELETE} ${space.name}`}
-          onClick={onDelete}
-          className={cn(
-            "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
-            "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-            "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+          {/* The selection's own error, when it has one — an empty query, which
+              parses fine and still selects nothing, so it never reaches `error`
+              above. Rust worded it; this prints it rather than inventing a second
+              sentence for the same state. */}
+          {selection?.error != null && selection.error !== space.error && (
+            <p className="text-destructive text-xs">{selection.error}</p>
           )}
-        >
-          <Trash2 aria-hidden="true" className="size-3.5" />
-        </button>
-      </div>
-
-      {subtitle !== null && (
-        <p
-          data-slot="space-subtitle"
-          // The whole of what Rust said, on the title, for a pointer; the
-          // keyboard path to it is the pencil, whose form lists every warning in
-          // full. A line in a section this narrow cannot hold one of them, and
-          // the editor is where the value gets fixed anyway.
-          title={misread ? space.warnings.join(" ") : (space.error ?? undefined)}
-          className="text-destructive text-xs"
-        >
-          {subtitle}
-        </p>
-      )}
-      {/* The selection's own error, when it has one — an empty query, which
-          parses fine and still selects nothing, so it never reaches `error`
-          above. Rust worded it; this prints it rather than inventing a second
-          sentence for the same state. */}
-      {selection?.error != null && selection.error !== space.error && (
-        <p className="text-destructive text-xs">{selection.error}</p>
-      )}
-
+        </>
+      }
+    >
       {loading ? (
         <p className="text-muted-foreground text-xs">{SESSION_SPACES_LOADING}</p>
       ) : files.length === 0 ? (
@@ -739,6 +813,6 @@ function SpaceSection({
           ))}
         </ul>
       )}
-    </div>
+    </FoldSection>
   );
 }

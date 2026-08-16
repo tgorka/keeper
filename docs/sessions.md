@@ -352,8 +352,8 @@ unchanged.
 
 ## Spaces, tasks and the log
 
-Below Files, a flat session shows three more surfaces. All three read the same pool; none
-of them stores anything.
+Below Files, a flat session shows three more surfaces. All three read the same pool, and
+none of them stores anything except the fold you leave a space in.
 
 **Spaces** are the zone's saved queries, one markdown file each under
 `60-sessions/_spaces/`. Five ship by default — About, Tasks, Log, References, Prompts —
@@ -386,6 +386,33 @@ and a sentence explaining it every time you clicked a row would be keeper apolog
 your setup. The two cases keeper does speak up about are a file inside a vault that the
 note index has not caught up with yet, and a vault list keeper could not read at all —
 both open the file viewer and say which of the two happened.
+
+**A space you can shut.** A space folds and unfolds from its own title — the title is the
+control, not a chevron beside it: the header of a ~208px card already carries the space's
+glyph, its count and three buttons, and a fourth would spend the pixels the name is
+already truncating out of. Folding hides the rows, not the section. The count stays, the
+fault sentence stays, and so do **New note**, edit and delete, so a space you have shut is
+still a space you can write into, and a count over no rows is how a folded space reads as
+folded rather than empty.
+
+**What an untouched space does is a setting.** Settings → Sessions → *Start spaces folded*,
+off unless you turn it on. It decides only the spaces you have never folded or unfolded
+yourself; the ones you have keep your answer, so turning it on does not shut the three you
+just opened. The key is `sessions.spaces_folded`, user-global like most of them, so a
+`[settings]` table in `~/.keeper/keeper.toml` — or in the main sync folder's — can set it
+like any other user-global key, and a file that sets it keeps winning: the switch shows as
+file-controlled instead of quietly losing to the next toggle. The section is not there
+until some folder is flagged as a sessions zone, because before that there are no spaces
+to arrange.
+
+**Where the fold is kept.** Per space, in a cookie in keeper's own webview — not in the
+zone, not in `keeper.toml`, not in any file on your drives. It survives a restart and it
+does not sync: folding is a lens you chose rather than a fact about the session, so
+arranging spaces on the laptop leaves the desktop exactly as it was, and arranging them
+twice is the price of wanting both. keeper remembers the thirty-two you most recently
+folded or unfolded and forgets the oldest beyond that, and the same space in two synced
+folders folds apart. Lose the lot — a cleared cookie jar, a new machine — and you have
+lost the arrangement and nothing else; every space is one press from open again.
 
 **Tasks** is a board of four columns — in preparation, to do, done, deferred — over the
 files tagged `task`. A card's column is its `status:` and its position is its `order:`, a

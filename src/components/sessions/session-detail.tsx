@@ -52,9 +52,15 @@ import {
   sessionsRefs,
   sessionsSpaceFiles,
   sessionsSpaces,
+  sessionsSpacesFoldedGet,
   sessionsTree,
 } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  hydrateSessionSpacesFold,
+  sessionSpacesFoldStore,
+  setSpacesFoldedDefault,
+} from "@/lib/stores/session-spaces-fold";
 
 /** The way back to the board. */
 export const SESSION_DETAIL_BACK_LABEL = "Back to sessions";
@@ -132,6 +138,64 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   // does — and "no sooner" is a race, not a guarantee. An explicit re-read after
   // a write keeps the section honest without waiting on the filesystem.
   const [reload, setReload] = useState(0);
+
+  /**
+   * Restore the spaces' fold, and read the default it falls back to
+   * (Story 49.3, FR-275, FR-276).
+   *
+   * **Here, at the mount point, and not inside `SessionSpaces`.** A `hydrate…`
+   * call is the one part of a remembered fold that no store-level test can see
+   * the absence of: the store passes every one of its own assertions with the
+   * restore never wired up, and the person gets a fold that forgets itself on
+   * every visit. That is DW-172, and Story 48.1's mutation M3 measured it — a
+   * removed `hydrate…` killed exactly one test, the one at the mount point. The
+   * matching test for this one is in `session-detail.test.tsx`.
+   *
+   * Once per document, not once per session: the cookie holds every space in
+   * every root, and {@link hydrateSessionSpacesFold} is idempotent, so a second
+   * detail cannot undo a fold the person has changed since the first.
+   *
+   * **The cookie does not wait for the setting.** Reading it needs no IPC, and
+   * the spaces themselves arrive from the sibling effect below — five
+   * independent `invoke`s with no ordering between them. Restoring the fold
+   * inside the setting read's `.then` therefore let the spaces payload win the
+   * race and paint every space the person had folded OPEN, against the store's
+   * initial `defaultFolded: false`, before snapping it shut a moment later.
+   * Only the fallback for spaces with NOTHING recorded genuinely needs Rust, so
+   * only that waits; a space somebody decided about is restored before anything
+   * paints.
+   *
+   * The setting arrives second and moves `defaultFolded` alone — never
+   * `recorded`, which is what keeps a hand-made answer outranking it — and it
+   * is applied only if nothing else moved the fallback while the read was out.
+   * Settings writes that fallback the moment somebody flips the switch, and a
+   * read issued before the flip is older news than the flip; the `hydrate…`
+   * latch used to cover that for free, and it is spelled out here now that the
+   * restore no longer waits behind it. A read that FAILS corrects nothing:
+   * unfolded is the registry's own default, and the store already holds either
+   * that or whatever another surface read.
+   */
+  useEffect(() => {
+    let live = true;
+    // The fallback the store already holds: this call restores the COOKIE, and
+    // the setting arrives on its own below.
+    const seeded = sessionSpacesFoldStore.getState().defaultFolded;
+    hydrateSessionSpacesFold(document.cookie, seeded);
+    sessionsSpacesFoldedGet().then(
+      (folded) => {
+        // Still `seeded` means nothing newer has been said about the fallback.
+        if (live && sessionSpacesFoldStore.getState().defaultFolded === seeded) {
+          setSpacesFoldedDefault(folded);
+        }
+      },
+      () => {
+        // Nothing to say and nothing to correct — see above.
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
 
   // Read on mount and re-read on the changed event — an agent's write on
   // disk moves this surface without a keystroke (FR-234's detail half).

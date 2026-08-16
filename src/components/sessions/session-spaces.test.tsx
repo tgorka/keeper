@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteFolderVm,
@@ -59,6 +59,14 @@ import {
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import {
+  hydrateSessionSpacesFold,
+  readSessionSpacesFold,
+  resetSessionSpacesFoldForTest,
+  SESSION_SPACES_FOLD_COOKIE,
+  setSpacesFoldedDefault,
+  spaceFoldKey,
+} from "@/lib/stores/session-spaces-fold";
 
 const mockDelete = vi.mocked(sessionsSpaceDelete);
 const mockRestore = vi.mocked(sessionsSpacesRestore);
@@ -177,9 +185,9 @@ function open(
   // folder-shaped session's pool excludes), so every case about the control
   // needs the shape that can carry it.
   shape = "flat",
-): { onChanged: ReturnType<typeof vi.fn> } {
+): { onChanged: ReturnType<typeof vi.fn>; unmount: () => void } {
   const onChanged = vi.fn();
-  render(
+  const view = render(
     <SessionSpaces
       rootId="p1"
       sessionId="01J5AAAAAAAAAAAAAAAAAAAAAA"
@@ -189,7 +197,7 @@ function open(
       onChanged={onChanged}
     />,
   );
-  return { onChanged };
+  return { onChanged, unmount: view.unmount };
 }
 
 beforeEach(() => {
@@ -220,10 +228,17 @@ beforeEach(() => {
   // right.
   primaryViewStore.getState().setView("sessions");
   resetPanelsStoreForTest();
+  // Nothing folded and nothing recorded: the fold is a document-wide store and
+  // a cookie, so a test that folded a space would otherwise fold it for the
+  // next one (Story 49.3).
+  resetSessionSpacesFoldForTest();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  resetSessionSpacesFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing the fold this suite wrote
+  document.cookie = `${SESSION_SPACES_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("SessionSpaces listing", () => {
@@ -900,5 +915,313 @@ describe("SessionSpaces opens a row before the vault list has landed", () => {
       profileId: "p1",
       relativePath: "60-sessions/active/s/task-migrate.md",
     });
+  });
+});
+
+/**
+ * Matrix rows 1–4, 8 and 11 (Story 49.3, FR-275, FR-276).
+ *
+ * The fold's own mechanism — the disclosure, the verb in its name,
+ * `aria-expanded`, the hidden body — belongs to `FoldSection` and is covered by
+ * `rail-fold.test.tsx`. What is this section's own is the composition: which
+ * spaces the setting moves, which spaces it must not, and that the header's
+ * controls and sentences stay reachable with the rows shut.
+ *
+ * Row 5 — the restore across a remount — is at the MOUNT POINT, in
+ * `session-detail.test.tsx`, because no test in this file can see that nothing
+ * calls `hydrateSessionSpacesFold` (DW-172). The remount case here is the
+ * store's half of it: what the cookie carries, given that somebody hydrates.
+ */
+describe("SessionSpaces folds", () => {
+  const TASKS = spaceFoldKey("p1", "_spaces/tasks.md");
+  const LOG = spaceFoldKey("p1", "_spaces/log.md");
+
+  /** Tasks and Log, both with something in them, in the zone's own order. */
+  function two(): { spaces: SessionSpaceVm[]; selections: SessionSpaceFilesVm[] } {
+    return {
+      spaces: [space({ name: "Tasks" }), space({ id: "_spaces/log.md", name: "Log" })],
+      selections: [
+        selection("_spaces/tasks.md", ["task-migrate.md"]),
+        selection("_spaces/log.md", ["2026-08-16.md"]),
+      ],
+    };
+  }
+
+  it("row 1: arrives open when the setting is off and nothing is recorded", () => {
+    open([space({ name: "Tasks" })], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
+
+    expect(screen.getByRole("list", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  /**
+   * Row 2. Folded on arrival, and everything the header carries is still there
+   * — the count, the fault-lamp column and all three verbs. A fold that took
+   * the buttons with it would make "shut" mean "read-only".
+   */
+  it("row 2: arrives folded when the setting says so, and keeps its whole header", () => {
+    setSpacesFoldedDefault(true);
+
+    open(
+      [space({ name: "Tasks", newFileKind: "task" })],
+      [selection("_spaces/tasks.md", ["task-migrate.md", "task-board.md"])],
+    );
+
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `${SESSION_SPACE_EDIT} Tasks` })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${SESSION_SPACE_DELETE} Tasks` }),
+    ).toBeInTheDocument();
+  });
+
+  /** Row 3. The press is on the title, and what it records is an answer — not
+   *  the absence of one, or the next mount would shut the space again. */
+  it("row 3: opens a folded space on a press and records that answer", async () => {
+    setSpacesFoldedDefault(true);
+    open([space({ name: "Tasks" })], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand Tasks" }));
+
+    expect(await screen.findByRole("list", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(readSessionSpacesFold(document.cookie).get(TASKS)).toBe(false);
+  });
+
+  /**
+   * Rows 4 and 11, which are the same rule read from both ends: the setting
+   * moves the spaces nobody has decided about, and only those.
+   *
+   * Log is opened by hand while the setting is ON, so from then on it must
+   * ignore the setting in BOTH directions — including when the setting is
+   * turned off and back on, which is the case a store that only remembered
+   * "folded" would pass by accident.
+   */
+  it("rows 4 and 11: the setting moves an untouched space and never a decided one", () => {
+    setSpacesFoldedDefault(true);
+    const { spaces, selections } = two();
+    open(spaces, selections);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand Log" }));
+
+    expect(screen.getByRole("list", { name: "Log" })).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+
+    // The switch in Settings, from the store's side.
+    act(() => setSpacesFoldedDefault(false));
+    expect(screen.getByRole("list", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Log" })).toBeInTheDocument();
+
+    act(() => setSpacesFoldedDefault(true));
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+    expect(screen.getByRole("list", { name: "Log" })).toBeInTheDocument();
+    expect(readSessionSpacesFold(document.cookie).get(LOG)).toBe(false);
+    expect(readSessionSpacesFold(document.cookie).has(TASKS)).toBe(false);
+  });
+
+  /**
+   * Row 4's second half, through the real cookie rather than through the store:
+   * a cold start with the setting still ON finds Log as the person left it.
+   *
+   * The store is wiped between the two renders — a fresh process, nothing
+   * remembered — so the only thing carried across is what the browser kept.
+   * That the DETAIL calls the hydrate is `session-detail.test.tsx`'s assertion,
+   * not this one's.
+   */
+  it("row 4: an opened space comes back open from the cookie alone", () => {
+    setSpacesFoldedDefault(true);
+    const { spaces, selections } = two();
+    const first = open(spaces, selections);
+    fireEvent.click(screen.getByRole("button", { name: "Expand Log" }));
+    const written = document.cookie;
+    first.unmount();
+
+    resetSessionSpacesFoldForTest();
+    hydrateSessionSpacesFold(written, true);
+    open(spaces, selections);
+
+    expect(screen.getByRole("button", { name: "Collapse Log" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "Expand Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /**
+   * Row 8. `actions` is outside the folded region, so a shut space is still a
+   * space you can write into — and what the write had to say is readable
+   * without opening it again. A create whose refusal landed inside the fold
+   * would be a press with no visible result, which is the exact bug a fold
+   * introduces and a fold test that only watches the rows never sees.
+   */
+  it("row 8: creates from a folded space and says what happened, still folded", async () => {
+    const said = "60-sessions/active/s/untitled.md: Permission denied (os error 13)";
+    mockNewKind.mockRejectedValue({ message: said });
+    setSpacesFoldedDefault(true);
+    open([space({ name: "Tasks", newFileKind: "task" })], [selection("_spaces/tasks.md", [])]);
+
+    fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` }));
+
+    await waitFor(() => expect(mockNewKind).toHaveBeenCalled());
+    // Prefixed with the space's own name (story 49.2): this live region sits
+    // under the `Spaces` heading, above every section, so an unprefixed
+    // sentence could not say which space it was about.
+    expect(await screen.findByText(`${SESSION_SPACE_NEW_NOTE} Tasks: ${said}`)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Expand Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("row 8: restores the defaults with every space folded, and reports it", async () => {
+    mockRestore.mockResolvedValue({ names: ["About"] });
+    setSpacesFoldedDefault(true);
+    open([space({ name: "Tasks" })], [selection("_spaces/tasks.md", [])]);
+
+    fireEvent.click(screen.getByRole("button", { name: SESSION_SPACES_RESTORE }));
+
+    expect(await screen.findByText("Restored About.")).toBeInTheDocument();
+    // Still shut. Without this the case tests a verb that lives on the parent
+    // header, outside every fold, so deleting the whole fold feature left it
+    // green — and reporting is not a reason to reopen what somebody closed.
+    expect(screen.getByRole("button", { name: "Expand Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  /**
+   * Row 8's other half: `notice` is outside the folded region too, so what is
+   * WRONG with a space is readable without opening it. A fault whose only
+   * explanation folds away with the thing it is about is a lamp nobody can
+   * read.
+   *
+   * `toBeVisible` and not `getByText` alone, which is what makes this case
+   * worth having: `getByText` reaches inside a `[hidden]` subtree, so every
+   * pre-existing subtitle case would stay green with `notice` moved INTO the
+   * fold. Both sentences, because `notice` has two children — the space's own
+   * subtitle and the selection's separate error.
+   */
+  it("row 8: says what is wrong with a folded space where it can still be read", () => {
+    setSpacesFoldedDefault(true);
+    const selects = "This space's query selects nothing.";
+    open(
+      [space({ name: "Prompts", error: "Unexpected end of query after `AND`." })],
+      [selection("_spaces/tasks.md", [], selects)],
+    );
+
+    expect(screen.getByRole("button", { name: "Expand Prompts" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText(SESSION_SPACE_BROKEN_SUBTITLE)).toBeVisible();
+    expect(screen.getByText(selects)).toBeVisible();
+  });
+
+  /**
+   * A space id is its zone-relative path, and a hand-written space file can be
+   * called `my tasks.md` — whereupon a pasted id makes `aria-controls` a list
+   * of TWO IDREFs, neither of which names an element. The disclosure then
+   * controls nothing for assistive technology while working perfectly for a
+   * pointer, so nothing else in this suite could see it.
+   *
+   * The second space is the collision half: `my tasks.md` and `my-tasks.md`
+   * differ only in the character a slug would rewrite, and two spaces sharing
+   * one region id would point the second disclosure at the first space's rows.
+   */
+  it("resolves the disclosure's aria-controls when a space filename holds a space", () => {
+    const spaced = "_spaces/my tasks.md";
+    const hyphen = "_spaces/my-tasks.md";
+    open(
+      [space({ id: spaced, name: "My tasks" }), space({ id: hyphen, name: "My tasks archive" })],
+      [selection(spaced, ["task-migrate.md"]), selection(hyphen, ["task-board.md"])],
+    );
+
+    const disclosure = screen.getByRole("button", { name: "Collapse My tasks" });
+    const controls = disclosure.getAttribute("aria-controls") ?? "";
+    expect(controls).not.toMatch(/\s/);
+    const region = document.getElementById(controls);
+    // The region it OPENS, not merely a region: the rows this space listed.
+    expect(region).not.toBeNull();
+    expect(region).toContainElement(screen.getByRole("list", { name: "My tasks" }));
+
+    const sibling = screen.getByRole("button", { name: "Collapse My tasks archive" });
+    expect(sibling.getAttribute("aria-controls")).not.toBe(controls);
+
+    fireEvent.click(disclosure);
+    expect(region).not.toBeVisible();
+    expect(screen.getByRole("list", { name: "My tasks archive" })).toBeVisible();
+  });
+
+  /**
+   * The glyph's own attributes, which moving it into `FoldSection`'s `icon`
+   * prop dropped once (Story 49.3) while the sibling `data-slot="space-dot"`
+   * survived. `data-space-icon` is the STORED name, and it is the only thing
+   * that tells an icon this build no longer knows from no icon at all: both
+   * draw the same fallback glyph, so the rendered DOM is otherwise identical.
+   * The notes rail carries the same pair, and the same case for it
+   * (`space-list.test.tsx`).
+   */
+  it("keeps the stored icon name on the space's glyph, known, unknown or absent", () => {
+    open(
+      [
+        space({ name: "Tasks", icon: "anchor" }),
+        space({ id: "_spaces/old.md", name: "Old", icon: "no-such-glyph" }),
+        space({ id: "_spaces/log.md", name: "Log", icon: null }),
+      ],
+      [selection("_spaces/tasks.md", []), selection("_spaces/old.md", [])],
+    );
+
+    const headers = screen.getAllByRole("button", { name: /^Collapse / });
+    const stored = headers.map((header) => [
+      header.getAttribute("aria-label"),
+      header.querySelector('[data-slot="space-icon"]')?.getAttribute("data-space-icon"),
+    ]);
+    expect(stored).toEqual([
+      ["Collapse Tasks", "anchor"],
+      ["Collapse Old", "no-such-glyph"],
+      ["Collapse Log", "none"],
+    ]);
+  });
+
+  /**
+   * A space's name is what the person typed, and the header it sits in already
+   * holds a count and three controls at ~208px of card.
+   *
+   * jsdom has no layout, so what is asserted is the arrangement that produces
+   * the behaviour: the title takes the spare width and clips, everything beside
+   * it refuses to shrink, and the accessible name stays whole however narrow
+   * the visible one gets (WCAG 2.5.3).
+   */
+  it("keeps a long space name inside its own row", () => {
+    const name = "Everything I have ever written about the migration";
+    open(
+      [space({ name, newFileKind: "task" })],
+      [selection("_spaces/tasks.md", ["task-migrate.md"])],
+    );
+
+    const disclosure = screen.getByRole("button", { name: `Collapse ${name}` });
+    expect(disclosure).toHaveClass("min-w-0", "flex-1");
+    expect(disclosure.querySelector("span")).toHaveClass("min-w-0", "truncate");
+    expect(screen.getByText("1")).toHaveClass("shrink-0");
+    expect(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} ${name}` })).toHaveClass(
+      "shrink-0",
+    );
   });
 });

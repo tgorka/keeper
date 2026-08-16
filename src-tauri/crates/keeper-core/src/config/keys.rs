@@ -610,6 +610,17 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Acoustic echo cancellation on the microphone track; costs a mono track and voice-band noise suppression.",
         example: "true",
     },
+    // ---- sessions --------------------------------------------------------
+    KeySpec {
+        key: "sessions.spaces_folded",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether a session's spaces arrive folded; a space folded or unfolded by hand keeps that answer.",
+        example: "true",
+    },
     // ---- sync ------------------------------------------------------------
     KeySpec {
         key: "sync.git_path",

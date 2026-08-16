@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { CaptureSettingsSection } from "@/components/notes/capture-settings";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
 import { RecordingDestinationControls } from "@/components/recording/recording-destination-controls";
+import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
 import { AboutSection } from "@/components/settings/about-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
@@ -213,6 +214,12 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
       {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
               every platform that cannot record, never a dead affordance. */}
       {recording && <RecordingSection open={open} />}
+      {/* Ungated by any capability, and beside Sync rather than inside it: a
+          sessions zone IS a synced folder somebody flagged, but what a space
+          does when it arrives is a reading preference and not a sync setting.
+          The section removes itself when no folder is flagged as a zone, the
+          way Quick capture removes itself without a vault (Story 49.3, FR-276). */}
+      <SessionsSettingsSection open={open} />
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}
