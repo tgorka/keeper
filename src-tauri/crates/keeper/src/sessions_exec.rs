@@ -179,6 +179,41 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             std::fs::rename(&source, &target)
                 .map_err(|e| failed(format!("move {from} → {to}: {e}")))
         }
+        PlanStep::MoveFile { from, to } => {
+            let source = zone.join(rel(from)?);
+            let target = zone.join(rel(to)?);
+            // **No already-moved short-circuit here, unlike `MoveDir` above.**
+            // That one infers "this plan already ran" from a gone source and a
+            // present target, and the inference holds where it lives: a resumed
+            // journal's only writer produced that exact pair. `MoveFile` has no
+            // crash-resume caller — its one caller is
+            // `sessions_template_rename_entry`, which stats the source through
+            // `entry_kind` and runs the plan straight away — so the same test
+            // proves nothing about the target: if the source disappears in that
+            // window (a sync pull, an agent, a move in Finder) and the typed
+            // destination happens to name an existing neighbour, the step would
+            // answer Ok, clear the journal, and hand the room the subpath of a
+            // file it never touched. A missing source is a stale list, and the
+            // rename error is what says so.
+            // `MoveDir`'s guard above, verbatim in its reasoning and sharing its
+            // predicate: a target that exists AND is a different file is a
+            // neighbour a rename must not eat, while a target that exists and IS
+            // the source is the case-only rename that normalises a hand-made
+            // name — `_template/x/About.md` → `about.md` — and on APFS the
+            // destination of that one exists because it is the file being
+            // renamed. `exists()` alone reads them as one thing.
+            if target.exists() && !same_directory(&target, &source) {
+                return Err(ExecError::Refused(format!(
+                    "{to} already exists; nothing was moved"
+                )));
+            }
+            // No `create_dir_all` for the target's parent, unlike `CopyFile`:
+            // a rename moves a file inside a directory that is already there,
+            // and inventing a parent here would turn a typo in a plan into a
+            // new directory on somebody's drive.
+            std::fs::rename(&source, &target)
+                .map_err(|e| failed(format!("move {from} → {to}: {e}")))
+        }
         PlanStep::TrashDir { path, trash_key } => {
             let source = zone.join(rel(path)?);
             let trash = zone.join(".keeper/trash").join(trash_key);
@@ -235,8 +270,11 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
     }
 }
 
-/// Whether two paths are the **same** directory on the disk, rather than two
-/// spellings of it that only look different.
+/// Whether two paths are the **same** thing on the disk, rather than two
+/// spellings of it that only look different. Named for the directory move it
+/// was extracted from, and asked by [`PlanStep::MoveFile`] too:
+/// `canonicalize` does not care whether the path names a file, and a case-only
+/// rename of `About.md` is the same trap as one of `Interview/`.
 ///
 /// Asked wherever a move has to tell "the destination is taken" from "the
 /// destination IS the source". On APFS and NTFS `_template/interview` exists the
@@ -537,5 +575,162 @@ mod tests {
             "renaming a directory onto itself keeps it"
         );
         assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+    }
+
+    /// Row 1 of the matrix: a file rename runs end to end — at the new path,
+    /// gone from the old, journal cleared. The bytes are asserted rather than
+    /// only the existence, because a copy-then-delete would also satisfy
+    /// "present at `to`, absent at `from`" and this step is a move.
+    #[test]
+    fn a_move_file_lands_the_file_at_its_new_name_and_clears_the_journal() {
+        let zone = zone();
+        let dir = zone.path().join("_template/interview");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("about.md"), "the record").expect("write");
+        let plan = Plan {
+            verb: "template-entry-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveFile {
+                from: "_template/interview/about.md".to_owned(),
+                to: "_template/interview/record.md".to_owned(),
+            }],
+        };
+        run(zone.path(), plan).expect("runs");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("record.md")).expect("read"),
+            "the record"
+        );
+        assert!(!dir.join("about.md").exists(), "the old name is gone");
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+    }
+
+    /// Row 2: the refusal, and the carve-out beside it — `MoveDir`'s pair of
+    /// tests asked of a file, because the two arms share `same_directory` and a
+    /// file rename is where the case-only case actually bites (`About.md` is a
+    /// name people capitalise; `Interview/` is one they rarely do).
+    ///
+    /// Both halves in one test because they are one rule: a destination that
+    /// exists is a collision exactly when it is a *different* file.
+    #[test]
+    fn a_move_file_refuses_a_different_file_and_allows_its_own_source() {
+        let zone = zone();
+        let dir = zone.path().join("_template/interview");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("about.md"), "mine").expect("write");
+        std::fs::write(dir.join("questions.md"), "theirs").expect("write");
+
+        let onto_a_neighbour = Plan {
+            verb: "template-entry-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveFile {
+                from: "_template/interview/about.md".to_owned(),
+                to: "_template/interview/questions.md".to_owned(),
+            }],
+        };
+        let error = run(zone.path(), onto_a_neighbour).expect_err("refuses");
+        assert!(matches!(
+            &error,
+            ExecError::Refused(said)
+                if said == "_template/interview/questions.md already exists; nothing was moved"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("questions.md")).expect("read"),
+            "theirs",
+            "the neighbour was not written over"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("about.md")).expect("read"),
+            "mine",
+            "and the source stayed where it was"
+        );
+
+        // The carve-out. The motivating case — `About.md` → `about.md` on APFS —
+        // cannot be reproduced on a case-sensitive volume, so this asserts the
+        // property it rests on in a spelling every filesystem produces: two paths
+        // for one file. On macOS the two differ in case instead, and the branch
+        // taken is this one.
+        let onto_itself = Plan {
+            verb: "template-entry-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveFile {
+                from: "_template/interview/about.md".to_owned(),
+                to: "_template/interview/./about.md".to_owned(),
+            }],
+        };
+        run(zone.path(), onto_itself).expect("the source is not its own collision");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("about.md")).expect("read"),
+            "mine",
+            "renaming a file onto itself keeps it"
+        );
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+    }
+
+    /// A `MoveFile` whose source vanished between the shell's stat and the plan
+    /// running answers with the failure, never with somebody else's file.
+    ///
+    /// `MoveDir`'s already-moved short-circuit reads "source gone, target there"
+    /// as "this plan already ran", which is sound for a resumed journal whose
+    /// only writer produced that pair. Copied onto `MoveFile` it was unsound: the
+    /// rename's source is stated by whoever typed the name, so a neighbour at the
+    /// destination satisfies the same test, and the command would have cleared
+    /// the journal and answered the room with the subpath of a file it never
+    /// touched. Both spellings of the vanished source are asserted, because they
+    /// answer differently and both answers must be about THIS plan: a neighbour
+    /// is the collision refusal, and nothing at all is the rename error.
+    #[test]
+    fn a_move_file_whose_source_vanished_never_reports_a_neighbour_as_moved() {
+        let zone = zone();
+        let dir = zone.path().join("_template/interview");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // No `about.md`: the source the plan names is already gone.
+        std::fs::write(dir.join("questions.md"), "theirs").expect("write");
+
+        let onto_a_neighbour = Plan {
+            verb: "template-entry-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveFile {
+                from: "_template/interview/about.md".to_owned(),
+                to: "_template/interview/questions.md".to_owned(),
+            }],
+        };
+        let error = run(zone.path(), onto_a_neighbour).expect_err("must not answer Ok");
+        assert!(
+            matches!(
+                &error,
+                ExecError::Refused(said)
+                    if said == "_template/interview/questions.md already exists; nothing was moved"
+            ),
+            "a neighbour is a collision, not a completed move: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("questions.md")).expect("read"),
+            "theirs",
+            "and the neighbour is untouched"
+        );
+
+        let onto_nothing = Plan {
+            verb: "template-entry-rename".to_owned(),
+            session: "_template/interview".to_owned(),
+            steps: vec![PlanStep::MoveFile {
+                from: "_template/interview/about.md".to_owned(),
+                to: "_template/interview/record.md".to_owned(),
+            }],
+        };
+        let error = run(zone.path(), onto_nothing).expect_err("a missing source is a failure");
+        // `run_step` reports a failed rename through `Refused` too (its own
+        // `failed` closure), so the variant is not what distinguishes this from a
+        // collision — the sentence is, and it names the move that did not happen.
+        assert!(
+            matches!(
+                &error,
+                ExecError::Refused(said)
+                    if said.starts_with(
+                        "move _template/interview/about.md → _template/interview/record.md"
+                    )
+            ),
+            "the rename error is what says the list was stale: {error}"
+        );
+        assert!(!dir.join("record.md").exists(), "and nothing was created");
     }
 }

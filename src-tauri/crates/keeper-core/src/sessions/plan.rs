@@ -43,6 +43,18 @@ pub enum PlanStep {
     },
     /// Move a directory. Succeeds if the source is gone and the target exists.
     MoveDir { from: String, to: String },
+    /// Move one file. Succeeds if the source is gone and the target exists.
+    ///
+    /// [`PlanStep::MoveDir`]'s twin, and a **move** rather than a copy followed
+    /// by a delete for two independent reasons. A rename inside one volume is
+    /// one atomic metadata write, while copy-then-delete is two writes the sync
+    /// watcher reads as a new file plus a deletion — the drive's history would
+    /// carry the bytes twice and the old path's provenance would be lost. And a
+    /// crash between the two halves leaves the file at both paths, which no
+    /// idempotent replay can tell apart from "the copy has not run yet"; a
+    /// rename has no such intermediate state, which is what keeps resume
+    /// "re-run the remaining steps" (AD-111).
+    MoveFile { from: String, to: String },
     /// Move a directory into the zone's `.keeper/trash/<id>/`, recoverable.
     TrashDir { path: String, trash_key: String },
     /// Move one file into the zone's `.keeper/trash/<id>/`, keeping its name,

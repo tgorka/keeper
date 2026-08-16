@@ -5253,8 +5253,8 @@ export async function sessionsTemplateInstall(rootId: string, name?: string): Pr
 }
 
 /**
- * Every file inside one template's directory (FR-269, FR-270) — the rows the
- * Templates list draws, newest change first.
+ * Every file **and folder** inside one template's directory (FR-269, FR-270) —
+ * the rows the Templates list draws, newest change first.
  *
  * `name` is `undefined` for the zone's own `_template/` and the template's
  * on-disk name for a named one, exactly as {@link sessionsTemplateInstall} takes
@@ -5277,10 +5277,12 @@ export async function sessionsTemplateInstall(rootId: string, name?: string): Pr
  * new session gets a stamped record rather than a copied one, while this list
  * shows it — editing a template's record is what the room is for.
  *
- * `name` is the file's path **relative to the template**, not a basename: a
- * folder-shaped template shows `prompts/hand-off.md`, and two files of the same
- * basename in two subdirectories are two distinguishable rows. Render it as
- * given. Directories and `.gitkeep` are not rows.
+ * `name` is the entry's path **relative to the template**, not a basename: a
+ * folder-shaped template shows `prompts/hand-off.md` and a row `prompts` for the
+ * folder itself, and two files of the same basename in two subdirectories are two
+ * distinguishable rows. Render it as given, and read `isDir` for what the row is
+ * — a folder is listed even when it is empty, which is what makes one you just
+ * created renameable. Only `.gitkeep` is not a row.
  *
  * A template that is not there resolves `[]` rather than rejecting. A directory
  * somebody removed in Finder is an empty room, not a fault, so re-reading after
@@ -5348,6 +5350,185 @@ export async function sessionsTemplateRename(
   newName: string,
 ): Promise<string> {
   return await invoke<string>("sessions_template_rename", { rootId, name, newName });
+}
+
+/**
+ * Make one file inside a template (FR-284), resolving with the profile-relative
+ * subpath that opens it — the same string the row for that file carries once the
+ * room re-reads, so hand it to a file target and join nothing (AD-65).
+ *
+ * `name` addresses the template exactly as {@link sessionsTemplateEntries} takes
+ * it: `undefined` for the zone's own `_template/`, and a named template's
+ * {@link SessionPatternVm}`.label` passed back verbatim.
+ *
+ * `rel` is the path **inside** the template, filename included —
+ * {@link SessionTemplateEntryVm}`.name`'s vocabulary. `notes.md` lands at the
+ * template's root; `refs/inputs.md` lands in a `refs/` that is **already there**.
+ * The last segment is folded in Rust (`Kick Off.md` → `kick-off.md`, never
+ * `kick-off-md`) and the directories in front of it are used verbatim, because
+ * those address folders that already exist — which is also why a folder that is
+ * NOT there is refused rather than created: only the last segment goes through
+ * the fold, so a created parent would be spelled `Interview Kit` where
+ * {@link sessionsTemplateDirNew} spells the same words `interview-kit`.
+ *
+ * The file lands **empty** — `{}` for a `.json`, which would otherwise not be
+ * valid JSON. keeper stamps no `id` into a template: a create copies the
+ * template, so a frozen id would give every session made from it the same one.
+ *
+ * The refusals, and what each means for you:
+ *
+ * - **a path that leaves the template** (`../escape.md`, an absolute path) —
+ *   refused before anything is opened. Compose `rel` from a row's own `name`.
+ * - **a dotfile** — the room does not list them and a create does not copy them,
+ *   so no verb here may name one. `.DS_Store` is not this surface's to remove.
+ * - **an extension outside `.md`/`.csv`/`.json`** — a template is copied into
+ *   every session made from it, so this button authors exactly what a session's
+ *   New file authors. Anything else belongs in `artifacts/`, put there by the
+ *   tool that made it.
+ * - **a name that folds to nothing** (`###`) — the field needs letters or digits.
+ *   Keep your own guard in front of it so the common case never round-trips.
+ * - **the template root** (an empty `rel`) — that is *New template*, not this.
+ * - **a folder in `rel` that is not there** — make it with
+ *   {@link sessionsTemplateDirNew} first. keeper will not invent a folder around
+ *   a file under a name it would have folded had you typed it as one.
+ * - **a destination that exists** — refused, naming it; nothing is written over.
+ *   Ask for another name.
+ * - **no such template** — your list is stale; re-read it.
+ *
+ * Rejects with: `internal` (any of the above, an unknown zone, a failed write),
+ * `unsupported`.
+ */
+export async function sessionsTemplateFileNew(
+  rootId: string,
+  name: string | undefined,
+  rel: string,
+): Promise<string> {
+  return await invoke<string>("sessions_template_file_new", {
+    rootId,
+    name: name ?? null,
+    rel,
+  });
+}
+
+/**
+ * Make one folder inside a template (FR-284).
+ *
+ * `name` and `rel` are {@link sessionsTemplateFileNew}'s, minus the filename:
+ * `artifacts` at the template's root, `refs/inputs` inside a `refs/` that is
+ * already there — the parent is addressed here for the same reason it is there,
+ * and a missing one is refused rather than spelled verbatim. The last segment is
+ * folded in Rust; a folder has no extension rule, so `v1.2` is a folder called
+ * `v1.2`.
+ *
+ * **Idempotent**: a folder that is already there resolves without writing and is
+ * not an error — the four skeleton directories are exactly the names somebody
+ * types without checking. A template's `workspace/` may be created here, unlike a
+ * session's: the fence AD-113 puts around a live session's scratch has nothing to
+ * protect in a skeleton a create copies.
+ *
+ * **A folder is a row the moment it exists.** {@link sessionsTemplateEntries}
+ * lists directories too, so one you create here appears immediately — empty — and
+ * carries the room's rename and delete verbs. It used to appear only once a file
+ * landed inside it, which made a folder created here unreachable by every verb
+ * that could have undone it.
+ *
+ * Rejects with: `internal` (a path that leaves the template, a dotfile, a name
+ * that folds to nothing, the template root, a folder in `rel` that is not there,
+ * a **file** already at that path — the one collision `mkdir` cannot absorb —, an
+ * unknown zone, no such template, a failed write), `unsupported`.
+ */
+export async function sessionsTemplateDirNew(
+  rootId: string,
+  name: string | undefined,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_template_dir_new", { rootId, name: name ?? null, rel });
+}
+
+/**
+ * Rename one file or folder inside a template (FR-284), resolving with the
+ * profile-relative subpath of the result — so an editor open on the old path can
+ * be re-targeted without composing anything.
+ *
+ * **This is offered inside a template and refused for a session's files**, and
+ * the difference is the point: a session file's path is its identity, so renaming
+ * one breaks the pins aimed at it, while nothing points at a template's files and
+ * a create copies them rather than referencing them. The room already renames a
+ * whole template directory, which moves every file inside it at once.
+ *
+ * `rel` is the entry's template-relative path — {@link SessionTemplateEntryVm}`.name`,
+ * verbatim. `newName` is a **name**, not a path: the entry stays in its own
+ * folder. Its stem folds to a slug and its extension survives, and a file whose
+ * typed name carries no extension keeps the one it has — a rename renames, it
+ * does not decide what kind of file this is.
+ *
+ * **Not idempotent in the direction that matters.** A `newName` folding to the
+ * name already on disk writes nothing and resolves. Anything else is a real move,
+ * including one that looks like the name on screen (`Interview Kit` →
+ * `interview-kit`). A second press after one that worked is refused, because the
+ * entry it names has moved: treat a rejection as "re-read the room".
+ *
+ * The refusals beyond {@link sessionsTemplateFileNew}'s:
+ *
+ * - **nothing at `rel`** — the room is stale; something moved or removed the
+ *   entry under you. Re-read rather than retry.
+ * - **the destination is a different entry that already exists** — refused, and
+ *   both stay where they are. "A different entry" is the literal test: on macOS
+ *   the destination of a case-only rename exists because it *is* the source, and
+ *   that rename is allowed.
+ * - **an extension change out of `.md`/`.csv`/`.json`** — `about.md` cannot
+ *   become `about.sh`, because that authors through a keeper verb a file
+ *   {@link sessionsTemplateFileNew} refuses to author. Keeping an extension the
+ *   file already has is free, whatever it is: `logo.png` → `Logo Mark` stays a
+ *   `.png`, and a typed name with no extension keeps the current one.
+ *
+ * Rejects with: `internal` (those three, a path that leaves the template, a
+ * dotfile, the template root, a name that folds to nothing, an unknown zone, no
+ * such template, a failed move), `unsupported`.
+ */
+export async function sessionsTemplateRenameEntry(
+  rootId: string,
+  name: string | undefined,
+  rel: string,
+  newName: string,
+): Promise<string> {
+  return await invoke<string>("sessions_template_rename_entry", {
+    rootId,
+    name: name ?? null,
+    rel,
+    newName,
+  });
+}
+
+/**
+ * Remove one file or folder from a template (FR-284) — a trash move, not an
+ * unlink and not a recursive erase.
+ *
+ * What goes lands in the zone's `.keeper/trash/<id>/` keeping its basename, and a
+ * folder goes whole, so it is recoverable whole. That promise is why this offers
+ * folder deletion at all where the session tree does not: a template's
+ * directories hold a skeleton somebody put there, and the trash is what makes
+ * taking one back cheap.
+ *
+ * `rel` is the entry's template-relative path — {@link SessionTemplateEntryVm}`.name`
+ * for a file, and the folder's own path for a folder. Rust decides which of the
+ * two it is by looking, so you send one verb for both.
+ *
+ * - **the template root** (an empty `rel`, or `"."`) — refused, naming the verb
+ *   that does that instead. Deleting a whole template is not this.
+ * - **a dotfile** — no verb here may name one; see
+ *   {@link sessionsTemplateFileNew}.
+ * - **nothing at `rel`** — the room is stale. Re-read it.
+ *
+ * Rejects with: `internal` (those three, a path that leaves the template, an
+ * unknown zone, no such template, a failed move), `unsupported`.
+ */
+export async function sessionsTemplateDeleteEntry(
+  rootId: string,
+  name: string | undefined,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_template_delete_entry", { rootId, name: name ?? null, rel });
 }
 
 /** What {@link sessionsFileNew} will write. The set is closed in Rust. */

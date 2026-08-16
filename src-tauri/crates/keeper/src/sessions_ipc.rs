@@ -1969,7 +1969,7 @@ pub fn sessions_template_install(
     Err(unsupported())
 }
 
-/// Every file inside one template's directory (FR-269, FR-270).
+/// Every file **and folder** inside one template's directory (FR-269, FR-270).
 ///
 /// The Templates list is a room the operator walks into, and a template's rows
 /// are its files: pressing one opens it in the same editor a session's record
@@ -1998,8 +1998,17 @@ pub fn sessions_template_install(
 /// one intended difference between the two surfaces — the room is where a
 /// template's record is edited, which is the whole of FR-270 — and it is a
 /// difference in what the create does with a file, not in what the directory
-/// holds. Only directories and `.gitkeep` are dropped here: a row is pressed to
-/// open a file, and neither of those opens anything.
+/// holds. Only `.gitkeep` is dropped here: it holds an empty directory open and
+/// there is nothing in it to read, and the directory it was holding open is now
+/// a row in its own right.
+///
+/// **A folder is a row, and that is what makes it addressable.** A directory
+/// that names no file — one `New folder` just made, or a skeleton's
+/// `artifacts/` whose only content is the `.gitkeep` below — used to be dropped
+/// here, so the room could not draw it, and a row the room cannot draw is one
+/// nothing can rename, delete, or create into. The webview still derives the
+/// *shape* from these paths (`templateTree`) rather than walking anything; what
+/// it can no longer do is invent the existence of a folder from its contents.
 ///
 /// Every `subpath` is profile-relative and composed HERE (AD-65): the zone
 /// subfolder, the template directory and the file's template-relative path,
@@ -2053,12 +2062,12 @@ pub fn sessions_template_entries(
     let files = pattern::without_dirs(&pattern_files(&dir), &excluded);
     let mut out: Vec<SessionTemplateEntryVm> = files
         .iter()
-        // A row is pressed to open a file, so a directory is not a row — it is
-        // the structure the rows are named after. A `.gitkeep` is not a row
-        // either, and for the picker's own reason: it holds an empty directory
-        // open and there is nothing in it to read.
-        .filter(|(path, is_dir)| !*is_dir && !pattern::is_placeholder(path))
-        .map(|(path, _)| {
+        // A `.gitkeep` is not a row, for the picker's own reason: it holds an
+        // empty directory open and there is nothing in it to read. The directory
+        // IS a row — see this command's doc — carrying `is_dir` so the room draws
+        // it rather than guessing at it from the files underneath.
+        .filter(|(path, _)| !pattern::is_placeholder(path))
+        .map(|(path, is_dir)| {
             // Checked, not `as i64` — `sessions_space_files`' spelling. A
             // future-dated file whose millisecond count does not fit wraps
             // negative under a cast and then sorts to the bottom of a
@@ -2079,6 +2088,7 @@ pub fn sessions_template_entries(
                 // webview is still a path operation (AD-65).
                 name: path.clone(),
                 mtime_ms,
+                is_dir: *is_dir,
             }
         })
         .collect();
@@ -2268,6 +2278,476 @@ pub fn sessions_template_rename(
 }
 
 // ---------------------------------------------------------------------------
+// Entry verbs (FR-284): make, rename and unmake what is INSIDE one template
+// ---------------------------------------------------------------------------
+//
+// The session file verbs below cannot be pointed at a template, and the wall is
+// an id lookup rather than a path guard: `sessions_file_new`,
+// `sessions_file_new_kind` and `sessions_file_delete` all resolve their
+// directory through `sessions_root::row_of(root_id, session_id)`, a lookup over
+// the scan's rows, and `_template/` is never scanned as a session (FR-225). So
+// these four address a template the way the three verbs above it do — by
+// `(root_id, name)` through `template_at` — and take a template-relative `rel`
+// for the entry itself.
+
+/// The refusal for a template path the domain will not compile, in its words.
+///
+/// [`file_verb_error`]'s twin, over
+/// [`keeper_core::sessions::template::EntryError`] rather than a session's
+/// `FileVerbError` — see that type for why the two sets of refusals are not one
+/// type.
+#[cfg(desktop)]
+fn entry_error(error: keeper_core::sessions::template::EntryError) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// What a verb says about a destination that is already taken.
+///
+/// The words `sessions_template_rename` refuses a template collision with, one
+/// level down: `WriteFile` overwrites by contract and `MoveFile`/`MoveDir` refuse,
+/// so without this a *create* would silently write over a file somebody put in
+/// the template while a *rename* onto the same name was refused — two answers to
+/// one question.
+#[cfg(desktop)]
+fn entry_taken_error(rel: &str) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "{rel} is already in this template — pick another name. keeper will not write over a \
+             file or a folder somebody put there."
+        ),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// The refusal for a create whose parent folder is not on the drive — the shell
+/// half of "this verb addresses a folder, it never mints one".
+///
+/// Both create verbs fold only the LAST segment of what was typed
+/// (`template::entry_name`, through `rejoin`), because the segments in front of
+/// it address directories that already exist — a hand-made `Interview Kit/` is
+/// addressable exactly as it is spelled. A verb that *created* a missing parent
+/// would spell it verbatim, so `Interview Kit/notes.md` minted a folder
+/// `New folder` could never have made, whose name folds to `interview-kit`. The
+/// refusal has to live here for [`entry_taken_error`]'s reason: the domain opens
+/// nothing (AD-108), and `atomic_write`'s own `create_dir_all` would otherwise
+/// make the parent whatever the plan said.
+#[cfg(desktop)]
+fn entry_parent_error(parent: &str) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "there is no folder {parent} in this template. Make it with New folder first — a \
+             create names the file, and keeper will not invent the folder around it under a name \
+             it would have folded."
+        ),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Whether the folder a template-relative create lands in is already there.
+///
+/// One question for both create verbs, so *New file* and *New folder* cannot
+/// answer it differently — see [`entry_parent_error`] for why it is asked at all.
+/// A root-level `rel` has no parent to ask about: the template's own directory is
+/// proved by [`template_dir`].
+#[cfg(desktop)]
+fn entry_parent_present(zone: &std::path::Path, dir: &str, rel: &str) -> Result<(), IpcError> {
+    let Some((parent, _)) = rel.rsplit_once('/') else {
+        return Ok(());
+    };
+    if zone.join(format!("{dir}/{parent}")).is_dir() {
+        return Ok(());
+    }
+    Err(entry_parent_error(parent))
+}
+
+/// The template directory a `(root_id, name)` pair addresses, and the zone root
+/// it sits in.
+///
+/// One resolver for all four verbs, so "unknown root" and "no such template" are
+/// each one sentence. The template is required to *be* a directory here rather
+/// than assumed: `sessions_template_entries` answers an absent one with an empty
+/// room on purpose — a template removed in Finder is not a fault to a reader —
+/// but a *write* into a directory that is not there would create it, and a
+/// template keeper invented is not one the operator named.
+#[cfg(desktop)]
+fn template_dir(
+    root_id: &str,
+    name: Option<&str>,
+) -> Result<(std::path::PathBuf, String), IpcError> {
+    let zone = crate::sessions_root::zone_of(root_id).ok_or_else(|| root_error(root_id))?;
+    let rel = template_at(name)?;
+    if !zone.join(&rel).is_dir() {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "there is no template at {rel} in this zone, so there is nothing to change \
+                 inside it."
+            ),
+            account_id: None,
+            retriable: false,
+        });
+    }
+    Ok((zone, rel))
+}
+
+/// The profile-relative subpath of one zone-relative path, composed here and
+/// only here (AD-65).
+///
+/// `sessions_template_entries`' own composition, so the path a create answers
+/// with is the same string the row for that file will carry when the room
+/// re-reads — and the webview opens both through the one file target without
+/// joining anything.
+#[cfg(desktop)]
+fn template_subpath(
+    state: &tauri::State<'_, crate::ipc::AppState>,
+    root_id: &str,
+    zone_rel: &str,
+) -> Result<String, IpcError> {
+    let profile = crate::sync_ipc::sessions_profile(state, root_id)?;
+    let zone_prefix = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    Ok(format!("{zone_prefix}/{zone_rel}"))
+}
+
+/// Whether the entry a rename or a delete names is a file or a folder — the one
+/// fact the domain cannot work out for itself (AD-108).
+///
+/// A path with nothing at it is refused here rather than left to the executor: a
+/// missing source is a stale list, and "read the list again" is a different
+/// instruction from "that name is taken".
+#[cfg(desktop)]
+fn entry_kind(
+    source: &std::path::Path,
+    rel: &str,
+) -> Result<keeper_core::sessions::template::EntryKind, IpcError> {
+    use keeper_core::sessions::template::EntryKind;
+
+    if source.is_dir() {
+        return Ok(EntryKind::Dir);
+    }
+    if source.is_file() {
+        return Ok(EntryKind::File);
+    }
+    Err(IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "there is nothing at {rel} in this template — it moved or was removed. Read the \
+             list again rather than trying again."
+        ),
+        account_id: None,
+        retriable: false,
+    })
+}
+
+/// Make one file inside a template (FR-284), and answer with the path that opens
+/// it.
+///
+/// `rel` is template-relative and carries the filename: `notes.md` at the
+/// template's root, `refs/inputs.md` in a folder that is already there. The last
+/// segment is folded to a slug and its extension kept — `Kick Off.md` lands as
+/// `kick-off.md`, never `kick-off-md` — while the directories in front of it
+/// travel verbatim, because they address folders that already exist
+/// (`template_at`'s rule one level down).
+///
+/// **A folder in front of the filename is addressed, never created.** It used to
+/// be created, in the same plan and under the name as typed, which minted a
+/// directory *New folder* could not have made: `Interview Kit/notes.md` left an
+/// `Interview Kit/` on the drive while the same words through
+/// `sessions_template_dir_new` fold to `interview-kit`. So a parent that is not
+/// there is refused here (`entry_parent_error`), and every directory keeper
+/// mints in a template is minted by the folder verb, through the one fold.
+///
+/// **The file lands empty.** A template is copied into every session made from
+/// it, so frontmatter with an `id` in it would hand every one of those sessions
+/// the same identity — the freeze `template::zone_skeleton` exists to prevent. A
+/// `.json` gets `{}` because an empty file is not valid JSON.
+///
+/// Rejects with: `internal` (unknown root, no such template, a path that leaves
+/// the template, a dotfile, an extension outside `.md`/`.csv`/`.json`, a name
+/// that folds to nothing, a folder in the path that is not there, a destination
+/// that exists, a failed write),
+/// `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_file_new(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::template;
+
+    let (zone, dir) = template_dir(&root_id, name.as_deref())?;
+    let compiled = template::compile_file_new(&dir, &rel).map_err(entry_error)?;
+    // A create names the FILE. The folder in front of it must already be on the
+    // drive, because only the last segment went through the fold — see
+    // `entry_parent_error`. Asked before the collision test: "there is no folder
+    // refs" is a truer answer about `refs/inputs.md` than anything about the
+    // file's own name.
+    entry_parent_present(&zone, &dir, &compiled.rel)?;
+    let landed = format!("{dir}/{}", compiled.rel);
+    // Reading the drive is the shell's job (AD-108), and this refusal has to be
+    // made here: `WriteFile` overwrites by contract, so nothing further down
+    // would stop a create from taking a file somebody wrote.
+    if zone.join(&landed).exists() {
+        return Err(entry_taken_error(&compiled.rel));
+    }
+    let subpath = template_subpath(&state, &root_id, &landed)?;
+    let plan = compiled.plan;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-file-new task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(subpath)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_file_new(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<String, IpcError> {
+    // No `state`: the desktop twin needs it to compose a profile-relative path,
+    // and a mobile twin that refuses would only be making the mobile build depend
+    // on `AppState` for a function that never reads it (`sessions_template_entries`'
+    // stub, and its reason).
+    let _ = (root_id, name, rel);
+    Err(unsupported())
+}
+
+/// Make one folder inside a template (FR-284).
+///
+/// `rel` is template-relative: `artifacts` at the root, `refs/inputs` inside a
+/// folder that is already there. **Idempotent** — a folder that is
+/// already there succeeds and changes nothing, because `MkDir` says so and
+/// because the four skeleton directories are exactly the names somebody types
+/// without checking first. A *file* already at that path is refused, since that
+/// is the one collision `mkdir` cannot absorb.
+///
+/// A template's `workspace/` may be created and trashed like any other folder,
+/// unlike a session's: `files::check_dir` refuses scratch because AD-113 fences
+/// every write out of a live session's workspace, and a template's `workspace/`
+/// is a skeleton directory a create copies rather than scratch anything is
+/// writing into.
+///
+/// Rejects with: `internal` (unknown root, no such template, a path that leaves
+/// the template, a dotfile, a name that folds to nothing, a folder in the path
+/// that is not there, a file at that path, a failed write), `unsupported`
+/// (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_dir_new(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<(), IpcError> {
+    use keeper_core::sessions::template;
+
+    let (zone, dir) = template_dir(&root_id, name.as_deref())?;
+    let compiled = template::compile_dir_new(&dir, &rel).map_err(entry_error)?;
+    // The folder verb mints its LAST segment and no other, for the reason
+    // `sessions_template_file_new` refuses the same thing: `create_dir_all` would
+    // spell an absent `Interview Kit/` verbatim, and that name is one this room
+    // folds when it is typed as a name of its own.
+    entry_parent_present(&zone, &dir, &compiled.rel)?;
+    if zone.join(format!("{dir}/{}", compiled.rel)).is_file() {
+        return Err(entry_taken_error(&compiled.rel));
+    }
+    let plan = compiled.plan;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-dir-new task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_dir_new(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, name, rel);
+    Err(unsupported())
+}
+
+/// Rename one file or folder inside a template (FR-284), and answer with the
+/// path that opens the result.
+///
+/// **Why this is offered here and refused for a session's files.**
+/// `docs/sessions.md`'s refusal is about link identity: a hand-written file has
+/// no `id` and is identified by its path, so renaming it breaks every pin
+/// pointing at it. A template has no such graph — nothing pins a template's
+/// files, and a create *copies* them rather than referencing them — and the room
+/// already renames a whole template directory, which moves every file inside it
+/// at once. The relaxation is recorded rather than smuggled: see the Templates
+/// section of `docs/sessions.md`.
+///
+/// `new_name` is a name a person typed: its stem folds to a slug and its
+/// extension survives, and a file whose typed name carries no extension keeps the
+/// one it has — a rename renames, it does not decide what kind of file this is.
+/// The entry stays in its own folder; only the last segment changes.
+///
+/// **Not a move between folders**, and not idempotent in the useful direction: a
+/// name that folds to the one already there writes nothing and answers, while a
+/// name that folds to anything else is a real move even when it looks like the
+/// name on screen. A collision means a *different* file, by identity rather than
+/// by spelling — on a case-insensitive volume the destination of a case-only
+/// rename exists because it IS the source.
+///
+/// Rejects with: `internal` (unknown root, no such template, a path that leaves
+/// the template, a dotfile, the template root itself, nothing at that path, a
+/// name that folds to nothing, a destination that is a different entry, a failed
+/// move), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_rename_entry(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+    new_name: String,
+) -> Result<String, IpcError> {
+    use keeper_core::sessions::template;
+
+    let (zone, dir) = template_dir(&root_id, name.as_deref())?;
+    // Normalised before it is joined onto a zone root, because the next lines
+    // stat it. The guard is the domain's own and the compiler asks it again — a
+    // guard the caller can skip is not a guard (`files::check_rel`'s pattern).
+    let rel = template::entry_rel(&rel).map_err(entry_error)?;
+    let source = zone.join(&dir).join(&rel);
+    let kind = entry_kind(&source, &rel)?;
+    let compiled =
+        template::compile_entry_rename(&dir, &rel, &new_name, kind).map_err(entry_error)?;
+    let landed = format!("{dir}/{}", compiled.rel);
+    let subpath = template_subpath(&state, &root_id, &landed)?;
+    if compiled.rel == rel {
+        // A journal row and a commit for a move that is not one would be noise on
+        // a synced drive — `sessions_template_rename`'s rule, one level down.
+        return Ok(subpath);
+    }
+    let target = zone.join(&landed);
+    // The same predicate the plan step guards itself with
+    // ([`crate::sessions_exec::same_directory`]), asked here so the operator reads
+    // a sentence rather than an executor refusal, and asked from the one
+    // definition so the two layers cannot disagree about which renames a template
+    // accepts.
+    if target.exists() && !crate::sessions_exec::same_directory(&target, &source) {
+        return Err(entry_taken_error(&compiled.rel));
+    }
+    let plan = compiled.plan;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-entry-rename task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(subpath)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_rename_entry(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+    new_name: String,
+) -> Result<String, IpcError> {
+    let _ = (root_id, name, rel, new_name);
+    Err(unsupported())
+}
+
+/// Remove one file or folder from a template (FR-284), recoverably.
+///
+/// A trash move into the zone's `.keeper/trash/<id>/`, never an unlink and never
+/// a `remove_dir_all`: a template is a thing somebody wrote, and a folder delete
+/// that erases bytes is one nobody presses without making a copy first. A
+/// directory goes whole, which is what makes it recoverable whole.
+///
+/// The session tree's own refusal — *"keeper deletes one file at a time. Removing
+/// a folder takes everything inside it with it"* — is not repeated here, and that
+/// is a judgement rather than an oversight: it is about a live session's
+/// directories, which hold work, while a template's hold a skeleton the operator
+/// put there and a create copies. The trash is what makes it safe either way.
+///
+/// `rel` is template-relative. The template **root** is refused
+/// (`template::entry_rel`), because deleting a whole template is a different verb
+/// with a different confirmation.
+///
+/// Rejects with: `internal` (unknown root, no such template, a path that leaves
+/// the template, a dotfile, the template root itself, nothing at that path, a
+/// failed move), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_template_delete_entry(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<(), IpcError> {
+    use keeper_core::sessions::template;
+
+    let (zone, dir) = template_dir(&root_id, name.as_deref())?;
+    let rel = template::entry_rel(&rel).map_err(entry_error)?;
+    let source = zone.join(&dir).join(&rel);
+    let kind = entry_kind(&source, &rel)?;
+    let compiled = template::compile_entry_delete(&dir, &rel, kind, &crate::sync_ipc::new_ulid())
+        .map_err(entry_error)?;
+    let plan = compiled.plan;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone, plan))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("template-entry-delete task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_template_delete_entry(
+    root_id: String,
+    name: Option<String>,
+    rel: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, name, rel);
+    Err(unsupported())
+}
+
+// ---------------------------------------------------------------------------
 // File verbs (FR-262): make and unmake one file inside a session
 // ---------------------------------------------------------------------------
 
@@ -2436,22 +2916,36 @@ pub async fn sessions_file_new(
     Ok(subpath)
 }
 
-/// Make a correctly-named, correctly-tagged log or prompt in the session's pool.
+/// Make a correctly-named, correctly-tagged file of one kind, **where this
+/// session's shape keeps that kind** (FR-277).
 ///
-/// **[`sessions_log_today`]'s flat twin, not a rival.** That command appends a
-/// dated heading to a folder-shaped session's `README.md`, which is where its
-/// log lives; a flat session has no `## Log` section to append to, and its log
-/// is a *file*. Same verb, same button, two contracts — which is why the
-/// frontend picks between them on `detail.shape` rather than offering both.
+/// **[`sessions_log_today`]'s twin, not a rival.** That command appends a dated
+/// heading to a folder-shaped session's `README.md`, which is where its log
+/// lives; a flat session has no `## Log` section to append to, and its log is a
+/// *file*. Same verb, same button, two contracts — which is why the frontend
+/// picks between them on `detail.shape` rather than offering both, and why a
+/// `log` asked of THIS command on a folder-shaped session is refused with a
+/// sentence pointing at that one rather than growing a second log writer.
+///
+/// **Where it writes is the shape's answer, not this command's**
+/// ([`keeper_core::sessions::shape::kind_dir`]). A flat session keeps every
+/// kind at its root; a folder-shaped one keeps references in `refs/` and
+/// prompts in `prompts/`, which are exactly the directories its pool reads back
+/// (`crate::sessions_root::read_ref_sources`). Until Story 50.1 this always
+/// wrote the root, so on a folder-shaped session the file landed somewhere no
+/// space and no *Unfiled* notice could ever see — which is why the surface
+/// suppressed the button instead of fixing the write.
 ///
 /// The name is `YYYY-MM-DD-HHMM-<slug>.md` and the tag is written into
 /// frontmatter, because those two together are what decide whether the zone's
-/// spaces will ever list the file. A log the operator named freehand is a log
-/// that no space selects — the flat shape's one real failure mode, and the whole
-/// reason these two verbs exist beside the general one.
+/// spaces will ever list the file. The directory is *not* the third half of
+/// that: [`keeper_core::sessions::pool::read_one`] derives a kind from tags
+/// alone (AD-120), so a file in `refs/` without `tags: [ref]` is unfiled no
+/// matter which folder it is in.
 ///
 /// Rejects with: `internal` (unknown root or session, an unknown kind tag, a
-/// failed write), `unsupported` (mobile).
+/// kind this session's shape has no home for, a refused path, a failed write),
+/// `unsupported` (mobile).
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_file_new_kind(

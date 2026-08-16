@@ -592,11 +592,13 @@ pub struct SessionTemplateEntryVm {
     /// picker's path and the list's path start to disagree about the same file.
     /// The row hands this straight to a file target and joins nothing.
     pub subpath: String,
-    /// The file's own basename — the row's label.
+    /// The entry's path **relative to the template** — `prompts/hand-off.md`
+    /// for a file, `prompts` for the folder holding it.
     ///
-    /// Sent beside [`Self::subpath`] rather than sliced off it in TypeScript: a
-    /// basename is a path operation, and AD-65 does not have an exception for
-    /// the easy ones.
+    /// Not a basename, now that the walk reaches into subdirectories: two files
+    /// sharing one would be two rows under one label. The tree the room draws is
+    /// read back out of these paths rather than out of a second walk, and the
+    /// entry verbs address an entry by exactly this string.
     pub name: String,
     /// Last modified, from the shell's stat — what the newest-first order is on.
     ///
@@ -604,6 +606,16 @@ pub struct SessionTemplateEntryVm {
     /// to `bigint`, which does not survive `JSON.parse`.
     #[ts(type = "number")]
     pub mtime_ms: i64,
+    /// Whether this entry is a directory.
+    ///
+    /// A folder is a row the shell **names**, rather than a shape the webview
+    /// infers from the paths of the files under it, because an empty one names
+    /// no file: it would have no row, and therefore no rename, no delete, and
+    /// nothing for a create to prefill from. `New folder` made exactly that —
+    /// a directory on the drive the room it was added to could never draw — and
+    /// the skeleton's own `artifacts/` and `workspace/` were invisible for the
+    /// same reason, their only content being a `.gitkeep` the walk drops.
+    pub is_dir: bool,
 }
 
 /// What the editor sends to save one session space (FR-261).

@@ -187,10 +187,11 @@ made.
   zone has — its own `_template/` and each named one — and under each, every file inside it,
   newest change first. That listing is the same walk the picker previews a create from, so
   the room and a new session cannot disagree about what a template holds: a file in a
-  subdirectory is a row too, carrying its path within the template. When such a row is too
-  narrow for the whole path it gives way on the directory and keeps the filename —
-  `prompts/hand-off.md` never shortens to `prompts/pro…`, because the filename is what you
-  came to press. The one difference is the create's, not the room's — a new session gets a
+  subdirectory is a row too, grouped under the folder it sits in and labelled with its own
+  name — the answer carries each file's path within the template, and the tree is read back
+  out of that rather than out of a second walk. Arrow keys walk it and `Enter` opens a file
+  or folds a folder, as in a session's own tree. The one difference is the create's, not the
+  room's — a new session gets a
   *stamped* record rather than a copied one, so `about.md` is a row here and never under
   *Copies*. Press a file to open it in the panel beside the board: the same editor a
   session's record opens in, because editing a template is editing a file and nothing more.
@@ -210,6 +211,64 @@ made.
   is) does reach the command, and does trash-then-write those two files. The search box and
   the Pinned/Unread filters are hidden in this mode: they filter session rows, and a
   template has no status.
+
+  **A template's own files and folders can be changed from here** (FR-284), which is why the
+  list is a **tree** rather than a column of paths: a template's shape is its folders, and a
+  create copies that shape whole. The tree is grouped out of the same single read — a file's
+  row carries its path inside the template, so the folders are already in the answer and
+  nothing walks the directory twice. **A folder is a row the moment it exists**, empty or
+  not, because a folder you cannot see is one you cannot rename or delete — the row is
+  keeper's answer about the directory rather than something inferred from the files inside
+  it. The one thing a directory's row does not show is an age: a folder's timestamp moves
+  whenever anything in it does.
+
+  Four verbs, each a journaled plan like every other zone write, so the drive gets one commit
+  with keeper's provenance on it rather than an edit keeper's watcher reads as somebody
+  else's:
+
+  - **New file** and **New folder**, on the template's own heading and always visible — the
+    field takes the path *inside* the template, so `notes.md` lands at its root and
+    `refs/inputs.md` lands in a `refs/` **that is already there** — a folder in the path
+    that is not on the drive is refused, naming it, and *New folder* is what makes one.
+    That is one rule rather than a restriction: only the last thing you type is folded to a
+    name, so a folder created around a filename would have been spelled exactly as typed
+    (`Interview Kit/`) while the same words typed into *New folder* fold to
+    `interview-kit` — one room with two spellings of one directory. A new file arrives
+    **empty**: keeper stamps no `id` into a template, because a create copies the file and
+    every session made from it would inherit that one identity. New folder is idempotent —
+    asking for `artifacts/` in a template that has it is not an error — and a template's
+    `workspace/` may be created and deleted like any other folder, unlike a live session's,
+    where the write fence exists to keep scratch scratch.
+  - **Rename**, on a row, for a file or a folder. The name you type is folded exactly as
+    *New template* folds one, except that **a file keeps its extension**: `Kick Off.md`
+    becomes `kick-off.md` and never `kick-off-md`, and a name typed without an extension keeps
+    the one the file has. The entry stays in its folder — this renames, it does not move
+    between folders. What a rename may **not** do is carry a file out of the set keeper
+    writes: `about.md` cannot become `about.sh`, because that would author through a rename
+    exactly what *New file* refuses to author. Keeping an extension the file already has is
+    always free, whatever it is — `logo.png` renamed to `Logo Mark` stays a `.png`, since
+    those bytes were already in the template. A name already taken is refused, naming it; a
+    name that only differs in case from the one on disk is allowed, because on macOS that
+    destination "exists" only because it *is* the file being renamed.
+  - **Delete**, on a row, for a file or a folder, behind a confirmation that says where it
+    goes: the zone's `.keeper/trash/<id>/`, never an unlink and never a recursive erase. A
+    folder goes whole and comes back whole. Sessions already made from the template keep their
+    own copies. The template *itself* is not a row here, so this verb cannot be aimed at it —
+    a whole template is made with *New template* and renamed with *Rename template*.
+
+  **This is where the no-rename rule stops applying, and that is a judgement rather than an
+  oversight.** *The session's files* below refuses renaming for a reason that is about link
+  identity: a hand-written file has no `id`, so its path *is* its identity and a rename breaks
+  the pins aimed at it. A template has no such graph — nothing pins a template's files, and a
+  create *copies* them rather than referencing them, so the only reader of the name is a copy
+  that reads the directory fresh. The room already renames a whole template directory, which
+  moves every file in it at once; renaming one of them is strictly less than the verb it
+  already had.
+
+  One thing this room still will not show you: a stray `.DS_Store`, or any other dotfile
+  except `.gitkeep`. The walk that lists a template is the walk a create copies from, so
+  giving the room eyes for those would also hand them to every new session. No verb here can
+  name one; Finder is where that gets removed.
 - **Rename a template** — offered on a **named** template's row, and only there. The name
   you type is folded to a directory name exactly as *New template* folds it, the move
   runs as one journaled plan — so the drive gets a single commit with keeper's provenance
@@ -524,4 +583,5 @@ mean in notes — while **the board's search box remains free text** over
 title/path/tags/snippet/log, because the board searches sessions and a space searches
 files inside one. And **files can be created and deleted from inside the session tree**;
 renaming and moving still cannot, which is deliberate — a rename is a link-rewriting
-problem, not a file-system one, and half of it would be worse than none.
+problem, not a file-system one, and half of it would be worse than none. **Inside a
+template** they can, because a template has no link graph to rewrite: see *Templates*.

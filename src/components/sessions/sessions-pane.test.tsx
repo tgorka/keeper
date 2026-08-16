@@ -28,6 +28,14 @@ vi.mock("@/lib/ipc/client", () => ({
     sessionsTemplateEntries(rootId, name),
   sessionsTemplateRename: (rootId: unknown, name: unknown, newName: unknown) =>
     sessionsTemplateRename(rootId, name, newName),
+  // The templates room's entry verbs (FR-284). Never pressed from this suite —
+  // they are the room's own tests — but the room imports them, and a factory mock
+  // that omits an export turns any future press into a mock error instead of a
+  // failure about the surface.
+  sessionsTemplateFileNew: vi.fn(async () => "60-sessions/_template/notes.md"),
+  sessionsTemplateDirNew: vi.fn(async () => {}),
+  sessionsTemplateRenameEntry: vi.fn(async () => "60-sessions/_template/record.md"),
+  sessionsTemplateDeleteEntry: vi.fn(async () => {}),
   sessionsSetPinned: vi.fn(async () => {}),
   sessionsLogToday: vi.fn(async () => {}),
   sessionsArchive: vi.fn(async () => {}),
@@ -169,7 +177,12 @@ beforeEach(() => {
   listenSessionsChanged.mockResolvedValue(() => {});
   sessionsTemplateInstall.mockResolvedValue("_template/interview");
   sessionsTemplateEntries.mockResolvedValue([
-    { subpath: "60-sessions/_template/AGENTS.md", name: "AGENTS.md", mtimeMs: NOW - 60_000 },
+    {
+      subpath: "60-sessions/_template/AGENTS.md",
+      name: "AGENTS.md",
+      mtimeMs: NOW - 60_000,
+      isDir: false,
+    },
   ]);
   sessionsTemplateRename.mockResolvedValue("_template/kick-off");
 });
@@ -343,7 +356,9 @@ describe("SessionsPane templates room", () => {
 
     // The zone's templates, with what Rust says is inside them.
     expect(await within(room).findByRole("heading", { name: "Zone template" })).toBeInTheDocument();
-    expect(await within(room).findByRole("button", { name: /AGENTS\.md/ })).toBeInTheDocument();
+    // The exact name: a row carries its own Rename and Delete now, each labelled
+    // with the entry it acts on, so a substring match would find three buttons.
+    expect(await within(room).findByRole("button", { name: "AGENTS.md" })).toBeInTheDocument();
     // The session rows are not what is showing.
     expect(screen.queryByRole("list", { name: SESSIONS_LIST_LABEL })).not.toBeInTheDocument();
     // Search, Pinned and Unread filter session rows; here they would be inert
