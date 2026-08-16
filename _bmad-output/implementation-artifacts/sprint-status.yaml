@@ -600,11 +600,41 @@ development_status:
   # and neither says what the CONFIG VALIDATOR refuses. A spec's "Block if" clause
   # that names a configuration must be checked against the validator, not only
   # against the code that reads it.
+  #
+  # SHIPPED as a four-PR stack on top of epic 49's five, 2026-08-16:
+  #
+  #   #148  feat/50-1-write-where-the-session-keeps-it  -> chore/the-epic-49-ledger
+  #   #149  feat/50-2-a-templates-files-and-folders     -> #148
+  #   #150  feat/50-3-one-editor-host                   -> #149
+  #   #151  feat/50-4-a-files-own-properties            -> #150
+  #
+  # Two review layers again returned `incorrect` on all three of the first
+  # stories, and the findings were worth the pass:
+  #
+  #   P1  50.2's `New folder` created a folder the room could never render — the
+  #       listing emitted files only and the tree invented folders from the
+  #       ancestors of FILE paths, so an empty directory had no row and therefore
+  #       no rename, no delete and no prefill. That is this story's own complaint
+  #       reproduced for the folder half, and the test that missed it asserted
+  #       the wire call and that no panel opened, never that a row appeared.
+  #   50.1 shipped a DATA defect in its first cut: the shape-aware destination
+  #       made the seeded reference title `refs/references`, which is also the
+  #       row label the References space shows.
+  #   50.3's central claim was false — the toolbar was gated on a render-time
+  #       boolean while the mount resolves six dynamic imports later, so every
+  #       press in that window was silently discarded; and the guard its own doc
+  #       said kept the writing tools off a `workspace/` markdown file did not
+  #       exist at all.
+  #
+  # 25 findings fixed across the four stories, 0 disputed. The recurring shape,
+  # now three epics deep: a claim in a comment or a spec that no test owns. Every
+  # one of these was a sentence that was true when it was written and false by
+  # the time it shipped.
   epic-50: in-progress
-  50-1-a-space-you-can-write-into-wherever-the-session-keeps-it: in-progress
-  50-2-a-templates-files-and-folders: backlog
-  50-3-one-editor-host-one-set-of-writing-tools: backlog
-  50-4-a-files-own-properties: backlog
+  50-1-a-space-you-can-write-into-wherever-the-session-keeps-it: review
+  50-2-a-templates-files-and-folders: review
+  50-3-one-editor-host-one-set-of-writing-tools: review
+  50-4-a-files-own-properties: review
   epic-50-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
