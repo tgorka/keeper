@@ -70,11 +70,123 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     if trust_full {
         options = options.with(gix::sec::Trust::Full);
     }
-    let repo = gix::open_opts(path, options)
+    let mut repo = gix::open_opts(path, options)
         .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))?;
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
+    drop_foreign_lfs_driver(&mut repo)?;
     Ok(repo)
+}
+
+/// Remove every `filter "lfs"` driver that is not this repository's own from the
+/// merged, in-memory configuration.
+///
+/// # The failure this ends
+///
+/// `git lfs install` — the same command whose hooks [`super::cli`] neutralizes —
+/// writes a driver into the user's **global** config:
+///
+/// ```text
+/// [filter "lfs"]
+///     process  = git-lfs filter-process
+///     clean    = git-lfs clean -- %f
+///     smudge   = git-lfs smudge -- %f
+///     required = true
+/// ```
+///
+/// gitoxide collects one driver per configuration *section* and then takes the
+/// **first** whose name matches (`gix::filter::extract_drivers` feeding
+/// `gix_filter::pipeline::util::extract_driver`). Sections arrive in scope order,
+/// so a global `filter "lfs"` precedes the local one
+/// [`enforce_local_config_with_filter`] writes — and keys are **not** merged
+/// across the two the way git merges them. The global section is therefore the
+/// whole answer: keeper's `clean`/`smudge` are never consulted, its
+/// `required = false` never applies, and `process` wins over both.
+///
+/// `process` is the long-running filter protocol, and gitoxide's launch of it
+/// fails hard whatever `required` says (`gix_filter::driver::State::
+/// maybe_launch_process` returns `ProcessHandshake` before any driver leniency is
+/// consulted). On a desktop launch `PATH` is Finder's, so `/bin/sh -c
+/// "git-lfs filter-process"` finds no `git-lfs`, exits, and the handshake read
+/// hits EOF:
+///
+/// ```text
+/// status failed: IO error while writing blob or reading file metadata or
+/// changing filetype: Process handshake with command … "/bin/sh" "-c"
+/// "git-lfs filter-process" "sh" failed: Failed to read or write to the
+/// process: failed to fill whole buffer
+/// ```
+///
+/// The trigger is any content re-read of an LFS entry, measured against gix
+/// 0.86: `index_as_worktree` falls through to a content comparison whenever the
+/// entry's stat tuple stops matching, and `FastEq` streams that content — through
+/// the filter — as long as the SIZE still agrees, which for an LFS entry it
+/// normally does (the entry's stat is the worktree file's, AD-46). A recording
+/// whose mtime moved after the last index write is exactly that shape, and so is
+/// the racily-clean case.
+///
+/// Field measurement (2026-08-13 → 2026-08-16, 90 430 identical lines in one
+/// user's log): the state is self-perpetuating. `status` fails, so nothing
+/// commits, so the index is never rewritten, so the same entry is re-read on the
+/// next pass — no retry, restart or reinstall can clear it.
+///
+/// # Why the whole section goes
+///
+/// keeper *is* the LFS implementation for a folder it manages: it writes the
+/// pointers, owns the object store under `.git/lfs`, uploads through its own
+/// journal and prunes objects it has replicated. A driver belonging to another
+/// installation is wrong here even when its binary is present — the same
+/// reasoning [`super::cli`] applies to git-lfs's hooks, one layer down. Only the
+/// repository's own scopes (`.git/config`, `.git/config.worktree`) may name the
+/// `lfs` driver.
+///
+/// Nothing on disk is touched: the surgery is on the merged snapshot this
+/// `Repository` handle holds, so a user's `~/.gitconfig` keeps working for every
+/// repository keeper does not manage.
+pub fn drop_foreign_lfs_driver(repo: &mut gix::Repository) -> Result<()> {
+    // Reading first keeps the common case free: committing a snapshot re-reads
+    // every value and clears the repository's caches, and this runs on every
+    // open, which is once per sync pass.
+    if !has_foreign_lfs_driver(repo) {
+        return Ok(());
+    }
+    let mut snapshot = repo.config_snapshot_mut();
+    // A loop, not one call: `remove_section_filter` removes the last match, and
+    // a machine can carry several (system *and* global, or two global files
+    // reached through an `include`).
+    while snapshot
+        .remove_section_filter("filter", Some("lfs".into()), |meta| {
+            !is_repository_scope(meta)
+        })
+        .is_some()
+    {}
+    snapshot
+        .commit()
+        .map_err(|err| SyncError::Git(format!("could not drop a foreign lfs filter: {err}")))?;
+    Ok(())
+}
+
+/// Whether any `filter "lfs"` section comes from outside this repository.
+fn has_foreign_lfs_driver(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .sections_by_name("filter")
+        .into_iter()
+        .flatten()
+        .any(|section| {
+            section
+                .header()
+                .subsection_name()
+                .is_some_and(|name| name == "lfs")
+                && !is_repository_scope(section.meta())
+        })
+}
+
+/// `.git/config` and `.git/config.worktree`, and nothing else.
+///
+/// The scope, not the trust level: a global file is perfectly trustworthy and
+/// still has no business naming the `lfs` driver for a folder keeper manages.
+fn is_repository_scope(meta: &gix::config::file::Metadata) -> bool {
+    meta.source.kind() == gix::config::source::Kind::Repository
 }
 
 /// Remove an `index.lock` left behind by a process that was killed.
@@ -454,7 +566,7 @@ pub fn clone(
             super::fetch::classify("clone", &super::fetch::flatten(&err), &host, interrupt)
         })?;
 
-    let (repo, _outcome) = checkout
+    let (mut repo, _outcome) = checkout
         .main_worktree(gix::progress::Discard, interrupt)
         .map_err(|err| {
             cancelled_or(interrupt, || {
@@ -463,6 +575,10 @@ pub fn clone(
         })?;
 
     enforce_local_config(&repo)?;
+    // The checkout above is the one filtered operation keeper cannot protect
+    // this way — `gix::clone::PrepareCheckout` hands out no mutable repository
+    // (DW-206). Everything the caller does with this handle afterwards is.
+    drop_foreign_lfs_driver(&mut repo)?;
     Ok(repo)
 }
 
@@ -497,7 +613,10 @@ pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
 /// Single-invocation `clean`/`smudge` rather than the long-running
 /// `filter.lfs.process` protocol: both git and gitoxide support it, it is far
 /// less machinery, and the per-call cost only lands when git's stat cache
-/// already missed.
+/// already missed. Any `process` key already in this section is **removed**, for
+/// the reason [`drop_foreign_lfs_driver`] spells out: `git lfs install --local`
+/// writes one here, it outranks `clean`/`smudge` in git and replaces them
+/// outright in gitoxide, and keeper owns this section.
 ///
 /// `required` is deliberately left false. A worktree whose keeper binary has
 /// moved must still be checkout-able — it would just get pointers, which is
@@ -554,6 +673,25 @@ pub fn enforce_local_config_with_filter(
         config
             .set_raw_value("filter.lfs.required", "false")
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
+        // The section exists: `set_raw_value` above created it if it had to.
+        // Several `[filter "lfs"]` sections in one file are legal, so every one
+        // of them is stripped rather than the last.
+        let ids: Vec<_> = config
+            .sections_and_ids()
+            .filter(|(section, _)| {
+                section.header().name() == "filter"
+                    && section
+                        .header()
+                        .subsection_name()
+                        .is_some_and(|name| name == "lfs")
+            })
+            .map(|(_, id)| id)
+            .collect();
+        for id in ids {
+            if let Some(mut section) = config.section_mut_by_id(id) {
+                while section.remove("process").is_some() {}
+            }
+        }
     }
 
     write_config_atomically(&config, &path)?;
@@ -1993,6 +2131,92 @@ mod tests {
             text.matches("sparse").count(),
             1,
             "a repeated call must overwrite, not append: {text}"
+        );
+    }
+
+    /// The `[filter "lfs"]` section `git lfs install --local` leaves in
+    /// `.git/config`, with the long-running driver keeper cannot answer.
+    fn with_local_lfs_process(root: &std::path::Path) {
+        let config = root.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str("[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n\trequired = true\n");
+        std::fs::write(&config, text).expect("write config");
+    }
+
+    #[test]
+    fn registering_the_filter_removes_a_process_driver_from_the_same_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        with_local_lfs_process(dir.path());
+
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")))
+            .expect("enforce");
+
+        // gitoxide takes `process` in preference to the pair below it and fails
+        // hard when it cannot be launched, whatever `required` says — so leaving
+        // the key in the section keeper owns would make the two keys it just
+        // wrote unreachable.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let config = reopened.config_snapshot();
+        assert_eq!(
+            config.string("filter.lfs.process"),
+            None,
+            "keeper's own section may not name a long-running driver"
+        );
+        assert!(
+            config
+                .string("filter.lfs.clean")
+                .is_some_and(|value| value.to_string().contains("lfs clean")),
+            "the clean filter has to survive"
+        );
+        assert_eq!(config.boolean("filter.lfs.required"), Some(false));
+    }
+
+    #[test]
+    fn a_foreign_lfs_driver_is_dropped_and_the_local_one_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")))
+            .expect("enforce");
+        let mut repo = open(dir.path(), true).expect("reopen");
+
+        // A global `[filter "lfs"]`, in the position a real one occupies: ahead
+        // of the repository's own section, because scopes merge in precedence
+        // order and gitoxide answers with the FIRST driver of that name.
+        let foreign = gix::config::File::from_bytes_owned(
+            &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
+            gix::config::file::Metadata::from(gix::config::Source::User),
+            Default::default(),
+        )
+        .expect("parse the foreign config");
+        {
+            let mut snapshot = repo.config_snapshot_mut();
+            let mut merged = foreign;
+            merged
+                .append(snapshot.clone())
+                .expect("merge the repository's own scopes after it");
+            *snapshot = merged;
+            snapshot.commit().expect("commit the doctored config");
+        }
+        assert_eq!(
+            repo.config_snapshot().string("filter.lfs.process"),
+            Some("git-lfs filter-process".into()),
+            "arranged: the foreign driver is what gix would launch"
+        );
+
+        drop_foreign_lfs_driver(&mut repo).expect("drop");
+
+        let config = repo.config_snapshot();
+        assert_eq!(
+            config.string("filter.lfs.process"),
+            None,
+            "a driver from outside the repository may not decide how it is filtered"
+        );
+        assert!(
+            config
+                .string("filter.lfs.clean")
+                .is_some_and(|value| value.to_string().contains("lfs clean")),
+            "the repository's own registration is what must remain"
         );
     }
 
