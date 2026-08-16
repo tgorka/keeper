@@ -502,10 +502,76 @@ development_status:
   48-5-the-header-stops-hiding-everything: review
   48-6-a-remembered-folder-is-re-read-once: review
   epic-48-retrospective: optional
+  # ── EPIC 49, 2026-08-16: the fifth field report, as a four-PR stack ──────────
+  #
+  # Bottom to top, and the order matters because each branch is the next one's
+  # base:
+  #
+  #   #141  feat/49-1-templates-you-can-enter        -> main
+  #   #142  feat/49-2-a-space-you-can-write-into     -> #141
+  #   #143  feat/49-3-spaces-fold-by-default         -> #142
+  #   #144  fix/an-assertion-that-asserted-nothing   -> #143
+  #
+  # The one non-obvious fact: **#141 unblocks the rest**. Nothing above it can
+  # land first, and #144 is not epic-49 work at all — it is two defects the macOS
+  # gate found (a `|| true` assertion that has asserted nothing since epic 47, and
+  # nine `unwrap()`s in 49.1's new shell-crate tests that `-D warnings` refuses).
+  # It sits at the top because that is where the gate ran, not because it depends
+  # on the fold.
+  #
+  # Triage first, and it changed the epic: four read-only scouts checked all eight
+  # claims against the code before the spine was written. Five of the eight were
+  # `unreachable` rather than absent — the capability was built and nothing
+  # rendered it — and ONE was already true: a session space has always held N
+  # notes (`Vec` in the domain, `Vec` on the wire, `files.map` in the UI, a
+  # two-file listing asserted since it shipped). What the owner felt as a cap was
+  # the WRITE path: no space could create into itself, so About/References/Tasks
+  # held exactly what the template wrote, forever. Nothing was built for
+  # multiplicity; the create verb is the fix.
+  #
+  # Every story was reviewed adversarially before its PR. All six passes returned
+  # `incorrect` and the findings were real: a refusal contract that could never
+  # fire (`naming::slug` falls back to `"untitled"`, so `rename(x, "###")` moved a
+  # template into `_template/untitled`), an async mirror with no root stamp
+  # (live Rename buttons addressing the wrong zone), a create offered where its
+  # own result would be invisible, an opener that silently took the file surface
+  # while the vault mirror was still null, and a fold that flashed open before its
+  # cookie was read. 27 findings fixed across the stack, 0 disputed.
+  #
+  # HESPERIA, 2026-08-16 — the gate and the install, both over the stack tip:
+  #
+  #   `bun run check:rust:macos` PASSED — full-workspace `cargo fmt --check`,
+  #   `clippy --workspace --all-targets -D warnings` and `cargo test --workspace`,
+  #   plus the binding-drift check (250 generated files, no drift). It is also
+  #   what found the two defects in #144: the Mac is pinned to an older stable
+  #   (1.96.0) than the dev box (1.97.1), and the older clippy is the one that
+  #   fires `overly_complex_bool_expr`. Green clippy on Linux is not evidence
+  #   about that class of defect.
+  #
+  #   `cargo test -p keeper --lib -- sessions_ipc::tests sessions_exec::tests`
+  #   13 passed — POSITIVE PROOF that the nine new shell-crate tests executed,
+  #   not merely compiled. That distinction is the whole reason this line exists.
+  #
+  #   `bun run install:macos` — signed release build installed to
+  #   /Applications/keeper.app, running as PID 16160. Proven to be THIS build by
+  #   string-probing the Mach-O: `sessions_template_rename`,
+  #   `sessions_template_entries`, `sessions.spaces_folded`,
+  #   `sessions_spaces_folded_get` and both new refusal sentences are all present
+  #   in the installed binary and ABSENT from the retained keeper.app.previous.
+  #   The frontend cannot be probed that way — Tauri embeds it compressed — and a
+  #   version string cannot distinguish two builds of 0.8.8, so the binary
+  #   contrast is the honest evidence.
+  #
+  #   NOT DONE: the on-screen smoke test. `system.menu_bar_presence = 1` on that
+  #   machine, so keeper is tray-resident and reports zero windows; the display
+  #   also kept sleeping and Arc was frontmost, i.e. a person may be at the
+  #   keyboard. Driving their UI to prove a chip renders was not worth the
+  #   intrusion. What is owed is one pass through each spec's "Manual smoke test
+  #   on hesperia" paragraph.
   epic-49: in-progress
-  49-1-templates-are-a-room-you-can-enter: in-progress
-  49-2-a-space-you-can-write-into: backlog
-  49-3-spaces-fold-and-the-fold-has-a-default: backlog
+  49-1-templates-are-a-room-you-can-enter: review
+  49-2-a-space-you-can-write-into: review
+  49-3-spaces-fold-and-the-fold-has-a-default: review
   epic-49-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
