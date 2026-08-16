@@ -84,6 +84,7 @@ import {
   SESSION_SPACE_NEW_NOTE,
   SESSION_SPACES_EMPTY,
   SESSION_SPACES_HEADING,
+  SESSION_SPACES_NO_FILES,
 } from "@/components/sessions/session-spaces";
 import { SESSION_TREE_EMPTY } from "@/components/sessions/session-tree";
 import { writeCookie } from "@/components/ui/cookie-writer";
@@ -794,5 +795,102 @@ describe("SessionDetail restores the spaces' fold", () => {
       "aria-expanded",
       "false",
     );
+  });
+});
+
+/**
+ * Story 50.4: a file that just became `tag:ref` appears in References, with no
+ * manual refresh (FR-283, AD-120).
+ *
+ * **Where the two halves are, so neither is asserted twice or not at all.** The
+ * write emits `keeper://sessions-changed` for the root it landed in
+ * (`sync_ipc::sync_write_frontmatter`) — that half is in the shell crate and is
+ * verified on macOS. The half here is the one that decides whether the surface
+ * is honest when it arrives: the detail re-reads BOTH space payloads on that
+ * event, so a selection that changed under it is on screen.
+ *
+ * The re-read itself is not new — it is the listener 47.x already wired, which
+ * is exactly why 50.4 adds no frontend plumbing for it. What is new is that a
+ * property write now announces itself into it instead of waiting for a
+ * debounced watcher, and these cases are what make that arrival meaningful.
+ */
+describe("SessionDetail after a file's properties change", () => {
+  const REFERENCES = space({
+    id: "_spaces/references.md",
+    name: "References",
+    query: "tag:ref",
+    defaultKey: "ref",
+    newFileKind: "ref",
+  });
+
+  function selection(relPath: string) {
+    return {
+      spaceId: REFERENCES.id,
+      files: [
+        {
+          id: `path:${relPath}`,
+          relPath,
+          subpath: `60-sessions/active/s/${relPath}`,
+          title: relPath.replace(/^.*\//, "").replace(/\.md$/, ""),
+          tags: ["ref"],
+          mtimeMs: NOW - 1_000,
+          unstableIdentity: true,
+        },
+      ],
+      error: null,
+      noHome: null,
+    };
+  }
+
+  it("row 6: lists a file in refs/ that just became tag:ref, on the next read", async () => {
+    sessionsSpaces.mockResolvedValue([REFERENCES]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+    ]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    expect(within(section).queryByText("inputs")).toBeNull();
+
+    // The tag is written, and the write says so on the zone's own event.
+    const onChanged = listenSessionsChanged.mock.calls[0][0] as (rootId: string) => void;
+    sessionsSpaceFiles.mockResolvedValue([selection("refs/inputs.md")]);
+    onChanged("tgdrive");
+
+    // No button was pressed on this surface. AD-120: the tag is what files the
+    // file, and the space it lands in is Rust's answer to the query.
+    expect(await within(section).findByText("inputs")).toBeInTheDocument();
+    expect(sessionsSpaceFiles).toHaveBeenCalledTimes(2);
+  });
+
+  it("row 7: does not list a folder-shaped session's ROOT markdown, however it is tagged", async () => {
+    // The boundary, stated rather than assumed. For a folder-shaped session the
+    // pool reads `README.md`, `refs/` and `prompts/` and nothing else
+    // (`sessions_root::read_ref_sources`, asserted there over real files), so a
+    // root `stray.md` tagged `ref` is in no space at all — not even Unfiled.
+    //
+    // What this surface owes is that it does not invent the row: it lists what
+    // the selection payload holds and never derives membership from a tag it
+    // can see. A test that only asserted row 6 would stay green over a surface
+    // that filed files client-side.
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder", unfiled: [] }));
+    sessionsSpaces.mockResolvedValue([REFERENCES]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+    ]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    const onChanged = listenSessionsChanged.mock.calls[0][0] as (rootId: string) => void;
+    // Rust re-read the pool and still selected nothing: the root file is not in
+    // it to be selected.
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+    ]);
+    onChanged("tgdrive");
+
+    await waitFor(() => expect(sessionsSpaceFiles).toHaveBeenCalledTimes(2));
+    expect(within(section).queryByText("stray")).toBeNull();
+    expect(within(section).getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
   });
 });

@@ -912,6 +912,12 @@ pub fn run() {
         sync_ipc::sync_delete_plan,
         sync_ipc::sync_delete_entries,
         sync_ipc::sync_create_entry,
+        // A file's own properties (Story 50.4, FR-283). Beside the write
+        // commands because they are one question: the same `WriteScope::route`
+        // decides whether a file's properties may be read and whether they may
+        // be written, so a panel is never offered where a write would refuse.
+        sync_ipc::sync_read_frontmatter,
+        sync_ipc::sync_write_frontmatter,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
         sync_ipc::sync_activity,

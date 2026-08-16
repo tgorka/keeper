@@ -3324,6 +3324,57 @@ export async function syncWriteEntry(id: string, subpath: string, content: strin
 }
 
 /**
+ * Read one file's frontmatter block (FR-283, AD-120, Story 50.4).
+ *
+ * Takes the profile id and the profile-relative `subpath` the listing handed
+ * you — never a path, never one composed here (AD-65). Resolves to the leading
+ * `---` block verbatim, or `""` for a file that has none, which is the same
+ * shape `NoteBodyBatch.frontmatter` carries: one properties panel consumes both
+ * addresses because they speak the same string.
+ *
+ * **A rejection means no panel, not an empty one.** Rust routes this through
+ * the same `WriteScope` the write goes through, so a `workspace/` file
+ * (AD-113), a directory, a path that escapes the profile and a file too large
+ * to edit all reject here — before a surface offers a control whose write would
+ * then refuse.
+ *
+ * Rejects with: `unsupported`, `internal`. The message is written to be shown
+ * verbatim.
+ */
+export async function syncReadFrontmatter(id: string, subpath: string): Promise<string> {
+  return await invoke<string>("sync_read_frontmatter", { id, subpath });
+}
+
+/**
+ * Write one file's frontmatter block, and nothing else in the file (FR-283,
+ * FR-233, AD-120, Story 50.4).
+ *
+ * `expect` is the block {@link syncReadFrontmatter} handed you. If the block on
+ * disk is no longer that one, the write refuses with a sentence saying so and
+ * offering a re-read, rather than dropping whatever an agent wrote in between.
+ * A concurrent edit to the *body* is neither refused nor lost: the body written
+ * is the one Rust just read.
+ *
+ * `frontmatter` is the whole new block — the same thing {@link notesSave} takes
+ * — and it must be exactly one terminated `---` block or the write refuses.
+ * Resolves to the block as it now stands on disk.
+ *
+ * Nothing is stamped: no `id`, no `updated`. This is a file keeper did not
+ * author.
+ *
+ * Rejects with: `unsupported`, `internal`. The message is written to be shown
+ * verbatim.
+ */
+export async function syncWriteFrontmatter(
+  id: string,
+  subpath: string,
+  expect: string,
+  frontmatter: string,
+): Promise<string> {
+  return await invoke<string>("sync_write_frontmatter", { id, subpath, expect, frontmatter });
+}
+
+/**
  * Word what deleting this selection would do, before it is done (FR-175,
  * UX-DR66, Story 45.3).
  *

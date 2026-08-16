@@ -434,9 +434,14 @@ completion, `![[…]]` embeds and the CSV table are addressed by a notes vault p
 vault-relative path. A sessions zone can never be inside a notes vault — keeper refuses
 that layout in either direction, because the notes indexer and the sessions indexer would
 each claim the same markdown — so a session file has no vault coordinates to offer them.
-They are therefore absent rather than present and failing. The properties panel,
-attachments, backlinks, note history and the conflict resolver are note surfaces for a
-related reason: each is addressed by a note id, which a file does not have.
+They are therefore absent rather than present and failing. Attachments, backlinks, note
+history and the conflict resolver are note surfaces for a related reason: each is
+addressed by a note id, which a file does not have.
+
+**The properties panel is not one of them.** Frontmatter is addressed by
+the file itself — the sync profile and the path inside it — so it works over a session
+file, and it is the same panel Notes uses rather than a second one wearing its clothes.
+See **How a file gets filed** below.
 
 An agent editing a session file on disk shows up in the tree, and in the log the agent
 appends to. An open file buffer is not a subscription, though: a file you are looking at
@@ -469,6 +474,31 @@ exactly the directories that shape reads its pool from, which is what makes the 
 appear in the space you pressed. The directory is *where keeper puts it*; the tag is what
 makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` is still
 unfiled, in either shape, and keeper will say so rather than guessing from the folder.
+
+**How a file gets filed.** A file that already exists — one you wrote in your editor, one
+an agent dropped in, the `README.md` a session has had since the day it was made — gets
+its tag from the **Properties** panel, above the editor when you open it. Add
+`tags: [ref]` and the file is in References on the next read, which happens by itself.
+There is no other step: the tag is the filing, and the folder never was.
+
+The panel is the one from Notes, over the file rather than over a note. It writes the
+frontmatter block and nothing else — every byte of the body is left exactly as it was,
+line endings included — and it stamps nothing of its own: no `id`, no `updated`, no kind
+guessed from where the file sits. A file keeper did not author stays a file keeper did
+not author. If somebody else changed that file's properties while you had them open, the
+write refuses and offers to re-read rather than dropping their edit; a change to the
+*body* underneath you is neither refused nor lost, because only the block is rewritten.
+
+It is offered for a markdown file keeper can save, and only there: not for a `.csv`
+(which has no frontmatter), not for a format keeper will not rewrite, and not for
+anything under `workspace/` — that folder refuses every write, so there is no panel
+rather than a panel that would refuse.
+
+**One boundary worth knowing.** A folder-shaped session's pool is its `README.md` plus
+`refs/` and `prompts/`. Markdown sitting loose at the session root of a *folder-shaped*
+session is not in the pool at all — so tagging it files it nowhere, and it will not even
+show up as Unfiled. Move it into `refs/` or `prompts/`, or *Convert to flat*, which is the
+contract where every root markdown file is in the pool.
 
 Two spaces are told plainly that they have no button, in one line where the button
 would have been — both of them a folder-shaped session's:

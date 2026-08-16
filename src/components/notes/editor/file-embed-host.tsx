@@ -154,6 +154,12 @@ export function NoteFileEmbed({ vaultId, target }: NoteFileEmbedProps): React.Re
       entry={entry}
       state={state}
       csv={csv}
+      // Story 50.4: a note embed is addressed by a vault id and a vault-relative
+      // target, not by a sync profile — the same asymmetry `csv` documents from
+      // the other direction. Deriving one from the other here would be the
+      // frontend deciding which folders are profiles (AD-65), so this host
+      // offers no properties panel and says so rather than guessing.
+      properties={null}
       preview={preview}
       csvOptions={csvOptions}
     />

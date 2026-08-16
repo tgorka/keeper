@@ -48,9 +48,23 @@
  * the same `savable` flag the Save button stands on. The MOUNT is in the raw
  * editor, because a toolbar acts on a live view and this frame holds none: what
  * travels down is a boolean, never an editor handle.
+ *
+ * # And so are the file's own properties
+ *
+ * Story 50.4 mounts the notes properties panel over a file (FR-283). Same
+ * decision, same predicate, one level up: `entry.format === "markdown" &&
+ * savable`, because on a sessions zone a tag is not decoration — it is what
+ * decides which space lists the file (AD-120) — and a panel over a buffer no
+ * save can follow would be controls that announce their own refusal.
+ *
+ * What differs from the toolbar is that a property write does not go through
+ * this buffer. It is its own command over the file's bytes, so the buffer must
+ * re-read afterwards; `reload` is handed over for exactly that, and without it
+ * a later Save would put the old block back.
  */
 import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
+import { FileProperties } from "@/components/notes/properties-panel";
 import { Button } from "@/components/ui/button";
 import type { ViewerEntry } from "@/lib/viewers";
 import type { MarkdownPreviewOptions } from "./markdown-preview";
@@ -112,6 +126,18 @@ export const FILE_SAVE_CLEAN_TITLE = "Nothing has changed since this file was la
  */
 export const TEXT_FILE_CAVEAT_TESTID = "text-file-caveat";
 
+/**
+ * Where a file's own properties are addressed (Story 50.4, FR-283).
+ *
+ * The pair `(profile id, profile-relative subpath)` and nothing else — the same
+ * two identifiers 45.6's loader was built from, and both arrive from the host
+ * exactly as Rust produced them (AD-65).
+ */
+export interface FilePropertiesCoordinates {
+  profileId: string;
+  relativePath: string;
+}
+
 export interface TextFileFrameProps {
   /** The file's own name. Display and aria only; never a path. */
   fileName: string;
@@ -139,6 +165,22 @@ export interface TextFileFrameProps {
   csv: CsvCoordinates | null;
   /** What a markdown preview resolves embeds against. */
   preview: MarkdownPreviewOptions;
+  /**
+   * Where this file's own properties live, or `null` when this surface holds no
+   * sync-profile coordinates for it (Story 50.4, FR-283).
+   *
+   * Shaped after {@link csv} and for the identical reason: the pair of commands
+   * behind it is addressed by a sync profile id and a profile-relative subpath,
+   * which a Files panel holds and a note embed does not. Deriving one address
+   * from the other in the webview would be the frontend deciding which folders
+   * are which (AD-65), so the host that has the address passes it and the host
+   * that has none passes `null` and gets no panel.
+   *
+   * Coordinates rather than a rendered panel: the frame decides WHETHER — a
+   * writable markdown file and nothing else — and the panel decides everything
+   * about what a property is. The same split 50.3 used for the writing tools.
+   */
+  properties: FilePropertiesCoordinates | null;
   /**
    * The standing sentence for a file keeper will write and does not manage, or
    * `null` (Story 46.14, AD-102).
@@ -181,6 +223,7 @@ export function TextFileFrame({
   writeCaveat = null,
   writeRefusal = null,
   csv,
+  properties,
   preview,
   csvOptions,
 }: TextFileFrameProps): React.ReactElement {
@@ -267,6 +310,23 @@ export function TextFileFrame({
   // keeper will not write there, which is the reason a reader would give.
   const writingTools = entry.format === "markdown" && savable;
 
+  // Story 50.4's verdict, and it is deliberately the SAME predicate.
+  //
+  // A property is a way of writing text too — on a sessions zone it is the way
+  // a file gets filed at all (AD-120) — so the panel appears exactly where the
+  // writing tools do and exactly where a Save can land. A markdown file with no
+  // save behind it would get a panel whose every control announced its own
+  // refusal, which is the shape 45.2 rejected; a `.csv` has no frontmatter to
+  // show in the first place (matrix row 9).
+  //
+  // `workspace/` (row 8) is still Rust's answer and not a second opinion about
+  // which folders are scratch — what changed with 50.3's fix is only WHEN that
+  // answer arrives. It now rides in on the listing row as `writeRefusal`, so
+  // the panel is absent rather than mounted and then emptied by a rejected
+  // read inside `FileProperties`. Both layers still refuse; the inner one is
+  // what makes the claim true for a host that passes no refusal at all.
+  const propertiesPanel = writingTools ? properties : null;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       {savable ? (
@@ -311,6 +371,21 @@ export function TextFileFrame({
         <p className="shrink-0 border-b px-3 py-1.5 text-destructive text-xs" role="alert">
           {error}
         </p>
+      )}
+      {/* Above the editor and below the banners, which is where the note editor
+          keeps it: the properties of a file are a standing fact about it, and
+          the banners are about the last action. `reload` is passed as the
+          after-write hook because a properties write changes the bytes this
+          buffer is holding — without it a later Save would put the old block
+          back, which is the one way this panel could lose somebody's edit. */}
+      {propertiesPanel === null ? null : (
+        <div className="shrink-0">
+          <FileProperties
+            profileId={propertiesPanel.profileId}
+            relativePath={propertiesPanel.relativePath}
+            onWritten={() => void reload()}
+          />
+        </div>
       )}
       <div className="min-h-0 flex-1">
         <RawRenderedView

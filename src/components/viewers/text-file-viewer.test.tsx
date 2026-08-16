@@ -49,6 +49,18 @@ vi.mock("@/lib/ipc/client", () => ({
   notesVaultActive: vi.fn(async () => null),
   revealPath: vi.fn(async () => undefined),
   syncOpenEntry: vi.fn(async () => undefined),
+  // Story 50.4: a markdown file in a profile now mounts the properties panel,
+  // which reaches the client through this factory. A mock that omits an export
+  // throws where the panel READS it, so these are needed even by the tests that
+  // never touch a property. `syncReadFrontmatter` resolving to `""` is a file
+  // with no frontmatter, which is what every fixture here is.
+  syncReadFrontmatter: vi.fn(async () => ""),
+  syncWriteFrontmatter: vi.fn(async () => ""),
+  notesSave: vi.fn(),
+  recordingNoteTargets: vi.fn(async () => null),
+  recordingOpenPath: vi.fn(async () => undefined),
+  recordingSessionMeta: vi.fn(),
+  tagsVocabulary: vi.fn(async () => ({ entries: [] })),
 }));
 
 import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";

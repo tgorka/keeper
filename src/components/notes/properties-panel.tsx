@@ -46,6 +46,24 @@
  * read-only beside `id:` because everything about a recording resolves through
  * it, and the `recordings` tag is refused with a sentence because it is what
  * makes the note findable as a recording at all.
+ *
+ * # Two addresses, one panel (Story 50.4, FR-283)
+ *
+ * AD-120 makes the tag the thing that files a file into a space, so on a
+ * sessions zone this panel is the surface that files a file — and a session's
+ * `README.md` is not a note. It has no vault id, no note id and no body
+ * subscription. What it has is the same thing a note has: a block of bytes.
+ *
+ * So the address is a prop rather than an assumption. A note passes the body
+ * subscription it always did; anything else passes {@link FilePropertiesTarget},
+ * two functions over `(profile id, subpath)`. Everything below the one `write`
+ * funnel is identical, which is the point: a second panel is how two surfaces
+ * come to disagree about what a property is, and this file exists so there is
+ * exactly one answer.
+ *
+ * {@link FileProperties} is the adapter that binds the second address. It lives
+ * here, beside the panel, so a third surface has somewhere obvious to look
+ * instead of somewhere to copy.
  */
 import { Copy, FolderOpen, MoreHorizontal, Play, Plus, Video } from "lucide-react";
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
@@ -74,6 +92,8 @@ import {
   recordingOpenPath,
   recordingSessionMeta,
   revealPath,
+  syncReadFrontmatter,
+  syncWriteFrontmatter,
   tagsVocabulary,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -108,6 +128,13 @@ export interface PropertyEntry {
    * map would either flatten it or invent a shape the parser does not have.
    */
   nested: boolean;
+  /**
+   * The line ending the block this entry came from is written with (Story
+   * 50.4). Carried per entry rather than passed alongside because a rewrite of
+   * a block list emits lines of its own, and emitting `\n` into a `\r\n` block
+   * would make the next read see one line where there are three.
+   */
+  newline: string;
 }
 
 export interface ParsedFrontmatter {
@@ -116,6 +143,17 @@ export interface ParsedFrontmatter {
   entries: PropertyEntry[];
   /** True when a block exists but holds something this reader will not touch. */
   unparsed: boolean;
+  /**
+   * The line ending the block is written with — `"\n"`, or `"\r\n"` for a file
+   * edited on Windows (Story 50.4).
+   *
+   * A note keeper wrote is always `"\n"`, which is why this did not exist until
+   * the panel gained a second address. A file it did not write can be either,
+   * and reading `"---\r\n"` as "this file has no properties" was not a cosmetic
+   * bug: the panel would then have added a *second* block above the first, and
+   * everything in the original would have become body.
+   */
+  newline: string;
 }
 
 const KEY_LINE = /^([A-Za-z0-9_][A-Za-z0-9_.\- ]*):[ \t]*(.*)$/;
@@ -144,22 +182,31 @@ function unquote(raw: string): { text: string; quoted: boolean } {
  * touch one span and leave the rest of the block alone.
  */
 export function readFrontmatter(source: string): ParsedFrontmatter {
-  const empty: ParsedFrontmatter = { block: null, entries: [], unparsed: false };
-  if (!source.startsWith("---\n")) {
+  const empty: ParsedFrontmatter = {
+    block: null,
+    entries: [],
+    unparsed: false,
+    newline: "\n",
+  };
+  // The opening fence carries the document's own ending, and every offset
+  // below is measured with it.
+  const newline = source.startsWith("---\r\n") ? "\r\n" : source.startsWith("---\n") ? "\n" : null;
+  if (newline === null) {
     return empty;
   }
-  const closing = source.indexOf("\n---", 3);
+  const closing = source.indexOf(`${newline}---`, 3);
   if (closing < 0) {
-    return { block: null, entries: [], unparsed: true };
+    return { block: null, entries: [], unparsed: true, newline };
   }
-  const inner = source.slice(4, closing + 1);
+  const opening = 3 + newline.length;
+  const inner = source.slice(opening, closing + newline.length);
   const entries: PropertyEntry[] = [];
   let unparsed = false;
-  let offset = 4;
+  let offset = opening;
 
-  for (const line of inner.split("\n")) {
+  for (const line of inner.split(newline)) {
     const lineFrom = offset;
-    offset += line.length + 1;
+    offset += line.length + newline.length;
     if (line.trim() === "" || line.trimStart().startsWith("#")) {
       continue;
     }
@@ -222,6 +269,7 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
         valueFrom,
         valueTo,
         nested: false,
+        newline,
       });
       continue;
     }
@@ -244,10 +292,16 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
       valueFrom,
       valueTo,
       nested: false,
+      newline,
     });
   }
 
-  return { block: { from: 0, to: closing + 4 }, entries, unparsed };
+  return {
+    block: { from: 0, to: closing + newline.length + 3 },
+    entries,
+    unparsed,
+    newline,
+  };
 }
 
 /** Render a scalar the way it was written, quoting only when it must be. */
@@ -257,10 +311,19 @@ function serialiseScalar(value: string, quoted: boolean): string {
   return needsQuotes ? ` "${value.replace(/"/g, '\\"')}"` : ` ${value}`;
 }
 
-/** Render a list in the style the user already used. */
-function serialiseList(items: string[], style: PropertyStyle): string {
+/**
+ * Render a list in the style the user already used, with the block's own line
+ * ending.
+ *
+ * The ending matters for a block list and only for one: its items are lines,
+ * and a `\n` item inside a `\r\n` block would be read back as part of the
+ * `tags:` line rather than under it.
+ */
+function serialiseList(items: string[], style: PropertyStyle, newline: string): string {
   if (style === "block") {
-    return items.length === 0 ? " []" : `\n${items.map((item) => `  - ${item}`).join("\n")}`;
+    return items.length === 0
+      ? " []"
+      : `${newline}${items.map((item) => `  - ${item}`).join(newline)}`;
   }
   return ` [${items.join(", ")}]`;
 }
@@ -276,7 +339,13 @@ export function spliceProperty(source: string, entry: PropertyEntry, value: stri
   return source.slice(0, entry.valueFrom) + value + source.slice(entry.valueTo);
 }
 
-/** Add a property, creating the block when the note has none. */
+/**
+ * Add a property, creating the block when the file has none.
+ *
+ * A fresh block is written with `\n`: keeper authors it, and the promise is
+ * about the bytes it did *not* author — the body below, which is untouched
+ * either way. An existing block keeps its own ending.
+ */
 export function addProperty(source: string, key: string, value: string): string {
   const parsed = readFrontmatter(source);
   if (parsed.block === null) {
@@ -284,8 +353,9 @@ export function addProperty(source: string, key: string, value: string): string 
   }
   // Immediately before the closing fence, so the user's ordering is preserved
   // and a new key never jumps above one they put first.
-  const closing = parsed.block.to - 4;
-  return `${source.slice(0, closing)}\n${key}:${value}${source.slice(closing)}`;
+  const closing = parsed.block.to - 3 - parsed.newline.length;
+  const line = `${parsed.newline}${key}:${value}`;
+  return `${source.slice(0, closing)}${line}${source.slice(closing)}`;
 }
 
 /** The remembered-width id of the key column. Stable across releases: change
@@ -320,9 +390,39 @@ export const UNPARSED_BLOCK_LABEL = "Properties block";
  */
 export const UNPARSED_PREVIEW_GRAPHEMES = 400;
 
-export interface PropertiesPanelProps {
-  /** The note's frontmatter block, verbatim, or `""` when it has none. */
+/**
+ * How the panel reaches a file that is not a note (Story 50.4, FR-283).
+ *
+ * Two functions and no identifiers: the adapter that supplies them holds the
+ * address, and the panel stays a lens over a block whatever is behind it.
+ */
+export interface FilePropertiesTarget {
+  /**
+   * Write the whole block back. `null` disables editing, which is the file
+   * address's spelling of `subscriptionId === null`.
+   *
+   * Rejects with keeper's own sentence — the clobber refusal is the one that
+   * matters — and the panel shows it verbatim beside a way out.
+   */
+  write: ((nextBlock: string) => Promise<void>) | null;
+  /** Read the file again, for the refusal that says it changed underneath. */
+  reread: () => void;
+}
+
+/** The note's frontmatter block, verbatim, or `""` when it has none. */
+interface PropertiesBlock {
   frontmatter: string;
+}
+
+/**
+ * A note: the write goes through the body subscription, and takes the buffer
+ * with it.
+ *
+ * The `?: never` fields are what make the union discriminate on presence rather
+ * than on a tag nobody would have to pass. A call site cannot accidentally
+ * satisfy both halves.
+ */
+interface NoteAddress {
   /**
    * The editor's buffer.
    *
@@ -337,15 +437,84 @@ export interface PropertiesPanelProps {
   baseRev: string;
   /** Adopt the write once Rust has acknowledged it. */
   onSaved: (body: string, write: NoteWriteVm) => void;
+  file?: never;
 }
 
-export function PropertiesPanel({
-  frontmatter,
-  body,
-  subscriptionId,
-  baseRev,
-  onSaved,
-}: PropertiesPanelProps) {
+/** Any other file, addressed by `(profile id, subpath)` behind the adapter. */
+interface FileAddress {
+  file: FilePropertiesTarget;
+  body?: never;
+  subscriptionId?: never;
+  baseRev?: never;
+  onSaved?: never;
+}
+
+export type PropertiesPanelProps =
+  | (PropertiesBlock & NoteAddress)
+  | (PropertiesBlock & FileAddress);
+
+/**
+ * What the panel says when a write did not land and nothing worded it.
+ *
+ * The note path's own sentence, kept because it is the honest one there:
+ * `notes_save` writes a conflict copy rather than refusing, so a rejection is a
+ * real fault — a drive that went out — and not an answer with words of its own.
+ */
+const WRITE_FAILED = "keeper couldn't write that property. The note is unchanged on disk.";
+
+/**
+ * The same, for the file address. A different noun and nothing else: what the
+ * reader is looking at is a file, and calling it a note would be the panel
+ * telling them about a surface they are not on.
+ *
+ * Almost never seen — every refusal this pair of commands makes arrives with
+ * Rust's own sentence, and this is what stands in when a rejection carries none.
+ */
+const FILE_WRITE_FAILED = "keeper couldn't write that property. The file is unchanged on disk.";
+
+/** The word on the control the clobber refusal offers (Story 50.4, row 10). */
+export const PROPERTIES_REREAD_LABEL = "Re-read";
+
+/**
+ * Both addresses, resolved to the two things the panel actually does with one.
+ *
+ * Everything below this function is one panel over one block. `save` is `null`
+ * when editing is off — which a note spells `subscriptionId === null` and a file
+ * spells `write: null` — and `reread` exists only where a write can refuse
+ * rather than fault, which is the file address alone.
+ *
+ * A plain function rather than a hook or a branch inside the component so the
+ * union narrows once, in one place, instead of at every prop the two halves do
+ * not share.
+ */
+function addressOf(props: PropertiesPanelProps): {
+  save: ((nextBlock: string) => Promise<void>) | null;
+  reread: (() => void) | null;
+} {
+  if (props.file !== undefined) {
+    return { save: props.file.write, reread: props.file.reread };
+  }
+  const { subscriptionId, body, baseRev, onSaved } = props;
+  if (subscriptionId === null) {
+    return { save: null, reread: null };
+  }
+  return {
+    save: (nextBlock) =>
+      notesSave(subscriptionId, body, baseRev, nextBlock).then(
+        (result) => {
+          onSaved(body, result);
+        },
+        () => {
+          throw new Error(WRITE_FAILED);
+        },
+      ),
+    reread: null,
+  };
+}
+
+export function PropertiesPanel(props: PropertiesPanelProps) {
+  const { frontmatter } = props;
+  const { save, reread } = addressOf(props);
   const parsed = readFrontmatter(frontmatter);
   const [newKey, setNewKey] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
@@ -395,18 +564,19 @@ export function PropertiesPanel({
   }, [sessionId]);
 
   const write = (nextBlock: string): void => {
-    if (subscriptionId === null) {
+    if (save === null) {
       return;
     }
-    void notesSave(subscriptionId, body, baseRev, nextBlock)
-      .then((result) => {
+    void save(nextBlock)
+      .then(() => {
         setFailure(null);
-        onSaved(body, result);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         // Said out loud, because the control has already moved and a silent
         // failure would leave the panel showing a value the file does not have.
-        setFailure("keeper couldn't write that property. The note is unchanged on disk.");
+        // The message is whichever address worded it: Rust's own refusal for a
+        // file, and the standing sentence for a note.
+        setFailure(error instanceof Error ? error.message : WRITE_FAILED);
       });
   };
 
@@ -486,7 +656,13 @@ export function PropertiesPanel({
                 entry={null}
                 sessionId={sessionId}
                 onChange={(tags) =>
-                  write(addProperty(frontmatter, TAGS_KEY, serialiseList(tags, NEW_TAGS_STYLE)))
+                  write(
+                    addProperty(
+                      frontmatter,
+                      TAGS_KEY,
+                      serialiseList(tags, NEW_TAGS_STYLE, parsed.newline),
+                    ),
+                  )
                 }
               />
             </div>
@@ -527,9 +703,129 @@ export function PropertiesPanel({
       {failure === null ? null : (
         <p role="alert" className="text-destructive">
           {failure}
+          {/* The way out of a clobber refusal, offered where the refusal is
+              read (Story 50.4, row 10). Only the file address has one: a note
+              save that loses a race writes a conflict copy rather than
+              refusing, so there is nothing there for a re-read to resolve. */}
+          {reread === null ? null : (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="ml-2 h-6"
+              onClick={() => {
+                setFailure(null);
+                reread();
+              }}
+            >
+              {PROPERTIES_REREAD_LABEL}
+            </Button>
+          )}
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * The sentence to show for a rejected properties write.
+ *
+ * `invoke` guarantees an `IpcError` whose `message` is composed in Rust to be
+ * rendered verbatim, and for this pair of commands the message is the answer:
+ * "these properties changed on disk, re-read the file". Narrowed with `in` and
+ * `typeof` rather than asserted, the way `use-text-file`'s own `sentence` is
+ * and for the same reason — an unchecked cast would put `undefined` on screen
+ * the day the envelope changed.
+ */
+function refusalSentence(error: unknown, fallback: string): string {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const { message } = error;
+    if (typeof message === "string" && message !== "") {
+      return message;
+    }
+  }
+  return fallback;
+}
+
+export interface FilePropertiesProps {
+  /** The sync profile the file is in. */
+  profileId: string;
+  /** Profile-relative, as Rust produced it. Never composed here (AD-65). */
+  relativePath: string;
+  /**
+   * The write landed, so whatever else is showing this file should look again.
+   *
+   * The editor buffer holding the same bytes is the one that must: a properties
+   * write changes the file underneath it, and a Save from a stale buffer would
+   * put the old block back.
+   */
+  onWritten: () => void;
+}
+
+/**
+ * The properties panel over a file addressed by `(profile id, subpath)`
+ * (Story 50.4, FR-283).
+ *
+ * **An adapter, not a second panel.** It owns exactly what the note editor owns
+ * on the other side — the read, the block it is holding, and what to do once a
+ * write lands — and renders {@link PropertiesPanel} with it. Everything a
+ * person sees and every rule about what may be edited is the panel's, unchanged.
+ *
+ * **Nothing until the read resolves, and nothing if it refuses.** Rust routes
+ * the read through the same `WriteScope` as the write, so a `workspace/` file
+ * (AD-113) or one keeper cannot edit rejects — and the panel simply is not
+ * there, rather than being there and refusing on the first keystroke.
+ */
+export function FileProperties({ profileId, relativePath, onWritten }: FilePropertiesProps) {
+  const [block, setBlock] = useState<string | null>(null);
+  // Bumped by the re-read the clobber refusal offers. A counter rather than a
+  // second copy of the effect: re-reading is the same read.
+  const [reload, setReload] = useState(0);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `reload` is a deliberate re-run trigger, not a read — the panel bumps it when a write refused because the block changed underneath.
+  useEffect(() => {
+    let live = true;
+    setBlock(null);
+    void syncReadFrontmatter(profileId, relativePath)
+      .then((read) => {
+        if (live) {
+          setBlock(read);
+        }
+      })
+      .catch(() => {
+        // No panel. Rust has already said why on whichever surface asked for
+        // the file itself; a second copy of the sentence here would be the same
+        // refusal twice.
+        if (live) {
+          setBlock(null);
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [profileId, relativePath, reload]);
+
+  if (block === null) {
+    return null;
+  }
+
+  return (
+    <PropertiesPanel
+      frontmatter={block}
+      file={{
+        write: (nextBlock) =>
+          syncWriteFrontmatter(profileId, relativePath, block, nextBlock).then(
+            (landed) => {
+              setBlock(landed);
+              onWritten();
+            },
+            (error: unknown) => {
+              throw new Error(refusalSentence(error, FILE_WRITE_FAILED));
+            },
+          ),
+        reread: () => setReload((n) => n + 1),
+      }}
+    />
   );
 }
 
@@ -596,6 +892,7 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
                 serialiseList(
                   entry.items.filter((candidate) => candidate !== item),
                   entry.style,
+                  entry.newline,
                 ),
               )
             }
@@ -612,7 +909,7 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
             if (event.key === "Enter" && value !== "") {
               event.preventDefault();
               event.currentTarget.value = "";
-              onChange(serialiseList([...entry.items, value], entry.style));
+              onChange(serialiseList([...entry.items, value], entry.style, entry.newline));
             }
           }}
         />
@@ -690,7 +987,7 @@ export function tagsOf(entry: PropertyEntry): string[] {
  */
 export function serialiseTags(tags: string[], entry: PropertyEntry): string {
   if (entry.kind === "list") {
-    return serialiseList(tags, entry.style);
+    return serialiseList(tags, entry.style, entry.newline);
   }
   // A scalar holds at most one tag, so from here the count is 0 — the last tag
   // came off — or two or more, because one was added. It is never 1: nothing
@@ -699,7 +996,9 @@ export function serialiseTags(tags: string[], entry: PropertyEntry): string {
   // fabricated value for a case no input reaches, and a mutation to the
   // boundary between them survived the whole suite because nothing could tell
   // the two apart.
-  return tags.length === 0 ? serialiseScalar("", entry.quoted) : serialiseList(tags, "flow");
+  return tags.length === 0
+    ? serialiseScalar("", entry.quoted)
+    : serialiseList(tags, "flow", entry.newline);
 }
 
 /**
