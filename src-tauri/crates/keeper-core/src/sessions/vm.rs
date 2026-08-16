@@ -473,6 +473,20 @@ pub struct SessionSpaceVm {
     /// The query does not parse. The space then selects **nothing**; it never
     /// falls back to selecting the whole session.
     pub error: Option<String>,
+    /// The kind a file created from inside this space would carry, or `None`
+    /// (FR-273).
+    ///
+    /// Derived in Rust by [`crate::sessions::spaces::creatable_kind`] so no
+    /// surface ever reads `keeper.space` itself — the rule
+    /// `use-notes-actions.ts:67-73` already states for a notes space, restated
+    /// here because a second reader of the query grammar in TypeScript is a
+    /// second grammar from the day it is written.
+    ///
+    /// `None` means the create verb is **absent**, never present-and-disabled.
+    /// A space asking for two things, for `about`, or for nothing keeper can
+    /// parse has no create to offer at all, and a greyed-out button would be a
+    /// control promising a state it can never reach.
+    pub new_file_kind: Option<String>,
 }
 
 /// What one space selected out of one session's pool (FR-261).

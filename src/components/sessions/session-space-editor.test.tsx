@@ -41,6 +41,10 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     order: p.order ?? 2,
     warnings: p.warnings ?? [],
     error: p.error ?? null,
+    // The editor neither reads nor writes the kind a space can create — that
+    // is the section's control (Story 49.2). Present because the VM requires
+    // it, and `null` because nothing here is about a creatable space.
+    newFileKind: p.newFileKind ?? null,
   };
 }
 

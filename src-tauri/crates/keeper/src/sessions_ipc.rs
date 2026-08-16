@@ -1483,11 +1483,18 @@ pub fn sessions_spaces(root_id: String) -> Result<Vec<()>, IpcError> {
 /// find out whether it parses, and the sort resolved once here so the form never
 /// has to work out what `bananas` falls back to (that rule lives in Rust and is
 /// tested there).
+///
+/// `new_file_kind` joins them for the same reason: the create verb's kind is
+/// read off the query by the domain, so the surface is handed a kind or nothing
+/// and never a DSL to parse. A query that does not parse gets `error: Some(_)`
+/// and `None` here by construction — `creatable_kind` runs the same parser this
+/// line does.
 #[cfg(desktop)]
 fn space_vm(
     space: &keeper_core::sessions::spaces::SessionSpace,
 ) -> keeper_core::sessions::vm::SessionSpaceVm {
     use keeper_core::notes::{query, sort};
+    use keeper_core::sessions::spaces;
 
     keeper_core::sessions::vm::SessionSpaceVm {
         id: space.rel.clone(),
@@ -1500,6 +1507,7 @@ fn space_vm(
         order: space.order,
         warnings: space.warnings.clone(),
         error: query::parse(&space.query).err().map(|error| error.message),
+        new_file_kind: spaces::creatable_kind(&space.query).map(|kind| kind.as_str().to_owned()),
     }
 }
 

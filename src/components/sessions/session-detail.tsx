@@ -417,6 +417,10 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               trust a grouping before seeing the thing grouped. */}
           <SessionSpaces
             rootId={rootId}
+            sessionId={sessionId}
+            // The section lists under both contracts; only its create verb is
+            // flat-only, and the shape is a fact only this surface holds.
+            shape={detail.shape}
             spaces={spaces}
             selections={spaceFiles}
             onChanged={() => setReload((n) => n + 1)}

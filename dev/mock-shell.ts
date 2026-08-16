@@ -476,6 +476,11 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     order: 1,
     warnings: [],
     error: null,
+    // `about` is the one kind `sessions_file_new_kind` refuses: a session has
+    // one record, and a second would give `shape()` two answers. So this space
+    // shows no create control — the state the section must render as ABSENT
+    // rather than disabled.
+    newFileKind: null,
   },
   {
     id: "_spaces/tasks.md",
@@ -488,6 +493,7 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     order: 2,
     warnings: [],
     error: null,
+    newFileKind: "task",
   },
   {
     id: "_spaces/log.md",
@@ -500,6 +506,7 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     order: 3,
     warnings: [],
     error: null,
+    newFileKind: "log",
   },
   {
     id: "_spaces/refs.md",
@@ -515,6 +522,8 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     order: 4,
     warnings: ["Couldn't read sort `sideways asc`; using modified desc."],
     error: null,
+    // A misread `sort` does not stop a create: the query still names one kind.
+    newFileKind: "ref",
   },
   {
     id: "_spaces/prompts.md",
@@ -530,6 +539,8 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     order: 5,
     warnings: [],
     error: "Unexpected end of query after `AND`.",
+    // A query that will not parse names no kind, so Rust derives none.
+    newFileKind: null,
   },
 ];
 
@@ -609,6 +620,55 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
 ];
 
 /**
+ * The session zone AS a notes vault, and the notes it holds (Story 49.2,
+ * FR-274).
+ *
+ * The other vault in this file is `10-notes`, which no `60-sessions/…` path can
+ * ever sit inside — so with it alone every space row resolves to "no vault" and
+ * opens the FILE viewer, and the half of this story that puts a session file in
+ * the full note editor cannot be looked at at all. A mock that renders a
+ * control and cannot render its outcome is how a surface ships unreachable.
+ *
+ * The index is derived from the space selections rather than hand-written, so a
+ * file created from a space is resolvable as a note the moment it appears in
+ * the space — the two halves of the story stay agreed with each other, which is
+ * the first thing a person pressing the button checks.
+ */
+const SESSION_VAULT_ID = "v2";
+
+/** The mock session's directory, vault-relative — `subpath` minus `60-sessions/`. */
+const SESSION_ZONE_DIR = "active/2026-08-12-keeper-sessions";
+
+function sessionNotes() {
+  // A file can sit in two spaces, and the index holds it once.
+  const seen = new Set<string>();
+  const files = SESSION_SPACE_FILES.flatMap((listing) => listing.files).filter((file) => {
+    if (seen.has(file.relPath)) {
+      return false;
+    }
+    seen.add(file.relPath);
+    return true;
+  });
+  return files.map((file) => ({
+    // Stable and path-derived, which is what the mock can honestly offer: the
+    // real id is a ULID in frontmatter and this file writes no frontmatter.
+    id: `sn-${file.relPath}`,
+    path: `${SESSION_ZONE_DIR}/${file.relPath}`,
+    title: file.title,
+    snippet: "",
+    tags: [...file.tags],
+    updatedMs: file.mtimeMs,
+    pinned: false,
+    archived: false,
+    unread: false,
+    conflict: false,
+    origin: "",
+    headRev: "",
+    order: { value: 0, source: "default" },
+  }));
+}
+
+/**
  * A CSV wider than any pane, so an embedded table can be LOOKED at under the
  * one condition that matters: more columns than the note has room for, and one
  * value long enough that no cap could show it whole.
@@ -666,6 +726,23 @@ const ANSWERS: Record<string, unknown> = {
       root: "/Volumes/merope/tgdrive/10-notes",
       indexed: true,
       noteCount: 42,
+      unreadCount: 0,
+      captureTemplate: null,
+      captureTag: null,
+      cadence: { commitIdleMs: 2000 },
+    },
+    // The session zone, flagged as a vault — see {@link sessionNotes}. Two
+    // vaults on one profile is also the shape `notePathForFile`'s
+    // longest-subfolder rule needs to be looked at: `10-notes` must not answer
+    // for a `60-sessions/…` path.
+    {
+      id: SESSION_VAULT_ID,
+      profileId: "p1",
+      name: "sessions",
+      subfolder: "60-sessions",
+      root: "/Volumes/merope/tgdrive/60-sessions",
+      indexed: true,
+      noteCount: 9,
       unreadCount: 0,
       captureTemplate: null,
       captureTag: null,
@@ -1032,13 +1109,25 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       order: Number(req.order ?? 0),
       warnings: [],
       error: null,
+      // Rust derives this from the query, and this shell has no parser —
+      // writing one here would be the second grammar `creatable_kind`'s own
+      // doc warns about. A space the operator invents therefore carries no
+      // kind until the real backend answers; an edited one keeps the kind it
+      // already had, below.
+      newFileKind: null,
     };
     const at = SESSION_SPACES.findIndex((space) => space.id === id);
     if (at === -1) {
       SESSION_SPACES.push(saved);
       SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null });
     } else {
-      SESSION_SPACES[at] = { ...SESSION_SPACES[at], ...saved };
+      SESSION_SPACES[at] = {
+        ...SESSION_SPACES[at],
+        ...saved,
+        // Not dropped by an edit: the section's create control would vanish on
+        // save for a reason the real backend does not have.
+        newFileKind: SESSION_SPACES[at].newFileKind,
+      };
     }
     return id;
   },
@@ -1092,7 +1181,18 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
     const relPath = `${stamp}-${slug}.md`;
     SESSION_ENTRIES.push(sessionEntry(relPath, false, 96, 0));
-    void kind;
+    // …and into the SPACE that asked for this kind, which is the whole of what
+    // FR-273 does and the one thing a screenshot of the tree cannot show. The
+    // real backend writes the tag into frontmatter and the next
+    // `sessions_space_files` read selects it; here the selection IS the
+    // fixture, so the row has to be put where that read would have found it.
+    // Without this the press adds a line to the tree and leaves Tasks exactly
+    // as empty as before — a mock that renders the control and not its outcome.
+    const target = SESSION_SPACES.find((space) => space.newFileKind === kind);
+    const listing = SESSION_SPACE_FILES.find((row) => row.spaceId === target?.id);
+    listing?.files.unshift(
+      spaceFile(relPath, String(payload.title ?? "").trim() || "untitled", [kind], 0),
+    );
     return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
   },
   sessions_file_delete: (payload) => {
@@ -1278,10 +1378,29 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     card.orderIsOwn = true;
     return null;
   },
+  /**
+   * The folder listing `openNoteForFile` looks a session file's note id up in
+   * (Story 45.18, reached by FR-274).
+   *
+   * Answers only for the session vault's own directory. Any other vault or
+   * folder gets an empty listing rather than borrowing these rows: the bridge
+   * matches on the exact vault-relative path, and a table that answered the
+   * same nine notes everywhere would make a wrong resolution look right.
+   */
+  notes_tree: (payload) => {
+    const relDir = String(payload.relDir ?? "");
+    const inSession =
+      String(payload.vaultId ?? "") === SESSION_VAULT_ID && relDir === SESSION_ZONE_DIR;
+    return { relDir, dirs: [], notes: inSession ? sessionNotes() : [] };
+  },
   notes_body_read: (payload) => {
     const row = NOTES.find(([id]) => id === payload.noteId);
     if (row === undefined) {
-      return null;
+      // A session file opened as a note. The mock has no bytes to read, and
+      // FR-98 says a note's title IS its first body line, so that line is the
+      // honest whole of what this fixture knows.
+      const note = sessionNotes().find((each) => each.id === payload.noteId);
+      return note === undefined ? null : { rev: "rev-mock", text: `# ${note.title}\n` };
     }
     const [, title, body] = row;
     const rest = String(body).split("\n").slice(1).join("\n");

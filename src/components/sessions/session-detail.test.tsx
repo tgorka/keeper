@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   SessionDetailVm,
@@ -13,6 +13,7 @@ const sessionsTree = vi.fn();
 const sessionsRefs = vi.fn();
 const sessionsSpaces = vi.fn();
 const sessionsSpaceFiles = vi.fn();
+const sessionsFileNewKind = vi.fn();
 const listenSessionsChanged = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
@@ -33,12 +34,22 @@ vi.mock("@/lib/ipc/client", () => ({
   // The file verbs, for the same reason: the Files heading imports all three
   // and the tree imports the fourth (FR-262).
   sessionsFileNew: vi.fn(),
-  sessionsFileNewKind: vi.fn(),
+  sessionsFileNewKind: (rootId: unknown, sessionId: unknown, kind: unknown, title: unknown) =>
+    sessionsFileNewKind(rootId, sessionId, kind, title),
   sessionsFileDelete: vi.fn(),
   sessionsLogToday: vi.fn(),
   // And the board's one write (FR-263), imported transitively through
   // SessionBoard.
   sessionsTaskMove: vi.fn(),
+  // The spaces section resolves a row's note through the vault mirror and the
+  // 45.18 bridge (Story 49.2), so the store and the bridge both reach this
+  // module. `notesVaults` answering an empty list is a machine with no vault
+  // configured, which is what every case in this file is about — the spaces
+  // section is exercised in `session-spaces.test.tsx`.
+  notesVaults: vi.fn(async () => []),
+  notesVaultActive: vi.fn(async () => null),
+  notesVaultSetActive: vi.fn(async () => undefined),
+  notesTree: vi.fn(),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
@@ -64,8 +75,13 @@ import {
   SESSION_REFS_EMPTY,
   SESSION_REFS_HEADING,
 } from "@/components/sessions/session-refs";
-import { SESSION_SPACES_EMPTY, SESSION_SPACES_HEADING } from "@/components/sessions/session-spaces";
+import {
+  SESSION_SPACE_NEW_NOTE,
+  SESSION_SPACES_EMPTY,
+  SESSION_SPACES_HEADING,
+} from "@/components/sessions/session-spaces";
 import { SESSION_TREE_EMPTY } from "@/components/sessions/session-tree";
+import { resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
 
 const NOW = Date.now();
@@ -188,6 +204,7 @@ function space(): SessionSpaceVm {
     order: 3,
     warnings: [],
     error: null,
+    newFileKind: "log",
   };
 }
 
@@ -199,6 +216,7 @@ beforeEach(() => {
   sessionsSpaceFiles.mockResolvedValue([]);
   listenSessionsChanged.mockResolvedValue(() => {});
   panelsStore.setState(panelsStore.getInitialState(), true);
+  resetNotesVaultsStoreForTest();
 });
 
 afterEach(() => {
@@ -416,6 +434,62 @@ describe("SessionDetail", () => {
     // The zone id alone for the definitions; the session too for the selections.
     expect(sessionsSpaces).toHaveBeenCalledWith("tgdrive");
     expect(sessionsSpaceFiles).toHaveBeenCalledWith("tgdrive", "01J5AAAAAAAAAAAAAAAAAAAAAA");
+  });
+
+  /**
+   * The section writes into THIS session (Story 49.2, FR-273), with the id this
+   * surface already holds.
+   *
+   * Asserted here and not only in the section's own suite, because a dropped
+   * prop is the one defect that suite cannot see: it passes the id itself, so
+   * it would stay green while the real surface wrote into `undefined`.
+   *
+   * The flat contract, explicitly: this file's default fixture is
+   * folder-shaped, where the create is absent by design — see the case below.
+   */
+  it("gives the spaces section the session a new note belongs to", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
+    sessionsSpaces.mockResolvedValue([space()]);
+    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    sessionsFileNewKind.mockResolvedValue("60-sessions/active/2026-08-10-keeper/untitled.md");
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    fireEvent.click(within(section).getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Log` }));
+
+    await waitFor(() =>
+      expect(sessionsFileNewKind).toHaveBeenCalledWith(
+        "tgdrive",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        "log",
+        "",
+      ),
+    );
+  });
+
+  /**
+   * The other half of that prop, and the reason it exists.
+   *
+   * A folder-shaped session's pool is `README.md` plus `refs/` and `prompts/`
+   * (`sessions_root.rs::read_ref_sources`), while `sessions_file_new_kind`
+   * writes its stamped file into the session ROOT. The created file would
+   * therefore be in no space's candidate set and in no Unfiled list — the space
+   * stays as empty as it was, with nothing said. `New prompt` refuses on this
+   * same shape (`session-file-actions.tsx`), and the section must agree.
+   *
+   * Only this suite can see it: the section is handed a shape and would happily
+   * be handed the wrong one forever.
+   */
+  it("offers no create in a folder-shaped session, whose pool could never list it", async () => {
+    sessionsSpaces.mockResolvedValue([space()]);
+    sessionsSpaceFiles.mockResolvedValue([{ spaceId: "_spaces/log.md", files: [], error: null }]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    // The space is listed — the query is still true here — and only the write
+    // verb is gone.
+    expect(within(section).getByText("Log")).toBeInTheDocument();
+    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
   });
 
   /**

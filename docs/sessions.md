@@ -362,6 +362,31 @@ query language is the notes vault's, the same grammar and the same chip editor, 
 `tag:` that meant one thing in notes and another in sessions would be a trap. A broken
 query selects nothing and says so; an unreadable sort still runs the query.
 
+**A space you can write into.** A space whose query names exactly one kind carries its
+own **New note** button — Tasks, Log, References and Prompts do, and so does any space you
+write that asks for one of those tags. The file is tagged as it is created, so it lands in
+the space you made it from rather than in Unfiled, and it opens immediately. About never
+offers it: a session has one record, and a second `about.md` would leave keeper with two
+answers about what the session is. Nor does a space that asks for two things at once
+(`tag:log date:today` has no one file that still satisfies it tomorrow), or one whose query
+keeper cannot read — the button is absent there rather than present and refusing. Nor does
+any space in a **folder-shaped** session: that shape reads its pool from `README.md`,
+`refs/` and `prompts/`, and a tagged file in the session root would be in no space and in
+no Unfiled list — invisible from the moment it was written. Migrating to the flat contract
+is how such a session gets the button, exactly as it is for **New prompt**.
+
+**What a row opens as.** A row is a single click and behaves like one everywhere: it
+replaces what the panel you pressed in was showing rather than adding a panel beside it.
+*Which* surface it opens in depends on where the zone lives. If the zone is inside a
+registered notes vault, the row opens the full note editor — the same editor, the same
+properties, the same history the Notes tab gives you — because that file *is* a note and
+the space was only a way of finding it. If the zone is outside every vault, the row opens
+the file viewer, and keeper says nothing about it: that is a configuration, not a failure,
+and a sentence explaining it every time you clicked a row would be keeper apologising for
+your setup. The two cases keeper does speak up about are a file inside a vault that the
+note index has not caught up with yet, and a vault list keeper could not read at all —
+both open the file viewer and say which of the two happened.
+
 **Tasks** is a board of four columns — in preparation, to do, done, deferred — over the
 files tagged `task`. A card's column is its `status:` and its position is its `order:`, a
 fractional number, so dragging one card rewrites one file rather than renumbering

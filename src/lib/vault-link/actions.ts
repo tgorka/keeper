@@ -22,6 +22,17 @@
  * there may now be several, which changes nothing here: the panel you pressed
  * the control in is the active one, and replacing it is still the wrong answer.
  *
+ * **Story 49.2 makes the gesture an argument on `openNoteForFile` alone,
+ * still defaulting to open-beside.** A space row is not a deliberate "also
+ * show me this" press; it is a list row, and AD-90 gives a single click on a
+ * row the REPLACE gesture (`notes-pane.tsx:289-296`). Left as it was, the same
+ * click would grow the panel strip by one inside a vault and replace one panel
+ * outside it — one gesture, two meanings, decided by configuration the person
+ * pressing cannot see. The rejected alternative was letting the caller resolve
+ * the note and call `setActiveTarget` itself: that would put a second copy of
+ * the vault-switch ordering below outside this file, which is the drift the
+ * paragraph above exists to prevent.
+ *
  * Living here rather than in the two components that press them keeps the pair
  * from drifting: they are one feature in two directions, and the day one of
  * them learns something about focus the other has to learn it too.
@@ -110,12 +121,29 @@ export function showNoteInFiles(vault: VaultLocation, notePath: string): boolean
  * The vault is made active before the panel target is set, because the notes
  * pane only shows the open note while its vault is the active one — setting the
  * target first would flash a pane with nothing in it.
+ *
+ * `options.gesture` picks between AD-90's pair for the final navigation only:
+ * `"beside"` (the default, and what both 45.18 controls press) or `"replace"`,
+ * for a caller whose trigger is a single click on a list row.
+ *
+ * `options.stillWanted` is asked after the awaits and before anything moves.
+ * The two mutations here — the vault switch and the panel target — happen
+ * INSIDE this function, so a caller racing two resolutions cannot guard them
+ * from outside; a superseded press would otherwise still take the active
+ * vault, the strip and the primary view on its way past. Answering `false`
+ * makes the call resolve to `null`: nothing moved and there is nothing to say,
+ * which is what the caller's success branch already does with `null`.
  */
 export async function openNoteForFile(
   vaults: readonly VaultLocation[],
   profileId: string,
   relativePath: string,
+  options: {
+    gesture?: "beside" | "replace";
+    stillWanted?: () => boolean;
+  } = {},
 ): Promise<string | null> {
+  const { gesture = "beside", stillWanted } = options;
   const resolved = notePathForFile(vaults, profileId, relativePath);
   if (resolved === null) {
     return FILE_HAS_NO_NOTE_SENTENCE;
@@ -129,6 +157,9 @@ export async function openNoteForFile(
   const row = folder.notes.find((note) => note.path === resolved.vaultPath);
   if (row === undefined) {
     return noteNotIndexedSentence(resolved.vaultPath);
+  }
+  if (stillWanted !== undefined && !stillWanted()) {
+    return null;
   }
   if (notesVaultsStore.getState().activeVaultId !== resolved.vaultId) {
     await setActiveVault(resolved.vaultId);
@@ -148,7 +179,16 @@ export async function openNoteForFile(
       return state.error ?? NOTES_UNKNOWN_ERROR;
     }
   }
-  panelsStore.getState().openPanel({ kind: "note", vaultId: resolved.vaultId, noteId: row.id });
+  if (stillWanted !== undefined && !stillWanted()) {
+    return null;
+  }
+  const target = { kind: "note", vaultId: resolved.vaultId, noteId: row.id } as const;
+  const panels = panelsStore.getState();
+  if (gesture === "replace") {
+    panels.setActiveTarget(target);
+  } else {
+    panels.openPanel(target);
+  }
   primaryViewStore.getState().setView("notes");
   return null;
 }

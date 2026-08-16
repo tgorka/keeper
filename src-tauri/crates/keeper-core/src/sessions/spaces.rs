@@ -44,8 +44,10 @@ use crate::notes::index::IndexEntry;
 use crate::notes::naming;
 use crate::notes::query;
 use crate::notes::sort;
+use crate::notes::tags;
 use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::pool::{as_index_entry, PoolEntry};
+use crate::sessions::shape::KindTag;
 
 /// Where a zone's space definitions live, zone-relative.
 ///
@@ -471,6 +473,60 @@ pub fn select(space: &SessionSpace, candidates: &[Candidate<'_>], now_ms: i64) -
     }
 }
 
+/// The kind a space can create into itself, or `None` (FR-273).
+///
+/// Derived here rather than in the surface, for the reason the notes rail
+/// already states: `keeper.space` is a grammar, and a second reader of it in
+/// TypeScript would be a second grammar from the day it was written (AD-20,
+/// AD-58). What crosses the boundary is a kind or nothing.
+///
+/// **Exactly one `tag:` term, or nothing.** Four of the five defaults are
+/// single `tag:` queries ([`DEFAULT_SESSION_SPACES`]), and for those "what
+/// would a file made here have to be?" has one answer. A second term does not
+/// narrow that answer, it breaks it: a create in `tag:log date:today` would
+/// write a file the space stops listing at midnight, which is worse than no
+/// create at all. [`crate::notes::seed::inherit`] takes the other choice — it
+/// seeds the terms it can and lets [`crate::notes::seed::verdict`] say the
+/// rest in a sentence — because a note create carries tags, flags and a
+/// destination and has somewhere to put a partial answer. A session file verb
+/// takes a kind and a title, and there is no remainder it could hold.
+///
+/// **`about` is refused**, matching `sessions_file_new_kind`: a session has one
+/// record, and a second would give [`crate::sessions::shape::shape`] two
+/// answers.
+///
+/// **The parse gate is the same one [`select`] runs**, and it is not
+/// decoration. A query that does not parse selects nothing and the space
+/// already renders that sentence; the create verb has to be absent in exactly
+/// those spaces, and one parser deciding both is what keeps it so — rather
+/// than two rules that happen to agree today.
+///
+/// `None`, therefore, for a tag that is not a kind (`tag:project/alpha`, and
+/// `tag:task/*` on the same rule, since [`KindTag::of`] matches a kind exactly),
+/// a negated term, a query with structure or two terms, a query that does not
+/// parse, and a space that has not been told what to show.
+#[must_use]
+pub fn creatable_kind(query: &str) -> Option<KindTag> {
+    query::parse(query).ok()?;
+    let terms = query::conjunction(query)?;
+    let [term] = terms.as_slice() else {
+        return None;
+    };
+    if term.negated || term.key.as_deref() != Some("tag") {
+        return None;
+    }
+    // Normalised by the one definition of a tag, so `tag:#TASK` names the kind
+    // `tag:task` does — the same fold the index applied to the files this space
+    // is selecting, which is what makes the two agree.
+    let tag = tags::normalise(&term.value)?;
+    match KindTag::of(&[tag])? {
+        // The one kind the file verb itself refuses, so the create is absent
+        // here rather than present and always failing.
+        KindTag::About => None,
+        kind => Some(kind),
+    }
+}
+
 /// What the editor asked to be written to one space.
 ///
 /// Everything the form can change and nothing it cannot. There is no `default`
@@ -716,6 +772,7 @@ pub fn compile_seed(defaults: &[&'static DefaultSessionSpace], ids: &[String], n
 mod tests {
     use super::*;
     use crate::sessions::pool::{read_one as read_pool_one, PoolFile};
+    use crate::sessions::shape::KINDS;
 
     const NOW: i64 = 1_760_000_000_000;
 
@@ -1203,6 +1260,110 @@ mod tests {
         assert_eq!(
             run(&seeded("tasks"), &files).expect("tasks"),
             ["a.md", "b.md"]
+        );
+    }
+
+    /// Rows 1 and 4 of the matrix. `ref` is named beside `task` because it is
+    /// the kind no button anywhere in the app offered before this verb: a space
+    /// that collects something nothing can create is a space that stays as
+    /// empty as the template left it.
+    #[test]
+    fn the_kind_a_space_creates_is_the_one_tag_it_asks_for() {
+        assert_eq!(creatable_kind("tag:task"), Some(KindTag::Task));
+        assert_eq!(creatable_kind("tag:ref"), Some(KindTag::Ref));
+    }
+
+    /// Row 2. `sessions_file_new_kind` refuses `about` — a session has one
+    /// record — so the space that collects it must offer nothing rather than a
+    /// button whose only outcome is the refusal sentence.
+    #[test]
+    fn the_about_space_offers_no_create_because_a_session_has_one_record() {
+        assert_eq!(creatable_kind("tag:about"), None);
+    }
+
+    /// Row 3, and the rule under it: a create takes a kind and a title, so it
+    /// has nowhere to put a second term and must not pretend otherwise. The
+    /// matrix's own spelling is refused twice over — `AND` is a bareword in
+    /// this grammar and `date:today` is not a comparison — so the parseable
+    /// pairs beside it are what carries the rule.
+    #[test]
+    fn a_query_that_asks_for_more_than_one_thing_creates_nothing() {
+        for query in [
+            "tag:log AND date:today",
+            "tag:log date:modified>=-1d",
+            "tag:task tag:log",
+        ] {
+            assert_eq!(creatable_kind(query), None, "{query}");
+        }
+    }
+
+    /// Row 5, plus the space that was never told what to show. The three broken
+    /// queries are `a_broken_query_selects_nothing_and_carries_the_sentence`'s
+    /// own: a section rendering a fault sentence, or nothing at all, must not
+    /// also render a create.
+    #[test]
+    fn a_query_the_space_could_not_run_offers_no_create_either() {
+        for query in ["is:task", "(tag:log", "tag:log |", "", "   "] {
+            assert_eq!(creatable_kind(query), None, "{query:?}");
+        }
+    }
+
+    /// Row 6. A kind is an exact tag: `tag:project/alpha` is an ordinary tag,
+    /// `tag:task/*` is the subtree without its own node, `tag:tasks` is the
+    /// plural nobody files under, and `tag:---` is not a tag at all.
+    #[test]
+    fn a_tag_that_is_not_a_kind_creates_nothing() {
+        for query in ["tag:project/alpha", "tag:task/*", "tag:tasks", "tag:---"] {
+            assert_eq!(creatable_kind(query), None, "{query}");
+        }
+    }
+
+    /// `-tag:task` is the space of everything that is *not* a task, and the one
+    /// file a create there could write is the one file it excludes. A group or
+    /// an `|` has structure, and a term lifted out of a disjunction is not a
+    /// term the whole query requires.
+    #[test]
+    fn a_negated_or_grouped_query_creates_nothing() {
+        for query in [
+            "-tag:task",
+            "- tag:task",
+            "(tag:task)",
+            "tag:task | tag:log",
+        ] {
+            assert_eq!(creatable_kind(query), None, "{query}");
+        }
+    }
+
+    /// The same fold the index applied to the files this space is selecting, so
+    /// a query spelled by hand names the kind its own listing already shows.
+    #[test]
+    fn the_tag_is_folded_the_way_the_index_folds_it() {
+        for query in ["  tag:task  ", "tag:TASK", "tag:#Task", "tag:task/"] {
+            assert_eq!(creatable_kind(query), Some(KindTag::Task), "{query}");
+        }
+    }
+
+    /// Every kind reachable from the space that collects it, so a sixth added
+    /// to [`KINDS`] later cannot be silently uncreatable — and the five spaces
+    /// an operator actually meets on first run, which is the acceptance
+    /// sentence: References, Tasks, Log and Prompts can be written into, About
+    /// cannot.
+    #[test]
+    fn every_kind_but_about_is_reachable_from_the_space_that_collects_it() {
+        for kind in KINDS {
+            let query = format!("tag:{}", kind.as_str());
+            let expected = (kind != KindTag::About).then_some(kind);
+            assert_eq!(creatable_kind(&query), expected, "{query}");
+        }
+        // The strings as they cross to the surface, which is what a button's
+        // presence is decided on.
+        let offered: Vec<Option<&str>> = DEFAULT_SESSION_SPACES
+            .iter()
+            .map(|space| creatable_kind(space.query).map(KindTag::as_str))
+            .collect();
+        assert_eq!(
+            offered,
+            [None, Some("task"), Some("log"), Some("ref"), Some("prompt")]
         );
     }
 
