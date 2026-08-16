@@ -461,6 +461,26 @@ moves, git still works — checkouts simply yield pointer files, which is
 recoverable. A required filter would instead hard-fail every git command in the
 repository.
 
+**A `git lfs install` elsewhere on the machine is ignored inside managed
+folders.** That command writes an `lfs` filter driver into your *global*
+`~/.gitconfig` — including `filter.lfs.process`, the long-running protocol — and
+keeper drops every `filter "lfs"` section that does not come from the
+repository's own `.git/config` before it reads a single file. It does this in
+memory: your `~/.gitconfig` is never edited and keeps working for every
+repository keeper does not manage. `filter.lfs.process` is also removed from the
+repository's own config, where `git lfs install --local` would put it.
+
+This is not tidiness. Until 0.8.9 such a driver took over completely: gitoxide
+answers with the first `filter "lfs"` section it finds and does not merge keys
+across scopes, so the global one hid keeper's `clean`/`smudge` *and* its
+`required = false`. A `process` driver that cannot be launched — and on a desktop
+launch `PATH` is Finder's, which does not include Homebrew's `git-lfs` — then
+failed every `status` with `Process handshake with command … "git-lfs
+filter-process" … failed to fill whole buffer`. Nothing committed, so the index
+was never rewritten, so the next pass re-read the same file: the folder was stuck
+for good. It is the same `git lfs install` whose hooks keeper already declines to
+run (it drives `git` with `core.hooksPath` pointed at a path that cannot exist).
+
 `lfsMode = pointerOnly` leaves excluded paths as pointer files. This is the only
 lever that reduces LFS traffic — sparse checkout does **not**, because git-lfs is
 entirely sparse-checkout-unaware. Such a file reads clean regardless: handed
@@ -756,6 +776,7 @@ free space, and exits non-zero when something is genuinely wrong.
 | Every large file fails on an `ssh://` remote although `git push` works | The LFS API is HTTPS even when git is ssh. Keeper asks the server for a credential with `git-lfs-authenticate` — if that is refused, the file's row quotes the server's own words. `Unknown git command` or `LFS Server is not enabled` means LFS is switched off on the forge. If the server answers but the transfer is rejected as unauthenticated, check whether its `href` names a different host from your ssh remote: keeper will not send that host the token you stored for this profile (§8), so such a server has to mint its own. |
 | Large files never arrive on a pendrive or other path remote | Fixed: objects are copied between the two `lfs/objects` stores (§8). A transfer that ran while the drive was absent is deferred, and reattaching the drive releases it on the next pass; one that already parked needs **Retry** on the file's row. |
 | History is growing fast | git keeps every revision. Run `git gc` on the repository, raise the LFS threshold, or exclude churning files. |
+| `status failed: … Process handshake with command … "git-lfs filter-process" … failed to fill whole buffer`, over and over | A `git lfs install` on this machine wrote an `lfs` filter driver into your global `~/.gitconfig`, and until 0.8.9 that driver hid keeper's own and failed every `status` (§8). Fixed from 0.8.9 — update. On an older build, `git config --global --remove-section filter.lfs` (keeper needs no `git-lfs`), then **Sync now**. |
 
 Enable **Settings → Advanced → Debug logging** for on-disk logs
 (`~/Library/Logs/keeper/keeper.log` on macOS, `$XDG_STATE_HOME/keeper/` on
