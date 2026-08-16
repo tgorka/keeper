@@ -681,11 +681,10 @@ Release drafted; DMG attached.\n\n\
             "the prose is byte-identical"
         );
 
-        let scope = files
+        let (scope_path, scope) = files
             .iter()
             .find(|(path, _)| path.ends_with("/01-scope.md"))
-            .expect("prompts hoist too")
-            .1;
+            .expect("prompts hoist too");
         let (fm, body_at) = Frontmatter::parse(scope);
         assert_eq!(fm.as_list("tags"), Some(vec!["prompt".to_owned()]));
         assert_eq!(
@@ -693,9 +692,15 @@ Release drafted; DMG attached.\n\n\
             "# Scope\n\nYou are a…\n",
             "a file with no frontmatter gains a block and keeps its body"
         );
+        // The claim this used to make was `scope.contains("01-scope.md") || true`
+        // — a tautology over the file's CONTENT, where the author meant its
+        // PATH. It asserted nothing, and the older clippy on the macOS gate is
+        // what found it. The real claim is about the hoisted name: the numbered
+        // stem survives, because it is what the prompts space sorts by, and the
+        // folder does not, because the flat contract has no `prompts/`.
         assert!(
-            scope.contains("01-scope.md") || true,
-            "the numbered stem is what the prompts space sorts by"
+            !scope_path.contains("/prompts/"),
+            "a hoisted prompt leaves the folder behind"
         );
         assert!(
             files.iter().any(|(path, _)| path.ends_with("/01-scope.md")),
