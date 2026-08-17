@@ -13,6 +13,7 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsSpaceDelete: vi.fn(),
   sessionsSpacesRestore: vi.fn(),
   sessionsSpaceSave: vi.fn(),
+  sessionsSpaceNarrow: vi.fn(),
   sessionsFileNewKind: vi.fn(),
   notesSpaceTerms: vi.fn(),
   notesTree: vi.fn(),
@@ -30,6 +31,9 @@ import {
   SESSION_SPACE_DELETE_CONFIRM,
   SESSION_SPACE_DELETE_FAILED,
   SESSION_SPACE_EDIT,
+  SESSION_SPACE_NARROW,
+  SESSION_SPACE_NARROW_FAILED,
+  SESSION_SPACE_NARROWED,
   SESSION_SPACE_NEW_NOTE,
   SESSION_SPACE_NEW_NOTE_FAILED,
   SESSION_SPACE_ROWS_LESS,
@@ -56,6 +60,7 @@ import {
   notesVaults,
   sessionsFileNewKind,
   sessionsSpaceDelete,
+  sessionsSpaceNarrow,
   sessionsSpacesRestore,
 } from "@/lib/ipc/client";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
@@ -73,6 +78,7 @@ import {
 
 const mockDelete = vi.mocked(sessionsSpaceDelete);
 const mockRestore = vi.mocked(sessionsSpacesRestore);
+const mockNarrow = vi.mocked(sessionsSpaceNarrow);
 const mockTerms = vi.mocked(notesSpaceTerms);
 const mockNewKind = vi.mocked(sessionsFileNewKind);
 const mockTree = vi.mocked(notesTree);
@@ -100,9 +106,11 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // Story 51.3, so no existing assertion changes meaning.
     folded: p.folded ?? null,
     rows: p.rows ?? null,
-    // Story 52.5's key: no destination named, which is today's behaviour
-    // byte-for-byte.
-    createDir: p.createDir ?? "",
+    // Story 52.5's key, three-valued since Story 53.5: `null` is a file that
+    // names no destination, which is every fixture here, and the placeholder it
+    // would inherit is empty — the session root.
+    createDir: p.createDir ?? null,
+    createDirDefault: p.createDirDefault ?? "",
   };
 }
 
@@ -162,6 +170,16 @@ function selection(
   noHome: string | null = null,
   /** Rust's per-space answer that the record this space wanted already exists. */
   openRecord = false,
+  /**
+   * The query Rust says a one-press repair would write into this space's
+   * definition (Story 53.4) — `null` on every space that is not an
+   * over-specified default, which is every fixture written before this story.
+   *
+   * Last, and defaulted, for the reason `noHome` was: a payload field that
+   * changed the meaning of an existing fixture would make every assertion above
+   * this line prove something else.
+   */
+  narrowTo: string | null = null,
 ) {
   return {
     spaceId,
@@ -176,6 +194,7 @@ function selection(
     })),
     error,
     noHome,
+    narrowTo,
     openRecord,
   } satisfies SessionSpaceFilesVm;
 }
@@ -282,6 +301,10 @@ beforeEach(() => {
   mockDelete.mockResolvedValue(undefined);
   mockRestore.mockReset();
   mockRestore.mockResolvedValue({ names: [] });
+  mockNarrow.mockReset();
+  // The verb resolves with the space's own id, unchanged: the repair rewrites one
+  // key and never moves the file.
+  mockNarrow.mockResolvedValue("_spaces/about.md");
   mockTerms.mockReset();
   mockTerms.mockResolvedValue({
     kind: "chips",
@@ -1683,5 +1706,192 @@ describe("SessionSpaces and the Untagged space", () => {
     );
     const mine = screen.getByRole("region", { name: "Untagged" });
     expect(within(mine).getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
+  });
+});
+
+/**
+ * Story 53.4 (FR-319) — the repair an over-specified space carries.
+ *
+ * The owner's report was *"the about space require recordings and about tag by
+ * default - change it to only about"*, and the default was already `tag:about`:
+ * the second term is in HIS `_spaces/about.md`, which no const can reach, because
+ * `spaces::read_one` builds a space from its own file and `spaces::plan` never
+ * re-seeds a zone that has a `_spaces/` directory. So the fix is a press.
+ *
+ * What is asserted here is only the half that is the webview's. WHETHER a repair
+ * applies and WHAT it writes are `spaces::narrow_target`'s, tested in
+ * `spaces.rs`; this file proves that Rust's answer becomes a control that names
+ * its outcome, that the control sends an id and no query, and that a space Rust
+ * offered nothing for offers nothing — including one carrying the same refusal
+ * sentence, which is the state a hand-written two-term space is in.
+ */
+describe("SessionSpaces narrow", () => {
+  /** The live About space: keeper's own default with a second term typed into it. */
+  const overSpecified = (over: Partial<SessionSpaceVm> = {}) =>
+    space({
+      id: "_spaces/about.md",
+      name: "About",
+      query: "tag:about tag:recordings",
+      defaultKey: "about",
+      order: 1,
+      // Two terms name no single kind, so there is no create to offer — which is
+      // the refusal the repair sits under.
+      newFileKind: null,
+      ...over,
+    });
+
+  /** The over-specified About space's payload, with Rust's repair on it. */
+  const refusedWithRepair = () =>
+    selection("_spaces/about.md", ["about.md"], null, MANY_TERMS, true, "tag:about");
+
+  /** What the control is called, as a person reaches for it. */
+  const label = (query: string, name = "About") => `${SESSION_SPACE_NARROW} ${query}: ${name}`;
+
+  /** Every repair control on the surface, however many spaces are drawn. */
+  const repairs = () =>
+    screen.queryAllByRole("button", { name: new RegExp(`^${SESSION_SPACE_NARROW}`) });
+
+  it("offers the repair beside the arity refusal, naming the query it will write", () => {
+    open([overSpecified()], [refusedWithRepair()]);
+
+    const repair = screen.getByRole("button", { name: label("tag:about") });
+    expect(repair).toBeEnabled();
+    // The outcome is ON the control, in the string Rust composed: a person reads
+    // what the press will write before pressing it, which is the difference
+    // between a repair and a settings toggle.
+    expect(repair).toHaveTextContent(`${SESSION_SPACE_NARROW} tag:about`);
+    // Beside the sentence that explains why it is there, which is still Rust's.
+    expect(screen.getByText(MANY_TERMS)).toBeInTheDocument();
+  });
+
+  /**
+   * The term is not read here, so it is not `"about"` here either: whatever query
+   * arrives on the payload is what the control offers, which is how a two-term
+   * `log` space offers `tag:log` without this file learning a second grammar.
+   */
+  it("offers whatever query Rust composed, not one of its own", () => {
+    open(
+      [overSpecified({ id: "_spaces/log.md", name: "Log", query: "tag:log tag:recordings" })],
+      [selection("_spaces/log.md", [], null, MANY_TERMS, false, "tag:log")],
+    );
+
+    expect(screen.getByRole("button", { name: label("tag:log", "Log") })).toBeEnabled();
+    expect(repairs()).toHaveLength(1);
+  });
+
+  it("presses once, sends an id and no query, and says what it wrote", async () => {
+    const { onChanged } = open([overSpecified()], [refusedWithRepair()]);
+
+    fireEvent.click(screen.getByRole("button", { name: label("tag:about") }));
+
+    // Two arguments and neither of them a query: the verb reads the term off the
+    // file again, so a stale payload narrows nothing (AD-65).
+    await waitFor(() => expect(mockNarrow.mock.calls).toEqual([["p1", "_spaces/about.md"]]));
+    expect(
+      await screen.findByText(`${SESSION_SPACE_NARROWED} About to tag:about.`),
+    ).toBeInTheDocument();
+    // The query that changed is on the definitions payload and the rows it now
+    // selects are on the other one, so only a re-read makes the section agree
+    // with the file.
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  /**
+   * It shares the session's one write-in-flight flag with the create, because
+   * both write into this zone: a repair pressed twice would journal two saves of
+   * the same edit, and a create pressed during one would race it.
+   */
+  it("cannot be pressed twice, and holds the create beside it while it writes", async () => {
+    let settle: (id: string) => void = () => {};
+    mockNarrow.mockReturnValue(
+      new Promise<string>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    open(
+      [overSpecified(), space({ newFileKind: "task" })],
+      [refusedWithRepair(), selection("_spaces/tasks.md", [])],
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: label("tag:about") }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: label("tag:about") })).toBeDisabled(),
+    );
+    expect(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` })).toBeDisabled();
+
+    await act(async () => {
+      settle("_spaces/about.md");
+    });
+    expect(screen.getByRole("button", { name: label("tag:about") })).toBeEnabled();
+    expect(mockNarrow).toHaveBeenCalledTimes(1);
+  });
+
+  it("repeats what Rust said about a refused repair, and nothing is re-read", async () => {
+    const said = "that space is no longer there; nothing was written";
+    mockNarrow.mockRejectedValue({ message: said });
+    const { onChanged } = open([overSpecified()], [refusedWithRepair()]);
+
+    fireEvent.click(screen.getByRole("button", { name: label("tag:about") }));
+
+    // Named with the space, because this notice sits above every section and a
+    // detail can draw several.
+    expect(await screen.findByText(`About: ${said}`)).toBeInTheDocument();
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  it("still says the repair failed when the rejection carries no sentence", async () => {
+    mockNarrow.mockRejectedValue({});
+    open([overSpecified()], [refusedWithRepair()]);
+
+    fireEvent.click(screen.getByRole("button", { name: label("tag:about") }));
+
+    expect(await screen.findByText(`About: ${SESSION_SPACE_NARROW_FAILED}`)).toBeInTheDocument();
+  });
+
+  /**
+   * No control where Rust offered none — and the first row is the one that
+   * matters: the SAME arity sentence, on a space claiming no default, offers
+   * nothing. A surface that keyed the control on the sentence rather than on
+   * `narrowTo` would pass every other assertion in this block and still offer a
+   * press with nothing behind it.
+   */
+  it.each([
+    ["the arity refusal on a space claiming no default", MANY_TERMS, null],
+    ["the record's own refusal", ONE_RECORD, "about"],
+    ["a query made of negations", NEGATED, "untagged"],
+  ])("offers no repair on %s", (_case, why, defaultKey) => {
+    open([overSpecified({ defaultKey })], [selection("_spaces/about.md", ["about.md"], null, why)]);
+
+    expect(screen.getByText(why)).toBeInTheDocument();
+    expect(repairs()).toEqual([]);
+  });
+
+  /**
+   * Per space, in one payload: two spaces refused for the same reason, one of
+   * which Rust gave a term for. Every case above draws one repairable space, so
+   * none of them can tell "this space offers the repair" from "the surface offers
+   * one wherever a refusal is printed".
+   */
+  it("offers it on the space Rust named and not on the one beside it", () => {
+    open(
+      [
+        overSpecified(),
+        overSpecified({
+          id: "_spaces/mine.md",
+          name: "Mine",
+          query: "tag:log tag:task",
+          defaultKey: null,
+          order: 2,
+        }),
+      ],
+      [refusedWithRepair(), selection("_spaces/mine.md", ["task-1.md"], null, MANY_TERMS, false)],
+    );
+
+    expect(repairs()).toEqual([screen.getByRole("button", { name: label("tag:about") })]);
+    // Both sentences are on screen, so the one without a repair is explained and
+    // still points at the editor.
+    expect(screen.getAllByText(MANY_TERMS)).toHaveLength(2);
+    expect(screen.getByRole("button", { name: `${SESSION_SPACE_EDIT} Mine` })).toBeInTheDocument();
   });
 });

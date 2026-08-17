@@ -468,7 +468,12 @@ const SESSION_SPACES: SessionSpaceVm[] = [
   {
     id: "_spaces/about.md",
     name: "About",
-    query: "tag:about",
+    // The live zone's About space, not the seeded one (Story 53.4): the owner
+    // typed a second term into his own `_spaces/about.md`, and this is the state
+    // the repair exists for. The DEFAULT is `tag:about` and always was — editing
+    // that const reaches no zone that already has a `_spaces/` directory, which
+    // is why the fix is a press and not a constant.
+    query: "tag:about tag:recordings",
     sort: "title asc",
     sortEffective: "title asc",
     icon: "info",
@@ -477,19 +482,21 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     warnings: [],
     error: null,
     // `about` is the one kind `sessions_file_new_kind` refuses: a session has
-    // one record, and a second would give `shape()` two answers. So this space
-    // renders a create that is PRESENT and DISABLED, describing itself with the
-    // sentence on `noHome` below (Story 52.4) — the state the owner reported as
-    // "about space nie ma przycisku dodaj jak inne".
+    // one record, and a second would give `shape()` two answers. And this query
+    // asks for two things, which is refused first — so this space renders a
+    // create that is PRESENT and DISABLED, describing itself with the sentence on
+    // `noHome` below (Story 52.4), plus the repair beside it (Story 53.4).
     newFileKind: null,
     // Says nothing about how it opens or how much it shows, which is what four
     // of the five defaults do — the plain case, so the fixture still shows a
     // space that behaves exactly as it did before Story 51.3.
     folded: null,
     rows: null,
-    // Names no directory, which is what every space does until somebody types
-    // one: a create lands where this session's contract keeps that kind.
-    createDir: "",
+    // Names no directory and inherits nothing: `about` is the one kind a create
+    // is refused for outright, so there is nowhere for a destination to point
+    // (Story 53.5).
+    createDir: null,
+    createDirDefault: "",
   },
   {
     id: "_spaces/tasks.md",
@@ -509,7 +516,14 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // list would render the control never, which is the state that hides a
     // regression rather than showing it.
     rows: 2,
-    createDir: "",
+    // **The owner's own state, and the whole of Story 53.5**: the file carries
+    // `keeper.default: tasks` and no `keeper.create_dir` at all, because it was
+    // seeded before any default named a directory. Nothing rewrites it — the
+    // inheritance is resolved on read, so an empty box here is `tasks/` and the
+    // editor says so with the placeholder rather than with a value it would then
+    // persist (AD-121).
+    createDir: null,
+    createDirDefault: "tasks",
   },
   {
     id: "_spaces/log.md",
@@ -528,10 +542,13 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // to carry or nobody sees it until a real zone sets it.
     folded: true,
     rows: null,
-    // The one fixture that files its creates somewhere (Story 52.5): a new log
+    // The one fixture that TYPES its destination (Story 52.5): a new log
     // goes into `logs/`, keeper makes the directory, and the space still lists
-    // the file because its QUERY matched the tag rather than the folder.
+    // the file because its QUERY matched the tag rather than the folder. Here it
+    // happens to agree with what it would have inherited, which is the ordinary
+    // case after Story 53.5 and still a different state from inheriting it.
     createDir: "logs",
+    createDirDefault: "logs",
   },
   {
     id: "_spaces/refs.md",
@@ -557,7 +574,12 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // read. Two warnings on one space is the list the editor prints in full.
     folded: null,
     rows: null,
+    // The EXPLICIT-EMPTY state (Story 53.5): this file names the empty string,
+    // which is an operator saying *the session's own root* and choosing against
+    // the `refs/` they would otherwise have inherited. Distinct from Tasks above,
+    // and the editor has to say which of the two it is showing.
     createDir: "",
+    createDirDefault: "refs",
   },
   {
     id: "_spaces/prompts.md",
@@ -577,7 +599,8 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     newFileKind: null,
     folded: null,
     rows: null,
-    createDir: "",
+    createDir: null,
+    createDirDefault: "prompts",
   },
   {
     id: "_spaces/untagged.md",
@@ -597,7 +620,10 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     newFileKind: null,
     folded: null,
     rows: null,
-    createDir: "",
+    // The residue is not a kind and offers no create, so it names nowhere and
+    // inherits nowhere.
+    createDir: null,
+    createDirDefault: "",
   },
 ];
 
@@ -621,6 +647,25 @@ function spaceFile(
 }
 
 /**
+ * `KindHasNoHome::OnlyOne`, as fixture bytes: the refusal the About space meets
+ * once its query asks for one thing — which is what the repair leaves behind
+ * (Story 53.4), and the state the seeded space is in.
+ *
+ * Restated here rather than imported, for the reason the namers below are: this
+ * shell never runs in the app, and Rust owns the wording wherever it does.
+ */
+const ONE_RECORD_REFUSAL =
+  "a session has one about record — about.md under the flat contract, README.md under the " +
+  "folder one — and keeper edits it rather than making a second.";
+
+/** `spaces::Refusal::ManyTerms`, as fixture bytes. */
+const MANY_TERMS_REFUSAL =
+  "this space asks for more than one thing, so there is no single kind a file made here could " +
+  "be: every term has to hold for a file to appear, and a create writes one kind with one tag. " +
+  "Narrow the query to a single `tag:` term to write into this space, or make the file from " +
+  "Files below and tag it so this space picks it up.";
+
+/**
  * What each space selected out of the mock session — same files as the tree, so
  * the two sections agree with each other, which is the first thing a person
  * scrolling past them checks.
@@ -634,17 +679,16 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     spaceId: "_spaces/about.md",
     files: [spaceFile("about.md", "About this session", ["about"], 45)],
     error: null,
-    // Flat mock session: every kind it can hold lives at the root, so no space
-    // has a home to complain about — except the record, which every contract
-    // keeps exactly one of. That refusal is `KindHasNoHome::OnlyOne`'s sentence
-    // and this shell restates it as fixture bytes for the same reason it
-    // restates the namers: it never runs in the app, and Rust owns the wording
-    // wherever it does.
-    noHome:
-      "a session has one about record — about.md under the flat contract, README.md under the " +
-      "folder one — and keeper edits it rather than making a second.",
-    // So the verb this space offers is opening that record, where the create
-    // would have been.
+    // Two terms, so the QUERY's refusal is the one a person meets — before
+    // anything looks at what its terms name (Story 51.7's ordering).
+    noHome: MANY_TERMS_REFUSAL,
+    // And the repair Rust offers beside that sentence (Story 53.4): the space
+    // claims `default: about`, whose own query asks for one term, so one press
+    // writes `tag:about`. A whole query, composed in Rust, so the label can say
+    // what the press will do before it is pressed.
+    narrowTo: "tag:about",
+    // The verb this space offers instead of a create is opening the record,
+    // which a two-term query naming `tag:about` still names.
     openRecord: true,
   },
   {
@@ -667,6 +711,9 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     ],
     error: null,
     noHome: null,
+    // Nothing to repair: a space asking for one thing is not over-specified, and
+    // Rust offers no press where there is nothing to narrow.
+    narrowTo: null,
     openRecord: false,
   },
   {
@@ -678,6 +725,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     ],
     error: null,
     noHome: null,
+    narrowTo: null,
     openRecord: false,
   },
   {
@@ -685,6 +733,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
     error: null,
     noHome: null,
+    narrowTo: null,
     openRecord: false,
   },
   {
@@ -692,6 +741,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     files: [],
     error: "Unexpected end of query after `AND`.",
     noHome: null,
+    narrowTo: null,
     openRecord: false,
   },
   {
@@ -710,6 +760,9 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
       "names no kind, and a create writes one kind with one tag. There is nothing a file made " +
       "here could be: make the file from Files below, and it appears here until you give it a " +
       "kind tag.",
+    // A negated query is not narrowed by a button: `ManyTerms`' advice would send
+    // this space round a loop, so its refusal carries no repair.
+    narrowTo: null,
     openRecord: false,
   },
 ];
@@ -1211,7 +1264,14 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       // exactly the surface built to catch it. `null` writes no key.
       folded: typeof req.folded === "boolean" ? req.folded : null,
       rows: typeof req.rows === "number" ? req.rows : null,
-      createDir: typeof req.createDir === "string" ? req.createDir.trim() : "",
+      // `null` straight through since Story 53.5 — a field the form never
+      // touched writes no key and the space keeps inheriting, while `""` is a
+      // cleared box and means the session's own root. Collapsing them here would
+      // hide the exact bug this surface exists to catch.
+      createDir: typeof req.createDir === "string" ? req.createDir.trim() : null,
+      // A space the operator invents claims no default, so it inherits nothing.
+      // An EDITED one keeps what it had — see the merge below.
+      createDirDefault: "",
     };
     const at = SESSION_SPACES.findIndex((space) => space.id === id);
     if (at === -1) {
@@ -1223,6 +1283,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         files: [],
         error: null,
         noHome: null,
+        narrowTo: null,
         openRecord: false,
       });
     } else {
@@ -1232,7 +1293,37 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         // Not dropped by an edit: the section's create control would vanish on
         // save for a reason the real backend does not have.
         newFileKind: SESSION_SPACES[at].newFileKind,
+        // Same rule, and the sharper one: this is Rust's answer about which
+        // default the file claims, not anything the form can send. An edit that
+        // reset it would make the seeded Tasks space stop inheriting `tasks/` the
+        // first time somebody renamed it.
+        createDirDefault: SESSION_SPACES[at].createDirDefault,
       };
+    }
+    return id;
+  },
+  // The repair (Story 53.4): narrow an over-specified space to the single term
+  // its default asks for. It mutates the DEFINITION and the REFUSAL, because the
+  // state the press leaves behind is the whole thing worth looking at here — the
+  // arity sentence becomes the one-record one, and the control goes away with the
+  // fault it fixed.
+  //
+  // The narrowed query is read off `narrowTo`, which Rust composed: this shell
+  // has no parser and must not grow one to decide what a query narrows to (the
+  // second grammar `creatable_kind`'s own doc warns about). The refusal it lands
+  // on is the record's, which is true of the one over-specified fixture this file
+  // holds — About — and is fixture bytes, not a rule.
+  sessions_space_narrow: (payload) => {
+    const id = String(payload.spaceId ?? "");
+    const files = SESSION_SPACE_FILES.find((row) => row.spaceId === id);
+    const at = SESSION_SPACES.findIndex((space) => space.id === id);
+    const narrowed = files?.narrowTo ?? null;
+    // A guard rather than a policy: the control that sends this only exists where
+    // `narrowTo` is set, and Rust refuses the verb everywhere else.
+    if (narrowed !== null && files !== undefined && at !== -1) {
+      SESSION_SPACES[at] = { ...SESSION_SPACES[at], query: narrowed };
+      files.noHome = ONE_RECORD_REFUSAL;
+      files.narrowTo = null;
     }
     return id;
   },
@@ -1312,8 +1403,15 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     // space's creates at the root would show the defect this story fixed.
     // Only a space matched BY ID names a directory — the Files heading sends no
     // id, so its own creates keep landing at the session root.
+    //
+    // **`??` and not `||`, which is the whole of Story 53.5 in one operator.** A
+    // `null` destination is a file that named none and inherits its default's;
+    // an EMPTY one is a file that named the session's own root. `||` would fold
+    // the second into the first and put a create in `refs/` that its own
+    // definition had sent to the root — the mirror image of the bug 52.5 left.
     const asked = SESSION_SPACES.find((space) => space.id === String(payload.spaceId ?? ""));
-    const dir = (asked?.createDir ?? "").trim().replace(/\/+$/, "");
+    const named = asked === undefined ? null : (asked.createDir ?? asked.createDirDefault);
+    const dir = (named ?? "").trim().replace(/\/+$/, "");
     const relPath = `${dir === "" ? "" : `${dir}/`}${stamp}-${slug}.md`;
     if (dir !== "" && !SESSION_ENTRIES.some((entry) => entry.relPath === dir)) {
       // `compile_new` leads with the same `MkDir`, so the directory appears in

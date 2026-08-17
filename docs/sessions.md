@@ -671,9 +671,12 @@ you leave a space in.
 `60-sessions/_spaces/`. Six ship by default — About, Tasks, Log, References, Prompts, and
 **Untagged** last — and they are ordinary files: rename them, reorder them, delete one,
 write your own. A default you delete stays deleted; *Restore default spaces* is how you ask
-for it back. The query language is the notes vault's, the same grammar and the same chip
-editor, because a `tag:` that meant one thing in notes and another in sessions would be a
-trap. A broken query selects nothing and says so; an unreadable sort still runs the query.
+for it back — and a default that is already there is never rewritten, which is why a space
+whose query has grown a second term is repaired by a press rather than by an upgrade (see
+**About says why too**, below). The query language is the notes vault's, the same grammar
+and the same chip editor, because a `tag:` that meant one thing in notes and another in
+sessions would be a trap. A broken query selects nothing and says so; an unreadable sort
+still runs the query.
 
 **Untagged** is that grammar read the other way round: `-tag:about -tag:log -tag:prompt
 -tag:ref -tag:task`, which is every kind negated, so it holds exactly the files that have
@@ -748,6 +751,32 @@ it. If the space's query asks for more than one thing — the About space on the
 asks `tag:about tag:recordings` — that is what it says instead, because a create would
 have to pick one kind and the query names two. A space asking for two ordinary tags gets
 the same line.
+
+**And where keeper knows what the space was meant to ask for, that line comes with a
+repair.** Beside the sentence sits one button — *Narrow this space to `tag:about`* — which
+writes exactly the query it names. Press it on the live About space and the query becomes
+`tag:about`; the create refusal it then meets is the one-record line above, because the
+space now asks for one thing. The term is read from the default the space **claims**, not
+from its name and not from a fixed word: a two-term Log space narrows to `tag:log`. So the
+button is offered only on a space carrying keeper's own `default:` marker, which is the one
+thing in the file that can say what a single term ought to be — a space you wrote yourself
+gets the sentence and the pencil, because keeper has no business deciding which of your two
+tags you meant. A query that is not a plain list of `tag:` terms gets the pencil too:
+dropping a `-tag:done` you typed on purpose is not narrowing anything.
+
+**Why that is a button and not a fix in keeper's own defaults.** The About default has
+always asked `tag:about` — one term, and the two-term query is in the copy on your drive.
+A default's query is written when a zone is **seeded** and never again. keeper reads a
+space entirely from that space's own file, and consults the shipped defaults at exactly one
+point: checking that the `default:` marker names something it knows. A zone that already
+has a `_spaces/` directory is never re-seeded, and *Restore default spaces* fills holes
+rather than replacing what is standing — so a file carrying `default: about` is skipped even
+there. That is the directory-is-the-ledger rule doing the job it exists for, and the cost is
+this: changing a shipped default would look exactly like a fix and would change nothing for
+any zone that already exists. The press is what reaches your file. It writes through the
+same save the chip editor uses, so it is an ordinary edit with an ordinary undo — edit the
+space again — and it is the **only** thing that narrows a space. A scan, a restore and an
+app start all leave the file byte for byte as it was.
 
 The button is **absent** in only one case: where keeper has neither a kind nor a reason to
 give you. A space asking for an ordinary tag that is not a kind — `tag:project/alpha` —
@@ -833,10 +862,22 @@ keeper:
   create_dir: logs    # New note here writes logs/2026-08-17-0914-untitled.md
 ```
 
-The editor calls it **New files go in**, and an empty box — which is every space until you
-type something — means what it has always meant: new files land at the session's own root.
-Set it and keeper makes the folder if it is not there, in the same write that creates the
-file. `logs` and `logs/` are the same request, and `notes/2026` is allowed.
+The editor calls it **New files go in**. Each of keeper's own defaults names a folder —
+Tasks writes `tasks/`, Log `logs/`, References `refs/`, Prompts `prompts/` — and About and
+Untagged name none, because neither of those offers a create at all. **A space whose file
+does not mention `create_dir` inherits the folder keeper picked for it.** That is most
+spaces, and it is every space seeded before this: nothing on your drive was rewritten to
+install a default, so the folder is worked out when the file is read. The box is empty and
+the grey word inside it is where your new files are actually going.
+
+**An empty box and an empty key are not the same answer.** Clear the box and save, and
+keeper writes `create_dir: ''` into the space — a deliberate *the session's own root* — and
+your files keep landing there whatever keeper's default for that space is. Leave the box
+alone and no key is written, which is the state that follows the default. The sentence
+under the field always says which of the two you are looking at, and it changes under your
+hand as you type. Set an actual folder and keeper makes it if it is not there, in the same
+write that creates the file. `logs` and `logs/` are the same request, and `notes/2026` is
+allowed.
 
 **It does not change what a file *is*.** The new file still carries the kind tag in its
 frontmatter, and that tag is the only reason any space lists it: a file in `logs/` tagged
@@ -848,10 +889,15 @@ to no space, so they keep writing where the session's own contract keeps that ki
 Three destinations are refused when you save the space, each saying which rule it broke:
 one that leaves the session, `workspace/` — scratch that is not synced and dies with the
 session — and any folder starting with a dot, because keeper's markdown scan never enters
-one, so a file filed there would be in no space, on no board and not even Untagged. On a
-session still in the **folder** shape the contract's own `refs/` and `prompts/` keep
-winning, because that shape's pool reads exactly those two folders and the root: convert
-the session to flat and the key takes effect.
+one, so a file filed there would be in no space, on no board and not even Untagged. The
+same three refusals apply to a folder keeper inherited for you, not only to one you typed:
+the destination is checked as a path at the moment the file is written, by the one guard,
+whoever named it. On a session still in the **folder** shape the contract's own `refs/` and
+`prompts/` keep winning — an inherited folder no more overrides them than a typed one does —
+because that shape's pool reads exactly those two folders and the root, and a file written
+anywhere else would be in no space at all. Convert the session to flat and the key
+takes effect. A flat session's scan walks into its subfolders, which is the whole reason a
+folder is safe here: a task filed into `tasks/` is read back and still listed by Tasks.
 
 **Where your own fold is kept.** Per space, in a cookie in keeper's own webview — not in the
 zone, not in `keeper.toml`, not in any file on your drives. It survives a restart and it

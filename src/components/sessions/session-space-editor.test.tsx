@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionSpaceVm } from "@/lib/ipc/client";
 
@@ -29,6 +29,7 @@ import {
   SESSION_SPACE_SORT_NOTES,
   SESSION_SPACE_TERMS_BROKEN,
   SessionSpaceEditor,
+  sessionSpaceCreateDirEmptyNote,
 } from "@/components/sessions/session-space-editor";
 import { notesSpaceTerms, sessionsSpaceSave } from "@/lib/ipc/client";
 
@@ -56,8 +57,14 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     folded: p.folded ?? null,
     rows: p.rows ?? null,
     // A space that says nothing about where its creates land, which is every
-    // space that existed before Story 52.5. `""` is the absent key, spelled.
-    createDir: p.createDir ?? "",
+    // space that existed before Story 52.5 — and since Story 53.5 `null` is how
+    // that is spelled: an ABSENT key, distinct from the `""` an operator writes
+    // to mean the session's own root. `?? null` would swallow a deliberate `""`,
+    // so the presence of the property is what decides.
+    createDir: "createDir" in p ? (p.createDir ?? null) : null,
+    // What an absent key inherits, which is Rust's answer and `""` unless a test
+    // is about the inheritance.
+    createDirDefault: p.createDirDefault ?? "",
   };
 }
 
@@ -122,13 +129,21 @@ describe("SessionSpaceEditor identity", () => {
     open(null);
 
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Blocked" } });
+    // Re-anchored by Story 53.2. This Enter used to land on row 0 of an
+    // unfiltered open list and quietly take whichever tag the fixture happened
+    // to put first; with the list folded until somebody comes to the field it
+    // takes nothing, and the tag this space gets is the one that was typed.
+    // Still swallowed, so the dialog's default button does not save either.
     fireEvent.keyDown(screen.getByLabelText("Add a tag"), { key: "Enter" });
+    expect(mockSave).not.toHaveBeenCalled();
+
     fireEvent.change(screen.getByLabelText("Add a tag"), { target: { value: "blocked" } });
     fireEvent.keyDown(screen.getByLabelText("Add a tag"), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().id).toBeNull();
+    expect(savedRequest().query).toBe("tag:blocked");
   });
 
   it("titles itself for what it is doing", async () => {
@@ -546,12 +561,12 @@ describe("SessionSpaceEditor destination", () => {
   });
 
   /**
-   * The empty box is the whole back-compatibility story: `""` is what an absent
-   * key already means, Rust writes no key for it, and `kind_dir` falls back to the
-   * shape's answer — so clearing the field restores today's behaviour rather than
-   * naming the session root as a destination.
+   * Story 53.5 changes what a cleared box means. `""` used to be "no answer" and
+   * wrote no key; now it is a DELIBERATE "the session's own root", written as the
+   * empty key so an unrelated Save keeps saying it. The absent state — which is
+   * what inherits — is `null`, and only an untouched field sends that.
    */
-  it("sends an empty destination for a space that names none, rather than a root path", async () => {
+  it("sends an explicit empty destination when the box is cleared", async () => {
     open(space({ createDir: "logs" }));
 
     await screen.findByRole("button", { name: /Tag task/ });
@@ -562,6 +577,93 @@ describe("SessionSpaceEditor destination", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().createDir).toBe("");
+  });
+
+  /**
+   * Story 53.5, acceptance 9 from the form's side. A space whose file names no
+   * destination must still name none after a save that was about something else:
+   * sending `""` here would persist a key nobody typed and stop the space
+   * inheriting its default's folder, and sending the INHERITED folder would be
+   * keeper writing a default into the operator's file (AD-121).
+   */
+  it("sends null for a destination nobody touched, so no key is written", async () => {
+    open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Backlog" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().createDir).toBeNull();
+  });
+
+  /**
+   * Story 53.5, acceptance 3 from the form's side. The inherited folder is the
+   * PLACEHOLDER and never the value: in the box it would be saved on the next
+   * press, and the operator would end up with a key keeper wrote for them.
+   */
+  it("shows the inherited folder as the placeholder and not as the value", async () => {
+    open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
+    expect(field.value).toBe("");
+    expect(field.placeholder).toBe("tasks");
+  });
+
+  /**
+   * Story 53.5, acceptance 4. Two files can both draw an empty box, and the
+   * operator cannot act on either without being told which one they are looking
+   * at — so the sentence under the field is the distinction, and it tracks the
+   * box as it is typed in.
+   */
+  it("says which of the two empties an inheriting space is, as the box is typed in", async () => {
+    open(space({ defaultKey: "tasks", createDirDefault: "tasks" }));
+    await screen.findByRole("button", { name: /Tag task/ });
+    expect(
+      screen.getByText(sessionSpaceCreateDirEmptyNote(null, "tasks") ?? ""),
+    ).toBeInTheDocument();
+
+    // Clearing the box is a different answer, and the sentence says so before
+    // anything is saved.
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
+      target: { value: "x" },
+    });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
+      target: { value: "" },
+    });
+    expect(screen.getByText(sessionSpaceCreateDirEmptyNote("", "tasks") ?? "")).toBeInTheDocument();
+  });
+
+  /**
+   * The other half of acceptance 4: a space whose file already carries the empty
+   * key reads as the session's own root the moment it opens, and does not borrow
+   * the `refs/` it would otherwise have inherited.
+   */
+  it("reads an explicit empty destination as the session's own folder on open", async () => {
+    open(space({ createDir: "", defaultKey: "refs", createDirDefault: "refs" }));
+    await screen.findByRole("button", { name: /Tag task/ });
+    const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
+    expect(field.value).toBe("");
+    expect(field.placeholder).toBe("The session's own folder");
+    expect(screen.getByText(sessionSpaceCreateDirEmptyNote("", "refs") ?? "")).toBeInTheDocument();
+  });
+
+  /**
+   * The three sentences, on their own — the branch table, so a reworded note
+   * cannot quietly collapse two states into one.
+   */
+  it("names the inherited folder in one sentence and the root in the other", () => {
+    expect(sessionSpaceCreateDirEmptyNote(null, "tasks")).toContain("tasks");
+    expect(sessionSpaceCreateDirEmptyNote("", "tasks")).toContain("tasks");
+    expect(sessionSpaceCreateDirEmptyNote(null, "tasks")).not.toBe(
+      sessionSpaceCreateDirEmptyNote("", "tasks"),
+    );
+    // No default to inherit: one sentence for both empties, because there is
+    // only one answer.
+    expect(sessionSpaceCreateDirEmptyNote(null, "")).toBe(sessionSpaceCreateDirEmptyNote("", ""));
+    // A box with a folder in it explains itself.
+    expect(sessionSpaceCreateDirEmptyNote("logs", "tasks")).toBeNull();
   });
 
   /** The note is always on screen: "New files go in" alone reads like a filter,
@@ -626,7 +728,8 @@ describe("SessionSpaceEditor reach", () => {
   /**
    * The half of the fix that is easy to delete because it looks decorative. The
    * body holds two children that own a scroll region — the icon grid and the tag
-   * combobox's always-rendered listbox — and a flex item whose own overflow is
+   * combobox's listbox, which Story 53.2 folds with `hidden` but still renders —
+   * and a flex item whose own overflow is
    * not `visible` has an automatic minimum size of ZERO. They are therefore the
    * only children that can give ground, so without `shrink-0` the flex algorithm
    * hands them the body's entire negative free space: the icon chooser and the
@@ -654,5 +757,68 @@ describe("SessionSpaceEditor reach", () => {
     expect(terms.querySelector<HTMLElement>("[role='listbox']")?.className).toContain(
       "overflow-y-auto",
     );
+  });
+});
+
+/**
+ * Folding the tag list away (Story 53.2, FR-315).
+ *
+ * This dialog is one of the two surfaces that mounted the chooser
+ * unconditionally and passed it no `onDismiss`, so it had no close path in the
+ * product at all: the list was on screen above the Save button from the moment
+ * the editor opened. The close is the control's own now — it opens folded and
+ * the caret leaving folds it again — so these assertions are about this surface
+ * rather than about the mechanism, which has its own suite in
+ * `tag-combobox.test.tsx`. Escape is deliberately not asserted here: Radix's
+ * dismissable layer claims Escape at the document in the CAPTURE phase, so on
+ * this dialog it closes the editor before the chooser sees the key — this
+ * form's own older decision, and not something to fight from inside a combobox.
+ */
+describe("SessionSpaceEditor tag chooser", () => {
+  it("opens with the list folded, and the caret is what unfolds it", async () => {
+    open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    const field = screen.getByLabelText("Add a tag");
+    act(() => {
+      field.focus();
+    });
+
+    // `task` is absent because the space already carries it, which is the same
+    // browsable list 44.13 shipped — one focus away instead of always there.
+    expect(
+      within(screen.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((row) => row.textContent),
+    ).toEqual(["log"]);
+  });
+
+  it("folds the list on a press elsewhere on the form, and that press still lands", async () => {
+    const { onClose } = open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    const field = screen.getByLabelText("Add a tag");
+    act(() => {
+      field.focus();
+    });
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    // The press, in the order a browser fires it. The fold must not happen
+    // between the pointer going down and the click landing, or every control
+    // below this list moves out from under the cursor mid-press.
+    const name = screen.getByLabelText("Name");
+    fireEvent.pointerDown(name);
+    act(() => {
+      name.focus();
+    });
+    fireEvent.pointerUp(name);
+    fireEvent.click(name);
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(document.activeElement).toBe(name);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
   });
 });

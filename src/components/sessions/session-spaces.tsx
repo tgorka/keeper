@@ -118,7 +118,12 @@ import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
-import { sessionsFileNewKind, sessionsSpaceDelete, sessionsSpacesRestore } from "@/lib/ipc/client";
+import {
+  sessionsFileNewKind,
+  sessionsSpaceDelete,
+  sessionsSpaceNarrow,
+  sessionsSpacesRestore,
+} from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 import {
   isSpaceFolded,
@@ -219,6 +224,31 @@ export const SESSION_SPACE_NEW_NOTE = "New note in";
 /** What the create says when keeper could not write. */
 export const SESSION_SPACE_NEW_NOTE_FAILED =
   "keeper couldn't create that note. Nothing was written.";
+
+/**
+ * The repair an over-specified space offers, suffixed with the query it will
+ * write (Story 53.4, FR-319).
+ *
+ * **It says what it will do before it is pressed**, which is what makes it a
+ * repair rather than a settings toggle: the query comes from Rust on the
+ * selection's `narrowTo`, so the string a person reads on the control and the
+ * string that lands in `keeper.space` are one value from one function (AD-65).
+ * "Fix this space" was the rejected wording — it names no outcome, and this
+ * control writes to a file the operator owns.
+ *
+ * It is offered only where Rust offered it: beside the arity refusal, on a space
+ * claiming a default whose query asks for a single `tag:` term. A space that
+ * claims nothing has no authority for a term and gets no control — the editor,
+ * which the pencil already opens, is the answer there.
+ */
+export const SESSION_SPACE_NARROW = "Narrow this space to";
+
+/** What the repair says when it wrote, in the notice the section already has. */
+export const SESSION_SPACE_NARROWED = "Narrowed";
+
+/** What the repair says when keeper could not write. */
+export const SESSION_SPACE_NARROW_FAILED =
+  "keeper couldn't narrow this space. Nothing was written.";
 
 /** What the delete confirmation asks and answers. */
 export const SESSION_SPACE_DELETE_TITLE = "Delete this space?";
@@ -643,6 +673,15 @@ function SpaceSection({
   // rather than the space id: a space id is a path and may hold whitespace, which
   // an IDREF cannot (see {@link SESSION_SPACE_FOLD_ID}).
   const refusalId = useId();
+  // The repair that refusal carries, when it carries one (Story 53.4, FR-319).
+  //
+  // A query, composed in Rust, on the SAME payload as the sentence: it is set
+  // only where `noHome` is the arity refusal AND the space claims a default that
+  // asks for a single `tag:` term, so this file decides nothing about when a
+  // repair applies and reads no `keeper.space` to find its term. What it does
+  // with the string is print it, so the person reads what the press will write
+  // before pressing, and send an id back.
+  const narrowTo = selection?.narrowTo ?? null;
 
   // Whether this space is folded, and where that is remembered (Story 49.3,
   // FR-275; Story 51.3, FR-289). Keyed by root and space id rather than by
@@ -712,6 +751,41 @@ function SpaceSection({
       )
       .finally(() => onWriting(false));
   }, [kind, rootId, sessionId, space.id, space.name, onOpen, onNotice, onChanged, onWriting]);
+
+  /**
+   * Narrow this space to the single term its default asks for (Story 53.4,
+   * FR-319).
+   *
+   * **An id and nothing else.** The query is Rust's — it read it off the default
+   * this space claims — and the verb reads it again server-side rather than
+   * trusting what this file is holding, so a stale payload narrows nothing.
+   * `narrowTo` is printed on the control for the person and never sent.
+   *
+   * It shares `writing` with the create, because both are writes into this
+   * session's zone and neither should be pressed twice while the first is in
+   * flight. The sentence lands in the section's one live region, named with the
+   * space for {@link newNote}'s reason: this notice sits above every section.
+   *
+   * `onChanged` after it lands, because the query that changed is on the
+   * definitions payload and the rows it now selects are on the other one — only
+   * a re-read makes the section agree with the file.
+   */
+  const narrow = useCallback(() => {
+    if (narrowTo === null) {
+      return;
+    }
+    onWriting(true);
+    onNotice(null);
+    sessionsSpaceNarrow(rootId, space.id)
+      .then(() => {
+        onNotice(`${SESSION_SPACE_NARROWED} ${space.name} to ${narrowTo}.`);
+        onChanged();
+      })
+      .catch((raw: unknown) =>
+        onNotice(`${space.name}: ${syncErrorMessage(raw, SESSION_SPACE_NARROW_FAILED)}`),
+      )
+      .finally(() => onWriting(false));
+  }, [narrowTo, rootId, space.id, space.name, onNotice, onChanged, onWriting]);
 
   return (
     <FoldSection
@@ -903,6 +977,42 @@ function SpaceSection({
             <p id={refusalId} data-slot="space-no-home" className="text-muted-foreground text-xs">
               {refusal}
             </p>
+          )}
+          {/* The repair, directly under the sentence that explains why it is
+              there (Story 53.4, FR-319). Rust decides whether it exists —
+              `narrowTo` is set only beside the arity refusal, on a space claiming
+              a default that asks for one `tag:` term — so a space with no
+              authority for a term offers the pencil and nothing else.
+
+              **It names its outcome.** The label ends in the query it will write,
+              which is the difference between a repair and a settings toggle: a
+              person can read what is about to happen to a file they own before
+              pressing, and what they read is the string that gets written.
+
+              A bordered button, not one of the header's ghost glyphs and not the
+              row-cap's underlined link: this one WRITES, and it should not look
+              like the two controls beside it that only rearrange what is on
+              screen. In the notice rather than in `actions` for the same reason
+              the sentence is: the header spends its ~208px on a name, a count and
+              three controls, and this control has to carry a query in its label.
+
+              No confirmation. It changes one key in one file through the same save
+              the editor uses, and it is undone by editing the space — an
+              AlertDialog here would be the weight of Delete on a reversible
+              edit. */}
+          {narrowTo !== null && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-slot="space-narrow"
+              aria-label={`${SESSION_SPACE_NARROW} ${narrowTo}: ${space.name}`}
+              disabled={writing}
+              onClick={narrow}
+              className="h-7 self-start px-2 font-normal text-xs"
+            >
+              {`${SESSION_SPACE_NARROW} ${narrowTo}`}
+            </Button>
           )}
         </>
       }

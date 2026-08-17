@@ -532,9 +532,9 @@ pub struct SessionSpaceVm {
     /// how much it is not showing. Capping the selection instead would make that
     /// count a lie, which is the one thing this key must not do.
     pub rows: Option<u32>,
-    /// The directory this space's creates go into, session-relative — empty when
-    /// it names none, which is today's behaviour for every space (Story 52.5,
-    /// FR-309).
+    /// The directory this space's creates go into, session-relative — `null`
+    /// when the file carries no `keeper.create_dir` key at all (Story 52.5,
+    /// FR-309; Story 53.5, FR-320).
     ///
     /// Carried so the editor can show what the file says and send it back
     /// unchanged; the surface never composes a path out of it and never reads a
@@ -542,7 +542,28 @@ pub struct SessionSpaceVm {
     /// [`crate::sessions::shape::kind_dir`]'s answer in Rust (AD-65), which
     /// takes this as its override and keeps the session's contract as the
     /// fallback.
-    pub create_dir: String,
+    ///
+    /// **Nullable rather than a plain string, for
+    /// [`crate::sessions::spaces::SessionSpace::create_dir`]'s reason**: `null`
+    /// is a space that inherits [`Self::create_dir_default`], and `""` is an
+    /// operator who chose the session root. The editor shows one empty box for
+    /// both and has to say which it is, and a request that could not spell the
+    /// difference would silently convert the second into the first on the next
+    /// unrelated Save.
+    pub create_dir: Option<String>,
+    /// The destination [`Self::create_dir`] inherits when it is `null` — `""` for
+    /// a space that claims no default, or claims one that names nowhere (Story
+    /// 53.5, FR-320).
+    ///
+    /// **Resolved in Rust and sent as the editor's PLACEHOLDER, not as its
+    /// value.** The placeholder is the only honest way to draw the inherited
+    /// answer: put it in the box and the next Save persists a key nobody typed,
+    /// which is the rewrite AD-121 forbids; leave the box saying nothing and an
+    /// empty field reads as the session root it used to mean. Composed by
+    /// [`crate::sessions::spaces::inherited`], so no surface reads
+    /// `DEFAULT_SESSION_SPACES` — the same rule that keeps `new_file_kind` from
+    /// being a query parsed in TypeScript.
+    pub create_dir_default: String,
     /// Presentation keys keeper could not read, each a finished sentence. The
     /// space still works — this is the "not obeying one line of its own file"
     /// severity, distinct from `error`.
@@ -606,6 +627,26 @@ pub struct SessionSpaceFilesVm {
     /// A create is **absent** where this is `Some`, never present-and-disabled,
     /// and the sentence goes where the button would have been.
     pub no_home: Option<String>,
+    /// The query a one-press repair would write into this space's definition, or
+    /// `None` when there is no repair to offer (Story 53.4, FR-319).
+    ///
+    /// Set exactly where `no_home` above is
+    /// [`crate::sessions::spaces::Refusal::ManyTerms`]' sentence AND the space
+    /// claims a default that asks for a single `tag:` term —
+    /// [`crate::sessions::spaces::CreateRefused::narrow_to`] is the one reader of
+    /// that pairing, so the control and the sentence cannot come apart.
+    ///
+    /// **A whole query, composed in Rust.** The surface presses a verb with an id
+    /// and never composes a query (AD-65), and it prints this string so the person
+    /// can read what the press will write BEFORE pressing it. A flag here would
+    /// mean TypeScript deciding that narrowing `tag:about tag:recordings` leaves
+    /// `tag:about`, which is a second reading of `keeper.space`.
+    ///
+    /// `None` on every other refusal: a contract with nowhere to put the kind and
+    /// a query made of negations are not things a narrowing fixes, and a space
+    /// claiming no default has nothing that could say what its one term is. The
+    /// editor is the answer in all three.
+    pub narrow_to: Option<String>,
     /// Whether the verb that applies here instead of a create is opening the
     /// session's record (FR-299).
     ///
@@ -751,12 +792,20 @@ pub struct SessionSpaceReq {
     /// How many rows the section renders; `null` writes no key, and zero is not
     /// a legal cap (Story 51.3).
     pub rows: Option<u32>,
-    /// The directory this space's creates go into; empty writes no key.
+    /// The directory this space's creates go into; `""` writes `create_dir: ""`
+    /// and `null` writes no key at all (Story 52.5; Story 53.5, FR-320).
     ///
     /// Sent on every save for `folded`'s reason: `render_edit` replaces the
     /// whole `keeper:` map, so a form that omitted this would delete the
     /// operator's destination on the next unrelated Save.
-    pub create_dir: String,
+    ///
+    /// **Nullable, and the two empties are not the same request.** `null` is a
+    /// field the operator never touched, which keeps the file inheriting its
+    /// default's destination; `""` is a box they cleared, which is a deliberate
+    /// *the session root* and writes the empty key that says so. One `String`
+    /// here would make an unrelated Save silently reinstate inheritance under an
+    /// operator who had chosen against it.
+    pub create_dir: Option<String>,
 }
 
 /// One thing the operator could reference (FR-265).

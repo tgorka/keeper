@@ -77,6 +77,28 @@ pub struct DefaultSessionSpace {
     pub icon: &'static str,
     /// Rail position.
     pub order: f64,
+    /// Where this default's creates land, session-relative — `""` for a default
+    /// that names nowhere (Story 53.5, FR-320).
+    ///
+    /// **The value a space file INHERITS when it carries no `keeper.create_dir`
+    /// key at all** ([`destination`]). Story 52.5 shipped the whole mechanism
+    /// and no default: `create_dir` defaulted empty, empty was specified as the
+    /// contract's own answer, and no default space, no seeder and no operator
+    /// ever set it — a switch nobody threw. This field is what sets it, and
+    /// inheritance-on-read rather than a rewrite is what carries it into a zone
+    /// whose `_spaces/` already exists (AD-121).
+    ///
+    /// **Honoured under [`Shape::Flat`] only**, which is
+    /// [`kind_dir`]'s rule and not a second one here: a flat session's pool scan
+    /// descends every directory it is allowed into, so a file written to
+    /// `tasks/` is read back and still matched by `tag:task`; a folder-shaped
+    /// session reads its root plus exactly `refs/` and `prompts/`, so the
+    /// contract's own directory wins there and this is ignored. That is why
+    /// `refs` and `prompts` here are not a collision with
+    /// [`crate::sessions::shape::REFS_DIR`] and
+    /// [`crate::sessions::shape::PROMPTS_DIR`]: under Folder the constants
+    /// already decide, and under Flat there is nothing to collide with.
+    pub create_dir: &'static str,
 }
 
 /// The six, in the order a session is read in.
@@ -130,6 +152,11 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         sort: "name asc",
         icon: "info",
         order: 1.0,
+        // Nowhere, because there is nowhere to put it: a session has exactly one
+        // record and `kind_dir` refuses an `about` create under both contracts
+        // before it looks at a destination at all. A directory named here would
+        // be a value nothing can ever read.
+        create_dir: "",
     },
     DefaultSessionSpace {
         key: "tasks",
@@ -140,6 +167,7 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         sort: "order asc",
         icon: "list-todo",
         order: 2.0,
+        create_dir: "tasks",
     },
     DefaultSessionSpace {
         key: "log",
@@ -150,6 +178,7 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         sort: "modified desc",
         icon: "history",
         order: 3.0,
+        create_dir: "logs",
     },
     DefaultSessionSpace {
         key: "refs",
@@ -158,6 +187,13 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         sort: "name asc",
         icon: "link",
         order: 4.0,
+        // `refs`, which is also `shape::REFS_DIR` — and deliberately the same
+        // word rather than a second one. Under Folder the constant already
+        // decides and this is ignored; under Flat there is no contract directory
+        // to collide with, and a flat session that grows a `refs/` cannot flip
+        // shape because `shape()` keys on `AGENTS.md` alone. One name for one
+        // idea is what keeps `refs/` and `tag:ref` from drifting apart.
+        create_dir: "refs",
     },
     DefaultSessionSpace {
         key: "prompts",
@@ -168,6 +204,8 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         sort: "name asc",
         icon: "message-square",
         order: 5.0,
+        // `prompts`, for `refs`' reason one space up.
+        create_dir: "prompts",
     },
     DefaultSessionSpace {
         key: "untagged",
@@ -191,6 +229,10 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
         // Last, which is the whole of the operator's instruction about it: the
         // residue is read after everything that has said what it is.
         order: 6.0,
+        // Nowhere. The residue is not a kind — its query is every kind negated
+        // — so `creatable_kind` offers it no create to file, and a destination
+        // would be an answer to a question this space never asks.
+        create_dir: "",
     },
 ];
 
@@ -248,8 +290,28 @@ pub struct SessionSpace {
     /// twelve files could not honestly say how many it was not showing.
     pub rows: Option<u32>,
     /// `keeper.create_dir`: the directory this space's creates go INTO,
-    /// session-relative — empty when it names none, which is every space until
-    /// somebody types one (Story 52.5, FR-309).
+    /// session-relative — and `None` when the file carries no such key at all
+    /// (Story 52.5, FR-309; Story 53.5, FR-320).
+    ///
+    /// **Three-valued, and that is the whole of Story 53.5.** [`Self::folded`]'s
+    /// shape for a sharper reason: `None` is a key the file never wrote, which
+    /// **inherits the claimed default's destination** ([`destination`]), while
+    /// `Some("")` is an operator saying *the session root* and is honoured as
+    /// such. A `String` could not tell those apart, and every zone that already
+    /// has a `_spaces/` is in exactly that state — its files were seeded before
+    /// any default named a directory — so a two-valued key would make the
+    /// default invisible to precisely the operators it was added for. Nothing is
+    /// rewritten to close that gap: the directory is the ledger and a persisted
+    /// space file is the operator's (AD-121), so the inheritance happens on
+    /// READ.
+    ///
+    /// **Where it deliberately departs from [`Self::folded`] and
+    /// [`Self::rows`].** For those
+    /// two an empty value is silence, indistinguishable from an absent key,
+    /// because "unfolded" and "uncapped" are already what silence produces. Here
+    /// an empty value is a real, nameable destination — the session's own folder
+    /// — and it is the ONLY spelling of it, so collapsing it into silence would
+    /// leave an operator who wants the root with nothing to write.
     ///
     /// **A destination for writes, and never a source for reads.** AD-120 says a
     /// file's kind is the tag it carries, and this key does not soften that by a
@@ -263,7 +325,7 @@ pub struct SessionSpace {
     /// space is a trap, and the path itself is validated where it is used, by
     /// the one guard [`crate::sessions::files::check_dir`], rather than by a
     /// second rule here that would have to agree with it forever.
-    pub create_dir: String,
+    pub create_dir: Option<String>,
     /// What keeper could not read and worked around, already worded. Empty for
     /// a file it understood entirely.
     pub warnings: Vec<String>,
@@ -296,7 +358,7 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
         order: sort::DEFAULT_SPACE_ORDER,
         folded: None,
         rows: None,
-        create_dir: String::new(),
+        create_dir: None,
         warnings: Vec::new(),
     };
     if let Some(FieldValue::Map(pairs)) = fm.get("keeper") {
@@ -337,8 +399,20 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
                 // request as `logs` (`files::dir_rel`'s own rule). A leading
                 // `/` is left exactly as written — it makes the path absolute,
                 // which is a refusal and not a spelling to repair.
-                ("create_dir", FieldValue::Str(dir)) => {
-                    space.create_dir = dir.trim().trim_end_matches('/').to_owned();
+                //
+                // **Matched on the key alone and flattened**, `order`'s rule
+                // three arms up, and since Story 53.5 the reason bites harder
+                // than it did: reaching this arm at all is what makes the answer
+                // `Some` rather than `None`, and `None` INHERITS. A
+                // `create_dir: [logs]` that fell through to the `_` arm would
+                // therefore not be a key that does nothing — it would be a key
+                // that silently files the operator's next file somewhere they
+                // never named. Whatever the value spells is read as the path it
+                // spells, and [`crate::sessions::files::check_dir`] is what
+                // judges it.
+                ("create_dir", value) => {
+                    space.create_dir =
+                        Some(value.index_string().trim().trim_end_matches('/').to_owned());
                 }
                 ("default", FieldValue::Str(raw)) => {
                     space.default_key = by_key(raw.trim()).map(|d| d.key.to_owned());
@@ -349,6 +423,59 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
     }
     space.warnings.extend(sort::read(&space.sort).warning);
     space
+}
+
+/// Where this space's creates land, with an absent key inheriting its claimed
+/// default's answer (Story 53.5, FR-320).
+///
+/// **The one function that decides, and the reason a default is not invisible.**
+/// [`SessionSpace::create_dir`] is three-valued and this is what collapses it:
+/// `Some(named)` is the file's own answer, honoured verbatim including
+/// `Some("")`, which is an operator saying *the session root* out loud;
+/// `None` is a file that never wrote the key and takes
+/// [`DefaultSessionSpace::create_dir`] off the default it claims. A space
+/// claiming no default and naming no directory is the root, which is what every
+/// create did before Story 52.5.
+///
+/// **Why inheritance and not a rewrite.** Every zone that already has a
+/// `_spaces/` was seeded before any default named a directory, so its files
+/// carry `keeper.default` and no `keeper.create_dir` — and `_spaces/` is the
+/// ledger, so [`plan`] adds nothing to a directory that exists and a `Restore`
+/// skips every default already [`claimed`]. Editing the const therefore reaches
+/// nobody who has a zone; reading it here reaches everybody. AD-121 is why the
+/// difference matters: a persisted space file is the operator's, and installing
+/// a default into one would be keeper writing where nobody pressed anything.
+///
+/// **Not a validator.** The answer still goes to
+/// [`crate::sessions::shape::kind_dir`], which honours it under
+/// [`Shape::Flat`] only, and then to
+/// [`crate::sessions::files::check_dir`], which is what refuses a path that
+/// escapes the session, names `workspace/` or starts with a dot — the three
+/// refusals Story 52.5 wrote, now met by an inherited value on exactly the same
+/// terms as a typed one, because there is one guard and this composes no second
+/// one.
+#[must_use]
+pub fn destination(space: &SessionSpace) -> &str {
+    match space.create_dir.as_deref() {
+        Some(named) => named,
+        None => inherited(space.default_key.as_deref()),
+    }
+}
+
+/// The destination a space claiming `default_key` inherits, or `""` for none.
+///
+/// Split out of [`destination`] because the editor needs it on its own: the
+/// field shows this as its PLACEHOLDER, so an empty box reads as what it now
+/// means rather than as the session root it used to mean. The shell projects it
+/// beside the file's own value ([`crate::sessions::vm::SessionSpaceVm`]) instead
+/// of resolving the two into one string, for the reason `folded` crosses
+/// nullable: a resolved field could not tell the operator which of the two
+/// answers they are looking at.
+#[must_use]
+pub fn inherited(default_key: Option<&str>) -> &'static str {
+    default_key
+        .and_then(by_key)
+        .map_or("", |claimed| claimed.create_dir)
 }
 
 /// How a space opens when nobody has folded it by hand, the sentence saying
@@ -520,20 +647,35 @@ pub fn rel_of(space: &DefaultSessionSpace) -> String {
 /// one file and it stays theirs.
 #[must_use]
 pub fn render_note(space: &DefaultSessionSpace, id: &str, now: &str) -> String {
+    let mut keeper = vec![
+        ("space".to_owned(), FieldValue::Str(space.query.to_owned())),
+        ("sort".to_owned(), FieldValue::Str(space.sort.to_owned())),
+        ("icon".to_owned(), FieldValue::Str(space.icon.to_owned())),
+        ("order".to_owned(), FieldValue::Num(space.order)),
+    ];
+    // Written when the default names one, and in [`keeper_pairs`]' position —
+    // last of the keys and before `default` — so a seeded file and a re-saved
+    // one are the same bytes in the same order, and an operator diffing the two
+    // sees nothing move.
+    //
+    // **Skipped when it names nowhere, rather than written empty.** About and
+    // the residue name no directory, and `create_dir: ""` in their files would
+    // be an explicit "the session root" — a real answer, under
+    // [`destination`]'s rule — where the truth is that neither space has a
+    // create to file at all. `icon`'s rule in [`keeper_pairs`], for a sharper
+    // reason: here the empty value is not silence.
+    if !space.create_dir.is_empty() {
+        keeper.push((
+            "create_dir".to_owned(),
+            FieldValue::Str(space.create_dir.to_owned()),
+        ));
+    }
+    keeper.push(("default".to_owned(), FieldValue::Str(space.key.to_owned())));
     let front = Frontmatter::serialise_new(&[
         ("id".to_owned(), FieldValue::Str(id.to_owned())),
         ("created".to_owned(), FieldValue::Str(now.to_owned())),
         ("updated".to_owned(), FieldValue::Str(now.to_owned())),
-        (
-            "keeper".to_owned(),
-            FieldValue::Map(vec![
-                ("space".to_owned(), FieldValue::Str(space.query.to_owned())),
-                ("sort".to_owned(), FieldValue::Str(space.sort.to_owned())),
-                ("icon".to_owned(), FieldValue::Str(space.icon.to_owned())),
-                ("order".to_owned(), FieldValue::Num(space.order)),
-                ("default".to_owned(), FieldValue::Str(space.key.to_owned())),
-            ]),
-        ),
+        ("keeper".to_owned(), FieldValue::Map(keeper)),
     ]);
     format!("{front}\n# {}\n", space.name)
 }
@@ -799,6 +941,26 @@ pub struct CreateRefused {
     pub record: bool,
 }
 
+impl CreateRefused {
+    /// The query a one-press repair would write, or `None` when there is none
+    /// (Story 53.4, FR-319).
+    ///
+    /// One reader of [`Refusal::ManyTerms`]' payload, so the shell projects the
+    /// repair without matching on the variant and without asking a second
+    /// question that could answer differently from the sentence it is rendering
+    /// beside. Non-`None` exactly where the printed refusal is the arity one AND
+    /// [`narrow_target`] found authority for a term: every other refusal — a
+    /// contract with nowhere to put the kind, a query of negations — is not
+    /// something a narrowing fixes.
+    #[must_use]
+    pub fn narrow_to(&self) -> Option<&'static str> {
+        match self.why {
+            Some(Refusal::ManyTerms { narrow_to }) => narrow_to,
+            _ => None,
+        }
+    }
+}
+
 /// A refusal a space's create can meet, worded exactly once.
 ///
 /// Sentences rather than codes, [`KindHasNoHome`]'s own rule, and *that* enum is
@@ -818,13 +980,27 @@ pub enum Refusal {
     /// SPACES section above FILES on the detail, so a sentence rendered in a
     /// space that sent a person upwards would send them past the record's header
     /// and out of the surface.
+    ///
+    /// **It carries its own repair** (Story 53.4, FR-319). `narrow_to` is what
+    /// [`narrow_target`] found for the space that met this refusal, and it rides
+    /// ON the refusal rather than beside it so the two can never disagree: the
+    /// press is offered exactly where this sentence is printed, and the sentence
+    /// keeps telling a person how to do it by hand because the press is a
+    /// shortcut through the editor, not a replacement for it. `None` — a space
+    /// claiming no default, or a query that is not a plain conjunction of `tag:`
+    /// terms — is a refusal whose only answer is that editor.
     #[error(
         "this space asks for more than one thing, so there is no single kind a file made here \
          could be: every term has to hold for a file to appear, and a create writes one kind \
          with one tag. Narrow the query to a single `tag:` term to write into this space, or make \
          the file from Files below and tag it so this space picks it up."
     )]
-    ManyTerms,
+    ManyTerms {
+        /// The query a one-press repair would write, or `None` when nothing
+        /// authorises one. A whole query and not a bare tag, because it is what
+        /// gets written and the writer must compose nothing.
+        narrow_to: Option<&'static str>,
+    },
     /// Every term is a negation, so the query names no kind at all — which is
     /// the `Untagged` default's own state and the reason it has a control that
     /// refuses rather than no control (Story 52.4).
@@ -840,6 +1016,67 @@ pub enum Refusal {
          kind tag."
     )]
     Negated,
+}
+
+/// The query an over-specified space narrows to in one press, or `None` when
+/// nothing authorises one (Story 53.4, FR-319).
+///
+/// **The term comes from the default the space is CLAIMING**, never from its
+/// name and never from a hard-coded `"about"`. `keeper.default` is the one field
+/// of a space file the operator cannot change ([`DefaultSessionSpace`]), so it
+/// is the only thing in the file that can say what this space was supposed to
+/// ask for — which is why a two-term `log` space narrows to `tag:log` and not to
+/// the tag of the story that asked for this.
+///
+/// **And it is the default's own string, verbatim** rather than one rebuilt out
+/// of the space's terms: what the press writes is what [`render_note`] would
+/// have seeded, so a space narrowed here and a space seeded fresh hold the same
+/// query byte for byte. Rebuilding it would also mean composing a query, which
+/// is the thing this function exists to stop the surface doing (AD-65).
+///
+/// **Editing [`DEFAULT_SESSION_SPACES`] is not this repair and never was.**
+/// [`read_one`] builds a space entirely from its own file and consults the
+/// defaults at exactly one point — validating the `default:` marker — and
+/// [`plan`] never re-seeds a zone that already has a `_spaces/` directory, while
+/// a `Restore` skips everything [`claimed`]. A default's query therefore reaches
+/// zones that have never been seeded and nothing else, which is AD-121 working
+/// as designed and the reason a press is the only thing that can fix a file that
+/// is already standing.
+///
+/// Four `None`s, each a place where keeper has no authority:
+/// - **no default claimed**: nothing in the file says what its single term ought
+///   to be, and guessing from the name is exactly the inference AD-120 refuses;
+/// - **a query keeper cannot parse, or one with structure** a term cannot be
+///   lifted out of ([`query::conjunction`]) — the gate [`read_create`] already
+///   applies, asked here again so the press is offered exactly where
+///   [`Refusal::ManyTerms`] is worded and nowhere else;
+/// - **a term that is not a positive `tag:`**: dropping a `date:today` or a
+///   `-tag:done` is not narrowing, it is discarding something the operator wrote
+///   on purpose;
+/// - **a query already asking for one thing**, which is not over-specified — and
+///   the same rule from the other side rules out the `Untagged` default as a
+///   target, since a default that asks for more than one thing is not something
+///   anything can be narrowed to.
+#[must_use]
+pub fn narrow_target(query: &str, default_key: Option<&str>) -> Option<&'static str> {
+    let default = by_key(default_key?)?;
+    if !asks_one_tag(default.query) || query::parse(query).is_err() {
+        return None;
+    }
+    let terms = query::conjunction(query)?;
+    (terms.len() > 1 && terms.iter().all(positive_tag)).then_some(default.query)
+}
+
+/// Whether one term is a plain, positive `tag:` term — the only shape a
+/// narrowing may drop, and the only one it may keep.
+fn positive_tag(term: &query::Term) -> bool {
+    !term.negated && term.key.as_deref() == Some("tag") && !term.value.trim().is_empty()
+}
+
+/// Whether a query asks for exactly one positive `tag:` term, and so is
+/// something a space can be narrowed TO.
+fn asks_one_tag(query: &str) -> bool {
+    matches!(query::conjunction(query).as_deref(), Some([term]) if positive_tag(term))
 }
 
 /// Why this space offers no create under this session's contract, and whether
@@ -863,8 +1100,15 @@ pub enum Refusal {
 /// and a contract is one session's: the caller has the session, and the
 /// alternative — projecting a sentence per shape onto the zone's definition —
 /// is a payload that is wrong for every session but one.
+///
+/// `default_key` is [`SessionSpace::default_key`], and it is taken for the
+/// opposite reason: it is the space's own, it decides nothing about the refusal,
+/// and it is only what [`narrow_target`] needs to word the repair the arity
+/// refusal now carries (Story 53.4). Taken beside the query rather than read out
+/// of a whole [`SessionSpace`] so a caller holding neither — the four `KINDS`
+/// tests, the create's own probe — asks the same function.
 #[must_use]
-pub fn create_refused(query: &str, shape: Shape) -> CreateRefused {
+pub fn create_refused(query: &str, default_key: Option<&str>, shape: Shape) -> CreateRefused {
     let verdict = read_create(query);
     let why = if let Some(kind) = verdict.kind {
         // The query offers a create, so the only thing left that can refuse it
@@ -876,7 +1120,12 @@ pub fn create_refused(query: &str, shape: Shape) -> CreateRefused {
     } else if verdict.negated {
         Some(Refusal::Negated)
     } else if verdict.many {
-        Some(Refusal::ManyTerms)
+        // The repair rides on the refusal, so it is decided here, in the arm
+        // that words the refusal, and cannot be offered on a space this function
+        // explained some other way.
+        Some(Refusal::ManyTerms {
+            narrow_to: narrow_target(query, default_key),
+        })
     } else if verdict.record {
         // Always `Err(OnlyOne)` today, and asked rather than asserted: a
         // contract that ever gave the record a home would make this space
@@ -918,14 +1167,23 @@ pub struct SpaceEdit {
     /// How many rows the section renders, or `None` to write no key — the
     /// editor's cap box, empty.
     pub rows: Option<u32>,
-    /// The directory this space's creates go into, or empty for none — the
-    /// editor's destination box, left blank (Story 52.5, FR-309).
+    /// The directory this space's creates go into; `Some("")` is the session
+    /// root, said out loud, and `None` writes no key at all (Story 52.5,
+    /// FR-309; Story 53.5, FR-320).
     ///
     /// Sent on every save for the reason [`SessionSpace::folded`] is: this
     /// function's map REPLACES the file's, so a form that omitted the field
     /// would delete the operator's destination the next time they renamed the
     /// space.
-    pub create_dir: String,
+    ///
+    /// **Three-valued since Story 53.5, and the third value is load-bearing on
+    /// the way OUT as well as in.** `None` writes no key, which is the state
+    /// that inherits ([`destination`]); `Some("")` writes `create_dir: ""`,
+    /// which is the state that does not. Collapsing the two here would make an
+    /// unrelated Save — a rename, a re-sort — silently turn a space that had
+    /// deliberately chosen the root into one that inherits `tasks/`, which is
+    /// the same class of quiet rewrite [`render_edit`] exists to avoid.
+    pub create_dir: Option<String>,
 }
 
 /// The `keeper:` map both renderers write, minus `default`.
@@ -973,14 +1231,15 @@ fn keeper_pairs(edit: &SpaceEdit) -> Vec<(String, FieldValue)> {
     // Last of the keys, after the presentation ones, because it is the only one
     // that is about WRITING rather than about what the space shows or how: an
     // operator diffing an old definition against a re-saved one sees one line
-    // added at the end and not a reshuffle. Empty writes no key at all —
-    // `icon`'s rule — so a space nobody gave a destination keeps the
-    // frontmatter it had.
-    if !edit.create_dir.is_empty() {
-        pairs.push((
-            "create_dir".to_owned(),
-            FieldValue::Str(edit.create_dir.clone()),
-        ));
+    // added at the end and not a reshuffle.
+    //
+    // **And it is the one key an empty value does not suppress.** `icon`'s rule
+    // is that an absent answer writes no key, and that is what `None` is here;
+    // but `Some("")` is an ANSWER — the session's own folder — and it is the only
+    // spelling of it, so writing the empty key is how an operator says "not the
+    // default" and keeps saying it across every later save.
+    if let Some(dir) = &edit.create_dir {
+        pairs.push(("create_dir".to_owned(), FieldValue::Str(dir.clone())));
     }
     pairs
 }
@@ -1517,6 +1776,7 @@ mod tests {
                 "  sort: order asc\n",
                 "  icon: list-todo\n",
                 "  order: 2\n",
+                "  create_dir: tasks\n",
                 "  default: tasks\n",
                 "---\n",
                 "\n",
@@ -1531,6 +1791,11 @@ mod tests {
         assert_eq!(read.icon.as_deref(), Some("list-todo"));
         assert_eq!(read.order, 2.0);
         assert_eq!(read.default_key.as_deref(), Some("tasks"));
+        assert_eq!(
+            read.create_dir.as_deref(),
+            Some("tasks"),
+            "a seeded default carries its own destination (Story 53.5)"
+        );
         assert!(read.warnings.is_empty(), "{:?}", read.warnings);
     }
 
@@ -1971,7 +2236,10 @@ mod tests {
     #[test]
     fn the_about_space_says_a_session_has_one_record_in_the_contracts_own_words() {
         for shape in [Shape::Flat, Shape::Folder] {
-            let refused = create_refused("tag:about", shape);
+            // Claiming the default it is, because that is the live file: a
+            // single-term space is not over-specified, so the claim buys it no
+            // repair (`the_repair_is_offered_only_where_a_claim_authorises_it`).
+            let refused = create_refused("tag:about", Some("about"), shape);
             assert_eq!(
                 refused.why,
                 Some(Refusal::NoHome(KindHasNoHome::OnlyOne {
@@ -1995,15 +2263,25 @@ mod tests {
         }
     }
 
-    /// Row 2. The live About space asks `tag:about tag:recordings`, and the
-    /// first refusal in the chain is the QUERY's: two terms, so there is no
-    /// single kind a create could write. Reported instead of the record's
-    /// refusal because it is the one that would survive the record becoming
-    /// creatable — and because it is the refusal the person actually met.
+    /// Row 2, and Story 53.4's row 1. The live About space asks
+    /// `tag:about tag:recordings`, and the first refusal in the chain is the
+    /// QUERY's: two terms, so there is no single kind a create could write.
+    /// Reported instead of the record's refusal because it is the one that would
+    /// survive the record becoming creatable — and because it is the refusal the
+    /// person actually met.
+    ///
+    /// It now carries the repair as well as the sentence, and the target is the
+    /// default's own query rather than anything read off `tag:recordings`.
     #[test]
     fn a_space_that_asks_for_more_than_one_thing_says_so() {
-        let refused = create_refused("tag:about tag:recordings", Shape::Folder);
-        assert_eq!(refused.why, Some(Refusal::ManyTerms));
+        let refused = create_refused("tag:about tag:recordings", Some("about"), Shape::Folder);
+        assert_eq!(
+            refused.why,
+            Some(Refusal::ManyTerms {
+                narrow_to: Some("tag:about")
+            })
+        );
+        assert_eq!(refused.narrow_to(), Some("tag:about"));
         assert!(
             refused.record,
             "and it is still the space this session's record is in"
@@ -2017,8 +2295,13 @@ mod tests {
         // `tag:log date:today` — the latter does not parse, and an unparseable
         // query is a space that already says why through its own `error`, which
         // is the case `a_space_that_already_says_why_is_left_to_say_it` owns.
-        let plain = create_refused("tag:log tag:task", Shape::Flat);
-        assert_eq!(plain.why, Some(Refusal::ManyTerms));
+        let plain = create_refused("tag:log tag:task", None, Shape::Flat);
+        assert_eq!(plain.why, Some(Refusal::ManyTerms { narrow_to: None }));
+        assert_eq!(
+            plain.narrow_to(),
+            None,
+            "a space claiming no default has no authority for a single term"
+        );
         assert!(!plain.record);
     }
 
@@ -2028,21 +2311,24 @@ mod tests {
     #[test]
     fn a_kind_this_contract_keeps_nowhere_is_still_the_refusal_it_was() {
         assert_eq!(
-            create_refused("tag:task", Shape::Folder).why,
+            create_refused("tag:task", Some("tasks"), Shape::Folder).why,
             Some(Refusal::NoHome(KindHasNoHome::NoDirectory {
                 shape: Shape::Folder,
                 kind: KindTag::Task,
             })),
         );
         assert_eq!(
-            create_refused("tag:log", Shape::Folder).why,
+            create_refused("tag:log", Some("log"), Shape::Folder).why,
             Some(Refusal::NoHome(KindHasNoHome::NotAFile {
                 shape: Shape::Folder,
                 kind: KindTag::Log,
             })),
         );
-        for (query, shape) in [("tag:ref", Shape::Folder), ("tag:task", Shape::Flat)] {
-            let refused = create_refused(query, shape);
+        for (query, key, shape) in [
+            ("tag:ref", Some("refs"), Shape::Folder),
+            ("tag:task", Some("tasks"), Shape::Flat),
+        ] {
+            let refused = create_refused(query, key, shape);
             assert_eq!(refused.why, None, "{query}");
             assert!(!refused.record, "{query}");
         }
@@ -2061,8 +2347,13 @@ mod tests {
     /// `a_query_of_negations_is_refused_for_naming_no_kind`.
     #[test]
     fn a_space_that_already_says_why_is_left_to_say_it() {
+        // Claiming About throughout, which is the load-bearing part: a claimed
+        // default is authority for a term and never authority for a REFUSAL, so
+        // a query keeper cannot read stays silent and offers no repair rather
+        // than being narrowed out from under the person who mistyped it.
         for query in ["", "   ", "(tag:log", "tag:log |", "tag:project/alpha"] {
-            let refused = create_refused(query, Shape::Flat);
+            let refused = create_refused(query, Some("about"), Shape::Flat);
+            assert_eq!(refused.narrow_to(), None, "{query:?}");
             assert_eq!(refused.why, None, "{query:?}");
             assert!(!refused.record, "{query:?}");
         }
@@ -2089,7 +2380,12 @@ mod tests {
                 .expect("the Untagged default exists")
                 .query,
         ] {
-            let refused = create_refused(query, Shape::Flat);
+            let refused = create_refused(query, Some("untagged"), Shape::Flat);
+            assert_eq!(
+                refused.narrow_to(),
+                None,
+                "and there is no repair on a refusal narrowing cannot fix: {query:?}"
+            );
             assert_eq!(refused.why, Some(Refusal::Negated), "{query:?}");
             assert!(
                 !refused.record,
@@ -2105,10 +2401,12 @@ mod tests {
         }
 
         // A surviving positive term is still the arity refusal, so the exception
-        // above is exactly as narrow as it says.
+        // above is exactly as narrow as it says — and it carries no repair even
+        // with a default claimed, because dropping `-tag:done` would discard
+        // something the operator wrote on purpose rather than narrow anything.
         assert_eq!(
-            create_refused("tag:task -tag:done", Shape::Flat).why,
-            Some(Refusal::ManyTerms)
+            create_refused("tag:task -tag:done", Some("tasks"), Shape::Flat).why,
+            Some(Refusal::ManyTerms { narrow_to: None })
         );
     }
 
@@ -2199,7 +2497,7 @@ mod tests {
     fn the_record_verb_and_a_create_are_never_offered_together() {
         for space in DEFAULT_SESSION_SPACES {
             for shape in [Shape::Flat, Shape::Folder] {
-                let refused = create_refused(space.query, shape);
+                let refused = create_refused(space.query, Some(space.key), shape);
                 assert!(
                     !(refused.record && creatable_kind(space.query).is_some()),
                     "{} under {}",
@@ -2210,7 +2508,7 @@ mod tests {
         }
         let carriers: Vec<&str> = DEFAULT_SESSION_SPACES
             .iter()
-            .filter(|space| create_refused(space.query, Shape::Folder).record)
+            .filter(|space| create_refused(space.query, Some(space.key), Shape::Folder).record)
             .map(|space| space.key)
             .collect();
         assert_eq!(carriers, ["about"]);
@@ -2225,40 +2523,55 @@ mod tests {
             order: 2.0,
             folded: None,
             rows: None,
-            create_dir: String::new(),
+            create_dir: None,
         }
     }
 
-    /// Story 52.5, acceptance 7: the destination survives a save and a read, and
-    /// clearing the box removes the key rather than writing an empty one — the
-    /// space is then back to today's behaviour with nothing left in the file to
-    /// explain.
+    /// Story 52.5, acceptance 7, as Story 53.5 narrows it: a typed destination
+    /// survives a save and a read, and CLEARING the box now writes the empty key
+    /// rather than deleting it. That is the change — an operator who clears the
+    /// field has said "the session root", and the only spelling of that answer is
+    /// `create_dir: ""`. Deleting the key would put the space back into the state
+    /// that INHERITS its default's directory, which is the opposite of what
+    /// clearing the box asks for.
     #[test]
-    fn a_destination_round_trips_and_clearing_it_writes_no_key() {
+    fn a_destination_round_trips_and_clearing_it_writes_the_empty_key() {
         let source = render_new(
             &SpaceEdit {
-                create_dir: "logs".to_owned(),
+                create_dir: Some("logs".to_owned()),
                 ..edit("Log", "tag:log")
             },
             "01ABC",
             "2026-08-17",
         );
         assert!(source.contains("create_dir: logs"), "{source}");
-        assert_eq!(read_one("_spaces/log.md", &source).create_dir, "logs");
+        assert_eq!(
+            read_one("_spaces/log.md", &source).create_dir.as_deref(),
+            Some("logs")
+        );
 
         let cleared = render_edit(
             "_spaces/log.md",
             &source,
             &SpaceEdit {
-                create_dir: String::new(),
+                create_dir: Some(String::new()),
                 ..edit("Log", "tag:log")
             },
         );
-        assert!(
-            !cleared.contains("create_dir"),
-            "an empty destination writes no key: {cleared}"
+        assert_eq!(
+            read_one("_spaces/log.md", &cleared).create_dir.as_deref(),
+            Some(""),
+            "a cleared box is an explicit root, not a deleted key: {cleared}"
         );
-        assert_eq!(read_one("_spaces/log.md", &cleared).create_dir, "");
+
+        // And a field the form never touched writes no key, which is the state
+        // that inherits.
+        let untouched = render_edit("_spaces/log.md", &source, &edit("Log", "tag:log"));
+        assert!(
+            !untouched.contains("create_dir"),
+            "an untouched destination writes no key: {untouched}"
+        );
+        assert_eq!(read_one("_spaces/log.md", &untouched).create_dir, None);
     }
 
     /// A destination is a path, so what is read is the path and not the
@@ -2276,21 +2589,296 @@ mod tests {
             let text =
                 format!("---\nkeeper:\n  space: tag:log\n  create_dir: {written}\n---\n# Log\n");
             assert_eq!(
-                read_one("_spaces/log.md", &text).create_dir,
-                expected,
+                read_one("_spaces/log.md", &text).create_dir.as_deref(),
+                Some(expected),
                 "{written:?}"
             );
         }
-        // A file that says nothing about a destination is every space until
-        // somebody types one, and it must read as empty rather than as absent-
-        // and-therefore-something.
+        // Story 53.5's crux, and the one row of this table that changed: a file
+        // that says nothing about a destination reads as ABSENT, not as empty.
+        // Those were one value until this story, which is exactly why the
+        // per-kind default 52.5 was missing could not have reached a zone whose
+        // `_spaces/` already existed.
         assert_eq!(
             read_one(
                 "_spaces/log.md",
                 "---\nkeeper:\n  space: tag:log\n---\n# Log\n"
             )
             .create_dir,
-            ""
+            None
+        );
+    }
+
+    /// Story 53.5, acceptance 3 and 4 — the distinction the whole story turns
+    /// on, read off the two files an operator can actually have.
+    ///
+    /// The absent case is the owner's: his `_spaces/tasks.md` was seeded before
+    /// any default named a directory, so it carries `keeper.default: tasks` and
+    /// no `keeper.create_dir` at all. Nothing rewrites it; reading it resolves
+    /// the inheritance, which is the only mechanism that can reach a zone that
+    /// already exists (AD-121).
+    #[test]
+    fn an_absent_destination_inherits_and_an_explicit_empty_one_is_the_root() {
+        let absent = read_one(
+            "_spaces/tasks.md",
+            "---\nkeeper:\n  space: tag:task\n  default: tasks\n---\n# Tasks\n",
+        );
+        assert_eq!(absent.create_dir, None, "the file names no destination");
+        assert_eq!(destination(&absent), "tasks");
+
+        let explicit = read_one(
+            "_spaces/tasks.md",
+            "---\nkeeper:\n  space: tag:task\n  create_dir: \"\"\n  default: tasks\n---\n# Tasks\n",
+        );
+        assert_eq!(explicit.create_dir.as_deref(), Some(""));
+        assert_eq!(
+            destination(&explicit),
+            "",
+            "an operator who said empty meant the session root"
+        );
+
+        let typed = read_one(
+            "_spaces/tasks.md",
+            "---\nkeeper:\n  space: tag:task\n  create_dir: notes/2026\n  default: tasks\n---\n# Tasks\n",
+        );
+        assert_eq!(
+            destination(&typed),
+            "notes/2026",
+            "the file wins over its default"
+        );
+
+        // A hand-written space claims no default, so there is nothing to inherit
+        // and the root is still the answer it always was.
+        let hand_made = read_one(
+            "_spaces/mine.md",
+            "---\nkeeper:\n  space: tag:task\n---\n# Mine\n",
+        );
+        assert_eq!(destination(&hand_made), "");
+    }
+
+    /// Story 53.5, acceptance 1 and 6 — the per-kind table, asserted against
+    /// `kind_dir` rather than against itself, so what is checked is where a
+    /// create actually lands.
+    ///
+    /// Under Flat the inherited directory is the answer. Under Folder the
+    /// contract's own directory wins for the two kinds it files and the other
+    /// three are refused outright — a destination cannot make a homeless kind
+    /// creatable, which is `kind_dir`'s rule and the reason About and the residue
+    /// name nothing.
+    #[test]
+    fn each_default_files_its_kind_where_the_shape_allows() {
+        for (key, kind, flat, folder) in [
+            ("tasks", KindTag::Task, Some(Some("tasks")), None),
+            ("log", KindTag::Log, Some(Some("logs")), None),
+            ("refs", KindTag::Ref, Some(Some("refs")), Some(Some("refs"))),
+            (
+                "prompts",
+                KindTag::Prompt,
+                Some(Some("prompts")),
+                Some(Some("prompts")),
+            ),
+            // The record is refused before a destination is looked at, under
+            // both contracts.
+            ("about", KindTag::About, None, None),
+        ] {
+            let space = seeded(key);
+            let dir = destination(&space);
+            assert_eq!(
+                kind_dir(Shape::Flat, kind, dir).ok(),
+                flat,
+                "{key} under Flat"
+            );
+            assert_eq!(
+                kind_dir(Shape::Folder, kind, dir).ok(),
+                folder,
+                "{key} under Folder"
+            );
+        }
+        // The residue is not a kind and offers no create at all, so it names
+        // nowhere for anything to land.
+        let untagged = seeded("untagged");
+        assert_eq!(destination(&untagged), "");
+        assert_eq!(creatable_kind(&untagged.query), None);
+    }
+
+    /// A seeded default carries its destination in its file, in the position a
+    /// re-save would write it — so the seeded bytes and the edited bytes are the
+    /// same bytes, and an operator diffing the two sees nothing move.
+    ///
+    /// About and Untagged write no key: an empty value there would be an explicit
+    /// "the session root", and neither space has a create to file.
+    #[test]
+    fn a_seeded_default_carries_the_destination_it_names() {
+        for default in &DEFAULT_SESSION_SPACES {
+            let text = render_note(default, "01ABC", "2026-08-17");
+            let reread = read_one(&rel_of(default), &text);
+            if default.create_dir.is_empty() {
+                assert!(
+                    !text.contains("create_dir"),
+                    "{}: names nowhere, so writes no key: {text}",
+                    default.key
+                );
+                assert_eq!(reread.create_dir, None, "{}", default.key);
+            } else {
+                assert_eq!(
+                    reread.create_dir.as_deref(),
+                    Some(default.create_dir),
+                    "{}: {text}",
+                    default.key
+                );
+            }
+            // Either way the resolved answer is the default's, because a seeded
+            // file and an inheriting one must not disagree about where a create
+            // goes.
+            assert_eq!(destination(&reread), default.create_dir, "{}", default.key);
+            // `create_dir` last of the keys, `default` after it.
+            if !default.create_dir.is_empty() {
+                let at_dir = text.find("create_dir").expect("the key");
+                let at_default = text.find("default:").expect("the marker");
+                assert!(at_dir < at_default, "{}: {text}", default.key);
+            }
+        }
+    }
+
+    /// Story 53.5, acceptance 9 — with a destination in play, an unrelated save
+    /// still rewrites nothing it was not given, in either direction.
+    ///
+    /// The `folded`/`rows` round trip already guards the presentation keys; this
+    /// guards the one key whose two empties mean different things. A rename that
+    /// dropped `create_dir: ""` would silently hand the space back to its
+    /// default's directory, and a rename that INVENTED the key would install a
+    /// default into a file nobody pressed anything on.
+    #[test]
+    fn a_rename_keeps_both_kinds_of_empty_exactly_as_they_were() {
+        for (source, expected) in [
+            (
+                "---\nkeeper:\n  space: tag:task\n  create_dir: \"\"\n  default: tasks\n---\n# Tasks\n",
+                Some(""),
+            ),
+            (
+                "---\nkeeper:\n  space: tag:task\n  default: tasks\n---\n# Tasks\n",
+                None,
+            ),
+        ] {
+            let read = read_one("_spaces/tasks.md", source);
+            let renamed = render_edit(
+                "_spaces/tasks.md",
+                source,
+                &SpaceEdit {
+                    // Straight through from what was read, which is what the
+                    // form sends.
+                    create_dir: read.create_dir.clone(),
+                    ..edit("Backlog", "tag:task")
+                },
+            );
+            let reread = read_one("_spaces/tasks.md", &renamed);
+            assert_eq!(reread.create_dir.as_deref(), expected, "{renamed}");
+            assert_eq!(
+                reread.default_key.as_deref(),
+                Some("tasks"),
+                "the marker survives: {renamed}"
+            );
+        }
+    }
+
+    /// Story 53.5, acceptance 1 and 2 — the load-bearing row, end to end at the
+    /// level this crate can reach.
+    ///
+    /// The owner's Task space is the ABSENT-key case, so nothing about this file
+    /// changed: it carries `keeper.default: tasks` and no destination, and the
+    /// inheritance is resolved on read. From there the chain is
+    /// `destination` → `kind_dir` → `new_stamped` → `compile_new`, which is
+    /// exactly what `sessions_file_new_kind` composes — asserted here because the
+    /// shell crate does not build on every machine this repo is worked in
+    /// (`files.rs`'s own argument for its twin of this test).
+    ///
+    /// **The second half is what makes a default safe.** The created file is put
+    /// back through the pool reader at `tasks/…` and the Task space still lists
+    /// it, because a flat session's scan descends subdirectories
+    /// (`sessions_root::read_ref_sources` → `markdown_rels(dir, true)`) and the
+    /// query matches the TAG. A destination that hid his files would be worse
+    /// than no destination at all.
+    #[test]
+    fn a_task_create_lands_in_the_inherited_directory_and_the_space_still_lists_it() {
+        use crate::sessions::files::{compile_new, new_stamped, render_new, NewFileKind};
+
+        // His file, byte for byte: seeded before any default named a directory.
+        let space = read_one(
+            "_spaces/tasks.md",
+            "---\nkeeper:\n  space: tag:task\n  default: tasks\n---\n# Tasks\n",
+        );
+        assert_eq!(space.create_dir, None);
+        let subdir = kind_dir(Shape::Flat, KindTag::Task, destination(&space))
+            .expect("a flat session has a home for a task")
+            .expect("and the claimed default names it");
+        assert_eq!(subdir, "tasks");
+
+        let name = new_stamped("Ship it", "2026-08-17", "0900", &BTreeSet::new());
+        let rel = format!("{subdir}/{name}");
+        assert_eq!(rel, "tasks/2026-08-17-0900-ship-it.md");
+
+        // The directory is made if absent, in the create's own journaled plan —
+        // one plan, one journal row, never a bare `create_dir_all`.
+        let text = render_new(
+            NewFileKind::Markdown,
+            Some(KindTag::Task),
+            "Ship it",
+            "01J5AAAAAAAAAAAAAAAAAAAAAA",
+            "2026-08-17",
+        );
+        let plan = compile_new("active/s", &rel, &text).expect("tasks/ is writable");
+        assert_eq!(
+            plan.steps,
+            vec![
+                PlanStep::MkDir {
+                    path: "active/s/tasks".to_owned()
+                },
+                PlanStep::WriteFile {
+                    path: "active/s/tasks/2026-08-17-0900-ship-it.md".to_owned(),
+                    content: text.clone(),
+                },
+            ]
+        );
+
+        // Read back where it landed: the kind is the tag's (AD-120), and the
+        // space that asked for the tag lists it.
+        let written = read_pool_one(pool_file(&rel, &text));
+        assert_eq!(written.kind, Some(KindTag::Task));
+        assert_eq!(
+            run(&space, &[(rel.as_str(), text.as_str())]).expect("the Task space"),
+            [rel.as_str()],
+            "a file in tasks/ is still what tag:task selects"
+        );
+
+        // And the explicit-empty file writes to the root instead, from the same
+        // chain — the distinction is doing real work, not just reading back.
+        let at_root = read_one(
+            "_spaces/tasks.md",
+            "---\nkeeper:\n  space: tag:task\n  create_dir: \"\"\n  default: tasks\n---\n# Tasks\n",
+        );
+        assert_eq!(
+            kind_dir(Shape::Flat, KindTag::Task, destination(&at_root)),
+            Ok(None)
+        );
+
+        // Acceptance 7, for the directory this story introduces: `tasks/` is a
+        // destination and never a kind. A file sitting in it tagged `ref` is a
+        // REFERENCE, listed by References and not by Tasks, because the pool
+        // reader derives the kind from tags alone (AD-120).
+        let ref_in_tasks = "tasks/2026-08-17-0900-the-spec.md";
+        assert_eq!(
+            read_pool_one(pool_file(ref_in_tasks, REF)).kind,
+            Some(KindTag::Ref)
+        );
+        assert!(
+            run(&space, &[(ref_in_tasks, REF)])
+                .expect("the Task space")
+                .is_empty(),
+            "a ref in tasks/ is not a task"
+        );
+        assert_eq!(
+            run(&seeded("refs"), &[(ref_in_tasks, REF)]).expect("the References space"),
+            [ref_in_tasks]
         );
     }
 
@@ -2702,6 +3290,45 @@ mod tests {
         );
     }
 
+    /// Story 53.5, acceptance 8. A template's space definition reaches the zone
+    /// as BYTES — [`template_seed_steps`] compiles a `CopyFile` and nothing
+    /// re-renders it — so whatever `keeper.create_dir` the template author wrote
+    /// is what the zone reads back, and it is what a create in that zone then
+    /// files by.
+    ///
+    /// Worth its own test rather than folded into the row above, because the
+    /// alternative implementation is the tempting one: read the candidate,
+    /// re-render it through [`render_new`] to "normalise" it. That would compose
+    /// the destination out of a [`SpaceEdit`], and the explicit-empty case — the
+    /// one distinction this story exists for — is the first thing it would lose.
+    #[test]
+    fn a_templates_destination_survives_the_copy_and_reaches_a_create() {
+        let source =
+            "---\ntitle: Tasks\nkeeper:\n  space: tag:task\n  create_dir: notes/2026\n---\n# Tasks\n";
+        let planned = plan_template_spaces("_template/house", &[("_spaces/tasks.md", source)], &[]);
+        assert_eq!(
+            template_seed_steps(&planned.seeds),
+            vec![
+                PlanStep::MkDir {
+                    path: "_spaces".to_owned()
+                },
+                PlanStep::CopyFile {
+                    from: "_template/house/_spaces/tasks.md".to_owned(),
+                    to: "_spaces/tasks.md".to_owned(),
+                },
+            ],
+            "a copy, so the destination travels verbatim"
+        );
+        // What the zone reads out of those exact bytes, and where a task create
+        // from it lands.
+        let landed = read_one("_spaces/tasks.md", source);
+        assert_eq!(landed.create_dir.as_deref(), Some("notes/2026"));
+        assert_eq!(
+            kind_dir(Shape::Flat, KindTag::Task, destination(&landed)),
+            Ok(Some("notes/2026"))
+        );
+    }
+
     /// Row 2, three ways. The zone's own edited space always wins — whether the
     /// two agree about the path, about the folded name, or about the default
     /// key. A create is pressed many times a week, and one that could rewrite a
@@ -2812,5 +3439,198 @@ mod tests {
     #[test]
     fn offering_nothing_appends_nothing() {
         assert!(template_seed_steps(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The repair an over-specified space carries (Story 53.4, FR-319)
+    // -----------------------------------------------------------------------
+
+    /// The live `_spaces/about.md` as the reporter's zone actually holds it:
+    /// keeper's own seeded file with a second term typed into its query by hand.
+    /// Written out in full rather than assembled, because what this story is
+    /// about is a file that already exists and cannot be reached by editing a
+    /// `const`.
+    const OVER_SPECIFIED_ABOUT: &str = "---\ntitle: About\nkeeper:\n  space: tag:about \
+                                        tag:recordings\n  sort: name asc\n  icon: info\n  \
+                                        order: 1\n  default: about\n---\n\n# About\n\nWhat this \
+                                        session is.\n";
+
+    /// The edit the repair verb sends: the narrowed query, and every other field
+    /// exactly as the file spells it.
+    ///
+    /// Mirrors `sessions_ipc::sessions_space_narrow` field for field, which is
+    /// the point — a repair that changed a second key would not be the one press
+    /// the surface promised, and this is where that claim is testable.
+    fn narrowing(stored: &SessionSpace, query: &str) -> SpaceEdit {
+        SpaceEdit {
+            name: stored.name.clone(),
+            query: query.to_owned(),
+            sort: stored.sort.clone(),
+            icon: stored.icon.clone(),
+            order: stored.order,
+            folded: stored.folded,
+            rows: stored.rows,
+            create_dir: stored.create_dir.clone(),
+        }
+    }
+
+    /// Rows 1 and 2. Pressing the repair on a `default: about` space asking
+    /// `tag:about tag:recordings` writes `tag:about`, and the refusal afterwards
+    /// is the one-record sentence rather than the arity one.
+    ///
+    /// The whole round trip, through the same [`render_edit`] the editor's Save
+    /// goes through, because the claim is not only that the query changes: the
+    /// `default:` marker has to survive (or Restore would start offering a second
+    /// About), and so does every other key and the prose under it.
+    #[test]
+    fn repair_narrows_the_live_about_space_and_touches_nothing_else() {
+        let rel = "_spaces/about.md";
+        let stored = read_one(rel, OVER_SPECIFIED_ABOUT);
+        assert_eq!(
+            stored.query, "tag:about tag:recordings",
+            "the file as it is"
+        );
+
+        let refused = create_refused(&stored.query, stored.default_key.as_deref(), Shape::Folder);
+        let narrowed = refused.narrow_to().expect("the refusal carries its repair");
+        assert_eq!(narrowed, "tag:about");
+
+        let saved = render_edit(rel, OVER_SPECIFIED_ABOUT, &narrowing(&stored, narrowed));
+        let after = read_one(rel, &saved);
+        assert_eq!(after.query, "tag:about", "the one key the press changed");
+        assert_eq!(
+            after.default_key,
+            Some("about".to_owned()),
+            "still keeper's About, or Restore would offer a second one"
+        );
+        assert_eq!(
+            (after.name.as_str(), after.sort.as_str(), after.order),
+            ("About", "name asc", 1.0),
+        );
+        assert_eq!(after.icon.as_deref(), Some("info"));
+        assert!(
+            saved.contains("What this session is."),
+            "the operator's prose is not a casualty of a repair: {saved}"
+        );
+
+        // Row 2: the refusal a person now meets is the record's, in the
+        // contract's own words — and it no longer carries a repair, because there
+        // is nothing left to narrow.
+        for shape in [Shape::Flat, Shape::Folder] {
+            let refused = create_refused(&after.query, after.default_key.as_deref(), shape);
+            assert_eq!(
+                refused.why,
+                Some(Refusal::NoHome(KindHasNoHome::OnlyOne {
+                    shape,
+                    kind: KindTag::About,
+                })),
+                "{}",
+                shape.as_str()
+            );
+            assert_eq!(refused.narrow_to(), None);
+            assert!(
+                refused.record,
+                "and opening the record is the verb that fits"
+            );
+        }
+    }
+
+    /// Row 6. The term is read off the default the space CLAIMS, so a two-term
+    /// `log` space narrows to `tag:log` — asked of every default that asks for a
+    /// single tag, which is the assertion that no `"about"` is hard-coded
+    /// anywhere on this path.
+    #[test]
+    fn repair_reads_its_term_from_the_claimed_default() {
+        for default in DEFAULT_SESSION_SPACES {
+            let over_specified = format!("{} tag:recordings", default.query);
+            let target = narrow_target(&over_specified, Some(default.key));
+            if default.key == "untagged" {
+                // The residue's own query asks for five things, so it is not
+                // something anything can be narrowed TO — the same rule from the
+                // other side.
+                assert_eq!(target, None, "{}", default.key);
+                continue;
+            }
+            assert_eq!(target, Some(default.query), "{}", default.key);
+        }
+        // Named once without the loop, because it is the sentence the story is
+        // about: a `log` space over-specified by hand narrows to `tag:log`, not
+        // to the tag of the space that was reported.
+        assert_eq!(
+            narrow_target("tag:log tag:recordings", Some("log")),
+            Some("tag:log")
+        );
+    }
+
+    /// Rows 3 and 4. No repair where keeper has no authority for one: a space
+    /// claiming no default (or one this build does not know), a query that is
+    /// already asking for one thing, and a query that is not a plain conjunction
+    /// of positive `tag:` terms.
+    ///
+    /// The last group is the one worth stating: dropping `-tag:done` or a
+    /// bareword `text:` term is not narrowing, it is discarding something the
+    /// operator wrote on purpose, and the editor is the answer there.
+    #[test]
+    fn repair_is_offered_only_where_a_claim_authorises_it() {
+        assert_eq!(
+            narrow_target("tag:about tag:recordings", None),
+            None,
+            "no claim, no authority"
+        );
+        assert_eq!(
+            narrow_target("tag:about tag:recordings", Some("recordings")),
+            None,
+            "a marker this build does not know claims nothing"
+        );
+        assert_eq!(
+            narrow_target("tag:about", Some("about")),
+            None,
+            "a space asking for one thing is not over-specified"
+        );
+        for query in [
+            "tag:about -tag:draft",
+            "tag:about recordings",
+            "tag:about tag:",
+            "tag:about | tag:log",
+            "(tag:about tag:log",
+            "",
+        ] {
+            assert_eq!(narrow_target(query, Some("about")), None, "{query:?}");
+        }
+    }
+
+    /// Row 5, at the level the writes are decided. Nothing narrows a space
+    /// without a press: a scan reads the file and returns what it says, a first
+    /// run into a zone that HAS a `_spaces/` directory plans no writes at all,
+    /// and a Restore skips the About default because the over-specified file
+    /// claims it.
+    ///
+    /// This is why editing [`DEFAULT_SESSION_SPACES`] would have reached nobody,
+    /// and it is the guarantee AD-121 is: the directory is the ledger.
+    #[test]
+    fn repair_writes_only_on_a_press_and_never_on_a_scan_or_a_restore() {
+        let existing = read_all(&[("_spaces/about.md", OVER_SPECIFIED_ABOUT)]);
+        assert_eq!(
+            existing
+                .iter()
+                .map(|space| space.query.as_str())
+                .collect::<Vec<_>>(),
+            ["tag:about tag:recordings"],
+            "a scan reports the query the file holds and rewrites nothing"
+        );
+        assert!(
+            plan(SeedMode::FirstRun, Some(&existing)).is_empty(),
+            "an app start never re-seeds a zone that has a _spaces/ directory"
+        );
+        assert!(
+            claimed(&existing).contains("about"),
+            "the file carries the marker, so the default is claimed"
+        );
+        assert!(
+            !plan(SeedMode::Restore, Some(&existing))
+                .iter()
+                .any(|default| default.key == "about"),
+            "and Restore fills holes rather than replacing what is standing"
+        );
     }
 }

@@ -265,9 +265,12 @@ function space(over: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // as "follow the setting" by accident rather than by decision.
     folded: null,
     rows: null,
-    // Story 52.5's key: this space names no destination, which is byte-for-byte
-    // today's behaviour.
-    createDir: "",
+    // Story 52.5's key, three-valued since Story 53.5: `null` is a file that
+    // names no destination and therefore inherits whatever its claimed default
+    // says. Nothing in this file is about where a create lands, so the inherited
+    // answer is empty and the pair is byte-for-byte today's behaviour.
+    createDir: null,
+    createDirDefault: "",
     ...over,
   };
 }

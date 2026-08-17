@@ -189,10 +189,55 @@ export const SESSION_SPACE_ROWS_NOTE =
  * The note says *new files* and never *files*: the key governs writes only, and
  * nothing moves when it is set. It also has to say the three places keeper will
  * not write, because the alternative is finding out at Save.
+ *
+ * **The "leave it empty" sentence moved out of here** (Story 53.5, FR-320),
+ * because an empty box no longer has one meaning. A space whose file names no
+ * folder inherits keeper's own answer for it, and a space whose file names the
+ * empty string has chosen the session's root — so what an empty box means is a
+ * fact about the space in front of the operator, and
+ * {@link sessionSpaceCreateDirEmptyNote} composes it. This half is the part that
+ * is true of every space.
  */
 export const SESSION_SPACE_CREATE_DIR_LABEL = "New files go in";
 export const SESSION_SPACE_CREATE_DIR_NOTE =
-  "A folder inside the session for files this space creates — “logs”, or “notes/2026”. keeper makes it if it is not there, and the new file still carries this space's tag, which is what makes it appear here. Nothing already in the session moves. Leave it empty to keep putting new files at the session's root. Not workspace/, which is scratch that dies with the session; not a folder starting with a dot, which keeper never reads back; and nothing outside the session.";
+  "A folder inside the session for files this space creates — “logs”, or “notes/2026”. keeper makes it if it is not there, and the new file still carries this space's tag, which is what makes it appear here. Nothing already in the session moves. Not workspace/, which is scratch that dies with the session; not a folder starting with a dot, which keeper never reads back; and nothing outside the session.";
+
+/**
+ * What an EMPTY destination box means for this particular space (Story 53.5,
+ * FR-320), or `null` when the box is not empty and says so itself.
+ *
+ * Three answers, because the field is three-valued and the operator cannot see
+ * which of the three they are looking at otherwise:
+ *
+ * - `typed === null` with a default to inherit — the file names no folder, so
+ *   keeper's own answer for this space applies. This is the state EVERY zone
+ *   seeded before Story 53.5 is in, and the sentence is what stops an empty box
+ *   from reading as "the session's root" when it no longer is.
+ * - `typed === ""` — the box was cleared, which is a deliberate *the session's
+ *   root* and is written into the file as an empty key so it keeps meaning that.
+ *   When there is a default it would otherwise have inherited, the sentence
+ *   names it, so the operator can see what they are choosing against.
+ * - no default either way — the root, which is where every create went before
+ *   any of this existed.
+ *
+ * `inherited` is Rust's answer (`SessionSpaceVm.createDirDefault`), never a
+ * table read here: the surface does not know the defaults and must not learn
+ * them (AD-65).
+ */
+export function sessionSpaceCreateDirEmptyNote(
+  typed: string | null,
+  inherited: string,
+): string | null {
+  if (typed !== null && typed.trim() !== "") {
+    return null;
+  }
+  if (inherited === "") {
+    return "New files go at the session's root, which is where they go when nothing names a folder.";
+  }
+  return typed === null
+    ? `This space's file names no folder, so keeper's own answer for it applies: new files go in “${inherited}”.`
+    : `This space's file names the session's own folder, so new files go there rather than in keeper's “${inherited}”.`;
+}
 
 /** The editable half of a space's query, once the chips can hold all of it. */
 interface Draft {
@@ -295,9 +340,24 @@ export function SessionSpaceEditor({
   // Text for `order`'s reason, one comment up. An empty box is "no cap", which
   // is what a missing key already means.
   const [rows, setRows] = useState(() => (space?.rows == null ? "" : String(space.rows)));
-  // Text, and empty is "the session's root" — which is what an absent key
-  // already means, so there is nothing to resolve here.
-  const [createDir, setCreateDir] = useState(space?.createDir ?? "");
+  // Text OR `null`, and the `null` is load-bearing (Story 53.5, FR-320):
+  // untouched means the file's own state — which for every space seeded before
+  // this story is "no key at all", the state that inherits keeper's own folder
+  // for it. Any keystroke, including the one that empties the box, makes this a
+  // string and therefore an ANSWER; clearing a folder is a deliberate "the
+  // session's own root" and is saved as the empty key that keeps saying so.
+  // Collapsing the two into `""` is what would let a rename silently hand a
+  // space back to a default it had chosen against.
+  const [createDir, setCreateDir] = useState<string | null>(space?.createDir ?? null);
+  // Rust's answer for what an absent key inherits, never a table read here
+  // (AD-65). `""` for a space that claims no default, or claims one that names
+  // nowhere — About and the residue.
+  const inheritedDir = space?.createDirDefault ?? "";
+  // Recomputed on every render rather than memoised: it is one comparison and a
+  // template string, and the value has to track the box the operator is typing
+  // in — clearing a folder changes what an empty box means, and the sentence
+  // saying so is the only place that change is visible.
+  const emptyDirNote = sessionSpaceCreateDirEmptyNote(createDir, inheritedDir);
   // A create starts with chips and an empty draft; only a stored query has to be
   // decomposed, and only a stored query can turn out to be unrepresentable.
   const [terms, setTerms] = useState<Terms>(
@@ -431,7 +491,12 @@ export function SessionSpaceEditor({
         // path, and Rust owns what a path may be — an escaping, scratch or
         // dotted directory comes back as a rejection with its own sentence,
         // which is what the catch below now shows.
-        createDir: createDir.trim(),
+        //
+        // `null` straight through, so a field nobody touched writes no key and
+        // the space keeps inheriting (Story 53.5). A touched-and-empty box is
+        // `""`, which is the answer "the session's own root" and is written as
+        // the empty key that keeps saying it.
+        createDir: createDir === null ? null : createDir.trim(),
       });
       onSaved();
     } catch (raw: unknown) {
@@ -693,16 +758,32 @@ export function SessionSpaceEditor({
             <Label htmlFor={createDirId}>{SESSION_SPACE_CREATE_DIR_LABEL}</Label>
             <Input
               id={createDirId}
-              // The placeholder is the default, spelled: an empty box is the
-              // session's own folder, which is where every create has always
-              // gone.
-              placeholder="The session's own folder"
-              value={createDir}
+              // The placeholder is what an empty box MEANS for this space, and
+              // since Story 53.5 that is not one sentence: a space whose file
+              // names no folder inherits keeper's own answer for it, so the
+              // inherited folder is what the empty box is doing. Drawn as the
+              // placeholder and never as the value, because a value would be
+              // persisted by the next Save — keeper installing a default into the
+              // operator's file, which is the write AD-121 forbids.
+              placeholder={
+                createDir === null && inheritedDir !== ""
+                  ? inheritedDir
+                  : "The session's own folder"
+              }
+              // `?? ""` only because a DOM input's value must be a string. The
+              // three-valued answer lives in the state, and any keystroke —
+              // including the one that empties the box — moves it out of `null`.
+              value={createDir ?? ""}
               onChange={(event) => setCreateDir(event.target.value)}
             />
             <p data-slot="create-dir-note" className="text-muted-foreground text-sm">
               {SESSION_SPACE_CREATE_DIR_NOTE}
             </p>
+            {emptyDirNote !== null && (
+              <p data-slot="create-dir-empty-note" className="text-muted-foreground text-sm">
+                {emptyDirNote}
+              </p>
+            )}
           </div>
 
           {/* `shrink-0` for the same reason as the icon fieldset: the tag
@@ -791,6 +872,15 @@ export function SessionSpaceEditor({
                     />
                   )}
                 </div>
+                {/* Story 53.2 gave this mount the close it never had, and it is
+                    not a prop: the chooser owns whether its list is unfolded, so
+                    it opens folded and the caret leaving it — or a press anywhere
+                    else on this form — folds it again, with no toggle of this
+                    dialog's own. No `onDismiss`, because there is nothing of this
+                    form's to unmount. Escape is not that path here and cannot be:
+                    Radix's dismissable layer claims it at the document in the
+                    capture phase and closes the whole editor first, which is this
+                    dialog's own older decision. */}
                 <TagCombobox
                   label="Add a tag"
                   placeholder="Type or browse"

@@ -49,6 +49,28 @@ error: string | null,
  */
 noHome: string | null, 
 /**
+ * The query a one-press repair would write into this space's definition, or
+ * `None` when there is no repair to offer (Story 53.4, FR-319).
+ *
+ * Set exactly where `no_home` above is
+ * [`crate::sessions::spaces::Refusal::ManyTerms`]' sentence AND the space
+ * claims a default that asks for a single `tag:` term —
+ * [`crate::sessions::spaces::CreateRefused::narrow_to`] is the one reader of
+ * that pairing, so the control and the sentence cannot come apart.
+ *
+ * **A whole query, composed in Rust.** The surface presses a verb with an id
+ * and never composes a query (AD-65), and it prints this string so the person
+ * can read what the press will write BEFORE pressing it. A flag here would
+ * mean TypeScript deciding that narrowing `tag:about tag:recordings` leaves
+ * `tag:about`, which is a second reading of `keeper.space`.
+ *
+ * `None` on every other refusal: a contract with nowhere to put the kind and
+ * a query made of negations are not things a narrowing fixes, and a space
+ * claiming no default has nothing that could say what its one term is. The
+ * editor is the answer in all three.
+ */
+narrowTo: string | null, 
+/**
  * Whether the verb that applies here instead of a create is opening the
  * session's record (FR-299).
  *

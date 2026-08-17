@@ -1843,7 +1843,17 @@ fn space_vm(
         // lands is `shape::kind_dir`'s answer, which needs a session's shape
         // and this payload is the ZONE's. The editor shows the field, the
         // create verb sends the space's id, and Rust composes the path (AD-65).
+        //
+        // Both halves cross, because they answer different questions and the
+        // editor asks both (Story 53.5). `create_dir` is what THIS FILE says,
+        // `None` included, which is what the form sends back so a save cannot
+        // convert an absent key into an empty one or the other way round.
+        // `create_dir_default` is what an absent key inherits, and it is the
+        // field's PLACEHOLDER — never its value, because a value would be
+        // persisted by the next Save and installing a default into the
+        // operator's file is the write AD-121 forbids.
         create_dir: space.create_dir.clone(),
+        create_dir_default: spaces::inherited(space.default_key.as_deref()).to_owned(),
         warnings: space.warnings.clone(),
         error: query::parse(&space.query).err().map(|error| error.message),
         new_file_kind: spaces::creatable_kind(&space.query).map(|kind| kind.as_str().to_owned()),
@@ -1920,7 +1930,12 @@ pub fn sessions_space_files(
             // button nor a reason, which is the defect the owner reported. One
             // call now, so the shell composes no refusal of its own and the
             // order the refusals are reported in is the domain's.
-            let refused = spaces::create_refused(&space.query, session_shape);
+            // `default_key` since Story 53.4: which default this space claims is
+            // what decides the term a narrow would write, so the payload and the
+            // repair verb ask one function and the control cannot appear where
+            // the write would fail.
+            let refused =
+                spaces::create_refused(&space.query, space.default_key.as_deref(), session_shape);
             SessionSpaceFilesVm {
                 space_id: space.rel.clone(),
                 files: selection
@@ -1943,6 +1958,7 @@ pub fn sessions_space_files(
                     .collect(),
                 error: selection.error,
                 no_home: refused.why.map(|why| why.to_string()),
+                narrow_to: refused.narrow_to().map(str::to_owned),
                 open_record: refused.record,
             }
         })
@@ -1993,9 +2009,19 @@ pub async fn sessions_space_save(
     // Folded exactly as the reader folds it, so what is validated is what a
     // create will compose: `logs/` and `logs` are one request, and blanks name
     // no directory at all.
-    let create_dir = space.create_dir.trim().trim_end_matches('/').to_owned();
-    if !create_dir.is_empty() {
-        files::check_dir(&create_dir).map_err(file_verb_error)?;
+    //
+    // **Only an EXPLICIT destination is validated here** (Story 53.5). `None` is
+    // a field the form never touched, which writes no key and leaves the space
+    // inheriting its default's directory — a value this process composed, not one
+    // the operator typed, and one the create verb still puts through the same
+    // `check_dir` before it writes. `Some("")` is a cleared box: an answer, the
+    // session root, and nothing to check because there is no path in it.
+    let create_dir = space
+        .create_dir
+        .as_deref()
+        .map(|dir| dir.trim().trim_end_matches('/').to_owned());
+    if let Some(named) = create_dir.as_deref().filter(|dir| !dir.is_empty()) {
+        files::check_dir(named).map_err(file_verb_error)?;
     }
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
@@ -2069,6 +2095,84 @@ pub async fn sessions_space_save(
 #[tauri::command]
 pub fn sessions_space_save(root_id: String, space: ()) -> Result<String, IpcError> {
     let _ = (root_id, space);
+    Err(unsupported())
+}
+
+/// Narrow one over-specified space to the single term its default asks for
+/// (Story 53.4, FR-319).
+///
+/// **The one press that can reach a `_spaces/*.md` that is already standing.** A
+/// default's query is written when a zone is seeded and never again:
+/// [`keeper_core::sessions::spaces::plan`] returns nothing for a zone that
+/// already has a `_spaces/` directory, and a Restore skips every default it
+/// already `claimed` — AD-121, the directory is the ledger. So editing
+/// `DEFAULT_SESSION_SPACES` cannot touch a space an operator has, and a space
+/// over-specified by hand is fixable only by a write they ask for, which is this.
+///
+/// **Through `sessions_space_save`, literally.** Not a second writer of
+/// `_spaces/`: the narrowed query goes through the same request the chip editor
+/// sends, so it is validated by the same `query::parse`, journaled by the same
+/// executor, rendered by the same `render_edit` — which preserves every other
+/// byte of the file, including `keeper.default` — and undone the way any edit is,
+/// by editing the space again. A bespoke plan here would be a second writer, and
+/// the first thing it would stop agreeing with is what a save does to the marker.
+///
+/// **The term is the domain's, not the caller's.**
+/// [`keeper_core::sessions::spaces::narrow_target`] reads it off the default this
+/// space CLAIMS, so a two-term `log` space narrows to `tag:log`; the frontend
+/// sends an id and no query (AD-65). A space claiming no default, or one whose
+/// query is not a plain conjunction of `tag:` terms, is refused here as well as
+/// offered no control there — the payload and this verb ask one function, so the
+/// button cannot appear where the write would fail.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_space_narrow(root_id: String, space_id: String) -> Result<String, IpcError> {
+    use keeper_core::sessions::spaces;
+
+    let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+    // The definition as it stands on disk, never a query off the wire: what is
+    // narrowed is what keeper can currently read.
+    let space = read
+        .spaces
+        .iter()
+        .find(|space| space.rel == space_id)
+        .ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: "that space is no longer there; nothing was written".to_owned(),
+            account_id: None,
+            retriable: false,
+        })?;
+    let Some(query) = spaces::narrow_target(&space.query, space.default_key.as_deref()) else {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: "this space claims no default to narrow to, or asks for something other \
+                      than tags: edit its query instead. Nothing was written."
+                .to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    };
+    // Every other field as the file spells it, including a `sort` keeper could
+    // not read: a repair that changed a second key would not be the one press
+    // the surface promised.
+    let req = keeper_core::sessions::vm::SessionSpaceReq {
+        id: Some(space.rel.clone()),
+        name: space.name.clone(),
+        query: query.to_owned(),
+        sort: space.sort.clone(),
+        icon: space.icon.clone(),
+        order: space.order,
+        folded: space.folded,
+        rows: space.rows,
+        create_dir: space.create_dir.clone(),
+    };
+    sessions_space_save(root_id, req).await
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_space_narrow(root_id: String, space_id: String) -> Result<String, IpcError> {
+    let _ = (root_id, space_id);
     Err(unsupported())
 }
 
@@ -3529,6 +3633,14 @@ pub async fn sessions_file_new_kind(
     // A definition that is gone is refused rather than treated as "no
     // destination": the operator asked for a file in a place, and writing it
     // somewhere else silently is the failure this story was reported as.
+    //
+    // **`spaces::destination` and not the field** (Story 53.5). A space file
+    // carrying no `keeper.create_dir` inherits the destination of the default it
+    // claims, and that is the state every zone seeded before Story 53.5 is in —
+    // which is why reading the field directly here is what made 52.5's whole
+    // mechanism invisible to the operator who reported it. The resolution is the
+    // domain's, asked once, so the create verb and the editor's placeholder
+    // cannot disagree about where the next file goes.
     let asked = space_id.trim();
     let create_dir = if asked.is_empty() {
         String::new()
@@ -3545,7 +3657,7 @@ pub async fn sessions_file_new_kind(
                 retriable: false,
             });
         };
-        space.create_dir.clone()
+        keeper_core::sessions::spaces::destination(space).to_owned()
     };
     let root = zone_root.join(&row.path);
 
