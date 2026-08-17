@@ -250,20 +250,23 @@ pub fn without_dirs(source: &[(String, bool)], dirs: &[String]) -> Vec<(String, 
 
 /// Apply a pattern to a source file list.
 ///
-/// **Template**: everything travels except the README, which is stamped from
-/// the template's own headings rather than copied — the plan's last step
+/// **Both kinds**: the standard directories for the source's shape exist in the
+/// new session, whether or not the source had them (FR-288).
+///
+/// **Template**: everything else travels except the README, which is stamped
+/// from the template's own headings rather than copied — the plan's last step
 /// writes it, so copying it first would be dead work the preview would have
-/// to explain.
+/// to explain. A template create is therefore *nearly* verbatim rather than
+/// exactly so: it adds those directories, and never a file.
 ///
 /// **Session** (FR-239): `prompts/**` (reusable by design) and `refs/**`
-/// (pointers worth keeping) travel; the standard directories for the source's
-/// shape exist empty; artifacts, workspace, the record and any loose file stay
-/// behind, each named with its reason.
+/// (pointers worth keeping) travel; artifacts, workspace, the record and any
+/// loose file stay behind, each named with its reason.
 ///
 /// The shape is derived from the source's own top-level names, so a
 /// continuation inherits the contract of what it continues — a flat session
 /// begets a flat one and never sprouts the two directories its `AGENTS.md`
-/// tells the reader not to create.
+/// tells the reader are not how kinds are filed.
 pub fn apply(kind: PatternKind, source: &[(String, bool)]) -> PatternOutcome {
     apply_with_kinds(kind, source, |_| None)
 }
@@ -295,10 +298,23 @@ pub fn apply_with_kinds(
         .collect();
     let shape = super::shape::shape(&top_level);
     let mut out = PatternOutcome::default();
-    if kind == PatternKind::Session {
-        for dir in standard_dirs(shape) {
-            out.copies.push(((*dir).to_owned(), true));
-        }
+    // The shape's own directories exist in every new session, whichever pattern
+    // it was made from (FR-288). This used to be `kind == PatternKind::Session`,
+    // and a session created from a template therefore had `artifacts/` and
+    // `workspace/` only if the template happened to carry them — the owner's own
+    // `_template/` did, by luck, which is why nobody saw it. A hand-made
+    // template lacking them produced a session whose `AGENTS.md` describes two
+    // directories it does not have, and whose first promoted artifact had
+    // nowhere to go.
+    //
+    // **So a template create is no longer purely verbatim, and that is the
+    // trade.** It adds directories and never files: what it forces is exactly
+    // the pair (or, for a folder-shaped template, the four) the same create
+    // forces out of a session source, so the two paths agree instead of one
+    // being the honest one. The loop below de-duplicates against the source, so
+    // a template that carries them is unchanged.
+    for dir in standard_dirs(shape) {
+        out.copies.push(((*dir).to_owned(), true));
     }
     for (rel, is_dir) in source {
         if out.copies.iter().any(|(existing, _)| existing == rel) {
@@ -440,6 +456,13 @@ mod tests {
 
     /// The template travels whole; only the README stays, and it stays for a
     /// reason the preview can state rather than for silence.
+    ///
+    /// **Row 10 (Story 51.2).** A hand-made template lacking `artifacts/` and
+    /// `workspace/` still begets a session that has them: this source is
+    /// folder-shaped by its own top-level names, so it gets that shape's four.
+    /// The `PatternKind::Session` guard that used to sit in front of this is
+    /// gone, which makes a template create *nearly* verbatim — directories added,
+    /// never a file — and this list is where that trade is visible.
     #[test]
     fn the_template_pattern_copies_everything_but_the_rebuilt_readme() {
         let out = apply(
@@ -452,7 +475,25 @@ mod tests {
             ]),
         );
         let copied: Vec<&str> = out.copies.iter().map(|(rel, _)| rel.as_str()).collect();
-        assert_eq!(copied, vec!["house-style.md", "refs", "refs/.gitkeep"]);
+        assert_eq!(
+            copied,
+            vec![
+                "artifacts",
+                "house-style.md",
+                "prompts",
+                "refs",
+                "refs/.gitkeep",
+                "workspace"
+            ]
+        );
+        // The template's own `refs/` is not doubled: the loop de-duplicates
+        // against the source, so a template that already carries one of these is
+        // copied rather than re-created.
+        assert_eq!(
+            copied.iter().filter(|rel| **rel == "refs").count(),
+            1,
+            "a directory the source carries must appear once"
+        );
         assert_eq!(
             out.skips,
             vec![("README.md".to_owned(), SkipReason::Record)]
@@ -592,7 +633,21 @@ mod tests {
         // `about.md` is absent because it is the record under its flat name and
         // gets restamped with this session's own title and date — copying the
         // template's would name every new session after the template.
-        assert_eq!(copied, vec!["AGENTS.md", "refs", "refs/.gitkeep"]);
+        //
+        // `artifacts/` and `workspace/` are present although this skeleton has
+        // neither on disk: every new session has the two its `AGENTS.md`
+        // describes (FR-288), and this source is flat by its own names, so it is
+        // that pair and not the folder shape's four.
+        assert_eq!(
+            copied,
+            vec![
+                "AGENTS.md",
+                "artifacts",
+                "refs",
+                "refs/.gitkeep",
+                "workspace"
+            ]
+        );
         // Not "left behind with a reason" either — a named template is not a
         // file this session refused, it is a different pattern entirely, and
         // listing it as a skip would put it in the preview's "Leaves behind".
@@ -600,10 +655,14 @@ mod tests {
     }
 
     /// A flat source begets a flat session (FR-268): two directories, not
-    /// four. Creating `refs/` and `prompts/` here would put in a brand-new
-    /// session exactly the two directories its own `AGENTS.md` tells the reader
-    /// not to create — a contradiction the operator meets on day one and would
+    /// four. Creating `refs/` and `prompts/` here would be a brand-new session
+    /// holding the two directories its own `AGENTS.md` says are not how kinds
+    /// are filed — a contradiction the operator meets on day one and would
     /// reasonably read as a bug.
+    ///
+    /// **Row 11 (Story 51.2): unchanged.** A session source always got its
+    /// shape's directories; dropping the `PatternKind::Session` guard extended
+    /// that to templates and must not have moved this list by one entry.
     #[test]
     fn a_flat_source_begets_a_flat_session_with_two_directories() {
         let out = apply(

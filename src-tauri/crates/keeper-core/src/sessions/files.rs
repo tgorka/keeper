@@ -125,6 +125,12 @@ pub enum FileVerbError {
          longer exists. Rename it in Finder if you really mean to."
     )]
     ShapeFile { rel: String },
+
+    #[error(
+        "\"{typed}\" has nothing in it a folder can be named after — it needs letters or digits. \
+         keeper folds a folder name to a slug and will not invent one for you."
+    )]
+    Unnameable { typed: String },
 }
 
 /// Whether a session-relative path is one this module may write or delete.
@@ -179,6 +185,72 @@ pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
         return Err(FileVerbError::Workspace { rel: owned() });
     }
     Ok(())
+}
+
+/// The folder path a *New folder* press lands on: the last segment folded, the
+/// ones in front of it addressing what is already there — or the refusal for a
+/// folder keeper will not make (FR-287).
+///
+/// **A session folder name folds, and that is a decision rather than an
+/// inheritance.** `Interview Kit` becomes `interview-kit`, through the same
+/// [`naming::slug_stem`] fold [`super::template::entry_name`] puts a template's
+/// folder names through. Templates folded and sessions had no precedent, so the
+/// rule is stated here: every name keeper writes into a session is already a slug
+/// ([`new_named`], [`new_stamped`]), and a pool holding
+/// `Interview Kit/2026-08-14-1030-opened.md` would be one directory spelled
+/// unlike every other name in the session it sits in.
+///
+/// **The whole segment folds here, extension and all**, where
+/// [`super::template::entry_name`] keeps a trailing `.md`. That is the one half
+/// of the fold not shared, and it is deliberate on both sides: a template's
+/// *New folder* shares its room with a *New file* whose field takes a filename,
+/// so one fold has to serve both; a session's create dialog takes its extension
+/// from a menu and never types one, so there is no extension here to preserve.
+/// A directory called `notes.md` in a pool that now reads subdirectories for
+/// markdown (FR-285) is a trap, not a folder.
+///
+/// **Only the last segment folds.** The ones in front of it address directories
+/// already on the drive — `template::rejoin`'s rule one scope out, for its
+/// reason: folding an addressed `Interview Kit/` somebody made in Finder would
+/// mint a second directory beside it instead of writing into it.
+///
+/// Public because the shell asks it first: it needs the folded path to compose
+/// the profile-relative subpath it puts to `WriteScope`, and a caller folding
+/// again itself would be the second namer (AD-65). [`compile_dir_new`] asks it
+/// again anyway — a guard the caller can skip is a guard.
+///
+/// # Errors
+/// Whatever [`check_dir`] refuses, asked of the typed path **and** of the folded
+/// one, so `Workspace` folds to `workspace` and is refused as scratch rather
+/// than created. [`FileVerbError::Unnameable`] when the fold leaves nothing.
+pub fn dir_rel(rel: &str) -> Result<String, FileVerbError> {
+    // Trailing separators only: `log/` is the same request as `log`, while
+    // trimming a LEADING one would turn `/etc` into a path this accepts.
+    let rel = rel.trim().trim_end_matches('/');
+    // Nothing typed is a naming failure and not a containment one — `check_dir`
+    // would answer "not a path inside this session" about a field left blank.
+    if rel.is_empty() {
+        return Err(FileVerbError::Unnameable {
+            typed: rel.to_owned(),
+        });
+    }
+    check_dir(rel)?;
+    let (parent, typed) = match rel.rsplit_once('/') {
+        Some((parent, last)) => (Some(parent), last),
+        None => (None, rel),
+    };
+    let name = naming::slug_stem(typed);
+    if name.is_empty() {
+        return Err(FileVerbError::Unnameable {
+            typed: typed.to_owned(),
+        });
+    }
+    let folded = match parent {
+        Some(parent) => format!("{parent}/{name}"),
+        None => name,
+    };
+    check_dir(&folded)?;
+    Ok(folded)
 }
 
 /// [`check_rel`], plus the two names a delete must never touch.
@@ -345,6 +417,49 @@ pub fn compile_new(session: &str, rel: &str, content: &str) -> Result<Plan, File
         verb: "file-new".to_owned(),
         session: session.to_owned(),
         steps,
+    })
+}
+
+/// The plan that makes one folder inside a session (FR-287): one `MkDir`.
+///
+/// `session` is the session's zone-relative folder (`active/2026-08-14-keeper`)
+/// and `rel` is session-relative; the join happens here so no caller composes a
+/// zone path (AD-65), and the name is folded by [`dir_rel`] so no caller spells
+/// one either.
+///
+/// **Idempotent by contract** ([`PlanStep::MkDir`]): asking for a folder that is
+/// already there succeeds and changes nothing. That is the right answer rather
+/// than a refusal — `artifacts/` is exactly the name somebody types without
+/// looking first, and "it is already there" is not a failure to report.
+///
+/// **One step for a nested path**, because `MkDir` makes parents: `a/b/c` is one
+/// plan and one journal row rather than three.
+///
+/// **No `.gitkeep`.** [`super::pattern::is_placeholder`] exists for FILE-list
+/// copies, where an empty directory would not survive one; a `MkDir` step holds
+/// its own directory open.
+///
+/// **Never [`super::template::compile_dir_new`] aimed at a session.** That
+/// module's guards deliberately carry no `workspace/` refusal — its own section
+/// header records the inverse rule, because a template's `workspace/` is a
+/// skeleton directory a create copies — so pointed at a live session it would
+/// compile `MkDir active/s/workspace/whatever` straight through the fence AD-113
+/// puts around scratch.
+///
+/// The shell asks `WriteScope::in_session_workspace` about the folded path as
+/// well as this: [`compile_new`]'s note, for its reason.
+///
+/// # Errors
+/// Whatever [`dir_rel`] refuses — the plan is not compiled for a folder keeper
+/// will not make.
+pub fn compile_dir_new(session: &str, rel: &str) -> Result<Plan, FileVerbError> {
+    let rel = dir_rel(rel)?;
+    Ok(Plan {
+        verb: "dir-new".to_owned(),
+        session: session.to_owned(),
+        steps: vec![PlanStep::MkDir {
+            path: format!("{session}/{rel}"),
+        }],
     })
 }
 
@@ -714,5 +829,157 @@ mod tests {
         assert!(compile_new("active/s", "workspace/iter.md", "x").is_err());
         assert!(compile_delete("active/s", "workspace/iter.md", "01T").is_err());
         assert!(compile_delete("active/s", ABOUT, "01T").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // A folder somebody makes (FR-287) — the spec's matrix, rows 1-6. Row 7 is
+    // the shell's (an unknown root or session), and rows 8-12 belong to the
+    // template and the pattern.
+    // -----------------------------------------------------------------------
+
+    /// Rows 1, 2 and 6. One `MkDir`, a verb the journal can name, and parents in
+    /// the same plan — `MkDir` makes them and succeeds on what is already there,
+    /// so a second press changes nothing and needs no second answer.
+    #[test]
+    fn a_new_folder_is_one_mkdir_the_journal_can_replay() {
+        let plan = compile_dir_new("active/s", "log").expect("a session may hold a log/");
+        assert_eq!(plan.verb, "dir-new");
+        assert_eq!(plan.session, "active/s");
+        assert_eq!(
+            plan.steps,
+            vec![PlanStep::MkDir {
+                path: "active/s/log".to_owned()
+            }],
+            "a folder verb that wrote a file would be writing something nobody asked for"
+        );
+        // Row 2: the same request twice is the same plan, and `MkDir` absorbs
+        // the second run rather than failing it (`plan.rs`'s first invariant).
+        assert_eq!(
+            compile_dir_new("active/s", "log").expect("idempotent by contract"),
+            plan
+        );
+        // Row 6: nested parents arrive in ONE step, because `MkDir` creates
+        // them. Three steps would be three journal rows for one press.
+        let deep = compile_dir_new("active/s", "a/b/c").expect("parents are made by MkDir");
+        assert_eq!(
+            deep.steps,
+            vec![PlanStep::MkDir {
+                path: "active/s/a/b/c".to_owned()
+            }]
+        );
+        // And no placeholder: `is_placeholder` exists for file-list copies, and
+        // a `.gitkeep` here would be a file keeper invented.
+        assert!(!deep
+            .steps
+            .iter()
+            .any(|step| matches!(step, PlanStep::WriteFile { .. })));
+    }
+
+    /// Row 3. The fold, asserted — templates fold and a session now folds the
+    /// same way, so one zone does not spell one directory two ways.
+    ///
+    /// The half that is NOT shared is asserted too: a template entry keeps a
+    /// trailing extension and a session folder does not, because a session's
+    /// create dialog takes its extension from a menu and a directory called
+    /// `notes.md` in a pool that reads subdirectories is a trap.
+    #[test]
+    fn a_session_folder_name_folds_the_way_a_templates_does() {
+        assert_eq!(dir_rel("Interview Kit").as_deref(), Ok("interview-kit"));
+        assert_eq!(dir_rel("  Log  ").as_deref(), Ok("log"));
+        assert_eq!(
+            dir_rel("log/").as_deref(),
+            Ok("log"),
+            "a trailing / is noise"
+        );
+        assert_eq!(dir_rel("Café Notes").as_deref(), Ok("cafe-notes"));
+        // The last segment folds; the ones in front address what is on the
+        // drive, so a folder somebody made in Finder is written INTO rather
+        // than duplicated beside.
+        assert_eq!(
+            dir_rel("Interview Kit/Kick Off").as_deref(),
+            Ok("Interview Kit/kick-off")
+        );
+        // The divergence from the template fold, asserted from both sides so
+        // that nobody "fixes" one of the two into the other by accident: a
+        // template's folder keeps a dotted tail (`v1.2` is a folder called
+        // `v1.2`), and a session's folds it away, because a session directory
+        // that reads as a filename is a trap in a pool that walks
+        // subdirectories for markdown.
+        assert_eq!(dir_rel("v1.2").as_deref(), Ok("v1-2"));
+        assert_eq!(
+            crate::sessions::template::entry_name("v1.2", None).as_deref(),
+            Some("v1.2")
+        );
+        assert_eq!(dir_rel("Kick Off.md").as_deref(), Ok("kick-off-md"));
+        // And the plan lands on the folded name, not on what was typed.
+        let plan = compile_dir_new("active/s", "Interview Kit").expect("nameable");
+        assert_eq!(
+            plan.steps,
+            vec![PlanStep::MkDir {
+                path: "active/s/interview-kit".to_owned()
+            }]
+        );
+    }
+
+    /// Row 4. Scratch is fenced (AD-113), and a folder there would invite writes
+    /// the engine refuses — including a `Workspace` that only becomes the fenced
+    /// name after the fold, which is why the folded path is checked as well.
+    #[test]
+    fn no_folder_is_made_inside_the_workspace() {
+        assert!(matches!(
+            dir_rel("workspace"),
+            Err(FileVerbError::Workspace { .. })
+        ));
+        assert!(matches!(
+            dir_rel("workspace/x"),
+            Err(FileVerbError::Workspace { .. })
+        ));
+        assert!(
+            matches!(dir_rel("Workspace"), Err(FileVerbError::Workspace { .. })),
+            "the fold is what makes this the fenced directory, so the fold is checked"
+        );
+        assert!(compile_dir_new("active/s", "workspace/iter-3").is_err());
+        // A folder merely *named* like the workspace is not in it, and
+        // `artifacts/` is the place the refusal itself points at.
+        assert_eq!(dir_rel("workspace-notes").as_deref(), Ok("workspace-notes"));
+        assert_eq!(dir_rel("artifacts").as_deref(), Ok("artifacts"));
+    }
+
+    /// Row 5. Refused before anything is opened — the domain performs no IO
+    /// (AD-108), so these never reach a `create_dir_all`.
+    #[test]
+    fn a_folder_path_cannot_walk_out_of_the_session() {
+        for rel in [
+            "../escape",
+            "/abs",
+            ".hidden",
+            "log/../../etc",
+            "a/.git",
+            "side\\ways",
+        ] {
+            assert!(
+                matches!(dir_rel(rel), Err(FileVerbError::Outside { .. })),
+                "{rel} must not be a folder keeper makes"
+            );
+            assert!(compile_dir_new("active/s", rel).is_err());
+        }
+    }
+
+    /// The trap `template::nameable` exists for, asked one module over: `slug`
+    /// answers `untitled` for a name with nothing in it, so a verb that folded
+    /// first and tested for empty afterwards would mint `untitled/` and call it
+    /// the operator's name.
+    #[test]
+    fn a_name_with_nothing_in_it_is_no_folder_name() {
+        for typed in ["###", "🎉", "   "] {
+            assert!(
+                matches!(dir_rel(typed), Err(FileVerbError::Unnameable { .. })),
+                "{typed} folds to nothing and must be refused, not renamed"
+            );
+        }
+        // …and this is why the test cannot be "did the fold come back empty".
+        assert_eq!(crate::notes::naming::slug("###"), "untitled");
+        // A name somebody really typed still passes, fallback word included.
+        assert_eq!(dir_rel("untitled").as_deref(), Ok("untitled"));
     }
 }

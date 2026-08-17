@@ -161,10 +161,18 @@ made.
   because a session whose files say one thing and whose shape says another is readable
   by neither reader.
 
-  Choosing a template copies it verbatim, minus its record: `about.md` and `README.md`
-  are restamped with *your* title and today's date, since copying the template's would
-  name every new session after the template. `AGENTS.md` travels untouched — a zone that
-  edited its own navigation contract meant it.
+  Choosing a template copies it verbatim, minus its record and plus two directories:
+  `about.md` and `README.md` are restamped with *your* title and today's date, since
+  copying the template's would name every new session after the template. `AGENTS.md`
+  travels untouched — a zone that edited its own navigation contract meant it.
+
+  **Every new session has `artifacts/` and `workspace/`** (FR-288), whether or not the
+  thing it was made from did — a folder-shaped pattern gets that shape's four. So a
+  template create is *nearly* verbatim rather than exactly so, and the preview says which
+  directories it is adding. The alternative was worse: a hand-made template without them
+  produced a session whose own `AGENTS.md` describes two directories it does not have, and
+  whose first promoted artifact had nowhere to go. A create from a **session** always
+  worked this way; this is that rule extended to templates rather than a new one.
 
   Choosing a **session** is a continuation (the zone's preferred reopen): structure
   only. In a folder-shaped source `prompts/` and `refs/` travel; in a flat one the files
@@ -192,11 +200,15 @@ made.
   putting your own seed log in `_template/` works exactly as you would expect, and why
   keeper's own does not end up beside it.
 - **Write keeper's template into this zone** — offered under the picker to a zone with no
-  `_template/` of its own. What lands is a **skeleton**: `AGENTS.md` and an `about.md`
-  titled `<session title>`, and deliberately not the seeds. A template has no title and
-  no minute — freezing either would name every session after the moment you pressed the
-  button — so the seeds stay something keeper writes per create, with that session's own
-  title. Add your own afterwards if you want different ones; a create will prefer yours.
+  `_template/` of its own. What lands is a **skeleton**: `AGENTS.md`, an `about.md` titled
+  `<session title>`, and `artifacts/` and `workspace/` — and deliberately not the seeds. A
+  template has no title and no minute — freezing either would name every session after the
+  moment you pressed the button — so the seeds stay something keeper writes per create,
+  with that session's own title. Add your own afterwards if you want different ones; a
+  create will prefer yours. Pressing it a second time is safe for the directories in a way
+  that matters: the two files are moved into `.keeper/trash/` and rewritten, so an edited
+  `AGENTS.md` is recoverable, while a directory is only ever *made* — an `artifacts/` with
+  your output in it is never trashed for the crime of already being there.
 - **Templates** — a mode on the board, sitting with the status chips rather than as a
   fourth button in the pane header. The chip is a toggle: press it again to come back to the
   session rows, or press a status chip, whichever you reach for. It lists every template the
@@ -359,6 +371,31 @@ log you have to name and tag by hand is a log you write later or not at all. Eac
 where your session's shape keeps that kind: a prompt at the root of a flat session, in
 `prompts/` in a folder-shaped one; **New log** in a flat session writes a file, and in a
 folder-shaped one appends a heading to `README.md`, which is where that shape's log is.
+
+**New folder** sits beside them (FR-287), always offered, under either shape. Its field
+takes the **path inside the session** — `log` at its root, `artifacts/2026` inside a
+folder that is already there — because only the last thing you type is folded to a name
+and the parts in front of it address folders that exist. `Interview Kit` becomes
+`interview-kit`, the way a template's folder name does; unlike a template's, a session
+folder folds the whole segment, dots included, since there is no filename here to keep an
+extension for and a directory that reads as a filename is a trap in a pool that walks
+subdirectories. Making a folder that is already there writes nothing and is not an error,
+and `a/b/c` arrives as one journaled plan. Refused, each for its own reason: `workspace/`
+or anything inside it (scratch is fenced — keeper never writes there, so a folder there
+would be a place for writes keeper goes on refusing), a path that leaves the session, a
+dotted name (the tree does not list one, so it would be a folder you could not undo), and
+a name with nothing in it — `###` is not a folder name and keeper will not invent one.
+
+**What a folder in a session is for, and what it is not.** A kind is still a tag and never
+a directory: markdown in a folder you make is read exactly as markdown in the session root
+is, so a `spaces/` or a `log/` is a real home — and the file's tag is what decides which
+space lists it, which means a `log/` full of files carrying no `log` tag is a directory
+nothing lists. `artifacts/` and `workspace/` are the two exceptions to the reading: one
+holds output, the other is scratch, and neither is scanned. This is why the `AGENTS.md`
+keeper writes into a flat session no longer says *"do not create other directories"* — a
+contract that forbids what the app's own button does is one an agent reads as noise. It
+says instead that a directory is a **container**, for what is not markdown or for thirty
+of something, and that a new *kind* of thing is still a new tag.
 
 A delete moves the file into the zone's `.keeper/trash/`, never an unlink, and
 `workspace/` refuses every write with the fence's own sentence. There is still no rename

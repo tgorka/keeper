@@ -2916,6 +2916,85 @@ pub async fn sessions_file_new(
     Ok(subpath)
 }
 
+/// Make one folder inside a session (FR-287).
+///
+/// `rel` is session-relative and is a **name**, or a path whose last segment is
+/// one: the last segment folds to a slug in
+/// [`keeper_core::sessions::files::dir_rel`] (`Interview Kit` → `interview-kit`)
+/// and the ones in front of it address directories already on the drive. Nothing
+/// here composes a name (AD-65) and nothing here composes a zone path — the
+/// domain joins the session's own folder onto the folded path.
+///
+/// **Idempotent.** `MkDir` succeeds on a directory that is already there and
+/// creates parents, so a second press changes nothing and `a/b/c` is one plan
+/// and one journal row. Unlike the Templates room's twin, this does not refuse a
+/// **file** sitting at that path: the executor's `create_dir_all` fails on it and
+/// says so, and a pre-flight `is_file` here would be a second answer to a
+/// question the write already answers. The room's verb needs one because it also
+/// refuses an absent parent, which this deliberately does not.
+///
+/// **Two fences, both asked.** `files::dir_rel` refuses `workspace/`, traversal,
+/// an absolute path and any dotted segment on shape grounds with no knowledge of
+/// zones; then this asks
+/// [`keeper_sync::files_write::WriteScope::in_session_workspace`] about the
+/// profile-relative subpath, which is the fence the product is measured against
+/// (AD-113). [`resolve_session_file`] is the same pair for a *file* and cannot be
+/// reused: it leads with `check_rel`, which requires one of three extensions, and
+/// a folder has none.
+///
+/// Rejects with: `internal` (unknown root or session, a name that folds to
+/// nothing, `workspace/`, a path that leaves the session, a dotted segment, a
+/// failed write), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_dir_new(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    rel: String,
+) -> Result<(), IpcError> {
+    use keeper_core::sessions::files;
+
+    // Folded first, and everything after it is about the folded path: `Workspace`
+    // becomes `workspace`, and a fence asked about what was typed would have
+    // missed it.
+    let rel = files::dir_rel(&rel).map_err(file_verb_error)?;
+
+    let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let subpath = format!("{zone}/{}/{rel}", row.path);
+    let (_vault, scope) = crate::sync_ipc::sessions_scope(&profile);
+    if scope.in_session_workspace(&subpath) {
+        return Err(IpcError {
+            code: IpcErrorCode::Internal,
+            message: keeper_sync::files_write::WriteRefusal::SessionWorkspace { subpath }
+                .to_string(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    let compiled = files::compile_dir_new(&row.path, &rel).map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("dir-new task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
 /// Make a correctly-named, correctly-tagged file of one kind, **where this
 /// session's shape keeps that kind** (FR-277).
 ///
@@ -3223,6 +3302,13 @@ pub fn sessions_file_new(
     kind: String,
 ) -> Result<String, IpcError> {
     let _ = (root_id, session_id, parent, title, kind);
+    Err(unsupported())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_dir_new(root_id: String, session_id: String, rel: String) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, rel);
     Err(unsupported())
 }
 

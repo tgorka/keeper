@@ -6,7 +6,7 @@
  * where the list begins. The tree itself stays what its own doc calls it — a
  * review surface — and gains only the one per-row verb that is about a row.
  *
- * **Three buttons for two ideas.** *New log* and *New prompt* write a file whose
+ * **Four buttons for three ideas.** *New log* and *New prompt* write a file whose
  * NAME and TAG keeper chooses (`YYYY-MM-DD-HHMM-slug.md`, `tags: [log]`), and
  * that choosing is the entire point: in a flat session those two fields are what
  * decide whether the zone's spaces will ever list the file, so a log the
@@ -16,6 +16,17 @@
  * is and guessing `log` would file a stray thought as history. The detail's
  * *unfiled* list is where such a file surfaces, with the sentence that says how
  * to file it.
+ *
+ * **The fourth is *New folder*** (FR-287), and it is a different idea from the
+ * other three: it writes no bytes at all. A session's kinds are still tags and
+ * never directories (AD-120) — a folder here is a *container*, for what is not
+ * markdown or for thirty of something — and the markdown inside one is read
+ * exactly as markdown in the session root is (FR-285). Its field takes the
+ * **path inside the session** rather than a name plus the folder menu, which is
+ * the Templates room's own shape: only the last segment is folded to a slug and
+ * the ones in front of it address folders already on the drive, so joining a
+ * picked folder onto a typed name in here would be this surface composing a path
+ * (AD-65) with a fold applied to half of it.
  *
  * **The log button is shape-aware.** A folder-shaped session's log lives in
  * `## Log` inside its README and `sessionsLogToday` appends a heading there; a
@@ -45,7 +56,7 @@
  * be translated back into `""` on the way to Rust, which is a path composed in
  * the frontend wearing a disguise.
  */
-import { FilePlus2, MessageSquarePlus, NotebookPen } from "lucide-react";
+import { FilePlus2, FolderPlus, MessageSquarePlus, NotebookPen } from "lucide-react";
 import { useCallback, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -59,13 +70,19 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { SessionEntryVm, SessionFileKind } from "@/lib/ipc/client";
-import { sessionsFileNew, sessionsFileNewKind, sessionsLogToday } from "@/lib/ipc/client";
+import {
+  sessionsDirNew,
+  sessionsFileNew,
+  sessionsFileNewKind,
+  sessionsLogToday,
+} from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 export const SESSION_FILE_NEW_LOG_LABEL = "New log";
 export const SESSION_FILE_NEW_PROMPT_LABEL = "New prompt";
 export const SESSION_FILE_NEW_LABEL = "New file";
+export const SESSION_DIR_NEW_LABEL = "New folder";
 
 /** The dialog's own words. */
 export const SESSION_FILE_NEW_TITLE = "New file";
@@ -85,6 +102,13 @@ export const SESSION_FILE_NEW_FAILED = "keeper couldn't create that file. Nothin
 export const SESSION_FILE_NEW_LOG_FAILED = "keeper couldn't create that log. Nothing was written.";
 export const SESSION_FILE_NEW_PROMPT_FAILED =
   "keeper couldn't create that prompt. Nothing was written.";
+export const SESSION_DIR_NEW_FAILED = "keeper couldn't create that folder. Nothing was written.";
+
+/** The folder dialog's own words. */
+export const SESSION_DIR_NEW_TITLE = "New folder";
+export const SESSION_DIR_NEW_BODY =
+  "The path inside this session — log at its root, artifacts/2026 inside a folder that is already there. Only the last part is folded to a name; markdown you put in it is read like markdown in the root. Kinds are still tags, so a folder is a container and not a filing system.";
+export const SESSION_DIR_NEW_NAME_LABEL = "Folder";
 
 /** The three writable extensions, in the order the menu offers them. */
 export const SESSION_FILE_KINDS: readonly { value: SessionFileKind; label: string }[] = [
@@ -139,10 +163,13 @@ export function SessionFileActions({
   const titleId = useId();
   const kindId = useId();
   const folderId = useId();
+  const dirId = useId();
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [kind, setKind] = useState<SessionFileKind>("md");
   const [parent, setParent] = useState("");
+  const [dirOpen, setDirOpen] = useState(false);
+  const [dirPath, setDirPath] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
 
   // Open what was just written, through the one file target (AD-109), on the
@@ -204,6 +231,22 @@ export function SessionFileActions({
       .finally(() => onBusy(false));
   }, [rootId, sessionId, parent, title, kind, opened, onBusy]);
 
+  // A folder write answers nothing to open — there is no file, and the tree is
+  // where the row appears — so this only re-reads. `onChanged` is what makes the
+  // new folder a row, and therefore an option in *New file*'s Folder menu.
+  const createDir = useCallback(() => {
+    onBusy(true);
+    setNotice(null);
+    sessionsDirNew(rootId, sessionId, dirPath)
+      .then(() => {
+        setDirOpen(false);
+        setDirPath("");
+        onChanged();
+      })
+      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_DIR_NEW_FAILED)))
+      .finally(() => onBusy(false));
+  }, [rootId, sessionId, dirPath, onChanged, onBusy]);
+
   const folders = entries.filter((entry) => entry.isDir && entry.locked === null);
 
   return (
@@ -243,11 +286,29 @@ export function SessionFileActions({
           <FilePlus2 aria-hidden className="size-3.5" />
           {SESSION_FILE_NEW_LABEL}
         </Button>
+        {/* Always visible, like its three siblings and unlike anything gated on
+            `shape`: a container is a container under both contracts, and the two
+            paths keeper refuses — `workspace/` and anything that leaves the
+            session — are refused by Rust with its own sentence rather than by a
+            button that is not there. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            setNotice(null);
+            setDirOpen(true);
+          }}
+          disabled={busy}
+        >
+          <FolderPlus aria-hidden className="size-3.5" />
+          {SESSION_DIR_NEW_LABEL}
+        </Button>
       </div>
       {/* One failure, said once (UX-DR43). The dialog owns the sentence while
           it is open — a refusal repeated above and behind the modal reads as two
           things having gone wrong. */}
-      {notice !== null && !open && (
+      {notice !== null && !open && !dirOpen && (
         <p role="status" className="text-destructive text-xs">
           {notice}
         </p>
@@ -314,6 +375,42 @@ export function SessionFileActions({
               {SESSION_FILE_NEW_CANCEL}
             </Button>
             <Button type="button" onClick={create} disabled={busy || title.trim() === ""}>
+              {SESSION_FILE_NEW_CONFIRM}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={dirOpen}
+        onOpenChange={(next) => {
+          if (busy) return;
+          setDirOpen(next);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{SESSION_DIR_NEW_TITLE}</DialogTitle>
+            <DialogDescription>{SESSION_DIR_NEW_BODY}</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={dirId}>{SESSION_DIR_NEW_NAME_LABEL}</Label>
+            <Input id={dirId} value={dirPath} onChange={(e) => setDirPath(e.target.value)} />
+          </div>
+          {notice !== null && (
+            <p role="status" className="text-destructive text-sm">
+              {notice}
+            </p>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setDirOpen(false)} disabled={busy}>
+              {SESSION_FILE_NEW_CANCEL}
+            </Button>
+            {/* An empty field is a question nobody answered rather than a
+                refusal to report, so the confirm is inert and Rust is never
+                asked — the Templates room's rule, and the same one *New file*
+                applies to its title. */}
+            <Button type="button" onClick={createDir} disabled={busy || dirPath.trim() === ""}>
               {SESSION_FILE_NEW_CONFIRM}
             </Button>
           </DialogFooter>

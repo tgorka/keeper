@@ -5615,6 +5615,50 @@ export async function sessionsFileNew(
 }
 
 /**
+ * Make one folder inside a session (FR-287).
+ *
+ * `rel` is session-relative, and its **last segment is a name you typed**: it is
+ * folded to a slug in Rust (`Interview Kit` → `interview-kit`), while the
+ * segments in front of it address folders already on the drive — so pass
+ * `<folder you picked>/<name typed>` and never a name you composed yourself
+ * (AD-65). A session folder folds the whole segment, extension and all: unlike
+ * {@link sessionsTemplateDirNew} there is no filename here to keep a `.md` for,
+ * and a directory that reads as a filename is a trap in a pool that walks
+ * subdirectories for markdown.
+ *
+ * **Idempotent**: a folder already there resolves without writing, and a nested
+ * `rel` creates its parents in the same journaled plan — one commit with keeper's
+ * provenance, like every other zone write. The tree re-reads afterwards, and a
+ * file can then be created into the new folder through
+ * {@link sessionsFileNew}'s Folder field.
+ *
+ * Each refusal, and the rule behind it:
+ *
+ * - **`workspace`, or anything inside it** — scratch is fenced (AD-113): keeper
+ *   never writes there, so a folder there would be a place for writes the engine
+ *   goes on refusing. Asked twice, on shape grounds and of the real write scope,
+ *   and asked about the *folded* name — `Workspace` is the fenced directory too.
+ * - **a path that leaves the session** — `../elsewhere`, `/etc`, a backslash:
+ *   refused before anything is opened.
+ * - **a dotted segment** — `.hidden` and `a/.git`. No verb here may name one; the
+ *   tree does not list them, so a folder you could not see is one you could not
+ *   undo.
+ * - **a name with nothing in it** — `###` or an empty field. keeper folds a name
+ *   and will not invent one, because `untitled/` would be keeper's word for your
+ *   folder rather than yours.
+ * - **unknown root or session** — the surface is stale; re-read it.
+ *
+ * Rejects with: `internal` (all of the above, and a failed write), `unsupported`.
+ */
+export async function sessionsDirNew(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_dir_new", { rootId, sessionId, rel });
+}
+
+/**
  * Make a correctly-named, correctly-tagged log, prompt, ref or task in a flat
  * session's pool (FR-262), and resolve with the subpath that opens it.
  *

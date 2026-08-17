@@ -1172,6 +1172,28 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     SESSION_ENTRIES.push(sessionEntry(relPath, false, 120, 0));
     return `60-sessions/active/2026-08-12-keeper-sessions/${relPath}`;
   },
+  // The folder verb (FR-287). Idempotent like the `MkDir` it compiles to, and
+  // folded like `files::dir_rel` folds — last segment only, so a path whose
+  // parent is a folder already in the tree lands inside it. Same restatement
+  // licence as the namers above: this file never runs in the app.
+  sessions_dir_new: (payload) => {
+    const typed = String(payload.rel ?? "")
+      .trim()
+      .replace(/\/+$/, "");
+    const cut = typed.lastIndexOf("/");
+    const parent = cut === -1 ? "" : typed.slice(0, cut);
+    const name =
+      typed
+        .slice(cut + 1)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "untitled";
+    const relPath = `${parent === "" ? "" : `${parent}/`}${name}`;
+    if (!SESSION_ENTRIES.some((entry) => entry.relPath === relPath)) {
+      SESSION_ENTRIES.push(sessionEntry(relPath, true, null, 0));
+    }
+    return null;
+  },
   sessions_file_new_kind: (payload) => {
     const kind = String(payload.kind ?? "log");
     const slug =

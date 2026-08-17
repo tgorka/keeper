@@ -6,15 +6,21 @@ import type { SessionEntryVm } from "@/lib/ipc/client";
 const sessionsFileNew = vi.fn();
 const sessionsFileNewKind = vi.fn();
 const sessionsLogToday = vi.fn();
+const sessionsDirNew = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   sessionsFileNew: (root: unknown, session: unknown, parent: unknown, t: unknown, k: unknown) =>
     sessionsFileNew(root, session, parent, t, k),
   sessionsFileNewKind: (root: unknown, session: unknown, tag: unknown, slug: unknown) =>
     sessionsFileNewKind(root, session, tag, slug),
   sessionsLogToday: (root: unknown, session: unknown) => sessionsLogToday(root, session),
+  sessionsDirNew: (root: unknown, session: unknown, rel: unknown) =>
+    sessionsDirNew(root, session, rel),
 }));
 
 import {
+  SESSION_DIR_NEW_FAILED,
+  SESSION_DIR_NEW_LABEL,
+  SESSION_DIR_NEW_NAME_LABEL,
   SESSION_FILE_NEW_CONFIRM,
   SESSION_FILE_NEW_FOLDER_LABEL,
   SESSION_FILE_NEW_LABEL,
@@ -97,6 +103,7 @@ beforeEach(() => {
     "60-sessions/active/2026-08-10-keeper/2026-08-14-0930-log.md",
   );
   sessionsLogToday.mockResolvedValue(undefined);
+  sessionsDirNew.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -260,5 +267,89 @@ describe("SessionFileActions", () => {
     sessionsFileNewKind.mockRejectedValue({});
     screen.getByRole("button", { name: SESSION_FILE_NEW_LOG_LABEL }).click();
     expect(await screen.findByRole("status")).toHaveTextContent(SESSION_FILE_NEW_LOG_FAILED);
+  });
+
+  /**
+   * Row 12. The verb is offered beside its three siblings and sends the path as
+   * typed: the fold (`Interview Kit` → `interview-kit`) is Rust's, and a slug
+   * composed here would be the second namer (AD-65).
+   */
+  it("creates a folder from the path typed, and re-reads the tree", async () => {
+    const { onChanged } = mount();
+    screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
+      target: { value: "Interview Kit" },
+    });
+    within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM }).click();
+    await waitFor(() => {
+      expect(sessionsDirNew).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "Interview Kit",
+      );
+    });
+    // Nothing to open: a folder is a row in the tree, not a document. The
+    // re-read is what makes it one — and therefore an option in *New file*'s
+    // Folder menu.
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(panelsStore.getState().panels.find((p) => p.target?.kind === "file")).toBeUndefined();
+    expect(sessionsFileNew).not.toHaveBeenCalled();
+  });
+
+  /** Offered under both contracts: a container is a container in either. */
+  it("offers the folder button on a folder-shaped session too", () => {
+    mount({ shape: "folder" });
+    expect(screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL })).toBeInTheDocument();
+  });
+
+  it("cannot create a folder with no path", async () => {
+    mount();
+    screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM })).toBeDisabled();
+    // Whitespace is not a path either — Rust is never asked a question nobody
+    // answered.
+    fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
+      target: { value: "   " },
+    });
+    expect(within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM })).toBeDisabled();
+    expect(sessionsDirNew).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The fence's own words reach the operator (AD-113). The dialog stays open on
+   * a refusal, because the path that was typed is the thing to correct.
+   */
+  it("says the workspace refusal in Rust's words and keeps the dialog open", async () => {
+    mount();
+    sessionsDirNew.mockRejectedValue({
+      message:
+        "workspace is inside the session's workspace — scratch that is not versioned, not synced, and dies with the session.",
+    });
+    screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
+      target: { value: "workspace" },
+    });
+    within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM }).click();
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent("scratch that is not versioned");
+    expect(screen.queryByText(SESSION_DIR_NEW_FAILED)).not.toBeInTheDocument();
+    // Said once: the sentence lives in the dialog while the dialog is open.
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("falls back to keeper's sentence when the folder refusal carries none", async () => {
+    mount();
+    sessionsDirNew.mockRejectedValue({});
+    screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
+      target: { value: "log" },
+    });
+    within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM }).click();
+    expect(await screen.findByRole("status")).toHaveTextContent(SESSION_DIR_NEW_FAILED);
   });
 });

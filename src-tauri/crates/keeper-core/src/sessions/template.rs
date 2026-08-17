@@ -37,7 +37,7 @@
 
 use super::shape::{KindTag, ABOUT, AGENTS};
 
-/// One file of the template, ready to write.
+/// One entry of the template, ready to write: bytes, or a directory to make.
 ///
 /// A pair rather than a path plus a closure: the plan compiler takes bytes, and
 /// a template that could not be printed before it is written would be a
@@ -55,6 +55,32 @@ pub struct TemplateFile {
     /// apart have different names and identical meaning. The kind is the thing
     /// that must not be duplicated, so the kind is what travels.
     pub kind: Option<KindTag>,
+    /// A **directory** the skeleton names rather than bytes it writes (FR-288):
+    /// [`compile_install`] emits a `MkDir` for it and never a `WriteFile`.
+    ///
+    /// A flag beside the bytes rather than an enum in place of them, because the
+    /// installer is the only consumer that ever meets a directory:
+    /// [`default_template`]'s entries are all files, and the create path reads
+    /// `content` as a field. An enum body would cost every file consumer a match
+    /// to express a state only the skeleton has.
+    pub dir: bool,
+}
+
+impl TemplateFile {
+    /// A directory the skeleton carries rather than a file it writes.
+    ///
+    /// A constructor rather than a literal at each site, so nobody has to write
+    /// `content: String::new()` and mean "there are no bytes" — a pair that
+    /// would be a lie the moment somebody read it as a file.
+    #[must_use]
+    pub fn directory(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            content: String::new(),
+            kind: None,
+            dir: true,
+        }
+    }
 }
 
 /// The navigation contract, verbatim.
@@ -113,7 +139,8 @@ one.
 
 ## The two directories
 
-Only two, and the difference between them is about *versioning*, not about kind:
+**`artifacts/`** and **`workspace/`** are in every session, and the difference
+between them is about *versioning*, not about kind:
 
 - **`artifacts/`** — output worth keeping. Versioned and synced. Put here
   anything a future reader should still be able to open.
@@ -122,8 +149,16 @@ Only two, and the difference between them is about *versioning*, not about kind:
   If something in here starts to matter, promote it to `artifacts/` and record
   the move in the `## Promote` table in `about.md`.
 
-Do not create other directories. A new kind of thing is a new tag, not a new
-folder — that is the whole point of this layout.
+A new *kind* of thing is a new tag, not a new folder — that is the whole point
+of this layout, and it is the rule that does not bend. A directory is still good
+for one thing: being a **container**. Somewhere for what is not markdown, or a
+folder you made on purpose because there are thirty of something. keeper's own
+*New folder* makes one, markdown inside it is read exactly as markdown in the
+root is, and each file's kind is still the tag in its own frontmatter — so a
+`logs/` whose files carry no `log` tag is a directory nothing lists, which is the
+mistake the rule above exists to prevent. The two directories named here are the
+exception to the reading: neither is scanned, because one holds output and the
+other is scratch.
 
 ## Writing
 
@@ -244,6 +279,7 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
             content: AGENTS_MD.to_owned(),
             // The contract is not one of the five kinds: it describes them.
             kind: None,
+            dir: false,
         },
         TemplateFile {
             name: ABOUT.to_owned(),
@@ -256,6 +292,7 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 about_body(title, date)
             ),
             kind: Some(KindTag::About),
+            dir: false,
         },
         TemplateFile {
             name: format!("{stamp}-opened.md"),
@@ -265,6 +302,7 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 seed_log_body(title)
             ),
             kind: Some(KindTag::Log),
+            dir: false,
         },
         TemplateFile {
             name: format!("{stamp}-handoff.md"),
@@ -274,13 +312,14 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
                 SEED_PROMPT_BODY
             ),
             kind: Some(KindTag::Prompt),
+            dir: false,
         },
     ]
 }
 
 /// What `_template/` gets when the operator adopts keeper's default (FR-268):
-/// the navigation contract and an empty record, and deliberately **not** the
-/// two seed files.
+/// the navigation contract, an empty record and the two directories every
+/// session has — and deliberately **not** the two seed files.
 ///
 /// A template is a *skeleton*, and the seeds are not part of the skeleton —
 /// they are examples keeper composes fresh for each new session, with that
@@ -290,6 +329,16 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
 /// stamped with the minute the operator pressed the button, *and* got a second
 /// seed pair composed beside it. Neither is a template's job.
 ///
+/// **The two directories are** part of the skeleton (FR-288), and they are the
+/// list [`super::pattern::standard_dirs`] already keeps rather than a second
+/// copy of it: what a create of this shape forces into a new session and what
+/// keeper's own template ships have to be the same two names, and a skeleton
+/// that named its own pair would be the copy that drifts. `Shape::Flat` because
+/// this skeleton *is* flat by its own top-level names — `refs/` and `prompts/`
+/// are tag queries in the flat contract, and creating them empty here would put
+/// in every new session exactly the two directories its `AGENTS.md` tells the
+/// reader not to make.
+///
 /// The record ships titled `<session title>` rather than with a real one,
 /// because [`super::plan::skeleton_from`] copies only its `## ` headings into a
 /// new session: the title line exists to be replaced, and saying so in the
@@ -298,11 +347,12 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
 /// carries theirs and composes none, which is the same rule this fixes stated
 /// from the other side.
 pub fn zone_skeleton(date: &str, id: &str) -> Vec<TemplateFile> {
-    vec![
+    let mut entries = vec![
         TemplateFile {
             name: AGENTS.to_owned(),
             content: AGENTS_MD.to_owned(),
             kind: None,
+            dir: false,
         },
         TemplateFile {
             name: ABOUT.to_owned(),
@@ -312,8 +362,16 @@ pub fn zone_skeleton(date: &str, id: &str) -> Vec<TemplateFile> {
                 about_body("<session title>", date)
             ),
             kind: Some(KindTag::About),
+            dir: false,
         },
-    ]
+    ];
+    entries.extend(
+        super::pattern::standard_dirs(super::shape::Shape::Flat)
+            .iter()
+            .copied()
+            .map(TemplateFile::directory),
+    );
+    entries
 }
 
 /// Whether a name a person typed folds to a directory name at all — the
@@ -353,6 +411,13 @@ pub fn nameable(name: &str) -> bool {
 /// gone. `dest` is zone-relative (`_template`, or `_template/<name>` for a
 /// named one) and `present` is what the caller found there, because the domain
 /// opens nothing (AD-108).
+///
+/// **A directory entry is made, never trashed-and-rewritten** (FR-288). `MkDir`
+/// is idempotent by contract, so an `artifacts/` that is already there needs
+/// nothing done to it — and the trash-then-write branch above must not reach it,
+/// because a template whose `artifacts/` holds the operator's own files would
+/// have the whole directory moved into `.keeper/trash/` for the crime of being
+/// present. Recoverable is not the same as untouched.
 pub fn compile_install(
     dest: &str,
     files: &[TemplateFile],
@@ -364,6 +429,10 @@ pub fn compile_install(
     }];
     for file in files {
         let path = format!("{dest}/{}", file.name);
+        if file.dir {
+            steps.push(super::plan::PlanStep::MkDir { path });
+            continue;
+        }
         if present.iter().any(|name| name == &file.name) {
             steps.push(super::plan::PlanStep::TrashFile {
                 path: path.clone(),
@@ -967,6 +1036,71 @@ mod tests {
         assert!(!writes.iter().any(|path| path.ends_with("stray.md")));
     }
 
+    /// Row 9. *Write keeper's template into this zone* installs the two
+    /// directories as well as the two files (FR-288) — the owner's own
+    /// `_template/` had them by luck, and a template without them hands every
+    /// session made from it a shape its own `AGENTS.md` describes and it does not
+    /// have.
+    ///
+    /// The sharp half is the second install: a directory already on disk is in
+    /// `present`, and the trash-then-write branch must not reach it. `MkDir` is
+    /// idempotent, while a `TrashFile` aimed at `artifacts/` would move the
+    /// operator's own output into `.keeper/trash/` for the crime of being there.
+    #[test]
+    fn an_install_makes_the_two_directories_and_never_trashes_one() {
+        let files = zone_skeleton("2026-08-14", "01J8A");
+        let plan = compile_install(
+            "_template",
+            &files,
+            // Everything already present, directories included — the second
+            // press of the button, and the case that must not destroy anything.
+            &[
+                AGENTS.to_owned(),
+                ABOUT.to_owned(),
+                "artifacts".to_owned(),
+                "workspace".to_owned(),
+            ],
+            "01J8Z",
+        );
+        let mkdirs: Vec<&String> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                crate::sessions::plan::PlanStep::MkDir { path } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mkdirs,
+            vec!["_template", "_template/workspace", "_template/artifacts"],
+            "the template's own directory, then the two every session has"
+        );
+        let trashes: Vec<&String> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                crate::sessions::plan::PlanStep::TrashFile { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            trashes,
+            vec!["_template/AGENTS.md", "_template/about.md"],
+            "only the two FILES are recoverable-then-rewritten"
+        );
+        // And no bytes are invented for a directory: no `.gitkeep`, no empty
+        // file standing in for one.
+        let writes: Vec<&String> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                crate::sessions::plan::PlanStep::WriteFile { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes, vec!["_template/AGENTS.md", "_template/about.md"]);
+    }
+
     /// A rename is a location change and nothing else: one move, the two names
     /// in the two fields, and a verb the journal can name. Anything extra in
     /// this plan would be a rename that also edited the template it moved.
@@ -1005,6 +1139,13 @@ mod tests {
 
     /// `AGENTS.md` is a contract with a reader who has no other context, so the
     /// facts it must state are worth asserting rather than trusting to review.
+    ///
+    /// **Including the amended sentence (Story 51.2).** It used to read *"Do not
+    /// create other directories"*, which a *New folder* button on a flat session
+    /// contradicts outright — so the sentence now permits a container and a
+    /// directory the operator makes deliberately, and keeps the rule the whole
+    /// layout rests on: the kind is the tag. Both halves are asserted, because
+    /// an amendment nobody pins is a sentence that reverts.
     #[test]
     fn the_navigation_file_states_the_load_bearing_rules() {
         for required in [
@@ -1013,12 +1154,21 @@ mod tests {
             "keeper will not write here",
             "in-preparation",
             "unfiled",
+            // The half that must survive the amendment.
+            "not a new folder",
+            // …and the half the amendment adds: keeper itself makes one now.
+            "*New folder*",
         ] {
             assert!(
                 AGENTS_MD.contains(required),
                 "AGENTS.md must state {required:?} — an agent handed this folder has no other source"
             );
         }
+        assert!(
+            !AGENTS_MD.contains("Do not create other directories"),
+            "the flat prohibition is amended, not restored: keeper offers New folder (FR-287), and \
+             a contract that forbids what the app's own button does is one an agent reads as noise"
+        );
         for kind in ["about", "task", "log", "prompt", "ref"] {
             assert!(
                 AGENTS_MD.contains(&format!("`{kind}`")),
@@ -1039,7 +1189,22 @@ mod tests {
     fn the_zone_skeleton_carries_no_seed_files_to_freeze() {
         let files = zone_skeleton("2026-08-14", "01J8A");
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
-        assert_eq!(names, vec![AGENTS, ABOUT]);
+        // Row 8. Two files and the two directories every session has (FR-288) —
+        // the pair `standard_dirs` already keeps for this shape, so the skeleton
+        // and a create cannot disagree about which two.
+        assert_eq!(names, vec![AGENTS, ABOUT, "workspace", "artifacts"]);
+        assert_eq!(
+            &names[2..],
+            crate::sessions::pattern::standard_dirs(Shape::Flat),
+            "the skeleton's directories are the create's, not a second list"
+        );
+        for dir in &files[2..] {
+            assert!(dir.dir, "{} is a directory to make", dir.name);
+            assert!(
+                dir.content.is_empty() && dir.kind.is_none(),
+                "a directory has no bytes and no kind — .gitkeep is for file-list copies"
+            );
+        }
 
         // Nothing here is stamped with an install-time minute, and nothing
         // states a title that a later session would inherit as its own.
