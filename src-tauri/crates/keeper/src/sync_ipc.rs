@@ -1429,10 +1429,38 @@ pub async fn sync_verify(
 ///
 /// Returns nothing: the effect shows up as the folder's own Pending list on the
 /// next walk, which is the thing the user was looking at when they pressed it.
+/// The remote half rides along (DW-208). "Recheck all files" is the one action
+/// whose plain meaning is *look at everything again*, and until now it looked
+/// only at the worktree — which cannot see the failure that actually loses
+/// content, a pointer whose object never reached the server. Nothing else in
+/// the engine ever retries one: uploads are queued only for files being freshly
+/// staged, so an obligation dropped once is dropped for good.
+///
+/// It runs after the rescan and its failure is not the button's failure: the
+/// local half has already taken effect, and a folder whose remote is
+/// unreachable must still be able to forget what it remembers. The repair is
+/// reported through the profile's own warnings, where the paths it could not
+/// recover are the part a human has to act on.
 #[tauri::command]
 pub async fn sync_rescan(state: tauri::State<'_, AppState>, id: String) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
-    engine.rescan(&id).map_err(|e| sync_ipc_error(&e))
+    engine.rescan(&id).map_err(|e| sync_ipc_error(&e))?;
+    match engine.republish_missing_objects(&id).await {
+        Ok(report) if report.missing > 0 => tracing::info!(
+            profile = id,
+            missing = report.missing,
+            queued = report.queued,
+            unrecoverable = report.unrecoverable.len(),
+            "recheck: re-publishing what the server was missing"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            profile = id,
+            error = %err,
+            "recheck: could not ask the server what it is missing"
+        ),
+    }
+    Ok(())
 }
 
 /// An `IpcError` carrying a message written for the person who will read it.

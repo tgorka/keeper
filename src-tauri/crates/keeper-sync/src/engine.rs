@@ -169,6 +169,21 @@ pub struct VerifyReport {
     pub bad: Vec<(String, String)>,
 }
 
+/// What one repair pass could and could not put back (DW-208).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepublishReport {
+    /// Objects the server does not have, whatever became of them here.
+    pub missing: u64,
+    /// Of those, the ones this machine can still supply and has queued.
+    pub queued: u64,
+    /// What that will cost to send.
+    pub queued_bytes: u64,
+    /// The rest: named, because a human knowing which files to go looking for
+    /// on which other machine is the only thing that can still recover them.
+    pub unrecoverable: Vec<lfs::audit::MissingObject>,
+}
+
 /// Why a path is not synced yet (Story 32.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Internally tagged, like `WorkKind`: the UI reads this as a discriminated
@@ -3595,6 +3610,26 @@ impl Engine {
     /// `push_unit` is this push's own journal row, when a journaled unit is
     /// driving. It is handed to the commit so the rows it records can name the
     /// work that will publish them (Story 34.16).
+    /// Push once, as the profile's own credential.
+    fn push_once(
+        &self,
+        profile: &SyncProfile,
+        refspec: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let git = self.git.clone();
+        let repo_path = profile.local_path.clone();
+        let refspec = refspec.to_owned();
+        let credential = self.credential(profile);
+        async move {
+            let credential = credential?;
+            tokio::task::spawn_blocking(move || {
+                git.push(&repo_path, "origin", &refspec, credential.as_ref())
+            })
+            .await
+            .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))?
+        }
+    }
+
     /// What a refused push means for *this* profile (DW-207).
     ///
     /// git says the same thing however the folder is configured — "! [rejected]
@@ -3604,48 +3639,83 @@ impl Engine {
     /// lane that is exactly right, because a human deciding is the point
     /// (AD-50).
     ///
-    /// On a **bidirectional profile sharing a branch** it is wrong, and wrong in
-    /// the way that stops a folder working. Being overtaken between the merge
-    /// and the push is what two machines syncing the same branch *do* — the
-    /// other one pushed first, which is the entire point of sharing it — and
-    /// the answer is the reconcile loop this engine already owns. Parking
-    /// instead makes every such race a manual chore, and each parked unit
-    /// leaves its commit unpublished while the next tick queues another push
-    /// that fails identically. Field shape: a folder whose PROBLEMS list is
-    /// dozens of identical "Push · stopped after 2 attempts", while its LFS
-    /// objects upload perfectly, because the objects never needed the ref.
+    /// On a **bidirectional profile sharing a branch** it is wrong. Being
+    /// overtaken between the merge and the push is what two machines syncing
+    /// one branch *do* — the other one pushed first, which is the entire point
+    /// of sharing it — and the answer is the reconcile this engine already
+    /// owns.
     ///
-    /// The reconcile has to be *queued*, not merely retried: a `Push` unit
-    /// re-runs [`Self::do_push`] alone, which would meet the same remote and
-    /// fail the same way. `Pull` is what fetches and merges, so it goes in
-    /// front, and the transient error is what brings the push back after it.
+    /// # Why the reconcile happens HERE, inline
     ///
-    /// `Diverged`'s own doc says bidirectional profiles never produce it. This
-    /// is the code that makes that true.
-    fn after_rejected_push(&self, profile: &SyncProfile, err: SyncError) -> Result<SyncError> {
+    /// The first cut of this queued a `Pull` and returned a transient error,
+    /// leaving the retry to the scheduler. Measured in the field, that spun:
+    /// **613 rejected pushes in 135 seconds**, ~4.5 per second, before the
+    /// queued reconcile finally got its turn. It converged — the merge ran, the
+    /// commits landed — but it hammered the forge six hundred times to do it
+    /// and burned the profile's failure counter on the way, so a folder that
+    /// was fixing itself told its owner "sync has failed 6 times in a row".
+    ///
+    /// The cause is queue ordering: every unpushed commit has queued its own
+    /// `Push` unit, `claim_ready` takes them in front of a `Pull` enqueued
+    /// afterwards, and each one meets the same unmoved remote. Fetching and
+    /// merging *in this unit*, then retrying *this* push, removes the ordering
+    /// question entirely: one reconcile, one retry, and the ordinary case ends
+    /// with nothing surfaced at all — which is what a race between two machines
+    /// deserves.
+    ///
+    /// Bounded on purpose: exactly one reconcile and one retry. If the remote
+    /// moved *again* in that window the error comes back transient, the
+    /// scheduler backs off, and the next pass tries the whole thing once more.
+    async fn reconcile_and_retry_push(
+        &self,
+        profile: &SyncProfile,
+        source: SyncSource,
+        refspec: &str,
+        err: SyncError,
+    ) -> Result<()> {
         let SyncError::Diverged { reason, .. } = &err else {
-            return Ok(err);
+            return Err(err);
         };
         // A lane, or a one-way profile: the remote moving is a decision, and
         // the human who owns the lane is the one who takes it.
         if profile.lane == SyncLane::Worktree || profile.direction == SyncDirection::PushOnly {
-            return Ok(err);
+            return Err(err);
         }
         let reason = reason.clone();
-        let now = self.platform.now_ms();
-        self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now))?;
-        // ...and look now rather than at the end of the poll interval: the
-        // remote has already moved, so there is nothing to wait for.
-        Self::lock(&self.next_scan_ms).remove(&profile.id);
         tracing::info!(
             profile = profile.name,
             %reason,
-            "the remote moved while pushing; reconciling and retrying"
+            "the remote moved while pushing; reconciling"
         );
-        Ok(SyncError::RemoteMoved {
-            profile: profile.name.clone(),
-            reason,
-        })
+
+        // Fetch and merge. `do_pull` commits settled work first, which is what
+        // lets the merge run at all, and it never pushes — so this cannot
+        // recurse back into here.
+        self.do_pull(profile, source).await?;
+
+        match self.push_once(profile, refspec).await {
+            Ok(()) => {
+                tracing::info!(
+                    profile = profile.name,
+                    "the reconcile landed and the push went through"
+                );
+                Ok(())
+            }
+            // Overtaken a second time inside one pass, or refused for a reason
+            // the reconcile cannot address. Transient either way: the scheduler
+            // backs off and the next pass reconciles again from scratch.
+            Err(again) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %again,
+                    "the push was still refused after reconciling"
+                );
+                Err(SyncError::RemoteMoved {
+                    profile: profile.name.clone(),
+                    reason,
+                })
+            }
+        }
     }
 
     async fn do_push(
@@ -3700,26 +3770,20 @@ impl Engine {
         event.files_total = (count > 0).then_some(count);
         self.publish(event);
 
-        let git = self.git.clone();
-        let repo_path = profile.local_path.clone();
         // A lane publishes ONLY its own branch. The base branch is never in
         // the refspec, so pushing over a human's work is impossible by
         // construction rather than by care (AD-50).
         let working = Self::working_branch(profile);
         let refspec = format!("refs/heads/{working}:refs/heads/{working}");
-        let credential = self.credential(profile)?;
         // Counted where the invocation is, not where it returns: an attempt
         // against an unreachable remote is still this policy firing, and a
         // session that claims "one push at the end" has to be able to show it
         // even when that push failed (Story 41.5).
         self.bump_counters(&profile.id, |counters| counters.pushes += 1);
-        let pushed = tokio::task::spawn_blocking(move || {
-            git.push(&repo_path, "origin", &refspec, credential.as_ref())
-        })
-        .await
-        .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))?;
+        let pushed = self.push_once(profile, &refspec).await;
         if let Err(err) = pushed {
-            return Err(self.after_rejected_push(profile, err)?);
+            self.reconcile_and_retry_push(profile, source, &refspec, err)
+                .await?;
         }
 
         if count > 0 {
@@ -5165,6 +5229,118 @@ impl Engine {
         Ok(lfs::audit::report(&specs, &paths, checked, bytes))
     }
 
+    /// Re-publish anything the server is missing that this machine can still
+    /// supply (DW-208).
+    ///
+    /// # Why nothing else does this
+    ///
+    /// `WorkKind::LfsUpload` is enqueued in exactly one place — `commit_local`,
+    /// for files being *freshly staged in that commit*. That is correct for the
+    /// path it serves and it means an obligation, once dropped, is never picked
+    /// up again: a file that is committed and unchanged produces no staging, so
+    /// no upload, so a pointer whose object silently never reached the server
+    /// stays that way forever. [`Self::rescan`] cannot help either — it forgets
+    /// the remembered tree state and asks for a walk, and a walk finds nothing
+    /// to stage in a file that has not changed.
+    ///
+    /// Measured on a real folder: 4 objects, 1.69 GB, committed 2026-08-10 and
+    /// still absent from the server a week later, through dozens of syncs,
+    /// several restarts and a "Recheck all files". Nothing in the engine was
+    /// ever going to try again.
+    ///
+    /// [`Self::audit_remote_objects`] is the half that *finds* them. This is
+    /// the half that fixes the ones that are fixable, and it is deliberately
+    /// separate: detection is read-only and safe to run anywhere, repair moves
+    /// gigabytes.
+    ///
+    /// # What "can still supply" means
+    ///
+    /// Two sources, in order of cost. The object may still be in this machine's
+    /// own store, in which case the upload is queued and the bytes are already
+    /// there. Otherwise the worktree file may *be* the content: re-cleaning it
+    /// hashes it back into the store and proves it, because a file whose digest
+    /// no longer matches the pointer is a different file and publishing it
+    /// under that oid would be a lie.
+    ///
+    /// Anything neither source can produce is reported, not papered over. Those
+    /// bytes exist on some other machine or nowhere, and the only thing that
+    /// helps is a human knowing which files to go looking for.
+    pub async fn republish_missing_objects(&self, id: &str) -> Result<RepublishReport> {
+        let audit = self.audit_remote_objects(id).await?;
+        let mut report = RepublishReport {
+            missing: audit.missing.len() as u64,
+            ..RepublishReport::default()
+        };
+        if audit.is_intact() {
+            return Ok(report);
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        store.ensure_layout()?;
+        let now = self.platform.now_ms();
+        // One upload per object, however many paths name it.
+        let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for object in &audit.missing {
+            if queued.contains(&object.oid) {
+                continue;
+            }
+            let absolute = profile.local_path.join(&object.path);
+            let have = store.contains(&object.oid, object.size) || {
+                // Not in the store. The worktree file may still be the content
+                // — that is the ordinary state on the machine that recorded it
+                // — so hash it back in and check what came out.
+                match lfs::stage::clean(&store, &absolute) {
+                    Ok(pointer) => pointer.oid == object.oid && pointer.size == object.size,
+                    Err(err) => {
+                        tracing::debug!(
+                            path = %object.path,
+                            error = %err,
+                            "cannot rebuild a missing object from the worktree"
+                        );
+                        false
+                    }
+                }
+            };
+            if !have {
+                report.unrecoverable.push(object.clone());
+                continue;
+            }
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            queued.insert(object.oid.clone());
+            report.queued += 1;
+            report.queued_bytes += object.size;
+        }
+
+        if report.queued > 0 {
+            // Look now: the whole point of pressing the button is not to wait.
+            self.wake_now(&profile.id);
+            tracing::info!(
+                profile = profile.name,
+                queued = report.queued,
+                bytes = report.queued_bytes,
+                "re-publishing objects the server was missing"
+            );
+        }
+        for object in &report.unrecoverable {
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!(
+                    "{} is not on the server and its content is not on this machine — {} bytes that only another machine can still supply",
+                    object.path, object.size
+                ),
+            );
+        }
+        Ok(report)
+    }
+
     /// Re-verify stored content for a profile (Story 25.6).
     pub async fn verify(&self, id: &str) -> Result<VerifyReport> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
@@ -5824,15 +6000,22 @@ mod tests {
         )
     }
     /// A shared branch overtaken by the other machine is weather, not a
-    /// decision (DW-207).
+    /// decision — and the reconcile happens *in this unit* (DW-207).
     ///
-    /// Field shape this reproduces: dozens of identical "Push · stopped after 2
-    /// attempts" on a bidirectional folder, while its LFS objects uploaded
-    /// perfectly — the objects never needed the ref. Each parked unit left its
-    /// commit unpublished and the next tick queued another that failed the same
-    /// way, so the folder never converged again without a human.
-    #[test]
-    fn a_bidirectional_push_the_remote_overtook_reconciles_instead_of_parking() {
+    /// The first cut queued a `Pull` and let the scheduler retry. Measured in
+    /// the field that spun 613 rejected pushes in 135 seconds before the
+    /// reconcile got its turn, because every unpushed commit had queued its own
+    /// `Push` and `claim_ready` takes those first. So the property under test
+    /// is ordering: the fetch has to be attempted *before* anything is handed
+    /// back to the scheduler.
+    ///
+    /// Asserted without a network by pointing the profile at a remote that
+    /// cannot resolve: the error that comes back is then the *pull's*, not
+    /// `RemoteMoved`. If the reconcile were skipped — deferred to a queue, as
+    /// it once was — this would answer `RemoteMoved` instead, which is exactly
+    /// the regression.
+    #[tokio::test]
+    async fn a_bidirectional_push_reconciles_before_it_retries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(engine) = engine(dir.path()) else {
             return;
@@ -5840,40 +6023,29 @@ mod tests {
         let profile = profile(dir.path());
         engine.upsert_profile(&profile).expect("store the profile");
 
-        let rejected = SyncError::Diverged {
-            profile: profile.name.clone(),
-            reason: "! refs/heads/main:refs/heads/main [rejected] (fetch first)".to_owned(),
-        };
-        let mapped = engine
-            .after_rejected_push(&profile, rejected)
-            .expect("mapping must not fail");
-
-        match &mapped {
-            SyncError::RemoteMoved { profile: named, .. } => assert_eq!(named, &profile.name),
-            other => panic!("expected RemoteMoved, got {other:?}"),
-        }
-        assert_eq!(
-            mapped.retriability(),
-            Retriability::Transient,
-            "a race has to come back on its own"
-        );
+        let err = engine
+            .reconcile_and_retry_push(
+                &profile,
+                SyncSource::Manual,
+                "refs/heads/main:refs/heads/main",
+                SyncError::Diverged {
+                    profile: profile.name.clone(),
+                    reason: "! refs/heads/main:refs/heads/main [rejected] (fetch first)".to_owned(),
+                },
+            )
+            .await
+            .expect_err("the fixture's remote does not resolve");
         assert!(
-            !mapped.needs_user_action(),
-            "nobody has a decision to make here"
+            !matches!(err, SyncError::RemoteMoved { .. }),
+            "the reconcile has to be attempted inline, not handed to the scheduler: {err:?}"
         );
-
-        // Queued, not merely retried: a `Push` unit re-runs the push alone and
-        // would meet the same remote. `Pull` is what fetches and merges.
-        let queued = engine
-            .with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::PULL))
-            .expect("count");
-        assert_eq!(queued, 1, "the reconcile has to be in front of the retry");
     }
 
     /// The case the permanent classification was written for stays permanent:
-    /// on a one-way lane a human deciding is the entire point (AD-50).
-    #[test]
-    fn a_one_way_lane_still_parks_on_a_rejected_push() {
+    /// on a one-way lane a human deciding is the entire point (AD-50). Both
+    /// shapes return before any git work, so neither touches the network.
+    #[tokio::test]
+    async fn a_one_way_lane_still_parks_on_a_rejected_push() {
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(engine) = engine(dir.path()) else {
             return;
@@ -5891,28 +6063,31 @@ mod tests {
             mutate(&mut profile);
             engine.upsert_profile(&profile).expect("store the profile");
 
-            let mapped = engine
-                .after_rejected_push(
+            let err = engine
+                .reconcile_and_retry_push(
                     &profile,
+                    SyncSource::Manual,
+                    "refs/heads/main:refs/heads/main",
                     SyncError::Diverged {
                         profile: profile.name.clone(),
                         reason: "(fetch first)".to_owned(),
                     },
                 )
-                .expect("mapping must not fail");
+                .await
+                .expect_err("a refused push on a lane is still an error");
             assert!(
-                matches!(mapped, SyncError::Diverged { .. }),
-                "a lane keeps its human: {mapped:?}"
+                matches!(err, SyncError::Diverged { .. }),
+                "a lane keeps its human: {err:?}"
             );
-            assert_eq!(mapped.retriability(), Retriability::Permanent);
+            assert_eq!(err.retriability(), Retriability::Permanent);
         }
     }
 
     /// Only a rejection is re-read. Everything else keeps the classification it
     /// arrived with — an auth failure that started retrying itself would spin
     /// against a credential that will never work.
-    #[test]
-    fn any_other_push_failure_passes_through_untouched() {
+    #[tokio::test]
+    async fn any_other_push_failure_passes_through_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(engine) = engine(dir.path()) else {
             return;
@@ -5920,16 +6095,19 @@ mod tests {
         let profile = profile(dir.path());
         engine.upsert_profile(&profile).expect("store the profile");
 
-        let mapped = engine
-            .after_rejected_push(
+        let err = engine
+            .reconcile_and_retry_push(
                 &profile,
+                SyncSource::Manual,
+                "refs/heads/main:refs/heads/main",
                 SyncError::Auth {
                     host: "forge.example.com".to_owned(),
                 },
             )
-            .expect("mapping must not fail");
-        assert!(matches!(mapped, SyncError::Auth { .. }), "{mapped:?}");
-        assert_eq!(mapped.retriability(), Retriability::Permanent);
+            .await
+            .expect_err("an auth failure stays a failure");
+        assert!(matches!(err, SyncError::Auth { .. }), "{err:?}");
+        assert_eq!(err.retriability(), Retriability::Permanent);
     }
 
     /// The supervisor ticks at 1 Hz so queued work starts promptly. Walking the
@@ -11253,15 +11431,13 @@ mod tests {
             durability.problem.is_none(),
             "a race that heals itself must not be reported as a failed publication: {durability:?}"
         );
-        // What *is* asserted: the reconcile is queued, so the retry meets a
-        // remote it can fast-forward from rather than the same rejection.
-        let reconcile = engine
-            .with_db(|conn| db::outstanding_count(conn, &p.id, WorkKind::PULL))
-            .expect("count the queue");
-        assert_eq!(
-            reconcile, 1,
-            "the push has to be preceded by the fetch and merge that make it land"
-        );
+        // The reconcile itself runs inline in `reconcile_and_retry_push`, so
+        // there is no queue entry to look for here; that ordering is what
+        // `a_bidirectional_push_reconciles_before_it_retries` pins down. What
+        // this test owns is the durability contract, and all three parts of it
+        // hold: the recording is committed, it is not yet on the remote, and
+        // nobody is told a publication failed.
+        assert!(!durability.verified);
         // The recording itself is untouched by any of it.
         assert!(segment.exists());
     }
