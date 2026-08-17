@@ -44,10 +44,13 @@
  * surface has, its toolbar is rendered by {@link MarkdownPane} because that is
  * what holds the live view, and a savable markdown file with no remembered
  * choice opens in it. A remembered choice still wins — the jar is read first and
- * only an absent answer takes the default — and a `note` choice this file cannot
- * honour still lights Preview. The two live panes also stop drawing a leading
- * `---` block that a properties FORM above them already draws, without changing
- * one byte of what a save writes.
+ * only an absent answer takes the default — and that memory is PER FORMAT, which
+ * is `view-mode.ts`'s own rule rather than a per-file one: the answer a reader
+ * gave for markdown is the answer for every markdown file, and no stored answer
+ * moves under anyone. A `note` choice this file cannot honour still lights
+ * Preview. The two live panes also stop drawing the leading `---` block the
+ * properties FORM above them is HOLDING — the form's own bytes, never a second
+ * parse of the buffer — without changing one byte of what a save writes.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
@@ -174,13 +177,22 @@ export interface RawRenderedViewProps {
    */
   noteMode?: boolean;
   /**
-   * Whether a properties FORM for this file is mounted above these views, so the
-   * live-preview panes must not draw the same block again as document text
-   * (Story 52.3, FR-304).
+   * The `---` block the properties FORM above these views is holding, or `null`
+   * when there is no form, when its read has not landed yet, and when that read
+   * refused (Story 52.3, FR-304).
    *
-   * The caller's fact, like {@link noteMode}: only the host knows whether it
-   * rendered a panel, and re-deriving "this file probably has one" here would be
-   * a second opinion about which addresses get properties.
+   * The BLOCK, and never a boolean about whether a form was mounted. The form's
+   * content is Rust's `file_properties::block_of` over the file ON DISK; a
+   * boolean made this component re-parse the live BUFFER to guess which bytes
+   * that form was drawing, and two recognisers over two sources is exactly how a
+   * form and a pane come to disagree. They did, four ways: the block was hidden
+   * from the first frame, before the read that fills the form had landed — and
+   * for good if that read refused; a file carrying a byte-order mark had its
+   * block drawn TWICE, because Rust skips the mark and `readFrontmatter` wants
+   * `---` at byte zero; a document whose first line is a `---` thematic break had
+   * its own first heading hidden from every view but Source; and typing `---` ⏎
+   * `---` at the top of a document made the shown text shorten under the caret,
+   * mid-edit.
    *
    * It is a DISPLAY concern and only that. The block stays in {@link content},
    * the Source tab still shows every character of the file, and an edit made in
@@ -189,7 +201,7 @@ export interface RawRenderedViewProps {
    * separate store field and this question never arises; on a file the buffer IS
    * the whole file, which is why the duplicate could exist at all.
    */
-  frontmatterInForm?: boolean;
+  frontmatterInForm?: string | null;
   /** The rendered view wrote the file; the host's buffer is now stale. */
   onExternalWrite?: () => void;
   /** 45.6's editor. See the module comment for why it is injected. */
@@ -411,27 +423,35 @@ function previewShape(options: MarkdownPreviewOptions | undefined): string {
 }
 
 /**
- * The document's leading `---` block, ending with the line ending that closes
- * it — or `""` when there is not one (Story 52.3, FR-304).
+ * The bytes at the head of `content` that ARE `block` — the block itself, or a
+ * byte-order mark and then the block — or `null` when the buffer does not carry
+ * that block at all (Story 52.3, FR-304).
  *
- * `readFrontmatter` and not a regex of this file's own: it is the frontend's one
- * reader of a leading block, the properties FORM this hides behind is drawn from
- * exactly the same parse, and a second recogniser here is how the form comes to
- * show a block the pane still draws as text. Its span stops at the closing
- * fence's last `-`, so the ending after it is added back: without that the body
- * would start with a blank line the file does not have, and a hidden block would
- * change the document's shape rather than only its visibility.
+ * `block` is the properties form's own, so nothing here recognises where a block
+ * starts or ends: this only asks whether the buffer still begins with the bytes
+ * the form is holding. That is the whole difference from the `readFrontmatter`
+ * parse this replaced — a pane may hide bytes because something else on screen
+ * is drawing them, and never because a second parser thinks they look like
+ * frontmatter.
  *
- * An unterminated `---` answers `""`, because `readFrontmatter` reports no block
- * for one. That is the safe direction: nothing is hidden from a document whose
- * form has nothing to show either.
+ * The mark is admitted because Rust deliberately leaves it out of its answer
+ * (`file_properties::block_of` says why, and `replace_block` re-attaches it), so
+ * without this a file Excel had touched would show its block in the form AND in
+ * the pane. It belongs to the PREFIX rather than to the body, so that what goes
+ * back in front of an edit is exactly what came off the front of it.
+ *
+ * Exported for `text-file-frame.tsx`, which splices a landed block over this
+ * same prefix rather than re-reading the file over somebody's unsaved text.
  */
-function frontmatterBlock(text: string): string {
-  const { block, newline } = readFrontmatter(text);
-  if (block === null) {
-    return "";
+export function leadingFormBlock(content: string, block: string | null | undefined): string | null {
+  if (block === null || block === undefined || block === "") {
+    return null;
   }
-  return text.slice(0, text.startsWith(newline, block.to) ? block.to + newline.length : block.to);
+  if (content.startsWith(block)) {
+    return block;
+  }
+  const mark = "\u{feff}";
+  return content.startsWith(mark) && content.startsWith(block, mark.length) ? mark + block : null;
 }
 
 /**
@@ -673,15 +693,42 @@ export function RawRenderedView({
   // On a file the buffer IS the whole file, YAML block included — unlike a note,
   // where frontmatter is a separate store field — so a host that draws the block
   // as a form above these views was drawing it twice: once as controls and once
-  // as document text. `frontmatterInForm` is the host saying it drew the form,
-  // which is the only fact that makes the second drawing redundant.
+  // as document text. `frontmatterInForm` is the block that form is HOLDING,
+  // which is the only thing that can say which bytes the second drawing is.
+  //
+  // Three things must be true to hide anything, and each one is a way this got it
+  // wrong while it was a boolean about whether a form was mounted:
+  //
+  // 1. The form holds a block. Nothing is hidden while its read is in flight —
+  //    a stat and a read that is hundreds of ms on a pendrive — or after it
+  //    refused, where the block would otherwise have been in neither the form nor
+  //    the text, for good.
+  // 2. The buffer's first bytes ARE that block (`leadingFormBlock`, which admits
+  //    the byte-order mark Rust leaves out of its answer). Nothing is hidden from
+  //    a buffer that has been typed into since, or from one that never matched:
+  //    hiding a length rather than a known prefix is what shortened the shown
+  //    text under the caret when somebody typed `---` ⏎ `---` at the top.
+  // 3. The form DRAWS those bytes. `readFrontmatter` here is the same call
+  //    `PropertiesPanel` makes on the same string, so it is the form's own answer
+  //    to "will the reader see these characters above the pane" and not a second
+  //    opinion about where a block is. It says no for a leading block that holds
+  //    no `key: value` line at all — `---\n# Heading\n---\nbody`, whose first
+  //    line is a thematic break — and that document's heading has to stay on
+  //    screen: the panel shows a tag row and nothing of it.
   //
   // The prefix is kept rather than discarded, because every byte of it goes back
   // in front of an edit before it reaches `onChange` or `onSave` below. The
   // Source tab is untouched: it is the file's characters, and hiding any of them
   // there would be a lie about what a save writes.
+  const inForm = rendered === "markdown" ? (frontmatterInForm ?? null) : null;
+  const carried = leadingFormBlock(content, inForm);
+  const drawnByForm = inForm === null ? null : readFrontmatter(inForm);
   const hiddenBlock =
-    frontmatterInForm === true && rendered === "markdown" ? frontmatterBlock(content) : "";
+    carried !== null &&
+    drawnByForm !== null &&
+    (drawnByForm.unparsed || drawnByForm.entries.length > 0)
+      ? carried
+      : "";
   /** What the live-preview panes are given. The whole buffer when nothing is
    *  hidden, which is every host that draws no properties form. */
   const shown = hiddenBlock === "" ? content : content.slice(hiddenBlock.length);

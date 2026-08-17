@@ -907,11 +907,19 @@ still an `about.md` is declined here and belongs to the verb below.
 
 ## Migrating the record's name
 
-Every flat session written before story 52.1 keeps its record in `about.md`, and
-`AGENTS.md` alone decides the shape now — so such a session reads with no record at all
-until its record is moved. That move is its own verb, one journaled plan per session, and
-it can be run for the whole zone at once because the record's name is a zone-wide
-contract.
+**Sessions → open the session → *Move records to README.md*.** Every flat session written
+before story 52.1 keeps its record in `about.md`, and `AGENTS.md` alone decides the shape
+now — so such a session reads with no record at all until its record is moved: no title, no
+pins, no lineage, and a board row that has lost its history. The session's own page says so
+and offers the verb, because that is the page whose emptiness is the symptom. Like every
+other verb that writes to your drive, it is a button you press.
+
+**One press moves the whole zone**, not just the session you are looking at. The record's
+name is a zone-wide contract and the pointer pass is zone-wide anyway, so fixing one row at
+a time would be forty presses for a break you did not make. It is a journaled plan per
+session and a session already at `README.md` compiles no plan at all, so the rest of the
+zone costs nothing. When it finishes it tells you how many records moved and names any
+session it had to skip.
 
 What it does, per session, in this order:
 
@@ -919,22 +927,37 @@ What it does, per session, in this order:
   and no `AGENTS.md` reads as folder-shaped, and moving its record without writing the
   contract file would leave it folder-shaped with a flat pool — every log invisible behind
   a `## Log` heading that is not there.
-- **Trashes an older migration's README signpost**, into `.keeper/trash/`, never an
-  unlink. That is the only `README.md` it will move out of the way, and it is recognised
-  by being tagged `ref` *and* pointing at `about.md`. Any other `README.md` in the way is
-  a **refusal** that names both paths: keeper will not choose for you which record to
-  keep.
-- **Rewrites every prose pointer at the record, across the zone.** A link written in one
-  session can name another session's record, so the sweep is not one folder. A session
-  still holding its own `about.md` is left alone — `[[about]]` there resolves to *that*
-  session's record, and it will be rewritten by that session's own run.
+- **Trashes whatever is standing on `README.md`**, into `.keeper/trash/`, never an unlink.
+  Two things can be: an older migration's signpost, recognised by being tagged `ref` *and*
+  pointing at `about.md`; or, in a session with **no `AGENTS.md`**, a `README.md` you put
+  there yourself. The second one is trashed too, and that is a decision worth stating: such
+  a session was *flat* before story 52.1, so `about.md` was its record and the `README.md`
+  was an ordinary file no reader ever took for one. It goes to the trash under its own key
+  so you can put it back under another name — and without that, the session had no way
+  forward at all, since keeper will not delete or rename a `README.md`.
+- **Refuses when the session HAS its `AGENTS.md` and a `README.md` you wrote.** There
+  keeper is already reading that `README.md` as the record while your `id`, pins and
+  lineage sit in `about.md`: two files hold record content and keeper chooses neither. The
+  refusal names both, and asks you to merge them by hand — the sweep goes on to the next
+  session and reports this one as skipped.
+- **Rewrites every prose pointer at the record, across the zone.** Two spellings: `about.md`
+  or `[[about]]` beside the file that says it, and the record's full path from the drive
+  root (`60-sessions/active/2026-08-10-keeper/about.md`), which is the only way a file in
+  *another* session can name this record and have keeper resolve it. A session still
+  holding its own `about.md` keeps its bare `[[about]]` — that resolves to *that* session's
+  record, and its own run will move it — but a full path naming this session is followed
+  wherever it was written.
 - **Moves the file, last.** One rename, never a copy-then-delete, so the bytes travel
   verbatim: every frontmatter key, the `id`, the `pinned` flag and the `keeper:` lineage
   map arrive untouched. The one thing left stale on purpose is a link the record holds *at
   itself*, because a byte-for-byte move cannot also edit what it moves.
 
-An `about.md` is an ordinary pool file after the move, and deletable like any other —
-`README.md` and `AGENTS.md` are the two a delete refuses now.
+**`about.md` is still not deletable, and will not be until this has run everywhere.**
+`README.md`, `AGENTS.md` and `about.md` are the three a delete refuses: moving the record's
+name moved nobody's files, so until a session's record has actually been moved, its
+`about.md` is the only place its identity, pins and lineage exist — and it renders in the
+About space as an ordinary row. That row's Delete is refused for the same reason
+`README.md`'s is.
 
 ## Finding things
 

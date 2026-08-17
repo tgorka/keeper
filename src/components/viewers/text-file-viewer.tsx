@@ -82,24 +82,31 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
   }, [vaults, file.profileId, file.relativePath]);
 
   /**
-   * Re-point this panel at the file the properties panel just renamed (Story
-   * 52.2, FR-302).
+   * Re-point the pane(s) showing this file at the file the properties panel just
+   * renamed (Story 52.2, FR-302).
    *
    * `next` is the new profile-relative subpath `sessions_file_rename` answered
    * with, passed to the store untouched: the old path plus the new title is a
-   * path composed in the webview, and AD-65 puts that in Rust. `setActiveTarget`
-   * retargets the panel in place — the gesture `session-detail.tsx` and
-   * `session-spaces.tsx` already open a session file with — so the reader keeps
-   * the pane they were reading in, now showing the same file at its new name.
+   * path composed in the webview, and AD-65 puts that in Rust.
+   *
+   * `retargetPanels` and not `setActiveTarget`, which is what this shipped with
+   * and was wrong in two ways the store's own doc spells out. The one that bites
+   * here: the title field commits on BLUR and a pane takes focus on
+   * `onMouseDown`, so "type the new title, then click the other pane" runs the
+   * focus change FIRST — and the single-click verb would then have re-pointed the
+   * pane the reader had just clicked into, destroying what it was showing and
+   * leaving this one on the address the rename emptied. Matching on the target
+   * moves whichever panes are actually holding this file, however many, whoever
+   * has focus by the time the command answers.
    *
    * Guarded INSIDE rather than by withholding the handler. Withholding it would
    * type-check just as well — a profile-less file mounts no `properties` and so
    * offers no rename to answer today — but it makes the file's no-profile case
    * fall back to `onWritten`, which means "re-read the address you have", and
-   * after a rename that is the address the rename emptied. Supplying it always
-   * means no arrangement of the frame's gate can turn this surface into one that
-   * re-reads a path a rename just moved. Shaped after {@link openInNotes}, which
-   * guards the same field the same way.
+   * after a rename that MOVED the file that is the address the rename emptied.
+   * Supplying it always means no arrangement of the frame's gate can turn this
+   * surface into one that re-reads a path a rename just moved. Shaped after
+   * {@link openInNotes}, which guards the same field the same way.
    */
   const repointAfterRename = useCallback(
     (next: string) => {
@@ -108,9 +115,12 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
       }
       panelsStore
         .getState()
-        .setActiveTarget({ kind: "file", profileId: file.profileId, relativePath: next });
+        .retargetPanels(
+          { kind: "file", profileId: file.profileId, relativePath: file.relativePath },
+          { kind: "file", profileId: file.profileId, relativePath: next },
+        );
     },
-    [file.profileId],
+    [file.profileId, file.relativePath],
   );
 
   /**

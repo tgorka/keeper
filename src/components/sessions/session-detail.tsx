@@ -41,6 +41,7 @@ import { Button } from "@/components/ui/button";
 import type {
   SessionDetailVm,
   SessionEntryVm,
+  SessionRecordMigrateVm,
   SessionReferencesVm,
   SessionSpaceFilesVm,
   SessionSpaceVm,
@@ -49,6 +50,7 @@ import type {
 import {
   listenSessionsChanged,
   sessionsDetail,
+  sessionsRecordMigrate,
   sessionsRefs,
   sessionsSpaceFiles,
   sessionsSpaces,
@@ -99,6 +101,55 @@ export const SESSION_DETAIL_NO_LOG = "No log entries yet.";
 export const SESSION_RECORD_NAME = "README.md";
 export const SESSION_DETAIL_OPEN_RECORD_LABEL = "Open README";
 
+/**
+ * The record-name migration, and the one place in the product it can be pressed
+ * (Story 52.1, FR-300).
+ *
+ * `sessions_record_migrate` shipped registered, wrapped and unreachable: nothing
+ * called it. That was not a missing convenience — story 52.1 narrowed
+ * `shape::shape` to `AGENTS.md` and repointed `sessions_root::row_for` at
+ * `README.md`, so every flat session already on somebody's drive (an `AGENTS.md`
+ * and an `about.md`, no `README.md`) parses an EMPTY record on the next rescan and
+ * loses its `id` to a `path:` fallback, with its title, its `pinned` flag and its
+ * `keeper:` lineage. `files::check_deletable` calls that "the worst failure shape
+ * there is because nothing looks broken". The remedy existed and could not be run.
+ *
+ * **Here, and sweeping the whole ZONE.** Two decisions:
+ *
+ * - The detail is where the failure is legible. This is the surface that draws the
+ *   record — its title, its properties, its log — so a session whose record keeps
+ *   its old name is a session that renders wrong *here*, which is where a person
+ *   arrives asking why. The board's row menu offers the shape verb ("Convert to
+ *   flat") per session; the record's name is not a per-session property.
+ * - `sessionId` is omitted, so one press moves every session in the zone. The
+ *   record's name is a zone-wide contract, the pointer pass is zone-wide whatever
+ *   is asked, and a per-session run would leave the operator pressing a button
+ *   once per broken row to fix a break they did not make. Per session it is
+ *   idempotent — an already-migrated session compiles an empty plan — so a sweep
+ *   costs the rest of the zone nothing.
+ *
+ * Offered only where this session still has an `about.md` at its root, read off
+ * the tree keeper already loaded: the button appears exactly where the failure is
+ * and disappears when it is fixed, rather than sitting on every session forever
+ * as a verb with nothing to do.
+ */
+export const SESSION_RECORD_MIGRATE_LABEL = "Move records to README.md";
+export const SESSION_RECORD_MIGRATE_NOTICE =
+  "This session's record is still about.md, so keeper reads it as a session with no record at all — no title, no pins, no lineage. Moving it is a verb you press; it runs for every session in this zone and keeps every byte of each record.";
+
+/**
+ * The answer's own label, so the sweep's outcome is addressable rather than "the
+ * one live region on the surface" — the spaces section has its own.
+ */
+export const SESSION_RECORD_MIGRATE_RESULT_LABEL = "Record migration";
+
+/** What the sweep answered, in the zone's own voice. */
+export function recordMigrateSentence(moved: number): string {
+  return moved === 0
+    ? "Nothing needed moving — every record in this zone is already at README.md."
+    : `Moved ${moved} ${moved === 1 ? "record" : "records"} to README.md.`;
+}
+
 export interface SessionDetailProps {
   rootId: string;
   /**
@@ -146,6 +197,19 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
    * crate's to make; this is what removes the press a person can perform.
    */
   const [writing, setWriting] = useState(false);
+
+  /**
+   * The record-name sweep: in flight, and what it answered.
+   *
+   * The answer is kept rather than discarded because a zone-wide run has two
+   * halves — what moved, and what keeper declined to move — and the second one is
+   * the whole reason the command reports rows instead of a count. A rejection is
+   * separate: that is a step that failed to write, and it has no `moved` to sit
+   * beside.
+   */
+  const [migrating, setMigrating] = useState(false);
+  const [migrated, setMigrated] = useState<SessionRecordMigrateVm | null>(null);
+  const [migrateError, setMigrateError] = useState<string | null>(null);
 
   /**
    * Restore the spaces' fold, and read the default it falls back to
@@ -346,6 +410,36 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     });
   }, [detail, rootId, subfolder]);
 
+  /**
+   * Whether this session still keeps its record under the old name, read off the
+   * tree this surface already has.
+   *
+   * The files are the truth (AD-110), and an `about.md` at the session's own root
+   * is the whole of the condition: `shape::shape` stopped reading that name in
+   * Story 52.1, so a session holding one renders from a record keeper never found.
+   * A tree that failed to load offers nothing rather than guessing.
+   */
+  const unmigrated =
+    tree?.entries.some((entry) => !entry.isDir && entry.relPath === "about.md") === true;
+
+  // The zone-wide sweep, with no `sessionId` — see SESSION_RECORD_MIGRATE_LABEL.
+  // Rust rescans the root when anything moved, so the record, the tree and the
+  // spaces all re-read through the changed event rather than from here.
+  const migrateRecords = useCallback(() => {
+    setMigrating(true);
+    setMigrateError(null);
+    sessionsRecordMigrate(rootId).then(
+      (report) => {
+        setMigrated(report);
+        setMigrating(false);
+      },
+      (e: unknown) => {
+        setMigrateError(e instanceof Error ? e.message : String(e));
+        setMigrating(false);
+      },
+    );
+  }, [rootId]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center gap-2 border-border border-b px-6 py-2">
@@ -401,6 +495,56 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               ))}
             </div>
           </header>
+
+          {/* The record's own name, where a session still keeps the old one
+              (Story 52.1, FR-300). A notice rather than a bare button: the
+              operator did not break this, keeper's own predicate change did, so
+              the surface says what happened before it offers the verb. */}
+          {unmigrated && (
+            <section
+              aria-label={SESSION_RECORD_MIGRATE_LABEL}
+              className="flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2"
+            >
+              <p className="text-muted-foreground text-sm">{SESSION_RECORD_MIGRATE_NOTICE}</p>
+              <div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={migrating}
+                  onClick={migrateRecords}
+                >
+                  {SESSION_RECORD_MIGRATE_LABEL}
+                </Button>
+              </div>
+            </section>
+          )}
+          {/* Outside the notice, because the notice disappears the moment the
+              record moves and the answer has to outlive it. */}
+          {migrated !== null && (
+            <div
+              role="status"
+              aria-label={SESSION_RECORD_MIGRATE_RESULT_LABEL}
+              className="rounded-md border border-border px-3 py-2 text-sm"
+            >
+              <p>{recordMigrateSentence(migrated.moved)}</p>
+              {migrated.skipped.length > 0 && (
+                <ul className="mt-1 flex flex-col gap-1 text-muted-foreground">
+                  {migrated.skipped.map((skip) => (
+                    <li key={skip.session}>
+                      <span className="font-medium">{skip.title}</span> ({skip.session}):{" "}
+                      {skip.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {migrateError !== null && (
+            <div role="alert" className="rounded-md bg-destructive/10 p-3 text-destructive text-sm">
+              {migrateError}
+            </div>
+          )}
 
           {/* The properties widget (FR-227): user-tier frontmatter, read here,
               edited in the README's own properties panel — one writer. */}

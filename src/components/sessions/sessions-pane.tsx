@@ -150,13 +150,15 @@ export function SessionsPane() {
   // external changes, the raw/rendered toggle — is Epic 45/46 machinery,
   // reused rather than rebuilt.
   //
-  // **The name is imported, not typed.** This composed a literal `README.md`
-  // with no shape branch, which was wrong for every flat session on the drive:
-  // a flat session's record was `about.md`, so opening a row from here landed
-  // the operator on the missing-file sentence. That was broken before Story
-  // 52.1 and is fixed here on its own merits — by reading the one constant the
-  // detail's own header reads, so the two surfaces cannot come to name
-  // different files again.
+  // **The name is imported, not typed.** This composed a literal `README.md` and
+  // still does: `SESSION_RECORD_NAME` is that same string, so nothing about what
+  // this opens changed with Story 52.1 — the refactor buys one reader of the
+  // record's name instead of three, so the board, the detail and the ⌘⌥L handler
+  // cannot come to name different files. What makes a row's target CORRECT for a
+  // session written before that story is the record having been moved:
+  // `sessions_record_migrate`, offered on the detail. Until it has run for a
+  // session, this path names a file that is not there, and no spelling of the
+  // constant here can change that.
   const openReadme = useCallback((rootId: string, subfolder: string, sessionPath: string) => {
     panelsStore.getState().setActiveTarget({
       kind: "file",

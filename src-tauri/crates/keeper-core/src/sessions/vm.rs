@@ -437,6 +437,42 @@ pub struct SessionMigrationVm {
     pub trashes: Vec<String>,
 }
 
+/// What a record-name sweep did, and what it could not do (story 52.1, FR-300).
+///
+/// The zone-wide run is the ordinary one — the record's name is a zone-wide
+/// contract — so a count alone is not an answer: one session holding a
+/// `README.md` keeper will not choose about is a session the sweep must skip
+/// while migrating every other row, and an operator told only "12" would never
+/// learn that two are still broken. A partial success reports both halves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecordMigrateVm {
+    /// How many sessions actually had their record moved. Zero is an ordinary
+    /// answer — a zone that was already swept — and is why this is not a
+    /// failure.
+    pub moved: u32,
+    /// The sessions the sweep passed over, each with the compiler's own refusal
+    /// sentence. Empty on a clean run.
+    pub skipped: Vec<SessionRecordSkipVm>,
+}
+
+/// One session a record-name sweep could not move, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecordSkipVm {
+    /// Zone-relative folder path — where to go and look.
+    pub session: String,
+    /// The session's own title, so the sentence names what the operator calls it
+    /// rather than only where it is.
+    pub title: String,
+    /// [`crate::sessions::migrate::RecordRenameError`]'s sentence, verbatim: it
+    /// already names both files and what to do about them, and a second wording
+    /// here would be a second contract.
+    pub reason: String,
+}
+
 /// One space definition in a zone's `_spaces/`, projected for the rail and the
 /// editor (FR-261, AD-121).
 ///

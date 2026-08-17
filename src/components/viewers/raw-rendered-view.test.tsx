@@ -1338,12 +1338,16 @@ describe("Note mode has the writing tools (Story 52.3)", () => {
 /** A file whose first bytes are a properties block, and the body under it. */
 const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
 const BODY = "# Weekly\n\nalpha\n";
+/** The byte-order mark Excel and Notepad leave in front of a file. Rust leaves
+ *  it out of the block it answers with — `file_properties::block_of` — so the
+ *  buffer carries a byte the form's block does not. */
+const MARK = "\u{feff}";
 
 describe("the frontmatter block is drawn once (Story 52.3)", () => {
-  it("row 4: keeps the block out of the Note pane when a form is mounted above", async () => {
+  it("row 4: keeps the block out of the Note pane when the form is holding it", async () => {
     const { container, view } = await openNote({
       initial: BLOCK + BODY,
-      frontmatterInForm: true,
+      frontmatterInForm: BLOCK,
     });
 
     // The document the pane holds is the body, exactly — not the body plus a
@@ -1364,12 +1368,102 @@ describe("the frontmatter block is drawn once (Story 52.3)", () => {
     expect(view.state.doc.toString()).toBe(BLOCK + BODY);
   });
 
+  it("draws it as text while the form's read is still out, and if it refused", async () => {
+    // `null` is both of those states — `FileProperties` reports it at the start of
+    // every read and again when the read rejects — and it is the state a file on a
+    // pendrive is in for the first hundreds of milliseconds. Hiding on "a form was
+    // mounted" hid the block from the FIRST frame, so those bytes were in neither
+    // the form nor the text, and permanently so for a read that refused.
+    const { view } = await openNote({ initial: BLOCK + BODY, frontmatterInForm: null });
+
+    expect(view.state.doc.toString()).toBe(BLOCK + BODY);
+  });
+
+  it("draws it as text when the form's block is not what the buffer begins with", async () => {
+    // The disagreeing case: the form is holding the block that was on disk and the
+    // buffer's first bytes are something else. Hiding a LENGTH here — or hiding
+    // whatever a second parser thought looked like a block — is how bytes nothing
+    // on screen accounts for disappear.
+    const { view } = await openNote({
+      initial: `---\ntitle: Renamed\n---\n${BODY}`,
+      frontmatterInForm: BLOCK,
+    });
+
+    expect(view.state.doc.toString()).toBe(`---\ntitle: Renamed\n---\n${BODY}`);
+  });
+
+  it("hides the byte-order mark with the block, because Rust left it out", async () => {
+    // Excel's marker. Rust skips it and answers with the block alone, and
+    // `readFrontmatter` wants `---` at byte zero — so while this seam re-parsed
+    // the buffer, the two disagreed and the block was drawn in the form AND in the
+    // pane, which is FR-304 unmet on exactly these files.
+    const saved: string[] = [];
+    const { view } = await openNote({
+      initial: MARK + BLOCK + BODY,
+      frontmatterInForm: BLOCK,
+      onSaved: (text) => saved.push(text),
+    });
+
+    expect(view.state.doc.toString()).toBe(BODY);
+
+    // And the mark comes back with the block, in front of the edit: it belongs to
+    // the file, and a save that dropped it would be this pane rewriting a byte
+    // nobody asked it to touch.
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.keyDown(view.contentDOM, { key: "s", ...MOD });
+    await settle();
+
+    expect(saved).toEqual([`${MARK}${BLOCK}# Weekly\n\nalpha\nbeta\n`]);
+  });
+
+  it("keeps a leading thematic break on screen, because the form draws none of it", async () => {
+    // `---` ⏎ `# Heading` ⏎ `---` is a document whose first line is a thematic
+    // break, and Rust calls it frontmatter. The FORM shows a tag row and not one
+    // character of the heading, so hiding the span left the reader's own prose on
+    // no screen but the Source tab.
+    const brokenUp = `---\n# Heading\n---\n${BODY}`;
+    const { container, view } = await openNote({
+      initial: brokenUp,
+      frontmatterInForm: `---\n# Heading\n---\n`,
+    });
+
+    expect(view.state.doc.toString()).toBe(brokenUp);
+    expect(container.textContent).toContain("Heading");
+  });
+
+  it("hides a block the form cannot parse, which it draws verbatim instead", async () => {
+    // `PropertiesPanel`'s unparsed arm renders the block exactly as it is on disk,
+    // so those characters ARE on screen above the pane — the one thing hiding
+    // depends on. A rule that only counted `key: value` rows would draw this one
+    // twice.
+    const odd = "---\n!anchored\n---\n";
+    const { view } = await openNote({ initial: odd + BODY, frontmatterInForm: odd });
+
+    expect(view.state.doc.toString()).toBe(BODY);
+  });
+
+  it("does not shorten the shown text under the caret when a block is typed", async () => {
+    // Story 52.3's own defect, and the reason this seam is the form's block rather
+    // than a parse of the buffer: with the buffer as the source, the moment a
+    // reader typed the closing `---` his first three lines vanished from the pane
+    // he was typing in. The form is holding no block for an unblocked file, so
+    // there is nothing to hide however the document grows.
+    const { view } = await openNote({ initial: "", frontmatterInForm: "" });
+
+    await typeAtCaret(view, "---\n---\nhi");
+
+    expect(view.state.doc.toString()).toBe("---\n---\nhi");
+  });
+
   it("row 4: the Source tab still shows every byte of the file", async () => {
     render(
       markdownHost({
         cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Araw`),
         initial: BLOCK + BODY,
-        frontmatterInForm: true,
+        frontmatterInForm: BLOCK,
       }),
     );
     await settle();
@@ -1383,7 +1477,7 @@ describe("the frontmatter block is drawn once (Story 52.3)", () => {
     const saved: string[] = [];
     const { view } = await openNote({
       initial: BLOCK + BODY,
-      frontmatterInForm: true,
+      frontmatterInForm: BLOCK,
       onSaved: (text) => saved.push(text),
     });
 

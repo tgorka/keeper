@@ -72,7 +72,7 @@ import {
   syncReadFrontmatter,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
-import { panelsStore, sameTarget } from "@/lib/stores/panels";
+import { panelsStore } from "@/lib/stores/panels";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /**
@@ -322,20 +322,25 @@ export function SpaceRowMenu({
       .then((nextSubpath) => {
         // Story 52.2: the rename answers with the file's new profile-relative
         // subpath, and a pane left on the old one renders "is no longer in
-        // tgdrive" over a file that merely changed its name. So the pane follows
-        // it — through `onOpen`, the section's own opener, because a
-        // `setActiveTarget` call here would be a second implementation of the
-        // row's click. The subpath is passed through untouched (AD-65).
+        // tgdrive" over a file that merely changed its name. So the panes showing
+        // it follow it. The subpath is passed through untouched (AD-65).
         //
-        // Guarded on the active panel actually SHOWING this file, which is the
-        // difference between following a rename and hijacking a panel: only the
-        // active panel can be re-pointed, and if it is showing something else
-        // then nothing here is stale and a rename must not change what it shows.
-        const { panels, activeId } = panelsStore.getState();
-        const active = panels.find((panel) => panel.id === activeId);
-        if (active !== undefined && sameTarget(active.target, target)) {
-          onOpen(nextSubpath);
-        }
+        // Matched on the TARGET, never on which pane has focus, and that is the
+        // difference between following a rename and hijacking a pane. The
+        // requirement is "do not move a pane that is not showing this file", and
+        // the target says that exactly: a pane showing the file follows whether
+        // or not it is the focused one, a pane showing something else is left
+        // alone, and a focus change while the round trip is in flight — a whole
+        // `syncReadFrontmatter` plus `sessionsFileRename` — can no longer decide
+        // which pane a rename moves. `retargetPanels` rather than the section's
+        // `onOpen` for the same reason `onOpen` was right for the row's click and
+        // wrong here: the opener moves the ACTIVE pane, which after a rename is
+        // whichever one the reader happened to click into last.
+        panelsStore.getState().retargetPanels(target, {
+          kind: "file",
+          profileId: rootId,
+          relativePath: nextSubpath,
+        });
         onChanged();
       })
       .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SPACE_ROW_RENAME_FAILED)));

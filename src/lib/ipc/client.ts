@@ -211,6 +211,8 @@ export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
+export type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
+export type { SessionRecordSkipVm } from "./gen/SessionRecordSkipVm";
 export type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 export type { SessionRefAddReq } from "./gen/SessionRefAddReq";
 export type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
@@ -363,6 +365,7 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
 import type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
@@ -5924,21 +5927,27 @@ export async function sessionsMigrate(rootId: string, sessionId: string): Promis
  *
  * What it does per session: writes `AGENTS.md` first where a hand-built session
  * never had one (without it the move would silently leave the session
- * folder-shaped), trashes an older migration's README signpost into
- * `.keeper/trash/`, rewrites every prose pointer at the record across the zone,
- * and moves the file last. The record's bytes are never recomposed — every
- * frontmatter key, the `pinned` flag and the `keeper:` lineage map arrive
- * untouched.
+ * folder-shaped), trashes into `.keeper/trash/` whatever is standing on the
+ * destination — an older migration's README signpost, or somebody's own
+ * `README.md` in a session that has no `AGENTS.md` and therefore kept its record
+ * in `about.md` — rewrites every prose pointer at the record across the zone, and
+ * moves the file last. The record's bytes are never recomposed: every frontmatter
+ * key, the `pinned` flag and the `keeper:` lineage map arrive untouched.
  *
- * Answers with how many sessions actually changed, so a run that needed nothing
- * does not look like one that failed.
+ * Answers with `moved` and one `skipped` row per session keeper declined to
+ * compile a plan for — a `README.md` in the way of a session that HAS its
+ * `AGENTS.md`, where two files hold record content and keeper chooses neither.
+ * A refusal never ends the sweep: the rest of the zone still migrates, and the
+ * answer says which rows did not.
  *
  * Rejects with: `internal` (unknown root, a root that has not scanned yet, an
- * unknown session, a `README.md` in the way that no migration wrote — the
- * refusal names both paths and nothing is written), `unsupported`.
+ * unknown session, a step that failed to write), `unsupported`.
  */
-export async function sessionsRecordMigrate(rootId: string, sessionId?: string): Promise<number> {
-  return await invoke<number>("sessions_record_migrate", { rootId, sessionId });
+export async function sessionsRecordMigrate(
+  rootId: string,
+  sessionId?: string,
+): Promise<SessionRecordMigrateVm> {
+  return await invoke<SessionRecordMigrateVm>("sessions_record_migrate", { rootId, sessionId });
 }
 
 /**

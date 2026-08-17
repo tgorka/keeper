@@ -301,4 +301,50 @@ describe("the favicons", () => {
     expect(readme).toContain(FAVICON);
     expect(readme).toContain(FAVICON_ICO);
   });
+
+  it("lets the vector win: rasters sized, SVG last", () => {
+    // The half of the reference that actually decides which icon a tab shows.
+    // Chromium prefers a RASTER over an SVG whenever the raster's link declares
+    // no size (crbug.com/1162276); the published workaround is to give every
+    // raster link an explicit `sizes` and list the vector last, so that among
+    // equally-eligible candidates the later understood one wins. Presence alone
+    // does not encode any of that: reorder the three links, or drop a `sizes`,
+    // and the tab silently falls back to a downscaled raster with every other
+    // check still green.
+    const html = readFileSync("index.html", "utf8");
+    const png = readPng(FAVICON);
+    // Anchored on the href rather than the bare filename: the comment above the
+    // links names `favicon.ico` in prose, so a bare indexOf would measure the
+    // COMMENT and stay green after the links themselves were reordered.
+    const linkAt = (file: string) => html.indexOf(`href="./${file}"`);
+    for (const file of [FAVICON, FAVICON_SVG, FAVICON_ICO]) {
+      expect(linkAt(file), `no <link> for ${file} to order`).toBeGreaterThan(-1);
+    }
+    expect(
+      html,
+      'the ICO link must declare sizes="any" — an unsized raster link is exactly ' +
+        "the candidate Chromium prefers over the SVG (crbug.com/1162276), and " +
+        '"any" is what tells it to pick from the sizes inside the file',
+    ).toContain(`href="./${FAVICON_ICO}" sizes="any"`);
+    expect(
+      html,
+      `the PNG link must declare its real size, sizes="${png.width}x${png.height}" — ` +
+        "an unsized raster link is exactly the candidate Chromium prefers over the " +
+        "SVG (crbug.com/1162276), so leaving the PNG unsized re-creates the bug the " +
+        "ICO's sizes attribute exists to defeat",
+    ).toContain(`href="./${FAVICON}" sizes="${png.width}x${png.height}"`);
+    expect(
+      linkAt(FAVICON_SVG) > linkAt(FAVICON_ICO),
+      "the SVG link must come AFTER the ICO link: where several links match, a " +
+        "browser takes the last one it understands, and that ordering is the only " +
+        "thing making the vector — not a downscaled raster — the icon Chromium " +
+        "draws in the tab (crbug.com/1162276)",
+    ).toBe(true);
+    expect(
+      linkAt(FAVICON_SVG) > linkAt(FAVICON),
+      "the SVG link must come AFTER the PNG link, for the same reason: the last " +
+        "understood match wins, so a vector listed above a raster loses the tab " +
+        "(crbug.com/1162276)",
+    ).toBe(true);
+  });
 });

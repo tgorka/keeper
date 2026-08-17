@@ -19,6 +19,10 @@ const listenSessionsChanged = vi.fn();
 // The fold default the detail reads on mount (Story 49.3): named here rather
 // than stubbed inline, because the restore cases below turn it on and off.
 const sessionsSpacesFoldedGet = vi.fn();
+// The record-name sweep (Story 52.1, FR-300). Named because the press is the
+// whole of what makes the verb reachable: it shipped registered, wrapped and
+// called by nothing.
+const sessionsRecordMigrate = vi.fn();
 // The board's one write (FR-263), named because Story 51.7 asserts it is
 // reachable on a folder-shaped session — the surface where the board itself was
 // absent until this story.
@@ -32,6 +36,8 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsSpaces: (rootId: unknown) => sessionsSpaces(rootId),
   sessionsSpaceFiles: (rootId: unknown, sessionId: unknown) =>
     sessionsSpaceFiles(rootId, sessionId),
+  sessionsRecordMigrate: (rootId: unknown, sessionId: unknown) =>
+    sessionsRecordMigrate(rootId, sessionId),
   // The spaces section's write path, unreachable from these cases but imported
   // by the module under test — a mock factory that omits an export makes the
   // import itself throw, not the call.
@@ -88,11 +94,15 @@ import {
   SESSION_BOARD_MOVE_LABEL,
 } from "@/components/sessions/session-board";
 import {
+  recordMigrateSentence,
   SESSION_DETAIL_FILES_HEADING,
   SESSION_DETAIL_LOG_HEADING,
   SESSION_DETAIL_OPEN_RECORD_LABEL,
   SESSION_DETAIL_PROPERTIES_HEADING,
   SESSION_DETAIL_WORKSPACE_CAVEAT,
+  SESSION_RECORD_MIGRATE_LABEL,
+  SESSION_RECORD_MIGRATE_NOTICE,
+  SESSION_RECORD_MIGRATE_RESULT_LABEL,
   SessionDetail,
 } from "@/components/sessions/session-detail";
 import { SESSION_FILE_NEW_PROMPT_LABEL } from "@/components/sessions/session-file-actions";
@@ -310,6 +320,8 @@ beforeEach(() => {
   // Unfolded, which is the registry's own default. A case that wants the other
   // answer says so.
   sessionsSpacesFoldedGet.mockResolvedValue(false);
+  // A clean sweep, which is what a zone already at `README.md` answers.
+  sessionsRecordMigrate.mockResolvedValue({ moved: 0, skipped: [] });
   panelsStore.setState(panelsStore.getInitialState(), true);
   resetNotesVaultsStoreForTest();
 });
@@ -430,6 +442,67 @@ describe("SessionDetail", () => {
         });
       });
     }
+  });
+
+  /**
+   * The record-name migration, pressed (Story 52.1, FR-300).
+   *
+   * `sessions_record_migrate` shipped registered in `lib.rs`, wrapped in
+   * `client.ts` and called by nothing: grepping `src/` for
+   * `sessionsRecordMigrate` found only its own definition. That is the story's
+   * own remedy being unreachable — and the story is what made it necessary, by
+   * narrowing `shape()` to `AGENTS.md` and repointing `row_for` at `README.md`,
+   * so every flat session on a drive parses an empty record until this runs.
+   *
+   * Three claims, and the second is the one a count could not carry:
+   * the press happens on the surface that renders the broken record, it sweeps
+   * the ZONE (no `sessionId`, because the record's name is not a per-session
+   * property), and a refusal for one session is reported beside what moved
+   * instead of ending the run.
+   */
+  it("presses the record migration for the whole zone and reports what it skipped", async () => {
+    sessionsTree.mockResolvedValue(
+      tree({ entries: [entry({ name: "AGENTS.md" }), entry({ name: "about.md" })] }),
+    );
+    sessionsRecordMigrate.mockResolvedValue({
+      moved: 3,
+      skipped: [
+        {
+          session: "active/2026-05-01-hand-built",
+          title: "a session somebody built by hand",
+          reason: "active/2026-05-01-hand-built/about.md cannot move to …/README.md: …",
+        },
+      ],
+    });
+
+    mount();
+    const notice = await screen.findByRole("region", { name: SESSION_RECORD_MIGRATE_LABEL });
+    expect(within(notice).getByText(SESSION_RECORD_MIGRATE_NOTICE)).toBeInTheDocument();
+    fireEvent.click(within(notice).getByRole("button", { name: SESSION_RECORD_MIGRATE_LABEL }));
+
+    await waitFor(() => {
+      expect(sessionsRecordMigrate).toHaveBeenCalledTimes(1);
+    });
+    expect(sessionsRecordMigrate).toHaveBeenCalledWith("tgdrive", undefined);
+
+    const said = await screen.findByRole("status", { name: SESSION_RECORD_MIGRATE_RESULT_LABEL });
+    expect(said).toHaveTextContent(recordMigrateSentence(3));
+    expect(said).toHaveTextContent("a session somebody built by hand");
+    expect(said).toHaveTextContent("cannot move to");
+  });
+
+  /**
+   * And it is offered nowhere else: a session whose record is already at
+   * `README.md` has nothing to press, so the verb does not sit on every session
+   * in the product forever.
+   */
+  it("offers the record migration only where an about.md is still there", async () => {
+    mount();
+    await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
+    expect(
+      screen.queryByRole("region", { name: SESSION_RECORD_MIGRATE_LABEL }),
+    ).not.toBeInTheDocument();
+    expect(sessionsRecordMigrate).not.toHaveBeenCalled();
   });
 
   /**

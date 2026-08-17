@@ -859,15 +859,37 @@ export interface FilePropertiesProps {
    * showing it should be re-ADDRESSED rather than re-read (Story 52.2, FR-302).
    *
    * Supplied only by a host that holds a panel target it can move. Called
-   * INSTEAD of {@link onWritten} for a rename, because the two are opposite
-   * instructions: `onWritten` says "read the address you have again", and after
-   * a rename that address is the one Rust just emptied — which is what put "is
-   * no longer in tgdrive" over a file that had merely been renamed.
+   * INSTEAD of {@link onWritten} for a rename that MOVED the file, because for
+   * that one the two are opposite instructions: `onWritten` says "read the
+   * address you have again", and after a move that address is the one Rust just
+   * emptied — which is what put "is no longer in tgdrive" over a file that had
+   * merely been renamed.
+   *
+   * **A rename that moved nothing gets `onWritten` even here**, because then the
+   * address the host holds is still the right one and re-reading it is exactly
+   * what has to happen: `sessions_file_rename` writes the new title either way,
+   * and it answers with the path it was given for the session record — whose
+   * filename the shape reader keys on (`files::renames`) — and for any title
+   * whose slug is unchanged (`files::rename_target`). Calling `onRenamed` with a
+   * path the host already holds re-points nothing, so the buffer beside this
+   * panel would still be holding the OLD block and the next Save would put it
+   * back. That is the one way this panel could lose somebody's edit, and it is
+   * the whole reason this hook is not the unconditional answer to a rename.
    *
    * `nextRelativePath` is the subpath `sessions_file_rename` answered with,
    * passed through untouched. Never the old path plus the new title (AD-65).
    */
   onRenamed?: (nextRelativePath: string) => void;
+  /**
+   * The `---` block this panel is holding, or `null` while the read is out — and
+   * `null` again if it refuses (Story 52.3).
+   *
+   * The pane below hides exactly the bytes this form holds, so what travels is
+   * the block itself and never a boolean about whether a form was mounted — a
+   * boolean is how the two came to disagree about a BOM'd file and about the
+   * first frame, before the read resolved.
+   */
+  onBlock?: (block: string | null) => void;
 }
 
 /**
@@ -903,20 +925,26 @@ export interface FilePropertiesProps {
  * renamed or deleted outside keeper." That rule is right for a file renamed on
  * another device and wrong here, because here keeper knows exactly where the
  * file went: `sessions_file_rename` answers with the new subpath for this
- * purpose (`sessions_ipc.rs:3419-3420`).
+ * purpose (`sessions_ipc.rs:3655-3656`).
  *
  * So a host that holds a panel target passes {@link FilePropertiesProps.onRenamed}
- * and re-points it with that answer. No new store verb was needed — the panels
- * store's own `setActiveTarget` is the retarget-in-place gesture every other
- * sessions surface already opens a file with. A host that passes no `onRenamed`
- * is unchanged, which is what keeps the note embed and every other caller on
- * today's behaviour.
+ * and re-points it with that answer — through the panels store's own
+ * `retargetPanels`, which is the verb for this and not the single-click one: a
+ * rename moves the panels that are SHOWING the file rather than the one that has
+ * focus, and a title commits on blur, so the click that moved focus lands first.
+ * A host that passes no `onRenamed` is unchanged, which is what keeps the note
+ * embed and every other caller on today's behaviour.
+ *
+ * And a rename that answered with the path the panel already holds is `onWritten`
+ * rather than `onRenamed` — see {@link FilePropertiesProps.onRenamed}, because
+ * that arm is where this feature could have cost somebody their retitle.
  */
 export function FileProperties({
   profileId,
   relativePath,
   onWritten,
   onRenamed,
+  onBlock,
 }: FilePropertiesProps) {
   const [block, setBlock] = useState<string | null>(null);
   // Bumped by the re-read the clobber refusal offers. A counter rather than a
@@ -946,6 +974,13 @@ export function FileProperties({
     };
   }, [profileId, relativePath, reload]);
 
+  // Reported from an effect rather than from the call sites of `setBlock`, so the
+  // pending state — `null`, set at the start of every read — is reported too. A
+  // host that hides these bytes has to know about the frame before they arrive.
+  useEffect(() => {
+    onBlock?.(block);
+  }, [block, onBlock]);
+
   if (block === null) {
     return null;
   }
@@ -965,21 +1000,38 @@ export function FileProperties({
             },
           ),
         // The block is not adopted from the answer here, unlike `write` above:
-        // this command answers with the file's new SUBPATH, and the block the
-        // panel is holding now belongs to a path this component is no longer
-        // addressed by.
+        // this command answers with the file's new SUBPATH rather than with the
+        // block it wrote.
         //
         // That subpath is forwarded rather than dropped, because it is the only
         // thing that can tell a host WHERE the file went — Rust returns it for
-        // exactly this (`sessions_ipc.rs:3419-3420`) and joining the old path to
+        // exactly this (`sessions_ipc.rs:3655-3656`) and joining the old path to
         // the new title here would be the webview composing a path (AD-65). A
         // host that can re-address itself gets `onRenamed` and does not want
         // `onWritten`: re-reading the old address is what rendered "is no longer
         // in tgdrive" over a file that had only been renamed. A host with no
         // panel target to move gets today's `onWritten` unchanged.
+        //
+        // **And so does a rename that answered with the path this panel is
+        // already addressed by**, which is not an edge case: it is the session
+        // record and every other one of the three names whose filename does not
+        // follow its title (`files::renames`), and it is any title edit whose
+        // slug is unchanged (`files::rename_target`). The title was still
+        // written, so the bytes beside this panel are stale, and `onRenamed`
+        // with a path its host already holds re-points nothing — the buffer
+        // would keep the OLD block and the next Save would put it back, which is
+        // the one way this panel could lose somebody's edit. So the news goes to
+        // `onWritten`, and this panel re-reads its own block for the same
+        // reason: it is holding a block that no longer matches the file, and the
+        // next property edit spliced out of it would refuse as a clobber.
         rename: (nextBlock) =>
           sessionsFileRename(profileId, relativePath, block, nextBlock).then(
             (nextRelativePath) => {
+              if (nextRelativePath === relativePath) {
+                setReload((n) => n + 1);
+                onWritten();
+                return;
+              }
               if (onRenamed === undefined) {
                 onWritten();
                 return;

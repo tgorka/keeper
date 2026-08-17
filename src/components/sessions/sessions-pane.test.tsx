@@ -47,6 +47,7 @@ import {
   SESSION_ACTIONS_LABEL,
   SESSION_NEW_LIKE_THIS_LABEL,
 } from "@/components/sessions/session-actions";
+import { SESSION_RECORD_NAME } from "@/components/sessions/session-detail";
 import {
   SESSION_PATTERN_INSTALL_LABEL,
   SESSION_PATTERN_LABEL,
@@ -77,6 +78,7 @@ import {
   SESSIONS_TEMPLATES_LABEL,
   SessionsPane,
 } from "@/components/sessions/sessions-pane";
+import { panelsStore } from "@/lib/stores/panels";
 import { resetSessionsListStoreForTest, sessionsListStore } from "@/lib/stores/sessions-list";
 import { resetSessionsRootsStoreForTest } from "@/lib/stores/sessions-roots";
 
@@ -249,6 +251,41 @@ describe("SessionsPane", () => {
     await waitFor(() =>
       expect(sessionsCreate).toHaveBeenCalledWith("tgdrive", "next thing", "_template"),
     );
+  });
+
+  /**
+   * Acceptance row 8 of spec 52.1, which nothing covered.
+   *
+   * The story replaced a literal `README.md` here with `SESSION_RECORD_NAME` — a
+   * constant holding that same string — and claimed a latent bug fixed "on its own
+   * merits". No behaviour changed, and no test looked at the path this composes at
+   * all, so the claim and the constant were both unguarded. This is the guard: what
+   * a create opens is the record, at the one name the detail also reads, joined to
+   * the ROOT'S OWN subfolder rather than to a default.
+   *
+   * The remaining half of row 8 — that this target is correct for a session
+   * written before the story — is not a frontend fact: it is true once
+   * `sessions_record_migrate` has moved that session's record, which
+   * `session-detail.test.tsx` presses.
+   */
+  it("opens the new session's record at the one name, under the root's subfolder", async () => {
+    panelsStore.setState(panelsStore.getInitialState(), true);
+    render(<SessionsPane />);
+    (await screen.findByRole("button", { name: SESSIONS_NEW_LABEL })).click();
+    fireEvent.change(await screen.findByLabelText(SESSIONS_NEW_TITLE_LABEL), {
+      target: { value: "next thing" },
+    });
+    (await screen.findByRole("button", { name: SESSIONS_NEW_CONFIRM_LABEL })).click();
+
+    await waitFor(() => {
+      const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;
+      expect(target).toMatchObject({
+        kind: "file",
+        profileId: "tgdrive",
+        relativePath: `60-sessions/active/2026-08-12-next/${SESSION_RECORD_NAME}`,
+      });
+    });
+    expect(SESSION_RECORD_NAME).toBe("README.md");
   });
 
   it("creates from a named template, sending the path it copies out of", async () => {

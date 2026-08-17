@@ -61,8 +61,9 @@ live-preview and editable, and all three share the file's single content state a
 - Never a second renderer, a second markdown extension set, or a second save path.
 - ~~Never make Note the default: a person opening a file to read it should not land in an editor.~~
   **SUPERSEDED by story 52.3** (epic 52, item 9): the owner asked for the reverse twice, so Note is
-  now the default wherever it is offered. A per-file remembered choice still wins, so nothing he had
-  already clicked changed under him.
+  now the default wherever it is offered. A remembered choice still wins — the jar is keyed per
+  FORMAT (`viewModeFor(cookie, format, offered)`), never per file — so nothing he had already
+  clicked changed under him.
 
 **I/O and edge-case matrix.**
 

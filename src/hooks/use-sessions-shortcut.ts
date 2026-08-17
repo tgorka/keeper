@@ -43,11 +43,12 @@ export async function logTodayInCurrentSession(): Promise<void> {
   const subfolder =
     sessionsRootsStore.getState().roots?.find((root) => root.id === rootId)?.subfolder ??
     "60-sessions";
-  // The record, by the one name the detail and the board both read. This
-  // composed a literal `README.md` with no shape branch, so ⌘⌥L in a flat
-  // session opened a file that did not exist and landed the operator on the
-  // missing-file sentence: broken before Story 52.1, fixed here on its own
-  // merits by importing the name instead of retyping it.
+  // The record, by the one name the detail and the board both read. The string it
+  // resolves to is the `README.md` this line already composed, so ⌘⌥L opens
+  // exactly what it opened before Story 52.1: what the constant buys is a single
+  // reader of the record's name, not a fix. A session whose record has not been
+  // moved yet still has no `README.md` to open, and moving it is
+  // `sessions_record_migrate`'s job — offered on the session detail.
   panelsStore.getState().setActiveTarget({
     kind: "file",
     profileId: rootId,

@@ -23,7 +23,14 @@ import {
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NoteCsvVm, NoteFolderVm, NoteRefVm, NoteRowVm, TextFileVm } from "@/lib/ipc/client";
+import type {
+  NoteCsvVm,
+  NoteFolderVm,
+  NoteRefVm,
+  NoteRowVm,
+  PanelTargetVm,
+  TextFileVm,
+} from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
 
 const syncReadText = vi.fn<(profileId: string, subpath: string) => Promise<TextFileVm>>();
@@ -1235,6 +1242,131 @@ describe("a rename in the properties panel takes the open pane with it (Story 52
       profileId: "profile-1",
       relativePath: SESSION_README,
     });
+  });
+
+  /** Somewhere else in the same profile, for the pane that must not move. */
+  const OTHER: PanelTargetVm = {
+    kind: "file",
+    profileId: "profile-1",
+    relativePath: `${SESSION_DIR}/notes.md`,
+  };
+
+  /** The README as a panel target — what the pane showing this file holds. */
+  const README: PanelTargetVm = {
+    kind: "file",
+    profileId: "profile-1",
+    relativePath: SESSION_README,
+  };
+
+  /**
+   * The sequence the owner will actually perform, and the one that made the
+   * first cut of this feature a worse defect than the banner it removed.
+   *
+   * The title field commits on BLUR and a pane takes focus on `onMouseDown`
+   * (`panel-strip.tsx`), so "type the new title, then click into the other pane"
+   * runs the focus change FIRST and the commit second. Re-pointing "the active
+   * panel" then moves the pane the reader has just clicked into — destroying what
+   * it was showing — and leaves the pane they renamed from on the emptied
+   * address, still rendering "is no longer in tgdrive". The rename is held open
+   * across the focus change here rather than assumed to be, because that is what
+   * the real round trip does.
+   */
+  it("moves the pane holding the file, not the one that took focus while the title was committing", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    let answer: (subpath: string) => void = () => {};
+    sessionsFileRename.mockReturnValue(
+      new Promise<string>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    // Two panes: the left one on another file, the right one on the README the
+    // reader is renaming from.
+    panelsStore.getState().setActiveTarget(OTHER);
+    panelsStore.getState().openPanel(README);
+    const [left, right] = panelsStore.getState().panels;
+    if (left === undefined || right === undefined) {
+      throw new Error("expected two panels");
+    }
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+    // The click into the other pane, which is what a blur means when it is a
+    // click and not a Tab.
+    await act(async () => {
+      panelsStore.getState().focusPanel(left.id);
+    });
+    await act(async () => {
+      answer(MOVED);
+    });
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+        OTHER,
+        { kind: "file", profileId: "profile-1", relativePath: MOVED },
+      ]),
+    );
+    // And the pane the reader clicked into keeps focus as well as its document: a
+    // rename is not a navigation.
+    expect(panelsStore.getState().activeId).toBe(left.id);
+  });
+
+  /**
+   * The same file in two panes — the shape a panel strip exists for, and the one
+   * where "move the active panel" leaves a dead path behind with no second click
+   * involved at all. The pane that did not follow persists that path to the
+   * panels cookie, so the banner comes back after a restart too.
+   */
+  it("moves every pane holding the file, not only the focused one", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    panelsStore.getState().setActiveTarget(README);
+    panelsStore.getState().openPanel(OTHER);
+    panelsStore.getState().setActiveTarget(README);
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([README, README]);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    const moved = { kind: "file", profileId: "profile-1", relativePath: MOVED };
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved, moved]),
+    );
+  });
+
+  /**
+   * The re-point is not a PREVIEW, and this is the gesture that proves it costs
+   * something to pretend otherwise.
+   *
+   * `setActiveTarget` records {@link Panel.replaced} so the second click of a
+   * double click can put back what the first displaced. Used for a rename it
+   * records `was:` the path the rename just emptied — and `openPanel`'s restore
+   * branch is live, so double-clicking the renamed file in the tree puts that dead
+   * path back and opens the file beside it. The reader gets the banner they were
+   * just spared, plus a second panel.
+   */
+  it("leaves no preview memory of the emptied path for a later double click to restore", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    // Pinned, not previewed: this pane really holds the README.
+    panelsStore.getState().openPanel(README);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+    const moved: PanelTargetVm = { kind: "file", profileId: "profile-1", relativePath: MOVED };
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved]),
+    );
+
+    // The double click, on the renamed row.
+    panelsStore.getState().openPanel(moved);
+
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved]);
   });
 
   it("offers no properties panel for a file in no profile, so no rename can strand it", async () => {

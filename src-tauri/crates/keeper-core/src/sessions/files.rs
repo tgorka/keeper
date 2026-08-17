@@ -46,13 +46,13 @@ use crate::sessions::shape::{KindTag, ABOUT, AGENTS};
 /// predicates that must agree should both run, not take turns.
 const WORKSPACE: &str = "workspace";
 
-/// The three names a rename never touches, session-relative.
+/// The three names neither a rename nor a delete ever touches, session-relative.
 ///
 /// `README.md` is the record under both contracts since story 52.1 — the
 /// session's identity, its `## Promote` table and its pins — and `AGENTS.md` is
 /// the one name [`super::shape::shape`] reads to decide which contract the
 /// folder follows. Renaming either would not break a link; it would break the
-/// *session*.
+/// *session*, and deleting either breaks it the same way ([`check_deletable`]).
 ///
 /// **`about.md` stays in this list even though nothing writes it any more.** An
 /// unmigrated `about.md` is still a session's record on the operator's drives,
@@ -155,10 +155,11 @@ pub enum FileVerbError {
     Extension { rel: String },
 
     #[error(
-        "{rel} is one of the two files a session cannot do without: AGENTS.md is what tells \
-         keeper this session is a flat one, and README.md is the record carrying its identity, \
-         its title, its pins and its promote table. Deleting either leaves a session that still \
-         has every byte and no longer renders. Move it in Finder if you really mean to."
+        "{rel} is one of the three files a session cannot do without: AGENTS.md is what tells \
+         keeper this session is a flat one, README.md is the record carrying its identity, its \
+         title, its pins and its promote table, and about.md is that same record in every \
+         session written before it moved. Deleting any of them leaves a session that still has \
+         every byte and no longer renders. Move it in Finder if you really mean to."
     )]
     ShapeFile { rel: String },
 
@@ -348,7 +349,7 @@ pub fn dir_rel(rel: &str) -> Result<String, FileVerbError> {
     Ok(folded)
 }
 
-/// [`check_rel`], plus the two names a delete must never touch.
+/// [`check_rel`], plus the three names a delete must never touch.
 ///
 /// `AGENTS.md` and `README.md` are not ordinary files, and for two different
 /// reasons. [`super::shape::shape`] reads `AGENTS.md` to decide which contract a
@@ -361,22 +362,28 @@ pub fn dir_rel(rel: &str) -> Result<String, FileVerbError> {
 /// rendering, which is the worst failure shape there is because nothing looks
 /// broken.
 ///
-/// **`about.md` is deletable again.** It was refused while it was the flat
-/// record; story 52.1 moved the record to `README.md`, so an unmigrated
-/// `about.md` is a pool file like any other and a delete of it costs the operator
-/// exactly what they asked for. A *rename* of it is still refused, because that
-/// one would half-work — see `RECORD_NAMES` and [`renames`].
+/// **`about.md` is refused for exactly that reason, not for its own.** Story 52.1
+/// moved the record's NAME; it did not move anybody's files. Until
+/// `sessions_record_migrate` has run over a zone, an unmigrated flat session's
+/// `about.md` is still the sole carrier of its `id`, its `pinned` flag, its
+/// `keeper:` lineage and its `## Promote` table — and it renders in the About
+/// space as an ordinary row with a delete button, one press from the same
+/// every-byte-present-and-nothing-renders failure. So it keeps the place
+/// `RECORD_NAMES` states for it: it leaves this list when nothing on any drive
+/// can still be holding one, and not before. A *rename* of it was already
+/// refused, for the narrower reason that one would half-work — see
+/// `RECORD_NAMES` and [`renames`].
 ///
 /// A create has no such rule: naming avoids collisions, so a create can only
 /// ever *add* a shape file, and adding one is the direction migration already
 /// goes.
 ///
 /// # Errors
-/// [`FileVerbError::ShapeFile`] for those two at the session root, or whatever
+/// [`FileVerbError::ShapeFile`] for those three at the session root, or whatever
 /// [`check_rel`] refuses.
 pub fn check_deletable(rel: &str) -> Result<(), FileVerbError> {
     check_rel(rel)?;
-    if rel == AGENTS || rel == README {
+    if RECORD_NAMES.contains(&rel) {
         return Err(FileVerbError::ShapeFile {
             rel: rel.to_owned(),
         });
@@ -962,29 +969,31 @@ mod tests {
         ));
     }
 
-    /// The sharp one: `shape()` keys on `AGENTS.md` and the record is `README.md`,
-    /// so deleting either turns a session into one that has every byte and renders
-    /// nothing.
+    /// The sharp one: `shape()` keys on `AGENTS.md`, the record is `README.md`,
+    /// and it is `about.md` in every session written before story 52.1 — so
+    /// deleting any of the three turns a session into one that has every byte and
+    /// renders nothing.
     ///
-    /// **Story 52.1 inverted the pair.** It was `[AGENTS, ABOUT]`; the record
-    /// moved, so `README.md` is refused now and an unmigrated `about.md` is an
-    /// ordinary pool file a delete may take.
+    /// **Story 52.1 added `README.md` to the pair; it did not remove `about.md`.**
+    /// Moving the record's name moved no operator's file, so until
+    /// `sessions_record_migrate` has run, `about.md` is still the only place a
+    /// session's `id`, `pinned` flag and `keeper:` lineage exist — and it renders
+    /// in the About space as an ordinary row with a delete button. The list is
+    /// `RECORD_NAMES`, asked once, so the delete rule and the rename rule cannot
+    /// come to disagree about which files are records.
     #[test]
-    fn the_two_files_a_session_cannot_do_without_cannot_be_deleted() {
-        for rel in [AGENTS, README] {
+    fn the_three_files_a_session_cannot_do_without_cannot_be_deleted() {
+        for rel in [AGENTS, README, ABOUT] {
             assert!(
                 matches!(check_deletable(rel), Err(FileVerbError::ShapeFile { .. })),
                 "{rel} is load-bearing and must survive a delete button"
             );
         }
-        assert!(
-            check_deletable(ABOUT).is_ok(),
-            "story 52.1: about.md is no longer the record, so deleting it is the operator's call"
-        );
-        // Only at the root, and only those two: a file that merely mentions them
+        // Only at the root, and only those three: a file that merely mentions one
         // is an ordinary file.
         assert!(check_deletable("artifacts/README.md").is_ok());
         assert!(check_deletable("readme-notes.md").is_ok());
+        assert!(check_deletable("logs/about.md").is_ok());
         // And creating one is fine — a create can only add a shape file, which
         // is the direction migration already goes.
         assert!(check_rel(AGENTS).is_ok());
@@ -1349,11 +1358,12 @@ mod tests {
     fn a_refused_path_compiles_to_no_plan_at_all() {
         assert!(compile_new("active/s", "workspace/iter.md", "x").is_err());
         assert!(compile_delete("active/s", "workspace/iter.md", "01T").is_err());
-        // Story 52.1: was `ABOUT` — the record's name is `README.md` under both
-        // contracts now, and an unmigrated `about.md` compiles to an ordinary
-        // trash move.
+        // Story 52.1 made `README.md` a record under both contracts. `about.md`
+        // is still one wherever the migration has not run, so a delete of either
+        // compiles to no plan at all rather than to a trash move.
         assert!(compile_delete("active/s", README, "01T").is_err());
-        assert!(compile_delete("active/s", ABOUT, "01T").is_ok());
+        assert!(compile_delete("active/s", ABOUT, "01T").is_err());
+        assert!(compile_delete("active/s", AGENTS, "01T").is_err());
     }
 
     // -----------------------------------------------------------------------

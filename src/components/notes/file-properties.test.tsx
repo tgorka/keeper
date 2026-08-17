@@ -64,11 +64,19 @@ const ABOUT_BLOCK = "---\ntags:\n  - about\n---\n";
 const PROFILE = "tgdrive";
 const REL = "60-sessions/active/weekly/README.md";
 
-function mount(onWritten = vi.fn(), onRenamed?: (next: string) => void) {
+/** A log in the same session: a file whose filename DOES follow its title, so a
+ *  retitle of it is the case the record's is not. */
+const LOG = "60-sessions/active/weekly/2026-08-16-1812-kick-off.md";
+
+function mount(
+  onWritten = vi.fn(),
+  onRenamed?: (next: string) => void,
+  relativePath: string = REL,
+) {
   render(
     <FileProperties
       profileId={PROFILE}
-      relativePath={REL}
+      relativePath={relativePath}
       onWritten={onWritten}
       onRenamed={onRenamed}
     />,
@@ -379,6 +387,10 @@ describe("a session file's title, changed in the panel", () => {
     // renamed. A host told where it went must not also be told to look where it
     // no longer is.
     expect(onWritten).not.toHaveBeenCalled();
+    // And it does not re-read the address it holds either: that address is the
+    // one the rename emptied, so a second read of it is the refusal this hook
+    // exists to avoid.
+    expect(syncReadFrontmatter).toHaveBeenCalledTimes(1);
   });
 
   it("still just says the file changed to a host that cannot re-address itself", async () => {
@@ -392,5 +404,86 @@ describe("a session file's title, changed in the panel", () => {
     // Exactly today's behaviour for the note embed and every other host that
     // holds no panel target, so adding the second hook changed no caller.
     await waitFor(() => expect(onWritten).toHaveBeenCalledTimes(1));
+  });
+
+  /**
+   * The rename that moves nothing, which is where this feature could have cost
+   * somebody their retitle.
+   *
+   * `sessions_file_rename` answers with the file's new subpath — and for two
+   * ordinary files that subpath is the one it was given. The session record and
+   * the other two names the shape reader keys on keep their filename
+   * (`files::renames`, `sessions/files.rs:419-426`) and the title is written
+   * anyway; so does any title whose slug is unchanged
+   * (`files::rename_target`, `:571-573`). `onRenamed` with a path its host already
+   * holds re-points nothing — `retargetPanels` finds nothing to move and
+   * `setActiveTarget` early-returned on the same target — so the buffer beside
+   * this panel would still be holding the block the rename replaced, and the next
+   * Save would put it back. The retitle would vanish, and the reader would have
+   * watched the form accept it.
+   *
+   * So the news goes to `onWritten`, which is exactly "re-read the address you
+   * have" — and here that address is right.
+   */
+  it("tells its host to re-read when the record's rename kept its filename", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    // What Rust answers for `README.md`: the path it was given.
+    sessionsFileRename.mockResolvedValue(REL);
+    const onRenamed = vi.fn<(next: string) => void>();
+    const onWritten = mount(vi.fn(), onRenamed);
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick Off");
+
+    await waitFor(() => expect(onWritten).toHaveBeenCalledTimes(1));
+    // Not the re-address: there is nowhere to re-address to, and calling it would
+    // be this panel telling its host the file moved to where it already is while
+    // leaving its buffer stale.
+    expect(onRenamed).not.toHaveBeenCalled();
+  });
+
+  it("tells its host to re-read when the retitle changed no filename", async () => {
+    // The other half, on a file whose name DOES follow its title: `Kick off` and
+    // `Kick Off` slug to the same stem, so Rust writes the title and moves
+    // nothing. Nothing about this file is special — which is what makes it the
+    // case a fixture of records could never have found.
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(LOG);
+    const onRenamed = vi.fn<(next: string) => void>();
+    const onWritten = mount(vi.fn(), onRenamed, LOG);
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick off");
+
+    await waitFor(() => expect(onWritten).toHaveBeenCalledTimes(1));
+    expect(onRenamed).not.toHaveBeenCalled();
+  });
+
+  it("re-reads its own block after a rename that moved nothing, so the next edit is not stale", async () => {
+    // The panel's own half of the same defect. The title WAS written, so the
+    // block this form is holding is not the block on disk any more — and every
+    // other property is spliced out of the block it is holding. Without the
+    // re-read the next edit would guard the write with a block that no longer
+    // exists and Rust would refuse it as a clobber, for a change the reader made
+    // through this very panel.
+    const RETITLED = "---\ntitle: Kick Off\n---\n";
+    syncReadFrontmatter.mockResolvedValueOnce(TITLED).mockResolvedValue(RETITLED);
+    sessionsFileRename.mockResolvedValue(REL);
+    mount(vi.fn(), vi.fn());
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick Off");
+    await waitFor(() => expect(syncReadFrontmatter).toHaveBeenCalledTimes(2));
+    await addTag("about");
+
+    // The guard is the block as it now stands, not the one the retitle replaced.
+    await waitFor(() =>
+      expect(syncWriteFrontmatter).toHaveBeenCalledWith(
+        PROFILE,
+        REL,
+        RETITLED,
+        expect.stringContaining("- about"),
+      ),
+    );
   });
 });

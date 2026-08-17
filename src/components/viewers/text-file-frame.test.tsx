@@ -17,11 +17,37 @@
  * lays nothing out, so what is asserted is the structure that CAUSES a shift —
  * the caption is not a width-variable participant in the row holding the button —
  * and never a measured pixel. See `pane-header.test.tsx`.
+ *
+ * **The last describe is the exception, and it is here for the same reason.**
+ * Story 52.3's seam is the properties FORM's block reaching the live pane, and
+ * the two states that seam gets wrong are states only a hand-held read can
+ * produce: a read still in flight, and a read that refused. So that block mounts
+ * the real panel over a real editor over a buffer the test owns, and drives the
+ * frontmatter commands itself.
  */
-import { type RenderResult, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import "@codemirror/lang-markdown";
+import "@codemirror/language";
+import "@codemirror/state";
+import "@/components/notes/editor/indent-keymap";
+import "@/components/notes/editor/live-preview";
+// Note mode's mount awaits three more chunks, and `settle()` drains microtasks
+// rather than frames — so they are warmed here for `raw-rendered-view.test.tsx`'s
+// reason: a cold `import()` would not have resolved by the time it returns.
+import "@/components/notes/editor/writing-tools";
+import { EditorView } from "@codemirror/view";
+import { act, fireEvent, type RenderResult, render, screen } from "@testing-library/react";
+import { useRef, useState } from "react";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TextFileVm } from "@/lib/ipc/client";
 import type { ViewerEntry } from "@/lib/viewers";
+import { withRangeRects } from "@/test/layout";
+
+/** Story 52.3's seam needs both halves of the properties address in the test's
+ *  hands: the block the form is holding is what the panes hide, and only a test
+ *  can hold a read open or refuse it. */
+const syncReadFrontmatter = vi.fn<(profileId: string, subpath: string) => Promise<string>>();
+const syncWriteFrontmatter =
+  vi.fn<(profileId: string, subpath: string, expected: string, block: string) => Promise<string>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   notesCsvRead: vi.fn(),
@@ -44,8 +70,11 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingOpenPath: vi.fn(async () => undefined),
   recordingSessionMeta: vi.fn(),
   tagsVocabulary: vi.fn(async () => ({ entries: [] })),
-  syncReadFrontmatter: vi.fn(async () => ""),
-  syncWriteFrontmatter: vi.fn(async () => ""),
+  syncReadFrontmatter: (profileId: string, subpath: string) =>
+    syncReadFrontmatter(profileId, subpath),
+  syncWriteFrontmatter: (profileId: string, subpath: string, expected: string, block: string) =>
+    syncWriteFrontmatter(profileId, subpath, expected, block),
+  sessionsFileRename: vi.fn(async () => ""),
 }));
 
 import {
@@ -162,6 +191,132 @@ function shownWord(): string {
  *  formatter's business, the SET is the claim. */
 function box(element: Element): string {
   return Array.from(element.classList).sort().join(" ");
+}
+
+/**
+ * jsdom has no `Range.getClientRects`, and the live pane's measure pass calls it
+ * on any animation frame that elapses. Without this the run throws at a time that
+ * depends on how slow the machine was — a suite that is green until it is not.
+ */
+let removeRangeRects: (() => void) | null = null;
+beforeAll(() => {
+  removeRangeRects = withRangeRects();
+});
+afterAll(() => {
+  removeRangeRects?.();
+});
+
+beforeEach(() => {
+  syncReadFrontmatter.mockReset();
+  // A file with no frontmatter, which is what every fixture outside the last
+  // describe is — and what makes the panel appear at all.
+  syncReadFrontmatter.mockResolvedValue("");
+  syncWriteFrontmatter.mockReset();
+  syncWriteFrontmatter.mockResolvedValue("");
+});
+
+/**
+ * Drain the microtasks the live pane's mount rides on, and nothing else.
+ *
+ * Deliberately not `waitFor`, which advances timers: a frame starts CodeMirror's
+ * measure pass, and `raw-rendered-view.test.tsx` records why that is a trade
+ * about jsdom rather than about the feature.
+ */
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let tick = 0; tick < 8; tick += 1) {
+      await Promise.resolve();
+    }
+  });
+}
+
+/** The live view inside whichever pane is mounted, asserted rather than assumed. */
+function paneView(): EditorView {
+  const content = document.querySelector<HTMLElement>(".cm-content");
+  expect(content, "no pane mounted a CodeMirror").not.toBeNull();
+  const view = EditorView.findFromDOM(content as HTMLElement);
+  expect(view, "no EditorView is mounted in that content DOM").not.toBeNull();
+  return view as EditorView;
+}
+
+/** Type at the caret, one character per transaction — how an edit really
+ *  arrives, and the only way a view rebuilt between keystrokes is visible. */
+async function typeAtCaret(view: EditorView, text: string): Promise<void> {
+  for (const character of text) {
+    await act(async () => {
+      const at = view.state.selection.main.head;
+      view.dispatch({
+        changes: { from: at, insert: character },
+        selection: { anchor: at + character.length },
+        userEvent: "input.type",
+      });
+    });
+    await settle();
+  }
+}
+
+/**
+ * The frame over a buffer the TEST owns, which is what 45.6's hook really is.
+ *
+ * `mount` above hands over a frozen `UseTextFileResult`, and that is right for
+ * every question about a `dirty` flag. It cannot answer this one: whether a
+ * properties write that lands over text somebody typed keeps the text. That needs
+ * `setContent` to move the buffer, `dirty` to follow it, and `reload` to behave
+ * the way `read` does — set `loading`, then replace the buffer with the disk.
+ */
+function LiveFrame({
+  initial,
+  disk,
+  sets,
+  reads,
+  address = ADDRESS,
+}: {
+  initial: string;
+  /** What a re-read would answer with, as the test's own mutable disk. */
+  disk: { text: string };
+  /** Every value the frame put in the buffer, in order. The last one is what a
+   *  Save would write. */
+  sets: string[];
+  /** One entry per re-read the frame asked for. */
+  reads: string[];
+  /** Which file the panel is addressed at. A panel replaces its target in place,
+   *  so a test can hand the same mount a second file. */
+  address?: FilePropertiesCoordinates;
+}): React.ReactElement {
+  const [content, setContentState] = useState(initial);
+  const [loading, setLoading] = useState(false);
+  const persisted = useRef(initial);
+  return (
+    <TextFileFrame
+      fileName="readme.md"
+      entry={MARKDOWN}
+      state={{
+        ...state(),
+        content,
+        loading,
+        dirty: content !== persisted.current,
+        setContent: (next) => {
+          sets.push(next);
+          setContentState(next);
+        },
+        reload: async () => {
+          reads.push(disk.text);
+          setLoading(true);
+          await Promise.resolve();
+          persisted.current = disk.text;
+          setContentState(disk.text);
+          setLoading(false);
+        },
+      }}
+      csv={null}
+      properties={address}
+      // The real Files host always passes one (Story 52.2), and the panel calls
+      // `onWritten` instead when it does not — a different path, asserted where
+      // that story's tests are.
+      onPropertiesRenamed={() => {}}
+      preview={{ vaultId: null }}
+    />
+  );
 }
 
 describe("the Save control", () => {
@@ -468,5 +623,175 @@ describe("Note mode", () => {
     mount({}, LOCKED, ADDRESS);
 
     expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+  });
+});
+
+/**
+ * The seam Story 52.3 created, and the line that decides WHEN to hide (FR-304).
+ *
+ * `frontmatterInForm` used to be "this frame mounted a `FileProperties`", and the
+ * pane then re-parsed the live BUFFER to guess which bytes that form was drawing.
+ * Two recognisers over two sources — Rust's `block_of` over the file on disk, and
+ * `readFrontmatter` over the buffer — and nothing in either suite mounted the
+ * frame with a read it could hold open, so the disagreement was invisible.
+ *
+ * These mount the real panel over the real pane and drive the frontmatter
+ * commands, because the two states that got it wrong are a read still in flight
+ * and a read that refused, and neither is a state a fixture can be.
+ */
+describe("the panes hide the block the form is holding, and only that (Story 52.3)", () => {
+  /** A block as `file_properties` writes one, and the body under it. `status`
+   *  rather than `title`: a title write is a RENAME, which is a different path. */
+  const BLOCK = "---\nstatus: draft\n---\n";
+  const LANDED = "---\nstatus: done\n---\n";
+  const BODY = "# Weekly\n\nalpha\n";
+
+  it("draws the block as document text until the form is holding it", async () => {
+    // The read `sync_ipc.rs` documents as a stat plus a read — hundreds of ms on a
+    // pendrive — held open here. Hiding on "a form was mounted" hid the block from
+    // the FIRST frame, so for the whole of that window it was in neither the form
+    // nor the text.
+    let land: (block: string) => void = () => {};
+    syncReadFrontmatter.mockReturnValue(
+      new Promise<string>((resolve) => {
+        land = resolve;
+      }),
+    );
+    render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
+    await settle();
+
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
+
+    await act(async () => {
+      land(BLOCK);
+    });
+    await settle();
+
+    // Now, and not before: the form holds those bytes, so the pane stops drawing
+    // them.
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+  });
+
+  it("keeps drawing the block when the form's read refused", async () => {
+    // `FileProperties` renders nothing when the read rejects — a `workspace/` file,
+    // a permission Rust will not cross — and reports `null`. Hiding on "a form was
+    // mounted" hid the block from a document that had no form above it AT ALL, for
+    // as long as the panel stayed open.
+    syncReadFrontmatter.mockRejectedValue(new Error("keeper will not read that here"));
+    render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
+    await settle();
+
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
+  });
+
+  it("keeps a typed paragraph when a property write lands in the form above it", async () => {
+    // The sequence 52.3 made ordinary: a savable markdown file now opens with a
+    // caret in Note mode, so "type a paragraph, then set a property above it" is
+    // how this pane is used. The unconditional re-read after a properties write
+    // destroyed the paragraph — `reload` is `read`, which replaces the buffer with
+    // no dirty check, silently and with no prompt.
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncWriteFrontmatter.mockResolvedValue(LANDED);
+    const sets: string[] = [];
+    const reads: string[] = [];
+    const disk = { text: BLOCK + BODY };
+    render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
+    await settle();
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+
+    const view = paneView();
+    expect(view.state.doc.toString()).toBe(BODY);
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    expect(view.state.doc.toString()).toBe(`${BODY}beta\n`);
+
+    // Rust wrote the block and preserved every other byte, so this is what the
+    // file now says — and what a re-read would have put in the buffer.
+    disk.text = LANDED + BODY;
+    const status = screen.getByLabelText("status");
+    fireEvent.change(status, { target: { value: "done" } });
+    fireEvent.blur(status);
+    await settle();
+
+    expect(syncWriteFrontmatter).toHaveBeenCalledWith("p1", ADDRESS.relativePath, BLOCK, LANDED);
+    // Not one re-read: the file was not read over somebody's unsaved text.
+    expect(reads).toEqual([]);
+    // The paragraph is still where he typed it, and the buffer a Save would write
+    // is the block that LANDED in front of it — not the block that was there when
+    // he started typing, which is what a later Save would otherwise have put back.
+    expect(paneView().state.doc.toString()).toBe(`${BODY}beta\n`);
+    expect(sets[sets.length - 1]).toBe(`${LANDED}${BODY}beta\n`);
+  });
+
+  it("re-reads the file when a property write lands over a buffer nobody typed in", async () => {
+    // The other half of the same rule, and why the answer is not simply "never
+    // re-read": with nothing to lose, the file itself is the truthful repair —
+    // it advances what the loader believes is on disk, which a splice cannot, and
+    // that is what keeps the Save button honest.
+    //
+    // Both commands answer from the same `disk` here, deliberately: a re-read
+    // tears the panel down and back up (`loading` empties the frame), so it asks
+    // for the block again, and a fixture that kept answering with the OLD block
+    // would have the form and the file disagreeing for ever — which is a livelock
+    // rather than a test.
+    const disk = { text: BLOCK + BODY, block: BLOCK };
+    syncReadFrontmatter.mockImplementation(async () => disk.block);
+    syncWriteFrontmatter.mockResolvedValue(LANDED);
+    const sets: string[] = [];
+    const reads: string[] = [];
+    render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
+    await settle();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+
+    disk.text = LANDED + BODY;
+    disk.block = LANDED;
+    const status = screen.getByLabelText("status");
+    fireEvent.change(status, { target: { value: "done" } });
+    fireEvent.blur(status);
+    await settle();
+
+    // Once. A splice AND a re-read would be the file read twice for one property.
+    expect(reads).toEqual([LANDED + BODY]);
+    // Nothing was spliced over the buffer: the read is what put the new block in
+    // it, which is why `dirty` did not go true for a property nobody typed.
+    expect(sets).toEqual([]);
+    expect(paneView().state.doc.toString()).toBe(BODY);
+  });
+
+  it("does not re-read when the panel is pointed at a second file", async () => {
+    // A panel replaces its target IN PLACE, so this frame outlives the file it is
+    // showing and the host's own loader is already re-reading. The second file's
+    // first block must read as a FIRST block: treating it as this file's block
+    // changing would spend a read on a file that had just been read.
+    const disk = { text: BLOCK + BODY, block: BLOCK };
+    syncReadFrontmatter.mockImplementation(async () => disk.block);
+    const sets: string[] = [];
+    const reads: string[] = [];
+    const view = render(<LiveFrame initial={BLOCK + BODY} disk={disk} sets={sets} reads={reads} />);
+    await settle();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+
+    // The other file, with a block of its own.
+    disk.block = LANDED;
+    view.rerender(
+      <LiveFrame
+        initial={BLOCK + BODY}
+        disk={disk}
+        sets={sets}
+        reads={reads}
+        address={{ profileId: "p1", relativePath: "60-sessions/active/s/OTHER.md" }}
+      />,
+    );
+    await settle();
+
+    expect(syncReadFrontmatter).toHaveBeenLastCalledWith("p1", "60-sessions/active/s/OTHER.md");
+    expect(reads).toEqual([]);
+    expect(sets).toEqual([]);
   });
 });

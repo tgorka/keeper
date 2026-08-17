@@ -905,21 +905,25 @@ pub async fn sessions_create(
     // back to the shipped default (FR-268) when the pattern has none to inherit
     // from.
     //
-    // **One name, since story 52.1**: the record is `README.md` under both
-    // contracts, so the `if flat { about.md } else { README.md }` that used to
-    // stand here is gone. The `about.md` fallback below is not that branch coming
-    // back — it is the *unmigrated pattern* case, and it exists so a zone whose
-    // `_template/` still keeps its record under the old name keeps inheriting its
-    // headings instead of silently dropping to the shipped default. It reads a
-    // file; it decides nothing.
-    let pattern_record =
-        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::model::README))
-            .ok()
-            .or_else(|| {
-                std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::shape::ABOUT)).ok()
-            });
-    let body = match (&pattern_record, flat) {
-        (Some(text), _) => {
+    // **Both names are read, and `record_at` says which one is the record.**
+    // Story 52.1 made `README.md` the record's name under both contracts; it did
+    // not move anybody's files, so a pattern — a `_template/` or a source session
+    // — can still be keeping its record at `about.md` until
+    // `sessions_record_migrate` has swept the zone. The two reads answer two
+    // questions with one pair of bytes: the headings this create inherits, and
+    // (for a create-FROM, below) the file the lineage append is guarded on and
+    // written to. The choice is the domain's, because the sharp case is the
+    // half-migrated one where a name picked by order picks an old signpost.
+    let pattern_readme =
+        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::model::README)).ok();
+    let pattern_about =
+        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::shape::ABOUT)).ok();
+    let pattern_record = keeper_core::sessions::migrate::record_at(
+        pattern_readme.as_deref(),
+        pattern_about.as_deref(),
+    );
+    let body = match (pattern_record, flat) {
+        (Some((_, text)), _) => {
             let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(text);
             plan::skeleton_from(&text[body_at..], &title, &date)
         }
@@ -1028,19 +1032,30 @@ pub async fn sessions_create(
 
     let mut compiled = match &source {
         None => plan::compile_create_shaped(&dir_name, &pattern_root, &copies, &expanded, &stamped),
-        Some(row) => plan::compile_create_from_shaped(
-            &dir_name,
-            &row.path,
-            // The SOURCE's record, read from the name the lineage append will be
-            // written back to. Never `pattern_record` — that one falls back to an
-            // unmigrated `about.md`, and a guard read from one file and written to
-            // another is a guard that always mismatches.
-            &std::fs::read_to_string(pattern_dir.join(model::README)).unwrap_or_default(),
-            &id,
-            &copies,
-            &expanded,
-            &stamped,
-        ),
+        Some(row) => {
+            // The SOURCE's record: which file it is, and the bytes in it. The
+            // lineage append is a `GuardedWrite`, so the two have to be the same
+            // read — `pattern_dir` IS this source session's directory (the
+            // `PatternSource::Session` arm above), and `record_at` picked the
+            // record out of the two names it can be under. A name assumed instead
+            // of read fails twice over on a zone nobody has swept yet: on an
+            // unmigrated source the guard reads a `README.md` that is not there
+            // and `sessions_exec` refuses with an errno *after* the new session is
+            // already on disk (a stray session and no lineage pair, AD-112's own
+            // loss), and on a half-migrated one the lengths agree and the lineage
+            // lands in an old signpost.
+            let (record_name, record_text) = pattern_record.unwrap_or((model::README, ""));
+            plan::compile_create_from_shaped(
+                &dir_name,
+                &row.path,
+                record_name,
+                record_text,
+                &id,
+                &copies,
+                &expanded,
+                &stamped,
+            )
+        }
     };
     // The spaces the template offers the ZONE (FR-291). Never the session:
     // AD-121 refused a per-session copy of a query, and `pattern::apply` keeps
@@ -1392,18 +1407,27 @@ pub fn sessions_migrate(root_id: String, session_id: String) -> Result<(), IpcEr
 /// bytes, which the executor's `GuardedWrite` recognises as its own output rather
 /// than as a conflict.
 ///
+/// **A refusal skips one row, it does not end the sweep.** One session holding a
+/// `README.md` keeper will not choose about used to propagate out of the loop:
+/// every later session was never compiled, the count of what had already moved
+/// went out with the `?`, and the operator saw one collision sentence with no
+/// indication that N had migrated and M had not. Re-running met the same wall
+/// forever. So a refusal is collected and the loop goes on — the answer carries
+/// `moved` and one row per skip, and a `Refused` from the *executor* still stops
+/// everything, because that is a write that failed rather than a plan keeper
+/// declined to make.
+///
 /// Answers with how many sessions the verb actually changed, so a zone-wide run
 /// can say "nothing needed moving" instead of looking identical to a failure.
 ///
 /// Rejects with: `internal` (unknown root, a root that has never scanned, an
-/// unknown session, a `README.md` in the way that no migration wrote, a failed
-/// step), `unsupported` (mobile).
+/// unknown session, a failed step), `unsupported` (mobile).
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_record_migrate(
     root_id: String,
     session_id: Option<String>,
-) -> Result<u32, IpcError> {
+) -> Result<keeper_core::sessions::vm::SessionRecordMigrateVm, IpcError> {
     use keeper_core::sessions::migrate::{compile_record_rename, PointerFile, RecordRenameInput};
     use keeper_core::sessions::shape::ABOUT;
 
@@ -1455,15 +1479,26 @@ pub async fn sessions_record_migrate(
 
     // One input, its expensive halves set once: a zone's whole markdown cloned
     // per session would be quadratic in a zone the operator actually has.
+    //
+    // `prefix` is the zone's own place on the drive, and it is what lets the
+    // pointer pass reach a genuinely cross-session link: a file in another session
+    // can only name this record by spelling it from the drive root, which is the
+    // third place `refs::resolve` looks.
     let mut input = RecordRenameInput {
         session: String::new(),
         top_level: Vec::new(),
         readme: String::new(),
         title: String::new(),
         pointers,
+        prefix: crate::sessions_root::subfolder_of(&root_id)
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('/')
+            .to_owned(),
         with_about,
     };
     let mut moved = 0u32;
+    let mut skipped: Vec<keeper_core::sessions::vm::SessionRecordSkipVm> = Vec::new();
     for row in targets {
         input.top_level = top_levels.get(&row.path).cloned().unwrap_or_default();
         input.readme = std::fs::read_to_string(
@@ -1474,12 +1509,21 @@ pub async fn sessions_record_migrate(
         input.title = row.title.clone();
         input.session = row.path.clone();
 
-        let compiled = compile_record_rename(&input).map_err(|refusal| IpcError {
-            code: IpcErrorCode::Internal,
-            message: refusal.to_string(),
-            account_id: None,
-            retriable: false,
-        })?;
+        // A refusal is this row's answer, never the sweep's: see the note above.
+        // Reported for a single-session run too, because "keeper declined to
+        // compile a plan, and here is the sentence" is the same fact whether one
+        // row was asked about or forty.
+        let compiled = match compile_record_rename(&input) {
+            Ok(compiled) => compiled,
+            Err(refusal) => {
+                skipped.push(keeper_core::sessions::vm::SessionRecordSkipVm {
+                    session: row.path.clone(),
+                    title: row.title.clone(),
+                    reason: refusal.to_string(),
+                });
+                continue;
+            }
+        };
         if compiled.steps.is_empty() {
             // Nothing to move. Not an error: the operator asked for an outcome
             // that already holds, which for a zone-wide run is most of the zone.
@@ -1502,7 +1546,7 @@ pub async fn sessions_record_migrate(
     if moved > 0 {
         crate::sessions_root::rescan(&root_id);
     }
-    Ok(moved)
+    Ok(keeper_core::sessions::vm::SessionRecordMigrateVm { moved, skipped })
 }
 
 #[cfg(not(desktop))]
@@ -1510,7 +1554,7 @@ pub async fn sessions_record_migrate(
 pub fn sessions_record_migrate(
     root_id: String,
     session_id: Option<String>,
-) -> Result<u32, IpcError> {
+) -> Result<keeper_core::sessions::vm::SessionRecordMigrateVm, IpcError> {
     let _ = (root_id, session_id);
     Err(unsupported())
 }
@@ -3585,12 +3629,14 @@ pub async fn sessions_file_new_kind(
 /// in a session is something somebody wrote, and a delete button that erases
 /// bytes is one nobody presses without making a copy first.
 ///
-/// `README.md` and `AGENTS.md` are refused by
+/// `README.md`, `AGENTS.md` and `about.md` are refused by
 /// [`keeper_core::sessions::files::check_deletable`]: `AGENTS.md` is the name
 /// `shape()` reads, so deleting it turns a flat session back into a
 /// folder-shaped one and hides every log behind a section that no longer exists,
-/// and `README.md` is the record under both contracts (story 52.1), so deleting
-/// it drops the session to a `path:` id and loses its title, pins and lineage.
+/// `README.md` is the record under both contracts (story 52.1), so deleting it
+/// drops the session to a `path:` id and loses its title, pins and lineage, and
+/// `about.md` is that same record in every session `sessions_record_migrate` has
+/// not swept yet.
 ///
 /// Rejects with: `internal` (unknown root or session, a refused path, a failed
 /// move), `unsupported` (mobile).

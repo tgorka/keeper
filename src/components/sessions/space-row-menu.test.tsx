@@ -309,9 +309,9 @@ describe("a space row's context menu", () => {
    * merely changed its name — the owner's report, reachable from this menu as
    * well as from the properties panel.
    *
-   * Through `onOpen`, which is the section's own opener, for the reason the
-   * open-in-this-panel case above gives: a `setActiveTarget` call here would be a
-   * second implementation of the row's click.
+   * Through the panels store's `retargetPanels` and not the section's `onOpen`:
+   * the opener moves the ACTIVE pane, which is the right answer for the row's own
+   * click and the wrong one for a rename — see the two cases below.
    */
   it("re-points the pane that was showing the file at the subpath the rename answered with", async () => {
     sessionsFileRename.mockResolvedValue(MOVED_SUBPATH);
@@ -319,7 +319,7 @@ describe("a space row's context menu", () => {
     panelsStore
       .getState()
       .setActiveTarget({ kind: "file", profileId: ROOT, relativePath: SUBPATH });
-    const { row, onOpen } = mount();
+    const { row } = mount();
     await openMenu(row);
 
     fireEvent.click(screen.getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }));
@@ -327,14 +327,105 @@ describe("a space row's context menu", () => {
     fireEvent.change(field, { target: { value: "Kick Off" } });
     fireEvent.keyDown(field, { key: "Enter" });
 
-    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(MOVED_SUBPATH));
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+        { kind: "file", profileId: ROOT, relativePath: MOVED_SUBPATH },
+      ]),
+    );
   });
 
   /**
-   * The difference between following a rename and hijacking a panel. Only the
-   * active panel can be re-pointed, so a rename of a row the reader is NOT
-   * looking at must leave what they are looking at exactly where it is — a menu
-   * verb that replaced the open file would be a worse defect than the banner.
+   * The gap the `activeId` guard left, and it is the same defect as the banner
+   * rather than a smaller one: a pane that is not focused is still a pane on
+   * screen, and the panel list is PERSISTED — so the pane nobody re-pointed keeps
+   * the emptied address, shows Rust's missing-file sentence, and writes that dead
+   * path into the cookie for the next launch to restore.
+   *
+   * The guard's real requirement is "do not move a pane that is not showing this
+   * file". Matching on the target satisfies it without also asking which pane
+   * happens to have focus when the round trip answers.
+   */
+  it("re-points a pane showing the file even when another pane has focus", async () => {
+    const OTHER = "60-sessions/active/2026-08-16-keeper/README.md";
+    sessionsFileRename.mockResolvedValue(MOVED_SUBPATH);
+    // The file is open on the left; the reader is working in the pane on the
+    // right, which is where the right-click on the space row happened from.
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: ROOT, relativePath: SUBPATH });
+    panelsStore.getState().openPanel({ kind: "file", profileId: ROOT, relativePath: OTHER });
+    const right = panelsStore.getState().activeId;
+    const { row } = mount();
+    await openMenu(row);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }));
+    const field = await screen.findByRole("textbox", { name: SPACE_ROW_RENAME_FIELD_LABEL });
+    fireEvent.change(field, { target: { value: "Kick Off" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+        { kind: "file", profileId: ROOT, relativePath: MOVED_SUBPATH },
+        { kind: "file", profileId: ROOT, relativePath: OTHER },
+      ]),
+    );
+    // Nothing was navigated: the reader is still in the pane they were in.
+    expect(panelsStore.getState().activeId).toBe(right);
+  });
+
+  /**
+   * The third gap, and the one no arrangement of panels could have shown: the
+   * guard ran AFTER a `syncReadFrontmatter` plus a `sessionsFileRename` round
+   * trip, so a focus change while the rename was in flight decided which pane
+   * followed it. Matching on the target makes the answer independent of when the
+   * command answers.
+   */
+  it("re-points the pane that was showing the file even if focus moved while the rename was in flight", async () => {
+    let answer: (subpath: string) => void = () => {};
+    sessionsFileRename.mockReturnValue(
+      new Promise<string>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const OTHER = "60-sessions/active/2026-08-16-keeper/README.md";
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: ROOT, relativePath: SUBPATH });
+    panelsStore.getState().openPanel({ kind: "file", profileId: ROOT, relativePath: OTHER });
+    const [holder] = panelsStore.getState().panels;
+    if (holder === undefined) {
+      throw new Error("expected two panels");
+    }
+    // Focus back on the pane showing the file, which is what the guard used to
+    // require — and then it moves away before the command answers.
+    panelsStore.getState().focusPanel(holder.id);
+    const { row } = mount();
+    await openMenu(row);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }));
+    const field = await screen.findByRole("textbox", { name: SPACE_ROW_RENAME_FIELD_LABEL });
+    fireEvent.change(field, { target: { value: "Kick Off" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() => expect(sessionsFileRename).toHaveBeenCalledTimes(1));
+    const other = panelsStore.getState().panels[1];
+    if (other === undefined) {
+      throw new Error("expected two panels");
+    }
+    panelsStore.getState().focusPanel(other.id);
+    answer(MOVED_SUBPATH);
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+        { kind: "file", profileId: ROOT, relativePath: MOVED_SUBPATH },
+        { kind: "file", profileId: ROOT, relativePath: OTHER },
+      ]),
+    );
+  });
+
+  /**
+   * The difference between following a rename and hijacking a pane. A rename of a
+   * row nobody has open must leave every pane exactly where it is — a menu verb
+   * that replaced the open file would be a worse defect than the banner.
    */
   it("leaves a pane that was showing another file where it was", async () => {
     const OTHER = "60-sessions/active/2026-08-16-keeper/README.md";
