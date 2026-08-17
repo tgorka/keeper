@@ -202,7 +202,7 @@ function entry(
     // fixtures in this file — a file inside a vault keeper may write — because
     // most tests are not about writing and would otherwise all have to opt in.
     // The tests that ARE about it use `readOnly` below.
-    write: { writable: true, reason: null, caveat: null },
+    write: { writable: true, reason: null, caveat: null, caveatShort: null },
     ...extra,
   } as FilesEntryVm;
 }
@@ -235,7 +235,7 @@ function readOnly(name: string, reason = OUTSIDE_VAULT): FilesEntryVm {
     name,
     { status: "synced", detail: null },
     {
-      write: { writable: false, reason, caveat: null },
+      write: { writable: false, reason, caveat: null, caveatShort: null },
     },
   );
 }
@@ -245,7 +245,12 @@ function listed(
   subpath: string,
   entries: FilesEntryVm[],
   detail: string | null = null,
-  write: FilesListingVm["write"] = { writable: true, reason: null, caveat: null },
+  write: FilesListingVm["write"] = {
+    writable: true,
+    reason: null,
+    caveat: null,
+    caveatShort: null,
+  },
 ): FilesListingVm {
   return {
     profileId,
@@ -271,7 +276,7 @@ function notListed(
     detail,
     truncated: false,
     // A folder keeper could not read is not a folder keeper will write into.
-    write: { writable: false, reason: detail, caveat: null },
+    write: { writable: false, reason: detail, caveat: null, caveatShort: null },
   };
 }
 
@@ -530,6 +535,7 @@ describe("FilesPane", () => {
         writable: false,
         reason: OUTSIDE_VAULT,
         caveat: null,
+        caveatShort: null,
       }),
     );
     render(<FilesPane />);
@@ -2250,6 +2256,7 @@ describe("FilesPane — the write path", () => {
         writable: false,
         reason: "Field holds no notes vault, so keeper will not change files in it.",
         caveat: null,
+        caveatShort: null,
       }),
     );
     render(<FilesPane />);
@@ -2388,7 +2395,7 @@ describe("FilesPane — attaching a selection to a note", () => {
     syncBrowse.mockResolvedValue(
       listed("01VAULT", "", [
         entry("report.pdf", "file", undefined, undefined, {
-          write: { writable: false, reason: OUTSIDE_VAULT, caveat: null },
+          write: { writable: false, reason: OUTSIDE_VAULT, caveat: null, caveatShort: null },
         }),
       ]),
     );

@@ -25,7 +25,7 @@
  * are two different problems.
  */
 import { X } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { ExportFileButton } from "@/components/export/export-file-button";
 import {
   FOLD_STRIP,
@@ -49,7 +49,12 @@ import { useNoteDocument } from "@/lib/stores/notes-editor";
 import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type Panel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { cn } from "@/lib/utils";
-import { openWithForProfileEntry, type ViewerFile, viewerComponentFor } from "@/lib/viewers";
+import {
+  openWithForProfileEntry,
+  type ResolvedViewer,
+  type ViewerFile,
+  viewerComponentFor,
+} from "@/lib/viewers";
 
 /** The accessible name of the strip itself. */
 export const PANEL_STRIP_LABEL = "Open panels";
@@ -174,11 +179,25 @@ function resolveFrom(listing: FilesListingVm, relativePath: string): FileResolut
  * containment rule, the volume check and the Rust-composed sentence for every
  * way a folder can fail to be readable. A second command that stat'ed one path
  * would be a second place those rules live.
+ *
+ * **Lifted into {@link PanelFrame} by Story 53.3, exactly as
+ * {@link noteVaultReason} was by 50.1 and for the same reason**: two decisions
+ * now turn on this answer and they must not be able to disagree — what the body
+ * draws, and whether this panel draws a header row at all. `null` for a target
+ * that is not a file, and `null` while the panel is folded, which is what keeps
+ * a folded panel from reading a directory nobody can see (its body is unmounted,
+ * so this used to stop happening by construction).
  */
-function useFileResolution(profileId: string, relativePath: string): FileResolution {
-  const [resolution, setResolution] = useState<FileResolution>({ status: "resolving" });
+function useFileResolution(target: PanelTargetVm | null, folded: boolean): FileResolution | null {
+  const profileId = target?.kind === "file" ? target.profileId : null;
+  const relativePath = target?.kind === "file" ? target.relativePath : null;
+  const [resolution, setResolution] = useState<FileResolution | null>(null);
 
   useEffect(() => {
+    if (profileId === null || relativePath === null || folded) {
+      setResolution(null);
+      return;
+    }
     let live = true;
     setResolution({ status: "resolving" });
     syncBrowse(profileId, parentOf(relativePath))
@@ -200,7 +219,7 @@ function useFileResolution(profileId: string, relativePath: string): FileResolut
     return () => {
       live = false;
     };
-  }, [profileId, relativePath]);
+  }, [profileId, relativePath, folded]);
 
   return resolution;
 }
@@ -218,18 +237,28 @@ function PanelReason({ reason }: { reason: string }) {
   );
 }
 
-/** A file target: resolved through `sync_browse`, drawn by the registry. */
-function FilePanelBody({ profileId, relativePath }: { profileId: string; relativePath: string }) {
-  const resolution = useFileResolution(profileId, relativePath);
+/**
+ * What a file panel has to show, once its folder has answered (Story 53.3).
+ *
+ * The pair of states a body can render, and the union is what makes the frame's
+ * one decision expressible: only `resolved` can carry a viewer, and only a
+ * viewer can promise a header row. `null` — the absence of this whole value — is
+ * the resolution still being in flight, or a target that is not a file, or a
+ * folded panel that is reading nothing.
+ */
+type FilePanelView =
+  | { readonly status: "unresolved"; readonly reason: string }
+  | { readonly status: "resolved"; readonly view: ResolvedViewer & { readonly file: ViewerFile } };
 
-  if (resolution.status === "resolving") {
-    return <PanelReason reason={PANEL_RESOLVING_SENTENCE} />;
-  }
-  if (resolution.status === "unresolved") {
-    return <PanelReason reason={resolution.reason} />;
-  }
-
-  const entry = resolution.entry;
+/**
+ * One resolved file, ready to hand to the registry (Story 53.3).
+ *
+ * Built where the resolution is now read, so the frame and the body cannot end
+ * up holding two `ViewerFile`s for one row — and so the registry is asked once
+ * per resolution rather than once per body render. The decision the frame needs
+ * from it is {@link ResolvedViewer.ownsHostRow}; the body needs everything else.
+ */
+function viewerFor(profileId: string, entry: FilesEntryVm): ResolvedViewer & { file: ViewerFile } {
   const file: ViewerFile = {
     name: entry.name,
     kind: entry.kind,
@@ -245,6 +274,9 @@ function FilePanelBody({ profileId, relativePath }: { profileId: string; relativ
     // manage. Composed in Rust and carried on the listing row, so the panel
     // neither words it nor decides when it applies.
     writeCaveat: entry.write.caveat,
+    // And the one-line form of it, composed in Rust beside the other (Story
+    // 53.3): the surface folds the sentence, and never by clipping it.
+    writeCaveatShort: entry.write.caveatShort,
     // And the other verdict on the same row: why keeper will not write HERE.
     // `reason` is `Some` exactly when `writable` is false, so the conditional
     // is reading the pair as Rust guarantees it rather than defending against
@@ -253,8 +285,20 @@ function FilePanelBody({ profileId, relativePath }: { profileId: string; relativ
     // is refused on the listing, before any surface offers to edit it.
     writeRefusal: entry.write.writable ? null : entry.write.reason,
   };
-  const { entry: viewerEntry, Component } = viewerComponentFor(file);
-  return <Component file={file} entry={viewerEntry} />;
+  return { ...viewerComponentFor(file), file };
+}
+
+/** A file target: resolved by the frame above, drawn by the registry. `frame` is
+ *  the host's controls, non-null only when the resolved viewer promised to draw
+ *  a row for them (Story 53.3). */
+function FilePanelBody({
+  view,
+  frame,
+}: {
+  view: ResolvedViewer & { file: ViewerFile };
+  frame: ReactNode;
+}) {
+  return <view.Component file={view.file} entry={view.entry} frame={frame} />;
 }
 
 /**
@@ -304,17 +348,23 @@ function NotePanelBody({
   return <NoteEditor vaultId={vaultId} noteId={noteId} onOpenNote={onOpenNote} frame={frame} />;
 }
 
-/** What one panel is showing. `noteReason` and `frame` are the frame's, and
- *  only a note target has any use for either. */
+/** What one panel is showing.
+ *
+ *  `noteReason`, `fileView` and `frame` are all the FRAME's answers, decided
+ *  above so that the frame knows whether the thing below it is going to draw the
+ *  panel's header row. `frame` is non-null for exactly one of them at a time —
+ *  see {@link PanelFrame} — and whichever body is not drawing the row ignores it. */
 function PanelBody({
   target,
   emptySentence,
   noteReason,
+  fileView,
   frame,
 }: {
   target: PanelTargetVm | null;
   emptySentence: string;
   noteReason: string | null;
+  fileView: FilePanelView | null;
   frame: ReactNode;
 }) {
   if (target === null) {
@@ -322,7 +372,16 @@ function PanelBody({
   }
   switch (target.kind) {
     case "file":
-      return <FilePanelBody profileId={target.profileId} relativePath={target.relativePath} />;
+      // `null` is the resolution not having landed yet, or having failed: the
+      // frame holds the sentence for both, because the same answer decides
+      // whether it kept its own row.
+      if (fileView === null) {
+        return <PanelReason reason={PANEL_RESOLVING_SENTENCE} />;
+      }
+      if (fileView.status === "unresolved") {
+        return <PanelReason reason={fileView.reason} />;
+      }
+      return <FilePanelBody view={fileView.view} frame={frame} />;
     case "note":
       return (
         <NotePanelBody
@@ -432,6 +491,25 @@ function panelName(target: PanelTargetVm | null, noteTitle: string | null): stri
  * Panels are `flex-1` inside a horizontally scrolling strip, so this header gets
  * NARROWER than the note editor's rather than wider, which is the regime the
  * shrink rules were written for.
+ *
+ * # And no header at all when what is below draws one
+ *
+ * Story 50.1 for a note, Story 53.3 for a file: the surface inside already draws
+ * a row naming the same thing, so the panel hands its controls down instead of
+ * drawing a second band above them. The two cases differ only in how the answer
+ * is reached — a note's is a pure store read, and a file's is the folder listing
+ * plus the registry's answer about what will draw it — and they meet in one
+ * `frame` node so a note panel and a file panel cannot come to offer different
+ * chrome.
+ *
+ * **The row is given up only when the thing below has PROMISED to draw one.** A
+ * `.pdf` resolves to a viewer with no chrome; a listing that has not landed yet
+ * and one that failed are sentences, and a sentence carries no fold and no
+ * close. `ownsHostRow` is the registry's promise (`components.tsx`), read here
+ * and never guessed at from a format — and `savable` is deliberately NOT part of
+ * this decision, because it is decided inside the frame from a read that has not
+ * happened yet. A frame handed the controls draws the row in every state,
+ * including the four in which it used to draw none.
  */
 function PanelFrame({
   panel,
@@ -459,6 +537,23 @@ function PanelFrame({
   const noteReason =
     panel.target?.kind === "note" ? noteVaultReason(vaults, panel.target.vaultId) : null;
   const noteOwnsRow = panel.target?.kind === "note" && noteReason === null;
+  // Story 53.3's half of the same rule, and the reason the resolution moved up
+  // here: `ownsHostRow` is only knowable once the folder has answered and the
+  // registry has said what draws the row it answered with.
+  const fileResolution = useFileResolution(panel.target, panel.folded);
+  const fileProfileId = panel.target?.kind === "file" ? panel.target.profileId : null;
+  const fileView = useMemo<FilePanelView | null>(() => {
+    if (fileResolution === null || fileProfileId === null) {
+      return null;
+    }
+    if (fileResolution.status === "resolving") {
+      return null;
+    }
+    return fileResolution.status === "unresolved"
+      ? { status: "unresolved", reason: fileResolution.reason }
+      : { status: "resolved", view: viewerFor(fileProfileId, fileResolution.entry) };
+  }, [fileResolution, fileProfileId]);
+  const fileOwnsRow = fileView?.status === "resolved" && fileView.view.ownsHostRow;
   const noteTitle = useNoteTitle(
     panel.target?.kind === "note" ? panel.target.vaultId : null,
     panel.target?.kind === "note" ? panel.target.noteId : null,
@@ -504,15 +599,36 @@ function PanelFrame({
       <X aria-hidden="true" />
     </Button>
   ) : null;
+  // Story 45.21. A file only: a note panel's Export is in the editor's own
+  // Actions menu, which is the surface that can flush the buffer before the
+  // bytes are read off the disk. Two Export controls over one note, one of which
+  // exported the last autosave, is the shape this placement exists to refuse.
+  const exportFile =
+    panel.target?.kind === "file" ? (
+      <ExportFileButton
+        profileId={panel.target.profileId}
+        relativePath={panel.target.relativePath}
+      />
+    ) : null;
   // What the PANEL's controls are, wherever the row that carries them is drawn
-  // — this frame's own header, or the note editor's. One node either way, so a
-  // note panel and a file panel cannot come to offer different chrome.
+  // — this frame's own header, the note editor's, or the file frame's. One node
+  // either way, so a note panel and a file panel cannot come to offer different
+  // chrome.
+  //
+  // Export travels with them for a FILE and not for a note, which is the same
+  // rule as when this row was the panel's own: the control belongs to whoever
+  // can read the bytes off the disk, and for a note that is the editor.
   const frame = (
     <>
+      {exportFile}
       {fold}
       {close}
     </>
   );
+  // Which surface below is drawing this panel's row, if either. At most one, and
+  // the node goes to whichever it is: `PanelBody` hands it to the body it draws,
+  // and a body that draws no row ignores it.
+  const handedDown = noteOwnsRow || fileOwnsRow ? frame : null;
   return (
     <section
       aria-label={name}
@@ -555,7 +671,7 @@ function PanelFrame({
           <FoldStripHead className="justify-center">{fold}</FoldStripHead>
           <FoldStripName name={name} />
         </>
-      ) : noteOwnsRow ? null : (
+      ) : noteOwnsRow || fileOwnsRow ? null : (
         <PaneHeader
           // No `border-b` and no `py-*`: `PaneHeader` owns its own bottom edge
           // and its own 40px height, and spelling either here draws it twice.
@@ -570,22 +686,7 @@ function PanelFrame({
           // in, minus the heading semantics: DESIGN.md's `pane-header`
           // typography, which this row was the one place not to use.
           identity={<span className={FOLD_STRIP.titleClass}>{name}</span>}
-          actions={
-            <>
-              {/* Story 45.21. A file only: a note panel's Export is in the
-                  editor's own Actions menu, which is the surface that can flush
-                  the buffer before the bytes are read off the disk. Two Export
-                  controls over one note, one of which exported the last
-                  autosave, is the shape this placement exists to refuse. */}
-              {panel.target?.kind === "file" && (
-                <ExportFileButton
-                  profileId={panel.target.profileId}
-                  relativePath={panel.target.relativePath}
-                />
-              )}
-              {frame}
-            </>
-          }
+          actions={frame}
         />
       )}
       {panel.folded ? null : (
@@ -594,10 +695,11 @@ function PanelFrame({
             target={panel.target}
             emptySentence={emptySentence}
             noteReason={noteReason}
-            // Handed to every body and consumed by exactly one: the note
-            // editor, when it is the thing drawing this panel's row. A body
+            fileView={fileView}
+            // Handed to every body and consumed by exactly one: the note editor
+            // or the file frame, whichever is drawing this panel's row. A body
             // that draws no row ignores it and the row above is this frame's.
-            frame={noteOwnsRow ? frame : null}
+            frame={handedDown}
           />
         </div>
       )}

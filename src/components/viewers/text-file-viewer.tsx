@@ -35,7 +35,7 @@ import { useTextFile } from "./use-text-file";
  */
 export const TEXT_FILE_NOTICE_SLOT = "text-file-notice";
 
-export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement {
+export function TextFileViewer({ file, entry, frame = null }: ViewerProps): React.ReactElement {
   const state = useTextFile({ profileId: file.profileId, subpath: file.relativePath });
   const vaults = useNotesVaultsStore((each) => each.vaults);
   const [notice, setNotice] = useState<string | null>(null);
@@ -223,6 +223,11 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           entry={entry}
           state={state}
           writeCaveat={file.writeCaveat}
+          // Rust's one-line form of the same fact, which is what the frame shows
+          // until the reader asks for the whole of it (Story 53.3). Handed on
+          // rather than derived: clipping the sentence here would paraphrase the
+          // clause that names what is missing, which `viewers/types.ts` forbids.
+          writeCaveatShort={file.writeCaveatShort}
           // The location's verdict, straight off the listing row the panel
           // opened this file from — Rust's own refusal sentence, which is what
           // keeps a session's `workspace/` file (AD-113) read-only and toolless
@@ -244,6 +249,10 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           // reader had merely retitled.
           onPropertiesRenamed={repointAfterRename}
           preview={preview}
+          // The panel's own Export, fold and close, when the panel gave up its
+          // row because this frame draws one (Story 53.3). `null` from a host
+          // that draws its own — the frame then keeps the shape it had.
+          frame={frame}
         />
       </div>
     </div>

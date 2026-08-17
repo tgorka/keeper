@@ -84,6 +84,11 @@ import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
 import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
+import {
+  fileFrameFoldCookie,
+  hydrateFileFrameFold,
+  resetFileFrameFoldForTest,
+} from "@/lib/stores/file-frame-fold";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -200,6 +205,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "412 bytes",
     openWith: null,
     writeCaveat: null,
+    writeCaveatShort: null,
     writeRefusal: null,
     ...overrides,
   };
@@ -470,20 +476,48 @@ describe("saving goes through Story 45.3's one write path", () => {
     // honest is that the reader is told what is missing BEFORE editing, not
     // after saving. Rust composes the sentence; this surface owes only that
     // it is on screen with the editor, not instead of it.
+    //
+    // **RE-ANCHORED BY STORY 53.3, which NARROWS this rule and does not drop
+    // it.** The reader can now fold the band, and what folding it shows is
+    // Rust's own one-line composition of the same fact — the four-line form is
+    // one press away, on the control beside it (`the caveat fold` in
+    // `text-file-frame.test.tsx` presses it). So what is asserted before the
+    // first keystroke is the SHORT sentence, and the teeth are unchanged in the
+    // direction that matters: if the band disappears, if the short line stops
+    // naming what is missing, or if the webview starts clipping the long
+    // sentence instead of rendering Rust's, this fails.
     const caveat =
       "AGENTS.md is not one of keeper's notes — it is outside tgdrive's notes vault " +
       "(10-notes). keeper saves it straight to the file and sends a delete to this " +
       "computer's trash: no note history, no search index and no conflict copy. Nothing " +
       "about how tgdrive syncs this folder changes.";
+    const short =
+      "AGENTS.md is not one of keeper's notes: no note history, no search index and no " +
+      "conflict copy.";
     syncReadText.mockResolvedValue(vm({ text: "hello\n" }));
 
     openThroughTheRegistry(
-      target({ name: "AGENTS.md", relativePath: "AGENTS.md", writeCaveat: caveat }),
+      target({
+        name: "AGENTS.md",
+        relativePath: "AGENTS.md",
+        writeCaveat: caveat,
+        writeCaveatShort: short,
+      }),
     );
     const editor = await editorHost();
 
-    // Verbatim, never paraphrased — the same rule `reason` and `detail` follow.
-    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(caveat);
+    // On screen, standing, before anything has been typed — and verbatim, never
+    // paraphrased, the same rule `reason` and `detail` follow.
+    const band = screen.getByTestId(TEXT_FILE_CAVEAT_TESTID);
+    expect(band).toHaveTextContent(short);
+    // Still naming what is absent, which is the whole of what AD-102 asks a
+    // reader to know before the first keystroke.
+    for (const absent of ["no note history", "no search index", "no conflict copy"]) {
+      expect(band).toHaveTextContent(absent);
+    }
+    // Rust's short sentence and not a clipped long one: the two are not prefixes
+    // of each other, so a webview that truncated would fail here.
+    expect(caveat.startsWith(short)).toBe(false);
     // And the editor is there: this is a caveat, not a refusal.
     expect(editor).toBeInTheDocument();
   });
@@ -1168,6 +1202,16 @@ describe("a session log opens in three modes (Story 51.5)", () => {
  * viewer this suite deliberately renders on its own (`openThroughTheRegistry`).
  */
 describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
+  // Story 53.3 put the form behind a fold that defaults closed, and a rename is
+  // committed from a field INSIDE that form. So these arrange the state a reader
+  // who has opened it once is in — the cookie's own encoding, through the real
+  // hydrate — rather than pressing the disclosure in five tests whose subject is
+  // where the pane points afterwards.
+  beforeEach(() => {
+    resetFileFrameFoldForTest();
+    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+  });
+
   /** A block with a title, which is the field a rename is committed from. */
   const TITLED = "---\ntitle: untitled\n---\n";
 
@@ -1399,6 +1443,15 @@ describe("a rename in the properties panel takes the open pane with it (Story 52
  * bytes. A frame test could only assert the prop it just passed.
  */
 describe("the properties block is drawn once, not twice (Story 52.3)", () => {
+  // The fold this claim needs open, arranged the way a reader who opened it once
+  // leaves it (Story 53.3). With it closed the pane draws the block, which is the
+  // correct behaviour for a surface with no form above it and is asserted in
+  // `text-file-frame.test.tsx`'s fold describe.
+  beforeEach(() => {
+    resetFileFrameFoldForTest();
+    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+  });
+
   /** A file with properties, as `file_properties` writes them, and its body. */
   const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
   const BODY = "# Weekly\n\nalpha\n";

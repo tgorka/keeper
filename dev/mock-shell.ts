@@ -201,7 +201,7 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.
-    write: { writable: true, reason: null, caveat: null },
+    write: { writable: true, reason: null, caveat: null, caveatShort: null },
   };
 }
 
@@ -1564,7 +1564,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       entries: subpath === "" ? ENTRIES : (CHILDREN[subpath] ?? []),
       detail: null,
       truncated: false,
-      write: { writable: true, reason: null, caveat: null },
+      write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
 };

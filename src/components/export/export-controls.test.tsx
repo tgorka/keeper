@@ -106,7 +106,12 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     // whether or not the folder happens to be writable.
     size: { bytes: 4300000, label: "4.3 MB" },
     folderRole: null,
-    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
+    write: {
+      writable: false,
+      reason: "This folder is outside a notes vault.",
+      caveat: null,
+      caveatShort: null,
+    },
   };
 }
 
@@ -114,7 +119,12 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
   return {
     profileId: "p1",
     subpath,
-    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
+    write: {
+      writable: false,
+      reason: "This folder is outside a notes vault.",
+      caveat: null,
+      caveatShort: null,
+    },
     state: "listed",
     entries,
     detail: null,

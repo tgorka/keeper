@@ -4234,6 +4234,14 @@ pub struct FilesListingVm {
 /// shows standing, BEFORE the first keystroke — an edit that quietly does less
 /// than the vault path does is strictly worse than the refusal it replaces.
 /// `Some` only when `writable`; the two are never both set.
+///
+/// `caveat_short` is the same fact in one sentence (Story 53.3, FR-318), and it
+/// is a SECOND field rather than a replacement because the surface shows one and
+/// then the other: the short form stands before the first keystroke and the full
+/// one is a press away. Composed in Rust for the same reason the full one is —
+/// the webview renders both verbatim, and a webview that clipped the long one to
+/// fit would be paraphrasing exactly the clause that names what is missing.
+/// `Some` exactly when `caveat` is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -4246,6 +4254,9 @@ pub struct FilesWriteVm {
     /// a whole sentence. `None` when keeper manages the file, and always
     /// `None` when `writable` is false.
     pub caveat: Option<String>,
+    /// The same fact in one sentence, for a surface that folds the caveat away
+    /// (Story 53.3). `Some` exactly when `caveat` is.
+    pub caveat_short: Option<String>,
 }
 
 impl FilesWriteVm {
@@ -4255,19 +4266,24 @@ impl FilesWriteVm {
             writable: true,
             reason: None,
             caveat: None,
+            caveat_short: None,
         }
     }
 
-    /// keeper writes here through AD-102's second writer, and this sentence
-    /// says what that costs.
+    /// keeper writes here through AD-102's second writer, and these sentences
+    /// say what that costs — the whole of it, and the one line a folded surface
+    /// shows in its place (Story 53.3).
     ///
-    /// Composed by `keeper_sync::files_write::WriteScope::unmanaged_caveat`
-    /// and rendered verbatim, exactly as `reason` is.
-    pub fn unmanaged(caveat: impl Into<String>) -> Self {
+    /// Composed by `keeper_sync::files_write::WriteScope::unmanaged_caveat` and
+    /// `unmanaged_caveat_short`, rendered verbatim, exactly as `reason` is. Both
+    /// at once and from one call, so a row cannot carry the standing fact in a
+    /// form the surface it reaches has folded away.
+    pub fn unmanaged(caveat: impl Into<String>, short: impl Into<String>) -> Self {
         Self {
             writable: true,
             reason: None,
             caveat: Some(caveat.into()),
+            caveat_short: Some(short.into()),
         }
     }
 
@@ -4277,6 +4293,7 @@ impl FilesWriteVm {
             writable: false,
             reason: Some(reason.into()),
             caveat: None,
+            caveat_short: None,
         }
     }
 
@@ -6965,22 +6982,35 @@ mod tests {
             FilesWriteVm {
                 writable: true,
                 reason: None,
-                caveat: None
+                caveat: None,
+                caveat_short: None,
             }
         );
         let refused = FilesWriteVm::refused("nope, and here is why");
         assert!(!refused.writable);
         assert_eq!(refused.reason.as_deref(), Some("nope, and here is why"));
         assert_eq!(refused.caveat, None);
+        assert_eq!(refused.caveat_short, None);
 
         // Story 46.14's third state: writable AND unmanaged. Never a refusal,
         // and never silent — the two fields are still exclusive.
-        let unmanaged = FilesWriteVm::unmanaged("AGENTS.md is not one of keeper's notes");
+        //
+        // Story 53.3 made the caveat two forms of one fact, and they arrive
+        // TOGETHER: a row carrying only the long one reaches a folded surface
+        // with nothing to show, which is AD-102's fact off the screen.
+        let unmanaged = FilesWriteVm::unmanaged(
+            "AGENTS.md is not one of keeper's notes — it is outside Vault's notes vault",
+            "AGENTS.md is not one of keeper's notes: no note history",
+        );
         assert!(unmanaged.writable);
         assert_eq!(unmanaged.reason, None);
         assert_eq!(
             unmanaged.caveat.as_deref(),
-            Some("AGENTS.md is not one of keeper's notes")
+            Some("AGENTS.md is not one of keeper's notes — it is outside Vault's notes vault")
+        );
+        assert_eq!(
+            unmanaged.caveat_short.as_deref(),
+            Some("AGENTS.md is not one of keeper's notes: no note history")
         );
 
         // The projection every call site actually uses: a `Result` from the

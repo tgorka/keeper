@@ -669,6 +669,16 @@ impl<'a> WriteScope<'a> {
         Ok(inside.map_or(Owned::Unmanaged, Owned::Vault))
     }
 
+    /// What the vault would have given this file and will not, in the words both
+    /// forms of the caveat are built from.
+    ///
+    /// One string rather than two literals because Story 53.3 added a second
+    /// form of the sentence, and the whole of what makes the short one honest is
+    /// that it names the SAME absences. Two lists would agree until the day one
+    /// of them is edited, and the reader who is shown the short one is exactly
+    /// the reader who never sees the other to compare it with.
+    const UNMANAGED_ABSENT: &'static str = "no note history, no search index and no conflict copy";
+
     /// The sentence a surface must show BEFORE editing a file keeper does not
     /// manage (Story 46.14, AD-102).
     ///
@@ -684,6 +694,12 @@ impl<'a> WriteScope<'a> {
     /// Finder. What is genuinely absent is everything the *vault* provides, and
     /// naming that precisely is the difference between a caveat and a scare.
     ///
+    /// This is the form a surface shows on request since Story 53.3 —
+    /// [`Self::unmanaged_caveat_short`] is what stands before the first
+    /// keystroke. The narrowing is deliberate and it is a narrowing: the fact
+    /// never leaves the screen, and neither form is ever paraphrased in the
+    /// webview.
+    ///
     /// Takes the file's own name, never its path (FR-145).
     pub fn unmanaged_caveat(&self, name: &str) -> String {
         let profile = self.profile_name;
@@ -695,9 +711,32 @@ impl<'a> WriteScope<'a> {
         };
         format!(
             "{name} is not one of keeper's notes — {placing}. keeper saves it straight to \
-             the file and sends a delete to this computer's trash: no note history, no \
-             search index and no conflict copy. Nothing about how {profile} syncs this \
-             folder changes."
+             the file and sends a delete to this computer's trash: {absent}. Nothing about \
+             how {profile} syncs this folder changes.",
+            absent = Self::UNMANAGED_ABSENT,
+        )
+    }
+
+    /// The same standing fact in ONE sentence, for a surface that folds the
+    /// caveat away (Story 53.3, FR-318).
+    ///
+    /// **Composed here rather than clipped there.** The webview renders both
+    /// forms verbatim and paraphrases neither (`viewers/types.ts`), and a
+    /// truncation is a paraphrase a reader cannot tell from the whole sentence:
+    /// cutting this text at a character count lands mid-clause, and the clause
+    /// it would land in is the one naming what is absent.
+    ///
+    /// **It keeps the head and the absences and drops everything else.** What
+    /// goes is where the vault is, which writer runs, and the sentence about
+    /// syncing — facts that qualify the caveat rather than state it. What stays
+    /// is that this file is not one of keeper's notes and that the three things
+    /// a note would have gained are not there, which is the whole of what AD-102
+    /// says a reader must know before the first keystroke. Fold it to one line;
+    /// never to nothing.
+    pub fn unmanaged_caveat_short(&self, name: &str) -> String {
+        format!(
+            "{name} is not one of keeper's notes: {absent}.",
+            absent = Self::UNMANAGED_ABSENT,
         )
     }
 }
@@ -2202,5 +2241,58 @@ mod tests {
             assert!(!caveat.contains("will not sync"), "{caveat}");
             assert!(!caveat.contains("does not sync"), "{caveat}");
         }
+    }
+
+    /// The one-line form Story 53.3 folds the caveat to (FR-318).
+    ///
+    /// **The fold is a narrowing of AD-102 and this is where that is enforced.**
+    /// What the short form must keep is the head — this file is not one of
+    /// keeper's notes — and the three absences, because those are the whole of
+    /// what a reader has to know before the first keystroke. What it must drop
+    /// is everything that qualifies rather than states: where the vault is,
+    /// which writer runs, and the clause about syncing.
+    ///
+    /// **And it must be composed here.** The webview renders it verbatim, so a
+    /// short form that re-worded the absences would be a second copy of these
+    /// words with nothing keeping the two in step — which is why both forms are
+    /// built from [`WriteScope::UNMANAGED_ABSENT`] and this asserts that they
+    /// are.
+    #[test]
+    fn the_short_caveat_still_names_what_is_missing() {
+        let short = scope().unmanaged_caveat_short("AGENTS.md");
+        let full = scope().unmanaged_caveat("AGENTS.md");
+
+        assert!(
+            short.contains("AGENTS.md is not one of keeper's notes"),
+            "{short}"
+        );
+        for absent in ["no note history", "no search index", "no conflict copy"] {
+            assert!(short.contains(absent), "{short}");
+        }
+        // Both forms say what is missing in the SAME words, which is what stops
+        // the folded sentence drifting away from the one it folds.
+        assert!(short.contains(WriteScope::UNMANAGED_ABSENT), "{short}");
+        assert!(full.contains(WriteScope::UNMANAGED_ABSENT), "{full}");
+
+        // ONE sentence: a full stop followed by a space is a second one. The
+        // file's own name carries a dot, so counting dots would count that.
+        assert!(!short.contains(". "), "{short}");
+        // The qualifiers the fold takes away, and the overstatement neither form
+        // may ever make.
+        for dropped in [
+            "notes vault (10-notes)",
+            "this computer's trash",
+            "Nothing about how",
+            "will not sync",
+            "does not sync",
+        ] {
+            assert!(!short.contains(dropped), "{short}");
+        }
+        // A file with no vault at all gets the same one line: the placing is what
+        // the two full forms differ by, and the short form does not carry it.
+        assert_eq!(
+            WriteScope::new("Field", None).unmanaged_caveat_short("clip.txt"),
+            WriteScope::new("Vault", Some("10-notes")).unmanaged_caveat_short("clip.txt"),
+        );
     }
 }

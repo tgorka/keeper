@@ -32,6 +32,7 @@ function file(name: string, kind: RecordingNoteTargetKind): ViewerFile {
     sizeLabel: "12 kB",
     openWith: null,
     writeCaveat: null,
+    writeCaveatShort: null,
     writeRefusal: null,
   };
 }
@@ -163,6 +164,7 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       sizeLabel: "4 kB",
       openWith: null,
       writeCaveat: null,
+      writeCaveatShort: null,
       // …and one of them sits somewhere keeper refuses to write. The registry
       // answers from the NAME: a refusal changes what a surface may offer over
       // the file, never which viewer draws it, and a build that resolved a
@@ -181,6 +183,7 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       sizeLabel: null,
       openWith: async () => undefined,
       writeCaveat: null,
+      writeCaveatShort: null,
       writeRefusal: null,
     };
     expect(resolveViewer(fromFiles)).toBe(resolveViewer(fromNote));

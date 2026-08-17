@@ -63,6 +63,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "2.4 MB",
     openWith: null,
     writeCaveat: null,
+    writeCaveatShort: null,
     writeRefusal: null,
     ...overrides,
   };
