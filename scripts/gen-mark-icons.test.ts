@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { icoSizes, readIcoEntries } from "./lib/ico-dir";
 import { enclosedHoles, measure, nonBlackPixels, readPng } from "./lib/png-alpha";
 
 // These run against the COMMITTED artwork rather than a fresh render, and that is
@@ -204,12 +205,17 @@ describe("the iOS AppIcon set", () => {
 });
 
 describe("the favicons", () => {
-  // The two files that live in the REPO ROOT, so the project is identifiable at
+  // The three files that live in the REPO ROOT, so the project is identifiable at
   // a glance in a file browser, on GitHub, and in every tool that opens the
-  // repo. Both are the same desktop tile `gen-mark-icons.ts` cuts: the PNG for
-  // consumers that need a raster, the SVG for consumers that prefer a vector.
+  // repo. All three are the same desktop tile `gen-mark-icons.ts` cuts: the PNG
+  // for consumers that need one big raster, the SVG for consumers that prefer a
+  // vector, and the ICO for the engines and shells that ask for that name and
+  // pick a size out of it.
   const FAVICON = "favicon.png";
   const FAVICON_SVG = "favicon.svg";
+  const FAVICON_ICO = "favicon.ico";
+  /** The Windows bundle's icon (`tauri.conf.json`), which the root ICO is a copy of. */
+  const BUNDLED_ICO = `${ICON_DIR}/icon.ico`;
 
   it("is a 1024px square", () => {
     // 1024 because it is a downscale for every consumer that reads it: 512 is the
@@ -254,6 +260,25 @@ describe("the favicons", () => {
     expect(readFileSync(FAVICON_SVG, "utf8")).toContain((green as string[])[1]);
   });
 
+  it("offers a size for every consumer in its ICONDIR", () => {
+    // A single-size ico is the shape this check exists to catch: a 32px-only file
+    // upscales in a 256px file listing and downscales badly into a 16px tab, and
+    // nothing in a diff of a binary would say so. The generator writes what
+    // `tauri icon` emits, so the failure would arrive from a CLI bump rather than
+    // from an edit here.
+    expect(icoSizes(FAVICON_ICO)).toEqual([16, 24, 32, 48, 64, 256]);
+    // Every entry is square and accounted for — a non-square entry would be
+    // filtered out of the list above and pass unnoticed.
+    expect(readIcoEntries(FAVICON_ICO)).toHaveLength(6);
+  });
+
+  it("is the same bytes as the icon Tauri bundles for Windows", () => {
+    // It is a COPY of the bundled ico, not a second render, so identity is the
+    // contract rather than a coincidence: two renders of the same tile would be
+    // free to drift, and the root file is the one nobody looks at twice.
+    expect(readFileSync(FAVICON_ICO).equals(readFileSync(BUNDLED_ICO))).toBe(true);
+  });
+
   it("is actually referenced, not just present", () => {
     // A root-level image nothing points at is a file, not an identity. This is the
     // half of the job that is easy to leave undone: the icon renders, the diff
@@ -266,6 +291,14 @@ describe("the favicons", () => {
     const html = readFileSync("index.html", "utf8");
     expect(html).toContain(FAVICON);
     expect(html).toContain(FAVICON_SVG);
-    expect(readFileSync("README.md", "utf8")).toContain(FAVICON);
+    expect(html).toContain(FAVICON_ICO);
+    // Relative, all three: Vite has no publicDir here, so a root-absolute href
+    // would be passed through untouched and 404 in dev and in the bundle alike.
+    for (const file of [FAVICON, FAVICON_SVG, FAVICON_ICO]) {
+      expect(html).toContain(`href="./${file}"`);
+    }
+    const readme = readFileSync("README.md", "utf8");
+    expect(readme).toContain(FAVICON);
+    expect(readme).toContain(FAVICON_ICO);
   });
 });

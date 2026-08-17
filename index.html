@@ -8,11 +8,17 @@
          through untouched and 404 in dev and in the bundle alike. A relative href
          is resolved as a build asset and emitted into dist. This replaced a link
          to `/vite.svg`, a scaffold leftover that has never existed in this repo.
-         The SVG is listed first — a browser that understands both prefers the
-         later-listed match, but every modern engine takes the vector; the PNG
-         stays as the fallback and as the raster GitHub and file browsers read. -->
-    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+         The SVG is listed LAST on purpose: where two links match, a browser
+         prefers the later one it understands, and every modern engine understands
+         the vector — so the vector wins where it is understood and the rasters
+         are what remains for engines that ignore it. `favicon.ico` carries
+         16/32/48/256 for the tab, the taskbar and a large-icon file listing; the
+         1024px PNG stays as the single big raster GitHub and file browsers read.
+         `sizes="any"` on the ICO says "pick from the sizes inside me" rather than
+         letting an engine treat it as one unknown-size image. -->
+    <link rel="icon" href="./favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" href="./favicon.png" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <!-- viewport-fit=cover exposes env(safe-area-inset-*) for edge-to-edge phone
          rendering (Story 13.5, FR-59); interactive-widget=resizes-content resizes
          the layout viewport under the on-screen keyboard on Chromium webviews

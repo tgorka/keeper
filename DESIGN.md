@@ -330,11 +330,13 @@ instrument, and it wears the same cell.
 
 Every asset is cut from `src-tauri/crates/keeper/icons/mark.svg` by
 `bun run scripts/gen-mark-icons.ts` — app icons, ten tray templates, the iOS AppIcon set, and
-`favicon.png` plus `favicon.svg` in the repo root. The coloured tile is the owner's approved
-comp: the mark in paper (light `--background`) on the healthy-hive green (light
-`--bridge-healthy` — keeper's original brand green, which is where that colour now lives in the
-palette), with neighbour cells ghosted in the dark ground at low opacity. All three colours are
-read from `src/index.css`, so a retheme moves the icon with it. Do not hand-edit the PNGs.
+the three root files `favicon.png`, `favicon.svg` and `favicon.ico` (the last a copy of the
+bundled Windows icon, so the root raster cannot drift from it). The coloured tile is the
+owner's approved comp: the mark in paper (light `--background`) on the healthy-hive green
+(light `--bridge-healthy` — keeper's original brand green, which is where that colour now
+lives in the palette), with neighbour cells ghosted in the dark ground at low opacity. All
+three colours are read from `src/index.css`, so a retheme moves the icon with it. Do not
+hand-edit the PNGs.
 
 ## Do's and Don'ts
 

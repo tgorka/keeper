@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 /**
  * Generates every raster the keeper mark is shipped as: the app icon set Tauri bundles, the macOS
- * tray TEMPLATE family the menu bar tints, the iOS AppIcon set, `favicon.png` in the repo root —
- * and `favicon.svg` beside it, the one vector consumers that can read a vector should prefer.
+ * tray TEMPLATE family the menu bar tints, the iOS AppIcon set, and the three root artefacts —
+ * `favicon.png`, `favicon.svg` (the one vector consumers that can read a vector should prefer),
+ * and `favicon.ico`, the multi-size raster copied out of the bundled set.
  *
  * `src-tauri/crates/keeper/icons/mark.svg` is the only source of geometry — including the tray
  * badges and the halo that seats them. Nothing here knows the shape of anything: this file
@@ -33,6 +34,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { icoSizes, readIcoEntries } from "./lib/ico-dir";
 import { enclosedHoles, encodeRgbPng, measure, nonBlackPixels, readPng } from "./lib/png-alpha";
 
 const ICON_DIR = "src-tauri/crates/keeper/icons";
@@ -233,15 +235,34 @@ const NEIGHBOUR_OPACITY = 0.3;
 const TILE = 64;
 const TILE_INSET = 4;
 /**
- * `favicon.png` in the REPO ROOT — the same coloured tile as the desktop icon,
- * cut once, large. 1024 because it is the only size that is a DOWNSCALE for
- * every consumer that reads it (512 is the set's next largest icon, 256 a file
- * browser's biggest thumbnail, 640 the floor of GitHub's social-preview slot).
- * `favicon.svg` is the same drawing as a vector, for consumers that can.
+ * The three root artefacts, all the same coloured tile as the desktop icon.
+ *
+ * `favicon.png` is cut once, large: 1024 because it is the only size that is a
+ * DOWNSCALE for every consumer that reads it (512 is the set's next largest
+ * icon, 256 a file browser's biggest thumbnail, 640 the floor of GitHub's
+ * social-preview slot). `favicon.svg` is the same drawing as a vector, for
+ * consumers that can. `favicon.ico` is the multi-size raster Windows, some file
+ * browsers and older engines ask for by that exact name — copied out of the
+ * desktop set rather than rendered again, so it is bit-identical to the icon
+ * Tauri bundles and costs no extra rasterisation.
+ *
+ * All three are referenced by `index.html`; the PNG is also the README's mark
+ * and the ICO is named there beside it, and `gen-mark-icons.test.ts` fails if
+ * any of those references goes missing — a root image nothing points at is a
+ * file, not an identity.
  */
 const FAVICON = "favicon.png";
 const FAVICON_SVG = "favicon.svg";
+const FAVICON_ICO = "favicon.ico";
 const FAVICON_SIZE = 1024;
+/**
+ * The sizes the root ico must offer. `tauri icon` writes six (16/24/32/48/64/256)
+ * and these four are the ones consumers actually pick: 16 and 32 for a tab and a
+ * taskbar, 48 for a desktop shortcut, 256 for a large-icon file listing. Checked
+ * rather than assumed, so a future CLI that quietly drops a size fails the build
+ * instead of shipping a favicon that upscales in the one place it is seen most.
+ */
+const FAVICON_ICO_SIZES = [16, 32, 48, 256];
 
 /**
  * A flat-topped hexagon path, for the tile's neighbour cells. Decorative and
@@ -384,6 +405,28 @@ check(
 console.log(
   `${FAVICON}  ${FAVICON_SIZE}px, the desktop tile, ${tilePixels} px of ${TILE_BG} ` +
     `— referenced by index.html and README.md`,
+);
+
+// --- favicon.ico, in the repo root -------------------------------------------
+//
+// COPIED out of the desktop set, not rendered again. That set's `icon.ico` is
+// this same tile at six sizes, already written above, so the root ico costs zero
+// extra rasterisation and cannot drift from the one Tauri bundles for Windows —
+// which is the whole reason a second render would be wrong here rather than
+// merely slower.
+copyFileSync(join(desktopSet, "icon.ico"), FAVICON_ICO);
+const icoEntries = readIcoEntries(FAVICON_ICO);
+const icoOffers = icoSizes(FAVICON_ICO);
+const icoMissing = FAVICON_ICO_SIZES.filter((size) => !icoOffers.includes(size));
+check(
+  icoEntries.length === icoOffers.length && icoMissing.length === 0,
+  `${FAVICON_ICO} carries ${icoEntries.length} entries (${icoOffers.join("/")} px)` +
+    `${icoMissing.length > 0 ? `, missing ${icoMissing.join("/")}` : ""}` +
+    ` — a consumer that wants ${FAVICON_ICO_SIZES.join("/")} would have to upscale`,
+);
+console.log(
+  `${FAVICON_ICO}  ${icoEntries.length} entries (${icoOffers.join("/")} px), ` +
+    `byte-identical to ${ICON_DIR}/icon.ico — referenced by index.html and README.md`,
 );
 
 // --- the iOS AppIcon set ----------------------------------------------------
