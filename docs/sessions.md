@@ -80,6 +80,22 @@ for whoever, or whatever, is handed the folder with no other context.
 `artifacts/` and `workspace/` survive in both shapes because their difference is
 about *versioning*, not about kind, and no tag can replace that.
 
+**Markdown is found wherever it sits.** keeper reads a session's markdown in
+subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
+file is in the pool, the space whose tag it carries lists it, and a file carrying no tag
+is **unfiled** rather than invisible. Two folders are never read, in both shapes —
+`artifacts/`, which is output, and `workspace/`, which is scratch that dies with the
+session — and neither is anything dotted, like `.git` or `.obsidian`. A folder-shaped
+session's root is read the same way, beside its `README.md`: the record stays the record
+and does not also appear as an ordinary file.
+
+**Moving a file still never changes what it is.** The tag decides the kind, so a sitting
+you drag into `log/` is still a log, and a file you drag into `spaces/` is whatever it
+said it was before you moved it. keeper itself keeps writing at the session root — the
+folders are yours to make and yours to file into. The scan is budgeted, because a session
+is not a vault index: a tree too big to read is reported as truncated rather than quietly
+cut short.
+
 **Which one a folder is** is decided by presence, not absence: a folder holding
 `AGENTS.md` or `about.md` is flat. A folder holding both `README.md` and `AGENTS.md`
 reads as flat — the safe direction, because the residual README then shows up as an
@@ -363,9 +379,10 @@ set on purpose, because the zone's own rule is that big files stay in their zone
 session points at them by path. So the thing that goes wrong is the pointer, and this is
 the only place that would ever say so.
 
-Keeper reads the session's record and its pointer files — everything in `refs/` and
-`prompts/` in a folder-shaped session, the whole root markdown pool in a flat one — and
-reports one row per distinct target, six kinds, each with a real test behind it:
+Keeper reads the session's record and its pointer files — a folder-shaped session's root
+markdown plus everything in `refs/` and `prompts/`, and a flat session's whole markdown
+tree, the folders you made included — and reports one row per distinct target, six kinds,
+each with a real test behind it:
 
 - **note** — the target resolves in the vault index, the same resolution a wikilink in a
   note gets.
@@ -406,28 +423,40 @@ on it. Keeper offers to copy the file into `artifacts/` and reference that inste
 offer, not a rule, since a deliberately temporary pointer is a thing a person is allowed
 to want.
 
-Two directories are deliberately not scanned. `artifacts/` is a deliverable, so a
-reference inside it is the artifact's business, not the session's. `workspace/` is scratch
-that dies with the session, and a broken pointer in a file nobody keeps is not worth
-reporting. The scan is bounded by total text rather than by file count — the cost here is
-parsing markdown — and says so when it stops early.
+Two directories are deliberately not scanned, in either shape. `artifacts/` is a
+deliverable, so a reference inside it is the artifact's business, not the session's.
+`workspace/` is scratch that dies with the session, and a broken pointer in a file nobody
+keeps is not worth reporting. Dotted folders are furniture and are not read either. The
+scan is bounded by total text rather than by file count — the cost here is parsing
+markdown — and says so when it stops early.
 
 ## Editing
 
 A session's text files open in keeper's own editor, in the panel beside the board. A
-markdown file gets two tabs: **Source**, which is where you write, and a rendered tab
-that draws the markdown — mermaid included — and is deliberately read-only, so the
-characters in the file and the picture of them can never disagree. Every other text
-format gets the code editor: line numbers, a grammar, byte-for-byte line endings.
-`workspace/` files open read-only, because that folder refuses every write.
+markdown file gets three tabs, and they are three views of one buffer rather than three
+copies of the file:
+
+- **Preview** — the rendered document, mermaid included. It is where a file opens, because
+  a person opening a file to read it should not land in an editor, and it is read-only:
+  the characters in the file and the picture of them can never disagree.
+- **Source** — the characters, with the code editor's line numbers and grammar.
+- **Note** — the same live preview as the first tab, editable. It renders as you type, the
+  way writing in Notes does, and it is offered only for a markdown file keeper can
+  actually write: not in `workspace/`, not past the size limit, not a format keeper
+  refuses. Where it cannot be offered the tab is absent rather than present and refusing.
+
+Switching tabs never loses an unsaved edit and never resets the caret — there is one
+buffer under all three, and one Save. Every other text format gets the code editor: line
+numbers, a grammar, byte-for-byte line endings. `workspace/` files open read-only, because
+that folder refuses every write.
 
 **A session log writes like a note.** On the Source tab a markdown file has the format
 toolbar, the `/` command menu and `:shortcode:` emoji completion. Not copies of the
 ones in Notes — *the same ones*: they live in one module both editors import, so a table
 inserted from `/` in a session log and one inserted in a note are the same bytes, and a
-change to either is a change to both. There is no autosave for a file, on purpose: `⌘S`
-or the Save button is the write, and the header says whether the buffer differs from the
-disk.
+change to either is a change to both. There is no autosave for a file, on purpose — in
+Note mode either: `⌘S` or the Save button is the write, and the header says whether the
+buffer differs from the disk.
 
 **What still needs a vault, and why it always will.** Wikilink completion, tag
 completion, `![[…]]` embeds and the CSV table are addressed by a notes vault plus a

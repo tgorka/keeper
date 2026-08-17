@@ -31,9 +31,11 @@ use crate::sessions::shape::{KindTag, Shape, TaskStatus};
 /// One markdown file of the pool, already read by the shell.
 ///
 /// `rel` is session-relative with `/` separators — `about.md`,
-/// `2026-08-12-0930-opened.md`. The pool is the session's own root, so these
-/// are bare filenames in practice; the type says `rel` because that is what it
-/// is measured against and because `path:` identity quotes it verbatim.
+/// `2026-08-12-0930-opened.md`, `log/2026-08-16-0900-note.md`. A subdirectory
+/// is ordinary: the shell reads markdown wherever it sits in the session
+/// (FR-285), and the path is what `path:` identity quotes verbatim, so two
+/// files of the same name in two directories are two entries. What a file *is*
+/// is still its tags and never its directory (AD-120).
 #[derive(Debug, Clone, Copy)]
 pub struct PoolFile<'a> {
     pub rel: &'a str,
@@ -356,13 +358,20 @@ pub fn read_pool(files: &[PoolFile<'_>]) -> Pool {
     group(read(files))
 }
 
-/// Root `.md` names that could be logs, newest first — from the names alone.
+/// Session-relative `.md` paths that could be logs, newest first — from the
+/// names alone.
 ///
 /// The board draws one row per session and needs each session's newest log
 /// line. Reading every markdown file in every session to find it would make
 /// opening the board cost the whole zone; this narrows the field to the files
 /// whose *name* carries a `YYYY-MM-DD-HHMM` stamp and orders them so the shell
 /// can read the first one or two, stop, and still be right.
+///
+/// Ordered by path, which is ordered by the clock while a session's logs all
+/// sit in one directory. A shell whose list spans directories — the operator
+/// made a `log/` and keeper still writes at the root — re-keys on the basename
+/// before it takes its window, because `log/…` sorts above every root name
+/// whatever date it carries.
 ///
 /// Only a candidate list, never a verdict: the tag decides whether a file is a
 /// log, and a stamped name is not a tag. The shell reads down this list until
@@ -655,6 +664,73 @@ mod tests {
         // Said once more at the level the mistake would be made at: `read_one`
         // is handed the `refs/` prefix and still answers `None`.
         assert_eq!(read_one(file("refs/bare.md", "# x\n")).kind, None);
+    }
+
+    /// AD-120 again, at the two places FR-285 and FR-286 make newly reachable.
+    ///
+    /// Story 51.1 teaches the shell to read markdown wherever it sits: a
+    /// `spaces/` or a `log/` the operator made, and the root of a folder-shaped
+    /// session. That widening introduces the same risk `refs/` introduced —
+    /// that somebody concludes the directory now confers the kind, and drops
+    /// the tag from a write into `log/`. It does not: the reader derives the
+    /// kind from tags alone and never looks at the path, so an untagged file in
+    /// the directory logs are filed in is *unfiled* — in the pool, listed by no
+    /// space, and named by the detail's Unfiled notice rather than silently
+    /// absent.
+    #[test]
+    fn a_file_in_a_log_directory_without_the_tag_is_still_unfiled() {
+        let pool = read_pool(&[
+            file(
+                "log/2026-08-16-0900-filed.md",
+                "---\ntags: [log]\n---\n# Filed\n",
+            ),
+            file("log/2026-08-15-0900-bare.md", "# Moved here by hand\n"),
+            file("spaces/plan.md", "# A plan that declares nothing\n"),
+            // The owner's orphan: read at last (FR-286), and until it says what
+            // it is, it is unfiled rather than a reference.
+            file("references.md", "# What this session points at\n"),
+        ]);
+
+        assert_eq!(pool.logs.len(), 1, "only the tagged one is a log");
+        assert_eq!(pool.logs[0].rel, "log/2026-08-16-0900-filed.md");
+        assert!(pool.tasks.is_empty(), "`spaces/` confers nothing either");
+        let unfiled: Vec<&str> = pool.unfiled.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(
+            unfiled,
+            [
+                "log/2026-08-15-0900-bare.md",
+                "references.md",
+                "spaces/plan.md",
+            ]
+        );
+        // Said once more at the level the mistake would be made at: a stamped
+        // name, in the directory logs live in, still answers `None`.
+        assert_eq!(
+            read_one(file("log/2026-08-16-0900-bare.md", "# x\n")).kind,
+            None
+        );
+    }
+
+    /// An entry is its path, not its basename: `refs/inputs.md` and a root
+    /// `inputs.md` are two entries with two identities, and a space lists both.
+    #[test]
+    fn two_files_of_one_name_in_two_directories_are_two_entries() {
+        let pool = read_pool(&[
+            file("inputs.md", "---\ntags: [ref]\n---\n# Root inputs\n"),
+            file("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n"),
+        ]);
+
+        assert_eq!(
+            pool.refs.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
+            ["inputs.md", "refs/inputs.md"],
+            "both, in folded path order"
+        );
+        assert_eq!(
+            pool.refs.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["path:inputs.md", "path:refs/inputs.md"],
+            "the path identity quotes the whole path, so neither shadows the \
+             other and an edit aimed at one cannot land on the other"
+        );
     }
 
     /// Inline tags count: one tag set, however it was written.
