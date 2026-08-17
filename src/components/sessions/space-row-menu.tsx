@@ -38,7 +38,7 @@
  * refusal they make is Rust's own sentence, printed rather than re-worded.
  */
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import {
   addProperty,
   readFrontmatter,
@@ -121,8 +121,43 @@ export const SPACE_ROW_DELETE_FAILED = "keeper couldn't delete that file. Nothin
 /** What a failed path lookup says — the one verb whose failure is not a write. */
 export const SPACE_ROW_PATH_FAILED = "keeper couldn't work out where that file is on this disk.";
 
+/**
+ * Why a Rename offered on the session's record changes its title and not the
+ * row's name.
+ *
+ * Rust does not refuse this rename: `files::renames` (`sessions/files.rs:414`)
+ * answers *false* for the three record names and `files::compile_rename`
+ * (`:769`) then compiles the title write with no move at all — deliberately,
+ * because "refusing the title edit as well would make the one file whose title
+ * is the session's own headline the one file whose headline cannot be changed"
+ * (`:405-409`). `sessionsFileRename`'s own doc says the same on this side
+ * (`client.ts:5733`).
+ *
+ * So the item stays, and stays live. What it grows is this sentence, because the
+ * session TREE labels its rows with the filename (`session-tree.tsx:340`): a
+ * title write there is a verb whose whole effect is off screen, and a control
+ * that appears to do nothing is worse than one that says what it does.
+ */
+export const SPACE_ROW_RENAME_KEEPS_NAME =
+  "This one keeps its filename — keeper reads the session's shape off that name — so the title changes and nothing moves.";
+
 /** The frontmatter key a rename is derived from. */
 const TITLE_KEY = "title";
+
+/**
+ * The three names whose filename does not follow their title.
+ *
+ * `files::RECORD_NAMES` (`sessions/files.rs:62`), compared against the whole
+ * session-relative path exactly as Rust compares it (`:411-415`): a
+ * `notes/README.md` somebody wrote is not the record, and it renames.
+ *
+ * Spelled here rather than read off the wire because nothing on the wire carries
+ * it — `SessionEntryVm` publishes `locked` and `undeletable`, and Rust exposes
+ * this one as a `bool` predicate with no sentence to print. Nothing is *gated*
+ * on it (see {@link SPACE_ROW_RENAME_KEEPS_NAME}), so the cost of it drifting is
+ * a sentence that stops appearing rather than a verb that stops working.
+ */
+const RECORD_NAMES: readonly string[] = ["AGENTS.md", "about.md", "README.md"];
 
 export interface SpaceRowMenuProps {
   /** The sessions root, which is also the sync profile (AD-90, AD-107). */
@@ -150,6 +185,38 @@ export interface SpaceRowMenuProps {
    * the one the reader has learnt is the one that is already there.
    */
   onNotice: (notice: string | null) => void;
+  /**
+   * Why this row's Delete is refused, when it is (FR-262) — Rust's own sentence,
+   * `SessionEntryVm::undeletable` verbatim.
+   *
+   * Non-null renders Delete DISABLED with the sentence as its description rather
+   * than dropping it, which is `session-tree.tsx:458-462`'s finding: the files a
+   * person will actually try to delete are the ones whose refusal is surprising,
+   * and a control that quietly is not there teaches nothing. A caller with no
+   * per-path answer omits this and gets the live Delete it always had.
+   */
+  deleteRefusal?: string | null;
+  /**
+   * Whether renaming this row means anything. `false` OMITS the item.
+   *
+   * Omitted rather than disabled, which is the other half of the same
+   * distinction: a directory and a `.png` have no frontmatter `title:` for
+   * {@link commitRename} to splice, so there is no refusal to explain — the verb
+   * simply is not one this row has. `session-tree.tsx:471` drops its Delete on a
+   * scratch row for the matching reason (UX-DR43).
+   */
+  renamable?: boolean;
+  /**
+   * Whether the row is a directory, in which case the three verbs that address a
+   * FILE are absent: both panel items and the system opener.
+   *
+   * `files-pane.tsx:1675-1686,1965-1975`'s rule, ported rather than re-decided —
+   * a folder is not a panel target (`rowTarget` answers `null` for one) and its
+   * own gesture is expand/collapse. Reveal and Copy path stay, because a folder
+   * has a location like anything else, and those two are exactly what
+   * `files-pane.test.tsx:1938-1942` pins for this case.
+   */
+  directory?: boolean;
   /** The row. Radix renders it as the trigger, so its own DOM is unchanged. */
   children: ReactNode;
 }
@@ -163,6 +230,9 @@ export function SpaceRowMenu({
   onOpen,
   onChanged,
   onNotice,
+  deleteRefusal = null,
+  renamable = true,
+  directory = false,
   children,
 }: SpaceRowMenuProps) {
   // The hook lives inside the component so the surface that mounts this does not
@@ -171,6 +241,14 @@ export function SpaceRowMenu({
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(title);
   const [deleting, setDeleting] = useState(false);
+  // One id per mounted row, for the two items that carry a sentence beside their
+  // label — `attach-file-button.tsx:219-229`'s construction, and for its reason:
+  // Radix names an item from its text content, so a hint left to concatenate
+  // would make the control answer to "Deletekeeper deletes one file at a
+  // time…" — unspeakable by anybody using speech input (WCAG 2.5.3). The name is
+  // the word on the item; the sentence is a description.
+  const hintId = useId();
+  const keepsItsName = RECORD_NAMES.includes(relPath);
 
   const target = { kind: "file", profileId: rootId, relativePath: subpath } as const;
 
@@ -285,20 +363,25 @@ export function SpaceRowMenu({
             last so the item under the cursor when the menu opens is never the
             one that removes the file. */}
         <ContextMenuContent>
-          <ContextMenuItem onSelect={() => onOpen(subpath)}>
-            {SPACE_ROW_OPEN_HERE_LABEL}
-          </ContextMenuItem>
-          <ContextMenuItem onSelect={() => panelsStore.getState().openPanel(target)}>
-            {SPACE_ROW_OPEN_BESIDE_LABEL}
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            onSelect={() => {
-              void syncOpenEntry(rootId, subpath).catch(() => undefined);
-            }}
-          >
-            {SPACE_ROW_OPEN_LABEL}
-          </ContextMenuItem>
+          {/* The three verbs that address a FILE, absent on a directory. */}
+          {!directory && (
+            <>
+              <ContextMenuItem onSelect={() => onOpen(subpath)}>
+                {SPACE_ROW_OPEN_HERE_LABEL}
+              </ContextMenuItem>
+              <ContextMenuItem onSelect={() => panelsStore.getState().openPanel(target)}>
+                {SPACE_ROW_OPEN_BESIDE_LABEL}
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+              <ContextMenuItem
+                onSelect={() => {
+                  void syncOpenEntry(rootId, subpath).catch(() => undefined);
+                }}
+              >
+                {SPACE_ROW_OPEN_LABEL}
+              </ContextMenuItem>
+            </>
+          )}
           {canReveal && (
             <ContextMenuItem
               onSelect={() =>
@@ -323,23 +406,42 @@ export function SpaceRowMenu({
             {SPACE_ROW_COPY_PATH_LABEL}
           </ContextMenuItem>
           <ContextMenuSeparator />
-          <ContextMenuItem
-            onSelect={() => {
-              onNotice(null);
-              setDraft(title);
-              setRenaming(true);
-            }}
-          >
-            {SPACE_ROW_RENAME_LABEL}
-          </ContextMenuItem>
+          {renamable && (
+            <ContextMenuItem
+              aria-label={SPACE_ROW_RENAME_LABEL}
+              aria-describedby={keepsItsName ? `${hintId}-rename` : undefined}
+              className={keepsItsName ? "flex-col items-start gap-0.5" : undefined}
+              onSelect={() => {
+                onNotice(null);
+                setDraft(title);
+                setRenaming(true);
+              }}
+            >
+              <span>{SPACE_ROW_RENAME_LABEL}</span>
+              {keepsItsName && (
+                <span id={`${hintId}-rename`} className="text-muted-foreground text-xs">
+                  {SPACE_ROW_RENAME_KEEPS_NAME}
+                </span>
+              )}
+            </ContextMenuItem>
+          )}
           <ContextMenuItem
             variant="destructive"
+            disabled={deleteRefusal !== null}
+            aria-label={SPACE_ROW_DELETE_LABEL}
+            aria-describedby={deleteRefusal === null ? undefined : `${hintId}-delete`}
+            className={deleteRefusal === null ? undefined : "flex-col items-start gap-0.5"}
             onSelect={() => {
               onNotice(null);
               setDeleting(true);
             }}
           >
-            {SPACE_ROW_DELETE_LABEL}
+            <span>{SPACE_ROW_DELETE_LABEL}</span>
+            {deleteRefusal !== null && (
+              <span id={`${hintId}-delete`} className="text-muted-foreground text-xs">
+                {deleteRefusal}
+              </span>
+            )}
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
@@ -348,8 +450,14 @@ export function SpaceRowMenu({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{SPACE_ROW_RENAME_TITLE}</AlertDialogTitle>
+            {/* The record's dialog says what the record's rename does. The body
+                above it promises a file that follows its title and links
+                rewritten in the same write, and for the three names in
+                `RECORD_NAMES` neither half happens — a confirmation that
+                promised a move keeper will not make would be the one sentence
+                here that is not true. */}
             <AlertDialogDescription>
-              {relPath} — {SPACE_ROW_RENAME_BODY}
+              {relPath} — {keepsItsName ? SPACE_ROW_RENAME_KEEPS_NAME : SPACE_ROW_RENAME_BODY}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <Input
