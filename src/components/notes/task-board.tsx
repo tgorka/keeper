@@ -36,6 +36,20 @@
  * that does the same write, because a drag needs a pointer, a working hand and a
  * screen tall enough to show two columns at once. The keyboard path is the
  * accessible one and the pointer path is the fast one; they are the same verb.
+ *
+ * **A drag has to say what it carries.** `dragstart` writes the card's key into
+ * the drag data store and declares `effectAllowed = "move"`; both drop targets
+ * answer with `dropEffect = "move"`. WebKit — the engine keeper ships on macOS —
+ * fires no `drop` at all for a drag that set no data: it draws the ghost, paints
+ * a no-drop badge and then does nothing, which is what "drag and drop does not
+ * work" looked like underneath a suite of green jsdom tests that could not see a
+ * data store jsdom does not implement. Never delete those two lines.
+ *
+ * **The menu is demoted, not removed.** Four permanent select boxes are four
+ * columns of chrome, so it is revealed on hover and on `focus-within` — the
+ * {@link "@/components/sessions/session-tree"} row idiom. It stays in the DOM
+ * and in the tab order at all times: opacity is not visibility, and a keyboard
+ * user tabbing to it brings it back.
  */
 import { GripVertical, TriangleAlert } from "lucide-react";
 import { useState } from "react";
@@ -131,6 +145,40 @@ function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
     );
 }
 
+/**
+ * The format the card's identity is written in.
+ *
+ * `text/plain` because a card *is* a file, so a card dropped into a text field
+ * should type its path, and because it is the one type every engine lets a drop
+ * handler read back. What is dropped inside the board is resolved from this
+ * component's own state, not from the store — the store's job on WebKit is to
+ * exist.
+ */
+const DRAG_FORMAT = "text/plain";
+
+/**
+ * Say what the drag carries, and that it is a move.
+ *
+ * The store is guarded rather than assumed because jsdom builds its synthetic
+ * drag events without one — the React types promise a `DataTransfer` the test
+ * environment does not supply.
+ */
+function carry(transfer: DataTransfer | null | undefined, key: string) {
+  if (transfer === null || transfer === undefined) {
+    return;
+  }
+  transfer.setData(DRAG_FORMAT, key);
+  transfer.effectAllowed = "move";
+}
+
+/** Answer a drag over a target: a move, so WebKit paints a cursor and not a badge. */
+function accept(transfer: DataTransfer | null | undefined) {
+  if (transfer === null || transfer === undefined) {
+    return;
+  }
+  transfer.dropEffect = "move";
+}
+
 export function TaskBoard({
   heading,
   cards,
@@ -190,13 +238,17 @@ export function TaskBoard({
     <li
       key={card.key}
       draggable
-      onDragStart={() => setDragging(card.key)}
+      onDragStart={(event) => {
+        carry(event.dataTransfer, card.key);
+        setDragging(card.key);
+      }}
       onDragEnd={() => {
         setDragging(null);
         setOver(null);
       }}
       onDragOver={(event) => {
         event.preventDefault();
+        accept(event.dataTransfer);
         setOver(`${status}:${at}`);
       }}
       onDrop={(event) => {
@@ -208,7 +260,7 @@ export function TaskBoard({
         void move(dragging, status, dropIndex(column, dragging, at));
       }}
       className={cn(
-        "rounded-md border border-border bg-card px-2 py-1.5",
+        "group rounded-md border border-border bg-card px-2 py-1.5",
         dragging === card.key && "opacity-50",
         over === `${status}:${at}` && dragging !== null && "border-primary border-dashed",
       )}
@@ -221,6 +273,15 @@ export function TaskBoard({
         <div className="flex min-w-0 flex-col gap-1">
           <button
             type="button"
+            // The whole card is the handle, and a form control is a hole in it:
+            // WebKit starts no ancestor drag from a mousedown on a `button`, so
+            // a user who grabbed the title — the obvious place to grab — got
+            // nothing. Marking the button draggable makes it start the drag
+            // itself, and `dragstart` bubbles to the `li` that carries the
+            // handlers. Click and keyboard activation are untouched: what it
+            // costs is selecting the title's text, which a draggable card had
+            // already spent.
+            draggable
             onClick={() => onOpen(card.key)}
             className="text-left text-sm hover:underline"
           >
@@ -251,7 +312,12 @@ export function TaskBoard({
           )}
           {/* The same move, without a pointer. A native select for the reason
               every other sessions surface uses one: Radix's forbids an
-              empty-valued item, and this list is short, closed and known. */}
+              empty-valued item, and this list is short, closed and known.
+
+              Revealed on hover and on focus rather than drawn on every card at
+              all times (`session-tree.tsx:420`). `opacity-0` and not `hidden`:
+              it stays in the DOM, in the tab order and in the accessibility
+              tree, so tabbing to it both reveals it and reads it out. */}
           <select
             aria-label={`${BOARD_MOVE_LABEL} — ${card.title}`}
             value={card.status ?? ""}
@@ -261,7 +327,7 @@ export function TaskBoard({
               // arrives when nobody said otherwise.
               void move(card.key, next, columnOf(cards, next).length);
             }}
-            className="h-7 rounded-md border border-input bg-transparent px-1 text-muted-foreground text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="h-7 rounded-md border border-input bg-transparent px-1 text-muted-foreground text-xs opacity-0 outline-none focus-within:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100"
           >
             {card.status !== null && !known.has(card.status) && (
               <option value={card.status}>{card.status}</option>
@@ -316,6 +382,7 @@ export function TaskBoard({
                   aria-label={column.label}
                   onDragOver={(event) => {
                     event.preventDefault();
+                    accept(event.dataTransfer);
                     setOver(column.status);
                   }}
                   onDrop={(event) => {

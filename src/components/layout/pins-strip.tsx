@@ -4,10 +4,13 @@
  * A horizontal strip of 44 px circular room avatars rendered atop the Inbox view,
  * one per pinned room in the Rust-authoritative order (the {@link pinsRoomsStore}
  * mirror). Clicking an avatar selects the room; a per-avatar context menu offers
- * "Unpin". Native HTML5 drag reorders the avatars — the drop dispatches
- * {@link reorderPins} with the new full order and the authoritative order arrives
- * back over the stream (there is NO optimistic membership/order overlay; only an
- * ephemeral in-component preview during the drag, cleared on drop).
+ * "Unpin". Native HTML5 drag reorders the avatars — the drag names the pin it
+ * carries in the drag data store, without which WebKit fires no `drop` at all
+ * (see {@link carry}; the strip claimed a working reorder for a year while the
+ * macOS app had none), and the drop dispatches {@link reorderPins} with the new
+ * full order, whose authoritative answer arrives back over the stream (there is
+ * NO optimistic membership/order overlay; only an ephemeral in-component preview
+ * during the drag, cleared on drop).
  *
  * On the phone tier (Story 13.6) a long-press lifts the pin: dragging while
  * lifted previews a reorder and the drop persists it via {@link reorderPins};
@@ -71,6 +74,35 @@ function persistOrder(next: InboxRoomVm[]): void {
   void reorderPins(next.map((room) => ({ accountId: room.accountId, roomId: room.roomId }))).catch(
     () => {},
   );
+}
+
+/**
+ * Say what the drag carries, and that it is a move.
+ *
+ * WebKit — the engine keeper ships on macOS — fires no `drop` for a drag that
+ * wrote nothing to the data store: it draws the ghost and then does nothing,
+ * which is why reordering a pin by dragging it did not work in the real app
+ * while every jsdom test of it passed. Same defect, same two lines and the same
+ * longer note in {@link "@/components/notes/task-board"}. The pin's identity is
+ * its `(account, room)` pair, the key the strip already renders it under.
+ *
+ * The store is guarded rather than assumed because jsdom builds its synthetic
+ * drag events without one.
+ */
+function carry(transfer: DataTransfer | null | undefined, key: string): void {
+  if (transfer === null || transfer === undefined) {
+    return;
+  }
+  transfer.setData("text/plain", key);
+  transfer.effectAllowed = "move";
+}
+
+/** Answer a drag over a pin: a move, so WebKit paints a cursor and not a badge. */
+function accept(transfer: DataTransfer | null | undefined): void {
+  if (transfer === null || transfer === undefined) {
+    return;
+  }
+  transfer.dropEffect = "move";
 }
 
 export function PinsStrip({ pins, onSelect, selected, reorderable = true }: PinsStripProps) {
@@ -280,9 +312,23 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                     // attribute; phone-gated so the desktop DOM stays identical.
                     data-pin-index={phone ? pinIndex : undefined}
                     draggable={reorderable}
-                    onDragStart={() => reorderable && setDragIndex(pinIndex)}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={() => onDrop(pinIndex)}
+                    onDragStart={(e) => {
+                      if (!reorderable) {
+                        return;
+                      }
+                      carry(e.dataTransfer, `${room.accountId}:${room.roomId}`);
+                      setDragIndex(pinIndex);
+                    }}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      accept(e.dataTransfer);
+                    }}
+                    onDrop={(e) => {
+                      // Now that the drag carries text, a drop this strip did not
+                      // claim is one WebKit would act on itself.
+                      e.preventDefault();
+                      onDrop(pinIndex);
+                    }}
                     onDragEnd={() => setDragIndex(null)}
                     onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
                     onPointerDown={longPress.onPointerDown}
