@@ -445,7 +445,42 @@ export function SpaceEditor({
         }
       }}
     >
-      <DialogContent className="sm:max-w-lg">
+      {/* The form scrolls, and the panel is what caps it (Story 52.6, FR-310).
+
+          This form is taller than a 900px window — the icon chooser, the sort
+          and layout selects, the help copy and the term chips — and the shadcn
+          panel constrains WIDTH only (`ui/dialog.tsx:55`), centred with `top-1/2
+          -translate-y-1/2`. A transform creates no scroll container, so the top
+          of the form was not merely clipped, it was unreachable.
+
+          The override is the one Settings already established
+          (`settings-dialog.tsx:110`), copied rather than reinvented: the panel
+          becomes a height-capped flex column that clips, the header and footer
+          size to content, and the body between them is `flex-1 min-h-0` so it
+          takes the remaining bounded height and scrolls inside it. `min-h-0` is
+          load-bearing — a flex child defaults to `min-height:auto` (= its
+          content size), which grows past the cap and bleeds out of the dialog
+          instead of scrolling. `min-w-0` lets the help copy wrap instead of
+          clipping on the right, and `-mr-2 pr-2` keeps the scrollbar off the
+          controls. Never the `grid-rows-[…minmax(0,1fr)]` alternative: Tailwind's
+          arbitrary-value parser drops the comma inside `minmax()` and emits no
+          rule at all, so the cap silently never applies.
+
+          One extra step this form needs that Settings did not: two of the body's
+          children hold a scroll region of their own — the icon grid's
+          `ICON_GRID_MAX_HEIGHT` and the tag combobox's always-rendered
+          `max-h-48` listbox. A flex item whose own overflow is not `visible` has
+          an automatic minimum size of ZERO, so those two are the only children
+          that can give ground, and the flex algorithm hands them the whole
+          negative free space: the icon chooser and the tag list collapse to a
+          sliver and the body never scrolls at all. Same algorithm, other axis, as
+          the pane-header defect in `files-pane.tsx:2063`. `shrink-0` on the icon
+          fieldset and the Terms section is what makes the overflow land on the
+          body, where the scrollbar is.
+
+          `sessions/session-space-editor.tsx` is this surface's deliberate twin
+          and carries the identical pair. */}
+      <DialogContent className="flex max-h-[85vh] flex-col gap-4 overflow-hidden sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Edit space</DialogTitle>
           <DialogDescription>
@@ -453,7 +488,7 @@ export function SpaceEditor({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4">
+        <div className="-mr-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor={nameId}>Name</Label>
             <Input
@@ -475,7 +510,11 @@ export function SpaceEditor({
               it is not an icon and no query names it, so filtering it away would
               make "take the glyph off this space" a thing you can only do by
               clearing the box first. */}
-          <fieldset className="flex flex-col gap-1.5">
+          {/* `shrink-0` because this fieldset holds a scroll region: without it
+              it is one of the only two children that can give ground and the
+              body's overflow collapses it instead of scrolling. See the panel
+              comment above. */}
+          <fieldset className="flex shrink-0 flex-col gap-1.5">
             <legend className="font-medium text-sm">Icon</legend>
             <Input
               type="search"
@@ -643,7 +682,10 @@ export function SpaceEditor({
             )}
           </div>
 
-          <section aria-label="Terms" className="flex flex-col gap-2">
+          {/* `shrink-0` for the same reason as the icon fieldset: the tag
+              combobox's listbox is a scroll region, which would otherwise make
+              this section absorb the body's overflow instead of scrolling it. */}
+          <section aria-label="Terms" className="flex shrink-0 flex-col gap-2">
             <span className="font-medium text-sm">Terms</span>
             {terms.kind === "pending" && (
               <p className="text-muted-foreground text-sm">Reading this space's terms…</p>

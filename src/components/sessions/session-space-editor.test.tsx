@@ -18,6 +18,7 @@ import {
 } from "@/components/notes/space-editor";
 import {
   SESSION_SPACE_CREATE_DIR_LABEL,
+  SESSION_SPACE_CREATE_DIR_NOTE,
   SESSION_SPACE_EDIT_TITLE,
   SESSION_SPACE_FOLDED_LABEL,
   SESSION_SPACE_FOLDED_NOTE,
@@ -508,5 +509,150 @@ describe("SessionSpaceEditor failure", () => {
 
     expect(await screen.findByText(SESSION_SPACE_SAVE_FAILED)).toBeInTheDocument();
     expect(onSaved).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionSpaceEditor destination", () => {
+  /**
+   * Story 52.5, FR-309. A space may name a folder its creates land in. The form's
+   * whole job here is to carry the answer both ways without editing it: Rust owns
+   * what a path may be, and `render_edit` rewrites the whole `keeper:` map, so a
+   * save that omitted the key would delete the operator's answer — `folded`'s
+   * reason, one field over.
+   */
+  it("round-trips the destination a space already names", async () => {
+    open(space({ createDir: "logs" }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    const field = screen.getByLabelText<HTMLInputElement>(SESSION_SPACE_CREATE_DIR_LABEL);
+    expect(field.value).toBe("logs");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().createDir).toBe("logs");
+  });
+
+  it("sends what was typed, trimmed", async () => {
+    open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
+      target: { value: "  notes/2026  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().createDir).toBe("notes/2026");
+  });
+
+  /**
+   * The empty box is the whole back-compatibility story: `""` is what an absent
+   * key already means, Rust writes no key for it, and `kind_dir` falls back to the
+   * shape's answer — so clearing the field restores today's behaviour rather than
+   * naming the session root as a destination.
+   */
+  it("sends an empty destination for a space that names none, rather than a root path", async () => {
+    open(space({ createDir: "logs" }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
+      target: { value: "   " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().createDir).toBe("");
+  });
+
+  /** The note is always on screen: "New files go in" alone reads like a filter,
+   *  and the three places keeper refuses to write are not guessable from a label. */
+  it("says what the field does and where keeper will not write", async () => {
+    open(space());
+
+    expect(await screen.findByText(SESSION_SPACE_CREATE_DIR_NOTE)).toBeInTheDocument();
+  });
+});
+
+describe("SessionSpaceEditor reach", () => {
+  /**
+   * Story 52.6, FR-310. The form is taller than a 900px window, and the shadcn
+   * panel constrains width only, centred by a transform — a transform creates no
+   * scroll container, so the top of the form was unreachable rather than merely
+   * clipped.
+   *
+   * jsdom cannot measure that: `src/test/setup.ts:84-103` shims every rect to
+   * 1024×768, so `getBoundingClientRect()` and `scrollHeight` here are fiction.
+   * The assertion is therefore by className — the pattern this repo already uses
+   * for caps CSS-less jsdom cannot compute (`chat/composer.test.tsx:992`) — and
+   * the real measurement is owed in a browser at 900×900: the panel's
+   * `getBoundingClientRect().top >= 0` and the body's
+   * `scrollHeight > clientHeight`.
+   */
+  it("caps the panel height and scrolls the form inside it, so both ends are reachable", async () => {
+    open(space());
+    await screen.findByRole("button", { name: /Tag task/ });
+
+    const panel = screen.getByRole("dialog");
+    // A height-capped flex column that clips — the Settings idiom
+    // (`settings-dialog.tsx:110`), not a second invention.
+    expect(panel.className).toContain("max-h-[85vh]");
+    expect(panel.className).toContain("overflow-hidden");
+    expect(panel.className).toContain("flex");
+    expect(panel.className).toContain("flex-col");
+    // The width the surface already had is untouched; only the height gained a cap.
+    expect(panel.className).toContain("sm:max-w-lg");
+    // The panel clips. It is never the thing that scrolls.
+    expect(panel.className).not.toContain("overflow-y-auto");
+
+    const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");
+    expect(body).not.toBeNull();
+    // `min-h-0` is load-bearing, not decoration. A flex child defaults to
+    // `min-height:auto`, which is its *content* size, so without `min-h-0` this
+    // body grows straight past the panel's cap and bleeds out of the dialog
+    // instead of scrolling — the exact bug this test exists for. Removing it "to
+    // simplify" reopens it. `min-w-0` lets the help copy wrap instead of clipping
+    // on the right; `flex-1` is what makes the body take the bounded remainder.
+    expect(body?.className).toContain("min-h-0");
+    expect(body?.className).toContain("min-w-0");
+    expect(body?.className).toContain("flex-1");
+
+    // And it is the *form* that scrolls, between a pinned header and footer — so
+    // the classes cannot quietly drift onto some empty wrapper.
+    expect(body?.contains(screen.getByLabelText("Name"))).toBe(true);
+    expect(body?.contains(screen.getByRole("button", { name: "Save" }))).toBe(false);
+    expect(body?.contains(screen.getByText(SESSION_SPACE_EDIT_TITLE))).toBe(false);
+  });
+
+  /**
+   * The half of the fix that is easy to delete because it looks decorative. The
+   * body holds two children that own a scroll region — the icon grid and the tag
+   * combobox's always-rendered listbox — and a flex item whose own overflow is
+   * not `visible` has an automatic minimum size of ZERO. They are therefore the
+   * only children that can give ground, so without `shrink-0` the flex algorithm
+   * hands them the body's entire negative free space: the icon chooser and the
+   * tag list collapse to a sliver and the body never scrolls at all. It is the
+   * same algorithm that squeezed the files pane's prose to one word per line
+   * (`files-pane.test.tsx:2897`), in the other axis.
+   */
+  it("keeps the icon chooser and the terms section from absorbing the body's overflow", async () => {
+    open(space());
+    await screen.findByRole("button", { name: /Tag task/ });
+
+    const panel = screen.getByRole("dialog");
+    const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");
+    const iconGroup = screen.getByRole("group", { name: "Icon" });
+    const terms = screen.getByRole("region", { name: "Terms" });
+
+    // Both are direct children of the scrolling body, and neither may shrink.
+    expect(iconGroup.parentElement).toBe(body);
+    expect(terms.parentElement).toBe(body);
+    expect(iconGroup.className).toContain("shrink-0");
+    expect(terms.className).toContain("shrink-0");
+
+    // And each still contains the scroll region that is the reason for it.
+    expect(iconGroup.querySelector(".overflow-y-auto")).not.toBeNull();
+    expect(terms.querySelector<HTMLElement>("[role='listbox']")?.className).toContain(
+      "overflow-y-auto",
+    );
   });
 });
