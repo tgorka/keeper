@@ -276,6 +276,55 @@ keeper maintains `.gitattributes` and commits it with provenance. The bytes move
 through keeper's own LFS client, streamed and hashed in a single pass, never
 buffered.
 
+### Keeper owns `filter.lfs.process` in its own repositories
+
+Keeper's own staging path invokes no filter — it writes the pointer blob and the
+worktree file's stat directly. The registration exists for the *other* git in
+the folder: the one a human runs by hand.
+
+That registration has to claim `filter.lfs.process`, not only
+`filter.lfs.clean`/`smudge`. **git prefers a `process` driver over a
+clean/smudge pair regardless of which scope each was defined in**, and
+`git lfs install` writes `filter.lfs.process` into `~/.gitconfig`. So on every
+machine that has ever had the real git-lfs — every developer's — a repository
+-local clean/smudge pair is silently outranked and never runs.
+
+What answers instead is git-lfs, which fetches objects itself and, when it
+cannot resolve one, dies mid-protocol. Under `filter.lfs.required=false` git
+absorbs that and writes **zero bytes** — for that path and every remaining path
+in the same checkout. One object missing from the server is enough to empty an
+entire fast-forward's worth of media.
+
+`required` stays `false`, but for a narrower reason than before: keeper's filter
+answers a per-path failure with `status=error` and stays up, so git falls back
+for one path instead of emptying the rest. What `false` still buys is that a
+worktree whose keeper binary has moved remains checkout-able, as pointers,
+rather than hard-failing every git command in the folder.
+
+Two guards sit behind it:
+
+- **A file that is empty while its pointer names non-zero bytes is never
+  staged.** There is no editing sequence that produces that pair, and committing
+  it replaces every peer's only reference to the real object with a reference to
+  nothing.
+- **`keeper-syncd verify --remote`** asks the server whether it actually holds
+  every object the pointers name. See below.
+
+### Verifying the half that loses data
+
+`keeper-syncd verify` checks that every pointer in the worktree names an object
+*this machine* still has. That is the half answerable without a network.
+
+`keeper-syncd verify --remote` asks the other half, and it is the one that finds
+permanent loss: a pointer whose object never reached the server is a valid git
+blob, a clean `git status` and a green folder, while the content exists on
+exactly one machine in the world. Nothing in the sync path notices — the push
+gate that should have prevented it is precisely what is being checked.
+
+It transfers nothing: one batch round trip per few hundred objects, using the
+`download` operation because its per-object 404 is the server saying "I cannot
+serve this". A non-empty result exits non-zero so a cron wrapper sees it.
+
 ### The second local copy, and `lfsPruneLocal`
 
 On the machine where content originates every LFS file exists **twice**: once in

@@ -494,14 +494,23 @@ pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
 /// cache misses — it reports every LFS-tracked file as modified. keeper itself
 /// tolerates that, but nobody running `git status` by hand should have to.
 ///
-/// Single-invocation `clean`/`smudge` rather than the long-running
-/// `filter.lfs.process` protocol: both git and gitoxide support it, it is far
-/// less machinery, and the per-call cost only lands when git's stat cache
-/// already missed.
+/// All three keys are written, and `filter.lfs.process` is the load-bearing one
+/// (DW-140). git prefers a `process` driver over a `clean`/`smudge` pair
+/// *whatever scope each was defined in*, so the repository-local pair this
+/// function used to write alone was silently outranked by the
+/// `filter.lfs.process` that `git lfs install` leaves in `~/.gitconfig` — on
+/// every machine that has ever had the real git-lfs. The pair is still written
+/// because it costs one line and is what a `git` old enough to lack process
+/// filters would use; the local `process` key is what actually takes effect.
 ///
-/// `required` is deliberately left false. A worktree whose keeper binary has
-/// moved must still be checkout-able — it would just get pointers, which is
-/// recoverable, where a required filter would hard-fail every git command.
+/// `required` is deliberately left false, and the reasoning changed rather than
+/// survived: it is not that a failure is harmless, it is that
+/// [`crate::lfs::filter::run_process`] no longer *has* the failure mode that
+/// made `false` dangerous. A per-path refusal is reported as `status=error` and
+/// the process stays up, so git falls back for one path instead of emptying the
+/// rest of the checkout. What `false` still buys is the original case: a
+/// worktree whose keeper binary moved must remain checkout-able, as pointers,
+/// rather than hard-failing every git command in the folder.
 pub fn enforce_local_config_with_filter(
     repo: &gix::Repository,
     filter_program: Option<&Path>,
@@ -545,12 +554,20 @@ pub fn enforce_local_config_with_filter(
             "\"{quoted}\" lfs smudge --repo \"{}\" %f",
             workdir.display()
         );
+        // No `%f`: the long-running protocol names each path in-band.
+        let process = format!(
+            "\"{quoted}\" lfs filter-process --repo \"{}\"",
+            workdir.display()
+        );
         config
             .set_raw_value("filter.lfs.clean", clean.as_str())
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.clean: {err}")))?;
         config
             .set_raw_value("filter.lfs.smudge", smudge.as_str())
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.smudge: {err}")))?;
+        config
+            .set_raw_value("filter.lfs.process", process.as_str())
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.process: {err}")))?;
         config
             .set_raw_value("filter.lfs.required", "false")
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
@@ -1979,6 +1996,51 @@ mod tests {
             Some(false),
             "without this, gix::status hard-fails on a sparse index"
         );
+    }
+
+    /// The key that decides whether keeper's filter is ever reached (DW-140).
+    ///
+    /// git prefers `filter.<drv>.process` over a `clean`/`smudge` pair
+    /// *whatever scope each was defined in*, so a global one — which
+    /// `git lfs install` writes into `~/.gitconfig` on every machine that has
+    /// ever had the real client — outranks the repository-local pair keeper
+    /// used to register alone. Writing a local `process` key is the only way to
+    /// win that comparison, and it is the whole reason this registration
+    /// exists.
+    #[test]
+    fn the_filter_registration_claims_the_key_that_actually_takes_effect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+
+        enforce_local_config_with_filter(&repo, Some(Path::new("/Applications/keeper.app/keeper")))
+            .expect("enforce");
+
+        // Read back through gix rather than off the raw file: the on-disk form
+        // escapes the quotes around the program path, and asserting on that
+        // spelling would test the encoder instead of the registration.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let snapshot = reopened.config_snapshot();
+        let process = snapshot
+            .string("filter.lfs.process")
+            .expect("the long-running form must be registered, not only clean/smudge")
+            .to_string();
+        assert_eq!(
+            process,
+            "\"/Applications/keeper.app/keeper\" lfs filter-process --repo \"".to_owned()
+                + &dir.path().display().to_string()
+                + "\""
+        );
+        // No `%f`: the protocol names each path in-band, and a stray
+        // placeholder would arrive as an argument the filter never asked for.
+        assert!(!process.contains("%f"), "{process}");
+        // The single-shot pair stays: it costs one line and is what a git old
+        // enough to lack process filters would use.
+        assert!(snapshot
+            .string("filter.lfs.clean")
+            .is_some_and(|value| value.to_string().contains("lfs clean")));
+        assert!(snapshot
+            .string("filter.lfs.smudge")
+            .is_some_and(|value| value.to_string().contains("lfs smudge")));
     }
 
     #[test]

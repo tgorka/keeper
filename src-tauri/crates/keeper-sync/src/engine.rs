@@ -3826,6 +3826,23 @@ impl Engine {
                     StabilityVerdict::Stable => {
                         if is_new {
                             new_paths.push(rela.clone());
+                        } else if let Some(bytes) =
+                            lfs::stage::truncated_media(&repo, rela, &absolute)
+                        {
+                            // Not an edit — an accident, and one whose commit
+                            // is unrecoverable: cleaning an empty file emits a
+                            // pointer to nothing, which then replaces the only
+                            // reference every peer has to the real object
+                            // (DW-140). Held out of the staged set and named
+                            // out loud instead.
+                            self.warn(
+                                &profile.id,
+                                &profile.name,
+                                format!(
+                                    "{} is empty but should hold {bytes} bytes — not committing it; restore it from the remote before syncing this folder",
+                                    rela.display()
+                                ),
+                            );
                         } else if !lfs::stage::is_false_modification(&repo, rela, &absolute) {
                             // An LFS-tracked path whose entry is racily clean
                             // reports the worktree's bytes as differing from
@@ -4994,6 +5011,77 @@ impl Engine {
         // rest of the poll interval first.
         Self::lock(&self.next_scan_ms).remove(id);
         self.note_watch_wake(id);
+    }
+
+    /// Ask the server whether it holds every object this folder's pointers name
+    /// (DW-140).
+    ///
+    /// The remote half of [`Self::verify`], and the half that finds permanent
+    /// loss. A pointer whose object never reached the server is a valid git
+    /// blob, a clean `git status`, a green folder — and content only one machine
+    /// in the world still has. Nothing in the sync path notices; the push gate
+    /// that should have prevented it is the thing being checked.
+    ///
+    /// Read-only and cheap: one batch round trip per few hundred objects, no
+    /// transfer, no writes. The `download` operation is what asks the question,
+    /// because that is the one whose per-object 404 means "I cannot serve this".
+    ///
+    /// A folder with no LFS at all answers instantly and intact, which is the
+    /// honest answer rather than an error about a server it never uses.
+    pub async fn audit_remote_objects(&self, id: &str) -> Result<lfs::audit::RemoteAudit> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Ok(lfs::audit::RemoteAudit::default());
+        }
+        self.publish(self.progress(&profile, SyncPhase::Verifying));
+
+        let repo = self.open_repo(&profile)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let (objects, paths) = lfs::audit::tracked_objects(&repo, &tracked);
+        drop(repo);
+        if objects.is_empty() {
+            return Ok(lfs::audit::RemoteAudit::default());
+        }
+        let checked = paths.values().map(|used| used.len() as u64).sum();
+        let bytes = objects.iter().map(|object| object.size).sum();
+
+        let lfsconfig = match std::fs::read_to_string(profile.local_path.join(".lfsconfig")) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(SyncError::io(
+                    "read .lfsconfig",
+                    profile.local_path.join(".lfsconfig"),
+                    err,
+                ));
+            }
+        };
+        // A filesystem remote has no batch API to ask. The objects either sit in
+        // the directory or they do not, and `verify` on the peer answers that
+        // better than a fabricated round trip would.
+        if lfsconfig.is_none() && lfs::local::remote_store(&profile.remote_url).is_some() {
+            return Ok(lfs::audit::RemoteAudit {
+                checked,
+                objects: objects.len() as u64,
+                bytes,
+                missing: Vec::new(),
+            });
+        }
+
+        let (endpoint, auth) = self
+            .lfs_access(
+                &profile,
+                lfsconfig.as_deref(),
+                lfs::ssh::Operation::Download,
+            )
+            .await?;
+        let client = lfs::batch::BatchClient::new(self.http.clone(), endpoint, auth.clone())
+            .with_ref(format!("refs/heads/{}", profile.branch))
+            .with_auth_refresh(self.lfs_auth_refresh(&profile, auth.clone()));
+        let specs = client.download(&objects).await?;
+        Ok(lfs::audit::report(&specs, &paths, checked, bytes))
     }
 
     /// Re-verify stored content for a profile (Story 25.6).

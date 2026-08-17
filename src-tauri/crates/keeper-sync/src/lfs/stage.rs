@@ -8,15 +8,23 @@
 //! every time anything touches it. Above a threshold, content must never
 //! become a git blob.
 //!
-//! # Why there is no filter subprocess
+//! # Why *this* path needs no filter subprocess — and why one exists anyway
 //!
-//! The obvious route is registering `filter.lfs.process` so gitoxide's filter
-//! pipeline does clean/smudge for us. It is not needed. Verified empirically
+//! Staging here never invokes a filter. Verified empirically
 //! (`tests/lfs_pointer_stat.rs`): an index entry whose **blob is the pointer**
 //! but whose **stat is the worktree file's** reads as clean from both
 //! `gix::status` and `git status`. That is precisely how real git+LFS stays
 //! fast, and it lets keeper stay a single process with no `%f` quoting, no
 //! protocol handshake, and no dependency on a `git-lfs` binary.
+//!
+//! What that argument does **not** cover — and was read for years as though it
+//! did — is the *other* git in the folder: the one a human runs by hand. That
+//! one does consult `filter.lfs.*`, and if keeper has not claimed
+//! `filter.lfs.process`, a globally-installed git-lfs has, because git prefers a
+//! process driver over a clean/smudge pair from any scope. So
+//! [`crate::lfs::filter`] registers and serves one. It is not needed for the
+//! code in this module; it is needed so that nothing else is answering for
+//! keeper's repositories (DW-140).
 //!
 //! The one wrinkle is git's *racily clean* rule: an entry whose mtime is not
 //! older than the index is re-read regardless of stat. Right after staging,
@@ -788,6 +796,39 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
     pointer_blob(repo, entry.id)
 }
 
+/// How many bytes a path just lost, if what is on disk cannot be its content.
+///
+/// `Some(size)` means: the index holds a pointer naming `size` non-zero bytes,
+/// and the worktree file is **empty**. There is no editing sequence that
+/// produces that pair. A 400 MB recording does not become zero bytes because
+/// somebody changed it; it becomes zero bytes because something failed while
+/// writing it — a smudge filter that died mid-checkout, an interrupted copy, a
+/// disk that filled — and the file is now a lie about the content it names.
+///
+/// Committing it is the expensive half. The clean of an empty file is a pointer
+/// to the empty object, so the commit replaces the only reference any peer has
+/// to the real bytes with a reference to nothing, and pushes it. On 2026-08-16
+/// a failed checkout left 122 recordings at zero bytes in a folder keeper was
+/// actively syncing; nothing committed them only because the damage was noticed
+/// first. This is the guard that means noticing first is not required.
+///
+/// Deliberately narrow. It asks only about **emptiness**, not about size
+/// mismatches in general: a re-encoded video legitimately has a different
+/// length, and a guard that second-guessed every length change would refuse
+/// real edits. Zero is the one length that is never an edit.
+///
+/// A path whose worktree file is *missing* is not this function's business
+/// either — that is a deletion, and deleting a recording is something people
+/// legitimately do.
+pub fn truncated_media(repo: &gix::Repository, rela: &Path, absolute: &Path) -> Option<u64> {
+    let pointer = indexed_pointer(repo, rela)?;
+    if pointer.size == 0 {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(absolute).ok()?;
+    (metadata.is_file() && metadata.len() == 0).then_some(pointer.size)
+}
+
 /// Is `rela` reported as modified only because of git's racily-clean rule?
 ///
 /// An entry whose mtime is not older than the index is re-read regardless of
@@ -1086,6 +1127,107 @@ mod tests {
         let mut p = SyncProfile::new("01J", "p", root, "https://git.invalid/r.git");
         p.lfs_threshold_bytes = 1024;
         p
+    }
+
+    /// A repository whose index holds `rela` as a pointer of `size` bytes,
+    /// paired with whatever the worktree file currently is.
+    fn repo_with_indexed_pointer(root: &Path, rela: &str, size: u64) -> gix::Repository {
+        use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        let repo = crate::git::repo::open(root, false).expect("open");
+        let pointer = Pointer::new("a".repeat(64), size);
+        let blob = repo
+            .write_blob(pointer.render().as_bytes())
+            .expect("write blob")
+            .detach();
+        let absolute = root.join(rela);
+        let metadata =
+            gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat the worktree");
+        let stat = Stat::from_fs(&metadata).expect("stat convert");
+        let mut index = State::new(repo.object_hash());
+        index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+        index.sort_entries();
+        let mut file = gix::index::File::from_state(index, repo.index_path());
+        file.write(gix::index::write::Options::default())
+            .expect("write index");
+        crate::git::repo::open(root, false).expect("reopen")
+    }
+
+    /// The guard that would have stopped 122 emptied recordings from being
+    /// committed over their own pointers (DW-140).
+    #[test]
+    fn an_empty_file_whose_pointer_names_real_bytes_is_reported_as_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("video.mov"), b"").expect("write empty");
+        let repo = repo_with_indexed_pointer(root, "video.mov", 406_321_626);
+
+        assert_eq!(
+            truncated_media(&repo, Path::new("video.mov"), &root.join("video.mov")),
+            Some(406_321_626),
+            "an empty file cannot be the 406 MB its pointer promises"
+        );
+    }
+
+    /// Narrow on purpose. Every one of these is either an ordinary edit or an
+    /// ordinary state, and refusing to commit any of them would be a worse bug
+    /// than the one the guard exists for.
+    #[test]
+    fn the_truncation_guard_does_not_fire_on_anything_ordinary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Content that is simply different — a re-encode, an edit. Length is
+        // not the question; only emptiness is.
+        std::fs::write(root.join("video.mov"), b"shorter than before").expect("write");
+        let repo = repo_with_indexed_pointer(root, "video.mov", 406_321_626);
+        assert_eq!(
+            truncated_media(&repo, Path::new("video.mov"), &root.join("video.mov")),
+            None
+        );
+
+        // Pointer text in the worktree: what a pointer-only profile holds, and
+        // what this module's own smudge writes when the object is not local.
+        let pointer = Pointer::new("a".repeat(64), 406_321_626).render();
+        std::fs::write(root.join("video.mov"), pointer.as_bytes()).expect("write");
+        assert_eq!(
+            truncated_media(&repo, Path::new("video.mov"), &root.join("video.mov")),
+            None
+        );
+
+        // Gone from disk. That is a deletion, and deleting a recording is
+        // something people legitimately do.
+        std::fs::remove_file(root.join("video.mov")).expect("remove");
+        assert_eq!(
+            truncated_media(&repo, Path::new("video.mov"), &root.join("video.mov")),
+            None
+        );
+
+        // A path git has never heard of has no pointer to contradict.
+        std::fs::write(root.join("other.mov"), b"").expect("write");
+        assert_eq!(
+            truncated_media(&repo, Path::new("other.mov"), &root.join("other.mov")),
+            None
+        );
+    }
+
+    /// An empty file whose pointer also says zero is consistent, not damaged.
+    #[test]
+    fn an_empty_file_matching_an_empty_pointer_is_not_truncated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("empty.mov"), b"").expect("write empty");
+        let repo = repo_with_indexed_pointer(root, "empty.mov", 0);
+
+        assert_eq!(
+            truncated_media(&repo, Path::new("empty.mov"), &root.join("empty.mov")),
+            None
+        );
     }
 
     #[test]

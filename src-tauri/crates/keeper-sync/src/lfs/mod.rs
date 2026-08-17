@@ -77,11 +77,13 @@
 //! 13. **An empty file is its own pointer** and passes through unchanged.
 //! 14. **Unknown keys must survive** a parse-and-regenerate cycle.
 
+pub mod audit;
 pub mod basic;
 pub mod batch;
 pub mod endpoint;
 pub mod filter;
 pub mod local;
+pub mod pktline;
 pub mod pointer;
 pub mod prune;
 pub mod ssh;
