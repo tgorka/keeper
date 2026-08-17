@@ -1,0 +1,291 @@
+src/lib/stores/sessions-list.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 17-28,40-45,72,81,94,160
+src/components/sessions/session-spaces.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-4,6-11,16,18-24,33-36,47-56,58-67,72-76,90-97,101-133,146-147,156-230,234,236-243,245,262-272,274-277,282-284,301-303,305,307-315,317-318,323,327-339,555-1439
+src-tauri/crates/keeper-sync/src/bin/lfs-filter-harness.rs
+  s_2a6cf9f4dd637c::t_f26b0f4d1dcd70 1-41
+src-tauri/crates/keeper-core/src/sessions/plan.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 46-57,114,132-151,156,168-175,178,228,243-248,256,259,711-789
+docs/sessions.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 34-36,38,86-107,149-153,174-188,216-381,428-458,461-526,539-542,549-552,559,573-578,585-590,594-636,640-641,650-790,797-804,876-883
+_bmad-output/implementation-artifacts/spec-51-4-a-template-that-defines-spaces.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-100
+src/components/viewers/text-viewer.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 18,97,102,106,111,119,121,219-265,524-613
+  s_2a6cf9f4dd637c::t_e1c93f0bd8389a 614
+package.json
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 4
+src/components/viewers/text-file-frame.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 38-48,56,61,109-111,116-123,130,243,291,334-472
+src/lib/viewers/unknown-viewer.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 49,118-136
+  s_2a6cf9f4dd637c::t_1c3ac2d8a40b51 137
+src/lib/viewers/types.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 288-317
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 505-692
+src/components/notes/editor/file-embed-host.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 77-84,165-170
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 2350-2569
+src/components/notes/editor/emoji-complete.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 6-16,44-49
+src/components/settings/settings-dialog.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 6,217-222
+src/components/sessions/session-space-editor.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 147-183,251-252,274-283,402-412,581-624
+  s_2a6cf9f4dd637c::t_cf896339e381bf 625
+src-tauri/crates/keeper/src/ipc.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 10383-10433
+src/components/sessions/session-templates.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-1065
+src-tauri/crates/keeper/tauri.conf.json
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 4
+_bmad-output/implementation-artifacts/spec-51-3-a-space-that-says-how-it-opens.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-106
+src-tauri/crates/keeper-core/src/sessions/migrate.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 44,229-239,287-301,303-315,715,718,726-731,733-734,819-864,1067-1098
+  s_2a6cf9f4dd637c::t_a22b370ce19933 1099
+src/components/sessions/sessions-pane.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 29,85-104,131,136-140,190-211,228-233,242,244,248-277,283-290,292-307,310-330,429,432-436,469-484,490-498,503-510,514-516,518,520-542,548,553-558,566-585
+src/components/sessions/session-templates.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-1334
+src-tauri/crates/keeper-core/src/sessions/template.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 40,58-83,142-143,152-161,282,295,305,315,321-322,332-341,350,355,365,367-395,414-420,432-435,454-909,1039-1139,1142-1148,1157-1160,1167-1171,1192-1207,1267-1640
+_bmad-output/planning-artifacts/epic-49-templates-you-can-hold-spaces-you-can-fill.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-94
+src/components/sessions/sessions-pane.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 13-15,25-38,51,60-67,77,134,136,138,178-187,321,340-500
+  s_2a6cf9f4dd637c::t_edc71256e27139 501
+src/components/sessions/session-detail.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1,8,17,19-25,45-46,51-66,69,77-81,93,99-104,106-107,109-117,225-227,229,241-249,260-262,264,269-271,477-479,489-734,751-1094
+src-tauri/crates/keeper-core/src/sessions/files.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 36,49-68,149-176,213-230,233,245-249,255-326,353-400,447-553,649-691,717-804,1066-1128,1147-1562
+src-tauri/crates/keeper-core/src/sessions/refs.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 305-307,388-394,439-451,455,457-469,471-472,474,489-804,953-1019,1137-1333
+docs/sync.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 513-532,828
+src/components/viewers/text-viewer.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 30-32,34,73-91,115-116,120-130,141-171,184,210-213,219-223,225,249-264
+src/components/notes/note-editor.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 41,456,468-472,558-564,644,699-728,1068
+src-tauri/crates/keeper-core/src/sessions/add_ref.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 76-81,431-441,443-450,896,905-954
+  s_2a6cf9f4dd637c::t_f8c93ed257a02f 955
+src-tauri/crates/keeper/src/sessions_exec.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 169-174,182-216,273-300,346,515-813
+src/components/sessions/space-row-menu.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-381
+_bmad-output/implementation-artifacts/spec-49-3-spaces-fold-and-the-fold-has-a-default.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-214
+src/components/sessions/session-detail.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 55,59-63,141-217,351-357,398,462-463,510-515,518-529,535-570
+src/components/sessions/session-file-actions.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 9,20-30,43-50,59,73-78,85,105-123,147-161,171-172,178,183-184,205,210,212,223,228-229,234,243-260,271-287,301-318,323,395-425,427
+  s_2a6cf9f4dd637c::t_339fcd0e283778 426,428-430
+src/components/layout/panel-strip.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 248-254
+_bmad-output/implementation-artifacts/spec-50-3-one-editor-host-one-set-of-writing-tools.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-236
+src-tauri/crates/keeper-core/src/sessions/spaces.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 47,50,189-207,238-239,260-273,285-341,441-451,579-777,796-845,874,902,1036-1203,1208,1699-1933,1941-1942,2032-2178,2279-2441
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 3222-3254
+src/lib/stores/session-spaces-fold.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-375
+_bmad-output/implementation-artifacts/spec-51-5-note-mode.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-175
+src/components/sessions/session-space-editor.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 21-22,24-25,48-55,356-464
+  s_2a6cf9f4dd637c::t_d6437a105e515f 465-466
+docs/notes.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 146-171
+src/components/viewers/text-file-frame.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 42-71,75,137-148,176-191,204-222,232,234,238,280-293,295,298-302,305-337,383-397,401-408,423-428
+src-tauri/crates/keeper-core/src/sessions/shape.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 162-280,474-570
+src-tauri/crates/keeper-core/src/config/keys.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 613-623
+src-tauri/crates/keeper-core/src/account.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 3758-3782
+src/components/viewers/view-mode.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 50-69,83-92,116-119
+src/components/layout/panel-strip.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 30,45-54,137,180-246
+  s_2a6cf9f4dd637c::t_fd0f2b191dc6e7 247
+src/lib/ipc/gen/SessionDetailVm.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 69-85
+src-tauri/crates/keeper-core/src/sessions/pattern.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 84-85,97-105,139-201,326-330,332-344,347-348,353,385-401,407-417,431,555-561,574-592,732-746,754-756,758-761,902-1028
+src/lib/ipc/gen/SessionTemplateEntryVm.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-56
+src/components/sessions/sessions-settings.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-169
+src/components/viewers/view-mode.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 2,27-41,64-74,76
+src/components/viewers/markdown-preview.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 21-25,34-54,61-95,136-142,149-175,189-196,198-201,212-221,226-253,259-305,319-326,332-356,359,366-369
+src/components/sessions/sessions-settings.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-228
+src/components/viewers/text-editor-host.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 11-41,80,300-316,332-342,388,394-397,441-445,520-524
+_bmad-output/implementation-artifacts/spec-50-4-a-files-own-properties.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-110
+_bmad-output/implementation-artifacts/spec-51-7-about-explains-itself.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-96
+src/components/viewers/document-viewer.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 66,128-153
+  s_2a6cf9f4dd637c::t_f6b103afcf9c33 154-155
+src/components/viewers/text-file-viewer.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 17-22,52-63,66-67,73,130-139,185,736-1123
+src/lib/ipc/gen/SessionSpaceFilesVm.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 25-67
+src-tauri/crates/keeper/src/lib.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 856-857,931-936,972-977,979,982-983
+docs/settings-keys.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 75-76
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_2a6cf9f4dd637c::t_1dd7ebe1f4ff7a 469-471
+  s_2a6cf9f4dd637c::t_a5d6381c3a5628 3068-3072,3162-3166
+  s_2a6cf9f4dd637c::t_1cc8e105daadec 611-617
+_bmad-output/planning-artifacts/epic-50-a-session-note-behaves-like-a-note.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-139
+src-tauri/crates/keeper-core/src/notes/sort.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 48,53,326,331-338,341
+src-tauri/crates/keeper-sync/src/lfs/filter.rs
+  s_2a6cf9f4dd637c::t_60849f3ee1f7d1 607-706
+src/components/sessions/space-row-menu.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-326
+_bmad-output/implementation-artifacts/spec-49-1-templates-are-a-room-you-can-enter.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-215
+src/components/sessions/session-pattern-picker.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 46
+src/components/viewers/raw-rendered-view.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 24-30,39,46-64,74-75,77-87,93-99,172-175,178-181,185,190,228-231,758-1227
+  s_2a6cf9f4dd637c::t_f1e1254e02eee1 1228
+src/lib/ipc/gen/SessionSpaceReq.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 28-44
+src-tauri/crates/keeper/src/sessions_root.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 28-29,32-34,367-373,393-399,403-411,501-507,669-671,690-691,786-817,903-910,912-917,919-920,1018-1019,1025-1027,1059-1227,1232-1236,1250-1252,1271-1276,1280-1281,1283,1287-1298,1300-1316,1326,1817-2416
+src-tauri/crates/keeper-core/src/sessions/pool.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 21,35-39,203-226,237,259,339-345,355-357,376,392-393,401-407,420,583-638,728-822
+  s_2a6cf9f4dd637c::t_381ee5f90145e4 823
+src-tauri/crates/keeper-sync/src/files_write.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 617-628,1294-1322
+  s_2a6cf9f4dd637c::t_5c4013f9add90e 1323-1324
+_bmad-output/planning-artifacts/epic-51-a-session-that-behaves-like-the-rest-of-keeper.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-96
+src-tauri/crates/keeper-core/src/registry.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 716-747,3817-3839
+  s_2a6cf9f4dd637c::t_cc683a45a9ad4f 3840-3842
+src-tauri/Cargo.toml
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 6
+src-tauri/crates/keeper/src/sessions_ipc.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 537,545-561,572-580,647-651,833,837-847,949-950,979-980,994-1020,1022,1030,1034-1088,1595-1600,1606,1617-1621,1624,1642-1643,1660-1668,1690-1698,1720-1721,1767-1772,1919-2013,2045,2048-2050,2093,2095-2146,2148-2225,2228-2239,2242,2244-2248,2250-2290,2292-2298,2300-2304,2307-2312,2317-2387,2390-2414,2416-2419,2421-2427,2430,2432-3046,3121-3215,3217-3224,3228-3231,3234-3235,3246,3269-3297,3299-3311,3322-3324,3380-3591,3728-3734,3758-3776,3818,3821-3824,3826,3909-3918,3940,3942-3968,4059-4065,4068,4331-4500
+_bmad-output/implementation-artifacts/spec-51-2-a-folder-you-can-make.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-101
+src/components/viewers/markdown-preview.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 18,139,143-144,195-403
+src/components/layout/sidebar-group.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 20-26,50,57,67-82,87-94,117-132,159,164-174
+src/lib/vault-link/actions.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 25-35,124-135,141-144,146,161-163,182-191
+_bmad-output/implementation-artifacts/spec-50-2-a-templates-files-and-folders.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-126
+_bmad-output/implementation-artifacts/spec-51-6-a-row-you-can-right-click.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-116
+src/lib/ipc/client.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 232,379,2672-2697,3326-3376,5306-5584,5617-5660,5706-5773
+  s_2a6cf9f4dd637c::t_7ea214379430a3 5774
+_bmad-output/implementation-artifacts/spec-50-1-a-space-you-can-write-into-wherever-the-session-keeps-it.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-131
+_bmad-output/implementation-artifacts/spec-49-2-a-space-you-can-write-into.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-229
+_bmad-output/implementation-artifacts/spec-51-1-markdown-is-found-wherever-it-sits.md
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-98
+src/components/viewers/raw-rendered-view.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 2-3,32-40,51,53,78-89,102-110,136-162,186-189,356-392,394-395,398,401-404,407-413,417-446,454,457-466,472-478,482-483,486-496,515,527-528,580-600,602-604,606-610,626-636,645-656,688,693,696-710
+src-tauri/crates/keeper-core/src/lib.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 27
+src-tauri/crates/keeper-core/src/sessions/vm.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 366-382,484-504,512-525,545-582,627-676,701-712
+src/components/viewers/markdown-preview-load-failure.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-57
+src/components/sessions/session-file-actions.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 2,9,16-17,21-23,68-79,85-87,89,91-95,106,152-166,168-182,271-400
+src/components/notes/note-editor.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 37,52,142,147,846-898
+  s_2a6cf9f4dd637c::t_77220178e5f6c8 899
+src/components/notes/properties-panel.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 49-66,95-97,132-138,147-157,186-195,198,200,202-203,206,208,210,273,296,300-305,308-324,330-338,340-342,358-364,372-374,409-444,446-456,471-589,592-594,643-653,656-657,660,663-665,724-732,753-759,800-817,824-959,1023,1040,1118,1127-1129
+src/components/notes/editor/writing-tools.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-236
+src-tauri/crates/keeper-core/src/file_properties.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-481
+src/components/viewers/media-viewer.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 79,128-150
+  s_2a6cf9f4dd637c::t_e9699ff56dfb49 151-152
+src/components/viewers/use-text-file.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 20-25,63-96,107-114,116-118,170-174,309-316,326,352,364
+src/lib/viewers/registry.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 35,166-173,184
+src/lib/ipc/gen/SessionSpaceVm.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 50-74,85-101
+src/components/notes/editor/writing-tools.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-96
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_2a6cf9f4dd637c::t_1732a27694e08b 2337-2338
+  s_2a6cf9f4dd637c::t_240cb74ae45b18 2247-2258,2260,2270-2276,2278-2285
+  s_2a6cf9f4dd637c::t_9ef052aabd2bbc 622-643
+  s_2a6cf9f4dd637c::t_1dd1552b65a5ce 2299-2305
+  s_2a6cf9f4dd637c::t_55629ec89eafe6 2346-2347,2349-2398
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 73,77,81-191,569,578-581,704-718,2238-2246,2259,2261-2264,2266-2269,2277,2286-2298,2306-2336,2339-2345
+  s_2a6cf9f4dd637c::t_a5d6381c3a5628 601,655,2188-2192,2265
+  s_2a6cf9f4dd637c::t_40010be4ebb1ce 696-703,719-720
+  s_2a6cf9f4dd637c::t_f0bc319fc03e5c 727-739,741,743
+  s_2a6cf9f4dd637c::t_23adbb5b9a1b1c 740
+  s_2a6cf9f4dd637c::t_9118fdfc1d6c9b 742
+  s_2a6cf9f4dd637c::t_90460c844cc63d 2193
+  s_2a6cf9f4dd637c::t_366456339feee9 2348
+src/components/sessions/session-spaces.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 26-89,91,93,96,111,113-118,176-188,199-231,235-264,274-277,280-290,360-389,447-452,455-456,513-518,521-522,529-539,542-543,554-635,638-676,678-679,681-686,688-694,696-808,818,820-836,838-860,865-886
+dev/mock-shell.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 479-488,501-507,520-525,539-542,544-550,566-569,606-617,638-639,649-650,656-657,663-664,668-716,780-796,1158-1169,1174-1182,1184-1190,1228-1249,1266-1277,1463-1477,1481-1485
+src/components/sessions/session-add-ref.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 286-334
+src/components/viewers/text-file-viewer.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 184-188,190-198
+src/lib/stores/session-spaces-fold.test.ts
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-373
+src-tauri/crates/keeper-sync/tests/lfs_filter_process.rs
+  s_2a6cf9f4dd637c::t_64c3fd8f10976a 28-56
+  s_2a6cf9f4dd637c::t_89865139f10b39 77-80
+  s_2a6cf9f4dd637c::t_4a6f801cb894b3 126-149
+  s_2a6cf9f4dd637c::t_12557982067dab 1-27,57-76,81-125,150-182
+src/lib/viewers/components.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 52,155-173
+  s_2a6cf9f4dd637c::t_b64679391ba77a 174-175
+src/components/notes/file-properties.test.tsx
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-360
+src-tauri/crates/keeper-sync/tests/lfs_filter_shadowing.rs
+  s_2a6cf9f4dd637c::t_c2e7dad4a0336d 1-152,159,162-193
+  s_2a6cf9f4dd637c::t_08270512ba4ada 153-158,160-161
+src-tauri/Cargo.lock
+  s_2a6cf9f4dd637c::t_9835c0403503a6 4189,4225,4254,4282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a805fd90d3e5f102b0576024af79f1bd185d2871",
+  "prompts": {},
+  "sessions": {
+    "s_2a6cf9f4dd637c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bc3d69a-e2a2-4d7e-893b-7eebe6936df4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
