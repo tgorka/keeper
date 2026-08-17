@@ -77,6 +77,7 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsFileRename: vi.fn(async () => ""),
 }));
 
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import {
   PANE_HEADER_ACTIONS_SLOT,
   PANE_HEADER_FRAME_SLOT,
@@ -1142,5 +1143,45 @@ describe("the merged title bar", () => {
     // because the host handed its controls over, and there is no buffer here that
     // can be dirty (`pane-header.tsx` on why the two are different).
     expect(bar()?.querySelector(`:scope > [data-slot="${PANE_HEADER_STATUS_SLOT}"]`)).toBeNull();
+  });
+
+  /** The name element itself, which is what carries the treatment. */
+  function nameElement(): Element {
+    const found = group(PANE_HEADER_IDENTITY_SLOT).firstElementChild;
+    if (found === null) {
+      throw new Error("the identity group drew no name");
+    }
+    return found;
+  }
+
+  it("names the file in the panel-title typography every other panel title wears", () => {
+    mount({ dirty: true }, MARKDOWN, ADDRESS, { frame: FRAME_CONTROLS });
+
+    // `FOLD_STRIP.titleClass` itself rather than a copy of its words: this row IS
+    // the panel's title row now, `panel-strip.tsx` gave up its own on that basis,
+    // and a strip holding `notes.md`, `report.pdf` and a note must not show three
+    // treatments for one thing. Folding the `.md` used to change the size of its
+    // own name, because the folded strip draws it in this class and the bar drew
+    // it in another.
+    const name = nameElement();
+    expect(name).toHaveTextContent("readme.md");
+    expect(name).toHaveClass(...FOLD_STRIP.titleClass.split(" "));
+    // And not the subordinate treatment it wore while it was a SECOND bar under
+    // the panel's own title row: 12px/500 beside every other panel's 15px/600.
+    expect(name).not.toHaveClass("text-xs");
+    expect(name).not.toHaveClass("font-medium");
+  });
+
+  it("leaves the name small for a host that draws its own row", () => {
+    // The note embed (`file-embed-host.tsx`), which passes no `frame`. This bar
+    // is not a panel title there — it is a label inside somebody's document, and
+    // a 15px heading would outshout the prose around it.
+    mount({ dirty: true }, MARKDOWN, ADDRESS);
+
+    const name = nameElement();
+    expect(name).toHaveTextContent("readme.md");
+    expect(name).toHaveClass("font-medium", "text-xs");
+    expect(name).not.toHaveClass("font-heading");
+    expect(name).not.toHaveClass("text-title");
   });
 });

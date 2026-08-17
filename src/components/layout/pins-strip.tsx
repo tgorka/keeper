@@ -257,6 +257,16 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
       <ul
         ref={listRef}
         aria-label="Pinned conversations"
+        // The move, the release and the cancel are listened for here and nowhere
+        // else. Before the slop crossing there is no capture, and a press 4 px
+        // from the edge of a 44 px avatar leaves it well before travelling the
+        // 10 px lift tolerance: that move lands on this list, and the avatar sits
+        // below it rather than above, so on the avatar alone nothing would hear it
+        // and the drag would silently never start. Every handler is
+        // `pointerId`-guarded and no-ops with no press in flight.
+        onPointerMove={drag.handlers.onPointerMove}
+        onPointerUp={drag.handlers.onPointerUp}
+        onPointerCancel={drag.handlers.onPointerCancel}
         className="flex flex-nowrap items-center gap-2 overflow-x-auto p-2"
       >
         {displayPins.map((room, index) => {
@@ -279,6 +289,13 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                     data-pin-index={phone ? pinIndex : undefined}
                     onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
                     onPointerDown={(e) => {
+                      // Every press, ahead of the gates below. A touch drag ends
+                      // with no synthesised click at all, so nothing eats the
+                      // swallow flag the lift set; and the phone gate returns
+                      // before `drag.begin`, which is the other site that clears
+                      // it. Without this the tap after a long-press reorder is
+                      // swallowed and the room does not open until the second.
+                      drag.allowNextClick();
                       longPress.onPointerDown(e);
                       // The desktop entry: no hold, and the press becomes a drag
                       // only past the slop, so a click still selects the room.
@@ -303,19 +320,14 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                         },
                       );
                     }}
-                    onPointerMove={(e) => {
-                      longPress.onPointerMove(e);
-                      drag.handlers.onPointerMove(e);
-                    }}
-                    onPointerUp={(e) => {
-                      longPress.onPointerUp(e);
-                      drag.handlers.onPointerUp(e);
-                    }}
-                    onPointerCancel={(e) => {
-                      longPress.onPointerCancel(e);
-                      drag.handlers.onPointerCancel(e);
-                    }}
-                    onLostPointerCapture={drag.handlers.onLostPointerCapture}
+                    // The long-press owns these on the avatar: it needs the
+                    // element it is holding. The drag's own move/release/cancel
+                    // are listened for once, on the list (`:257`), because this
+                    // avatar is inside it — a copy here would only re-run the same
+                    // slot hit-test on every move of a live drag.
+                    onPointerMove={longPress.onPointerMove}
+                    onPointerUp={longPress.onPointerUp}
+                    onPointerCancel={longPress.onPointerCancel}
                     onClickCapture={(e) => {
                       longPress.onClickCapture(e);
                       drag.handlers.onClickCapture(e);

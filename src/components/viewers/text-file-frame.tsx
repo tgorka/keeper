@@ -119,6 +119,7 @@
  */
 import { ChevronDown, ChevronRight, SlidersHorizontal } from "lucide-react";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
 import { FileProperties, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
@@ -319,6 +320,31 @@ export interface TextFileFrameProps {
    */
   frame?: ReactNode;
   /**
+   * The host's own bands — what it offers about this file and what it has to
+   * report about the last thing it tried — or omitted when it has none
+   * (Story 53.3's fix).
+   *
+   * **They belong here because this frame draws the title row.** They used to be
+   * siblings ABOVE the mounted frame in `text-file-viewer.tsx`, which was right
+   * while the panel drew its own header on top of them. Since this story the
+   * header below IS the panel's title row, so a band left above it made the
+   * panel's first row a lone right-aligned button — pushing the name, the fold
+   * and the close ~27px down for the ordinary Files→vault markdown file, and
+   * for the whole life of a notice a wikilink left behind. Across a strip the
+   * fold and close controls then stopped lining up with the panels beside them.
+   *
+   * Rendered directly under the header and above this frame's own bands, which
+   * is the order the host had: its band first, then the caveat, then the error.
+   * The only thing that moved is the row, and it moved to the top where a title
+   * row belongs.
+   *
+   * A `ReactNode` rather than coordinates, unlike {@link
+   * TextFileFrameProps.properties}: what the band SAYS is the host's own
+   * knowledge — which vault holds the file, which link went nowhere — and this
+   * frame has no opinion to add. It owns only where the nodes sit.
+   */
+  notices?: ReactNode;
+  /**
    * Why keeper will not write this file's LOCATION, or `null` (Story 45.3's
    * `FilesWriteVm`, threaded by Story 50.3's fix).
    *
@@ -349,6 +375,7 @@ export function TextFileFrame({
   writeCaveatShort = null,
   writeRefusal = null,
   frame = null,
+  notices = null,
   csv,
   properties,
   onPropertiesRenamed,
@@ -489,7 +516,30 @@ export function TextFileFrame({
   // embed that mounts it has no header at all, and since Story 53.3 a panel that
   // handed its controls down has no row of its own either, so this is the one
   // identity every host can rely on.
-  const identity = <span className="min-w-0 flex-1 truncate font-medium text-xs">{fileName}</span>;
+  //
+  // TWO treatments, because this row is two different things depending on who
+  // mounted it. With a `frame` it IS the panel's title row, and every other
+  // panel title in the strip is drawn in `FOLD_STRIP.titleClass` —
+  // `DESIGN.md`'s `pane-header` typography, which `panel-strip.tsx` gives up its
+  // own row to keep (`panel-strip.tsx:684-688`) and which the notes surface's
+  // merged row already wears (`note-editor.tsx`'s `deriveTitle` heading). Kept
+  // small, a strip holding `notes.md`, `report.pdf` and a note showed three
+  // typographies for one thing, and folding the `.md` changed the size of its
+  // own name.
+  //
+  // Without one — the note embed (`file-embed-host.tsx`) — this is not a panel
+  // title at all but a label inside somebody's document, where a 15px heading
+  // would outshout the prose around it. The heading semantics stay off both:
+  // `panel-strip.tsx` says why a second `h2` naming the same file is wrong.
+  const identity = (
+    <span
+      className={
+        frame === null ? "min-w-0 flex-1 truncate font-medium text-xs" : FOLD_STRIP.titleClass
+      }
+    >
+      {fileName}
+    </span>
+  );
 
   // A state with no file in it: one sentence, and — when a host gave up its row
   // for this frame — the row it is owed above it (Story 53.3, FR-317).
@@ -502,12 +552,22 @@ export function TextFileFrame({
   // No status and no actions: there is no buffer to be dirty and no Save to
   // offer. `PaneHeader` reserves nothing for a status it is not given, so this is
   // the same 40px row with the name in it and the frame's controls at the end.
+  //
+  // The host's own bands come with it. They are about the FILE, not about the
+  // buffer — a vault markdown file has its note whether the bytes arrived or
+  // not — so dropping them here would make Open in Notes flicker out for the
+  // whole of a pendrive's read, which is what it did while these nodes were the
+  // host's own siblings.
   const framed = (sentence: ReactNode): React.ReactElement =>
     frame === null ? (
-      <>{sentence}</>
+      <>
+        {notices}
+        {sentence}
+      </>
     ) : (
       <div className="flex h-full min-h-0 flex-col">
         <PaneHeader className="px-3" identity={identity} actions={null} frame={frame} />
+        {notices}
         {sentence}
       </div>
     );
@@ -685,6 +745,11 @@ export function TextFileFrame({
           frame={frame}
         />
       ) : null}
+      {/* The host's bands, directly under the row and above this frame's own —
+          the order the host used to draw them in, minus the panel header that
+          used to sit between them and the file (see `notices`). Whatever they
+          are, the title row is the panel's FIRST row. */}
+      {notices}
       {writeCaveat === null ? null : (
         <div
           data-testid={TEXT_FILE_CAVEAT_TESTID}

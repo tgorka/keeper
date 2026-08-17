@@ -47,6 +47,7 @@ import {
   SESSION_SPACES_RESTORE,
   SESSION_SPACES_RESTORE_FAILED,
   SESSION_SPACES_RESTORE_NOTHING,
+  SESSION_SPACES_TRUNCATED,
   SessionSpaces,
 } from "@/components/sessions/session-spaces";
 import {
@@ -180,6 +181,13 @@ function selection(
    * this line prove something else.
    */
   narrowTo: string | null = null,
+  /**
+   * Whether the session's markdown scan stopped before it had seen the whole
+   * session (Story 53.5), so this selection is a prefix. `false` on every
+   * fixture written before that story, which is what a session inside the walk's
+   * budget answers.
+   */
+  poolTruncated = false,
 ) {
   return {
     spaceId,
@@ -193,6 +201,7 @@ function selection(
       unstableIdentity: true,
     })),
     error,
+    poolTruncated,
     noHome,
     narrowTo,
     openRecord,
@@ -411,6 +420,38 @@ describe("SessionSpaces listing", () => {
 
     expect(screen.getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
     expect(screen.queryByText(SESSION_SPACES_LOADING)).not.toBeInTheDocument();
+  });
+
+  /**
+   * Story 53.5. The session's markdown scan is bounded, and a create now lands
+   * in the per-kind directory a space names rather than at the session root the
+   * walk enumerates first — so on a session wide enough to exhaust the walk, the
+   * file that was just written is genuinely not in the list that wrote it.
+   *
+   * Rust says the scan stopped (`SessionSpaceFilesVm.poolTruncated`) and this
+   * section says so, on every space evaluated over that pool: an empty-looking
+   * space that stayed silent is the state the flag exists to end, so "Nothing in
+   * this session yet" — a claim about the SESSION — is not made where keeper
+   * stopped reading it.
+   */
+  it("says a short list is short rather than claiming the session is empty", () => {
+    open(
+      [space({ name: "Tasks" }), space({ id: "_spaces/log.md", name: "Log" })],
+      [
+        selection("_spaces/tasks.md", [], null, null, false, null, true),
+        selection("_spaces/log.md", ["2026-08-16.md"], null, null, false, null, true),
+      ],
+    );
+
+    expect(screen.getAllByText(SESSION_SPACES_TRUNCATED)).toHaveLength(2);
+    expect(screen.queryByText(SESSION_SPACES_NO_FILES)).not.toBeInTheDocument();
+  });
+
+  it("says nothing about a scan that finished, and still says a finished space is empty", () => {
+    open([space({ name: "Tasks" })], [selection("_spaces/tasks.md", [])]);
+
+    expect(screen.queryByText(SESSION_SPACES_TRUNCATED)).not.toBeInTheDocument();
+    expect(screen.getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
   });
 
   it("offers the defaults when the zone has no spaces at all", () => {

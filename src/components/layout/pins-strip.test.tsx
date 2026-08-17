@@ -79,6 +79,20 @@ function dragPin(avatar: HTMLElement, x: number) {
   fireEvent.pointerUp(avatar, { pointerId: 1, clientX: x, clientY: 30 });
 }
 
+/**
+ * Record the pointer captures taken on one element.
+ *
+ * An own property rather than `vi.spyOn`: `setPointerCapture` is inherited from
+ * `Element.prototype`, where `src/test/setup.ts` stubs it once for the whole
+ * suite, so a spy installed there is shared by every element and cannot say
+ * *which* one took the capture — which is the whole question in these tests.
+ */
+function capturesOn(element: HTMLElement) {
+  const taken = vi.fn();
+  element.setPointerCapture = taken;
+  return taken;
+}
+
 afterEach(() => {
   vi.clearAllMocks();
 });
@@ -130,6 +144,152 @@ describe("PinsStrip", () => {
       { accountId: "acctA", roomId: "!b" },
       { accountId: "acctA", roomId: "!c" },
       { accountId: "acctA", roomId: "!a" },
+    ]);
+  });
+
+  it("takes the capture back when the preview moves the pressed pin, and still lands the reorder", () => {
+    // The defect this strip shipped twice. The move that crosses the slop is the
+    // move that paints the preview, and the preview reorders a keyed list: React
+    // moves the pressed node, `insertBefore` REMOVES it from its parent first,
+    // and the removing steps are what Pointer Events hooks for the implicit
+    // release of pointer capture. So the drag lost its capture on its own first
+    // step, every later move and the release were discarded, and the strip
+    // snapped back — green in jsdom, dead on WebKit, because nothing here used
+    // to dispatch `lostpointercapture`.
+    render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+      />,
+    );
+    mockPinSlots();
+    const alpha = screen.getAllByRole("button")[0];
+    const captured = capturesOn(alpha);
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 30, clientY: 30 });
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    // Taken on the crossing, and the preview has moved this very node: same
+    // element, third slot.
+    expect(captured).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole("button")[2]).toBe(alpha);
+    // What WebKit does next, and jsdom never did on its own.
+    fireEvent.lostPointerCapture(alpha, { pointerId: 1 });
+    // Still connected, still mounted: the gesture is live and the capture comes
+    // back rather than the drag being torn down.
+    expect(captured).toHaveBeenCalledTimes(2);
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    fireEvent.pointerUp(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(reorderPins).toHaveBeenCalledTimes(1);
+    expect(reorderPins).toHaveBeenCalledWith([
+      { accountId: "acctA", roomId: "!b" },
+      { accountId: "acctA", roomId: "!c" },
+      { accountId: "acctA", roomId: "!a" },
+    ]);
+  });
+
+  it("ends the gesture and frees the next click when the pressed pin unmounts mid-drag", () => {
+    // The other cause of the same event, which wants the opposite answer: the
+    // captured element is gone for good, so there is nothing to take back — and
+    // the click this drag was going to swallow will never be dispatched at a node
+    // that no longer exists, so the swallow flag has to go with the press.
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+        onSelect={onSelect}
+      />,
+    );
+    mockPinSlots();
+    const alpha = screen.getAllByRole("button")[0];
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 30, clientY: 30 });
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    // The stream unpins Alpha mid-drag.
+    rerender(
+      <PinsStrip
+        pins={[room("!b", { displayName: "Bravo" }), room("!c", { displayName: "Charlie" })]}
+        onSelect={onSelect}
+      />,
+    );
+    expect(alpha.isConnected).toBe(false);
+    fireEvent.lostPointerCapture(alpha, { pointerId: 1 });
+    expect(reorderPins).not.toHaveBeenCalled();
+    // The next tap on another pin is that pin's own.
+    fireEvent.click(screen.getByRole("button", { name: "Pinned conversation with Bravo" }));
+    expect(onSelect).toHaveBeenCalledWith({ accountId: "acctA", roomId: "!b" });
+  });
+
+  it("keeps a drag whose pointer left the avatar before the slop: the strip hears the move", () => {
+    // 44 px avatars and a 10 px tolerance: a press 4 px from the edge leaves the
+    // avatar before the press has become a drag, and before the crossing there is
+    // no capture. The move lands on the list, which the avatar sits below rather
+    // than above — so with handlers on the avatar alone nothing hears it and the
+    // drag silently never starts.
+    render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+      />,
+    );
+    mockPinSlots();
+    const list = screen.getByRole("list", { name: "Pinned conversations" });
+    const alpha = screen.getAllByRole("button")[0];
+    const onAvatar = capturesOn(alpha);
+    const onList = capturesOn(list);
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 40, clientY: 30 });
+    fireEvent.pointerMove(list, { pointerId: 1, clientX: 150, clientY: 30 });
+    fireEvent.pointerUp(list, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(reorderPins).toHaveBeenCalledWith([
+      { accountId: "acctA", roomId: "!b" },
+      { accountId: "acctA", roomId: "!c" },
+      { accountId: "acctA", roomId: "!a" },
+    ]);
+    // The capture belongs to the pressed avatar, never to the box a stray move
+    // happened to land on.
+    expect(onAvatar).toHaveBeenCalledWith(1);
+    expect(onList).not.toHaveBeenCalled();
+  });
+
+  it("hands the capture to a second press that begins while the first is in flight", () => {
+    // A second finger, or a release this strip never heard. The new press must not
+    // inherit the old one's capture hold: a hold that outlives its press is never
+    // released — its own element's release names a pointer that has gone — and no
+    // later gesture on this strip could capture again.
+    render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+      />,
+    );
+    mockPinSlots();
+    const alpha = screen.getByRole("button", { name: "Pinned conversation with Alpha" });
+    const bravo = screen.getByRole("button", { name: "Pinned conversation with Bravo" });
+    const onAlpha = capturesOn(alpha);
+    const onBravo = capturesOn(bravo);
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 30, clientY: 30 });
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(onAlpha).toHaveBeenCalledTimes(1);
+    // Alpha's release never arrives. Bravo is pressed and carried to the front.
+    fireEvent.pointerDown(bravo, { pointerId: 2, button: 0, clientX: 90, clientY: 30 });
+    fireEvent.pointerMove(bravo, { pointerId: 2, clientX: 30, clientY: 30 });
+    expect(onBravo).toHaveBeenCalledTimes(1);
+    fireEvent.pointerUp(bravo, { pointerId: 2, clientX: 30, clientY: 30 });
+    expect(reorderPins).toHaveBeenCalledTimes(1);
+    expect(reorderPins).toHaveBeenCalledWith([
+      { accountId: "acctA", roomId: "!b" },
+      { accountId: "acctA", roomId: "!a" },
+      { accountId: "acctA", roomId: "!c" },
     ]);
   });
 
@@ -232,6 +392,20 @@ describe("PinsStrip", () => {
     // beside the one that can.
     const { container } = render(<PinsStrip pins={[room("!a"), room("!b")]} />);
     expect(container.querySelectorAll("[draggable]")).toHaveLength(0);
+  });
+
+  it("reorders nothing in answer to an HTML5 drag", () => {
+    // `draggable` is the attribute; this is the behaviour. Nothing in the strip
+    // answers `dragstart`, `dragover` or `drop`, so the mechanism that could not
+    // work under Tauri cannot come back one handler at a time either.
+    render(<PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} />);
+    mockPinSlots();
+    const [alpha, bravo] = screen.getAllByRole("button");
+    fireEvent.dragStart(alpha);
+    fireEvent.dragOver(bravo);
+    fireEvent.drop(bravo);
+    fireEvent.dragEnd(alpha);
+    expect(reorderPins).not.toHaveBeenCalled();
   });
 
   it("invokes unpinRoom from the per-avatar context menu", async () => {
@@ -354,6 +528,34 @@ describe("PinsStrip phone touch idioms", () => {
       { accountId: "acctA", roomId: "!c" },
       { accountId: "acctA", roomId: "!a" },
     ]);
+  });
+
+  it("opens the room on the tap after a long-press reorder", () => {
+    // A touch drag ends with no synthesised click, so nothing eats the swallow
+    // flag the lift set — and the phone gate returns before `drag.begin`, the
+    // other site that clears it. Left leaking, the next tap is eaten and the room
+    // does not open until the second.
+    const onSelect = vi.fn();
+    render(<PinsStrip pins={pins()} onSelect={onSelect} />);
+    mockPinSlots();
+    const alpha = screen.getByRole("button", { name: "Pinned conversation with Alpha" });
+    const captured = capturesOn(alpha);
+    fireEvent.pointerDown(alpha, { pointerId: 1, clientX: 30, clientY: 30 });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    fireEvent.pointerUp(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(reorderPins).toHaveBeenCalledTimes(1);
+    // The lift captured at the hold; the slop crossing asks again for the same
+    // pointer on the same element and is skipped, so one capture, one release
+    // listener, one gesture.
+    expect(captured).toHaveBeenCalledTimes(1);
+    const bravo = screen.getByRole("button", { name: "Pinned conversation with Bravo" });
+    fireEvent.pointerDown(bravo, { pointerId: 2, clientX: 90, clientY: 30 });
+    fireEvent.pointerUp(bravo, { pointerId: 2, clientX: 90, clientY: 30 });
+    fireEvent.click(bravo);
+    expect(onSelect).toHaveBeenCalledWith({ accountId: "acctA", roomId: "!b" });
   });
 
   it("shows a reorder preview while the lifted pin drags", () => {

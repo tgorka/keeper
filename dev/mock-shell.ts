@@ -679,6 +679,9 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     spaceId: "_spaces/about.md",
     files: [spaceFile("about.md", "About this session", ["about"], 45)],
     error: null,
+    // The mock session is a handful of files, so the real walk would never hit
+    // its budget: nothing is a prefix here, and every space says so (Story 53.5).
+    poolTruncated: false,
     // Two terms, so the QUERY's refusal is the one a person meets — before
     // anything looks at what its terms name (Story 51.7's ordering).
     noHome: MANY_TERMS_REFUSAL,
@@ -710,6 +713,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
       spaceFile("task-named-templates.md", "Named templates", ["task"], 30),
     ],
     error: null,
+    poolTruncated: false,
     noHome: null,
     // Nothing to repair: a space asking for one thing is not over-specified, and
     // Rust offers no press where there is nothing to narrow.
@@ -724,6 +728,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
       spaceFile("2026-08-12-0900-opened-the-session.md", "Opened the session", ["log"], 220),
     ],
     error: null,
+    poolTruncated: false,
     noHome: null,
     narrowTo: null,
     openRecord: false,
@@ -732,6 +737,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     spaceId: "_spaces/refs.md",
     files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
     error: null,
+    poolTruncated: false,
     noHome: null,
     narrowTo: null,
     openRecord: false,
@@ -740,6 +746,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     spaceId: "_spaces/prompts.md",
     files: [],
     error: "Unexpected end of query after `AND`.",
+    poolTruncated: false,
     noHome: null,
     narrowTo: null,
     openRecord: false,
@@ -752,6 +759,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     // Story 52.4, which is a field this payload no longer has.
     files: [spaceFile("stray-thought.md", "stray-thought", [], 8)],
     error: null,
+    poolTruncated: false,
     // `spaces::Refusal::Negated`, restated as fixture bytes for the reason the
     // record's refusal above is: this shell never runs in the app, and Rust owns
     // the wording wherever it does.
@@ -1282,6 +1290,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         spaceId: id,
         files: [],
         error: null,
+        poolTruncated: false,
         noHome: null,
         narrowTo: null,
         openRecord: false,

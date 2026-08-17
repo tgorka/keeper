@@ -190,6 +190,33 @@ describe("a file's properties, over a sync-profile address", () => {
       expect(block).not.toContain(stamped);
     }
   });
+
+  it("shows the vault's tags on the press that asks for them, with no key pressed", async () => {
+    // The same `TagsProperty` as the note panel, so the same hole: `addTag`
+    // above types, and typing opens the chooser's list by itself, which left
+    // nothing in either suite asserting the list is on screen for somebody who
+    // came to BROWSE (Story 53.2 acceptance row 9, UX-DR61). This surface is one
+    // of the two the owner's screenshot came from.
+    tagsVocabulary.mockResolvedValue({
+      entries: [
+        { path: "about", count: 2 },
+        { path: "reference", count: 1 },
+      ],
+    });
+    mount();
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    fireEvent.click(screen.getByRole("button", { name: ADD_NOTE_TAG }));
+
+    expect(await screen.findByRole("option", { name: "about" })).toBeInTheDocument();
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
+      "about",
+      "reference",
+    ]);
+    const field = screen.getByRole("combobox", { name: ADD_NOTE_TAG });
+    expect(field).toHaveAttribute("aria-expanded", "true");
+    expect(document.activeElement).toBe(field);
+  });
 });
 
 describe("a file whose properties keeper will not serve", () => {

@@ -795,10 +795,12 @@ export function SpaceEditor({
                     opens folded. There is no `onDismiss` because there is nothing
                     of this form's to unmount — the field stays, and the Save
                     button stops sitting under the height of a list nobody is
-                    reading. Escape is not that path here and cannot be: Radix's
-                    dismissable layer claims it at the document in the capture
-                    phase, so it closes this whole dialog before the chooser sees
-                    it, which is this form's own older decision. */}
+                    reading. Escape is a fold here too, and one press of it does
+                    not cancel this dialog: the chooser claims that key on the
+                    window while its list is up (`tag-combobox.tsx:217`), which is
+                    ahead of where Radix's dismissable layer reads the claim, so
+                    the first press folds the list and the second closes the form
+                    with the draft still on screen in between. */}
                 <TagCombobox
                   label="Add a tag"
                   placeholder="Type or browse"

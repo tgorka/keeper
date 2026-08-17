@@ -21,7 +21,7 @@ import {
   startCompletion,
 } from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteCsvVm,
@@ -227,6 +227,33 @@ function vm(overrides: Partial<TextFileVm> = {}): TextFileVm {
 function openThroughTheRegistry(file: ViewerFile) {
   const { entry, Component } = viewerComponentFor(file);
   return { entry, ...render(<Component file={file} entry={entry} />) };
+}
+
+/**
+ * The panel's own controls, as `panel-strip.tsx` hands them down when it gives up
+ * its row because this viewer's frame draws one (Story 53.3). One button, named
+ * the way the strip names its fold, so a test can find it after it has travelled.
+ */
+const FRAME_CONTROL_LABEL = "Fold panel";
+
+/** Mount the way a panel that gave up its row mounts it: the registry, plus the
+ *  controls the host handed down. */
+function openWithTheHostsRowHandedDown(file: ViewerFile) {
+  const { entry, Component } = viewerComponentFor(file);
+  return {
+    entry,
+    ...render(
+      <Component
+        file={file}
+        entry={entry}
+        frame={
+          <button type="button" aria-label={FRAME_CONTROL_LABEL}>
+            x
+          </button>
+        }
+      />,
+    ),
+  };
 }
 
 /** Drain microtasks without letting a frame run — see `raw-rendered-view.test.tsx`. */
@@ -788,6 +815,92 @@ describe("a file knows its note (Story 45.18, FR-196)", () => {
     });
 
     expect(notesResolveLink).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The merged title bar is the panel's FIRST row, in every state this surface can
+ * put above a file (Story 53.3's fix).
+ *
+ * **Why this suite and not `panel-strip.test.tsx`.** The band under test only
+ * exists for a markdown file whose profile has a vault holding it, and the strip's
+ * file fixture is a `docs/notes.md` with no vault configured at all — so `inVault`
+ * is null there and the band never renders in the one suite that mounts the merged
+ * bar. This is the suite that can seed a vault, and the ordinary Files→vault
+ * markdown file is what the defect was: the panel's first row was a lone
+ * right-aligned button and the name, Export, fold and close sat ~27px lower than
+ * on the `.pdf` beside it.
+ */
+describe("the merged title bar is the panel's first row (Story 53.3)", () => {
+  /** The frame's root, which is the box the panel's body holds. */
+  function rowsOf(header: Element): Element[] {
+    const root = header.parentElement;
+    if (root === null) {
+      throw new Error("the header has no row box around it");
+    }
+    return Array.from(root.children);
+  }
+
+  it("draws the row above a vault file's Open in Notes band, not below it", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# Meeting\n" }));
+    openWithTheHostsRowHandedDown(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    // The band is on screen — this is the ordinary Files→vault markdown case,
+    // which is what makes the ordering claim worth anything.
+    const band = screen.getByRole("button", { name: "Open in Notes" });
+    const header = document.querySelector("header");
+    expect(header).not.toBeNull();
+    // The panel's controls are in that row, so "first row" is a claim about where
+    // the fold and the close are: at y=0, level with every panel beside it.
+    expect(
+      within(header as HTMLElement).getByRole("button", { name: FRAME_CONTROL_LABEL }),
+    ).toBeInTheDocument();
+    expect(within(header as HTMLElement).getByText("meeting.md")).toBeInTheDocument();
+
+    const rows = rowsOf(header as HTMLElement);
+    expect(rows.indexOf(header as HTMLElement)).toBe(0);
+    const bandRow = rows.find((row) => row.contains(band));
+    expect(bandRow).toBeDefined();
+    expect(rows.indexOf(bandRow as Element)).toBeGreaterThan(0);
+  });
+
+  it("draws the row above the notice a failed action leaves, for the whole life of it", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# New\n" }));
+    // The index has not caught up, which is how a reader gets the notice without
+    // anything else about the surface changing.
+    notesTree.mockResolvedValue(folderWith({ id: "note-other", path: "somethingelse.md" }));
+    openWithTheHostsRowHandedDown(target({ name: "fresh.md", relativePath: "inbox/fresh.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    expect(noticeText()).toContain("fresh.md");
+    const notice = document.querySelector(`[data-slot="${TEXT_FILE_NOTICE_SLOT}"]`) as Element;
+    const header = document.querySelector("header") as HTMLElement;
+    const rows = rowsOf(header);
+    expect(rows.indexOf(header)).toBe(0);
+    expect(rows.indexOf(notice)).toBeGreaterThan(0);
+  });
+
+  it("keeps the band on screen while the file is still opening", async () => {
+    // The band is about the FILE and not about the buffer, and the row it now
+    // lives under is drawn in this state too — so a vault file does not lose its
+    // note for the whole of a pendrive's read.
+    seedVaults();
+    syncReadText.mockReturnValue(new Promise<TextFileVm>(() => undefined));
+    openWithTheHostsRowHandedDown(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    const header = document.querySelector("header") as HTMLElement;
+    const band = screen.getByRole("button", { name: "Open in Notes" });
+    const rows = rowsOf(header);
+    expect(rows.indexOf(header)).toBe(0);
+    expect(rows.indexOf(rows.find((row) => row.contains(band)) as Element)).toBeGreaterThan(0);
+    expect(screen.getByRole("status")).toHaveTextContent("opening meeting.md");
   });
 });
 

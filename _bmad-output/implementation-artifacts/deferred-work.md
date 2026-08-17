@@ -357,6 +357,46 @@ note: 2026-08-17 (story 53.1) — the entry stays OPEN, and what it asks for is 
   source, the pins stale-index guard, or re-cutting the target at the old `<ul>`'s
   edges each fails a named test in `notes/task-board.test.tsx`,
   `sessions/session-board.test.tsx` or `layout/pins-strip.test.tsx`.
+note: 2026-08-17 (story 53.1, review) — one correction to the note above and one
+  limit it did not state.
+  THE CORRECTION. "Both now press, move and release through one state machine" was
+  true and the machine had a defect that made the pins strip's desktop reorder dead
+  again, for the third time: the move that crosses the slop takes the pointer
+  capture, and it is the SAME move that paints the reorder preview. A preview that
+  reorders a keyed list makes React move the pressed node, `insertBefore` removes
+  that node from its parent before putting it back, and the removing steps are what
+  Pointer Events hooks for the *implicit release* of pointer capture. So the strip
+  released its own capture on the drag's first step, the following moves and the
+  release were discarded by the `pressRef === null` guard, and the strip snapped
+  back. No test could see it: `src/test/setup.ts` stubs `setPointerCapture` /
+  `releasePointerCapture` / `hasPointerCapture` as no-ops and nothing in the repo
+  dispatched `lostpointercapture`, so the headline reorder test passed over a dead
+  drag. `hooks/use-pointer-drag.ts` now listens for the release natively on the
+  captured element — React delegates at the root container, so an element removed
+  for good never reaches a delegated `onLostPointerCapture` at all — and tells the
+  two causes apart by `isConnected`: MOVED takes the capture back (the node is still
+  mounted and its handlers are intact), UNMOUNTED ends the gesture and clears the
+  swallowed-click flag with it. Both surfaces are covered by the one fix; the board
+  was safe only by accident, since an external `order:` edit from Obsidian, an agent
+  or the watcher moves a pressed card mid-drag exactly as a preview does.
+  THE LIMIT, which the story's title and the note above did not qualify. On the task
+  board a finger lifts a card only where the gesture does not race a scroll
+  container. `notes/task-board.tsx` deliberately leaves `touch-action` alone (claiming
+  it would stop a phone scrolling the board by starting on a card, which is
+  the commoner gesture), so where an ancestor can pan in the direction the finger
+  travels, the browser claims the gesture at about the 6 px slop and the board gets
+  `pointercancel`, which returns the card. At phone width the four columns stack
+  (`grid-cols-1`), so EVERY cross-column move travels along the page's own pan axis
+  and the touch lift does not survive there. Above the phone tier the columns sit
+  side by side, cross-column travel is horizontal, nothing pans that way, and a
+  finger does move a card. The non-gesture path on that tier is the per-card column
+  menu, which is in the DOM, in the tab order and in the accessibility tree at all
+  times. The pins strip has no such limit: its phone entry is a long-press lift and
+  its avatars are `touch-none`. The cure for the board is the same route — gate the
+  touch press behind `hooks/use-long-press` and pass `captureNow`, which
+  `use-pointer-drag` already supports — and it is a UX decision about what a press on
+  a card should mean on a phone (a hold, with the scroll it costs), not a defect fix,
+  so 53.1's review did not make it.
 
 ### DW-38: A favourited chat has no unread/mention affordance anywhere in the inbox view — the Favorites section renders compact rows as avatar + name only, and favourited rooms are removed from the Inbox window, so an unread favourited conversation shows no bold-name/dot/mention badge on any surface.
 

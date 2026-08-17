@@ -377,12 +377,30 @@ describe("the whole control works from the keyboard", () => {
  * the same order, is one focus away and is still BUILT while hidden.
  */
 describe("the list folds away when the choosing stops (Story 53.2)", () => {
-  it("is folded before anybody has come to the field", () => {
+  it("is folded before anybody has come to the field, and takes no caret", () => {
     open();
 
     expect(screen.queryByRole("listbox")).toBeNull();
     expect(screen.queryAllByRole("option")).toHaveLength(0);
     expect(listbox()).not.toBeVisible();
+    // The two space editors' mount: a permanent part of a form, so it must not
+    // steal the caret from the Name field the dialog just opened on.
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("takes the caret and starts unfolded when the host mounted it on a press", () => {
+    // The three surfaces that REVEAL this chooser do it in answer to a press
+    // whose whole meaning is "I want to choose a tag now". That used to be a
+    // `node?.focus()` ref callback at the callsite, which left the browse half
+    // of UX-DR61 riding on a focus side effect nothing declared: deleting the
+    // ref left a bare field with no list until the user typed, and every test
+    // stayed green. `openOnMount` is the same request, stated, and the fold
+    // state does not wait for the focus event to arrive.
+    open({ openOnMount: true });
+
+    expect(document.activeElement).toBe(field());
+    expect(offered()).toEqual(VAULT);
+    expect(field()).toHaveAttribute("aria-expanded", "true");
   });
 
   it("folds once a tag is taken and the focus moves on, without unmounting the list", () => {
@@ -449,6 +467,42 @@ describe("the list folds away when the choosing stops (Story 53.2)", () => {
     expect(screen.queryByRole("listbox")).toBeNull();
   });
 
+  it("folds on a right press outside it, which fires no click at all", () => {
+    // `click` is the primary button's event only. A right press fires
+    // `contextmenu` — and on Windows and Linux fires it as the button goes down,
+    // with the native menu free to swallow the release — so a list closed on
+    // `click` alone stayed open underneath a context menu the user had opened
+    // somewhere else entirely.
+    withNeighbour();
+
+    fireEvent.pointerDown(elsewhere(), { button: 2 });
+    fireEvent.contextMenu(elsewhere());
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("folds on a middle press outside it, which fires an auxclick and no click", () => {
+    withNeighbour();
+
+    fireEvent.pointerDown(elsewhere(), { button: 1 });
+    fireEvent.pointerUp(elsewhere(), { button: 1 });
+    // `auxclick` is the non-primary button's `click`, and it is absent from
+    // `@testing-library/dom`'s event map, so it is constructed here.
+    fireEvent(elsewhere(), new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("stays up for a right press inside it, which is somebody reaching for Paste", () => {
+    // The other half of the case above: the signal is a press OUTSIDE, and
+    // right-clicking the field to paste a tag name is not leaving the control.
+    withNeighbour();
+
+    fireEvent.contextMenu(field());
+
+    expect(offered()).toEqual(VAULT);
+  });
+
   it("stays up for a click inside it, including the one that takes a tag", () => {
     const onChoose = withNeighbour();
 
@@ -462,10 +516,12 @@ describe("the list folds away when the choosing stops (Story 53.2)", () => {
     expect(offered()).toEqual(VAULT);
   });
 
-  it("folds on Escape with no host to dismiss, which is the space editors' whole close", () => {
-    // Both space editors mount this control unconditionally and pass no
-    // `onDismiss`, because there is nothing of theirs to unmount. Before this
-    // story that left those two surfaces with no close path in the product.
+  it("folds on Escape and leaves the caret, so the same list is one keystroke back", () => {
+    // Named for what it renders: the control's own Escape, with no host to
+    // dismiss and no dialog above it. That Escape reaches the two space editors
+    // at all is a claim about THOSE surfaces, and it is asserted on them —
+    // `space-editor.test.tsx` and `session-space-editor.test.tsx` press Escape
+    // on the real dialog and check the draft is still there.
     browsing();
 
     fireEvent.keyDown(field(), { key: "Escape" });
@@ -487,6 +543,45 @@ describe("the list folds away when the choosing stops (Story 53.2)", () => {
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("claims Escape before a dismissable layer above it could read the key", () => {
+    // The mechanism, at the one place a bare render can see it. Radix's
+    // dismissable layer — what closes every dialog in this repo, and what the
+    // two space editors are wrapped in — listens for `keydown` on the owner
+    // DOCUMENT in the capture phase and dismisses unless the event is already
+    // `defaultPrevented` (`react-dismissable-layer/dist/index.mjs:84-91`). This
+    // observer is that listener, so what it sees is what the dialog decides on.
+    //
+    // The value is read INSIDE the handler, which is the whole point: the
+    // field's own Escape handler prevents the default too, several phases later,
+    // so an assertion on the event object after the dispatch would read `true`
+    // whether or not the claim was made in time and would pass with the layer
+    // deleted.
+    const seen: boolean[] = [];
+    const layer = (event: KeyboardEvent): void => {
+      seen.push(event.defaultPrevented);
+    };
+    document.addEventListener("keydown", layer, true);
+    try {
+      browsing();
+
+      fireEvent.keyDown(field(), { key: "Escape" });
+
+      // Claimed on the window, which the event path visits before the document,
+      // so the layer above sees the claim rather than acting ahead of it.
+      expect(seen).toEqual([true]);
+      expect(screen.queryByRole("listbox")).toBeNull();
+
+      fireEvent.keyDown(field(), { key: "Escape" });
+
+      // Folded, so there is nothing of this control's left to close and the key
+      // belongs to whatever is above again — which is what makes the second
+      // press close the form rather than leaving Escape dead on that surface.
+      expect(seen).toEqual([true, false]);
+    } finally {
+      document.removeEventListener("keydown", layer, true);
+    }
   });
 
   it("takes nothing on Enter while it is folded, and still swallows the key", () => {

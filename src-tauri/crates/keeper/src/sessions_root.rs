@@ -1015,6 +1015,19 @@ pub struct SessionPool {
     /// `(session-relative path, text, mtime_ns)` in reading order — a path
     /// rather than a name, because markdown is read wherever it sits (FR-285).
     pub files: Vec<(String, String, i128)>,
+    /// Whether a budget stopped the scan before it had seen the whole session,
+    /// so `files` is a PREFIX of what is there.
+    ///
+    /// Carried since Story 53.5, and the story is why it has to be: a flat
+    /// session's creates used to land at the session root, which
+    /// [`markdown_rels`] enumerates first, and now they land in the per-kind
+    /// directory the space names — reached only after the root's dirents and
+    /// every earlier-sorting subtree have been paid for out of
+    /// [`MARKDOWN_WALK_BUDGET`]. A session wide enough to exhaust the walk
+    /// therefore has a create writing a file the space that created it does not
+    /// list, and dropping this flag was what made that look like an empty space
+    /// rather than a short one.
+    pub truncated: bool,
 }
 
 /// Read one session's pool for space evaluation (FR-261).
@@ -1026,11 +1039,20 @@ pub struct SessionPool {
 /// yet: a `tag:ref` query over an unmigrated session finds whatever those files
 /// declare, and finds nothing when they declare nothing, which is the honest
 /// answer either way.
+///
+/// The shape is discarded here — a space's selection is its query's, not its
+/// session's contract's — but the truncation is not: see
+/// [`SessionPool::truncated`].
 pub fn session_pool(root_id: &str, session_id: &str) -> Option<SessionPool> {
     let row = row_of(root_id, session_id)?;
     let zone = zone_of(root_id)?;
-    let dir = zone.join(&row.path);
-    let (sources, _truncated, _shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
+    Some(read_session_pool(&zone.join(&row.path), row.path))
+}
+
+/// [`session_pool`] over a plain directory, so a test can hand it a folder —
+/// [`read_zone_spaces`]'s split, for [`read_zone_spaces`]'s reason.
+fn read_session_pool(dir: &Path, path: String) -> SessionPool {
+    let (sources, truncated, _shape) = read_ref_sources(dir, DETAIL_SCAN_BUDGET);
     let files = sources
         .into_iter()
         .map(|source| {
@@ -1042,10 +1064,11 @@ pub fn session_pool(root_id: &str, session_id: &str) -> Option<SessionPool> {
             (source.rel, source.text, mtime_ns)
         })
         .collect();
-    Some(SessionPool {
-        path: row.path,
+    SessionPool {
+        path,
         files,
-    })
+        truncated,
+    }
 }
 
 /// The most markdown one session's reference scan reads, in bytes. Ten
@@ -2431,5 +2454,70 @@ mod tests {
             ],
             "the root's own markdown first, then the file at the bottom"
         );
+    }
+
+    /// Story 53.5's own hazard, at the level the spaces payload reads: a pool
+    /// the walk stopped short of finishing SAYS it is short, so a space that
+    /// lists a prefix of the session can render a notice instead of looking
+    /// empty.
+    ///
+    /// The story is what makes the flag load-bearing rather than tidy. A flat
+    /// session's creates used to land at the session root, which the walk
+    /// enumerates before it descends anything; they now land in the per-kind
+    /// directory the space names, which is reached only after the root's dirents
+    /// and every earlier-sorting subtree have been paid for. So on a session this
+    /// wide the file the create verb just wrote is genuinely absent from the
+    /// space that created it, and the only honest surface for that is a short
+    /// list that says it is short.
+    #[test]
+    fn a_pool_past_the_walk_budget_says_it_is_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        // Flat, so the walk descends at all — `a_tree_past_the_entry_budget`'s
+        // reason, and its shape.
+        std::fs::write(session.join("AGENTS.md"), "how to read this folder\n").expect("write");
+        std::fs::write(session.join("README.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        let per_folder = 200;
+        let folders = MARKDOWN_WALK_BUDGET / per_folder + 1;
+        for folder in 0..folders {
+            let sub = session.join(format!("d{folder:03}"));
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            for file in 0..per_folder {
+                std::fs::write(sub.join(format!("f{file:03}.md")), "x").expect("write");
+            }
+        }
+        // Where a per-kind create lands on this session, and it sorts after every
+        // `d000/` above: the walk never reaches it.
+        let tasks = session.join("tasks");
+        std::fs::create_dir_all(&tasks).expect("mkdir");
+        std::fs::write(
+            tasks.join("20260817-1200-a-card.md"),
+            "---\ntags: [task]\n---\n# A card\n",
+        )
+        .expect("write");
+
+        let pool = read_session_pool(session, "active/wide".to_owned());
+        assert!(
+            pool.truncated,
+            "the walk stopped, and the pool carries the fact instead of dropping it"
+        );
+        assert!(
+            !pool
+                .files
+                .iter()
+                .any(|(rel, _, _)| rel == "tasks/20260817-1200-a-card.md"),
+            "the file a create just wrote is past the bound — which is what the \
+             flag exists to say out loud"
+        );
+
+        // And a session inside the bound says nothing, so the notice cannot
+        // become furniture every space carries.
+        let small = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            small.path().join("README.md"),
+            "---\ntags: [about]\n---\n# S\n",
+        )
+        .expect("write");
+        assert!(!read_session_pool(small.path(), "active/small".to_owned()).truncated);
     }
 }

@@ -1916,6 +1916,9 @@ pub fn sessions_space_files(
         })
         .collect();
     let now = chrono::Local::now().timestamp_millis();
+    // Copied out before the pool is borrowed per space: one fact about the scan,
+    // repeated onto every section evaluated over it.
+    let pool_truncated = pool.truncated;
 
     Ok(read
         .spaces
@@ -1957,6 +1960,13 @@ pub fn sessions_space_files(
                     })
                     .collect(),
                 error: selection.error,
+                // One fact about the POOL, on every space evaluated over it: the
+                // scan is bounded, and since Story 53.5 a create lands in a
+                // per-kind directory the walk reaches after the session root
+                // rather than at the root itself. A section that dropped this
+                // would render a file the create verb just wrote as an empty
+                // space instead of a short one.
+                pool_truncated,
                 no_home: refused.why.map(|why| why.to_string()),
                 narrow_to: refused.narrow_to().map(str::to_owned),
                 open_record: refused.record,

@@ -409,10 +409,13 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
                 // that silently files the operator's next file somewhere they
                 // never named. Whatever the value spells is read as the path it
                 // spells, and [`crate::sessions::files::check_dir`] is what
-                // judges it.
+                // judges it — under a sentence, when the value was not one path
+                // ([`read_create_dir`]), which is the warning the three
+                // flattened keys above have always carried and this one did not.
                 ("create_dir", value) => {
-                    space.create_dir =
-                        Some(value.index_string().trim().trim_end_matches('/').to_owned());
+                    let (named, warning) = read_create_dir(value);
+                    space.create_dir = Some(named);
+                    space.warnings.extend(warning);
                 }
                 ("default", FieldValue::Str(raw)) => {
                     space.default_key = by_key(raw.trim()).map(|d| d.key.to_owned());
@@ -533,6 +536,36 @@ fn read_rows(raw: &str) -> Option<Result<u32, String>> {
             sort::clip(trimmed)
         ))),
     }
+}
+
+/// Where this space's creates land as its own file spells it, and the sentence
+/// saying keeper could read only one path out of a value that was not one
+/// (Story 53.5, FR-320).
+///
+/// **A destination and not an `Option`**, which is the arm's rule stated as a
+/// type: a value keeper cannot make sense of must still read as SOMETHING the
+/// operator named, because `None` inherits and an inherited directory is a file
+/// filed where nobody typed a name.
+///
+/// **And it warns**, which `order`, `folded` and `rows` have always done for a
+/// value keeper could not read and this key did not. A scalar is never warned
+/// about — `create_dir: 2026` is a directory called `2026` and reads exactly as
+/// written, so a sentence there would be keeper crying wolf over a name it
+/// understood. A list or a map always is: [`FieldValue::index_string`] joins
+/// those on newlines, so the name keeper ends up holding is one the operator
+/// never typed, and this is the single key of a space file that decides where
+/// their next file lands.
+fn read_create_dir(value: &FieldValue) -> (String, Option<String>) {
+    let named = value.index_string().trim().trim_end_matches('/').to_owned();
+    let warning = matches!(value, FieldValue::List(_) | FieldValue::Map(_)).then(|| {
+        format!(
+            "keeper can read only one directory from `create_dir`, so it read this space's as \
+             \"{}\". A file made here lands under exactly that name — write a single path, or \
+             clear the key to file where this space's default says.",
+            sort::clip(&named)
+        )
+    });
+    (named, warning)
 }
 
 /// Read a whole `_spaces/` directory, in rail order.
@@ -1043,7 +1076,7 @@ pub enum Refusal {
 /// as designed and the reason a press is the only thing that can fix a file that
 /// is already standing.
 ///
-/// Four `None`s, each a place where keeper has no authority:
+/// Five `None`s, each a place where keeper has no authority:
 /// - **no default claimed**: nothing in the file says what its single term ought
 ///   to be, and guessing from the name is exactly the inference AD-120 refuses;
 /// - **a query keeper cannot parse, or one with structure** a term cannot be
@@ -1056,15 +1089,28 @@ pub enum Refusal {
 /// - **a query already asking for one thing**, which is not over-specified — and
 ///   the same rule from the other side rules out the `Untagged` default as a
 ///   target, since a default that asks for more than one thing is not something
-///   anything can be narrowed to.
+///   anything can be narrowed to;
+/// - **a query that does not ASK for the default's own term**, which is the same
+///   refusal as the two above and the one that bites hardest. A marker is
+///   carried through every save ([`render_edit`]) and still counts as
+///   [`claimed`], so a seeded space the operator has since repurposed —
+///   `keeper.default: about` over a query edited to `tag:log tag:task` — keeps
+///   its marker for good. Narrowing that to `tag:about` would not drop a term,
+///   it would drop BOTH of the operator's terms and substitute a third,
+///   emptying the space of everything it was listing. A narrowing keeps one of
+///   the terms that are there or it is not a narrowing.
 #[must_use]
 pub fn narrow_target(query: &str, default_key: Option<&str>) -> Option<&'static str> {
     let default = by_key(default_key?)?;
-    if !asks_one_tag(default.query) || query::parse(query).is_err() {
+    let kept = one_tag(default.query)?;
+    if query::parse(query).is_err() {
         return None;
     }
     let terms = query::conjunction(query)?;
-    (terms.len() > 1 && terms.iter().all(positive_tag)).then_some(default.query)
+    (terms.len() > 1
+        && terms.iter().all(positive_tag)
+        && terms.iter().any(|term| same_tag(term, &kept)))
+    .then_some(default.query)
 }
 
 /// Whether one term is a plain, positive `tag:` term — the only shape a
@@ -1073,10 +1119,43 @@ fn positive_tag(term: &query::Term) -> bool {
     !term.negated && term.key.as_deref() == Some("tag") && !term.value.trim().is_empty()
 }
 
-/// Whether a query asks for exactly one positive `tag:` term, and so is
-/// something a space can be narrowed TO.
-fn asks_one_tag(query: &str) -> bool {
-    matches!(query::conjunction(query).as_deref(), Some([term]) if positive_tag(term))
+/// The one positive `tag:` term a query asks for, or `None` when it asks for
+/// anything else — so a query is something a space can be narrowed TO exactly
+/// when this is `Some`, and the term itself is what the narrowing must find in
+/// the query it replaces.
+fn one_tag(query: &str) -> Option<query::Term> {
+    let mut terms = query::conjunction(query)?;
+    if terms.len() != 1 {
+        return None;
+    }
+    let term = terms.pop()?;
+    positive_tag(&term).then_some(term)
+}
+
+/// Whether two positive `tag:` terms ask for the same tag, folded the way the
+/// engine folds them ([`tags::normalise`]) so `tag:About` and `tag:about` are
+/// the one term they select as. A `/*` subtree term is its own request and not
+/// the bare tag: narrowing `tag:about/* tag:log` to `tag:about` would select
+/// what neither term did.
+fn same_tag(held: &query::Term, other: &query::Term) -> bool {
+    match (tag_path(&held.value), tag_path(&other.value)) {
+        (Some(held), Some(other)) => held == other,
+        // A tag that normalises to nothing names no tag, so it is not the same
+        // request as anything — including another unreadable one.
+        _ => false,
+    }
+}
+
+/// A `tag:` value as `(canonical path, subtree)`, or `None` when it names no
+/// tag. [`query`]'s own reading of the value, so a comparison here and a
+/// selection there cannot disagree.
+fn tag_path(value: &str) -> Option<(String, bool)> {
+    let trimmed = value.trim();
+    let (base, subtree) = match trimmed.strip_suffix("/*") {
+        Some(base) => (base, true),
+        None => (trimmed, false),
+    };
+    tags::normalise(base).map(|path| (path, subtree))
 }
 
 /// Why this space offers no create under this session's contract, and whether
@@ -2609,6 +2688,66 @@ mod tests {
         );
     }
 
+    /// The arm that reads a destination matches on the KEY ALONE, and that is
+    /// what this pins: a value keeper cannot read as one path still names a
+    /// directory, because the alternative is `None` — and since Story 53.5
+    /// `None` INHERITS, so a `create_dir` keeper quietly ignored would file the
+    /// operator's next file into their default's directory, which is not the one
+    /// they wrote a key about.
+    ///
+    /// And it says so, which the three sibling flattened keys have always done
+    /// for a value keeper could not read: this is the one key of a space file
+    /// that decides where a file LANDS, so silence here was the one silence that
+    /// costs a file. A scalar is not warned about — a directory called `2026` is
+    /// a directory, and a sentence about it would be keeper crying wolf.
+    #[test]
+    fn a_destination_keeper_cannot_read_as_one_path_still_names_one_and_says_so() {
+        let listed = read_one(
+            "_spaces/log.md",
+            "---\nkeeper:\n  space: tag:log\n  create_dir: [logs, notes]\n  default: log\n---\n# \
+             Log\n",
+        );
+        assert_eq!(
+            listed.create_dir.as_deref(),
+            Some("logs\nnotes"),
+            "the value is read as the one name it flattens to, whatever \
+             `files::check_dir` then makes of it"
+        );
+        assert_eq!(
+            destination(&listed),
+            "logs\nnotes",
+            "and it is the file's own answer: `default: log` would have inherited \
+             `logs`, which is a directory nobody named here"
+        );
+        assert_eq!(
+            listed.warnings.len(),
+            1,
+            "and the space says keeper could read only one path: {:?}",
+            listed.warnings
+        );
+        let warning = &listed.warnings[0];
+        assert!(
+            warning.contains("create_dir") && warning.contains("logs notes"),
+            "the sentence names the key and quotes what keeper read: {warning}"
+        );
+
+        // A scalar keeper read exactly as written warns about nothing, in both
+        // spellings YAML has for one: a bare number is a `FieldValue::Num` and a
+        // directory called `2026` all the same.
+        for written in ["2026", "\"2026\""] {
+            let scalar = read_one(
+                "_spaces/log.md",
+                &format!("---\nkeeper:\n  space: tag:log\n  create_dir: {written}\n---\n# Log\n"),
+            );
+            assert_eq!(scalar.create_dir.as_deref(), Some("2026"), "{written}");
+            assert!(
+                scalar.warnings.is_empty(),
+                "{written}: {:?}",
+                scalar.warnings
+            );
+        }
+    }
+
     /// Story 53.5, acceptance 3 and 4 — the distinction the whole story turns
     /// on, read off the two files an operator can actually have.
     ///
@@ -3559,6 +3698,83 @@ mod tests {
         assert_eq!(
             narrow_target("tag:log tag:recordings", Some("log")),
             Some("tag:log")
+        );
+    }
+
+    /// The case Row 6's table could not see, because every query it builds is
+    /// `format!("{} tag:recordings", default.query)` and so always CONTAINS the
+    /// default's own term.
+    ///
+    /// A narrowing keeps one of the terms that are there. A space whose marker
+    /// says `about` and whose query the operator has since edited to
+    /// `tag:log tag:task` has no term in common with `tag:about`, so writing that
+    /// query would not drop a term — it would drop both of the operator's and
+    /// substitute a third, emptying the space of everything it was listing.
+    ///
+    /// **And the state is reachable, which is why it is asserted through a save.**
+    /// [`render_edit`] carries `keeper.default` through on every write, so a
+    /// seeded space keeps its marker however far its query travels from what it
+    /// was seeded with — that is deliberate ([`claimed`] must keep counting it so
+    /// a Restore never seeds a second About), and it is exactly what puts a live
+    /// space one press away from losing its query.
+    #[test]
+    fn a_repair_never_substitutes_a_query_the_space_does_not_ask_for() {
+        let seeded = render_note(&DEFAULT_SESSION_SPACES[0], "01J0", "2026-08-17");
+        assert_eq!(
+            read_one("_spaces/about.md", &seeded).default_key.as_deref(),
+            Some("about"),
+            "the fixture is the About space"
+        );
+        let repurposed = render_edit(
+            "_spaces/about.md",
+            &seeded,
+            &edit("Work in flight", "tag:log tag:task"),
+        );
+        let space = read_one("_spaces/about.md", &repurposed);
+        assert_eq!(
+            space.default_key.as_deref(),
+            Some("about"),
+            "a save carries the marker through, so the state is the operator's"
+        );
+        assert!(
+            claimed(std::slice::from_ref(&space)).contains("about"),
+            "and it still counts as claimed, which is why the marker is kept"
+        );
+
+        assert_eq!(
+            narrow_target(&space.query, space.default_key.as_deref()),
+            None,
+            "no term of `tag:log tag:task` is `tag:about`, so there is nothing to narrow"
+        );
+        for shape in [Shape::Flat, Shape::Folder] {
+            let refused = create_refused(&space.query, space.default_key.as_deref(), shape);
+            assert_eq!(
+                refused.why,
+                Some(Refusal::ManyTerms { narrow_to: None }),
+                "the arity refusal still explains it, and offers no press: {}",
+                shape.as_str()
+            );
+            assert_eq!(refused.narrow_to(), None, "{}", shape.as_str());
+        }
+
+        // The other side of the same rule, so this test cannot pass by refusing
+        // everything: a query that DOES ask for the default's term still offers
+        // the press, in either spelling of the tag, and a `/*` subtree term is a
+        // different request from the bare tag it descends from.
+        assert_eq!(
+            narrow_target("tag:log tag:about", Some("about")),
+            Some("tag:about")
+        );
+        assert_eq!(
+            narrow_target("tag:log tag:About", Some("about")),
+            Some("tag:about"),
+            "the engine folds a tag's case, so a comparison here does too"
+        );
+        assert_eq!(
+            narrow_target("tag:log tag:about/*", Some("about")),
+            None,
+            "a subtree term is not the bare tag, and swapping one for the other \
+             selects what neither asked for"
         );
     }
 

@@ -66,7 +66,7 @@
  * instead of somewhere to copy.
  */
 import { Copy, FolderOpen, MoreHorizontal, Play, Plus, Video } from "lucide-react";
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { namesTag } from "@/components/tags/tag-match";
 import { Button } from "@/components/ui/button";
@@ -1322,12 +1322,6 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
     };
   }, [adding]);
 
-  // A stable ref callback, so the field takes focus once when the chooser
-  // opens and not again on every render of the panel behind it.
-  const focusChooser = useCallback((node: HTMLInputElement | null) => {
-    node?.focus();
-  }, []);
-
   function closeChooser(): void {
     setAdding(false);
     addRef.current?.focus();
@@ -1386,7 +1380,13 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
           // `keeper-core/src/notes/tags.rs`, at the boundary, and folding it
           // here would be the second place that decides (AD-20, Story 42.5).
           allowCreate
-          inputRef={focusChooser}
+          // The user pressed "Add tag" to get here, so the caret comes to the
+          // field and the list is unfolded for browsing (Story 53.2). One prop,
+          // in the control that owns the fold: this was a ref callback whose
+          // body was `node?.focus()`, and the browse half of UX-DR61 rode on
+          // that focus as a side effect — nothing said so, and deleting the ref
+          // left this panel with a bare field and no list until you typed.
+          openOnMount
           onChoose={(tag) => {
             setRefusal(null);
             onChange([...items, tag]);

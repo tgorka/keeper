@@ -769,10 +769,11 @@ describe("SessionSpaceEditor reach", () => {
  * the editor opened. The close is the control's own now — it opens folded and
  * the caret leaving folds it again — so these assertions are about this surface
  * rather than about the mechanism, which has its own suite in
- * `tag-combobox.test.tsx`. Escape is deliberately not asserted here: Radix's
- * dismissable layer claims Escape at the document in the CAPTURE phase, so on
- * this dialog it closes the editor before the chooser sees the key — this
- * form's own older decision, and not something to fight from inside a combobox.
+ * `tag-combobox.test.tsx`. Escape IS asserted here, because this is one of the
+ * two surfaces where it had to reach past something: Radix's dismissable layer
+ * claims Escape at the document in the capture phase, and until the chooser
+ * claimed the same key on the window it closed this editor — and lost the draft
+ * — on the press the other three surfaces teach as "fold this list".
  */
 describe("SessionSpaceEditor tag chooser", () => {
   it("opens with the list folded, and the caret is what unfolds it", async () => {
@@ -820,5 +821,30 @@ describe("SessionSpaceEditor tag chooser", () => {
     expect(document.activeElement).toBe(name);
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+
+  it("folds the list on Escape and keeps the draft, and the next Escape closes the editor", async () => {
+    const { onClose } = open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    const field = screen.getByLabelText("Add a tag");
+    act(() => {
+      field.focus();
+    });
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    fireEvent.keyDown(field, { key: "Escape" });
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    // The editor and its unsaved draft are both still here, which is the whole
+    // difference: one press folds, it does not cancel.
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /Tag task/ })).toBeInTheDocument();
+    expect(document.activeElement).toBe(field);
+
+    fireEvent.keyDown(field, { key: "Escape" });
+
+    // Folded, so the key belongs to the dialog again and Escape still closes it.
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

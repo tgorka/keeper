@@ -877,10 +877,12 @@ export function SessionSpaceEditor({
                     it opens folded and the caret leaving it — or a press anywhere
                     else on this form — folds it again, with no toggle of this
                     dialog's own. No `onDismiss`, because there is nothing of this
-                    form's to unmount. Escape is not that path here and cannot be:
-                    Radix's dismissable layer claims it at the document in the
-                    capture phase and closes the whole editor first, which is this
-                    dialog's own older decision. */}
+                    form's to unmount. Escape folds it too, and the first press of
+                    it does not cancel this dialog: the chooser claims that key on
+                    the window while its list is up (`tag-combobox.tsx:217`),
+                    which is ahead of where Radix's dismissable layer reads the
+                    claim, so the fold comes first and the unsaved draft survives
+                    the key the other surfaces teach as "fold this list". */}
                 <TagCombobox
                   label="Add a tag"
                   placeholder="Type or browse"

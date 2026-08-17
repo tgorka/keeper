@@ -26,17 +26,32 @@ function cards(): BoardCard[] {
 function mount(over: Partial<React.ComponentProps<typeof TaskBoard>> = {}) {
   const onOpen = vi.fn();
   const onMove = vi.fn(async () => {});
-  const result = render(
-    <TaskBoard
-      heading="Tasks"
-      cards={cards()}
-      empty="No tasks yet."
-      onOpen={onOpen}
-      onMove={onMove}
-      {...over}
-    />,
-  );
-  return { ...result, onOpen, onMove };
+  const props: React.ComponentProps<typeof TaskBoard> = {
+    heading: "Tasks",
+    cards: cards(),
+    empty: "No tasks yet.",
+    onOpen,
+    onMove,
+    ...over,
+  };
+  const result = render(<TaskBoard {...props} />);
+  /** An external re-read: the same board, a new `cards` array. */
+  const reread = (next: BoardCard[]) => result.rerender(<TaskBoard {...props} cards={next} />);
+  return { ...result, onOpen, onMove, reread };
+}
+
+/**
+ * Record the pointer captures taken on one element.
+ *
+ * An own property rather than `vi.spyOn`: `setPointerCapture` is inherited from
+ * `Element.prototype`, where `src/test/setup.ts` stubs it once for the whole
+ * suite, so a spy installed there is shared by every element and cannot say
+ * *which* one took the capture — which is the whole question in these tests.
+ */
+function capturesOn(element: HTMLElement) {
+  const taken = vi.fn();
+  element.setPointerCapture = taken;
+  return taken;
 }
 
 /**
@@ -258,6 +273,127 @@ describe("TaskBoard pointer gesture", () => {
     );
     const prep = screen.getByRole("list", { name: "In preparation" });
     expect(within(prep).getByRole("button", { name: "Draft the plan" })).toBeInTheDocument();
+  });
+
+  it("takes the capture back when a re-read moves the pressed card, and still lands the move", async () => {
+    // The board is safe from the pins strip's own defect only by accident today:
+    // it paints no reorder preview, so nothing MOVES the pressed node mid-drag.
+    // An external `order:` edit does — from Obsidian, an agent or the watcher —
+    // and a keyed child moved inside its own list keeps its DOM node, which means
+    // `insertBefore` removes it from the parent first and Pointer Events treats
+    // that removal as an implicit release of the capture.
+    const { onMove, reread } = mount();
+    layout();
+    const li = cardOf("Write the board");
+    const captured = capturesOn(li);
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.todo, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.done, clientY: Y.header });
+    expect(captured).toHaveBeenCalledTimes(1);
+    // A sibling's `order:` drops below this card's: same list, new position.
+    reread([
+      card({ title: "Draft the plan", status: "in-preparation", order: 1 }),
+      card({ title: "Write the board", status: "todo", order: 1 }),
+      card({ title: "Wire the IPC", status: "todo", order: 0 }),
+    ]);
+    layout();
+    const todo = screen.getByRole("list", { name: "To do" });
+    expect(Array.from(todo.children)).toEqual([cardOf("Wire the IPC"), li]);
+    expect(li.isConnected).toBe(true);
+    // What WebKit does next, and jsdom never did on its own.
+    fireEvent.lostPointerCapture(li, { pointerId: 1 });
+    expect(captured).toHaveBeenCalledTimes(2);
+    // The gesture is still live: the release still lands where it says.
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.done, clientY: Y.header });
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.done, clientY: Y.header });
+    await waitFor(() => expect(onMove).toHaveBeenCalledWith("write-the-board.md", "done", 0));
+  });
+
+  it("ends the gesture and frees the next click when the pressed card unmounts mid-drag", () => {
+    // The other cause of the same event, which wants the opposite answer. A keyed
+    // child whose parent list changes is not moved but remounted, so a re-read
+    // that restatuses the pressed card takes its node away for good — and the
+    // click this drag was going to swallow will never be dispatched at a node
+    // that no longer exists.
+    const { onMove, onOpen, reread } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.prep, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    expect(cued()).toEqual(["todo"]);
+    reread([
+      card({ title: "Draft the plan", status: "done", order: 1 }),
+      card({ title: "Write the board", status: "todo", order: 1 }),
+      card({ title: "Wire the IPC", status: "todo", order: 2 }),
+    ]);
+    expect(li.isConnected).toBe(false);
+    fireEvent.lostPointerCapture(li, { pointerId: 1 });
+    // Torn down: nothing written, and no cue left claiming a live gesture.
+    expect(onMove).not.toHaveBeenCalled();
+    expect(cued()).toEqual([]);
+    // The next click on the board is its own.
+    fireEvent.click(screen.getByRole("button", { name: "Wire the IPC" }));
+    expect(onOpen).toHaveBeenCalledWith("wire-the-ipc.md");
+  });
+
+  it("keeps a drag whose pointer left the card before the slop: the board hears the move", async () => {
+    // 28 px cards and a 6 px slop: a press 3 px from the edge leaves the card
+    // before the press has become a drag, and before the crossing there is no
+    // capture. The move lands on the column box, which the card sits below rather
+    // than above — so with handlers on the card alone nothing hears it and the
+    // drag silently never starts.
+    const { onMove } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    const section = screen.getByRole("region", { name: "Tasks" });
+    const onCard = capturesOn(li);
+    const onSection = capturesOn(section);
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.prep, clientY: 68 });
+    fireEvent.pointerMove(section, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    fireEvent.pointerUp(section, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    await waitFor(() => expect(onMove).toHaveBeenCalledWith("draft-the-plan.md", "todo", 2));
+    // The capture belongs to the pressed card, never to the box a stray move
+    // happened to land on.
+    expect(onCard).toHaveBeenCalledWith(1);
+    expect(onSection).not.toHaveBeenCalled();
+  });
+
+  it("moves nothing in answer to an HTML5 drag", () => {
+    // `draggable` is the attribute the test above reads; this is the behaviour.
+    // `onDragStart`, `onDragOver` and `onDrop` render no DOM attribute at all, so
+    // the only honest guard against the dead mechanism growing back one handler
+    // at a time is to drive it and find that the board does nothing.
+    const { onMove, onOpen } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    const todo = document.querySelector<HTMLElement>('[data-board-column="todo"]');
+    if (todo === null) {
+      throw new Error("no to-do column");
+    }
+    fireEvent.dragStart(li);
+    fireEvent.dragOver(todo);
+    fireEvent.drop(todo);
+    fireEvent.dragEnd(li);
+    expect(onMove).not.toHaveBeenCalled();
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(cued()).toEqual([]);
+  });
+
+  it("frees the click of the next press when the drag ended without one", async () => {
+    // A finger's drag ends with no synthesised click, so nothing eats the swallow
+    // flag the drag set — and the next press is not guaranteed to reach `begin`,
+    // the other site that clears it: a press on a card's own menu returns before
+    // it. Left leaking, that press's click is eaten and the menu does not open.
+    const { onMove } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.prep, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    await waitFor(() => expect(onMove).toHaveBeenCalledWith("draft-the-plan.md", "todo", 2));
+    const menu = menuOf("Wire the IPC");
+    fireEvent.pointerDown(menu, { pointerId: 2, button: 0, clientX: X.todo, clientY: 75 });
+    // Not cancelled: `dispatchEvent` answers false for a click the board swallowed.
+    expect(fireEvent.click(menu)).toBe(true);
   });
 
   it("carries no HTML5 drag anywhere in the board", () => {

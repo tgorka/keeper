@@ -36,6 +36,20 @@
  * This is the shape {@link "@/hooks/use-swipe-actions"} already uses (`:187`);
  * {@link "@/components/ui/resizable-columns"} (`:202`) captures on press because
  * a resize seam has no click to protect.
+ *
+ * **And the capture has to be taken BACK when the DOM moves the element.** The
+ * move that crosses the slop is the same move that paints the drag's preview,
+ * and a preview that reorders a keyed list makes React move the pressed node:
+ * `insertBefore` on a node already in that parent REMOVES it first, and the
+ * removing steps are exactly what Pointer Events hooks for the *implicit release*
+ * of pointer capture. So the pins strip's first drag step released its own
+ * capture and every later move was discarded — the reorder never landed. The
+ * release is listened for natively on the captured element rather than through
+ * React's `onLostPointerCapture`, because React delegates at the root container
+ * and an element removed for good never reaches it. `isConnected` then tells the
+ * two causes apart, and they want opposite things: *moved* is recoverable (take
+ * the capture back, the handlers are intact one step later), *unmounted* is not
+ * (end the gesture, and clear the click it was going to swallow).
  */
 import * as React from "react";
 
@@ -79,12 +93,30 @@ export interface UsePointerDragOptions<Item, Target> {
   slopPx?: number;
 }
 
-/** Spread on the element the press begins on, beside its own `onPointerDown`. */
+/**
+ * Where these go, which is not all one place.
+ *
+ * `onPointerMove`, `onPointerUp` and `onPointerCancel` belong on the **surface's
+ * own container box** — the board's `<section>`, the strip's `<ul>` — and not on
+ * each item. Before the slop crossing there is no capture, so a move is delivered
+ * only to the element under the pointer and to that element's ancestors: a press
+ * three pixels from the edge of a 28 px card leaves the card before it has
+ * travelled six, and the move then lands on the column box, which the card sits
+ * *below* rather than above. Nothing would hear it, the drag would silently never
+ * start, and the press would stay in flight until the next one. The container is
+ * an ancestor of every item — and of the captured element after the crossing, which
+ * is where the platform retargets the rest of the gesture — so it hears all of it.
+ * A second copy on each item would only re-run the same hit-test on every move of
+ * a live drag.
+ *
+ * `onClickCapture` belongs on the item, beside the item's own `onPointerDown`:
+ * that click is the one the item was about to act on, and the capture retargets it
+ * to the element the press began on.
+ */
 export interface PointerDragHandlers {
   onPointerMove: (event: React.PointerEvent<HTMLElement>) => void;
   onPointerUp: (event: React.PointerEvent<HTMLElement>) => void;
   onPointerCancel: (event: React.PointerEvent<HTMLElement>) => void;
-  onLostPointerCapture: (event: React.PointerEvent<HTMLElement>) => void;
   onClickCapture: (event: React.MouseEvent<HTMLElement>) => void;
 }
 
@@ -101,6 +133,20 @@ export interface PointerDrag<Item, Target> {
    * `captureNow` because by then the gesture is already committed).
    */
   begin: (item: Item, origin: PointerPressOrigin, captureNow?: boolean) => void;
+  /**
+   * Forget that the last gesture was a drag, so the click that follows this
+   * press belongs to whatever it lands on again.
+   *
+   * The swallowed-click flag is cleared by the click it eats and by {@link begin},
+   * which is enough for a mouse and not enough for a finger: a touch drag ends
+   * with no synthesised click at all, and a surface that gates its press never
+   * reaches `begin` on the following tap — the pins strip returns before `begin`
+   * for *every* phone press, the board for a press on a card's own menu. The flag
+   * would still be set and that tap would be eaten. Call this at the top of the
+   * surface's `onPointerDown`, ahead of every gate, which is where
+   * {@link "@/hooks/use-long-press"} clears its own `firedRef` (`:102`).
+   */
+  allowNextClick: () => void;
   handlers: PointerDragHandlers;
 }
 
@@ -108,9 +154,23 @@ export interface PointerDrag<Item, Target> {
 interface Press<Item> {
   pointerId: number;
   item: Item;
+  /**
+   * The element the press began on: the one the capture is taken on, and the one
+   * a mid-gesture DOM move loses it from. Held here rather than read off the
+   * crossing move's `currentTarget`, because the move handler lives on the
+   * surface's container and a crossing delivered there would capture the container
+   * instead of the item.
+   */
+  target: HTMLElement;
   startX: number;
   startY: number;
   moved: boolean;
+}
+
+/** The captured element and the native release listener it carries. */
+interface CaptureHold {
+  element: HTMLElement;
+  onLost: (event: PointerEvent) => void;
 }
 
 export function usePointerDrag<Item, Target>(
@@ -122,40 +182,111 @@ export function usePointerDrag<Item, Target>(
   optionsRef.current = options;
 
   const pressRef = React.useRef<Press<Item> | null>(null);
-  // Set the moment a press becomes a drag, cleared by the click it swallows and
-  // by the next press. A touch drag ends without a click, so clearing it at
-  // `begin` too is what stops a stale flag eating the following tap.
+  // Set the moment a press becomes a drag; cleared by the click it swallows, by
+  // the next press, by {@link PointerDrag.allowNextClick}, and by the unmount
+  // that ends a gesture. A touch drag ends without a click, so every one of those
+  // clearing sites is load-bearing on the phone.
   const draggedRef = React.useRef(false);
+  // The element holding the capture, while it holds it. Null between gestures,
+  // and before the slop crossing on the entries that capture there.
+  const captureRef = React.useRef<CaptureHold | null>(null);
 
   const [item, setItem] = React.useState<Item | null>(null);
   const [dragging, setDragging] = React.useState(false);
   const [over, setOver] = React.useState<Target | null>(null);
 
+  const detach = React.useCallback(() => {
+    const held = captureRef.current;
+    if (held === null) {
+      return;
+    }
+    captureRef.current = null;
+    held.element.removeEventListener("lostpointercapture", held.onLost);
+  }, []);
+
   const forget = React.useCallback(() => {
+    detach();
     pressRef.current = null;
     setItem(null);
     setDragging(false);
     setOver(null);
-  }, []);
+  }, [detach]);
 
-  const begin = React.useCallback((next: Item, origin: PointerPressOrigin, captureNow = false) => {
-    // A press whose release was never seen — a pointer that left a small
-    // target without ever crossing the slop, so no capture and no `pointerup`
-    // here — must not wedge the surface for good. The new press wins.
+  // A press interrupted by the whole surface unmounting has no element left to
+  // hear the release on; the listener goes with it.
+  React.useEffect(() => detach, [detach]);
+
+  /**
+   * Take the capture and listen for losing it.
+   *
+   * Idempotent by design: the phone's lift captures at the hold, and the slop
+   * crossing then asks again for the same pointer on the same element.
+   */
+  const capture = React.useCallback(
+    (press: Press<Item>) => {
+      if (captureRef.current !== null) {
+        return;
+      }
+      const element = press.target;
+      const onLost = (event: PointerEvent) => {
+        const current = pressRef.current;
+        // The implicit release that follows every `pointerup` lands here too, by
+        // which time `onPointerUp` has already forgotten the press: nothing to
+        // take back, and nothing to tear down twice.
+        if (current === null || event.pointerId !== current.pointerId) {
+          return;
+        }
+        if (element.isConnected) {
+          // MOVED, not removed: React reconciled the drag's own preview and
+          // `insertBefore` took this node out of its parent before putting it
+          // back. It is still mounted and its handlers are intact, so the gesture
+          // is still live — take the capture back, or every remaining move and
+          // the release itself are delivered somewhere else.
+          element.setPointerCapture(event.pointerId);
+          return;
+        }
+        // Removed for good. The click this drag was going to swallow will never
+        // be dispatched at a node that no longer exists, so the flag goes with
+        // the press — otherwise it eats the next, unrelated click.
+        draggedRef.current = false;
+        forget();
+      };
+      captureRef.current = { element, onLost };
+      element.addEventListener("lostpointercapture", onLost);
+      element.setPointerCapture(press.pointerId);
+    },
+    [forget],
+  );
+
+  const begin = React.useCallback(
+    (next: Item, origin: PointerPressOrigin, captureNow = false) => {
+      // A press whose release was never seen — a pointer that left a small target
+      // without ever crossing the slop, so no capture and no `pointerup` here —
+      // must not wedge the surface for good. The new press wins, and it cannot
+      // inherit the previous one's capture hold.
+      detach();
+      draggedRef.current = false;
+      const press: Press<Item> = {
+        pointerId: origin.pointerId,
+        item: next,
+        target: origin.target,
+        startX: origin.clientX,
+        startY: origin.clientY,
+        moved: false,
+      };
+      pressRef.current = press;
+      setItem(next);
+      setDragging(false);
+      setOver(null);
+      if (captureNow) {
+        capture(press);
+      }
+    },
+    [capture, detach],
+  );
+
+  const allowNextClick = React.useCallback(() => {
     draggedRef.current = false;
-    pressRef.current = {
-      pointerId: origin.pointerId,
-      item: next,
-      startX: origin.clientX,
-      startY: origin.clientY,
-      moved: false,
-    };
-    setItem(next);
-    setDragging(false);
-    setOver(null);
-    if (captureNow) {
-      origin.target.setPointerCapture(origin.pointerId);
-    }
   }, []);
 
   const handlers = React.useMemo<PointerDragHandlers>(
@@ -176,7 +307,7 @@ export function usePointerDrag<Item, Target>(
           // From here the pointer may leave the pressed element — and a drag that
           // stopped following the pointer exactly when the user moved fastest is
           // the defect capture exists to prevent.
-          event.currentTarget.setPointerCapture(event.pointerId);
+          capture(press);
         }
         setOver(optionsRef.current.resolve(event.clientX, event.clientY));
       },
@@ -197,14 +328,6 @@ export function usePointerDrag<Item, Target>(
           forget();
         }
       },
-      onLostPointerCapture: (event) => {
-        // The capture element left the DOM mid-gesture, or the platform took the
-        // pointer back. The implicit release after `pointerup` also lands here,
-        // by which time there is nothing left to forget.
-        if (pressRef.current?.pointerId === event.pointerId) {
-          forget();
-        }
-      },
       onClickCapture: (event) => {
         if (!draggedRef.current) {
           return;
@@ -214,8 +337,8 @@ export function usePointerDrag<Item, Target>(
         event.stopPropagation();
       },
     }),
-    [forget],
+    [capture, forget],
   );
 
-  return { item, dragging, over, begin, handlers };
+  return { item, dragging, over, begin, allowNextClick, handlers };
 }

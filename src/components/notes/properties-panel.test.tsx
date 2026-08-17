@@ -588,6 +588,28 @@ describe("PropertiesPanel — a recording note's tags", () => {
     });
   });
 
+  it("shows the vault's tags on the press that asks for them, with no key pressed", async () => {
+    // The browse half of UX-DR61 on this surface (acceptance row 9 of Story
+    // 53.2), and it needs a case of its own because every other assertion in
+    // this describe types first — and typing opens the list by itself. Nothing
+    // here asserted the chooser ARRIVES open, so the single thing that opened
+    // it could be deleted with all of these tests still green while a user
+    // pressing "Add tag" got a bare field and no list until they typed.
+    renderPanel(TAGGED);
+
+    fireEvent.click(screen.getByRole("button", { name: ADD_NOTE_TAG }));
+
+    expect(await screen.findByRole("option", { name: "client/anvil" })).toBeInTheDocument();
+    // The vault's vocabulary minus what the note already carries, which is what
+    // makes this the vault's list rather than any list.
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual(["client/anvil"]);
+    const field = screen.getByRole("combobox", { name: ADD_NOTE_TAG });
+    expect(field).toHaveAttribute("aria-expanded", "true");
+    // The other half of the same press: the caret is here, so the first
+    // keystroke narrows the list instead of going to the note's body.
+    expect(document.activeElement).toBe(field);
+  });
+
   it("adds a tag, and the rest of the block is the same bytes", async () => {
     renderPanel(TAGGED);
     const field = await openChooser();

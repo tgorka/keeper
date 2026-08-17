@@ -764,6 +764,15 @@ gets the sentence and the pencil, because keeper has no business deciding which 
 tags you meant. A query that is not a plain list of `tag:` terms gets the pencil too:
 dropping a `-tag:done` you typed on purpose is not narrowing anything.
 
+**And only where narrowing keeps something the space already asks for.** The marker rides
+through every save, so a seeded space you have since repurposed — About's file, with a query
+you edited to `tag:log tag:task` — still says `default: about` for good, and it has to: that
+is what stops *Restore default spaces* seeding you a second About. Writing `tag:about` into
+that space would not drop one of your terms, it would drop both and put an unrelated one in
+their place, emptying the space of everything it was listing. So the button is offered only
+when your query still asks for the default's own tag; otherwise you get the sentence and the
+pencil, and the space keeps the query you gave it.
+
 **Why that is a button and not a fix in keeper's own defaults.** The About default has
 always asked `tag:about` — one term, and the two-term query is in the copy on your drive.
 A default's query is written when a zone is **seeded** and never again. keeper reads a
@@ -898,6 +907,25 @@ because that shape's pool reads exactly those two folders and the root, and a fi
 anywhere else would be in no space at all. Convert the session to flat and the key
 takes effect. A flat session's scan walks into its subfolders, which is the whole reason a
 folder is safe here: a task filed into `tasks/` is read back and still listed by Tasks.
+
+**With one caveat, and the space says it out loud.** That scan is budgeted (see **The scan
+is budgeted** above): it stops after a fixed number of entries, having read the session's
+own root first and then descended folder by folder in name order. A session wide enough to
+exhaust that — thousands of files, or a checkout you keep in a folder of your own — is read
+only as far as the budget goes, and a folder that sorts late is where the scan runs out.
+A file keeper has just written into `tasks/` can therefore be past the bound and missing
+from the very space that wrote it. Every space over such a session says *too many files to
+read them all*, and says it instead of *nothing in this session yet*, so a short list is
+never presented as an empty one. Filing your own bulk elsewhere — `workspace/`,
+`artifacts/`, or any folder starting with a dot, none of which the scan enters — is what
+buys the budget back.
+
+**A `create_dir` keeper cannot read as one folder still counts as one.** Write a list
+(`create_dir: [logs, notes]`) and keeper does not quietly fall back to the space's default,
+because that would file your next file somewhere you never named: it reads the value as the
+single folder name the list flattens to, and puts a sentence on the space saying it could
+read only one folder and what it read. Fix it in the editor, or clear the key to go back to
+inheriting.
 
 **Where your own fold is kept.** Per space, in a cookie in keeper's own webview — not in the
 zone, not in `keeper.toml`, not in any file on your drives. It survives a restart and it

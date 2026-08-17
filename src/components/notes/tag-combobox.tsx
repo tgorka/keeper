@@ -11,17 +11,19 @@
  * one, because a list you have to open is a list nobody browses.
  *
  * **Story 53.2 narrows that sentence; it does not reverse it.** Browsing still
- * costs no deliberate press — focus on the field opens the list, so does typing,
- * so does an arrow key. What the control gained is a notion of *done choosing*:
- * focus leaving the whole control, a press outside it, or Escape where a
- * dismissable layer above has not already claimed that key. After that the
- * list is `hidden` rather than unmounted — the `FoldSection` idiom
- * (`sidebar-group.tsx:215`, and the reason at `:32-37`) — so it stops claiming
- * height in the column while remaining the same list, in the same order, one
- * focus away. That is what makes this one component the fix on all five
- * surfaces: the two space editors (`space-editor.tsx`, `session-space-editor.tsx`)
- * mount it unconditionally with no `onDismiss` and so had no close path at all,
- * and they need none of their own now, because the state lives here.
+ * costs no deliberate press — the field taking the caret opens the list, so does
+ * typing, so does an arrow key, and a host that reveals this control on a press
+ * of its own says `openOnMount` and gets both halves in one word. What the
+ * control gained is a notion of *done choosing*: focus leaving the whole
+ * control, a press outside it, or Escape. After that the list is `hidden` rather
+ * than unmounted — the `FoldSection` idiom (`sidebar-group.tsx:215`, and the
+ * reason at `:32-37`) — so it stops claiming height in the column while
+ * remaining the same list, in the same order, one focus away. That is what makes
+ * this one component the fix on all five surfaces: the two space editors
+ * (`space-editor.tsx`, `session-space-editor.tsx`) mount it unconditionally with
+ * no `onDismiss` and so had no close path at all, and they need none of their
+ * own now — not even for Escape, which this control claims ahead of the dialog
+ * around it while the list is up (`:217`).
  *
  * **What matches is not this file's decision.** `components/tags/tag-match.ts`
  * owns it, and the editor's `#` popup asks the same function, so the two
@@ -42,15 +44,7 @@
  * several times in a row and a control that drops focus after each one makes
  * the second tag cost a reach for the mouse.
  */
-import {
-  type KeyboardEvent,
-  type ReactNode,
-  type Ref,
-  useEffect,
-  useId,
-  useRef,
-  useState,
-} from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { matchTags, namesTag } from "@/components/tags/tag-match";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -85,7 +79,7 @@ export function TagCombobox({
   placeholder,
   onChoose,
   onDismiss,
-  inputRef,
+  openOnMount = false,
 }: {
   /** The visible label; also the accessible name of the field and of the list. */
   label: string;
@@ -103,7 +97,11 @@ export function TagCombobox({
   /** Escape on an empty query. Absent, Escape only clears the query, which is
    *  what an inline chooser with nowhere to go should do. */
   onDismiss?: () => void;
-  inputRef?: Ref<HTMLInputElement>;
+  /** The host revealed this chooser because the user asked for it, so the field
+   *  takes the caret and the list starts unfolded. Absent — the two space
+   *  editors, which mount it as a permanent part of a form — nothing is
+   *  focused and the list waits, folded, for somebody to come to it. */
+  openOnMount?: boolean;
 }) {
   const fieldId = useId();
   const listId = `${fieldId}-list`;
@@ -112,16 +110,33 @@ export function TagCombobox({
   // Story 53.2. Closed until the user is at the field: the surfaces that mount
   // this control unconditionally would otherwise claim a list's height before
   // anybody has come to read it. Every way INTO the control opens it — focus,
-  // typing, an arrow key — so there is still no press whose job is "open".
-  const [open, setOpen] = useState(false);
+  // typing, an arrow key — and a host that mounted the control BECAUSE the user
+  // asked for it starts open rather than waiting for a focus event to arrive.
+  const [open, setOpen] = useState(openOnMount);
   const root = useRef<HTMLDivElement>(null);
+  const field = useRef<HTMLInputElement>(null);
   // True from a pointer going down anywhere until it comes back up. The
   // focus-out that a press causes must NOT close the list mid-press: this list
   // sits above a dialog's Save button, and hiding it between mousedown and
   // mouseup moves that button out from under the cursor, so the click the user
   // meant never lands. While a press is in flight the close is left to the
-  // `click` below, by which time the browser has already settled what was hit.
+  // press layer below, by which time the browser has already settled what was
+  // hit.
   const pressing = useRef(false);
+
+  // The caret follows the mount, for the hosts that asked for one (Story 53.2).
+  // This is `openOnMount`'s other half and it lives HERE on purpose: the three
+  // surfaces that reveal this chooser on a press of their own used to spell it
+  // `inputRef={(node) => node?.focus()}` at the callsite, which made the browse
+  // half of UX-DR61 depend on a focus side effect no host stated and no host
+  // test could see — deleting that ref left the list folded until the user
+  // typed, with every test still green. One prop carries both halves now, and
+  // the state above no longer waits on the focus event to know it is open.
+  useEffect(() => {
+    if (openOnMount) {
+      field.current?.focus();
+    }
+  }, [openOnMount]);
 
   const typed = query.trim();
 
@@ -164,7 +179,7 @@ export function TagCombobox({
     const up = (): void => {
       pressing.current = false;
     };
-    const clicked = (event: MouseEvent): void => {
+    const outside = (event: Event): void => {
       if (root.current?.contains(event.target as Node) !== true) {
         setOpen(false);
       }
@@ -172,16 +187,67 @@ export function TagCombobox({
     document.addEventListener("pointerdown", down, true);
     document.addEventListener("pointerup", up, true);
     document.addEventListener("pointercancel", up, true);
-    document.addEventListener("click", clicked, true);
+    // Three names for one signal, because `click` is the PRIMARY button's only:
+    // a middle press fires `auxclick` and no `click` at all, and a right press
+    // fires `contextmenu` (and `auxclick`) and no `click` either — so a list
+    // closed on `click` alone stayed up, over the top of a context menu the
+    // user had opened somewhere else entirely. `pointerup` is deliberately NOT
+    // the signal: it arrives before the browser has settled what a press hit,
+    // which is the whole reason the mid-press guard above exists. `contextmenu`
+    // is the one of the three that can arrive mid-press — Windows and Linux
+    // raise it as the button goes DOWN — and that is harmless, because a press
+    // opening a context menu is not a press whose click has to land on a
+    // control underneath this list.
+    document.addEventListener("click", outside, true);
+    document.addEventListener("auxclick", outside, true);
+    document.addEventListener("contextmenu", outside, true);
     return () => {
       document.removeEventListener("pointerdown", down, true);
       document.removeEventListener("pointerup", up, true);
       document.removeEventListener("pointercancel", up, true);
-      document.removeEventListener("click", clicked, true);
+      document.removeEventListener("click", outside, true);
+      document.removeEventListener("auxclick", outside, true);
+      document.removeEventListener("contextmenu", outside, true);
       // A press that ended with this layer gone must not leave the next
       // focus-out believing a button is still held down.
       pressing.current = false;
     };
+  }, [open]);
+
+  // Escape's claim, made early enough to be seen (Story 53.2, acceptance row 5).
+  //
+  // The field's own handler below already prevents this key's default — that is
+  // how this control has always said "Escape is mine" — but it says it far too
+  // late for the only other listener that cares. A dismissable layer above
+  // (`@radix-ui/react-dismissable-layer`, which is what closes every Radix
+  // dialog in the repo) reads the claim from a `keydown` listener on the owner
+  // DOCUMENT in the CAPTURE phase, and dismisses unless the event is already
+  // `defaultPrevented` (`dist/index.mjs:84-91`). So the same claim is made here
+  // on the WINDOW, which the DOM's event path visits before the document: the
+  // layer then sees the claim and leaves the dialog alone. That is the veto its
+  // own `onEscapeKeyDown` prop exists to spell — the same library contract, from
+  // the one place that knows whether there is a list to close, instead of a
+  // boolean mirrored into every dialog that ever mounts this control.
+  //
+  // Only while the list is up, and only for a key aimed INSIDE this control:
+  // Escape anywhere else on a dialog still cancels the dialog, and Escape with
+  // the list folded has nothing of this control's left to close, so the second
+  // press closes the form. Without this the two space editors threw an unsaved
+  // space draft away on the key the other three surfaces teach as "fold this
+  // list".
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    // `globalThis.` because React's own `KeyboardEvent` type is imported above
+    // for the field's handler, and this listener is the platform's.
+    const claim = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === "Escape" && root.current?.contains(event.target as Node) === true) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", claim, true);
+    return () => window.removeEventListener("keydown", claim, true);
   }, [open]);
 
   function choose(row: Row | undefined): void {
@@ -235,12 +301,12 @@ export function TagCombobox({
         return;
       }
       // Story 53.2: on an empty query Escape folds the list away, and then the
-      // host's dismiss runs if it has one. It is not the only fold, and on a
-      // surface inside a Radix dialog it is not the reachable one — that
-      // library's dismissable layer claims Escape at the document in the
-      // CAPTURE phase and closes the dialog before this handler runs, which is
-      // those dialogs' own older decision. The folds that always work are focus
-      // leaving and a press outside, which is why they exist.
+      // host's dismiss runs if it has one. It is not the only fold — focus
+      // leaving and a press outside are the ones that cost no key — but it is
+      // now a reachable one on every surface, including the two inside a Radix
+      // dialog: the layer at `:217` makes this control's claim on the key before
+      // that dialog's dismissable layer reads it, so the first press folds the
+      // list and the second closes the form.
       setOpen(false);
       onDismiss?.();
     }
@@ -261,7 +327,7 @@ export function TagCombobox({
     <div ref={root} className="flex flex-col gap-1.5">
       <Label htmlFor={fieldId}>{label}</Label>
       <Input
-        ref={inputRef}
+        ref={field}
         id={fieldId}
         role="combobox"
         // The real state, not a literal (Story 53.2): the list below is hidden

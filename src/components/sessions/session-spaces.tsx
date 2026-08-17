@@ -154,6 +154,20 @@ export const SESSION_SPACES_EMPTY = "This zone has no spaces. Restore the defaul
 export const SESSION_SPACES_NO_FILES = "Nothing in this session yet.";
 
 /**
+ * What a space says when the session's scan stopped before it had seen the whole
+ * session (Story 53.5).
+ *
+ * Worded like the tree's and the references' own notices, and for the same
+ * reason those exist: a bounded scan that showed a prefix silently would be a
+ * list that lies about being complete. Story 53.5 is what makes it load-bearing
+ * here — a create now lands in the per-kind directory a space names rather than
+ * at the session root the walk enumerates first, so on a session wide enough to
+ * exhaust the walk the file that was just written is genuinely not in this list.
+ */
+export const SESSION_SPACES_TRUNCATED =
+  "Too many files to read them all — this list is a prefix of what this space would show, and a file created here may not appear in it.";
+
+/**
  * The seeded default that shows what declares no kind (Story 52.4).
  *
  * **The identity is `defaultKey`, never the name** — `@/lib/recordings-space`'s
@@ -962,6 +976,20 @@ function SpaceSection({
           {selection?.error != null && selection.error !== space.error && (
             <p className="text-destructive text-xs">{selection.error}</p>
           )}
+          {/* The session's scan stopped before it had seen everything, so this
+              list is a prefix (Story 53.5). One fact about the POOL, which every
+              space evaluated over it carries, and it renders in the section a
+              person is actually looking at rather than once at the top: the file
+              they are looking for is missing from THIS list, and per-kind
+              destinations are what moved a fresh create behind the bound.
+
+              Outside the folded region with the other notices, because a list
+              that is short is short whether or not its rows are showing. */}
+          {selection?.poolTruncated === true && (
+            <p data-slot="space-truncated" className="text-muted-foreground text-xs">
+              {SESSION_SPACES_TRUNCATED}
+            </p>
+          )}
           {/* Why this space offers no create, in Rust's words — this session's
               contract keeping that kind nowhere, the query asking for more than
               one thing so that "what would a file made here be?" has no single
@@ -1020,8 +1048,13 @@ function SpaceSection({
       {loading ? (
         <p className="text-muted-foreground text-xs">{SESSION_SPACES_LOADING}</p>
       ) : files.length === 0 ? (
+        // "Nothing in this session yet" is a claim about the session, so it is
+        // not made where keeper stopped reading the session (Story 53.5): the
+        // truncation notice above is what an empty-looking space says then, and
+        // saying both would be one sentence contradicting the other.
         !broken &&
-        selection?.error == null && (
+        selection?.error == null &&
+        selection?.poolTruncated !== true && (
           <p className="text-muted-foreground text-xs">{SESSION_SPACES_NO_FILES}</p>
         )
       ) : (

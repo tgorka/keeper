@@ -604,6 +604,24 @@ pub struct SessionSpaceFilesVm {
     /// Its query would not parse, already worded. `files` is then empty, and the
     /// section renders the sentence rather than a suspiciously complete list.
     pub error: Option<String>,
+    /// Whether a budget stopped the session's markdown scan before it had seen
+    /// the whole session, so what this space selected is a PREFIX of what it
+    /// would have selected (Story 53.5).
+    ///
+    /// One fact about the pool, repeated onto every space evaluated over it,
+    /// because a section is where a person is looking when the list they expect
+    /// a file in is short. Story 53.5 is what makes it matter: per-kind
+    /// destinations moved a create out of the session root — the first thing the
+    /// walk enumerates — and into a directory reached only after every
+    /// earlier-sorting subtree, so on a wide session the file a create just wrote
+    /// is genuinely missing from the space that wrote it.
+    ///
+    /// **A flag, not a sentence**, unlike `error` and `no_home` below: the two
+    /// sibling truncated scans on this surface ([`SessionTreeVm::truncated`],
+    /// [`SessionReferencesVm::truncated`]) are flags whose notice is written
+    /// where it is rendered, and a third wording of "keeper stopped looking" is
+    /// the thing to avoid here, not a second one.
+    pub pool_truncated: bool,
     /// Why this space offers no create, already worded — or `None` when it has
     /// one to offer, and when the refusal is nothing a person needs told.
     ///

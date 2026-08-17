@@ -28,10 +28,22 @@ import { NOTES_RAIL_FOLD_COOKIE, readNotesRailFold } from "@/lib/stores/notes-ra
  * only name".
  */
 function jar(value: string): string {
+  return rawJar(encodeURIComponent(value));
+}
+
+/**
+ * The same jar with the file pane's value written RAW, byte for byte.
+ *
+ * {@link jar} goes through `encodeURIComponent`, which CANNOT produce a value
+ * that is not valid percent-encoding — a `%` comes back as `%25` and decodes
+ * cleanly. A malformed escape only ever arrives from outside this build, so a
+ * test for one has to write the bytes itself.
+ */
+function rawJar(encoded: string): string {
   return [
     "theme=dark",
     `${NOTES_RAIL_FOLD_COOKIE}=${encodeURIComponent("spaces:1|tags:1|files:0")}`,
-    `${FILE_FRAME_FOLD_COOKIE}=${encodeURIComponent(value)}`,
+    `${FILE_FRAME_FOLD_COOKIE}=${encoded}`,
   ].join("; ");
 }
 
@@ -75,6 +87,24 @@ describe("readFileFrameFold", () => {
       properties: true,
       caveat: false,
     });
+  });
+
+  it("leaves both bands at their defaults for a value that is not percent-encoding", () => {
+    // Junk this parser can READ is dropped by the test above. This is junk it
+    // cannot: `decodeURIComponent` throws a `URIError` on a lone `%` and on a
+    // truncated escape, and the read happens inside `TextFileFrame`'s mount
+    // effect — so unguarded, a jar an extension rewrote or an interrupted write
+    // left behind did not fold a band wrong, it took the whole panel down.
+    //
+    // Both bands VISIBLY at their defaults: the values inside the truncated
+    // entry say `0` for both, so a parser that read half of it before failing
+    // would answer differently.
+    expect(readFileFrameFold(rawJar("%"))).toEqual(fileFrameFolded());
+    expect(readFileFrameFold(rawJar("properties:0|caveat:0%7"))).toEqual(fileFrameFolded());
+
+    // And it costs its own surface only: one unreadable value in a shared jar
+    // must not lose the rail the fold beside it remembers.
+    expect(readNotesRailFold(rawJar("%"))).toEqual({ spaces: true, tags: true, files: false });
   });
 
   it("reads its own cookie and never the notes rail's", () => {

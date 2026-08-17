@@ -290,6 +290,11 @@ export function TaskBoard({
       data-card-key={card.key}
       data-dragging={drag.dragging && drag.item === card.key ? "true" : undefined}
       onPointerDown={(event) => {
+        // Every press, ahead of the gates below: a press on a card's own menu
+        // returns without reaching `begin`, which is the other site that clears
+        // the swallowed-click flag, and a touch drag ends with no synthesised
+        // click to eat it.
+        drag.allowNextClick();
         // Secondary buttons open menus and select text; and a press that begins
         // on the column menu belongs to the menu, which owns its own pointer.
         if (
@@ -305,10 +310,11 @@ export function TaskBoard({
           target: event.currentTarget,
         });
       }}
-      onPointerMove={drag.handlers.onPointerMove}
-      onPointerUp={drag.handlers.onPointerUp}
-      onPointerCancel={drag.handlers.onPointerCancel}
-      onLostPointerCapture={drag.handlers.onLostPointerCapture}
+      // The move, the release and the cancel are listened for once, on the board
+      // (`:404`), and not again here: this card is inside it, so a card-level copy
+      // would only run the same hit-test a second time on every move of a live
+      // drag. The press stays here, because it is the press that names the card,
+      // and so does the click swallow, because that click lands on the card.
       onClickCapture={drag.handlers.onClickCapture}
       // The whole card is the handle, so the whole card says so. `select-none` is
       // what `draggable` used to buy: without it a mouse drag paints a text
@@ -395,7 +401,22 @@ export function TaskBoard({
   );
 
   return (
-    <section ref={board} aria-label={heading} className="flex flex-col gap-1">
+    <section
+      ref={board}
+      aria-label={heading}
+      // The move, the release and the cancel are listened for here and nowhere
+      // else. Before the slop crossing there is no capture, and a press 3 px from
+      // the edge of a 28 px card leaves the card before travelling 6: that move
+      // lands on the column box, which the card sits below rather than above, so
+      // on the card alone nothing would hear it and the drag would silently never
+      // start. From here the whole board hears it — including the release of a
+      // card whose own `li` an external re-read unmounted mid-drag. Every handler
+      // is `pointerId`-guarded and no-ops with no press in flight.
+      onPointerMove={drag.handlers.onPointerMove}
+      onPointerUp={drag.handlers.onPointerUp}
+      onPointerCancel={drag.handlers.onPointerCancel}
+      className="flex flex-col gap-1"
+    >
       <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
         {heading}
       </h3>

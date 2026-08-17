@@ -183,12 +183,8 @@ describe("editing a space changes what it selects", () => {
   });
 
   it("folds the list when the caret moves to another field of the form (Story 53.2)", async () => {
-    // Focus leaving, not Escape, is this surface's fold. Escape inside a Radix
-    // dialog is claimed at the document in the CAPTURE phase
-    // (`@radix-ui/react-dismissable-layer`), so it closes the whole editor
-    // before the chooser's own handler runs — which is the pre-existing
-    // behaviour of this dialog and not something to fight from inside a
-    // combobox. What this form needed was a fold that costs no press at all.
+    // Focus leaving is this surface's cheapest fold — it costs no key at all —
+    // and Escape is asserted separately below.
     const { onClose } = open();
 
     await screen.findByRole("button", { name: /Tag client\/acme/ });
@@ -214,6 +210,40 @@ describe("editing a space changes what it selects", () => {
     // The dialog is untouched: folding a list is not dismissing a form.
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+
+  it("folds the list on Escape and keeps the draft, and the next Escape closes the editor", async () => {
+    // The hazard this exists for (Story 53.2, acceptance row 5). Escape is the
+    // key the other three surfaces teach as "fold this list", and on this dialog
+    // it reached `@radix-ui/react-dismissable-layer` first — a `keydown` listener
+    // on the document in the CAPTURE phase — so the one press folded nothing and
+    // threw the whole unsaved space draft away instead. The chooser now claims
+    // the key on the window while its list is up (`tag-combobox.tsx:217`), which
+    // the event path visits before the document, and that layer's own contract is
+    // to leave the dialog alone once the event is `defaultPrevented`.
+    const { onClose } = open();
+
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    const field = screen.getByLabelText("Add a tag");
+    act(() => {
+      field.focus();
+    });
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    fireEvent.keyDown(field, { key: "Escape" });
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    // The draft is still on screen and the caret is still in the chooser, so the
+    // next keystroke brings the same list back.
+    expect(screen.getByRole("button", { name: /Tag client\/acme/ })).toBeInTheDocument();
+    expect(document.activeElement).toBe(field);
+
+    fireEvent.keyDown(field, { key: "Escape" });
+
+    // Nothing of the chooser's left to close, so the key is the dialog's again:
+    // the fold is one press deep, not a surface where Escape stops working.
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("takes a tag the vault does not have yet, because a space is authored (Story 44.13)", async () => {

@@ -40,15 +40,7 @@
  * build filters.
  */
 import { Minus, Plus, Search, X } from "lucide-react";
-import {
-  type KeyboardEvent,
-  type Ref,
-  useCallback,
-  useEffect,
-  useId,
-  useRef,
-  useState,
-} from "react";
+import { type KeyboardEvent, type Ref, useEffect, useId, useRef, useState } from "react";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -214,12 +206,6 @@ export function NoteFilterBar({
     };
   }, [adding]);
 
-  // A stable ref callback, so the field takes focus once when the chooser opens
-  // and not again on every render of the bar behind it.
-  const focusChooser = useCallback((node: HTMLInputElement | null) => {
-    node?.focus();
-  }, []);
-
   function closeChooser(): void {
     setAdding(false);
     addRef.current?.focus();
@@ -337,7 +323,11 @@ export function NoteFilterBar({
           placeholder="Type or browse"
           vocabulary={vocabulary}
           chosen={tagTerms.map((chip) => chip.tag)}
-          inputRef={focusChooser}
+          // The bar's own press is what mounted this, so the caret comes here
+          // and the list is unfolded to browse (Story 53.2). This was a ref
+          // callback calling `node?.focus()`, which left the browse half of
+          // UX-DR61 riding on a focus side effect nothing declared.
+          openOnMount
           onChoose={(tag) => notesFiltersStore.getState().setTagTerm(tag, "include")}
           onDismiss={closeChooser}
         />
