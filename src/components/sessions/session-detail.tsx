@@ -52,9 +52,15 @@ import {
   sessionsRefs,
   sessionsSpaceFiles,
   sessionsSpaces,
+  sessionsSpacesFoldedGet,
   sessionsTree,
 } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
+import {
+  hydrateSessionSpacesFold,
+  sessionSpacesFoldStore,
+  setSpacesFoldedDefault,
+} from "@/lib/stores/session-spaces-fold";
 
 /** The way back to the board. */
 export const SESSION_DETAIL_BACK_LABEL = "Back to sessions";
@@ -132,6 +138,83 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   // does — and "no sooner" is a race, not a guarantee. An explicit re-read after
   // a write keeps the section honest without waiting on the filesystem.
   const [reload, setReload] = useState(0);
+  /**
+   * ONE create in flight across this whole session, not one per section.
+   *
+   * Two children offer a create — the Files heading's *New log* / *New prompt*
+   * / *New file* and every writable space's *New note in …* — and the two
+   * kind-creates both post `sessions_file_new_kind` with an EMPTY title. Rust
+   * names such a file `YYYY-MM-DD-HHMM-untitled.md` from the clock to the
+   * minute and `files::compile_new` emits a plain `WriteFile`, so two presses
+   * in the same minute compute `taken_in` before either write lands, resolve to
+   * one filename, and the second silently overwrites the first — a `tag: task`
+   * file becoming a `tag: log` one.
+   *
+   * The flag lives HERE because that is the lowest node both surfaces share:
+   * each of them held its own `useState` until Story 50.1's review, which
+   * removed only the presses within one component and left "New prompt above,
+   * New note below" reachable. Serialising in Rust is the real fix and is that
+   * crate's to make; this is what removes the press a person can perform.
+   */
+  const [writing, setWriting] = useState(false);
+
+  /**
+   * Restore the spaces' fold, and read the default it falls back to
+   * (Story 49.3, FR-275, FR-276).
+   *
+   * **Here, at the mount point, and not inside `SessionSpaces`.** A `hydrate…`
+   * call is the one part of a remembered fold that no store-level test can see
+   * the absence of: the store passes every one of its own assertions with the
+   * restore never wired up, and the person gets a fold that forgets itself on
+   * every visit. That is DW-172, and Story 48.1's mutation M3 measured it — a
+   * removed `hydrate…` killed exactly one test, the one at the mount point. The
+   * matching test for this one is in `session-detail.test.tsx`.
+   *
+   * Once per document, not once per session: the cookie holds every space in
+   * every root, and {@link hydrateSessionSpacesFold} is idempotent, so a second
+   * detail cannot undo a fold the person has changed since the first.
+   *
+   * **The cookie does not wait for the setting.** Reading it needs no IPC, and
+   * the spaces themselves arrive from the sibling effect below — five
+   * independent `invoke`s with no ordering between them. Restoring the fold
+   * inside the setting read's `.then` therefore let the spaces payload win the
+   * race and paint every space the person had folded OPEN, against the store's
+   * initial `defaultFolded: false`, before snapping it shut a moment later.
+   * Only the fallback for spaces with NOTHING recorded genuinely needs Rust, so
+   * only that waits; a space somebody decided about is restored before anything
+   * paints.
+   *
+   * The setting arrives second and moves `defaultFolded` alone — never
+   * `recorded`, which is what keeps a hand-made answer outranking it — and it
+   * is applied only if nothing else moved the fallback while the read was out.
+   * Settings writes that fallback the moment somebody flips the switch, and a
+   * read issued before the flip is older news than the flip; the `hydrate…`
+   * latch used to cover that for free, and it is spelled out here now that the
+   * restore no longer waits behind it. A read that FAILS corrects nothing:
+   * unfolded is the registry's own default, and the store already holds either
+   * that or whatever another surface read.
+   */
+  useEffect(() => {
+    let live = true;
+    // The fallback the store already holds: this call restores the COOKIE, and
+    // the setting arrives on its own below.
+    const seeded = sessionSpacesFoldStore.getState().defaultFolded;
+    hydrateSessionSpacesFold(document.cookie, seeded);
+    sessionsSpacesFoldedGet().then(
+      (folded) => {
+        // Still `seeded` means nothing newer has been said about the fallback.
+        if (live && sessionSpacesFoldStore.getState().defaultFolded === seeded) {
+          setSpacesFoldedDefault(folded);
+        }
+      },
+      () => {
+        // Nothing to say and nothing to correct — see above.
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
 
   // Read on mount and re-read on the changed event — an agent's write on
   // disk moves this surface without a keystroke (FR-234's detail half).
@@ -265,6 +348,13 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   // reads a field rather than probing the disk for which file exists.
   const recordName = detail?.shape === "flat" ? "about.md" : "README.md";
 
+  // And the label naming it, once. The spaces section offers the same verb where
+  // a create is refused because the record already exists (Story 51.7, FR-299),
+  // and two places composing "which file is the record called" is how the header
+  // and the section come to name different files for one contract.
+  const recordLabel =
+    detail?.shape === "flat" ? SESSION_DETAIL_OPEN_ABOUT_LABEL : SESSION_DETAIL_OPEN_README_LABEL;
+
   const openRecord = useCallback(() => {
     if (detail === null) {
       return;
@@ -305,9 +395,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               </Badge>
               <Button type="button" variant="outline" size="sm" onClick={openRecord}>
                 <Pencil aria-hidden className="size-3.5" />
-                {detail.shape === "flat"
-                  ? SESSION_DETAIL_OPEN_ABOUT_LABEL
-                  : SESSION_DETAIL_OPEN_README_LABEL}
+                {recordLabel}
               </Button>
             </div>
             {detail.summary !== "" && (
@@ -371,6 +459,8 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
                 sessionId={sessionId}
                 shape={detail.shape}
                 entries={tree?.entries ?? []}
+                busy={writing}
+                onBusy={setWriting}
                 onChanged={() => setReload((n) => n + 1)}
               />
             </div>
@@ -417,34 +507,67 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               trust a grouping before seeing the thing grouped. */}
           <SessionSpaces
             rootId={rootId}
+            sessionId={sessionId}
+            // The section lists AND writes under both contracts (Story 50.1):
+            // `sessions_file_new_kind` writes where the shape keeps the kind,
+            // and a kind this session's shape keeps no home for arrives as a
+            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
+            // does not travel: one reader of `shape::kind_dir`, in Rust.
             spaces={spaces}
             selections={spaceFiles}
+            // The verb a space offers where its create is refused because the
+            // record already exists (Story 51.7, FR-299). WHICH space that is is
+            // Rust's answer, per space, on `openRecord`; the label and the target
+            // are the header's own, because the record is one fixed name at a
+            // known place and this surface already opens it from up there.
+            recordLabel={recordLabel}
+            onOpenRecord={openRecord}
+            // The same flag the Files heading above is handed — both surfaces
+            // offer a create that posts an empty title, and one filename is
+            // what they would collide on.
+            writing={writing}
+            onWriting={setWriting}
             onChanged={() => setReload((n) => n + 1)}
           />
 
           {/* The board (FR-263) — after the spaces, because a space is the
               question "which files are tasks?" and the board is what those files
-              say about themselves. Rendered for a flat session only: a
-              folder-shaped one has no pool to tag, so its board would be four
-              empty columns saying nothing true. */}
-          {detail.shape === "flat" && (
-            <SessionBoard
-              rootId={rootId}
-              sessionId={sessionId}
-              tasks={detail.tasks}
-              // A card knows its session-relative path; the path that OPENS it
-              // is the `subpath` Rust composed for the same file in the tree
-              // (AD-65). Looked up rather than joined, so there is still exactly
-              // one place in the app that knows how a zone path is built.
-              onOpen={(relPath) => {
-                const entry = tree?.entries.find((candidate) => candidate.relPath === relPath);
-                if (entry !== undefined) {
-                  openFile(entry);
-                }
-              }}
-              onChanged={() => setReload((n) => n + 1)}
-            />
-          )}
+              say about themselves.
+
+              **Both shapes** (Story 51.7, FR-299). This used to render for a flat
+              session only, and the reason was true when it was written: a
+              folder-shaped session had no pool to tag, so its board would have
+              been four empty columns saying nothing true. Story 51.1 put that
+              shape's root markdown into the pool, so a `task`-tagged file there
+              is a card — and the shape was standing in for the real question,
+              which is whether there is anything tagged.
+
+              That question is `detail.tasks`, and there is deliberately no second
+              predicate beside it: a session with nothing to tag has no cards, and
+              the board answers an empty list with the sentence that says what a
+              task is rather than with columns (`task-board.tsx`). A "does it have
+              a pool" flag could only ever disagree with the cards by being wrong.
+
+              Drag-and-drop and the per-card dropdown are untouched: the drop
+              writes `status:` and `order:` through `sessions_task_move`, which
+              re-reads the column it is dropping into and knows nothing of the
+              shape. */}
+          <SessionBoard
+            rootId={rootId}
+            sessionId={sessionId}
+            tasks={detail.tasks}
+            // A card knows its session-relative path; the path that OPENS it
+            // is the `subpath` Rust composed for the same file in the tree
+            // (AD-65). Looked up rather than joined, so there is still exactly
+            // one place in the app that knows how a zone path is built.
+            onOpen={(relPath) => {
+              const entry = tree?.entries.find((candidate) => candidate.relPath === relPath);
+              if (entry !== undefined) {
+                openFile(entry);
+              }
+            }}
+            onChanged={() => setReload((n) => n + 1)}
+          />
 
           {/* What the session points at (FR-255) — after the files, because it
               is the same question asked the other way: what it holds, then what

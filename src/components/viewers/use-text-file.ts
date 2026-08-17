@@ -17,6 +17,12 @@
  * the other in the webview (AD-65; the resolution is Story 45.18's), so the two
  * commands are genuinely different commands.
  *
+ * Which is why the pair the surface DID address comes back out as {@link
+ * FileOrigin}: a view over the buffer has to be able to tell new bytes from a
+ * new file — an undo stack that spans two files writes one over the other — and
+ * the only place that answer cannot go stale is beside the read that produced
+ * the bytes.
+ *
  * Everything else about them is identical, and everything else is where the
  * bugs live: the generation counter that stops a slow read for the previous
  * file overwriting the current one's buffer, `persisted` being state rather
@@ -55,6 +61,40 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { syncReadText, syncWriteEntry, type TextFileVm } from "@/lib/ipc/client";
 
 /**
+ * Which file a buffer was read from, in whichever coordinates its surface
+ * addresses files by.
+ *
+ * **The two hosts do not identify a file the same way, and this does not
+ * pretend they do.** A Files panel holds a sync profile id and a
+ * profile-relative subpath; a note embed holds a notes vault id and the
+ * vault-relative target Rust answered with. Neither is derivable from the other
+ * in the webview (AD-65), so this pair is whichever one the surface can prove —
+ * it is never assembled, never joined to a root, and never handed to a command,
+ * because the commands in {@link TextFileSource.read} / {@link
+ * TextFileSource.write} already hold their own coordinates.
+ *
+ * It exists because a view has to be able to tell NEW BYTES from a NEW FILE, and
+ * a display name cannot: story 51.1 made two markdown files with one basename in
+ * two directories an ordinary session layout, and a panel replaces its target in
+ * place. It comes out of the loader rather than down a second prop chain so it
+ * cannot disagree with the buffer it describes.
+ */
+export interface FileOrigin {
+  /**
+   * The sync profile id, or the notes vault id — whichever this surface
+   * addresses files by — and `null` for a surface that holds neither.
+   *
+   * Never a note id: a note is a row in a vault's index and this is the vault
+   * (or the profile) itself. Never rendered, either; a profile id is a uuid.
+   */
+  readonly profileOrVaultId: string | null;
+  /** The path the buffer was read from, relative to {@link profileOrVaultId}:
+   *  a profile-relative subpath, or a vault-relative target. Never absolute
+   *  (FR-145). */
+  readonly relativePath: string;
+}
+
+/**
  * The two commands one surface addresses one file with, plus what to call it.
  *
  * **Must be referentially stable.** {@link useTextBuffer} re-reads whenever this
@@ -64,9 +104,18 @@ import { syncReadText, syncWriteEntry, type TextFileVm } from "@/lib/ipc/client"
  * gets a read per render, which the tests below catch by counting calls.
  */
 export interface TextFileSource {
-  /** What this file is called in a sentence and in a log line. Never a path
-   *  that could be absolute (FR-145) — the callers pass a relative one. */
+  /**
+   * The path this surface addresses the file by, relative to {@link
+   * profileOrVaultId}. Never a path that could be absolute (FR-145).
+   *
+   * Rendered in a sentence and in a log line — and, with the id below, it is
+   * also the file's identity ({@link FileOrigin}), which is why it is a path
+   * and not a display name.
+   */
   readonly label: string;
+  /** The profile or vault {@link label} is relative to, or `null` when this
+   *  surface has neither. See {@link FileOrigin}. */
+  readonly profileOrVaultId: string | null;
   /** Read it, or reject with Rust's sentence. */
   readonly read: () => Promise<TextFileVm>;
   /** Write the whole buffer exactly, or reject with Rust's sentence. */
@@ -118,6 +167,11 @@ export interface UseTextFileResult {
   /** A whole sentence, already worded by Rust, or `null`. */
   error: string | null;
   loading: boolean;
+  /**
+   * Which file these bytes came from — {@link FileOrigin}, carried out of the
+   * loader so a view can rebuild on a new FILE without rebuilding on new BYTES.
+   */
+  loadedFrom: FileOrigin;
 }
 
 /**
@@ -252,6 +306,14 @@ export function useTextBuffer(source: TextFileSource): UseTextFileResult {
     }
   }, [content, persisted, source, vm]);
 
+  // One object per file rather than one per render, so a consumer may put it in
+  // a dependency array without rebuilding on every keystroke — which is exactly
+  // what the views downstream do with it.
+  const loadedFrom = useMemo<FileOrigin>(
+    () => ({ profileOrVaultId: source.profileOrVaultId, relativePath: source.label }),
+    [source.profileOrVaultId, source.label],
+  );
+
   return {
     vm,
     content,
@@ -261,6 +323,7 @@ export function useTextBuffer(source: TextFileSource): UseTextFileResult {
     reload: read,
     error,
     loading,
+    loadedFrom,
   };
 }
 
@@ -286,6 +349,7 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
       };
       return {
         label: subpath,
+        profileOrVaultId: null,
         read: refuse,
         write: refuse,
         unreachable: {
@@ -297,6 +361,7 @@ export function useTextFile({ profileId, subpath }: UseTextFileArgs): UseTextFil
     }
     return {
       label: subpath,
+      profileOrVaultId: profileId,
       read: () => syncReadText(profileId, subpath),
       write: (content) => syncWriteEntry(profileId, subpath, content),
       unreachable: null,

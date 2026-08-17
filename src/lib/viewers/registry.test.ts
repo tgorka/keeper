@@ -32,6 +32,7 @@ function file(name: string, kind: RecordingNoteTargetKind): ViewerFile {
     sizeLabel: "12 kB",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
   };
 }
 
@@ -162,6 +163,14 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       sizeLabel: "4 kB",
       openWith: null,
       writeCaveat: null,
+      // …and one of them sits somewhere keeper refuses to write. The registry
+      // answers from the NAME: a refusal changes what a surface may offer over
+      // the file, never which viewer draws it, and a build that resolved a
+      // fenced file to some read-only row would give the two surfaces two
+      // different opinions about what a `.csv` is.
+      writeRefusal:
+        "60-sessions/active/2026-08-10-keeper/workspace/budget.csv is inside a session's " +
+        "workspace — scratch that is not versioned, not synced, and dies with the session.",
     };
     const fromNote: ViewerFile = {
       name: "budget.csv",
@@ -172,6 +181,7 @@ describe("resolveViewer — two surfaces get the same answer", () => {
       sizeLabel: null,
       openWith: async () => undefined,
       writeCaveat: null,
+      writeRefusal: null,
     };
     expect(resolveViewer(fromFiles)).toBe(resolveViewer(fromNote));
   });

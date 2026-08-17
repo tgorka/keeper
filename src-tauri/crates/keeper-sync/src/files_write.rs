@@ -614,7 +614,18 @@ impl<'a> WriteScope<'a> {
             Some(&"archive") => 3,
             _ => return WorkspacePosition::Outside,
         };
-        if parts.get(at) != Some(&"workspace") {
+        // Folded, because the segment is one an operator can make in Finder and
+        // the volume keeper ships on (APFS by default) answers `Workspace` and
+        // `workspace` with the same directory. A case-sensitive `==` here left
+        // this fence and `keeper_core::sessions::files::check_dir` sharing one
+        // blind spot, so running both predicates bought nothing: the pair only
+        // means something if neither can be defeated by the shift key. The two
+        // lifecycle names above are keeper's own and every reader in the app
+        // spells them one way, so they stay exact.
+        if !parts
+            .get(at)
+            .is_some_and(|part| part.eq_ignore_ascii_case("workspace"))
+        {
             return WorkspacePosition::Outside;
         }
         if parts.len() > at + 1 {
@@ -1278,6 +1289,37 @@ mod tests {
         assert!(!scope.session_workspace_lock("30-work/project/workspace", true));
         assert!(scope
             .session_workspace_lock("60-sessions/archive/2025/2025-03-01-taxes/workspace", true));
+    }
+
+    /// The fence is the DIRECTORY, not one spelling of its name (AD-113).
+    ///
+    /// On APFS's default case-insensitive volume `Workspace/iter.md` is a file
+    /// in the fenced scratch, so a fence that only recognised the lowercase
+    /// spelling let a write land there — and it was the *second* of the two
+    /// predicates `sessions_dir_new` runs, which is why running two bought
+    /// nothing while both were blind. Asserted through all three public
+    /// questions, because they are one parse and a fold applied to one of them
+    /// would be the drift this helper exists to prevent.
+    #[test]
+    fn the_workspace_fence_reads_the_segment_folded() {
+        let scope = WriteScope::new("tgdrive", Some("60-notes")).with_sessions(Some("60-sessions"));
+        for cased in ["Workspace", "WORKSPACE", "WorkSpace"] {
+            let file = format!("60-sessions/active/2026-08-10-keeper/{cased}/iter.md");
+            let dir = format!("60-sessions/active/2026-08-10-keeper/{cased}");
+            assert!(
+                scope.in_session_workspace(&file),
+                "{file} is the fenced scratch on the volume keeper ships on"
+            );
+            assert!(matches!(
+                scope.classify(&file, false),
+                Err(WriteRefusal::SessionWorkspace { .. })
+            ));
+            assert!(scope.session_workspace_lock(&dir, true), "{dir}");
+        }
+        // The neighbour that merely starts with the word is not the container,
+        // at any capitalisation: the fence is a whole segment.
+        assert!(!scope
+            .in_session_workspace("60-sessions/active/2026-08-10-keeper/Workspace-notes/plan.md"));
     }
 
     /// The refusal's sentence speaks the zone's own words — the promote path

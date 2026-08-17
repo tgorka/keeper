@@ -144,6 +144,43 @@ export const SESSION_SPACE_SORT_NOTES: Readonly<Record<string, string>> = {
     "Each file's own position, highest first. Most files have none, so they fall in alphabetically after the ones that do.",
 };
 
+/**
+ * How the section opens, and the three answers it can carry (Story 51.3,
+ * FR-289).
+ *
+ * **A three-option control and not a checkbox**, which is what the ask named.
+ * The fold has a user-global setting under it (`sessions.spaces_folded`), so a
+ * space has three things to say and not two: folded, unfolded, and *nothing —
+ * whatever the setting says*. A two-state checkbox cannot spell the third, and
+ * the first Save of any space would then stamp `folded: false` into it and quietly
+ * take that space out from under the setting forever. An indeterminate checkbox
+ * spells it and is worse: a state a person can leave and cannot get back to with
+ * a pointer. Three named options say all three out loud, in the same `<select>`
+ * shape the sort controls above already use.
+ */
+export const SESSION_SPACE_FOLDED_LABEL = "Opens";
+export const SESSION_SPACE_FOLDED_OPTIONS: readonly { value: string; label: string }[] = [
+  { value: "unset", label: "However the setting says" },
+  { value: "folded", label: "Folded" },
+  { value: "unfolded", label: "Unfolded" },
+];
+export const SESSION_SPACE_FOLDED_NOTE =
+  "Whether this space's rows start hidden. Folding or unfolding it by hand still wins for as long as you keep that answer.";
+
+/**
+ * The row cap, and the sentence that keeps it from being read as a filter
+ * (Story 51.3, FR-290).
+ *
+ * The note says *shows* and never *finds*, because that is the whole distinction
+ * between this key and a note space's `keeper.limit`: the query still selects
+ * everything, the header still counts everything, and the rest is one press
+ * away. A person who read this as "only look at the first 5" would trust a
+ * section that was hiding work from them.
+ */
+export const SESSION_SPACE_ROWS_LABEL = "Rows";
+export const SESSION_SPACE_ROWS_NOTE =
+  "How many rows to show before the rest folds behind a “Show more”. The space still finds every file, and the count beside its name is the whole list. Leave it empty to show all of them.";
+
 /** The editable half of a space's query, once the chips can hold all of it. */
 interface Draft {
   tags: readonly TagChip[];
@@ -211,6 +248,8 @@ export function SessionSpaceEditor({
   const sortKeyId = useId();
   const sortDirId = useId();
   const orderId = useId();
+  const foldedId = useId();
+  const rowsId = useId();
   const iconGroupId = useId();
   const [name, setName] = useState(space?.name ?? "");
   const [icon, setIcon] = useState<string | null>(space?.icon ?? null);
@@ -232,6 +271,16 @@ export function SessionSpaceEditor({
   const [order, setOrder] = useState(() =>
     space === null || space.order === 0 ? "" : String(space.order),
   );
+  // The three answers, held as the `<select>`'s own word rather than as a
+  // `boolean | null`: the control's value has to be a string, and mapping in one
+  // direction only — at Save — keeps "nothing said" from having two spellings in
+  // this file.
+  const [folded, setFolded] = useState(() =>
+    space?.folded === true ? "folded" : space?.folded === false ? "unfolded" : "unset",
+  );
+  // Text for `order`'s reason, one comment up. An empty box is "no cap", which
+  // is what a missing key already means.
+  const [rows, setRows] = useState(() => (space?.rows == null ? "" : String(space.rows)));
   // A create starts with chips and an empty draft; only a stored query has to be
   // decomposed, and only a stored query can turn out to be unrepresentable.
   const [terms, setTerms] = useState<Terms>(
@@ -350,6 +399,17 @@ export function SessionSpaceEditor({
         // An empty or unreadable box is "unpositioned" — the same zero an absent
         // key means — rather than a reason to refuse the whole save.
         order: Number.parseFloat(order.trim()) || 0,
+        // The two keys this story added, and they are sent on EVERY save
+        // including one that changed something else entirely: `render_edit`
+        // replaces the whole `keeper:` map, so a form that omitted them would
+        // delete the operator's answers the first time they renamed a space.
+        folded: folded === "folded" ? true : folded === "unfolded" ? false : null,
+        // A cap has to be a whole number above zero, and anything else writes no
+        // key at all. `parseInt` accepts "5 rows" and "5.9", so the digits are
+        // checked first — and 0 goes the same way as the empty box, because a
+        // section with no rows under a header that still counts them is not a
+        // cap somebody meant.
+        rows: /^\d+$/.test(rows.trim()) ? Number.parseInt(rows.trim(), 10) || null : null,
       });
       onSaved();
     } catch {
@@ -517,6 +577,51 @@ export function SessionSpaceEditor({
               {SESSION_SPACE_SORT_NOTES[`${sortKey} ${sortDir}`]}
             </p>
           )}
+
+          {/* How it opens and how much it shows: one row, because they are the
+              two answers to "what does this space look like when I arrive", and
+              each carries its own line saying what it does. Below the sort rather
+              than beside it — the sort row is already three controls wide at
+              `sm:max-w-lg`, and a fifth would wrap into a column of one. */}
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="flex min-w-40 flex-1 flex-col gap-1.5">
+              <Label htmlFor={foldedId}>{SESSION_SPACE_FOLDED_LABEL}</Label>
+              <select
+                id={foldedId}
+                value={folded}
+                onChange={(event) => setFolded(event.target.value)}
+                className="h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {SESSION_SPACE_FOLDED_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex w-24 flex-col gap-1.5">
+              <Label htmlFor={rowsId}>{SESSION_SPACE_ROWS_LABEL}</Label>
+              <Input
+                id={rowsId}
+                type="number"
+                min="1"
+                step="1"
+                inputMode="numeric"
+                // "All" and not "0": zero is not a cap this form can write, and a
+                // placeholder that showed it would be teaching the one value the
+                // save throws away.
+                placeholder="All"
+                value={rows}
+                onChange={(event) => setRows(event.target.value)}
+              />
+            </div>
+          </div>
+          <p data-slot="folded-note" className="-mt-2 text-muted-foreground text-sm">
+            {SESSION_SPACE_FOLDED_NOTE}
+          </p>
+          <p data-slot="rows-note" className="-mt-2 text-muted-foreground text-sm">
+            {SESSION_SPACE_ROWS_NOTE}
+          </p>
 
           <section aria-label="Terms" className="flex flex-col gap-2">
             <span className="font-medium text-sm">Terms</span>

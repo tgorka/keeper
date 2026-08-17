@@ -502,6 +502,194 @@ development_status:
   48-5-the-header-stops-hiding-everything: review
   48-6-a-remembered-folder-is-re-read-once: review
   epic-48-retrospective: optional
+  # ── EPIC 49, 2026-08-16: the fifth field report, as a four-PR stack ──────────
+  #
+  # Bottom to top, and the order matters because each branch is the next one's
+  # base:
+  #
+  #   #141  feat/49-1-templates-you-can-enter        -> main
+  #   #142  feat/49-2-a-space-you-can-write-into     -> #141
+  #   #143  feat/49-3-spaces-fold-by-default         -> #142
+  #   #144  fix/an-assertion-that-asserted-nothing   -> #143
+  #
+  # The one non-obvious fact: **#141 unblocks the rest**. Nothing above it can
+  # land first, and #144 is not epic-49 work at all — it is two defects the macOS
+  # gate found (a `|| true` assertion that has asserted nothing since epic 47, and
+  # nine `unwrap()`s in 49.1's new shell-crate tests that `-D warnings` refuses).
+  # It sits at the top because that is where the gate ran, not because it depends
+  # on the fold.
+  #
+  # Triage first, and it changed the epic: four read-only scouts checked all eight
+  # claims against the code before the spine was written. Five of the eight were
+  # `unreachable` rather than absent — the capability was built and nothing
+  # rendered it — and ONE was already true: a session space has always held N
+  # notes (`Vec` in the domain, `Vec` on the wire, `files.map` in the UI, a
+  # two-file listing asserted since it shipped). What the owner felt as a cap was
+  # the WRITE path: no space could create into itself, so About/References/Tasks
+  # held exactly what the template wrote, forever. Nothing was built for
+  # multiplicity; the create verb is the fix.
+  #
+  # Every story was reviewed adversarially before its PR. All six passes returned
+  # `incorrect` and the findings were real: a refusal contract that could never
+  # fire (`naming::slug` falls back to `"untitled"`, so `rename(x, "###")` moved a
+  # template into `_template/untitled`), an async mirror with no root stamp
+  # (live Rename buttons addressing the wrong zone), a create offered where its
+  # own result would be invisible, an opener that silently took the file surface
+  # while the vault mirror was still null, and a fold that flashed open before its
+  # cookie was read. 27 findings fixed across the stack, 0 disputed.
+  #
+  # HESPERIA, 2026-08-16 — the gate and the install, both over the stack tip:
+  #
+  #   `bun run check:rust:macos` PASSED — full-workspace `cargo fmt --check`,
+  #   `clippy --workspace --all-targets -D warnings` and `cargo test --workspace`,
+  #   plus the binding-drift check (250 generated files, no drift). It is also
+  #   what found the two defects in #144: the Mac is pinned to an older stable
+  #   (1.96.0) than the dev box (1.97.1), and the older clippy is the one that
+  #   fires `overly_complex_bool_expr`. Green clippy on Linux is not evidence
+  #   about that class of defect.
+  #
+  #   `cargo test -p keeper --lib -- sessions_ipc::tests sessions_exec::tests`
+  #   13 passed — POSITIVE PROOF that the nine new shell-crate tests executed,
+  #   not merely compiled. That distinction is the whole reason this line exists.
+  #
+  #   `bun run install:macos` — signed release build installed to
+  #   /Applications/keeper.app, running as PID 16160. Proven to be THIS build by
+  #   string-probing the Mach-O: `sessions_template_rename`,
+  #   `sessions_template_entries`, `sessions.spaces_folded`,
+  #   `sessions_spaces_folded_get` and both new refusal sentences are all present
+  #   in the installed binary and ABSENT from the retained keeper.app.previous.
+  #   The frontend cannot be probed that way — Tauri embeds it compressed — and a
+  #   version string cannot distinguish two builds of 0.8.8, so the binary
+  #   contrast is the honest evidence.
+  #
+  #   NOT DONE: the on-screen smoke test. `system.menu_bar_presence = 1` on that
+  #   machine, so keeper is tray-resident and reports zero windows; the display
+  #   also kept sleeping and Arc was frontmost, i.e. a person may be at the
+  #   keyboard. Driving their UI to prove a chip renders was not worth the
+  #   intrusion. What is owed is one pass through each spec's "Manual smoke test
+  #   on hesperia" paragraph.
+  epic-49: in-progress
+  49-1-templates-are-a-room-you-can-enter: review
+  49-2-a-space-you-can-write-into: review
+  49-3-spaces-fold-and-the-fold-has-a-default: review
+  epic-49-retrospective: optional
+
+  # ── EPIC 50, 2026-08-16: the owner ran the epic-49 build and reported three ──
+  # things missing. Each was measured on their machine before this epic existed,
+  # and one of them is a verdict on epic 49 itself:
+  #
+  #   1. No create button in a space. Their sessions are FOLDER-shaped; story
+  #      49.2's `shape === "flat"` gate suppresses every one. The gate's reason was
+  #      true (a folder-shaped pool cannot see the session root, where the writer
+  #      writes) and it treated a symptom. The counts they see are 0 because the
+  #      live README carries no frontmatter at all, so no space selects it.
+  #   2. No opening in a notes window. Story 49.2's note arm CANNOT EXECUTE IN ANY
+  #      VALID CONFIGURATION: `notePathForFile` resolves only when the vault
+  #      contains the zone, and `SessionsConfig::validate` refuses that containment
+  #      in either direction with a reason that has teeth (two indexers over one
+  #      tree). The arm, three matrix rows and a race guard were written for a
+  #      state the product forbids. Epic 50 deletes them and corrects 49.2's spec.
+  #      What the owner is actually missing is the editor CHROME — FR-233 has
+  #      promised the format toolbar, slash menu and properties panel since phase
+  #      7 and none of them has ever been on a file target.
+  #   3. No file/folder CRUD inside a template. Absent, no refusal to relax. The
+  #      plan vocabulary has every step but `MoveFile`.
+  #
+  # The lesson worth keeping: 49.2 shipped a branch nobody could reach and six
+  # review layers did not catch it, because every layer read the code and the spec
+  # and neither says what the CONFIG VALIDATOR refuses. A spec's "Block if" clause
+  # that names a configuration must be checked against the validator, not only
+  # against the code that reads it.
+  #
+  # SHIPPED as a four-PR stack on top of epic 49's five, 2026-08-16:
+  #
+  #   #148  feat/50-1-write-where-the-session-keeps-it  -> chore/the-epic-49-ledger
+  #   #149  feat/50-2-a-templates-files-and-folders     -> #148
+  #   #150  feat/50-3-one-editor-host                   -> #149
+  #   #151  feat/50-4-a-files-own-properties            -> #150
+  #
+  # Two review layers again returned `incorrect` on all three of the first
+  # stories, and the findings were worth the pass:
+  #
+  #   P1  50.2's `New folder` created a folder the room could never render — the
+  #       listing emitted files only and the tree invented folders from the
+  #       ancestors of FILE paths, so an empty directory had no row and therefore
+  #       no rename, no delete and no prefill. That is this story's own complaint
+  #       reproduced for the folder half, and the test that missed it asserted
+  #       the wire call and that no panel opened, never that a row appeared.
+  #   50.1 shipped a DATA defect in its first cut: the shape-aware destination
+  #       made the seeded reference title `refs/references`, which is also the
+  #       row label the References space shows.
+  #   50.3's central claim was false — the toolbar was gated on a render-time
+  #       boolean while the mount resolves six dynamic imports later, so every
+  #       press in that window was silently discarded; and the guard its own doc
+  #       said kept the writing tools off a `workspace/` markdown file did not
+  #       exist at all.
+  #
+  # 25 findings fixed across the four stories, 0 disputed. The recurring shape,
+  # now three epics deep: a claim in a comment or a spec that no test owns. Every
+  # one of these was a sentence that was true when it was written and false by
+  # the time it shipped.
+  epic-50: in-progress
+  50-1-a-space-you-can-write-into-wherever-the-session-keeps-it: review
+  50-2-a-templates-files-and-folders: review
+  50-3-one-editor-host-one-set-of-writing-tools: review
+  50-4-a-files-own-properties: review
+  epic-50-retrospective: optional
+
+  # ── EPIC 51, 2026-08-16: fourteen items, and four of them were not what they ──
+  # looked like. Five read-only scouts checked every one against the code before
+  # the spine existed, which changed the epic twice over:
+  #
+  #   ALREADY SHIPPED, UNREACHABLE (2). Tasks drag-and-drop has worked since the
+  #     board was written — the BOARD renders only for a flat session, and his are
+  #     folder-shaped, so he had never seen it. And the "spaces directory" he asked
+  #     for exists at zone level (`_spaces/`, AD-121); what he could not do was put
+  #     markdown in a subdirectory and have anything read it.
+  #   ONE CAPABILITY BEHIND THREE ITEMS. `read_ref_sources` read one level, files
+  #     only. That single fact hid `spaces/`, `log/` AND his root `references.md`.
+  #   PUSHED BACK, NOT BUILT (1). Renaming the flat record `about.md` → `README.md`
+  #     is UNSAFE as asked: `shape()` keys on the presence of `about.md`, so adding
+  #     `README.md` to that predicate flips every folder-shaped session to Flat in
+  #     one rescan — his live, unmigrated data. The safe form deletes a documented
+  #     fallback, promotes `AGENTS.md` to mandatory and needs `migrate` rewritten,
+  #     and it reverses his own earlier instruction ("the navigation file is
+  #     AGENTS.md, and a README beside it would be a second answer"). Two options
+  #     are written into the epic; neither was taken unilaterally.
+  #   DELIBERATE, KEPT (2). A second `about` record would give `shape()` two
+  #     answers, so About still offers no create — it now SAYS so, in Rust's words,
+  #     and offers *Open the record* instead. And `kind_dir(Flat) → root` stays, so
+  #     a `log/` works if the operator makes one and keeper does not file there.
+  #
+  # Shipped as a five-PR stack on top of epic 50's five and epic 49's five:
+  #
+  #   #153  feat/51-1-markdown-found-wherever-it-sits   -> chore/the-epic-50-ledger
+  #   #154  feat/51-2-a-folder-you-can-make             -> #153
+  #   #155  feat/51-5-note-mode                         -> #154
+  #   #156  feat/51-wave-b-spaces-templates-rename-board -> #155  (51.3/51.4/51.6/51.7)
+  #   #157  fix/what-epic-51s-review-found              -> #156
+  #
+  # Two review layers over wave A both returned `incorrect` with four P1s, and the
+  # sharpest one is worth keeping: the wave's own thesis was "one walk, so the row
+  # and the pool cannot disagree" — and `pool::group` was never re-keyed, so the
+  # board row and the detail's Log named different newest sittings. A test hid it
+  # by sorting before asserting. Third epic running, the same shape: a claim in a
+  # comment that no test owns.
+  #
+  # Two finds worth recording beyond their stories: `notesRename` (FR-97) has been
+  # shipped with ZERO call sites since epic 39 — story 51.6 is its first — and the
+  # workspace fence (AD-113) was case-blind in BOTH predicates, so `Workspace/x`
+  # was writable scratch on every Mac keeper ships to.
+  epic-51: in-progress
+  51-1-markdown-is-found-wherever-it-sits: review
+  51-2-a-folder-you-can-make: review
+  51-3-a-space-that-says-how-it-opens: review
+  51-4-a-template-that-defines-spaces: review
+  51-5-note-mode: review
+  51-6-a-row-you-can-right-click: review
+  51-7-about-explains-itself: review
+  51-8-the-record-is-called-readme: blocked
+  epic-51-retrospective: optional
 
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in

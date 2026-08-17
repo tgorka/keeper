@@ -41,7 +41,7 @@ use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming::slug;
 use crate::sessions::model::{log_entries, README};
 use crate::sessions::plan::{Plan, PlanStep};
-use crate::sessions::shape::{shape, KindTag, Shape, ABOUT, AGENTS};
+use crate::sessions::shape::{kind_dir, shape, KindTag, Shape, ABOUT, AGENTS, KINDS};
 
 /// One markdown file the migration carries into the pool, as the shell read it.
 ///
@@ -226,7 +226,17 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
     });
 
     // 6. Irreversible, and therefore last.
-    for dir in ["refs", "prompts"] {
+    //
+    //    The directories are asked of [`kind_dir`] rather than listed here, for
+    //    [`carried_kind`]'s reason and to keep its claim true: a fourth
+    //    directory added to the folder contract is read back into the pool for
+    //    free, and this is the step that would otherwise leave it on disk —
+    //    a half-migrated session whose stale kind directory `shape()` cannot
+    //    see, because it keys on `AGENTS.md` and not on what is left behind.
+    for dir in KINDS
+        .into_iter()
+        .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+    {
         if input.top_level.iter().any(|entry| entry == dir) {
             steps.push(PlanStep::TrashDir {
                 path: at(dir),
@@ -274,14 +284,35 @@ fn unique(name: &str, taken: &mut Vec<String>) -> String {
 }
 
 /// Which kind a carried file gains, from the directory it is leaving.
+///
+/// **The inverse of [`kind_dir`], and derived from it rather than written
+/// beside it.** That function is the authoritative direction — where a create
+/// of a given kind goes under a given shape — and this asks it once per kind
+/// instead of restating `refs/ → Ref`. A fourth directory added there therefore
+/// arrives here for free, which is the whole reason the two are not two
+/// tables: a mapping that exists twice is a mapping that will disagree with
+/// itself the first time one half is extended.
+///
+/// [`Shape::Folder`] because that is the shape being migrated *away from*; a
+/// flat session keeps everything at the root and has no directory to read a
+/// kind out of.
+///
+/// [`KINDS`] order decides a tie, as it does in [`KindTag::of`] — though no two
+/// directories in the folder contract nest, so no tie is reachable today.
 fn carried_kind(rel: &str) -> Option<KindTag> {
-    if rel.starts_with("refs/") {
-        Some(KindTag::Ref)
-    } else if rel.starts_with("prompts/") {
-        Some(KindTag::Prompt)
-    } else {
-        None
-    }
+    KINDS
+        .into_iter()
+        .find(|kind| match kind_dir(Shape::Folder, *kind) {
+            // `strip_prefix` plus the separator rather than
+            // `starts_with("refs/")`: no allocation, and `refsy/x.md` is a
+            // different folder that a bare `starts_with(dir)` would match.
+            Ok(Some(dir)) => rel
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/')),
+            // A kind with no directory under this contract cannot be carried
+            // out of one, and the root is not a directory a file is "leaving".
+            Ok(None) | Err(_) => false,
+        })
 }
 
 /// A body with its `## Log` section cut out, and nothing else touched.
@@ -681,11 +712,10 @@ Release drafted; DMG attached.\n\n\
             "the prose is byte-identical"
         );
 
-        let scope = files
+        let (scope_path, scope) = files
             .iter()
             .find(|(path, _)| path.ends_with("/01-scope.md"))
-            .expect("prompts hoist too")
-            .1;
+            .expect("prompts hoist too");
         let (fm, body_at) = Frontmatter::parse(scope);
         assert_eq!(fm.as_list("tags"), Some(vec!["prompt".to_owned()]));
         assert_eq!(
@@ -693,9 +723,15 @@ Release drafted; DMG attached.\n\n\
             "# Scope\n\nYou are a…\n",
             "a file with no frontmatter gains a block and keeps its body"
         );
+        // The claim this used to make was `scope.contains("01-scope.md") || true`
+        // — a tautology over the file's CONTENT, where the author meant its
+        // PATH. It asserted nothing, and the older clippy on the macOS gate is
+        // what found it. The real claim is about the hoisted name: the numbered
+        // stem survives, because it is what the prompts space sorts by, and the
+        // folder does not, because the flat contract has no `prompts/`.
         assert!(
-            scope.contains("01-scope.md") || true,
-            "the numbered stem is what the prompts space sorts by"
+            !scope_path.contains("/prompts/"),
+            "a hoisted prompt leaves the folder behind"
         );
         assert!(
             files.iter().any(|(path, _)| path.ends_with("/01-scope.md")),
@@ -777,6 +813,52 @@ Release drafted; DMG attached.\n\n\
                 .iter()
                 .any(|step| matches!(step, PlanStep::TrashDir { .. })),
             "nothing to remove is not an error"
+        );
+    }
+
+    /// The migration empties **every** directory the folder contract keeps,
+    /// because it asks [`kind_dir`] for the list rather than holding one.
+    ///
+    /// This is the other half of [`carried_kind`]'s claim that a fourth
+    /// directory "arrives here for free": reading a kind back out of it is
+    /// worthless if the directory is then left on disk by the verb whose job
+    /// was to empty it. Written as a set comparison against the mapping itself
+    /// rather than against `["refs", "prompts"]`, so a fourth directory turns
+    /// this green instead of turning it into the second table to update.
+    #[test]
+    fn the_migration_trashes_exactly_the_directories_the_mapping_names() {
+        let dirs: Vec<&str> = KINDS
+            .into_iter()
+            .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+            .collect();
+        assert!(!dirs.is_empty(), "the folder contract keeps directories");
+
+        let mut top_level = vec!["README.md", "artifacts", "workspace"];
+        top_level.extend(dirs.iter().copied());
+        let plan = compile_migrate(&input("# s\n", &top_level, &[])).expect("plan");
+
+        let mut trashed: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::TrashDir { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        trashed.sort_unstable();
+        let mut expected: Vec<String> = dirs
+            .iter()
+            .map(|dir| format!("active/2026-08-10-keeper/{dir}"))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(trashed, expected);
+        // `artifacts/` and `workspace/` are not kind directories and the flat
+        // contract keeps both (AD-119), so neither is ever a trash step.
+        assert!(
+            !trashed
+                .iter()
+                .any(|path| path.ends_with("artifacts") || path.ends_with("workspace")),
+            "the two non-markdown subtrees survive migration: {trashed:?}"
         );
     }
 
@@ -981,5 +1063,38 @@ Release drafted; DMG attached.\n\n\
             without_log_section("# s\n\n## Summary\n"),
             "# s\n\n## Summary\n"
         );
+    }
+
+    /// The two directions are one mapping (Story 50.1).
+    ///
+    /// `kind_dir` says where a create of a kind goes; this says which kind a
+    /// file gains from the directory it is leaving. They are derived from one
+    /// another, and this is the test that would fail if someone re-introduced
+    /// the second table: every directory the forward mapping hands out round
+    /// trips, and a folder that merely *starts with* one of those names does
+    /// not.
+    #[test]
+    fn carrying_a_file_out_of_a_directory_inverts_the_create_mapping() {
+        for kind in KINDS {
+            let Ok(Some(dir)) = kind_dir(Shape::Folder, kind) else {
+                continue;
+            };
+            assert_eq!(
+                carried_kind(&format!("{dir}/inputs.md")),
+                Some(kind),
+                "{dir} is where a {} create goes, so a file there is one",
+                kind.as_str()
+            );
+        }
+        // A prefix is not a directory: `refsy/` and a root-level file are both
+        // outside the contract, and a `starts_with` that forgot the separator
+        // would file the first as a reference.
+        assert_eq!(carried_kind("refsy/inputs.md"), None);
+        assert_eq!(carried_kind("references.md"), None);
+        assert_eq!(carried_kind("artifacts/out.md"), None);
+        // The kinds the folder contract has no directory for cannot be carried
+        // out of one either — there is nowhere they could have been.
+        assert_eq!(carried_kind("tasks/a.md"), None);
+        assert_eq!(carried_kind("logs/a.md"), None);
     }
 }

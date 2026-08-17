@@ -14,6 +14,18 @@ import type { SessionRowVm } from "@/lib/ipc/client";
 /** Which lifecycle slice the board shows (FR-229's `is:` set, chip form). */
 export type SessionsStatusFilter = "all" | "active" | "archived";
 
+/**
+ * Which room of the board is open: the session rows, or the zone's templates
+ * (FR-269).
+ *
+ * A mode rather than a fourth {@link SessionsStatusFilter} value, even though
+ * the chip that drives it reads as a peer of All/Active/Archived — filter
+ * values are matched against `row.status` in {@link filterRows}, and a template
+ * has no status. It is a different kind of thing shown on the same board, not
+ * another slice of the same list.
+ */
+export type SessionsBoardMode = "sessions" | "templates";
+
 /** How long an active session may sit untouched before `stale` (FR-229). */
 export const SESSIONS_STALE_DAYS = 14;
 
@@ -25,6 +37,12 @@ export interface SessionsListState {
   /** Free-text filter over title, path, tags, snippet and log line. */
   text: string;
   status: SessionsStatusFilter;
+  /**
+   * Which room the board shows. Kept beside `status` rather than inside it for
+   * the reason {@link SessionsBoardMode} states; the status the operator last
+   * chose survives a trip through Templates and back.
+   */
+  mode: SessionsBoardMode;
   /** Show only pinned sessions. */
   pinnedOnly: boolean;
   /** Show only unread sessions. */
@@ -51,6 +69,7 @@ export interface SessionsListState {
   setPinnedOnly: (pinnedOnly: boolean) => void;
   setUnreadOnly: (unreadOnly: boolean) => void;
   setError: (error: string | null) => void;
+  setMode: (mode: SessionsBoardMode) => void;
   requestCreateOpen: (patternId?: string) => void;
 }
 
@@ -59,6 +78,7 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   rowsRootId: null,
   text: "",
   status: "all",
+  mode: "sessions",
   pinnedOnly: false,
   unreadOnly: false,
   error: null,
@@ -71,6 +91,7 @@ export const sessionsListStore = createStore<SessionsListState>()((set) => ({
   setPinnedOnly: (pinnedOnly) => set({ pinnedOnly }),
   setUnreadOnly: (unreadOnly) => set({ unreadOnly }),
   setError: (error) => set({ error }),
+  setMode: (mode) => set({ mode }),
   requestCreateOpen: (patternId) =>
     set((state) => ({
       createNonce: state.createNonce + 1,
@@ -136,6 +157,7 @@ export function resetSessionsListStoreForTest(): void {
     rowsRootId: null,
     text: "",
     status: "all",
+    mode: "sessions",
     pinnedOnly: false,
     unreadOnly: false,
     error: null,

@@ -63,6 +63,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "2.4 MB",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -122,6 +123,34 @@ describe("the document viewer's binding", () => {
       expect(entry.writable, `${name} must be read-only`).toBe(false);
       expect(Component.name, name).toBe("DocumentViewer");
     }
+  });
+
+  it("says nothing about a write refusal it does not own", async () => {
+    // Two verdicts now travel on a `ViewerFile`, and a document has both: the
+    // FORMAT refuses (`entry.writable` is false above, for all four), and a
+    // document inside a session's `workspace/` carries the LOCATION's refusal
+    // as well. This viewer offers no editor, so neither is its business — it
+    // must draw the document and leave the sentences to the surface that
+    // actually offers a write.
+    geometry = withListGeometry({ viewport: VIEWPORT_PX, row: ROW_PX });
+    syncReadDocument.mockResolvedValue(
+      vm({
+        format: "docx",
+        words: { blocks: [block("hello")], blockCount: 1, truncated: false },
+      }),
+    );
+    const { container } = mount(
+      target({
+        name: "report.docx",
+        relativePath: "60-sessions/active/2026-08-10-keeper/workspace/report.docx",
+        writeRefusal:
+          "60-sessions/active/2026-08-10-keeper/workspace/report.docx is inside a session's " +
+          "workspace — keeper reads it but never writes there.",
+      }),
+    );
+
+    expect(await screen.findByText("hello")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("never writes there");
   });
 
   it("leaves a document format keeper does not implement on the unknown viewer", async () => {

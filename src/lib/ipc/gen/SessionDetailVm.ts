@@ -66,7 +66,22 @@ shape: string,
  */
 unfiled: Array<string>, 
 /**
- * The work items, ready for the board. Empty under the folder contract,
- * which has no such thing.
+ * The work items, ready for the board — under **either** contract.
+ *
+ * The folder shape used to have none, because the detail read the pool only
+ * for a flat session. Story 51.1 put a folder-shaped session's root markdown
+ * into the pool (FR-286), so a `task`-tagged file there is a card now, and
+ * this reader was the last place still answering as though it were not.
+ *
+ * **This list is also the board's gate** (Story 51.7, FR-299). The surface
+ * used to render the board for the flat shape only, because a folder-shaped
+ * session had no pool to tag and its board would have been four empty
+ * columns saying nothing true. It has a pool now, and the honest gate was
+ * never the shape: it is whether there is anything tagged, which is exactly
+ * what this carries. A separate "does it have a pool" flag beside it would
+ * be a second predicate to keep in step with the first, and it could only
+ * ever disagree by being wrong — an empty pool selects no tasks either way,
+ * and the board answers an empty list with the sentence that says what a
+ * task is rather than with columns.
  */
 tasks: Array<SessionTaskVm>, };

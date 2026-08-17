@@ -10380,6 +10380,57 @@ pub fn menu_bar_presence_set(enabled: bool) -> Result<(), IpcError> {
     )))
 }
 
+/// Read the default fold state of a session's spaces (Story 49.3, FR-276). Reads the
+/// persisted `sessions.spaces_folded` setting (default off — spaces arrive unfolded).
+/// The DEFAULT only: a space somebody folded by hand is remembered in the frontend's
+/// `keeper_session_spaces_fold` cookie and never travels through here. Errors funnel
+/// through [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_spaces_folded_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .sessions_spaces_folded_get(&state.platform)
+        .map_err(to_ipc_error)
+}
+
+/// Mobile stub for [`sessions_spaces_folded_get`]: the Sessions surface is desktop-only
+/// (`sessions_ipc`'s twins all refuse there), so no space is ever rendered on iOS and
+/// `false` — nothing arrives folded — is the honest answer, whatever a desktop wrote.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces_folded_get() -> Result<bool, IpcError> {
+    Ok(false)
+}
+
+/// Set the default fold state of a session's spaces (Story 49.3, FR-276). Persists into
+/// the `settings` k/v table under `sessions.spaces_folded`. Nothing else moves: spaces
+/// the person folded or unfolded by hand keep their recorded answer, and only the ones
+/// with nothing recorded follow the new value. Errors funnel through [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_spaces_folded_set(
+    state: State<'_, AppState>,
+    folded: bool,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .sessions_spaces_folded_set(&state.platform, folded)
+        .map_err(to_ipc_error)
+}
+
+/// Mobile stub for [`sessions_spaces_folded_set`]: an honest `Unsupported`
+/// (`retriable: false`) with nothing persisted — the default for a desktop-only surface
+/// must not be changed from a phone that cannot show it.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces_folded_set(folded: bool) -> Result<(), IpcError> {
+    let _ = folded;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "a session's spaces are a desktop-only surface".to_owned(),
+    )))
+}
+
 /// Read the per-Chat notification mode for `(accountId, roomId)` (Story 10.2). Resolves
 /// the account's live `Client` and reads the synced Matrix push-rule mode. A room-not-
 /// found / inactive account funnels through [`to_ipc_error`] to `TimelineUnavailable`.

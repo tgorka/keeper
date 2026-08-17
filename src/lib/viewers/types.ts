@@ -285,6 +285,36 @@ export interface ViewerFile extends ViewerSubject {
    * a note embed, a file outside every profile.
    */
   readonly writeCaveat: string | null;
+  /**
+   * Why keeper will not write this file's LOCATION, or `null` when it will
+   * (Story 45.3's `FilesWriteVm.writable`/`reason`, threaded here by Story
+   * 50.3's fix).
+   *
+   * The sibling of {@link ViewerFile.writeCaveat} and read the same way: a
+   * whole sentence composed by `keeper_sync::files_write::WriteRefusal`,
+   * rendered verbatim, never paraphrased and never re-derived. The two are
+   * mutually exclusive by construction — a location keeper refuses has no
+   * caveat, because a caveat is what it says about a file it WILL write.
+   *
+   * {@link ViewerEntry.writable} is the other half of 45.2's two questions and
+   * this is not a duplicate of it: that one is the FORMAT's verdict, the same
+   * for every `.md` in the world, and this one is the LOCATION's. A session's
+   * `workspace/` file (AD-113) is markdown of a perfectly writable format
+   * sitting somewhere every write refuses, and it is the case that proves the
+   * two cannot be folded into one.
+   *
+   * Carried on the file rather than discovered from a refused save, because a
+   * surface has to decide what to OFFER before the first keystroke: the Save
+   * button, the format toolbar and the slash menu are all controls that would
+   * otherwise announce their own refusal. Rust has already answered — the
+   * verdict rides on the listing row — so passing it on is not the frontend
+   * deciding which locations are writable (AD-65); composing a sentence here,
+   * or testing for a `workspace` segment here, would be.
+   *
+   * `null` for every surface with no such verdict to carry — a recording, a
+   * note embed, a file outside every profile.
+   */
+  readonly writeRefusal: string | null;
 }
 
 /**

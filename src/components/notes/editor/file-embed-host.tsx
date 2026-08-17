@@ -74,6 +74,14 @@ export function NoteFileEmbed({ vaultId, target }: NoteFileEmbedProps): React.Re
   const source = useMemo<TextFileSource>(
     () => ({
       label: target,
+      // The vault, because that is what a note CAN prove: this host has no sync
+      // profile and deriving one would be the path arithmetic AD-65 forbids
+      // (the same asymmetry `csv` and `properties` document below). With
+      // `label` it is what tells the panel's views a new FILE from new BYTES —
+      // the bracket text and not `resolved.relPath`, because it is the prop
+      // that identifies this embed before Rust has answered, and the frame
+      // renders "opening …" rather than a view until it has.
+      profileOrVaultId: vaultId,
       read: async (): Promise<TextFileVm> => {
         // A rejection propagates and the loader words it, which is what puts
         // Rust's "keeper looked for …" sentence where the embed is. The last
@@ -154,6 +162,12 @@ export function NoteFileEmbed({ vaultId, target }: NoteFileEmbedProps): React.Re
       entry={entry}
       state={state}
       csv={csv}
+      // Story 50.4: a note embed is addressed by a vault id and a vault-relative
+      // target, not by a sync profile — the same asymmetry `csv` documents from
+      // the other direction. Deriving one from the other here would be the
+      // frontend deciding which folders are profiles (AD-65), so this host
+      // offers no properties panel and says so rather than guessing.
+      properties={null}
       preview={preview}
       csvOptions={csvOptions}
     />

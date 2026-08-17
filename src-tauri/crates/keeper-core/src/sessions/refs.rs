@@ -302,7 +302,9 @@ fn quoted_paths(body: &str, code: &[(usize, usize)]) -> Vec<(usize, RawRef)> {
 /// `found` is `(source, raw)` in the order the shell read them — the README
 /// first, then `refs/`. `prefix` is the session's own profile-relative folder,
 /// which is what makes `artifacts/report.md` in a session README mean the file
-/// beside it rather than one at the drive root.
+/// beside it rather than one at the drive root — and `source` is the file the
+/// pointer was written in, which is what makes one written inside
+/// `spaces/plan.md` mean the file beside *that* file (see [`candidates`]).
 ///
 /// **Missing rows sort first**, and the rest keep document order. The widget's
 /// whole reason to exist is the pointer that broke while nobody was looking, so
@@ -383,7 +385,13 @@ fn resolve(source: &str, raw: &RawRef, prefix: &str, probe: &dyn RefProbe) -> Op
         }
     }
 
-    let looked = candidates(&raw.target, prefix);
+    // Resolved against the file the pointer was written in, first. A `notes.md`
+    // inside `spaces/plan.md` means `spaces/notes.md` to every markdown reader
+    // there is, and markdown is read wherever it sits (FR-285), so a source at
+    // depth is ordinary rather than exotic. A root-level source has no
+    // directory of its own and asks exactly what it always asked.
+    let source_dir = source.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let looked = candidates(&raw.target, prefix, source_dir);
     if let Some(hit) = looked.iter().find(|subpath| probe.exists(subpath)) {
         if let Some(session) = probe.session(hit) {
             return Some(row(
@@ -428,22 +436,42 @@ fn pick_label(title: &str, raw: &RawRef) -> String {
 
 /// Where a target could be, profile-relative, in the order keeper looks.
 ///
-/// Session-relative first: a link written inside a session almost always means
-/// the file beside it, and resolving `README.md` to the *zone's* README would
-/// be both wrong and confusing. Then the target as written, which is the
-/// repo-root-relative spelling the drives' own AGENTS.md asks for.
+/// **Beside the file it was written in, first.** `source_dir` is that file's own
+/// directory, session-relative and empty at the session root. A pointer is
+/// written where the author was writing, and a relative path in markdown means
+/// the file beside the one holding it — so `notes.md` in `spaces/plan.md` is
+/// `spaces/notes.md` and not a same-named file at the session root, which is
+/// the wrong file rather than merely a miss.
+///
+/// Then session-relative: the spelling `super::add_ref::link_path` writes, and
+/// the one every pointer written before markdown could sit in a subdirectory
+/// carries. Then the target as written, which is the repo-root-relative
+/// spelling the drives' own AGENTS.md asks for. Every probe keeper makes ends
+/// up in [`missing_notice`], so a miss names each place rather than only the
+/// first.
 ///
 /// [`crate::notes::embed::candidates`]' shape rather than its function: that one folds in the
 /// vault's `attachments/` folder, which a session does not have.
-fn candidates(target: &str, prefix: &str) -> Vec<String> {
+fn candidates(target: &str, prefix: &str, source_dir: &str) -> Vec<String> {
     let clean = target.trim_start_matches("./");
-    let mut out = Vec::new();
+    let beside = match (prefix.is_empty(), source_dir.is_empty()) {
+        (_, true) => prefix.to_owned(),
+        (true, false) => source_dir.to_owned(),
+        (false, false) => format!("{prefix}/{source_dir}"),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |path: String| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    if !beside.is_empty() {
+        push(format!("{beside}/{clean}"));
+    }
     if !prefix.is_empty() {
-        out.push(format!("{prefix}/{clean}"));
+        push(format!("{prefix}/{clean}"));
     }
-    if !out.iter().any(|existing| existing == clean) {
-        out.push(clean.to_owned());
-    }
+    push(clean.to_owned());
     out
 }
 
@@ -456,6 +484,322 @@ pub fn missing_notice(target: &str, looked: &[String]) -> String {
         "{target}: this session points at something the drive does not have — \
          keeper looked for {paths}"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Following a rename (Story 51.6, FR-295, FR-296)
+// ---------------------------------------------------------------------------
+
+/// The bytes `body` — the session file at `source` — should have once the session
+/// file at `from` is at `to`, or `None` when nothing in it named that file.
+///
+/// This is the *other* half of the module's job. Everything above reports the
+/// pointer that broke while nobody was looking; this stops one class of them
+/// breaking in the first place, on the one occasion keeper itself is the thing
+/// doing the moving. `docs/sessions.md` refused to rename a session file because
+/// *"a rename is a link-rewriting problem, not a file-system one, and half of it
+/// would be worse than none"* — this function is that half, so the refusal can
+/// be relaxed rather than restated.
+///
+/// **What is rewritten, and what is not.**
+///
+/// - Every link [`scan`] would find and [`plan`] would resolve to the file: a
+///   markdown destination naming it, a `[[wikilink]]` naming its stem, and either
+///   of those written relative to `source`'s own directory. Those are the three
+///   spellings that resolve to a session file, so those are the three that are
+///   rewritten — see [`names`], which is handed `source` for exactly that reason.
+/// - The `## Promote` table's cells, where a row names it. That table is a list
+///   of paths in the record rather than a set of links, so no link parser can see
+///   it; an unreadable row is carried through untouched, which is
+///   [`super::promote`]'s own contract.
+/// - **Not a backticked path.** The module's first asymmetry says a quoted path
+///   is an author typing, not an author linking, and the widget silently drops
+///   one that stops resolving. So a rename costs such a path a row in a widget
+///   and nothing else, where rewriting it would edit the `cat …` in somebody's
+///   pasted shell transcript into a command that was never run.
+/// - **Not a link inside a fenced block or a code span.** [`links::extract`]
+///   skips those already: a wikilink in a code fence is documentation about
+///   wikilinks.
+/// - **Not a name keeper cannot spell back.** A percent-encoded destination whose
+///   text does not end in the old name is left exactly as the author wrote it,
+///   and the widget reports it missing. Guessing an encoding to write back would
+///   be keeper rewriting a link on a hunch, and a missing row is the honest
+///   answer that costs nobody bytes.
+///
+/// What is not *here* at all is out of scope by location rather than by choice:
+/// `workspace/` and `artifacts/` are never read into a session's pool
+/// (`sessions_root::UNSCANNED_DIRS`) and are refused a second time by
+/// [`super::files::check_rewritable`], and everything keyed on a session — pins,
+/// unread, lineage, the recordings lens, the `.keeper/` cache — names sessions
+/// and not files, so a file's rename cannot reach it.
+///
+/// Byte-exact outside the spans it replaces (NFR-39), and `None` rather than an
+/// unchanged copy so the caller leaves an untouched file out of the plan instead
+/// of writing back bytes it already has.
+#[must_use]
+pub fn rewrite_pointers(body: &str, source: &str, from: &str, to: &str) -> Option<String> {
+    if from == to {
+        return None;
+    }
+    // Derived here rather than taken as a directory, so a caller cannot hand
+    // this the wrong frame: `source` is the pool's own `rel` for `body`, which
+    // is what every caller already has in its hand.
+    let source_dir = source.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+
+    for link in links::extract(body) {
+        if !names(&link.target, from, source_dir) {
+            continue;
+        }
+        let Some((start, end)) = target_span(body, link.span) else {
+            continue;
+        };
+        let Some(written) = body.get(start..end) else {
+            continue;
+        };
+        let Some(renamed) = renamed_target(written, from, to) else {
+            continue;
+        };
+        edits.push((start, end, renamed));
+    }
+    promote_edits(body, from, to, &mut edits);
+
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|(start, _, _)| *start);
+
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0usize;
+    for (start, end, text) in edits {
+        // A link inside a promote row would be replaced twice; the outer edit
+        // already carries the inner one's rewrite, so the first span wins.
+        if start < at {
+            continue;
+        }
+        out.push_str(body.get(at..start)?);
+        out.push_str(&text);
+        at = end;
+    }
+    out.push_str(body.get(at..)?);
+    Some(out)
+}
+
+/// Whether a pointer's target text, written in a file whose own directory is
+/// `source_dir`, names the session file at `rel`.
+///
+/// **The rewrite's match is the resolver's match**, and that is the invariant
+/// that makes the whole thing honest: [`resolve`] answers a session file by
+/// probing the target beside the file it was written in and then beside the
+/// session ([`candidates`]' first two entries), and a wikilink names the same
+/// file by its stem because that is how a vault writes one. Every spelling that
+/// resolves is rewritten. A form nobody thought of is not a link that silently
+/// rots — it is a row the widget already reports as missing, which is the failure
+/// this module was built to make visible.
+///
+/// `source_dir` is asked **as well as**, never instead of, the session-relative
+/// question: a pointer written repo-root-relative or session-relative inside a
+/// filed file is the spelling `super::add_ref::link_path` writes and the one
+/// every pointer written before markdown could sit in a subdirectory carries, so
+/// dropping it would break the common case to fix the new one.
+///
+/// Case-folded for [`dedupe_key`]'s reason: a link is typed by hand, and
+/// `Notes/X.md` is not a second file on a volume that folds case.
+fn names(target: &str, rel: &str, source_dir: &str) -> bool {
+    let clean = target.trim().trim_start_matches("./");
+    if clean.eq_ignore_ascii_case(rel) || clean.eq_ignore_ascii_case(md_stem(rel)) {
+        return true;
+    }
+    if source_dir.is_empty() {
+        return false;
+    }
+    // The frame `candidates` probes first, asked in the other direction.
+    let beside = format!("{source_dir}/{clean}");
+    beside.eq_ignore_ascii_case(rel) || beside.eq_ignore_ascii_case(md_stem(rel))
+}
+
+/// A path with its `.md` dropped — how a wikilink names a markdown file, and the
+/// one extension a wikilink omits. A `.csv` is named in full or not at all.
+fn md_stem(rel: &str) -> &str {
+    rel.strip_suffix(".md").unwrap_or(rel)
+}
+
+/// The target text with the old name at its end swapped for the new one, or
+/// `None` when the text as written does not end in the old name.
+///
+/// A **suffix** substitution rather than a rebuild of the link, and that is what
+/// keeps every other byte the author's: the directory in front of the name, an
+/// `./`, an alias, an anchor, a `(path "Title")`, the angle brackets `keeper`'s
+/// own writer uses for a destination with a space — all of them survive because
+/// none of them is touched. Rebuilding `[text](dest)` from its parts would have
+/// to re-invent each of those decisions, and would get one of them wrong on
+/// somebody's file.
+///
+/// [`super::files::rename_target`] changes only the last segment's stem, so the
+/// name is always the tail of whatever spelling resolved — which is why the
+/// basename pairs are tried after the full ones: a pointer written beside its own
+/// file (`notes.md` for a `spaces/notes.md`) ends in the name and nothing more,
+/// and the directory it does not spell is a directory the rename does not change.
+fn renamed_target(written: &str, from: &str, to: &str) -> Option<String> {
+    // `continue`, never `?`: the wikilink spelling is SHORTER than the path one,
+    // so a `?` on the first pair's arithmetic would return before the second pair
+    // was ever tried — and the second pair is the one that rewrites `[[stem]]`.
+    for (old, new) in [
+        (from, to),
+        (md_stem(from), md_stem(to)),
+        (base_of(from), base_of(to)),
+        (md_stem(base_of(from)), md_stem(base_of(to))),
+    ] {
+        let Some(head) = written.len().checked_sub(old.len()) else {
+            continue;
+        };
+        let (Some(prefix), Some(tail)) = (written.get(..head), written.get(head..)) else {
+            continue;
+        };
+        if tail.eq_ignore_ascii_case(old) {
+            let mut out = String::with_capacity(head + new.len());
+            out.push_str(prefix);
+            out.push_str(new);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The last segment of a session-relative path — what a rename changes, and all
+/// a pointer written beside its own file spells.
+fn base_of(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// The byte span of one link's target **as written**, inside the span
+/// [`links::extract`] handed back for it.
+///
+/// Arithmetic over a span the one link parser already produced, and deliberately
+/// not a second parser: [`links`]'s own header says two readers of `[[…]]` is the
+/// drift this codebase keeps a single extractor to avoid. So the shapes are
+/// discriminated exactly as `links::extract` discriminates them — an optional
+/// leading `!`, then `[[` or not — and the delimiters inside the slice are walked
+/// in the order `links::markdown_link` walks them, because the span this returns
+/// has to be the text that parser turned into `RawLink::target`.
+fn target_span(body: &str, span: (usize, usize)) -> Option<(usize, usize)> {
+    let raw = body.get(span.0..span.1)?;
+    let lead = usize::from(raw.starts_with('!'));
+    let inner = raw.get(lead..)?;
+    let (start, end) = if inner.starts_with("[[") {
+        wikilink_target(inner)?
+    } else {
+        markdown_dest(inner)?
+    };
+    Some((span.0 + lead + start, span.0 + lead + end))
+}
+
+/// `[[target]]`, `[[target#anchor|alias]]`: the target, alias and anchor cut off.
+fn wikilink_target(inner: &str) -> Option<(usize, usize)> {
+    const OPEN: usize = 2;
+    let close = inner.get(OPEN..)?.find("]]")? + OPEN;
+    let text = inner.get(OPEN..close)?;
+    let mut end = text.find('|').unwrap_or(text.len());
+    if let Some(hash) = text.get(..end)?.find('#') {
+        end = hash;
+    }
+    let target = text.get(..end)?;
+    let start = OPEN + (target.len() - target.trim_start().len());
+    let end = OPEN + end - (target.len() - target.trim_end().len());
+    (start < end).then_some((start, end))
+}
+
+/// `[text](dest)`, `![alt](<dest> "Title")`: the destination, stripped of the
+/// title, the angle brackets and the anchor, in that order.
+fn markdown_dest(inner: &str) -> Option<(usize, usize)> {
+    let text_end = inner.get(1..)?.find(']')? + 1;
+    if inner.as_bytes().get(text_end + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut start = text_end + 2;
+    // `span.1` is one past the closing paren, so the paren is the last byte.
+    let mut end = inner.len().checked_sub(1)?;
+    if start > end {
+        return None;
+    }
+    let slice = inner.get(start..end)?;
+    start += slice.len() - slice.trim_start().len();
+    end -= slice.len() - slice.trim_end().len();
+
+    // `(path "Title")` — the quote must follow whitespace, or `it's notes.md`
+    // would lose its tail. `markdown_link`'s rule, verbatim.
+    let slice = inner.get(start..end)?;
+    if let Some(quote) = slice.find(['"', '\'']) {
+        if quote > 0 && slice.get(..quote)?.ends_with(char::is_whitespace) {
+            end = start + slice.get(..quote)?.trim_end().len();
+        }
+    }
+    // `(<path with spaces>)`
+    let slice = inner.get(start..end)?;
+    start += slice.len() - slice.trim_start_matches('<').len();
+    end -= slice.len() - slice.trim_end_matches('>').len();
+
+    // The anchor selects a place inside the target, not a different file.
+    let slice = inner.get(start..end)?;
+    if let Some(hash) = slice.find('#') {
+        end = start + hash;
+    }
+    (start < end).then_some((start, end))
+}
+
+/// The promote table's rows that name the moved file, re-rendered.
+///
+/// The record's `## Promote` table is *"a copy under a stable name, listed
+/// here"*, so a row naming a file that moved is a row that has stopped being the
+/// contract it claims to be — and no link parser can see it, because a cell is a
+/// path in a table and not a link. An [`super::promote::PromoteRow::Unreadable`]
+/// row is skipped rather than repaired, which is that module's own promise: a row
+/// keeper cannot read is a row keeper never rewrites.
+///
+/// A touched row is re-rendered in [`super::promote::render_row`]'s canonical
+/// spelling, which is what [`super::promote::upsert_row`] already does to a row
+/// it updates — so the table has one writer and one shape, rather than two that
+/// disagree about padding.
+fn promote_edits(body: &str, from: &str, to: &str, out: &mut Vec<(usize, usize, String)>) {
+    let Some(table) = super::promote::parse(body) else {
+        return;
+    };
+    for (row, span) in table.rows.iter().zip(&table.row_spans) {
+        let super::promote::PromoteRow::Entry {
+            source,
+            target,
+            note,
+        } = row
+        else {
+            continue;
+        };
+        // A block body rather than `.then(…).flatten()`: the guard and the
+        // rewrite are two different questions, and one line that asked both read
+        // as neither.
+        let moved = |cell: &str| {
+            // Session-relative, and never the source file's frame: a cell is a
+            // path in `super::promote`'s table — `workspace/x.md`,
+            // `artifacts/y.md` — written by that module against the session
+            // root, not a link an author typed where he happened to be.
+            if !names(cell, from, "") {
+                return None;
+            }
+            renamed_target(cell, from, to)
+        };
+        let (new_source, new_target) = (moved(source), moved(target));
+        if new_source.is_none() && new_target.is_none() {
+            continue;
+        }
+        out.push((
+            span.0,
+            span.1,
+            super::promote::render_row(
+                new_source.as_deref().unwrap_or(source),
+                new_target.as_deref().unwrap_or(target),
+                note,
+            ),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +950,73 @@ mod tests {
         );
     }
 
+    /// A pointer written in a file that sits in a subdirectory resolves against
+    /// that directory, which is what every markdown reader does.
+    ///
+    /// The walk that reads markdown wherever it sits (FR-285) made a source at
+    /// depth ordinary; resolving its pointers against the session root instead
+    /// either reports a working link missing, or — worse, and this is the half
+    /// asserted second — silently opens the same-named file at the root.
+    #[test]
+    fn a_pointer_inside_a_subdirectory_resolves_beside_its_own_file() {
+        let probe = Fake {
+            files: vec![
+                "60-sessions/active/2026-08-10-keeper/spaces/notes.md",
+                "60-sessions/active/2026-08-10-keeper/notes.md",
+                "60-sessions/active/2026-08-10-keeper/artifacts/report.md",
+            ],
+            ..Fake::default()
+        };
+        let filed: Vec<(String, RawRef)> = scan("[n](notes.md) and [r](artifacts/report.md)")
+            .into_iter()
+            .map(|raw| ("spaces/plan.md".to_owned(), raw))
+            .collect();
+        let rows = plan(&filed, PREFIX, &probe);
+
+        assert_eq!(
+            rows[0].open,
+            RefTarget::File {
+                subpath: "60-sessions/active/2026-08-10-keeper/spaces/notes.md".to_owned()
+            },
+            "the file beside the one holding the link, not the root's namesake"
+        );
+        assert_eq!(
+            rows[1].open,
+            RefTarget::File {
+                subpath: "60-sessions/active/2026-08-10-keeper/artifacts/report.md".to_owned()
+            },
+            "and a session-root-relative spelling — what `add_ref` writes — \
+             still resolves, from the second probe"
+        );
+    }
+
+    /// A miss from a filed source names every place keeper looked, in the order
+    /// it looked, so the sentence is a `mv` away from being useful.
+    #[test]
+    fn a_missing_pointer_in_a_subdirectory_names_all_three_probes() {
+        let probe = Fake::default();
+        let filed: Vec<(String, RawRef)> = scan("[gone](notes.md)")
+            .into_iter()
+            .map(|raw| ("spaces/plan.md".to_owned(), raw))
+            .collect();
+        let rows = plan(&filed, PREFIX, &probe);
+
+        assert_eq!(rows[0].kind, RefKind::Missing);
+        let RefTarget::Missing { looked } = &rows[0].open else {
+            panic!("missing carries where keeper looked");
+        };
+        assert_eq!(
+            looked,
+            &[
+                "60-sessions/active/2026-08-10-keeper/spaces/notes.md".to_owned(),
+                "60-sessions/active/2026-08-10-keeper/notes.md".to_owned(),
+                "notes.md".to_owned(),
+            ],
+            "beside the file, then beside the session, then the drive root"
+        );
+        assert!(missing_notice(&rows[0].target, looked).contains("spaces/notes.md"));
+    }
+
     /// The feature's whole reason to exist: the pointer that broke. It says
     /// missing, keeps the author's own spelling, names both places keeper
     /// looked, and sorts to the top past a working link written before it.
@@ -722,5 +1133,202 @@ mod tests {
             &Fake::default()
         )
         .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Following a rename (Story 51.6)
+    // -----------------------------------------------------------------------
+
+    const OLD: &str = "2026-08-16-1812-untitled.md";
+    const NEW: &str = "2026-08-16-1812-kick-off.md";
+
+    /// Every test below but the last is about pointers written in the session's
+    /// record at the root — where the promote table lives, and where keeper's own
+    /// writer puts a reference. The source is spelled once here rather than
+    /// thirteen times; the pointer written beside its own file has its own test
+    /// and calls [`rewrite_pointers`] with all four arguments.
+    fn rewrite_in_record(body: &str, from: &str, to: &str) -> Option<String> {
+        rewrite_pointers(body, "about.md", from, to)
+    }
+
+    /// Row 2. A wikilink names a markdown file by its stem, so the stem is what
+    /// follows — and the alias beside it is the author's own words, untouched.
+    #[test]
+    fn a_wikilink_naming_the_old_stem_follows_the_rename() {
+        assert_eq!(
+            rewrite_in_record("See [[2026-08-16-1812-untitled]] for the call.\n", OLD, NEW)
+                .as_deref(),
+            Some("See [[2026-08-16-1812-kick-off]] for the call.\n")
+        );
+        assert_eq!(
+            rewrite_in_record(
+                "See [[2026-08-16-1812-untitled#Decisions|yesterday's call]].\n",
+                OLD,
+                NEW
+            )
+            .as_deref(),
+            Some("See [[2026-08-16-1812-kick-off#Decisions|yesterday's call]].\n"),
+            "the anchor selects a place in the file and the alias is the author naming it"
+        );
+        // An embed is the same pointer with a `!`, and the `!` is not the target.
+        assert_eq!(
+            rewrite_in_record("![[2026-08-16-1812-untitled]]\n", OLD, NEW).as_deref(),
+            Some("![[2026-08-16-1812-kick-off]]\n")
+        );
+    }
+
+    /// Row 3. A markdown destination names the file in full — with its
+    /// extension, its folder, and whatever else the author wrote around it.
+    #[test]
+    fn a_markdown_destination_naming_the_old_path_follows_the_rename() {
+        assert_eq!(
+            rewrite_in_record("- [the call](2026-08-16-1812-untitled.md)\n", OLD, NEW).as_deref(),
+            Some("- [the call](2026-08-16-1812-kick-off.md)\n")
+        );
+        // A folder in front of the name is not something a retitle changes, and
+        // an `./` the author typed is theirs.
+        assert_eq!(
+            rewrite_in_record(
+                "- [x](./refs/2026-08-16-1812-untitled.md \"The call\")\n",
+                "refs/2026-08-16-1812-untitled.md",
+                "refs/2026-08-16-1812-kick-off.md"
+            )
+            .as_deref(),
+            Some("- [x](./refs/2026-08-16-1812-kick-off.md \"The call\")\n"),
+            "the title in the destination is not part of the path and must survive"
+        );
+        // The angle-bracket form keeper's own writer uses.
+        assert_eq!(
+            rewrite_in_record("- [x](<2026-08-16-1812-untitled.md>)\n", OLD, NEW).as_deref(),
+            Some("- [x](<2026-08-16-1812-kick-off.md>)\n")
+        );
+    }
+
+    /// A pointer to something else is not a pointer to this, and a file with
+    /// none at all is left out of the plan rather than rewritten with its own
+    /// bytes.
+    #[test]
+    fn nothing_naming_the_file_means_nothing_to_write() {
+        for body in [
+            "See [[2026-08-16-1900-standup]].\n",
+            "- [x](artifacts/report.md)\n",
+            "- [docs](https://example.com/2026-08-16-1812-untitled.md)\n",
+            "Just a paragraph about the work.\n",
+        ] {
+            assert_eq!(
+                rewrite_in_record(body, OLD, NEW),
+                None,
+                "{body} names no session file this rename moved"
+            );
+        }
+        // The same name is not a rename, whatever else is in the file.
+        assert_eq!(
+            rewrite_in_record("See [[2026-08-16-1812-untitled]].\n", OLD, OLD),
+            None
+        );
+    }
+
+    /// The module's first asymmetry, applied to the write side: a link is an
+    /// author saying "this is a thing", and a backticked path is an author
+    /// typing. Rewriting the second would edit somebody's pasted transcript
+    /// into a command that was never run.
+    #[test]
+    fn a_quoted_path_and_a_fenced_link_are_left_exactly_as_written() {
+        assert_eq!(
+            rewrite_in_record("Ran `cat 2026-08-16-1812-untitled.md` earlier.\n", OLD, NEW),
+            None
+        );
+        assert_eq!(
+            rewrite_in_record(
+                "How to link:\n\n```\n[[2026-08-16-1812-untitled]]\n```\n",
+                OLD,
+                NEW
+            ),
+            None,
+            "a wikilink in a fence is documentation about wikilinks"
+        );
+    }
+
+    /// The promote table is a list of paths in the record, invisible to any link
+    /// parser — and a row keeper cannot read is a row keeper never rewrites.
+    #[test]
+    fn a_promote_row_naming_the_file_follows_and_an_unreadable_row_does_not() {
+        let body = "# Session\n\n## Promote\n\n| workspace | → artifacts | note |\n| --- | --- | --- |\n| 2026-08-16-1812-untitled.md | artifacts/report.md | weekly |\n| just one cell |\n\n## Log\n";
+        let out = rewrite_in_record(body, OLD, NEW).expect("the row names the moved file");
+        assert!(
+            out.contains("| 2026-08-16-1812-kick-off.md | artifacts/report.md | weekly |"),
+            "the row's source cell follows the file: {out}"
+        );
+        assert!(
+            out.contains("| just one cell |"),
+            "an unreadable row is carried verbatim: {out}"
+        );
+        // Every other byte of the record survives (NFR-39).
+        assert!(out.starts_with("# Session\n\n## Promote\n"));
+        assert!(out.ends_with("\n## Log\n"));
+        assert_eq!(
+            out.len(),
+            body.len() + NEW.len() - OLD.len(),
+            "only the name changed length: {out}"
+        );
+    }
+
+    /// Several pointers in one file are one rewrite, and the offsets of the
+    /// later ones survive the earlier ones being replaced.
+    #[test]
+    fn every_pointer_in_one_file_moves_in_the_same_rewrite() {
+        let body = "- [[2026-08-16-1812-untitled]]\n- [again](2026-08-16-1812-untitled.md)\n- [[2026-08-16-1812-untitled|and again]]\n";
+        assert_eq!(
+            rewrite_in_record(body, OLD, NEW).as_deref(),
+            Some(
+                "- [[2026-08-16-1812-kick-off]]\n- [again](2026-08-16-1812-kick-off.md)\n- [[2026-08-16-1812-kick-off|and again]]\n"
+            )
+        );
+    }
+
+    /// A link typed in a different case is the same link on a volume that folds
+    /// case, and the rewrite spells the new name keeper's way.
+    #[test]
+    fn a_hand_typed_case_is_still_the_same_pointer() {
+        assert_eq!(
+            rewrite_in_record("[[2026-08-16-1812-UNTITLED]]\n", OLD, NEW).as_deref(),
+            Some("[[2026-08-16-1812-kick-off]]\n")
+        );
+    }
+
+    /// A pointer written beside its own file follows the rename too — the one
+    /// spelling that resolves and, until the source's own frame reached this
+    /// side, did not follow. `candidates` opens `notes.md` inside
+    /// `spaces/plan.md` as `spaces/notes.md`, so a rename that left it as written
+    /// would break the pointer form this wave taught keeper to read, and break it
+    /// silently: the row would simply come back missing.
+    #[test]
+    fn a_pointer_beside_its_own_file_follows_the_rename() {
+        let body = "- [the plan](notes.md) and [[notes]] and [root](spaces/notes.md)\n";
+        assert_eq!(
+            rewrite_pointers(
+                body,
+                "spaces/plan.md",
+                "spaces/notes.md",
+                "spaces/inputs.md"
+            )
+            .as_deref(),
+            Some("- [the plan](inputs.md) and [[inputs]] and [root](spaces/inputs.md)\n"),
+            "each spelling keeps its own frame: the relative one stays relative, \
+             the session-relative one stays session-relative, and the wikilink \
+             stays a stem"
+        );
+        // The same bytes in the record at the root name a DIFFERENT file — the
+        // root's own `notes.md` — so this rename must not touch them.
+        assert_eq!(
+            rewrite_pointers(
+                "- [the plan](notes.md)\n",
+                "about.md",
+                "spaces/notes.md",
+                "spaces/inputs.md"
+            ),
+            None,
+            "a root-relative `notes.md` is the root's file, not the filed one"
+        );
     }
 }

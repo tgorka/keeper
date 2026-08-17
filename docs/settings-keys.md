@@ -72,6 +72,8 @@ file-controlled instead, and says which file.
 | | | | | Fallback cap on a single segment's duration, in minutes. |
 | `recording.echo_cancellation` | user-global | boolean (`1`/`0`) | `0` | `"recording.echo_cancellation" = true` |
 | | | | | Acoustic echo cancellation on the microphone track; costs a mono track and voice-band noise suppression. |
+| `sessions.spaces_folded` | user-global | boolean (`1`/`0`) | `0` | `"sessions.spaces_folded" = true` |
+| | | | | Whether a session's spaces arrive folded; a space folded or unfolded by hand keeps that answer. |
 | `sync.list_folded` | user-global | integer 1..=50 | `10` | `"sync.list_folded" = 10` |
 | | | | | Rows a folder card's lists show before the fold. |
 | `sync.list_unfolded` | user-global | integer 10..=1000 | `100` | `"sync.list_unfolded" = 100` |

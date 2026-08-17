@@ -713,6 +713,38 @@ pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreE
     )
 }
 
+/// The `settings` key holding the default fold state of a session's spaces
+/// (Story 49.3, FR-276). Stored as `"1"`/`"0"`; absent = unfolded (a space
+/// arrives open unless somebody has said otherwise).
+const SESSIONS_SPACES_FOLDED_KEY: &str = "sessions.spaces_folded";
+
+/// Read the default fold state of a session's spaces (Story 49.3, FR-276).
+/// Absent / anything-but-`"1"` ⇒ `false` (spaces arrive unfolded). Stored in the
+/// `settings` k/v table under `sessions.spaces_folded`.
+///
+/// **The default only** — never a space's own fold. A fold somebody set by hand
+/// is chrome they arranged, and it lives in the frontend's cookie
+/// (`src/lib/stores/session-spaces-fold.ts`): one entry per space per session is
+/// not a preference, and putting it here would grow the settings table without
+/// bound and round-trip a chevron through IPC.
+pub fn get_sessions_spaces_folded(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, SESSIONS_SPACES_FOLDED_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the default fold state of a session's spaces (Story 49.3, FR-276).
+/// Persists `"1"`/`"0"` into the `settings` k/v table under
+/// `sessions.spaces_folded` — the same literal the key is registered with
+/// (`Shape::Flag01` in [`crate::config::keys`]), because a getter that compares
+/// against text the config layer never writes makes the setting do the opposite
+/// of what a `keeper.toml` said.
+pub fn set_sessions_spaces_folded(data_dir: &Path, folded: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        SESSIONS_SPACES_FOLDED_KEY,
+        if folded { "1" } else { "0" },
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -3779,6 +3811,32 @@ mod tests {
         assert!(get_menu_bar_presence(&dir).expect("read back on"));
         set_menu_bar_presence(&dir, false).expect("disable");
         assert!(!get_menu_bar_presence(&dir).expect("read back off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sessions_spaces_folded_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ unfolded (a space arrives open unless somebody said otherwise).
+        assert!(!get_sessions_spaces_folded(&dir).expect("read default"));
+        set_sessions_spaces_folded(&dir, true).expect("fold by default");
+        assert!(get_sessions_spaces_folded(&dir).expect("read back folded"));
+        set_sessions_spaces_folded(&dir, false).expect("unfold by default");
+        assert!(!get_sessions_spaces_folded(&dir).expect("read back unfolded"));
+        // The stored text, not just the round trip: the getter compares against
+        // `"1"`, and the key is registered `Shape::Flag01`, so a writer that put
+        // `"true"` here would round-trip through itself and still invert every
+        // `keeper.toml` that sets the key (config/mod.rs:394-399).
+        set_sessions_spaces_folded(&dir, true).expect("fold by default again");
+        assert_eq!(
+            get_setting(&dir, "sessions.spaces_folded").expect("read raw"),
+            Some("1".to_owned())
+        );
+        set_sessions_spaces_folded(&dir, false).expect("unfold by default again");
+        assert_eq!(
+            get_setting(&dir, "sessions.spaces_folded").expect("read raw"),
+            Some("0".to_owned())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

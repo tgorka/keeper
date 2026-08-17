@@ -3,15 +3,17 @@
  *
  * Two halves of one affordance:
  *
- *  - **A menu**, for the shortcode you half remember. It is a fourth
- *    `CompletionSource` in the note editor's existing `autocompletion()` call,
- *    not a fourth popup. Story 43.9 is what a from-scratch popup costs: the `/`
- *    menu had never opened for anybody, ever, because it anchored `from` at the
- *    trigger character and the matcher then filtered every option out. So this
- *    source is shaped exactly like `tag-complete.ts` — `from` sits AFTER the
- *    colon so the match span is the word being typed, `apply` reaches back to
- *    `from - 1` to take the colon with it, and `filter: false` hands narrowing
- *    to keeper's own matcher rather than to CodeMirror's fuzzy one.
+ *  - **A menu**, for the shortcode you half remember. It is one more
+ *    `CompletionSource` in the one `autocompletion()` call this product makes
+ *    over markdown — `editor/writing-tools.ts` since Story 50.3, the note
+ *    editor's own call before that — and not a second popup. Story 43.9 is what
+ *    a from-scratch popup costs: the `/` menu had never opened for anybody, ever,
+ *    because it anchored `from` at the trigger character and the matcher then
+ *    filtered every option out. So this source is shaped exactly like
+ *    `tag-complete.ts` — `from` sits AFTER the colon so the match span is the
+ *    word being typed, `apply` reaches back to `from - 1` to take the colon with
+ *    it, and `filter: false` hands narrowing to keeper's own matcher rather than
+ *    to CodeMirror's fuzzy one.
  *  - **A closing colon**, for the shortcode you know. Typing `:tada:` straight
  *    through produces 🎉 and never has to be noticed as a menu interaction.
  *
@@ -39,11 +41,12 @@
  * in the table, the filter declines, and the text stays exactly as typed.
  *
  * **The table is not in the app's startup bundle.** It is ~45 KB of generated
- * data, and it is reached by a plain static import on purpose: this module is
- * itself behind `note-editor.tsx`'s dynamic `import()`, so the cost is paid
- * when a note is opened and never by someone who only used Files. A second
- * layer of laziness here would buy nothing and would make the closing colon
- * race the chunk it needs to answer.
+ * data, and it is reached by a plain static import on purpose: this module sits
+ * behind `editor/writing-tools.ts`, which both surfaces that mount the writing
+ * tools reach through a dynamic `import()`, so the cost is paid when a note or a
+ * markdown file is opened and never by someone who only listed folders. A second
+ * layer of laziness here would buy nothing and would make the closing colon race
+ * the chunk it needs to answer.
  */
 import type {
   Completion,

@@ -181,7 +181,21 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           entry={entry}
           state={state}
           writeCaveat={file.writeCaveat}
+          // The location's verdict, straight off the listing row the panel
+          // opened this file from — Rust's own refusal sentence, which is what
+          // keeps a session's `workspace/` file (AD-113) read-only and toolless
+          // from the first frame instead of from the first refused save.
+          writeRefusal={file.writeRefusal}
           csv={csv}
+          // Story 50.4: this host holds the sync-profile address, so it is the
+          // one that can offer a file's own properties. A file outside every
+          // profile has no `profileId` and therefore no properties surface —
+          // the same condition that already leaves it with no loader.
+          properties={
+            file.profileId === null
+              ? null
+              : { profileId: file.profileId, relativePath: file.relativePath }
+          }
           preview={preview}
         />
       </div>

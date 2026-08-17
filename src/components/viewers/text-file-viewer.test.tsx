@@ -14,6 +14,12 @@
  * 45.6's loading hook, 45.6's real CodeMirror, the toggle, the structure view —
  * is the real thing.
  */
+import {
+  acceptCompletion,
+  completionStatus,
+  currentCompletions,
+  startCompletion,
+} from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,14 +49,28 @@ vi.mock("@/lib/ipc/client", () => ({
   notesVaultActive: vi.fn(async () => null),
   revealPath: vi.fn(async () => undefined),
   syncOpenEntry: vi.fn(async () => undefined),
+  // Story 50.4: a markdown file in a profile now mounts the properties panel,
+  // which reaches the client through this factory. A mock that omits an export
+  // throws where the panel READS it, so these are needed even by the tests that
+  // never touch a property. `syncReadFrontmatter` resolving to `""` is a file
+  // with no frontmatter, which is what every fixture here is.
+  syncReadFrontmatter: vi.fn(async () => ""),
+  syncWriteFrontmatter: vi.fn(async () => ""),
+  notesSave: vi.fn(),
+  recordingNoteTargets: vi.fn(async () => null),
+  recordingOpenPath: vi.fn(async () => undefined),
+  recordingSessionMeta: vi.fn(),
+  tagsVocabulary: vi.fn(async () => ({ entries: [] })),
 }));
 
+import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
+import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { type ViewerFile, viewerComponentFor } from "@/lib/viewers";
-import { TEXT_FILE_CAVEAT_TESTID } from "./text-file-frame";
+import { FILE_SAVE_LABEL, TEXT_FILE_CAVEAT_TESTID } from "./text-file-frame";
 import { TEXT_FILE_NOTICE_SLOT, TextFileViewer } from "./text-file-viewer";
 
 /**
@@ -107,12 +127,16 @@ function folderWith(...notes: Array<{ id: string; path: string }>): NoteFolderVm
 /**
  * Press the rendered wikilink, retrying until the outcome is observable.
  *
- * The retry is not politeness about timing, it is required: the preview is
- * mounted by an async `import()` and is torn down and rebuilt when the loaded
- * text arrives, so a node captured from the first mount is detached by the
- * second and a `mouseDown` on it reaches no handler at all — silently, because
- * a detached node still accepts events. Re-querying inside the retry is what
- * makes the press land on the view that is actually on screen.
+ * The retry is not politeness about timing, it is required: the preview is mounted by an
+ * async `import()`, and the decoration that draws the link is rebuilt whenever the
+ * document it decorates changes — the loaded text arriving after the first paint is
+ * exactly that. A node captured before either happens is detached, and a `mouseDown` on
+ * it reaches no handler at all, silently, because a detached node still accepts events.
+ * Re-querying inside the retry is what makes the press land on the view on screen.
+ *
+ * Story 51.5 narrowed the first half of that and not the second: the pane no longer
+ * remounts on every text change — it adopts the text through `setContent` — but the
+ * adoption is still a document change, so the decorations are still rebuilt under it.
  */
 async function pressWikilink(outcome: () => void): Promise<void> {
   await waitFor(() => {
@@ -158,6 +182,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "412 bytes",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -706,5 +731,393 @@ describe("a file knows its note (Story 45.18, FR-196)", () => {
     });
 
     expect(notesResolveLink).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The writing tools a session log now has (Story 50.3, FR-233, rows 1–5 and
+ * 8–10).
+ *
+ * **Why here.** The claim is not "these extensions work" — `slash-menu.test.ts`,
+ * `emoji-complete.test.ts` and `format-commands.test.ts` each prove that over a
+ * stack they build themselves, and every one of them stayed green through Story
+ * 43.9, in which the `/` menu had never opened for anybody. The claim is that a
+ * FILE opened the way a panel opens one has them: through the registry, through
+ * the frame's own markdown-and-writable verdict, in the real editor, on the tab
+ * a person writes in. Only a test that starts at `viewerComponentFor` can see
+ * that, which is what this file has always been for.
+ *
+ * The fixture is the owner's own layout: a folder-shaped session, whose zone can
+ * never be inside a notes vault, so `inVault` is null throughout and none of
+ * this depends on a vault resolving.
+ */
+const SESSION_DIR = "60-sessions/active/2026-08-10-keeper";
+const SESSION_README = `${SESSION_DIR}/README.md`;
+
+/** Type at the caret, one transaction per character.
+ *
+ *  A completion only opens for a transaction that says it came from a keystroke,
+ *  and the emoji filter is written against exactly the shape one person typing
+ *  one character produces — so a whole-string dispatch would prove neither. */
+async function typeAtCaret(view: EditorView, text: string): Promise<void> {
+  await act(async () => {
+    for (const character of text) {
+      const at = view.state.selection.main.head;
+      view.dispatch({
+        changes: { from: at, insert: character },
+        selection: { anchor: at + character.length },
+        userEvent: "input.type",
+      });
+    }
+  });
+}
+
+/** The live view behind a content DOM, asserted rather than assumed. */
+function liveView(editor: HTMLElement): EditorView {
+  const view = EditorView.findFromDOM(editor);
+  expect(view, "no EditorView is mounted in that content DOM").not.toBeNull();
+  return view as EditorView;
+}
+
+/**
+ * Open a session log and put the caret at the end of its Source tab.
+ *
+ * Markdown opens in its RENDERED view by default (`DEFAULT_VIEW_MODE`), and
+ * AD-88 keeps that half read-only — so the tools belong to the tab a person
+ * writes in, and a test about them has to press it first, exactly as a person
+ * does.
+ */
+async function openSessionLog(text: string): Promise<{ editor: HTMLElement; view: EditorView }> {
+  syncReadText.mockResolvedValue(vm({ text }));
+  syncWriteEntry.mockResolvedValue(undefined);
+  openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+  await settle();
+  fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+  const editor = await editorHost();
+  const view = liveView(editor);
+  await act(async () => {
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+  });
+  return { editor, view };
+}
+
+describe("a session log is markdown a person writes into (Story 50.3)", () => {
+  it("has the format toolbar, and Bold wraps the selection", async () => {
+    const { view } = await openSessionLog("# Session\n\nalpha\n");
+
+    const at = view.state.doc.toString().indexOf("alpha");
+    await act(async () => {
+      view.dispatch({ selection: { anchor: at, head: at + "alpha".length } });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+    await settle();
+
+    // The characters, in the buffer the save path holds — not a class on a
+    // button. This is the same command the note editor's toolbar runs, from the
+    // one module both import.
+    expect(view.state.doc.toString()).toBe("# Session\n\n**alpha**\n");
+  });
+
+  it("saves what the toolbar wrote, through the file's own write path", async () => {
+    const { editor, view } = await openSessionLog("# Session\n\nalpha\n");
+
+    const at = view.state.doc.toString().indexOf("alpha");
+    await act(async () => {
+      view.dispatch({ selection: { anchor: at, head: at + "alpha".length } });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Bold" }));
+    await settle();
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+
+    // Row 9. A toolbar that edited a buffer the save path could not see would
+    // look identical on screen and write nothing — which is the failure mode a
+    // file surface with no autosave cannot afford.
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      "# Session\n\n**alpha**\n",
+    );
+  });
+
+  it("opens the slash menu, offering the commands a note offers", async () => {
+    const { view } = await openSessionLog("# Session\n\n");
+
+    await typeAtCaret(view, "/");
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+
+    // As a set: with an empty pattern CodeMirror orders the rows itself. The
+    // rows are the shared table's own, and `writing-tools.test.ts` proves there
+    // is only one such table in the repository — which together is the whole of
+    // "the same items the note editor offers".
+    const offered = currentCompletions(view.state).map((option) => option.label);
+    expect(offered.sort()).toEqual(SLASH_COMMANDS.map((command) => command.label).sort());
+  });
+
+  it("inserts exactly the text the same command inserts in a note", async () => {
+    const { view } = await openSessionLog("# Session\n\n");
+
+    await typeAtCaret(view, "/tas");
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+    // Polled rather than asserted once: production keeps CodeMirror's 75 ms
+    // `interactionDelay`, so an accept that lands under a still-moving hand
+    // refuses — returning false and changing nothing, which is safe to retry.
+    await vi.waitFor(() => expect(acceptCompletion(view)).toBe(true));
+    await settle();
+
+    const task = SLASH_COMMANDS.find((command) => command.label === "Task");
+    if (task === undefined) {
+      throw new Error("the shared slash table no longer has a Task row");
+    }
+    // Row 10, and asserted against the table's own function rather than a
+    // literal: `slash-menu.test.ts` pins `- [ ] ` for this row over the note's
+    // stack, so a change to the text has to change both surfaces at once.
+    expect(view.state.doc.toString()).toBe(`# Session\n\n${task.text(new Date())}`);
+    // And no slash survived, which is the whole of 43.9's defect.
+    expect(view.state.doc.toString()).not.toContain("/");
+  });
+
+  it("completes an emoji shortcode, and commits one typed in full", async () => {
+    const { view } = await openSessionLog("# Session\n\n");
+
+    await typeAtCaret(view, ":sm");
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+
+    // The same list `matchEmoji` gives a note, in the same order — the source
+    // hands narrowing to keeper's matcher (`filter: false`), so what the menu
+    // offers IS the matcher's answer.
+    const matches = matchEmoji("sm");
+    expect(matches.length).toBeGreaterThan(0);
+    const offered = currentCompletions(view.state).map((option) => option.label);
+    expect(offered).toEqual(matches.map((hit) => hit.shortcode));
+
+    // The other half of Story 45.11, which moved with the menu: a shortcode
+    // typed straight through becomes its character.
+    await typeAtCaret(view, "\n:tada:");
+    expect(view.state.doc.toString()).toBe("# Session\n\n:sm\n🎉");
+  });
+});
+
+describe("a file that is not prose keeps the editor it had (Story 50.3)", () => {
+  it("gives a workspace source file no toolbar, no menu and no shortcodes", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "fn main() {}\n" }));
+    openThroughTheRegistry(
+      target({ name: "main.rs", relativePath: `${SESSION_DIR}/workspace/main.rs` }),
+    );
+    const editor = await editorHost();
+    const view = liveView(editor);
+
+    // Row 4. `startCompletion` returns false only when the extension is absent
+    // from the view, which is a stronger claim than "no menu opened for the keys
+    // this test happened to press".
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+    expect(startCompletion(view)).toBe(false);
+    // And the code editor is the one it always was: a gutter, because a config
+    // file is something people are told about by line.
+    expect(document.querySelector(".cm-gutters")).not.toBeNull();
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, ":tada:");
+
+    // Six characters, unchanged. A `.rs` file is not prose, and a shortcode in
+    // one is a string literal somebody meant.
+    expect(view.state.doc.toString()).toBe("fn main() {}\n:tada:");
+  });
+
+  it("keeps the rendered tab read-only, with no toolbar over it (AD-88)", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    // Row 5. The default view for markdown, which is where a person lands.
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+
+    const view = liveView(await editorHost());
+    expect(view.state.readOnly).toBe(true);
+    expect(startCompletion(view)).toBe(false);
+  });
+
+  it("offers no tools over a markdown format keeper will not write", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    const { entry } = viewerComponentFor(target({ name: "README.md" }));
+
+    // Built by hand for the reason the refusal test above states: no
+    // `viewer: "text"` row is non-writable today, and a guard that only runs on
+    // inputs the current table can produce is the guard that rots unnoticed.
+    render(
+      <TextFileViewer
+        file={target({ name: "README.md", relativePath: SESSION_README })}
+        entry={{ ...entry, writable: false, label: "Locked" }}
+      />,
+    );
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    // Row 8. Absent, not present-and-failing: the tools are ways of writing
+    // text, and this buffer is one nothing can be written into.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+    expect(startCompletion(view)).toBe(false);
+  });
+
+  it("offers no tools over a file only the first part of which was read", async () => {
+    syncReadText.mockResolvedValue(
+      vm({ text: "# Session\n\nalpha\n", oversize: true, sizeLabel: "40 MB" }),
+    );
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    // The other half of row 8, and the reason the frame decides the tools from
+    // the same flag that decides Save: the loader refuses a save that would
+    // truncate the rest of the file, so there is no save for a toolbar edit to
+    // land through.
+    expect(screen.queryByRole("button", { name: FILE_SAVE_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+    expect(startCompletion(view)).toBe(false);
+  });
+});
+
+/**
+ * The hole Story 50.3 shipped, and the fixture that would have found it.
+ *
+ * The story's own justification named a guard that did not exist: "a
+ * `workspace/` source file is refused by Rust rather than by the registry …
+ * what keeps the tools off it here is that it is not markdown". The test above
+ * it uses `main.rs`, so it proved only that a `.rs` is not markdown and stayed
+ * green over the case the sentence was about. `workspace/` markdown is the
+ * documented normal case — `docs/sessions.md` says `workspace/` files open
+ * read-only, and this repo's own canonical fixture for one is
+ * `workspace/iter-3.md` — and before the fix it got the full toolbar, the slash
+ * menu, emoji completion and a Save button over a buffer every write refuses,
+ * and was not marked read-only either.
+ *
+ * The refusal is Rust's own: `keeper_sync::files_write::WriteRefusal::
+ * SessionWorkspace`'s Display, which `sync_browse` puts on the listing row this
+ * panel opened the file from.
+ */
+const WORKSPACE_REFUSAL =
+  `${SESSION_DIR}/workspace/notes.md is inside a session's workspace — scratch that is not ` +
+  "versioned, not synced, and dies with the session. keeper reads it but never writes there; " +
+  "promote the file into the session's artifacts instead.";
+const WORKSPACE_NOTE = `${SESSION_DIR}/workspace/notes.md`;
+
+describe("markdown keeper will not write gets no writing tools (Story 50.3)", () => {
+  it("gives a workspace markdown file no toolbar, no menu, no Save, and says why", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Scratch\n\nalpha\n" }));
+    openThroughTheRegistry(
+      target({ name: "notes.md", relativePath: WORKSPACE_NOTE, writeRefusal: WORKSPACE_REFUSAL }),
+    );
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    // Every control that assumes a save can follow, absent — and the reason on
+    // screen in Rust's words rather than nothing.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+    expect(startCompletion(view)).toBe(false);
+    expect(screen.queryByRole("button", { name: FILE_SAVE_LABEL })).toBeNull();
+    expect(view.state.readOnly).toBe(true);
+    expect(screen.getByText(WORKSPACE_REFUSAL)).toBeInTheDocument();
+
+    // And the buffer is genuinely inert to the tools: a shortcode typed into
+    // scratch stays six characters, as it does in a `.rs`.
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, ":tada:");
+    expect(view.state.doc.toString()).toContain(":tada:");
+  });
+
+  it("withholds them for the refusal and not for the word workspace in the path", async () => {
+    // The same file at the same path, with keeper's verdict flipped and nothing
+    // else changed. This is what makes the test above a claim about the fence
+    // rather than about a path segment — and it is the assertion that would
+    // fail on the tempting wrong fix, a `relativePath.includes("/workspace/")`
+    // in the webview, which is the frontend deciding which folders are scratch
+    // (AD-65).
+    syncReadText.mockResolvedValue(vm({ text: "# Scratch\n\nalpha\n" }));
+    openThroughTheRegistry(
+      target({ name: "notes.md", relativePath: WORKSPACE_NOTE, writeRefusal: null }),
+    );
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    expect(await screen.findByRole("button", { name: "Bold" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: FILE_SAVE_LABEL })).toBeInTheDocument();
+    expect(view.state.readOnly).toBe(false);
+  });
+});
+
+/**
+ * The owner's own sentence, end to end (Story 51.5, FR-294).
+ *
+ * *"nie jest to prawdziwy note edytor jak w notes (chcialem preview, source,
+ * note)"* — so this opens a session log the way the panel opens one, presses the
+ * third tab, writes in it, and asserts the bytes that reach Rust. Everything
+ * below the IPC line is real: the registry binding, the frame's predicate, the
+ * loader, the decoration layer and the one write path.
+ */
+describe("a session log opens in three modes (Story 51.5)", () => {
+  it("previews by default, writes in Note, and saves only when asked", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncWriteEntry.mockResolvedValue(undefined);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Preview",
+      "Source",
+      "Note",
+    ]);
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Note" }));
+    const editor = await editorHost();
+    const view = liveView(editor);
+    expect(view.state.readOnly).toBe(false);
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+
+    // Rendered as he types, through the note editor's own decorations — the
+    // half of the old refusal that never had teeth.
+    expect(document.querySelector(".cm-lp-h1")).not.toBeNull();
+    // And nothing has been written. There is no autosave for a file, in this
+    // mode least of all: the write path is last-write-wins.
+    expect(syncWriteEntry).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: FILE_SAVE_LABEL })).toBeEnabled();
+
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+
+    // The same command, the same profile and the same subpath the Source tab
+    // saves through — which is the whole of "Note mode adds no write path".
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      "# Session\n\nalpha\nbeta\n",
+    );
+  });
+
+  it("offers no third tab over a file keeper will not write", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Scratch\n\nalpha\n" }));
+    openThroughTheRegistry(
+      target({ name: "notes.md", relativePath: WORKSPACE_NOTE, writeRefusal: WORKSPACE_REFUSAL }),
+    );
+    await settle();
+
+    // Rust's fence, arriving on the listing row (AD-113). Preview and Source
+    // are unchanged and the refusal is still on screen in Rust's words.
+    const tabs = screen.getAllByRole("tab").map((tab) => tab.textContent);
+    expect(tabs).toEqual(["Preview", "Source"]);
+    expect(screen.getByText(WORKSPACE_REFUSAL)).toBeInTheDocument();
   });
 });
