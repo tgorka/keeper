@@ -49,13 +49,50 @@ export const VIEW_MODE_COOKIE = "keeper_viewer_modes";
 export const VIEW_MODE_MAX_AGE = 60 * 60 * 24 * 365;
 
 /**
+ * What the file in front of the reader can offer, which is what its default is
+ * a function of (Story 52.3, FR-305).
+ *
+ * One field today and shaped as a record anyway, because the alternative at the
+ * call site is a bare boolean — `viewModeFor(jar, format, true)` says nothing
+ * about which of three views the `true` is about, and the second such flag would
+ * be positional beside it.
+ */
+export interface OfferedViews {
+  /**
+   * Whether this file is offered Note mode: markdown, note mode allowed by the
+   * surface, and not read-only.
+   *
+   * The surface's verdict, never re-derived here. `raw` and the format's own
+   * `rendered` half are not in this record because neither is ever withheld —
+   * raw is the view every text format has (AD-88), and a format with no
+   * rendered half renders no tablist at all, so there is nothing to default.
+   */
+  note: boolean;
+}
+
+/**
  * The view a format opens in when the reader has never said.
  *
- * `rendered` for everything, because the rendered view is the thing and the raw
- * view is the name of the thing — which is the sentence this whole epic is
- * about. Raw is one click away and is what a reader asks for deliberately.
+ * `note` when Note mode is offered, and `rendered` otherwise (Story 52.3, item
+ * 9 of the owner's sixth report). `spec-51-5:62` recorded the opposite as a
+ * deliberate non-goal — "a person opening a file to read it must not land in an
+ * editor" — and the owner has since asked for the reverse twice, so it is
+ * reversed on his say and the reasoning is written down rather than lost: Note
+ * mode is the live-preview view, so landing in it shows the reader the same
+ * drawing of their document Preview does, with a caret in it. Reading is not
+ * interrupted; only writing stops needing a click.
+ *
+ * Where Note is not offered — a read-only file, an oversize one, a `.csv`, a
+ * `.json` — this is unchanged: `rendered`, because the rendered view is the
+ * thing and the raw view is the name of the thing. Raw stays one click away and
+ * is what a reader asks for deliberately.
+ *
+ * A function rather than the constant this used to be, because "the default" is
+ * now a question about a particular file and a constant cannot answer one.
  */
-export const DEFAULT_VIEW_MODE: ViewMode = "rendered";
+export function defaultViewMode(offered: OfferedViews): ViewMode {
+  return offered.note ? "note" : "rendered";
+}
 
 /** Format ids come from the registry's `FILE_FORMATS` table, so they are ours
  *  and are constrained rather than escaped. */
@@ -107,16 +144,23 @@ export function readViewModes(cookie: string): Record<string, ViewMode> {
 }
 
 /**
- * The view `format` opens in: what the reader last chose, or the default.
+ * The view `format` opens in: what the reader last chose, or the default for a
+ * file offering these views.
  *
- * Total on purpose. A format the jar has never heard of, a jar that is empty,
- * a jar written by a build that spelled the value differently — all of them
- * answer `rendered` rather than `undefined`, because every caller of this would
- * otherwise have to repeat the same fallback and one of them would get it
- * wrong.
+ * **The jar is read first, and only an ABSENT answer takes the default** (Story
+ * 52.3). That order is the whole of why changing the default is safe: a reader
+ * who once pressed Preview kept a `rendered` in this jar, and he still opens in
+ * Preview. What a stored choice cannot do is claim a view this file does not
+ * have — that resolution belongs to the surface, which lights the tab it can
+ * honour and leaves the jar alone (`raw-rendered-view.tsx`).
+ *
+ * Total on purpose. A format the jar has never heard of, a jar that is empty, a
+ * jar written by a build that spelled the value differently — all of them answer
+ * a view rather than `undefined`, because every caller of this would otherwise
+ * have to repeat the same fallback and one of them would get it wrong.
  */
-export function viewModeFor(cookie: string, format: string): ViewMode {
-  return readViewModes(cookie)[format] ?? DEFAULT_VIEW_MODE;
+export function viewModeFor(cookie: string, format: string, offered: OfferedViews): ViewMode {
+  return readViewModes(cookie)[format] ?? defaultViewMode(offered);
 }
 
 /**

@@ -438,6 +438,12 @@ export function TextFileFrame({
           // whether a third tab exists. Story 51.5's mode is a way of writing
           // text, so it lives exactly where a Save can land — see the header.
           noteMode={writingTools}
+          // The same value the panel above is drawn from, and never a second
+          // opinion about it: the block is hidden from the live-preview panes
+          // exactly when this frame drew it as a form, so the two cannot come to
+          // disagree about whether it is on screen twice (Story 52.3, FR-304).
+          // The Source tab still shows every byte, and a save still writes them.
+          frontmatterInForm={propertiesPanel !== null}
           onExternalWrite={() => void reload()}
           editor={TextEditorSurface}
           csvOptions={csvOptions}

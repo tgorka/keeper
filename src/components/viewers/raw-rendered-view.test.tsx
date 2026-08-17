@@ -21,16 +21,23 @@ import "@codemirror/lang-markdown";
 import "@codemirror/language";
 import "@codemirror/state";
 import "@/components/notes/editor/live-preview";
-// Note mode's mount awaits two more chunks — the editing keymap and Story
-// 43.1's Tab bindings — so they are warmed here for the same reason as the
-// four above: `settle()` drains microtasks and never a frame, and a cold
-// `import()` would not have resolved by the time it returns.
+// Note mode's mount awaits three more chunks — the editing keymap, Story 43.1's
+// Tab bindings and (story 52.3) the writing tools — so they are warmed here for
+// the same reason as the four above: `settle()` drains microtasks and never a
+// frame, and a cold `import()` would not have resolved by the time it returns.
+// The writing tools pull the completion package and the emoji table behind them,
+// which is precisely why they are lazy in the product and why a cold registry
+// leaves the pane un-mounted for longer than eight ticks here.
 import "@/components/notes/editor/indent-keymap";
+import "@/components/notes/editor/writing-tools";
+import { completionStatus, currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { undo, undoDepth } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
+import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteCsvVm } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
 import type { MarkdownPreview } from "./markdown-preview";
@@ -93,6 +100,9 @@ vi.mock("./markdown-preview", async (importOriginal) => {
       return {
         failure: forcedPreviewFailure,
         setContent: () => null,
+        // Nothing was mounted, so a toolbar press has nowhere to land — which is
+        // what the real module answers for a document it could not draw.
+        runFormat: null,
         destroy: () => {
           panes.destroyed += 1;
         },
@@ -868,18 +878,27 @@ async function openNote(
 }
 
 describe("Note mode is a third view over one buffer (Story 51.5)", () => {
-  it("row 1: offers Preview, Source and Note, and a reader lands on Preview", async () => {
-    render(markdownHost());
+  it("row 1: offers Preview, Source and Note, and a reader lands on Note", async () => {
+    const cookie = jar();
+    render(markdownHost({ cookie }));
     await settle();
 
-    // The order is the reading order, and the default is unchanged: a person
-    // opening a file to read it must not land in an editor.
+    // The order is the reading order and is unchanged. Where a reader LANDS is
+    // not: story 51.5 wrote "a person opening a file to read it must not land in
+    // an editor" and the owner has since asked for the opposite twice (story
+    // 52.3, `spec-51-5:62`). Note mode is the same live-preview drawing Preview
+    // shows, with a caret in it, so what he lands in still reads as his document.
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
       "Preview",
       "Source",
       "Note",
     ]);
-    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    // The editable pane, not merely the lit tab.
+    expect(screen.getByRole("textbox", { name: "Note of log.md" })).toBeInTheDocument();
+    // And the jar is untouched: a default is not an answer the reader gave, so
+    // nothing was recorded on his behalf.
+    expect(cookie.read()).toBe("");
   });
 
   it("offers no Note tab when the frame did not say the file may be written", async () => {
@@ -891,6 +910,10 @@ describe("Note mode is a third view over one buffer (Story 51.5)", () => {
 
     expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
     expect(screen.getAllByRole("tab")).toHaveLength(2);
+    // Story 52.3: and the DEFAULT falls back with the tab. A file that offers no
+    // Note mode — read-only, oversize, `workspace/` — still opens in Preview, so
+    // the new default cannot leave a reader looking at a view that is not there.
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("row 11: restores Note from the jar, as an editable region with the file's name", async () => {
@@ -1224,5 +1247,186 @@ describe("Note mode is a third view over one buffer (Story 51.5)", () => {
     // their own effect's cleanup.
     expect(panes.built).toBeGreaterThan(1);
     expect(panes.destroyed).toBe(panes.built - 1);
+  });
+});
+
+/**
+ * Note mode is a place you can write (Story 52.3, FR-303/304/305).
+ *
+ * Everything here is the real thing: the real writing tools in a real
+ * `EditorView`, the real `FormatToolbar`, and the same one-buffer `Host` the
+ * tests above use. A mock of the tools would prove the pane asked for them and
+ * nothing about whether a press, a `/` or a `:tada:` reaches the buffer a save
+ * writes — which is the whole of what was missing.
+ */
+describe("Note mode has the writing tools (Story 52.3)", () => {
+  it("row 1: renders the toolbar, and a press changes the document", async () => {
+    const { view } = await openNote();
+
+    // The control the Notes surface and the Source tab both have, in the pane
+    // that had none until this story.
+    const bold = await screen.findByRole("button", { name: "Bold" });
+
+    const at = view.state.doc.toString().indexOf("alpha");
+    await act(async () => {
+      view.dispatch({ selection: { anchor: at, head: at + "alpha".length } });
+    });
+    fireEvent.click(bold);
+    await settle();
+
+    // The characters, in the buffer a save writes — not a class on a span. A
+    // toolbar that decorated the view without editing the document would pass
+    // every assertion about its own presence.
+    expect(view.state.doc.toString()).toBe("# Session\n\n**alpha**\n");
+  });
+
+  it("draws no toolbar over Preview, which nothing can type into (AD-88)", async () => {
+    const { view } = await openNote({ cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Arendered`) });
+
+    // The pair, and both halves matter: a toolbar over a read-only pane is a
+    // control that announces its own refusal, and the extensions behind it are
+    // absent rather than present-and-inert.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+    expect(view.state.readOnly).toBe(true);
+    expect(startCompletion(view)).toBe(false);
+  });
+
+  it("row 2: opens the slash menu on `/`, from the shared source", async () => {
+    const { view } = await openNote();
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "/");
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+
+    // The product's whole slash vocabulary — not a menu this pane grew for
+    // itself. Sorted on both sides: with no query typed yet CodeMirror orders the
+    // options itself, and the ORDER is `slash-menu.ts`'s own business rather than
+    // something this surface promises.
+    expect(
+      currentCompletions(view.state)
+        .map((option) => option.label)
+        .sort(),
+    ).toEqual(SLASH_COMMANDS.map((command) => command.label).sort());
+  });
+
+  it("row 2: completes an emoji shortcode, and commits one typed in full", async () => {
+    const { view } = await openNote({ initial: "# Session\n\n" });
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, ":sm");
+    await vi.waitFor(() => expect(completionStatus(view.state)).toBe("active"));
+
+    // Keeper's own matcher's answer, in its order: the source hands narrowing to
+    // `matchEmoji` (`filter: false`), so what the menu offers IS that answer.
+    const matches = matchEmoji("sm");
+    expect(matches.length).toBeGreaterThan(0);
+    expect(currentCompletions(view.state).map((option) => option.label)).toEqual(
+      matches.map((hit) => hit.shortcode),
+    );
+
+    // The other half of Story 45.11, which travels with the menu: a shortcode
+    // typed straight through becomes its character.
+    await typeAtCaret(view, "\n:tada:");
+    expect(view.state.doc.toString()).toBe("# Session\n\n:sm\n🎉");
+  });
+});
+
+/** A file whose first bytes are a properties block, and the body under it. */
+const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
+const BODY = "# Weekly\n\nalpha\n";
+
+describe("the frontmatter block is drawn once (Story 52.3)", () => {
+  it("row 4: keeps the block out of the Note pane when a form is mounted above", async () => {
+    const { container, view } = await openNote({
+      initial: BLOCK + BODY,
+      frontmatterInForm: true,
+    });
+
+    // The document the pane holds is the body, exactly — not the body plus a
+    // stray blank line where the block's closing fence used to be.
+    expect(view.state.doc.toString()).toBe(BODY);
+    // And nothing of the block is on screen as text, which is what the owner saw
+    // twice: once as the form above, once as `---` lines in his document.
+    expect(container.textContent).not.toContain("title: Weekly");
+    expect(container.textContent).not.toContain("---");
+  });
+
+  it("row 4: draws it as text for a host that has no form, which is unchanged", async () => {
+    // The note embed and any other host that passes no properties address. The
+    // block IS the document there, and hiding it would be hiding bytes nothing
+    // else on screen accounts for.
+    const { view } = await openNote({ initial: BLOCK + BODY });
+
+    expect(view.state.doc.toString()).toBe(BLOCK + BODY);
+  });
+
+  it("row 4: the Source tab still shows every byte of the file", async () => {
+    render(
+      markdownHost({
+        cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Araw`),
+        initial: BLOCK + BODY,
+        frontmatterInForm: true,
+      }),
+    );
+    await settle();
+
+    // The one view that is always the file's characters (AD-88). Hiding anything
+    // here would be a lie about what a save writes.
+    expect(screen.getByLabelText("Source of log.md")).toHaveValue(BLOCK + BODY);
+  });
+
+  it("row 5: a save from Note mode writes the whole file, block included", async () => {
+    const saved: string[] = [];
+    const { view } = await openNote({
+      initial: BLOCK + BODY,
+      frontmatterInForm: true,
+      onSaved: (text) => saved.push(text),
+    });
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.keyDown(view.contentDOM, { key: "s", ...MOD });
+    await settle();
+
+    // Byte for byte, and this is the assertion the hiding stands or falls on: the
+    // reader was shown the body and the file keeps its properties. A save that
+    // wrote what the pane was holding would silently delete the block — and the
+    // form above it would then be writing into a file that no longer has one.
+    expect(saved).toEqual([`${BLOCK}# Weekly\n\nalpha\nbeta\n`]);
+  });
+});
+
+describe("the default view is Note when Note is possible (Story 52.3)", () => {
+  it("row 7: a remembered `rendered` choice still opens Preview", async () => {
+    // The promise that makes reversing the default safe. Nothing the reader has
+    // already clicked changes under him, and the jar is left exactly as he left
+    // it — a default is not an answer, so it never writes one.
+    const cookie = jar(`${VIEW_MODE_COOKIE}=markdown%3Arendered`);
+    render(markdownHost({ cookie }));
+    await settle();
+
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(cookie.read()).toBe(`${VIEW_MODE_COOKIE}=markdown%3Arendered`);
+  });
+
+  it("row 8: a read-only markdown file opens Preview and offers no Note tab", async () => {
+    // The frame's verdict for an oversize file, a `workspace/` one, or a format
+    // keeper will not rewrite, arriving here as `readOnly` — the belt beside
+    // `noteMode`'s braces. A default that ignored it would light a tab that is
+    // not there.
+    render(markdownHost({ readOnly: true, readOnlyReason: "keeper will not write this file" }));
+    await settle();
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    // And no toolbar anywhere on the surface: there is no editable pane to have
+    // one, in either of this file's two views.
+    expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
   });
 });

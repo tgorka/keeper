@@ -52,9 +52,27 @@
  * persistence alone. So editability is a parameter — {@link
  * MarkdownPreviewOptions.editing}, whose absence is the clamp — rather than a
  * fact about the renderer.
+ *
+ * ## The editable half carries the writing tools
+ *
+ * Note mode is a place a person writes prose (Story 52.3, FR-303), so it mounts
+ * the same `notes/editor/writing-tools.ts` the Notes surface and the raw file
+ * editor mount — the slash menu, emoji completion, and the translation a
+ * toolbar press needs — and never a second copy of any of them. Requested in the
+ * same `import()` wave as the editing keymap and only when a destination for an
+ * edit was named, so a reader who only ever previews still downloads no emoji
+ * table (NFR-27).
+ *
+ * The toolbar itself is a React control and stays with the host, for the reason
+ * `text-viewer.tsx` states where it mounts one: a toolbar acts on a live view,
+ * and the view is this module's. What crosses the boundary is {@link
+ * MarkdownPreview.runFormat} — non-null exactly when the extensions behind it
+ * are in the view, so a host cannot draw a control over an editor that never
+ * loaded the commands it presses.
  */
 import type { ensureSyntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
+import type { FormatAction } from "@/components/notes/editor/format-commands";
 import type { NoteWidgetOptions } from "@/components/notes/editor/note-widget";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
 
@@ -173,6 +191,18 @@ export interface MarkdownPreview {
    * Always safe to call, including after a failure.
    */
   setContent: (next: string) => string | null;
+  /**
+   * Run a toolbar press against this view, or `null` when there is no editable
+   * view for one to land in (Story 52.3, FR-303).
+   *
+   * The same contract `TextEditorMount.runFormat` publishes, from the same
+   * shared translation (`runFormatAction`): non-null exactly when the writing
+   * extensions are in the view, so a surface cannot render a toolbar over an
+   * editor that never loaded the commands behind it. `null` for the read-only
+   * preview and for both failures — a document that was never drawn has nothing
+   * to format.
+   */
+  runFormat: ((action: FormatAction) => void) | null;
   /** Always safe to call, including after a failure. */
   destroy: () => void;
 }
@@ -210,7 +240,7 @@ export async function mountMarkdownPreview(
   options: MarkdownPreviewOptions,
 ): Promise<MarkdownPreview> {
   const editing = options.editing ?? null;
-  // `.catch` and not a bare `await`: the six chunks below are fetched over the
+  // `.catch` and not a bare `await`: the seven chunks below are fetched over the
   // network in production and evaluated by a module runner in a test, and a
   // rejection from either — an offline reader, a deploy that moved the chunk, a
   // host torn down while the wave was in flight — would reject THIS promise and
@@ -229,6 +259,12 @@ export async function mountMarkdownPreview(
     // not use it.
     editing === null ? null : import("@codemirror/commands"),
     editing === null ? null : import("@/components/notes/editor/indent-keymap"),
+    // Story 52.3's writing tools, on the same terms and in the same wave: the
+    // slash menu, emoji completion and the toolbar's translation, from the one
+    // module that defines them. `null` when no edit has a destination, so the
+    // ~45 KB emoji table is downloaded by a reader who can type into this
+    // document and by nobody else (NFR-27).
+    editing === null ? null : import("@/components/notes/editor/writing-tools"),
   ]).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
   if (typeof loaded === "string") {
     console.info(
@@ -241,10 +277,12 @@ export async function mountMarkdownPreview(
       // Nothing was mounted, so there is nothing to adopt into: the host is
       // showing the raw view, which holds the same buffer.
       setContent: () => null,
+      // Nothing to press against, for the same reason.
+      runFormat: null,
       destroy: () => {},
     };
   }
-  const [state, view, markdown, preview, commands, indent] = loaded;
+  const [state, view, markdown, preview, commands, indent, writing] = loaded;
 
   // One flag rather than reading the document back: the update listener runs
   // for programmatic dispatches too, and an adoption of the host's own buffer
@@ -256,10 +294,10 @@ export async function mountMarkdownPreview(
     doc: text,
     extensions: [
       view.EditorView.lineWrapping,
-      ...(editing === null || commands === null || indent === null
+      ...(editing === null || commands === null || indent === null || writing === null
         ? [
             // The clamp, reached when no caller named a destination for an edit
-            // — and, by construction, only then: the two keymap chunks are
+            // — and, by construction, only then: the three editing chunks are
             // requested in the same wave `editing` is read in, so the null
             // checks above are TypeScript's narrowing rather than a second
             // state. Read-only is the right way for that narrowing to fail.
@@ -302,6 +340,11 @@ export async function mountMarkdownPreview(
               }
               editing.onChange(update.state.doc.toString());
             }),
+            // Story 52.3's three tools, from the module that owns them, on the
+            // editable branch alone: an absent extension cannot be triggered,
+            // so there is no state in which `/` opens a menu over a preview a
+            // reader was told they cannot change.
+            writing.markdownWritingTools(),
           ]),
       markdown.markdown({ base: markdown.markdownLanguage }),
       preview.livePreview({
@@ -352,6 +395,14 @@ export async function mountMarkdownPreview(
           adopting = false;
         }
       },
+      // The same translation the note editor and the raw file editor perform,
+      // from the same module — which is the whole of Story 50.3 reaching this
+      // surface. Non-null exactly when the extensions are in the view, because
+      // it is the same `writing` the extension branch above was built from.
+      runFormat:
+        writing === null
+          ? null
+          : (action: FormatAction) => writing.runFormatAction(mounted, action),
       destroy: () => mounted.destroy(),
     };
   } catch (error) {
@@ -367,6 +418,8 @@ export async function mountMarkdownPreview(
       // Nothing to adopt into, so nothing can fail: the host is showing the raw
       // view, which holds the same buffer this would have received.
       setContent: () => null,
+      // Nor anything to format: there is no view.
+      runFormat: null,
       destroy: () => {},
     };
   }

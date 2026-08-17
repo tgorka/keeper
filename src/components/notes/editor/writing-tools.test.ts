@@ -73,6 +73,17 @@ function filesMatching(pattern: RegExp): string[] {
 const SHARED = "components/notes/editor/writing-tools.ts";
 const NOTE_EDITOR = "components/notes/note-editor.tsx";
 const FILE_HOST = "components/viewers/text-editor-host.ts";
+/** The markdown live-preview mount, which Note mode is (Story 52.3). It is the
+ *  third surface to reach the tools, and the second to hold a view a toolbar
+ *  press lands in. */
+const PREVIEW = "components/viewers/markdown-preview.ts";
+/** The component that renders Note mode's toolbar over the view {@link PREVIEW}
+ *  mounts — the toolbar is React and the view is not, so the two are separate
+ *  files by construction. */
+const MARKDOWN_PANE = "components/viewers/raw-rendered-view.tsx";
+/** The Source tab's editor surface, which mounts the same toolbar over
+ *  {@link FILE_HOST}'s view. */
+const TEXT_VIEWER = "components/viewers/text-viewer.tsx";
 const SLASH_MENU = "components/notes/editor/slash-menu.ts";
 const EMOJI = "components/notes/editor/emoji-complete.ts";
 const FORMAT_COMMANDS = "components/notes/editor/format-commands.ts";
@@ -144,38 +155,58 @@ describe("one definition of each writing tool", () => {
     ).toEqual([SHARED]);
   });
 
-  it("renders one toolbar component, on both surfaces", () => {
+  it("renders one toolbar component, on all three surfaces", () => {
     expect(
       filesMatching(/export function FormatToolbar\b/),
-      "there is a second format toolbar component. Reuse @/components/notes/format-toolbar — it speaks plain FormatAction data and holds no editor, which is what lets both surfaces mount it.",
+      "there is a second format toolbar component. Reuse @/components/notes/format-toolbar — it speaks plain FormatAction data and holds no editor, which is what lets every surface mount it.",
     ).toEqual(["components/notes/format-toolbar.tsx"]);
+    // THREE, deliberately, since Story 52.3: the Notes surface, the Source tab,
+    // and Note mode's live-preview pane — which had no toolbar at all until then,
+    // and was the owner's first item in his sixth report.
     expect(
       filesMatching(/<FormatToolbar\b/),
       "the set of surfaces mounting the toolbar has changed. That is allowed — a new one is welcome — but it has to be added here on purpose, so the next reader knows how many editors this control is expected to serve.",
-    ).toEqual([NOTE_EDITOR, "components/viewers/text-viewer.tsx"].sort());
+    ).toEqual([NOTE_EDITOR, TEXT_VIEWER, MARKDOWN_PANE].sort());
   });
 });
 
-describe("both surfaces reach the tools through the shared module", () => {
-  it("is imported by the note editor and the file editor host, and by nobody else", () => {
+describe("all three surfaces reach the tools through the shared module", () => {
+  it("is imported by the note editor, the file editor host and the preview, and by nobody else", () => {
     expect(
       filesMatching(/writing-tools"/),
       "the set of surfaces mounting the writing tools has changed. Add the new one here deliberately; the number of editors keeper has is a fact worth writing down.",
-    ).toEqual([FILE_HOST, NOTE_EDITOR].sort());
+    ).toEqual([FILE_HOST, NOTE_EDITOR, PREVIEW].sort());
   });
 
-  it("is imported lazily by both, so a pane that draws a file row pays nothing", () => {
-    // A static edge from either surface would pull the emoji table and the
+  it("is imported lazily by all three, so a pane that draws a file row pays nothing", () => {
+    // A static edge from any of them would pull the emoji table and the
     // completion package into the main bundle — the boundary NFR-27 stands on,
-    // and the reason both callers name this module inside an `import()`.
+    // and the reason all three callers name this module inside an `import()`.
     const note = CODE.find(({ path }) => path === NOTE_EDITOR)?.code ?? "";
     const host = CODE.find(({ path }) => path === FILE_HOST)?.code ?? "";
+    const preview = CODE.find(({ path }) => path === PREVIEW)?.code ?? "";
     const lazily =
       "reach this module through a dynamic import() inside the closure that owns the view. A static import pulls ~45 KB of emoji table and the completion package into the main bundle, which is the boundary quick capture's 300 ms budget stands on.";
     expect(note, `the note editor must ${lazily}`).toContain('import("./editor/writing-tools")');
     expect(host, `the file editor host must ${lazily}`).toContain(
       'import("../notes/editor/writing-tools")',
     );
+    expect(preview, `the markdown preview must ${lazily}`).toContain(
+      'import("@/components/notes/editor/writing-tools")',
+    );
+  });
+
+  it("is reached by no STATIC edge at all, which is the half `toContain` cannot see", () => {
+    // The assertions above prove a dynamic import exists; they cannot prove a
+    // static one does not, and a file may hold both — at which point the chunk is
+    // in the main bundle and every `import()` above it is decoration. So the
+    // `from` clause is banned outright. A type-only import would be erased and
+    // would be harmless, and there is nothing here to type-import: this module
+    // exports two functions and no types.
+    expect(
+      filesMatching(/from "[^"]*writing-tools"/),
+      "something now imports the writing tools statically. That defeats the lazy boundary NFR-27 depends on however many dynamic import()s sit beside it: the emoji table and the completion package land in the main bundle, and quick capture pays for them. Move the import inside the closure that mounts the view.",
+    ).toEqual([]);
   });
 });
 

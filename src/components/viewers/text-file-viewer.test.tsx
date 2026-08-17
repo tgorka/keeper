@@ -798,10 +798,10 @@ function liveView(editor: HTMLElement): EditorView {
 /**
  * Open a session log and put the caret at the end of its Source tab.
  *
- * Markdown opens in its RENDERED view by default (`DEFAULT_VIEW_MODE`), and
- * AD-88 keeps that half read-only — so the tools belong to the tab a person
- * writes in, and a test about them has to press it first, exactly as a person
- * does.
+ * A savable markdown file opens in NOTE since story 52.3 (`defaultViewMode`), so
+ * the press below is what makes these tests about the SOURCE tab's tools rather
+ * than about whichever pane happened to be selected. Both panes have the toolbar
+ * now; the Source tab is the one 50.3 wired and the one these tests own.
  */
 async function openSessionLog(text: string): Promise<{ editor: HTMLElement; view: EditorView }> {
   syncReadText.mockResolvedValue(vm({ text }));
@@ -947,7 +947,12 @@ describe("a file that is not prose keeps the editor it had (Story 50.3)", () => 
     openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
     await settle();
 
-    // Row 5. The default view for markdown, which is where a person lands.
+    // Row 5, re-anchored by story 52.3: a savable markdown file now LANDS in
+    // Note, so the read-only half is reached by pressing Preview — which is what
+    // this test is about and always was. What must not change is what Preview is:
+    // a drawing of the document that nothing can type into (AD-88).
+    fireEvent.click(screen.getByRole("tab", { name: "Preview" }));
+    await settle();
     expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
 
@@ -1080,7 +1085,7 @@ describe("markdown keeper will not write gets no writing tools (Story 50.3)", ()
  * loader, the decoration layer and the one write path.
  */
 describe("a session log opens in three modes (Story 51.5)", () => {
-  it("previews by default, writes in Note, and saves only when asked", async () => {
+  it("opens in Note, writes there, and saves only when asked", async () => {
     syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
     syncWriteEntry.mockResolvedValue(undefined);
     openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
@@ -1091,9 +1096,11 @@ describe("a session log opens in three modes (Story 51.5)", () => {
       "Source",
       "Note",
     ]);
-    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    // Story 52.3, end to end: he lands where he writes, with no press at all —
+    // and the pane he lands in is the editable one, not the Preview that used to
+    // be selected here.
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
 
-    fireEvent.click(screen.getByRole("tab", { name: "Note" }));
     const editor = await editorHost();
     const view = liveView(editor);
     expect(view.state.readOnly).toBe(false);
@@ -1243,5 +1250,74 @@ describe("a rename in the properties panel takes the open pane with it (Story 52
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
     expect(syncReadFrontmatter).not.toHaveBeenCalled();
     expect(sessionsFileRename).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The block is drawn once, and saved whole (Story 52.3, FR-304).
+ *
+ * *"note tab w sesions nie musi renderowac czesci properties jak juz jest powyzej
+ * formularz"* — on a file the buffer IS the whole file, so the YAML block was on
+ * screen twice: once as the panel's controls, once as `---` lines in the reader's
+ * own document.
+ *
+ * End to end here rather than in `text-file-frame.test.tsx`, deliberately: what
+ * has to hold is that the frame's verdict REACHES the pane and that a save still
+ * writes the block, and both need the real panel above a real editor over real
+ * bytes. A frame test could only assert the prop it just passed.
+ */
+describe("the properties block is drawn once, not twice (Story 52.3)", () => {
+  /** A file with properties, as `file_properties` writes them, and its body. */
+  const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
+  const BODY = "# Weekly\n\nalpha\n";
+
+  it("keeps the block out of Note mode and puts it back in the bytes a save writes", async () => {
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncReadText.mockResolvedValue(vm({ text: BLOCK + BODY }));
+    syncWriteEntry.mockResolvedValue(undefined);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    // The form is genuinely above the pane. Without this the test would pass over
+    // a surface that had no panel at all, which is the case where the block SHOULD
+    // be document text.
+    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+
+    const editor = await editorHost();
+    const view = liveView(editor);
+    // Story 52.3's default put the reader here with no press, and what he is
+    // looking at is his document — not his document with its own metadata pasted
+    // at the top of it.
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    expect(view.state.doc.toString()).toBe(BODY);
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+
+    // Byte for byte, through the same one write path: the block the reader was
+    // never shown is still the first thing in the file. A save that wrote what the
+    // pane was holding would delete the properties the form above it is editing.
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      `${BLOCK}# Weekly\n\nalpha\nbeta\n`,
+    );
+  });
+
+  it("still shows every byte on the Source tab, which is the file's characters", async () => {
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncReadText.mockResolvedValue(vm({ text: BLOCK + BODY }));
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    // AD-88's one buffer, visible in full in the one view that is always the
+    // source. Hiding anything here would be a lie about what Save writes.
+    expect(view.state.doc.toString()).toBe(BLOCK + BODY);
   });
 });
