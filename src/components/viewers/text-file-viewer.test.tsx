@@ -127,12 +127,16 @@ function folderWith(...notes: Array<{ id: string; path: string }>): NoteFolderVm
 /**
  * Press the rendered wikilink, retrying until the outcome is observable.
  *
- * The retry is not politeness about timing, it is required: the preview is
- * mounted by an async `import()` and is torn down and rebuilt when the loaded
- * text arrives, so a node captured from the first mount is detached by the
- * second and a `mouseDown` on it reaches no handler at all — silently, because
- * a detached node still accepts events. Re-querying inside the retry is what
- * makes the press land on the view that is actually on screen.
+ * The retry is not politeness about timing, it is required: the preview is mounted by an
+ * async `import()`, and the decoration that draws the link is rebuilt whenever the
+ * document it decorates changes — the loaded text arriving after the first paint is
+ * exactly that. A node captured before either happens is detached, and a `mouseDown` on
+ * it reaches no handler at all, silently, because a detached node still accepts events.
+ * Re-querying inside the retry is what makes the press land on the view on screen.
+ *
+ * Story 51.5 narrowed the first half of that and not the second: the pane no longer
+ * remounts on every text change — it adopts the text through `setContent` — but the
+ * adoption is still a document change, so the decorations are still rebuilt under it.
  */
 async function pressWikilink(outcome: () => void): Promise<void> {
   await waitFor(() => {
@@ -1047,5 +1051,73 @@ describe("markdown keeper will not write gets no writing tools (Story 50.3)", ()
     expect(await screen.findByRole("button", { name: "Bold" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: FILE_SAVE_LABEL })).toBeInTheDocument();
     expect(view.state.readOnly).toBe(false);
+  });
+});
+
+/**
+ * The owner's own sentence, end to end (Story 51.5, FR-294).
+ *
+ * *"nie jest to prawdziwy note edytor jak w notes (chcialem preview, source,
+ * note)"* — so this opens a session log the way the panel opens one, presses the
+ * third tab, writes in it, and asserts the bytes that reach Rust. Everything
+ * below the IPC line is real: the registry binding, the frame's predicate, the
+ * loader, the decoration layer and the one write path.
+ */
+describe("a session log opens in three modes (Story 51.5)", () => {
+  it("previews by default, writes in Note, and saves only when asked", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncWriteEntry.mockResolvedValue(undefined);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Preview",
+      "Source",
+      "Note",
+    ]);
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Note" }));
+    const editor = await editorHost();
+    const view = liveView(editor);
+    expect(view.state.readOnly).toBe(false);
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+
+    // Rendered as he types, through the note editor's own decorations — the
+    // half of the old refusal that never had teeth.
+    expect(document.querySelector(".cm-lp-h1")).not.toBeNull();
+    // And nothing has been written. There is no autosave for a file, in this
+    // mode least of all: the write path is last-write-wins.
+    expect(syncWriteEntry).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: FILE_SAVE_LABEL })).toBeEnabled();
+
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+
+    // The same command, the same profile and the same subpath the Source tab
+    // saves through — which is the whole of "Note mode adds no write path".
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      "# Session\n\nalpha\nbeta\n",
+    );
+  });
+
+  it("offers no third tab over a file keeper will not write", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Scratch\n\nalpha\n" }));
+    openThroughTheRegistry(
+      target({ name: "notes.md", relativePath: WORKSPACE_NOTE, writeRefusal: WORKSPACE_REFUSAL }),
+    );
+    await settle();
+
+    // Rust's fence, arriving on the listing row (AD-113). Preview and Source
+    // are unchanged and the refusal is still on screen in Rust's words.
+    const tabs = screen.getAllByRole("tab").map((tab) => tab.textContent);
+    expect(tabs).toEqual(["Preview", "Source"]);
+    expect(screen.getByText(WORKSPACE_REFUSAL)).toBeInTheDocument();
   });
 });

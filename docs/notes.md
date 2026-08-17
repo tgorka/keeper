@@ -158,9 +158,16 @@ apart.
 
 What stayed here is what needs a **vault**: wikilink and tag completion, `![[…]]` embeds
 and the CSV table are all addressed by a vault plus a vault-relative path, and a file
-outside a vault has neither. Live preview stayed too — a note autosaves against a
-subscription, and a file is saved by hand, so one editor showing both would be two
-contracts wearing one face.
+outside a vault has neither.
+
+**Live preview did not stay.** This paragraph used to say it had, because a note autosaves
+against a subscription and a file is saved by hand — but that is a fact about *saving*,
+not about *rendering*. Since Story 51.5 a markdown file has a third tab, **Note**, and it
+is this same live-preview layer over the file's own buffer: rendered as you type, in Files
+and in a session exactly as in a note. The distinction the old sentence was protecting is
+intact, because it was never about the renderer — a note saves itself, and Note mode over
+a file writes when you press `⌘S` or Save and at no other moment. One renderer, two save
+contracts, and neither surface borrowed the other's.
 
 ## Finding text
 

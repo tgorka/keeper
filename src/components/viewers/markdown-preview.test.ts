@@ -15,6 +15,7 @@
  * the user assembles. That is why the assembly is still here after the fix.
  */
 
+import { undo, undoDepth } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { ensureSyntaxTree } from "@codemirror/language";
 import { EditorState } from "@codemirror/state";
@@ -135,10 +136,12 @@ describe("mountMarkdownPreview", () => {
     preview.destroy();
   });
 
-  it("is read-only, because editing markdown is the note editor and its save path", async () => {
+  it("row 6: is read-only when no caller named a destination for an edit", async () => {
     const host = document.createElement("div");
     const preview = await mountMarkdownPreview(host, "# Title\n", { vaultId: "vault-1" });
 
+    // The clamp is the ABSENCE of `editing`, which is Story 51.5's shape for
+    // "there is nowhere for a keystroke to go". Preview never grew a write path.
     expect(host.querySelector('[contenteditable="true"]')).toBeNull();
     preview.destroy();
   });
@@ -189,5 +192,161 @@ describe("mountMarkdownPreview", () => {
     // Safe to call after a failure — every caller does, and one of them would
     // otherwise have to remember not to.
     expect(() => preview.destroy()).not.toThrow();
+    expect(() => preview.setContent("# other\n")).not.toThrow();
+  });
+});
+
+/**
+ * Note mode's half of this module (Story 51.5, FR-294).
+ *
+ * Asserted against a real `EditorView` for the same reason the rest of this file
+ * is: what is being claimed is that the EDITABLE pane is the same assembly as
+ * the read-only one plus a keymap, and a double of the mount could not tell that
+ * from a second renderer.
+ */
+describe("mountMarkdownPreview, editable", () => {
+  /** The mounted view behind a host, asserted rather than assumed. */
+  function viewIn(host: HTMLElement): EditorView {
+    const content = host.querySelector<HTMLElement>(".cm-content");
+    expect(content, "nothing mounted a CodeMirror in that host").not.toBeNull();
+    const view = EditorView.findFromDOM(content as HTMLElement);
+    expect(view, "no EditorView is mounted in that content DOM").not.toBeNull();
+    return view as EditorView;
+  }
+
+  /** The one caller shape: a destination for an edit, a destination for a save,
+   *  and a name for the region. Presence is the mode. */
+  function editing(recorded: { changes: string[]; saves: string[] }) {
+    return {
+      label: "Note of log.md",
+      onChange: (next: string) => recorded.changes.push(next),
+      onSave: (next: string) => recorded.saves.push(next),
+    };
+  }
+
+  it("is editable, named, and drawn by the same decoration layer", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "# Title\n\n*em*\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+
+    expect(preview.failure).toBeNull();
+    expect(host.querySelector('[contenteditable="true"]')).not.toBeNull();
+    expect(viewIn(host).state.readOnly).toBe(false);
+    expect(host.querySelector(".cm-content")?.getAttribute("aria-label")).toBe("Note of log.md");
+    // Not a second renderer: the note editor's own marks, in an editable view.
+    expect(host.querySelector(".cm-lp-h1")).not.toBeNull();
+    expect(host.querySelector(".cm-lp-em")?.textContent).toBe("em");
+    preview.destroy();
+  });
+
+  it("reports a change as the exact buffer", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+    const view = viewIn(host);
+
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "beta\n" } });
+
+    // The whole document and not a patch: the host holds one buffer and saves
+    // it, so a partial report is a file with a hole in it.
+    expect(recorded.changes).toEqual(["alpha\nbeta\n"]);
+    preview.destroy();
+  });
+
+  it("does not report an adoption as the reader's edit, which would be a loop", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+
+    preview.setContent("gamma\n");
+
+    expect(viewIn(host).state.doc.toString()).toBe("gamma\n");
+    expect(recorded.changes).toEqual([]);
+    preview.destroy();
+  });
+
+  it("leaves the caret alone when the text it is handed is the text it holds", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\nbeta\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+    const view = viewIn(host);
+    view.dispatch({ selection: { anchor: 3 } });
+
+    preview.setContent("alpha\nbeta\n");
+
+    // The no-op is what makes the controlled prop safe: the pane reports every
+    // keystroke upward and the identical string comes back, and a dispatch of it
+    // would map the selection to the end of the replacement on every character.
+    expect(view.state.selection.main.head).toBe(3);
+    preview.destroy();
+  });
+
+  it("hands `Mod-s` the document's own text, and writes nothing itself", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+    const view = viewIn(host);
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "beta\n" } });
+
+    // Ctrl and not Cmd: jsdom presents itself as something other than a Mac, so
+    // CodeMirror binds `Mod` to Ctrl and a Cmd-flagged event would match
+    // nothing, assert nothing, and still pass.
+    view.contentDOM.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "s", ctrlKey: true, bubbles: true }),
+    );
+
+    // The text the VIEW holds, so a save cannot write a buffer it has moved
+    // past — and the module itself reaches no write path to reach.
+    expect(recorded.saves).toEqual(["alpha\nbeta\n"]);
+    preview.destroy();
+  });
+
+  it("brings history with the keymap, so an edit can be taken back", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+    const view = viewIn(host);
+
+    view.dispatch({
+      changes: { from: view.state.doc.length, insert: "beta\n" },
+      userEvent: "input.type",
+    });
+
+    expect(undoDepth(view.state)).toBeGreaterThan(0);
+    expect(undo(view)).toBe(true);
+    expect(view.state.doc.toString()).toBe("alpha\n");
+    preview.destroy();
+  });
+
+  it("keeps the file's own line endings, because a save follows this buffer", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\r\nbeta\r\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+
+    // Without the `lineSeparator` facet CodeMirror hands back "\n" for every
+    // line, so saving an untouched CRLF file would rewrite every line in it.
+    expect(viewIn(host).state.doc.toString()).toBe("alpha\r\nbeta\r\n");
+    preview.destroy();
   });
 });

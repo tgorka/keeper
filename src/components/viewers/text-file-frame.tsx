@@ -49,6 +49,14 @@
  * editor, because a toolbar acts on a live view and this frame holds none: what
  * travels down is a boolean, never an editor handle.
  *
+ * Story 51.5's Note tab is decided in the same breath and by the same
+ * predicate. It is a way of writing text too — the live-preview editor over the
+ * same buffer and the same Save (FR-294) — so it appears exactly where the
+ * toolbar and the Save button do, and a `workspace/` file (AD-113) or an
+ * oversize one gets Preview and Source as before. Absent rather than
+ * present-and-refusing: a third tab that opened an editor nothing would accept
+ * is the shape 45.2 spent a paragraph rejecting.
+ *
  * # And so are the file's own properties
  *
  * Story 50.4 mounts the notes properties panel over a file (FR-283). Same
@@ -405,6 +413,11 @@ export function TextFileFrame({
           csv={csv}
           preview={preview}
           writingTools={writingTools}
+          // The same flag, deliberately, and passed twice because the view asks
+          // two different questions of it: which tools its editor mounts, and
+          // whether a third tab exists. Story 51.5's mode is a way of writing
+          // text, so it lives exactly where a Save can land — see the header.
+          noteMode={writingTools}
           onExternalWrite={() => void reload()}
           editor={TextEditorSurface}
           csvOptions={csvOptions}

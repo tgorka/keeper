@@ -47,6 +47,26 @@ describe("readViewModes", () => {
   it("is not confused by another cookie whose name ends with ours", () => {
     expect(readViewModes(`not_${VIEW_MODE_COOKIE}=json%3Araw`)).toEqual({});
   });
+
+  it("row 10: reads a jar written before Note mode existed, unchanged", () => {
+    // The vocabulary widened in Story 51.5 and the old values are the same
+    // values. A reader who chose Source for markdown in an older build still
+    // gets Source.
+    expect(readViewModes(jar("markdown:rendered|json:raw"))).toEqual({
+      markdown: "rendered",
+      json: "raw",
+    });
+  });
+
+  it("row 11: reads `note`, rather than dropping a value it has never stored", () => {
+    // The other direction of the same compatibility, and the reason it is
+    // asserted: a build that did not know the word would drop this pair as
+    // malformed and silently reset the reader's choice.
+    expect(readViewModes(jar("markdown:note|csv:rendered"))).toEqual({
+      markdown: "note",
+      csv: "rendered",
+    });
+  });
 });
 
 describe("viewModeFor", () => {
@@ -59,6 +79,16 @@ describe("viewModeFor", () => {
     // one of them would get it wrong.
     expect(viewModeFor(jar("json:raw"), "csv")).toBe(DEFAULT_VIEW_MODE);
     expect(DEFAULT_VIEW_MODE).toBe("rendered");
+  });
+
+  it("row 11: answers `note` for a format that was remembered in it", () => {
+    expect(viewModeFor(jar("markdown:note"), "markdown")).toBe("note");
+  });
+
+  it("still answers the default for markdown, which is not the editor", () => {
+    // Never Note by default: a person opening a file to read it must not land
+    // in an editor.
+    expect(viewModeFor(jar(""), "markdown")).toBe("rendered");
   });
 });
 
@@ -82,5 +112,9 @@ describe("viewModeCookie", () => {
 
   it("round-trips through its own reader", () => {
     expect(viewModeFor(viewModeCookie("", "markdown", "raw"), "markdown")).toBe("raw");
+  });
+
+  it("round-trips `note` too, so the third mode survives a restart", () => {
+    expect(viewModeFor(viewModeCookie("", "markdown", "note"), "markdown")).toBe("note");
   });
 });

@@ -20,8 +20,14 @@
 import "@codemirror/lang-markdown";
 import "@codemirror/language";
 import "@codemirror/state";
-import "@codemirror/view";
 import "@/components/notes/editor/live-preview";
+// Note mode's mount awaits two more chunks — the editing keymap and Story
+// 43.1's Tab bindings — so they are warmed here for the same reason as the
+// four above: `settle()` drains microtasks and never a frame, and a cold
+// `import()` would not have resolved by the time it returns.
+import "@/components/notes/editor/indent-keymap";
+import { undo, undoDepth } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,7 +58,7 @@ vi.mock("./markdown-preview", async (importOriginal) => {
       // fragment of a render; the double has to do the same or the assertions
       // about what is left behind would be about the double.
       host.replaceChildren();
-      return { failure: forcedPreviewFailure, destroy: () => {} };
+      return { failure: forcedPreviewFailure, setContent: () => {}, destroy: () => {} };
     },
   };
 });
@@ -697,5 +703,266 @@ describe("the structure view shows what the file says", () => {
     );
     // A truncated view that says nothing reads as a short file.
     expect(screen.getByRole("status")).toHaveTextContent("showing the first 5000 of 5101 values");
+  });
+});
+
+/**
+ * Story 51.5's third view, against the real thing (FR-294).
+ *
+ * The pane is a REAL `EditorView` carrying the real decoration layer and the
+ * real editing keymap, and the host above it is the same one-buffer `Host` every
+ * other test in this file uses. That combination is the whole point: what has to
+ * hold is that the buffer, the dirty text and the Save are the SAME ones the
+ * Source tab has, and a mocked mount could not tell a shared buffer from a
+ * second copy of the text.
+ */
+
+/** The live view inside the pane, asserted rather than assumed. */
+function paneView(container: HTMLElement): EditorView {
+  const content = container.querySelector<HTMLElement>(".cm-content");
+  expect(content, "the pane mounted no CodeMirror").not.toBeNull();
+  const view = EditorView.findFromDOM(content as HTMLElement);
+  expect(view, "no EditorView is mounted in that content DOM").not.toBeNull();
+  return view as EditorView;
+}
+
+/**
+ * Type at the caret, one character per transaction.
+ *
+ * Per character and with the `input.type` user event, because that is how an
+ * edit actually arrives and because the shape row 5 is about — a view rebuilt
+ * between keystrokes — is invisible to a single bulk dispatch.
+ */
+async function typeAtCaret(view: EditorView, text: string): Promise<void> {
+  for (const character of text) {
+    await act(async () => {
+      const at = view.state.selection.main.head;
+      view.dispatch({
+        changes: { from: at, insert: character },
+        selection: { anchor: at + character.length },
+        userEvent: "input.type",
+      });
+    });
+    await settle();
+  }
+}
+
+/** The modifier CodeMirror's `Mod-s` resolves to in this environment. A
+ *  constant for the reason `text-file-viewer.test.tsx` states: jsdom presents
+ *  itself as something other than a Mac, so `Mod` binds to Ctrl and a
+ *  Cmd-flagged event would match nothing, assert nothing, and still pass. */
+const MOD = { ctrlKey: true };
+
+/** A writable markdown file, in whichever mode the jar asks for. */
+function markdownHost(over: Partial<React.ComponentProps<typeof Host>> = {}): React.ReactElement {
+  return (
+    <Host
+      format="markdown"
+      rendered="markdown"
+      language="markdown"
+      noteMode
+      cookie={jar()}
+      fileName="log.md"
+      initial={"# Session\n\nalpha\n"}
+      preview={{ vaultId: null }}
+      {...over}
+    />
+  );
+}
+
+/** Opened straight into Note mode, which is what a reader who chose it once
+ *  gets on every markdown file after. */
+async function openNote(
+  over: Partial<React.ComponentProps<typeof Host>> = {},
+): Promise<{ container: HTMLElement; view: EditorView }> {
+  const { container } = render(
+    markdownHost({ cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Anote`), ...over }),
+  );
+  await settle();
+  return { container, view: paneView(container) };
+}
+
+describe("Note mode is a third view over one buffer (Story 51.5)", () => {
+  it("row 1: offers Preview, Source and Note, and a reader lands on Preview", async () => {
+    render(markdownHost());
+    await settle();
+
+    // The order is the reading order, and the default is unchanged: a person
+    // opening a file to read it must not land in an editor.
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Preview",
+      "Source",
+      "Note",
+    ]);
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("offers no Note tab when the frame did not say the file may be written", async () => {
+    // The view half of rows 7–9. WHICH files may be written is the frame's
+    // verdict and is asserted against Rust's own refusal in its suite; what this
+    // component owes is that it never invents the tab for itself.
+    render(markdownHost({ noteMode: undefined }));
+    await settle();
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+  });
+
+  it("row 11: restores Note from the jar, as an editable region with the file's name", async () => {
+    const { container } = await openNote();
+
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    // Editable, and named: CodeMirror gives its content `role="textbox"` and no
+    // accessible name, so a pane without the label announces itself as an
+    // unlabelled text box.
+    expect(screen.getByRole("textbox", { name: "Note of log.md" })).toBeInTheDocument();
+    // The note editor's own decorations, so this is that renderer and not a
+    // second one that happens to produce similar HTML.
+    expect(container.querySelector(".cm-lp-h1")).not.toBeNull();
+  });
+
+  it("row 10: a jar written before Note mode existed still resolves", async () => {
+    render(markdownHost({ cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Araw`) }));
+    await settle();
+
+    expect(screen.getByRole("tab", { name: "Source" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Source of log.md")).toHaveValue("# Session\n\nalpha\n");
+  });
+
+  it("lights Preview for a `note` jar on a file that offers no Note tab", async () => {
+    // Not "lights nothing at all", which is what reading the stored preference
+    // verbatim would do — and the jar is left holding `note`, so the next
+    // writable markdown file still honours it.
+    const cookie = jar(`${VIEW_MODE_COOKIE}=markdown%3Anote`);
+    render(markdownHost({ noteMode: undefined, cookie }));
+    await settle();
+
+    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    expect(cookie.read()).toBe(`${VIEW_MODE_COOKIE}=markdown%3Anote`);
+  });
+
+  it("row 2: renders what is typed and reports it to the buffer the Save writes", async () => {
+    const saved: string[] = [];
+    const { container, view } = await openNote({ onSaved: (text) => saved.push(text) });
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "## Later\n");
+    // Live, through the same decoration layer the Preview tab mounts.
+    expect(container.querySelector(".cm-lp-h2")).not.toBeNull();
+
+    // Row 13. The same chord and the same `onSave` the Source tab calls, and it
+    // carries the characters the view actually holds.
+    fireEvent.keyDown(view.contentDOM, { key: "s", ...MOD });
+    await settle();
+    expect(saved).toEqual(["# Session\n\nalpha\n## Later\n"]);
+  });
+
+  it("row 3: an edit made in Note mode is on the Source tab, unsaved", async () => {
+    const saved: string[] = [];
+    const { view } = await openNote({ onSaved: (text) => saved.push(text) });
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+
+    // One buffer: the Source tab is looking at the characters Note mode
+    // produced, and nothing has been written.
+    expect(screen.getByLabelText("Source of log.md")).toHaveValue("# Session\n\nalpha\nbeta\n");
+    expect(saved).toEqual([]);
+  });
+
+  it("row 4: an edit made in Source is in Note mode, and the caret does not jump", async () => {
+    render(markdownHost({ cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Araw`) }));
+    await settle();
+    fireEvent.change(screen.getByLabelText("Source of log.md"), {
+      target: { value: "# Session\n\nalpha and more\n" },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Note" }));
+    await settle();
+
+    // The unsaved edit crossed the switch: Note mode mounts over the host's
+    // buffer, not over the bytes the file was opened with.
+    const view = paneView(document.body);
+    expect(view.state.doc.toString()).toBe("# Session\n\nalpha and more\n");
+
+    // And the caret stays where a person put it, through the round trip the old
+    // `[text]`-keyed effect destroyed: the keystroke is reported upward, the
+    // host stores it, the identical string comes back as a prop, and the
+    // adoption is a no-op. Re-queried rather than read off the handle above,
+    // because a rebuilt view leaves that handle holding a destroyed one whose
+    // state still reads correctly — which is a test that cannot fail.
+    const at = view.state.doc.toString().indexOf("alpha") + "alpha".length;
+    await act(async () => {
+      view.dispatch({ selection: { anchor: at } });
+    });
+    await typeAtCaret(view, "!");
+
+    const live = paneView(document.body);
+    expect(live).toBe(view);
+    expect(live.state.doc.toString()).toBe("# Session\n\nalpha! and more\n");
+    expect(live.state.selection.main.head).toBe(at + 1);
+  });
+
+  it("row 5: ten keystrokes leave one view standing, with its undo history", async () => {
+    const { container, view } = await openNote();
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "0123456789");
+    expect(view.state.doc.toString()).toBe("# Session\n\nalpha\n0123456789");
+
+    // The same view object, not a tenth rebuild of it. This is the assertion
+    // that fails against a `[text]`-keyed mount effect: an editable pane reports
+    // every keystroke upward and gets the identical string straight back, so a
+    // text key would tear the view down on every character.
+    expect(paneView(container)).toBe(view);
+    // And the history is intact, which is what a reader actually notices. A
+    // rebuilt view has an empty one, so `undo` would change nothing.
+    expect(undoDepth(view.state)).toBeGreaterThan(0);
+    await act(async () => {
+      expect(undo(view)).toBe(true);
+    });
+    expect(view.state.doc.toString()).not.toContain("0123456789");
+  });
+
+  it("row 6: Preview is still read-only, so typing in it changes nothing", async () => {
+    const { container, view } = await openNote({
+      cookie: jar(`${VIEW_MODE_COOKIE}=markdown%3Arendered`),
+    });
+
+    // Both halves of the clamp, because one is not enough: `editable` stops
+    // typing and `readOnly` is what stops Enter, Backspace, cut and paste,
+    // which arrive as commands rather than as input.
+    expect(container.querySelector('[contenteditable="true"]')).toBeNull();
+    expect(view.state.readOnly).toBe(true);
+
+    fireEvent.keyDown(view.contentDOM, { key: "x" });
+    expect(view.state.doc.toString()).toBe("# Session\n\nalpha\n");
+  });
+
+  it("row 12: outside a vault an embed degrades to its link rather than crashing", async () => {
+    const { container, view } = await openNote({ initial: "see ![[notes/other]]\n" });
+
+    // 50.3's measured degrade, unchanged by the mode: the decoration layer
+    // renders the wikilink with its target, because there is no vault to
+    // resolve it against.
+    expect(view.state.doc.toString()).toBe("see ![[notes/other]]\n");
+    expect(container.textContent).toContain("notes/other");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps a CRLF file's own line endings, so an untouched save is not a whole diff", async () => {
+    const { view } = await openNote({ initial: "# Session\r\nalpha\r\n" });
+
+    // The `lineSeparator` facet, asserted where it matters: this buffer is one
+    // a save writes, and a document that hands back "\n" for every line would
+    // rewrite every line of the file on the first Save.
+    expect(view.state.doc.toString()).toBe("# Session\r\nalpha\r\n");
+    expect(view.state.doc.lines).toBe(3);
   });
 });

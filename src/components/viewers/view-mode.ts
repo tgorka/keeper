@@ -1,5 +1,5 @@
 /**
- * Which of a file's two views the reader last chose, remembered per FORMAT
+ * Which of a file's views the reader last chose, remembered per FORMAT
  * (Story 45.4, FR-177, AD-88, UX-DR67).
  *
  * **Per format, never per file.** A person who prefers to see CSVs as a table
@@ -24,8 +24,21 @@
  * never" is the shape of defect this epic exists to stop shipping.
  */
 
-/** The two views every text-shaped format has. `raw` is always editable. */
-export type ViewMode = "raw" | "rendered";
+/**
+ * The views a text-shaped format can have.
+ *
+ * `raw` is always editable and is the one every format has. `rendered` is the
+ * format's own drawing of itself — a preview, a table, a structure — and is
+ * read-only. `note` is Story 51.5's third mode and exists for markdown alone:
+ * the same live-preview layer the `rendered` half mounts, editable, over the
+ * same buffer and the same explicit Save (FR-294).
+ *
+ * Widened here rather than by a second per-format enum because the cookie
+ * below stores one vocabulary for every format, and a value this type does not
+ * admit is dropped by {@link isViewMode} — so the two would have to agree
+ * anyway, and one of them would eventually not.
+ */
+export type ViewMode = "raw" | "rendered" | "note";
 
 /** The cookie every format's remembered view shares. One cookie, not one each
  *  — a jar with a name per format is a jar that hits the per-origin cap. */
@@ -48,9 +61,19 @@ export const DEFAULT_VIEW_MODE: ViewMode = "rendered";
  *  and are constrained rather than escaped. */
 const FORMAT_ID = /^[a-z][a-z0-9+-]*$/;
 
-/** Whether a decoded cookie fragment is one of the two views. */
+/**
+ * Whether a decoded cookie fragment is one of the views.
+ *
+ * `note` joined the vocabulary in Story 51.5, and the compatibility runs both
+ * ways on purpose: a jar written by an older build holds `raw` or `rendered`
+ * and still resolves, and a jar holding `note` is not silently reset by a
+ * build that has the mode. What a `note` preference means on a file that
+ * offers no Note tab is `raw-rendered-view.tsx`'s question, not this table's —
+ * the jar remembers what the reader asked for, and the surface decides what it
+ * can honour.
+ */
 function isViewMode(value: string): value is ViewMode {
-  return value === "raw" || value === "rendered";
+  return value === "raw" || value === "rendered" || value === "note";
 }
 
 /**

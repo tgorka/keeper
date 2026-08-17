@@ -28,11 +28,67 @@
  * blank. 45.10 lifted that decoration into a `StateField` (`mermaidLayer`), so
  * a mermaid fence now renders, the pre-flight parse this module used to do is
  * gone, and diagrams are no longer a special case anywhere in the viewer.
+ *
+ * ## The clamp became a parameter, and the half with teeth still holds
+ *
+ * Until Story 51.5 the two facets below were unconditional, under a comment
+ * saying that editing markdown IS the note editor and that wiring an arbitrary
+ * file into it would be a second WRITE path, which AD-88 exists to prevent.
+ *
+ * That refusal had two halves and only one of them had teeth.
+ *
+ * The half that HOLDS is the write path, and this module still adds none.
+ * Note mode (FR-294) reports its edits to the surface that owns the file's one
+ * buffer and saves through that surface's one explicit Save — the same
+ * `syncWriteEntry` the Source tab reaches, on the same keystroke. There is no
+ * autosave here, no second conflict story, and nothing in this file writes.
+ *
+ * The half that does NOT hold is that rendering needs a note. It never did:
+ * `livePreview`'s only required option is a `vaultId`, which this module
+ * already supplies as `""` outside a vault, and note identity is needed by
+ * persistence alone. So editability is a parameter — {@link
+ * MarkdownPreviewOptions.editing}, whose absence is the clamp — rather than a
+ * fact about the renderer.
  */
 import type { ensureSyntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
 import type { NoteWidgetOptions } from "@/components/notes/editor/note-widget";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
+
+/**
+ * Where an edit goes, for a caller that wants the editable pane (Story 51.5).
+ *
+ * One object rather than a boolean beside two optional callbacks: presence IS
+ * the mode, so there is no state in which a view was made editable and its
+ * edits have nowhere to land. A caller that cannot say where a keystroke goes
+ * gets the read-only preview, which is the correct answer to that question.
+ */
+export interface MarkdownEditing {
+  /**
+   * Every document change, as the exact buffer.
+   *
+   * Not called for an adoption through `setContent`: text that came from the
+   * host is not the reader's edit, and reporting it back would be a loop.
+   */
+  onChange: (next: string) => void;
+  /**
+   * `Mod-s`, with the document's own text at the moment the chord fired.
+   *
+   * The text is passed rather than left to the caller's copy so a save cannot
+   * write a buffer the view has moved past — the same contract the raw editor
+   * hands its host.
+   */
+  onSave: (next: string) => void;
+  /**
+   * The accessible name for the editable region.
+   *
+   * CodeMirror gives its content `role="textbox"` and no name, so an editable
+   * pane without this announces itself as an unlabelled text box — the gap
+   * Story 45.14 found in the note editor and fixed there the same way. The
+   * read-only preview needs none: it is not a control.
+   */
+  label: string;
+}
 
 /** What the decoration layer needs to resolve embeds inside the document. */
 export interface MarkdownPreviewOptions {
@@ -74,12 +130,39 @@ export interface MarkdownPreviewOptions {
    * (AD-88) — the same rule the gallery's pins already follow.
    */
   mountWidget?: NoteWidgetOptions["mount"];
+  /**
+   * Where an edit goes, or absent for the read-only preview (Story 51.5).
+   *
+   * Absent is the default and stays the default: a person opening a file to
+   * read it must not land in an editor.
+   */
+  editing?: MarkdownEditing;
 }
 
 /** A mounted preview, or the sentence explaining why there is not one. */
 export interface MarkdownPreview {
   /** Null when the document rendered. A finished sentence when it did not. */
   failure: string | null;
+  /**
+   * Adopt text that came from outside this view.
+   *
+   * The same contract as `TextEditorMount.setContent` in `text-editor-host.ts`,
+   * including the no-op when the document already reads that way — which is
+   * what makes Note mode's controlled prop safe: the pane reports every
+   * keystroke upward, the host stores it, the identical string comes back, and
+   * dispatching it would reset the selection on every character. Remounting on
+   * `[text]`, which is what the pane used to do, destroys the caret, the undo
+   * stack and the scroll position instead.
+   *
+   * A throw from an update is deliberately NOT turned into a {@link failure}
+   * the way a throw from construction is: a refusal reported half-way through
+   * an update would leave a live view in a state this module cannot describe,
+   * and construction is where every failure this module has actually seen
+   * happens (DW-165).
+   *
+   * Always safe to call, including after a failure.
+   */
+  setContent: (next: string) => void;
   /** Always safe to call, including after a failure. */
   destroy: () => void;
 }
@@ -94,7 +177,10 @@ export interface MarkdownPreview {
 const PARSE_BUDGET_MS = 250;
 
 /**
- * Mount `text` into `host` as the note editor's preview, read-only.
+ * Mount `text` into `host` as the note editor's preview.
+ *
+ * Read-only unless {@link MarkdownPreviewOptions.editing} says where an edit
+ * goes — see the module comment for which half of the old refusal that keeps.
  *
  * Never rejects and never throws. A failure is a returned sentence, because
  * every caller's correct response to one is the same — say it and show the raw
@@ -105,23 +191,100 @@ export async function mountMarkdownPreview(
   text: string,
   options: MarkdownPreviewOptions,
 ): Promise<MarkdownPreview> {
-  const [state, view, markdown, preview] = await Promise.all([
+  const editing = options.editing ?? null;
+  // `.catch` and not a bare `await`: the six chunks below are fetched over the
+  // network in production and evaluated by a module runner in a test, and a
+  // rejection from either — an offline reader, a deploy that moved the chunk, a
+  // host torn down while the wave was in flight — would reject THIS promise and
+  // break the contract three lines up that every caller was written against.
+  // Normalised to a sentence here, because `reason` is the same wording the two
+  // construction failures below already use and a caller cannot tell the three
+  // apart usefully.
+  const loaded = await Promise.all([
     import("@codemirror/state"),
     import("@codemirror/view"),
     import("@codemirror/lang-markdown"),
     import("@/components/notes/editor/live-preview"),
-  ]);
+    // In the same wave rather than after it, so Note mode costs one chunk fetch
+    // and never a second round trip — and `null` when it was not asked for, so
+    // a reader who only ever previews does not download an editing keymap to
+    // not use it.
+    editing === null ? null : import("@codemirror/commands"),
+    editing === null ? null : import("@/components/notes/editor/indent-keymap"),
+  ]).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+  if (typeof loaded === "string") {
+    console.info(
+      `viewers: the markdown preview's editor could not be loaded, showing the source instead: ${loaded}`,
+    );
+    return {
+      failure:
+        "keeper could not load its editor for this document, so the source is below, unchanged: " +
+        loaded,
+      // Nothing was mounted, so there is nothing to adopt into: the host is
+      // showing the raw view, which holds the same buffer.
+      setContent: () => null,
+      destroy: () => {},
+    };
+  }
+  const [state, view, markdown, preview, commands, indent] = loaded;
+
+  // One flag rather than reading the document back: the update listener runs
+  // for programmatic dispatches too, and an adoption of the host's own buffer
+  // must not be reported back as the reader's edit — that is the loop a
+  // controlled prop over a live view exists to avoid.
+  let adopting = false;
 
   const editorState = state.EditorState.create({
     doc: text,
     extensions: [
       view.EditorView.lineWrapping,
-      // Read-only, and not editable at all. Editing markdown IS the note
-      // editor, which has a save path and a conflict story of its own; wiring
-      // an arbitrary file into it would be a second write path, which AD-88
-      // exists to prevent. The raw view is the editable one.
-      state.EditorState.readOnly.of(true),
-      view.EditorView.editable.of(false),
+      ...(editing === null || commands === null || indent === null
+        ? [
+            // The clamp, reached when no caller named a destination for an edit
+            // — and, by construction, only then: the two keymap chunks are
+            // requested in the same wave `editing` is read in, so the null
+            // checks above are TypeScript's narrowing rather than a second
+            // state. Read-only is the right way for that narrowing to fail.
+            //
+            // Both facets, never one: `editable` takes `contenteditable` off
+            // the content DOM and stops typing, and `readOnly` is what stops
+            // Backspace, Enter, cut and paste, which arrive as commands — the
+            // pair `text-editor-host.ts` spells out.
+            state.EditorState.readOnly.of(true),
+            view.EditorView.editable.of(false),
+          ]
+        : [
+            view.EditorView.contentAttributes.of({ "aria-label": editing.label }),
+            commands.history(),
+            view.keymap.of([
+              ...commands.defaultKeymap,
+              ...commands.historyKeymap,
+              // Story 43.1's binding, imported and not restated. Tab is claimed
+              // here for the reason it is claimed in a note and in the raw
+              // editor: an unclaimed Tab escapes to the web view, which edits
+              // the DOM under CodeMirror.
+              ...indent.indentBindings,
+              {
+                // The Source tab's save, on the Source tab's chord, through the
+                // surface that owns the buffer. Deliberately the only way text
+                // leaves this view: there is no autosave (three recorded
+                // refusals) and `syncWriteEntry` is last-write-wins with no
+                // revision guard, so an explicit press is the guard.
+                key: "Mod-s",
+                preventDefault: true,
+                run: (target) => {
+                  editing.onSave(target.state.doc.toString());
+                  return true;
+                },
+              },
+            ]),
+            view.EditorView.updateListener.of((update) => {
+              if (!update.docChanged || adopting) {
+                return;
+              }
+              editing.onChange(update.state.doc.toString());
+            }),
+          ]),
       markdown.markdown({ base: markdown.markdownLanguage }),
       preview.livePreview({
         // The decoration layer takes a value because the note editor is built
@@ -135,12 +298,34 @@ export async function mountMarkdownPreview(
         listFolder: options.listFolder,
         mountWidget: options.mountWidget,
       }),
+      // Line endings are the file's, not the editor's — `text-editor-host.ts`'s
+      // facet and its reason: without it CodeMirror hands back "\n" for every
+      // line, so saving an untouched CRLF file would rewrite every line in it.
+      // Set for the read-only pane too, because `setContent`'s equality check
+      // is what keeps a keystroke from resetting the caret, and an equality
+      // check over a document that does not round-trip byte for byte is one
+      // that always answers "different".
+      state.EditorState.lineSeparator.of("\n"),
     ],
   });
 
   try {
     const mounted = new view.EditorView({ parent: host, state: editorState });
-    return { failure: null, destroy: () => mounted.destroy() };
+    return {
+      failure: null,
+      setContent: (next: string) => {
+        if (mounted.state.doc.toString() === next) {
+          return;
+        }
+        adopting = true;
+        try {
+          mounted.dispatch({ changes: { from: 0, to: mounted.state.doc.length, insert: next } });
+        } finally {
+          adopting = false;
+        }
+      },
+      destroy: () => mounted.destroy(),
+    };
   } catch (error) {
     console.info(
       `viewers: the markdown preview could not be built, showing the source instead: ${
@@ -154,6 +339,7 @@ export async function mountMarkdownPreview(
       failure:
         "keeper could not draw this document, so the source is below, unchanged: " +
         (error instanceof Error ? error.message : String(error)),
+      setContent: () => {},
       destroy: () => {},
     };
   }

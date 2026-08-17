@@ -386,3 +386,84 @@ describe("a file's own properties", () => {
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
   });
 });
+
+/**
+ * Story 51.5's half of the frame: WHETHER a markdown file is offered Note mode
+ * (FR-294).
+ *
+ * Deliberately the same predicate as the writing tools and the properties panel,
+ * and asserted here rather than in the view because this is the layer that holds
+ * all three of its inputs — the registry's format, the size guard, and Rust's
+ * own refusal to write the location.
+ */
+describe("Note mode", () => {
+  it("is offered for a writable markdown file, beside Preview and Source", () => {
+    mount({}, MARKDOWN, ADDRESS);
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Preview",
+      "Source",
+      "Note",
+    ]);
+  });
+
+  it("row 7: is absent for a `workspace/` file, whose refusal is unchanged", () => {
+    // Rust's own sentence, carried on the listing row (AD-113). The tab is
+    // ABSENT rather than present-and-refusing: an editor over a buffer every
+    // write refuses is a control that announces its own refusal.
+    const refusal = "keeper does not write inside workspace/, which is scratch space";
+    render(
+      <TextFileFrame
+        fileName="notes.md"
+        entry={MARKDOWN}
+        state={state()}
+        writeRefusal={refusal}
+        csv={null}
+        properties={ADDRESS}
+        preview={{ vaultId: null }}
+      />,
+    );
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(refusal);
+  });
+
+  it("row 8: a file with no rendered view has neither a Preview nor a Note tab", () => {
+    // The registry's own `.rs` row, verbatim: a text viewer, writable, one
+    // language and no rendered half. Unchanged by this story — there is no
+    // live-preview view of a `.rs` to make editable.
+    const rust: ViewerEntry = {
+      viewer: "text",
+      format: "source",
+      label: "Rust source",
+      icon: "file-code",
+      rendered: null,
+      language: "rust",
+      writable: true,
+    };
+    mount({}, rust, ADDRESS);
+
+    expect(screen.queryByRole("tablist")).toBeNull();
+  });
+
+  it("row 9: is absent for an oversize file, of which only a prefix was read", () => {
+    mount(
+      { vm: vm({ oversize: true, detail: "readme.md is larger than 1.0 MB." }) },
+      MARKDOWN,
+      ADDRESS,
+    );
+
+    // The same rule the Save button follows: the loader declines a save that
+    // would truncate the rest of the file, so there is nothing for a third
+    // editing tab to save.
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Source" })).toBeInTheDocument();
+  });
+
+  it("is absent for a format keeper will not rewrite", () => {
+    mount({}, LOCKED, ADDRESS);
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+  });
+});

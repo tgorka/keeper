@@ -1,6 +1,6 @@
 /**
- * One component, two views, a toggle that remembers per format
- * (Story 45.4, FR-177, AD-88, UX-DR67).
+ * One component, a file's views, and a toggle that remembers per format
+ * (Story 45.4, FR-177, AD-88, UX-DR67; Story 51.5, FR-294).
  *
  * **Raw is always editable, and it is the same bytes.** AD-88 exists so keeper
  * never grows a read path and a write path that can disagree about what a file
@@ -29,6 +29,14 @@
  * only thing that writes a CSV. What this file adds is the one thing that
  * module could not know: after a cell lands, the raw buffer the host is holding
  * is stale, so {@link RawRenderedViewProps.onExternalWrite} asks for a re-read.
+ *
+ * **Markdown has a third view, and it is not a third buffer.** Story 51.5's
+ * Note tab is the same live-preview layer the Preview tab mounts, editable
+ * (`markdown-preview.ts` records which half of its old refusal that keeps).
+ * Everything AD-88 asks for is unchanged: an edit in Note mode is the same
+ * `onChange` the Source tab reports, `Mod-s` is the same `onSave` it calls, and
+ * there is no autosave on either. What the two panes must NOT share is a
+ * remount-on-text — see {@link MarkdownPane}.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
@@ -39,7 +47,7 @@ import { notesCsvSetCell } from "@/lib/ipc/client";
 import type { LanguageId, RenderedView, ViewerFormat } from "@/lib/viewers";
 import type { JsonParseError, JsonRow, JsonStructure } from "./json-structure";
 import { parseJsonlStructure, parseJsonStructure } from "./json-structure";
-import type { MarkdownPreview, MarkdownPreviewOptions } from "./markdown-preview";
+import type { MarkdownEditing, MarkdownPreview, MarkdownPreviewOptions } from "./markdown-preview";
 import { mountMarkdownPreview } from "./markdown-preview";
 import type { ViewMode } from "./view-mode";
 import { viewModeCookie, viewModeFor } from "./view-mode";
@@ -117,6 +125,22 @@ export interface RawRenderedViewProps {
    * were mounted in rather than by a second rule about tabs.
    */
   writingTools?: boolean;
+  /**
+   * Whether this markdown file is offered Story 51.5's Note tab (FR-294).
+   *
+   * The caller's verdict and never re-derived here, for the same reason
+   * {@link writingTools} is: it is the registry's `format`, the size guard and
+   * Rust's own write refusal, and this component holds none of the three. What
+   * it does hold is the second half of the question — whether there is a
+   * rendered markdown view to be editable AT ALL — so the two are combined
+   * below and nowhere else.
+   *
+   * It is deliberately the same predicate the writing tools stand on rather
+   * than a looser one: Note mode is a way of writing text, and offering it
+   * where no save can follow would be a control that announces its own
+   * refusal — the shape 45.2 spent a paragraph rejecting.
+   */
+  noteMode?: boolean;
   /** The rendered view wrote the file; the host's buffer is now stale. */
   onExternalWrite?: () => void;
   /** 45.6's editor. See the module comment for why it is injected. */
@@ -139,6 +163,10 @@ const RENDERED_LABEL: Record<RenderedView, string> = {
 /** The raw tab. "Source", not "Raw": every editor a person has used calls the
  *  characters in the file the source, and this view is editable. */
 const RAW_LABEL = "Source";
+
+/** The third tab (Story 51.5). The owner's own word for it, and the word the
+ *  app already uses for the surface it behaves like. */
+const NOTE_LABEL = "Note";
 
 /** Rows the structure list assumes before one has been measured, in px. */
 const STRUCTURE_ROW_HEIGHT = 22;
@@ -306,45 +334,93 @@ function CsvPane({
   return <div ref={hostRef} className="h-full min-h-0 overflow-auto px-3 py-2 text-xs" />;
 }
 
-/** The note editor's preview over a file, reporting a refusal upward rather
- *  than leaving an empty box behind. */
+/**
+ * The note editor's own live-preview layer over a file — read-only for the
+ * Preview tab, editable for Note mode — reporting a refusal upward rather than
+ * leaving an empty box behind.
+ *
+ * One component for both, because they are one view with one parameter between
+ * them (Story 51.5). A second component would be a second place for the file
+ * surface and the note surface to disagree about what markdown looks like,
+ * which is what `markdown-preview.ts` refuses in its first paragraph.
+ */
 function MarkdownPane({
+  fileName,
   text,
   options,
+  editing,
   onOutcome,
 }: {
+  /** Display and aria only — and the identity that rebuilds the view. */
+  fileName: string;
   text: string;
   options: MarkdownPreviewOptions | undefined;
+  /**
+   * Where an edit goes, or null for the read-only Preview tab.
+   *
+   * Without the label: the editable region is named from `fileName` below, so
+   * a host cannot hand down a name for a file it is not showing.
+   */
+  editing: Omit<MarkdownEditing, "label"> | null;
   onOutcome: (failure: string | null) => void;
 }): React.ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const latest = useRef({ options, onOutcome });
-  latest.current = { options, onOutcome };
+  const mountRef = useRef<MarkdownPreview | null>(null);
+  const latest = useRef({ text, options, editing, onOutcome });
+  latest.current = { text, options, editing, onOutcome };
+  const editable = editing !== null;
 
+  // NOT keyed on `[text]`, which is what this effect used to be. An editable
+  // pane reports every keystroke upward and gets the identical string straight
+  // back as a prop, so a text key would tear the view down and rebuild it on
+  // every character — caret, undo stack and scroll position with it. The buffer
+  // is adopted below instead, the way the raw editor has always adopted it.
+  //
+  // What DOES rebuild it: the mode, because an extension list is fixed at
+  // construction and there is no compartment here; and the file, because an
+  // undo stack that reaches back into a previous file's text is a worse thing
+  // to own than a remount nobody can see.
   useEffect(() => {
     const host = hostRef.current;
     if (host === null) {
       return;
     }
     let disposed = false;
-    let preview: MarkdownPreview | null = null;
     void (async () => {
-      const mounted = await mountMarkdownPreview(host, text, {
+      const mounted = await mountMarkdownPreview(host, latest.current.text, {
         vaultId: null,
         ...latest.current.options,
+        // Indirected through the ref because the view outlives every render: a
+        // handler captured here would report this pane's edits to the first
+        // render's host forever.
+        editing: editable
+          ? {
+              label: `Note of ${fileName}`,
+              onChange: (next) => latest.current.editing?.onChange(next),
+              onSave: (next) => latest.current.editing?.onSave(next),
+            }
+          : undefined,
       });
       if (disposed) {
         mounted.destroy();
         return;
       }
-      preview = mounted;
+      mountRef.current = mounted;
+      // The buffer may have moved while the editor chunk was in flight. A no-op
+      // when it has not, which is the ordinary case.
+      mounted.setContent(latest.current.text);
       latest.current.onOutcome(mounted.failure);
     })();
     return () => {
       disposed = true;
-      preview?.destroy();
+      mountRef.current?.destroy();
+      mountRef.current = null;
       host.replaceChildren();
     };
+  }, [editable, fileName]);
+
+  useEffect(() => {
+    mountRef.current?.setContent(text);
   }, [text]);
 
   return <div ref={hostRef} className="h-full min-h-0 overflow-auto" />;
@@ -375,6 +451,7 @@ export function RawRenderedView({
   csv,
   preview,
   writingTools,
+  noteMode,
   onExternalWrite,
   editor: Editor,
   csvOptions,
@@ -426,10 +503,37 @@ export function RawRenderedView({
       : null;
 
   const refusalMessage = previewFailure?.message ?? structureRefusal ?? csvRefusal;
+
+  // Story 51.5's third mode, and both halves of the question are here. WHETHER
+  // this file may be written is `noteMode` — the frame's verdict, which reads
+  // the registry's format, the size guard and Rust's own write refusal, and is
+  // never re-derived in this component. WHETHER there is a live-preview view to
+  // make editable is `rendered === "markdown"`, which is this component's own
+  // question and the registry's answer to it.
+  //
+  // `readOnly` is belt as well as braces. A caller that passes `readOnly` and
+  // `noteMode` together is contradicting itself, and the safe reading of a
+  // contradiction is the one that does not put an editor over a buffer nothing
+  // will accept.
+  const noteOffered = rendered === "markdown" && noteMode === true && readOnly !== true;
+
+  // What the reader asked for, resolved against what THIS file can offer. A jar
+  // holding `note` for a file with no Note tab — a `workspace/` markdown file,
+  // an oversize one — lights the Preview tab rather than lighting nothing at
+  // all, and the jar is left holding `note` so the next writable markdown file
+  // still honours it.
+  const selected: ViewMode = chosen === "note" && !noteOffered ? "rendered" : chosen;
+
   // The choice the reader made is NOT changed by a file that cannot be drawn.
-  // The next file of this format still opens in the view they asked for.
+  // The next file of this format still opens in the view they asked for. A
+  // document the renderer refuses cannot host the note editor either, so that
+  // fallback is Source — the one view that is always editable (AD-88).
   const showing: ViewMode =
-    rendered === null || chosen === "raw" || refusalMessage !== null ? "raw" : "rendered";
+    refusalMessage !== null || rendered === null || selected === "raw"
+      ? "raw"
+      : selected === "note"
+        ? "note"
+        : "rendered";
 
   const choose = (next: ViewMode): void => {
     setChosen(next);
@@ -445,6 +549,17 @@ export function RawRenderedView({
 
   const renderedLabel = rendered === null ? null : RENDERED_LABEL[rendered];
 
+  /** The tabs this file has, in reading order: what the file looks like, then
+   *  its characters, then — for writable markdown — writing in the first. */
+  const tabs =
+    renderedLabel === null
+      ? []
+      : [
+          { mode: "rendered" as const, label: renderedLabel },
+          { mode: "raw" as const, label: RAW_LABEL },
+          ...(noteOffered ? [{ mode: "note" as const, label: NOTE_LABEL }] : []),
+        ];
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       {renderedLabel === null ? null : (
@@ -453,24 +568,18 @@ export function RawRenderedView({
           role="tablist"
           aria-label={fileName}
         >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={chosen === "rendered"}
-            className="rounded px-2 py-0.5 text-xs aria-selected:bg-muted"
-            onClick={() => choose("rendered")}
-          >
-            {renderedLabel}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={chosen === "raw"}
-            className="rounded px-2 py-0.5 text-xs aria-selected:bg-muted"
-            onClick={() => choose("raw")}
-          >
-            {RAW_LABEL}
-          </button>
+          {tabs.map((tab) => (
+            <button
+              key={tab.mode}
+              type="button"
+              role="tab"
+              aria-selected={selected === tab.mode}
+              className="rounded px-2 py-0.5 text-xs aria-selected:bg-muted"
+              onClick={() => choose(tab.mode)}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
       )}
 
@@ -509,7 +618,20 @@ export function RawRenderedView({
             writingTools={writingTools}
           />
         ) : rendered === "markdown" ? (
-          <MarkdownPane text={content} options={preview} onOutcome={onOutcome} />
+          <MarkdownPane
+            fileName={fileName}
+            text={content}
+            options={preview}
+            // One buffer and one Save, which is the whole of how Note mode adds
+            // no write path: an edit here is the same `onChange` the Source tab
+            // reports and `Mod-s` is the same `onSave` it calls.
+            editing={
+              showing === "note"
+                ? { onChange: (next) => onChange?.(next), onSave: (next) => void onSave?.(next) }
+                : null
+            }
+            onOutcome={onOutcome}
+          />
         ) : rendered === "table" && csv != null ? (
           <CsvPane coordinates={csv} options={csvOptions} onExternalWrite={onExternalWrite} />
         ) : structure !== null ? (
