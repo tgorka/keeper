@@ -17,6 +17,7 @@ import {
   SPACE_TERMS_READONLY,
 } from "@/components/notes/space-editor";
 import {
+  SESSION_SPACE_CREATE_DIR_LABEL,
   SESSION_SPACE_EDIT_TITLE,
   SESSION_SPACE_FOLDED_LABEL,
   SESSION_SPACE_FOLDED_NOTE,
@@ -53,6 +54,9 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // is every space that existed before Story 51.3.
     folded: p.folded ?? null,
     rows: p.rows ?? null,
+    // A space that says nothing about where its creates land, which is every
+    // space that existed before Story 52.5. `""` is the absent key, spelled.
+    createDir: p.createDir ?? "",
   };
 }
 
@@ -465,8 +469,38 @@ describe("SessionSpaceEditor fold and row cap", () => {
 });
 
 describe("SessionSpaceEditor failure", () => {
+  /**
+   * The refusal is Rust's to word (Story 52.5). `sessions_space_save` refuses a
+   * destination through `files::check_dir` before anything is written, and each
+   * rule has its own sentence — a path that leaves the session, `workspace/`
+   * being scratch that dies with the session, a dotted folder the markdown scan
+   * never reads back. Rendering {@link SESSION_SPACE_SAVE_FAILED} for all three
+   * would tell the operator only that something went wrong, which is the silence
+   * this surface exists to end.
+   */
+  it("renders the refusal keeper actually gave, not a generic one", async () => {
+    mockSave.mockRejectedValue(
+      new Error(
+        "workspace/ is scratch that is not versioned, not synced, and dies with the session",
+      ),
+    );
+    const { onSaved } = open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_CREATE_DIR_LABEL), {
+      target: { value: "workspace/logs" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText(/dies with the session/)).toBeInTheDocument();
+    expect(screen.queryByText(SESSION_SPACE_SAVE_FAILED)).toBeNull();
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  /** And the fallback is still there for a rejection that says nothing readable —
+   *  an empty message must not render as an empty refusal. */
   it("says the write failed and changes nothing, rather than closing as if it worked", async () => {
-    mockSave.mockRejectedValue(new Error("read-only volume"));
+    mockSave.mockRejectedValue(new Error(""));
     const { onSaved } = open(space());
 
     await screen.findByRole("button", { name: /Tag task/ });

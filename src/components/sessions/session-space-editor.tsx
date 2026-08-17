@@ -63,6 +63,7 @@ import {
   tagChipState,
   withTagTerm,
 } from "@/lib/stores/notes-filters";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** How many icons the chooser shows before it needs its own scroll region. */
@@ -181,6 +182,18 @@ export const SESSION_SPACE_ROWS_LABEL = "Rows";
 export const SESSION_SPACE_ROWS_NOTE =
   "How many rows to show before the rest folds behind a “Show more”. The space still finds every file, and the count beside its name is the whole list. Leave it empty to show all of them.";
 
+/**
+ * Where this space's creates land, and the sentence that keeps the field from
+ * being read as a filter (Story 52.5, FR-309).
+ *
+ * The note says *new files* and never *files*: the key governs writes only, and
+ * nothing moves when it is set. It also has to say the three places keeper will
+ * not write, because the alternative is finding out at Save.
+ */
+export const SESSION_SPACE_CREATE_DIR_LABEL = "New files go in";
+export const SESSION_SPACE_CREATE_DIR_NOTE =
+  "A folder inside the session for files this space creates — “logs”, or “notes/2026”. keeper makes it if it is not there, and the new file still carries this space's tag, which is what makes it appear here. Nothing already in the session moves. Leave it empty to keep putting new files at the session's root. Not workspace/, which is scratch that dies with the session; not a folder starting with a dot, which keeper never reads back; and nothing outside the session.";
+
 /** The editable half of a space's query, once the chips can hold all of it. */
 interface Draft {
   tags: readonly TagChip[];
@@ -250,6 +263,7 @@ export function SessionSpaceEditor({
   const orderId = useId();
   const foldedId = useId();
   const rowsId = useId();
+  const createDirId = useId();
   const iconGroupId = useId();
   const [name, setName] = useState(space?.name ?? "");
   const [icon, setIcon] = useState<string | null>(space?.icon ?? null);
@@ -281,6 +295,9 @@ export function SessionSpaceEditor({
   // Text for `order`'s reason, one comment up. An empty box is "no cap", which
   // is what a missing key already means.
   const [rows, setRows] = useState(() => (space?.rows == null ? "" : String(space.rows)));
+  // Text, and empty is "the session's root" — which is what an absent key
+  // already means, so there is nothing to resolve here.
+  const [createDir, setCreateDir] = useState(space?.createDir ?? "");
   // A create starts with chips and an empty draft; only a stored query has to be
   // decomposed, and only a stored query can turn out to be unrepresentable.
   const [terms, setTerms] = useState<Terms>(
@@ -410,10 +427,20 @@ export function SessionSpaceEditor({
         // section with no rows under a header that still counts them is not a
         // cap somebody meant.
         rows: /^\d+$/.test(rows.trim()) ? Number.parseInt(rows.trim(), 10) || null : null,
+        // Sent on every save for `folded`'s reason. Trimmed only: this is a
+        // path, and Rust owns what a path may be — an escaping, scratch or
+        // dotted directory comes back as a rejection with its own sentence,
+        // which is what the catch below now shows.
+        createDir: createDir.trim(),
       });
       onSaved();
-    } catch {
-      setFailure(SESSION_SPACE_SAVE_FAILED);
+    } catch (raw: unknown) {
+      // Rust's own sentence, not a generic one. A refused destination names which
+      // rule it broke — scratch that dies with the session, a dotted folder the
+      // scan never reads back, a path that leaves the session — and three
+      // different refusals reading identically is the silence this surface is
+      // supposed to have ended.
+      setFailure(syncErrorMessage(raw, SESSION_SPACE_SAVE_FAILED));
       setSaving(false);
     }
   }
@@ -623,7 +650,26 @@ export function SessionSpaceEditor({
             {SESSION_SPACE_ROWS_NOTE}
           </p>
 
-          <section aria-label="Terms" className="flex flex-col gap-2">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={createDirId}>{SESSION_SPACE_CREATE_DIR_LABEL}</Label>
+            <Input
+              id={createDirId}
+              // The placeholder is the default, spelled: an empty box is the
+              // session's own folder, which is where every create has always
+              // gone.
+              placeholder="The session's own folder"
+              value={createDir}
+              onChange={(event) => setCreateDir(event.target.value)}
+            />
+            <p data-slot="create-dir-note" className="text-muted-foreground text-sm">
+              {SESSION_SPACE_CREATE_DIR_NOTE}
+            </p>
+          </div>
+
+          {/* `shrink-0` for the same reason as the icon fieldset: the tag
+              combobox's listbox is a scroll region, which would otherwise make
+              this section absorb the body's overflow instead of scrolling it. */}
+          <section aria-label="Terms" className="flex shrink-0 flex-col gap-2">
             <span className="font-medium text-sm">Terms</span>
             {terms.kind === "pending" && (
               <p className="text-muted-foreground text-sm">Reading this space's terms…</p>

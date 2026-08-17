@@ -42,8 +42,16 @@ vi.mock("@/lib/ipc/client", () => ({
   // The file verbs, for the same reason: the Files heading imports all three
   // and the tree imports the fourth (FR-262).
   sessionsFileNew: vi.fn(),
-  sessionsFileNewKind: (rootId: unknown, sessionId: unknown, kind: unknown, title: unknown) =>
-    sessionsFileNewKind(rootId, sessionId, kind, title),
+  // Five arguments, the fifth being the id of the space that pressed the button
+  // (Story 52.5). A mock that forwarded four would drop the one argument that
+  // decides where the file lands, and this suite could not see it go missing.
+  sessionsFileNewKind: (
+    rootId: unknown,
+    sessionId: unknown,
+    kind: unknown,
+    title: unknown,
+    spaceId: unknown,
+  ) => sessionsFileNewKind(rootId, sessionId, kind, title, spaceId),
   sessionsFileDelete: vi.fn(),
   sessionsLogToday: vi.fn(),
   // And the board's one write (FR-263), imported transitively through
@@ -84,8 +92,6 @@ import {
   SESSION_DETAIL_LOG_HEADING,
   SESSION_DETAIL_OPEN_RECORD_LABEL,
   SESSION_DETAIL_PROPERTIES_HEADING,
-  SESSION_DETAIL_UNFILED_HEADING,
-  SESSION_DETAIL_UNFILED_HINT,
   SESSION_DETAIL_WORKSPACE_CAVEAT,
   SessionDetail,
 } from "@/components/sessions/session-detail";
@@ -97,6 +103,7 @@ import {
 } from "@/components/sessions/session-refs";
 import {
   SESSION_SPACE_NEW_NOTE,
+  SESSION_SPACE_UNTAGGED_KEY,
   SESSION_SPACES_EMPTY,
   SESSION_SPACES_HEADING,
   SESSION_SPACES_NO_FILES,
@@ -142,11 +149,14 @@ function detail(over: Partial<SessionDetailVm> = {}): SessionDetailVm {
       { date: "2026-08-10", title: "opened", body: "" },
     ],
     // The folder contract, which is what every case in this file exercises: a
-    // README-backed session with no task files and nothing unfiled. The flat
-    // contract's own rendering is tested where it is built, not by widening
-    // every fixture here into a shape it never has to draw.
+    // README-backed session with no task files. The flat contract's own
+    // rendering is tested where it is built, not by widening every fixture here
+    // into a shape it never has to draw.
+    //
+    // There is no `unfiled` key any more (Story 52.4): what declares no kind is
+    // the `Untagged` space's selection, which arrives on `sessions_space_files`
+    // like every other space's.
     shape: "folder",
-    unfiled: [],
     tasks: [],
     ...over,
   };
@@ -245,7 +255,48 @@ function space(over: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // as "follow the setting" by accident rather than by decision.
     folded: null,
     rows: null,
+    // Story 52.5's key: this space names no destination, which is byte-for-byte
+    // today's behaviour.
+    createDir: "",
     ...over,
+  };
+}
+
+/**
+ * The residue space, as `sessions_spaces` sends it (Story 52.4).
+ *
+ * Its query is every kind negated, so Rust answers `newFileKind: null` and puts
+ * {@link UNTAGGED_REFUSAL} on the selection — this fixture is that pair and not
+ * a hand-made variant of it.
+ */
+const UNTAGGED = space({
+  id: "_spaces/untagged.md",
+  name: "Untagged",
+  query: "-tag:about -tag:log -tag:prompt -tag:ref -tag:task",
+  sort: "name asc",
+  sortEffective: "name asc",
+  icon: "inbox",
+  defaultKey: SESSION_SPACE_UNTAGGED_KEY,
+  order: 6,
+  newFileKind: null,
+});
+
+/** `spaces::Refusal::Negated`'s sentence, as Rust words it. */
+const UNTAGGED_REFUSAL =
+  "this space asks for what is left over — every one of its terms is a negation — so it names " +
+  "no kind, and a create writes one kind with one tag. There is nothing a file made here could " +
+  "be: make the file from Files below, and it appears here until you give it a kind tag.";
+
+/** One row of a space's selection, named by the file it is. */
+function row(relPath: string) {
+  return {
+    id: `path:${relPath}`,
+    relPath,
+    subpath: `60-sessions/active/2026-08-10-keeper/${relPath}`,
+    title: relPath.replace(/\.md$/, ""),
+    tags: [],
+    mtimeMs: NOW - 1_000,
+    unstableIdentity: true,
   };
 }
 
@@ -325,20 +376,24 @@ describe("SessionDetail", () => {
     expect(within(files).getByText(SESSION_DETAIL_WORKSPACE_CAVEAT)).toBeInTheDocument();
   });
 
-  it("puts the files first and the log last, in document order", async () => {
+  it("puts the spaces above the files, and the log last, in document order", async () => {
     mount();
     await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
-    // Asserting on the DOM's own order rather than on three separate presence
-    // checks: "files first, log last" is a claim about sequence, and only a
+    // Asserting on the DOM's own order rather than on four separate presence
+    // checks: "spaces first, log last" is a claim about sequence, and only a
     // sequence can falsify it. `compareDocumentPosition` reads the rendered
     // tree, so a reorder that satisfied every individual query but shuffled the
-    // page would still fail here.
+    // page would still fail here — which is exactly what happened to this
+    // assertion in Story 52.4: the first two entries swapped and nothing else on
+    // the surface could tell.
     const order = [
-      SESSION_DETAIL_FILES_HEADING,
-      // After the files, on the operator's own instruction: the tree is what the
-      // session holds and this is a reading of it, so the contents come before
-      // keeper's grouping of them.
+      // ABOVE the files, on the operator's own instruction (*"umiesc spaces
+      // ponad files"*). It read the other way round until Story 52.4, on the
+      // argument that the tree is what the session holds and this is a reading
+      // of it — which is about which is more fundamental, not about which is
+      // read more often.
       SESSION_SPACES_HEADING,
+      SESSION_DETAIL_FILES_HEADING,
       SESSION_REFS_HEADING,
       SESSION_DETAIL_LOG_HEADING,
     ].map((name) => screen.getByRole("region", { name }));
@@ -377,24 +432,47 @@ describe("SessionDetail", () => {
     }
   });
 
-  it("shows unfiled root markdown as a nudge, and shows nothing when there is none", async () => {
+  /**
+   * Row 8. The `Unfiled` badge list is gone and the same files arrive as the
+   * LAST space instead.
+   *
+   * This test used to mock `detail({ unfiled: [...] })` and assert a region
+   * called "Unfiled" holding one static badge per filename — no count, no fold,
+   * no verb on any row. There is no such field on the payload now (`pool.unfiled`
+   * stops at the Rust boundary), so the claim is asserted at the same level in
+   * its new form: the residue is an ordinary space's selection, it sits after
+   * every other space, its rows are rows, and nothing on this surface is called
+   * Unfiled any more.
+   */
+  it("shows what declares no kind as the last space, and has no Unfiled list", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
+    sessionsSpaces.mockResolvedValue([space(), UNTAGGED]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null, openRecord: false },
+      {
+        spaceId: UNTAGGED.id,
+        files: [row("stray-thought.md"), row("pasted.md")],
+        error: null,
+        noHome: UNTAGGED_REFUSAL,
+        openRecord: false,
+      },
+    ]);
     mount();
-    // The clean session is the common one, and a permanent empty section on it
-    // would make the notice mean nothing when it did appear.
-    await screen.findByRole("region", { name: SESSION_DETAIL_FILES_HEADING });
-    expect(
-      screen.queryByRole("region", { name: SESSION_DETAIL_UNFILED_HEADING }),
-    ).not.toBeInTheDocument();
 
-    cleanup();
-    sessionsDetail.mockResolvedValue(
-      detail({ shape: "flat", unfiled: ["stray-thought.md", "pasted.md"] }),
-    );
-    mount();
-    const unfiled = await screen.findByRole("region", { name: SESSION_DETAIL_UNFILED_HEADING });
-    expect(within(unfiled).getByText("stray-thought.md")).toBeInTheDocument();
-    expect(within(unfiled).getByText("pasted.md")).toBeInTheDocument();
-    expect(within(unfiled).getByText(SESSION_DETAIL_UNFILED_HINT)).toBeInTheDocument();
+    const spaces = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    const untagged = within(spaces).getByRole("region", { name: "Untagged" });
+    expect(within(untagged).getByText("stray-thought")).toBeInTheDocument();
+    expect(within(untagged).getByText("pasted")).toBeInTheDocument();
+
+    // Last, which is the whole of the operator's instruction about where it
+    // goes: asserted on sequence, because a residue section rendered above Tasks
+    // would satisfy every presence check on this surface.
+    const sections = within(spaces).getAllByRole("region");
+    expect(sections[sections.length - 1]).toBe(untagged);
+
+    // And the surface it replaced is gone rather than sitting beside it, which is
+    // the half a presence check on the new section cannot see.
+    expect(screen.queryByRole("region", { name: "Unfiled" })).toBeNull();
   });
 
   it("re-reads ALL THREE when the changed event names this root — the agent's write moves the view", async () => {
@@ -522,6 +600,9 @@ describe("SessionDetail", () => {
         "01J5AAAAAAAAAAAAAAAAAAAAAA",
         "log",
         "",
+        // The space that pressed it (Story 52.5), so Rust can read that
+        // definition's own destination.
+        "_spaces/log.md",
       ),
     );
   });
@@ -532,8 +613,10 @@ describe("SessionDetail", () => {
    * A folder-shaped session's log is a `## Log` heading inside README.md, not a
    * file (`pool::log_view`), so `shape::kind_dir` refuses `(Folder, Log)`,
    * `sessions_space_files` puts that refusal on the selection, and the section
-   * prints it where the button would have been. Absent AND explained: the
-   * silence was the reported defect.
+   * renders it as the control's own description. Story 52.4 turned that control
+   * from absent into present-and-disabled: the refusal is a thing to read, and a
+   * gap where every other space has a button was a question the surface left the
+   * person to answer.
    *
    * **The sentence is on the payload, not composed anywhere in TypeScript.**
    * Story 50.1 shipped a `shape` prop feeding a TS copy of `kind_dir` and a TS
@@ -542,7 +625,7 @@ describe("SessionDetail", () => {
    * `session-spaces.test.tsx` hands itself the payload, so a dropped
    * `selections` prop is invisible from there.
    */
-  it("prints the no-home sentence Rust put on the selection, and offers no create", async () => {
+  it("describes the disabled create with the no-home sentence Rust put on the selection", async () => {
     const noHome =
       "a folder-shaped session's log is a `### ` entry under `## Log` in README.md, not a " +
       "file — use New log, which appends one there.";
@@ -553,36 +636,45 @@ describe("SessionDetail", () => {
     mount();
 
     const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
-    // The space is listed — the query is still true here — and only the write
-    // verb is gone.
+    // The space is listed — the query is still true here — and the write verb is
+    // present, refusing, and saying why.
     expect(within(section).getByText("Log")).toBeInTheDocument();
-    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+    const create = within(section).getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Log` });
+    expect(create).toBeDisabled();
+    // Resolved through the accessibility tree rather than by reading the
+    // attribute: a dangling `aria-describedby` renders byte-identically and every
+    // presence check still passes, which is the shape of defect this repo keeps
+    // shipping.
+    expect(create).toHaveAccessibleDescription(noHome);
     expect(within(section).getByText(noHome)).toBeInTheDocument();
   });
 
   /**
-   * Rows 1 and 2 of Story 51.7, at the mount point: a space that offers **no
-   * create at all** still explains itself.
+   * Rows 1 and 2 of Story 51.7 and row 2 of Story 52.4, at the mount point:
+   * About's refusal is a control a person can see, focus and read.
    *
-   * This is the About space, and the defect it shipped with was that the
-   * sentence was only computed where a create HAD been derived
-   * (`sessions_space_files` asked `creatable_kind` first), so the one space with
-   * three reasons to refuse had none of them on screen. Rust answers both halves
-   * now (`spaces::create_refused`, whose own tests own the wording and which of
-   * the refusals wins); what this asserts is the half that is the webview's — a
-   * sentence arriving beside `newFileKind: null` is printed rather than dropped
-   * on the floor with the button.
+   * The defect 51.7 shipped with was that the sentence was only computed where a
+   * create HAD been derived (`sessions_space_files` asked `creatable_kind`
+   * first), so the one space with three reasons to refuse had none of them on
+   * screen. 51.7 gave it the sentence; the button was still absent, and the
+   * owner's report on 52.4 was precisely that — *"about space nie ma przycisku
+   * dodaj jak inne"*. So the control is present now, disabled, and its
+   * accessible description IS Rust's sentence: nothing about this refusal is
+   * worded in TypeScript, and `session-spaces.test.tsx` cannot see that the
+   * sentence travelled because it hands itself the payload.
    *
    * The two-term sentence, deliberately, because that is the live zone's About
    * query (`tag:about tag:recordings`): the first refusal in the chain is the
    * query's own, and it is the one a person has to read to understand why.
    */
-  it("prints the sentence for a space that offers no create at all", async () => {
+  it("gives About a create that is present, disabled, and describes itself with Rust's refusal", async () => {
     const noHome =
       "this space asks for more than one thing, so there is no single kind a file made here " +
       "could be: every term has to hold for a file to appear, and a create writes one kind " +
       "with one tag. Narrow the query to a single `tag:` term to write into this space, or " +
-      "make the file from Files above and tag it so this space picks it up.";
+      // "below" since Story 52.4 moved this section above the files. The sentence
+      // is Rust's; a stale direction here is a stale direction in the product.
+      "make the file from Files below and tag it so this space picks it up.";
     sessionsSpaces.mockResolvedValue([
       space({
         id: "_spaces/about.md",
@@ -599,7 +691,11 @@ describe("SessionDetail", () => {
 
     const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
     expect(within(section).getByText(noHome)).toBeInTheDocument();
-    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+    const create = within(section).getByRole("button", {
+      name: `${SESSION_SPACE_NEW_NOTE} About`,
+    });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(noHome);
   });
 
   /**
@@ -674,6 +770,8 @@ describe("SessionDetail", () => {
         "01J5AAAAAAAAAAAAAAAAAAAAAA",
         "ref",
         "",
+        // The space that pressed it (Story 52.5).
+        "_spaces/refs.md",
       ),
     );
   });
@@ -986,7 +1084,7 @@ describe("SessionDetail after a file's properties change", () => {
     // it lists what the payload holds and never derives membership from a tag it
     // can see. A test that only asserted the row above would stay green over a
     // surface that filed files client-side.
-    sessionsDetail.mockResolvedValue(detail({ shape: "folder", unfiled: [] }));
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder" }));
     sessionsSpaces.mockResolvedValue([REFERENCES]);
     sessionsSpaceFiles.mockResolvedValue([
       { spaceId: REFERENCES.id, files: [], error: null, noHome: null, openRecord: false },

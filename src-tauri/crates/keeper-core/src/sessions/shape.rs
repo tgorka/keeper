@@ -199,8 +199,8 @@ pub const PROMPTS_DIR: &str = "prompts";
 /// The rejected alternative was folding these into [`kind_dir`]'s `Option` —
 /// `None` for "nowhere" as well as for "the session root". That makes the most
 /// dangerous answer the quiet one: a caller that forgot to branch would write a
-/// task into a folder-shaped session's root, where no space and no *Unfiled*
-/// notice can see it (`sessions_root::read_ref_sources` reads `README.md` plus
+/// task into a folder-shaped session's root, where no space can see it — not even
+/// the Untagged one (`sessions_root::read_ref_sources` reads `README.md` plus
 /// `refs/` and `prompts/`, and nothing else).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KindHasNoHome {
@@ -243,7 +243,7 @@ pub enum KindHasNoHome {
 }
 
 /// Where a session of this shape keeps files of this kind, relative to the
-/// session's own folder.
+/// session's own folder — or the directory the SPACE that asked named instead.
 ///
 /// `Ok(None)` is **the session root** — the flat contract's whole premise is one
 /// pool of markdown, so every kind it can hold lives there and there is no
@@ -252,6 +252,31 @@ pub enum KindHasNoHome {
 /// (`sessions_root::read_ref_sources` walks exactly `refs/` and `prompts/`) —
 /// which is the whole point, because a create that writes where the pool does
 /// not read produces a file no space can ever list.
+///
+/// **`create_dir` is the space's own answer, and `""` is no answer** (Story
+/// 52.5, FR-309). A space may name a directory its creates go into
+/// ([`super::spaces::SessionSpace::create_dir`]); empty means it named none, and
+/// then this returns exactly what it always returned. That is why the override
+/// is a parameter here rather than a second mapping beside this one: the
+/// question "where does a create of this kind go" has to have one answer, and a
+/// caller choosing between two functions is a caller that can choose wrong.
+///
+/// **The refusals are decided before the override is looked at.** A destination
+/// cannot make a homeless kind creatable: a folder-shaped session keeps no tasks
+/// file and its log is a README heading, and writing either into a directory the
+/// space named would produce precisely the invisible file the paragraph above
+/// refuses. So `create_dir` never widens what may be created — it only moves
+/// what already could be.
+///
+/// **And it is honoured under the flat contract only.** A flat session's pool is
+/// read wherever its markdown sits (FR-285: the walk descends every directory
+/// that is not dotted, `artifacts/` or `workspace/`), so a file written into
+/// `logs/` is read back, matched by the space's query and listed. A
+/// folder-shaped session's pool reads its root plus exactly `refs/` and
+/// `prompts/`, so honouring an override there would write a file no space in
+/// that session could ever list — the one thing this mapping exists to prevent.
+/// The contract's own directory therefore wins, and the way to file a
+/// folder-shaped session's creates elsewhere is to migrate it.
 ///
 /// **This is the authoritative direction, and the only one.**
 /// `migrate::carried_kind` answers the inverse — which kind a file
@@ -264,32 +289,52 @@ pub enum KindHasNoHome {
 /// a file; what makes that file a `ref` is the `tags: [ref]` frontmatter
 /// [`super::files::render_new`] stamps. [`super::pool::read_one`] derives the
 /// kind from tags alone and never looks at the path, so a caller that uses this
-/// mapping and skips the tag has written an unfiled file into `refs/`.
+/// mapping and skips the tag has written an unfiled file into `refs/`. A space's
+/// `create_dir` changes nothing about that: a file in `logs/` tagged `ref` is a
+/// reference, and the space that lists it is the one whose query matched the tag.
+///
+/// **Nothing here validates the destination.** The answer is checked as a path
+/// by [`super::files::check_dir`], which the create verb already asks about
+/// whatever this returns — one guard, asked, rather than a second one written
+/// here that would have to agree with it forever.
 ///
 /// # Errors
 /// [`KindHasNoHome`] for the three the contracts genuinely have nowhere to put:
 /// a folder-shaped task, a folder-shaped log (which is a README heading, not a
 /// file), and the record under either contract.
-pub fn kind_dir(shape: Shape, kind: KindTag) -> Result<Option<&'static str>, KindHasNoHome> {
+pub fn kind_dir(
+    shape: Shape,
+    kind: KindTag,
+    create_dir: &str,
+) -> Result<Option<&str>, KindHasNoHome> {
     // Refused under both contracts, so it is answered before the shape is
     // consulted: a second record would give `shape` two answers about which
     // contract this session follows.
     if kind == KindTag::About {
         return Err(KindHasNoHome::OnlyOne { shape, kind });
     }
-    match shape {
-        Shape::Flat => Ok(None),
+    let contract: Option<&'static str> = match shape {
+        Shape::Flat => None,
         Shape::Folder => match kind {
-            KindTag::Ref => Ok(Some(REFS_DIR)),
-            KindTag::Prompt => Ok(Some(PROMPTS_DIR)),
-            KindTag::Task => Err(KindHasNoHome::NoDirectory { shape, kind }),
-            KindTag::Log => Err(KindHasNoHome::NotAFile { shape, kind }),
+            KindTag::Ref => Some(REFS_DIR),
+            KindTag::Prompt => Some(PROMPTS_DIR),
+            KindTag::Task => return Err(KindHasNoHome::NoDirectory { shape, kind }),
+            KindTag::Log => return Err(KindHasNoHome::NotAFile { shape, kind }),
             // Answered above, and spelled out rather than swept into a `_` arm
             // so that a sixth kind fails to compile here instead of quietly
             // inheriting whatever the record's answer happens to be.
-            KindTag::About => Err(KindHasNoHome::OnlyOne { shape, kind }),
+            KindTag::About => return Err(KindHasNoHome::OnlyOne { shape, kind }),
         },
+    };
+    // Trimmed here as well as where it is read, because this is the function
+    // that decides: a definition file hand-edited to `create_dir: "logs "`
+    // must not compose a directory whose name ends in a space, and a key
+    // holding only blanks is a key that says nothing.
+    let named = create_dir.trim().trim_end_matches('/');
+    if shape == Shape::Flat && !named.is_empty() {
+        return Ok(Some(named));
     }
+    Ok(contract)
 }
 
 /// The four states a task file can be in — the board's columns (FR-259).
@@ -497,7 +542,7 @@ mod tests {
         }
     }
 
-    /// Matrix rows 1–3 (Story 50.1, FR-277).
+    /// Matrix rows 1–3 (Story 50.1, FR-277), with no space naming a directory.
     ///
     /// `Ok(None)` is "the session root, deliberately" and never "nowhere":
     /// the flat contract's whole premise is one pool at the root, so every kind
@@ -506,15 +551,15 @@ mod tests {
     fn a_flat_session_keeps_every_kind_at_its_root_and_a_folder_one_files_them() {
         for kind in [KindTag::Log, KindTag::Prompt, KindTag::Ref, KindTag::Task] {
             assert_eq!(
-                kind_dir(Shape::Flat, kind),
+                kind_dir(Shape::Flat, kind, ""),
                 Ok(None),
                 "the flat contract has no subdirectory for {}",
                 kind.as_str()
             );
         }
-        assert_eq!(kind_dir(Shape::Folder, KindTag::Ref), Ok(Some("refs")));
+        assert_eq!(kind_dir(Shape::Folder, KindTag::Ref, ""), Ok(Some("refs")));
         assert_eq!(
-            kind_dir(Shape::Folder, KindTag::Prompt),
+            kind_dir(Shape::Folder, KindTag::Prompt, ""),
             Ok(Some("prompts"))
         );
     }
@@ -529,14 +574,14 @@ mod tests {
     #[test]
     fn the_kinds_a_shape_has_no_home_for_are_refused_with_the_reason() {
         assert_eq!(
-            kind_dir(Shape::Folder, KindTag::Task),
+            kind_dir(Shape::Folder, KindTag::Task, ""),
             Err(KindHasNoHome::NoDirectory {
                 shape: Shape::Folder,
                 kind: KindTag::Task
             })
         );
         assert_eq!(
-            kind_dir(Shape::Folder, KindTag::Log),
+            kind_dir(Shape::Folder, KindTag::Log, ""),
             Err(KindHasNoHome::NotAFile {
                 shape: Shape::Folder,
                 kind: KindTag::Log
@@ -546,7 +591,7 @@ mod tests {
         // flat arm refuses it too rather than answering "the root".
         for shape in [Shape::Flat, Shape::Folder] {
             assert_eq!(
-                kind_dir(shape, KindTag::About),
+                kind_dir(shape, KindTag::About, ""),
                 Err(KindHasNoHome::OnlyOne {
                     shape,
                     kind: KindTag::About
@@ -559,14 +604,14 @@ mod tests {
     /// person needs: which contract they are on, and what to do instead.
     #[test]
     fn a_refusal_names_the_shape_the_kind_and_the_way_out() {
-        let task = kind_dir(Shape::Folder, KindTag::Task)
+        let task = kind_dir(Shape::Folder, KindTag::Task, "")
             .expect_err("a folder-shaped session has no tasks file")
             .to_string();
         assert!(task.contains("folder-shaped"), "{task}");
         assert!(task.contains("task"), "{task}");
         assert!(task.contains("flat"), "the way out is migration: {task}");
 
-        let log = kind_dir(Shape::Folder, KindTag::Log)
+        let log = kind_dir(Shape::Folder, KindTag::Log, "")
             .expect_err("a folder-shaped log is a heading")
             .to_string();
         assert!(log.contains("README.md"), "{log}");
@@ -580,17 +625,113 @@ mod tests {
     /// write into — `files::check_dir` refuses `workspace/`, traversal and
     /// dotfolders, and a mapping that returned one of those would turn a
     /// containment rule into a refusal at the last possible moment.
+    ///
+    /// Asked of a space's own destination too (Story 52.5): the override rides
+    /// out through the same return value, so it meets the same guard, which is
+    /// the argument for it being a parameter here rather than a second mapping.
     #[test]
     fn every_directory_the_mapping_names_is_one_a_create_may_write_into() {
         for shape in [Shape::Flat, Shape::Folder] {
             for kind in KINDS {
-                if let Ok(Some(dir)) = kind_dir(shape, kind) {
-                    assert!(
-                        crate::sessions::files::check_dir(dir).is_ok(),
-                        "{dir} is not a directory a session file may be written into"
-                    );
+                for named in ["", "logs", "notes/2026"] {
+                    if let Ok(Some(dir)) = kind_dir(shape, kind, named) {
+                        assert!(
+                            crate::sessions::files::check_dir(dir).is_ok(),
+                            "{dir} is not a directory a session file may be written into"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// Story 52.5, acceptance 2: the space's directory is where its creates go,
+    /// and it is returned for every kind the flat contract can hold — the
+    /// destination is the SPACE's, so it does not vary by kind.
+    #[test]
+    fn a_space_that_names_a_directory_is_where_its_creates_land() {
+        for kind in [KindTag::Log, KindTag::Prompt, KindTag::Ref, KindTag::Task] {
+            assert_eq!(
+                kind_dir(Shape::Flat, kind, "logs"),
+                Ok(Some("logs")),
+                "a space's own directory holds whatever it creates, including {}",
+                kind.as_str()
+            );
+        }
+        // Nested, because a destination is a path and not a name: `dir_rel`
+        // addresses directories in front of the last segment, and a space
+        // filing into `notes/2026` is asking for one that already exists.
+        assert_eq!(
+            kind_dir(Shape::Flat, KindTag::Log, "notes/2026"),
+            Ok(Some("notes/2026"))
+        );
+    }
+
+    /// Story 52.5, acceptance 1: a space that named nothing is answered exactly
+    /// as it was before the parameter existed — and a key holding only blanks or
+    /// a trailing separator says nothing new either.
+    #[test]
+    fn a_destination_of_blanks_or_a_bare_separator_is_no_destination() {
+        for named in ["", "   ", "\t", "/"] {
+            assert_eq!(
+                kind_dir(Shape::Flat, KindTag::Log, named),
+                Ok(None),
+                "{named:?} names no directory, so the answer is the session root"
+            );
+        }
+        // A trailing separator is the same request without it (`dir_rel`'s own
+        // rule), and surrounding blanks are not part of a directory's name.
+        assert_eq!(
+            kind_dir(Shape::Flat, KindTag::Log, " logs/ "),
+            Ok(Some("logs"))
+        );
+    }
+
+    /// Story 52.5: a destination never widens what may be created, because the
+    /// refusals are decided before it is looked at. A folder-shaped session
+    /// keeps no tasks file, and a space naming `tasks/` does not give it one —
+    /// the file would be in no pool that session reads.
+    #[test]
+    fn a_destination_cannot_make_a_homeless_kind_creatable() {
+        assert_eq!(
+            kind_dir(Shape::Folder, KindTag::Task, "tasks"),
+            Err(KindHasNoHome::NoDirectory {
+                shape: Shape::Folder,
+                kind: KindTag::Task
+            })
+        );
+        assert_eq!(
+            kind_dir(Shape::Folder, KindTag::Log, "logs"),
+            Err(KindHasNoHome::NotAFile {
+                shape: Shape::Folder,
+                kind: KindTag::Log
+            })
+        );
+        for shape in [Shape::Flat, Shape::Folder] {
+            assert_eq!(
+                kind_dir(shape, KindTag::About, "records"),
+                Err(KindHasNoHome::OnlyOne {
+                    shape,
+                    kind: KindTag::About
+                })
+            );
+        }
+    }
+
+    /// Story 52.5: the folder contract's own directories win over a space's
+    /// destination, because that shape's pool reads exactly them plus the root
+    /// (`sessions_root::read_ref_sources`). A create honoured into `logs/` there
+    /// would be a file no space in the session could ever list — the failure the
+    /// mapping exists to prevent.
+    #[test]
+    fn a_folder_shaped_session_files_by_its_contract_whatever_a_space_says() {
+        assert_eq!(
+            kind_dir(Shape::Folder, KindTag::Ref, "logs"),
+            Ok(Some("refs"))
+        );
+        assert_eq!(
+            kind_dir(Shape::Folder, KindTag::Prompt, "logs"),
+            Ok(Some("prompts"))
+        );
     }
 }

@@ -354,15 +354,6 @@ pub struct SessionDetailVm {
     /// to *offer* — migration, a new-log button — never to decide what a file
     /// means; that decision was already made in Rust (AD-7).
     pub shape: String,
-    /// Root markdown declaring no kind: a leftover `README.md`, a file someone
-    /// dropped in, anything mid-migration. Session-relative paths.
-    ///
-    /// Surfaced rather than swallowed. The flat contract's whole premise is
-    /// that a file says what it is, so a file that says nothing is exactly the
-    /// case the operator needs to see — and it is what makes a half-finished
-    /// migration visible instead of merely survivable. Empty for a clean
-    /// session, in both shapes.
-    pub unfiled: Vec<String>,
     /// The work items, ready for the board — under **either** contract.
     ///
     /// The folder shape used to have none, because the detail read the pool only
@@ -505,6 +496,17 @@ pub struct SessionSpaceVm {
     /// how much it is not showing. Capping the selection instead would make that
     /// count a lie, which is the one thing this key must not do.
     pub rows: Option<u32>,
+    /// The directory this space's creates go into, session-relative — empty when
+    /// it names none, which is today's behaviour for every space (Story 52.5,
+    /// FR-309).
+    ///
+    /// Carried so the editor can show what the file says and send it back
+    /// unchanged; the surface never composes a path out of it and never reads a
+    /// kind out of it. Where a create actually lands is
+    /// [`crate::sessions::shape::kind_dir`]'s answer in Rust (AD-65), which
+    /// takes this as its override and keeps the session's contract as the
+    /// fallback.
+    pub create_dir: String,
     /// Presentation keys keeper could not read, each a finished sentence. The
     /// space still works — this is the "not obeying one line of its own file"
     /// severity, distinct from `error`.
@@ -713,6 +715,12 @@ pub struct SessionSpaceReq {
     /// How many rows the section renders; `null` writes no key, and zero is not
     /// a legal cap (Story 51.3).
     pub rows: Option<u32>,
+    /// The directory this space's creates go into; empty writes no key.
+    ///
+    /// Sent on every save for `folded`'s reason: `render_edit` replaces the
+    /// whole `keeper:` map, so a form that omitted this would delete the
+    /// operator's destination on the next unrelated Save.
+    pub create_dir: String,
 }
 
 /// One thing the operator could reference (FR-265).

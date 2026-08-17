@@ -138,9 +138,9 @@ tags: [log]
 
 A file may carry any other tags it likes; those are ordinary tags and the query
 language reaches them. What is fixed is that one of the five above decides which
-list the file appears in. A file with none of them is **unfiled** — that is not
-an error, but it does mean nothing will surface it, so add a tag when you notice
-one.
+list the file appears in. A file with none of them is **untagged** — that is not
+an error, and it is not invisible either: the last space, *Untagged*, lists
+exactly those files, so add a tag when you notice one there.
 
 ## The two directories
 
@@ -1166,6 +1166,13 @@ mod tests {
     /// directory the operator makes deliberately, and keeps the rule the whole
     /// layout rests on: the kind is the tag. Both halves are asserted, because
     /// an amendment nobody pins is a sentence that reverts.
+    ///
+    /// **And the amended residue sentence (Story 52.4).** It used to say a file
+    /// declaring no kind is *unfiled* and that *nothing will surface it*, which
+    /// stopped being true the day the `Untagged` space started listing exactly
+    /// those files. The contract now names the space, and the old claim is
+    /// asserted GONE below — a sentence telling an agent its untagged file is
+    /// invisible is worse than none, because it is advice to look elsewhere.
     #[test]
     fn the_navigation_file_states_the_load_bearing_rules() {
         for required in [
@@ -1173,7 +1180,8 @@ mod tests {
             "workspace/",
             "keeper will not write here",
             "in-preparation",
-            "unfiled",
+            "untagged",
+            "*Untagged*",
             // The half that must survive the amendment.
             "not a new folder",
             // …and the half the amendment adds: keeper itself makes one now.
@@ -1188,6 +1196,11 @@ mod tests {
             !AGENTS_MD.contains("Do not create other directories"),
             "the flat prohibition is amended, not restored: keeper offers New folder (FR-287), and \
              a contract that forbids what the app's own button does is one an agent reads as noise"
+        );
+        assert!(
+            !AGENTS_MD.contains("nothing will surface it"),
+            "the residue is a space now (Story 52.4), so the contract must not tell an agent its \
+             untagged file is invisible"
         );
         for kind in ["about", "task", "log", "prompt", "ref"] {
             assert!(

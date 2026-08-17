@@ -73,6 +73,19 @@ folded: boolean | null,
  */
 rows: number | null, 
 /**
+ * The directory this space's creates go into, session-relative — empty when
+ * it names none, which is today's behaviour for every space (Story 52.5,
+ * FR-309).
+ *
+ * Carried so the editor can show what the file says and send it back
+ * unchanged; the surface never composes a path out of it and never reads a
+ * kind out of it. Where a create actually lands is
+ * [`crate::sessions::shape::kind_dir`]'s answer in Rust (AD-65), which
+ * takes this as its override and keeps the session's contract as the
+ * fallback.
+ */
+createDir: string, 
+/**
  * Presentation keys keeper could not read, each a finished sentence. The
  * space still works — this is the "not obeying one line of its own file"
  * severity, distinct from `error`.

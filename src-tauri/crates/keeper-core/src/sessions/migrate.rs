@@ -264,9 +264,12 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
     //    free, and this is the step that would otherwise leave it on disk —
     //    a half-migrated session whose stale kind directory `shape()` cannot
     //    see, because it keys on `AGENTS.md` and not on what is left behind.
+    //    `""` for the destination: this asks the CONTRACT what it keeps, and a
+    //    space's own directory (Story 52.5) is where a create goes rather than
+    //    a directory the migration owns and empties.
     for dir in KINDS
         .into_iter()
-        .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+        .filter_map(|kind| kind_dir(Shape::Folder, kind, "").ok().flatten())
     {
         if input.top_level.iter().any(|entry| entry == dir) {
             steps.push(PlanStep::TrashDir {
@@ -568,7 +571,7 @@ fn unique(name: &str, taken: &mut Vec<String>) -> String {
 fn carried_kind(rel: &str) -> Option<KindTag> {
     KINDS
         .into_iter()
-        .find(|kind| match kind_dir(Shape::Folder, *kind) {
+        .find(|kind| match kind_dir(Shape::Folder, *kind, "") {
             // `strip_prefix` plus the separator rather than
             // `starts_with("refs/")`: no allocation, and `refsy/x.md` is a
             // different folder that a bare `starts_with(dir)` would match.
@@ -1095,7 +1098,7 @@ Release drafted; DMG attached.\n\n\
     fn the_migration_trashes_exactly_the_directories_the_mapping_names() {
         let dirs: Vec<&str> = KINDS
             .into_iter()
-            .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+            .filter_map(|kind| kind_dir(Shape::Folder, kind, "").ok().flatten())
             .collect();
         assert!(!dirs.is_empty(), "the folder contract keeps directories");
 
@@ -1393,7 +1396,7 @@ Release drafted; DMG attached.\n\n\
     #[test]
     fn carrying_a_file_out_of_a_directory_inverts_the_create_mapping() {
         for kind in KINDS {
-            let Ok(Some(dir)) = kind_dir(Shape::Folder, kind) else {
+            let Ok(Some(dir)) = kind_dir(Shape::Folder, kind, "") else {
                 continue;
             };
             assert_eq!(

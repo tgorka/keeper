@@ -5595,10 +5595,10 @@ export type SessionFileKind = "md" | "csv" | "json";
  * composed here would be a second namer, and the two would disagree about
  * collisions the instant an agent wrote a file between the read and the create.
  *
- * A new `.md` declares no kind, so it lands in the detail's *unfiled* list and
- * is told so — keeper does not know what an operator's new file is, and guessing
- * `log` would file a stray thought as history. {@link sessionsFileNewKind} is
- * the verb for the two it does know.
+ * A new `.md` declares no kind, so the `Untagged` space lists it and explains
+ * itself there (Story 52.4) — keeper does not know what an operator's new file
+ * is, and guessing `log` would file a stray thought as history.
+ * {@link sessionsFileNewKind} is the verb for the kinds it does know.
  *
  * Rejects with: `internal` (unknown root or session; a path inside `workspace/`,
  * which is scratch keeper never writes to; an extension outside the closed set),
@@ -5671,17 +5671,33 @@ export async function sessionsDirNew(
  * whether the zone's spaces will ever list the file, which is why keeper spells
  * both rather than leaving them to whoever is typing.
  *
- * Rejects with: `internal` (unknown root or session, or `about` — a session has
- * one record and a second would give the shape reader two answers),
- * `unsupported`.
+ * **`spaceId` is the space that pressed the button, and `""` is nobody** (Story
+ * 52.5). A space may name a directory its creates go into
+ * ({@link SessionSpaceVm.createDir}), and Rust reads that definition and composes
+ * the path (AD-65) — pass the space's own id and nothing else. The *Files*
+ * heading's own creates belong to no space and send `""`, which produces the
+ * write it always produced. Nothing here joins a directory to a filename, and a
+ * directory keeper will not write into was already refused when the space was
+ * saved.
+ *
+ * Rejects with: `internal` (unknown root or session, a space that is no longer
+ * there, or `about` — a session has one record and a second would give the shape
+ * reader two answers), `unsupported`.
  */
 export async function sessionsFileNewKind(
   rootId: string,
   sessionId: string,
   kind: string,
   title: string,
+  spaceId: string,
 ): Promise<string> {
-  return await invoke<string>("sessions_file_new_kind", { rootId, sessionId, kind, title });
+  return await invoke<string>("sessions_file_new_kind", {
+    rootId,
+    sessionId,
+    kind,
+    title,
+    spaceId,
+  });
 }
 
 /**

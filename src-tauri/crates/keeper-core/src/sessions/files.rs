@@ -141,6 +141,14 @@ pub enum FileVerbError {
     Outside { rel: String },
 
     #[error(
+        "{rel} is dotted, and keeper's markdown scan never reads a dotted name: `.git`, \
+         `.obsidian` and the zone's own `.keeper` are furniture rather than pool, so the walk \
+         skips them by prefix (`sessions_root::scans_markdown`). A file written there would be \
+         in no space at all, not even the Untagged one, and on no board. Name it without the dot."
+    )]
+    Hidden { rel: String },
+
+    #[error(
         "keeper creates and deletes .md, .csv and .json files — {rel} is none of those. \
          Anything else belongs in artifacts/, put there by the tool that made it."
     )]
@@ -236,8 +244,12 @@ pub fn check_rel(rel: &str) -> Result<(), FileVerbError> {
 /// folder and never the fenced scratch, which is the session's own.
 ///
 /// # Errors
-/// [`FileVerbError::Outside`] for traversal, an absolute path or a dotfolder;
-/// [`FileVerbError::Workspace`] for scratch, however it is capitalised.
+/// [`FileVerbError::Outside`] for traversal or an absolute path;
+/// [`FileVerbError::Hidden`] for a dotted segment — its own sentence rather than
+/// the containment one, because a dotted directory IS inside the session and the
+/// reason keeper will not write there is that its own scan never reads it back
+/// (Story 52.5); [`FileVerbError::Workspace`] for scratch, however it is
+/// capitalised.
 pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
     let owned = || rel.to_owned();
     if rel.is_empty()
@@ -245,9 +257,14 @@ pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
         || rel.contains('\\')
         || rel
             .split('/')
-            .any(|part| part.is_empty() || part == "." || part == ".." || part.starts_with('.'))
+            .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(FileVerbError::Outside { rel: owned() });
+    }
+    // After the traversal arm, so `.` and `..` are answered as what they are: a
+    // path walking out of the session, not a directory keeper declines to scan.
+    if rel.split('/').any(|part| part.starts_with('.')) {
+        return Err(FileVerbError::Hidden { rel: owned() });
     }
     if rel
         .split('/')
@@ -571,10 +588,10 @@ pub fn rename_target(
 /// The bytes a new file starts with.
 ///
 /// `kind` decides the shape and `tag` decides whether any space will ever list
-/// it — `None` for a plain markdown file, which lands in the detail's *unfiled*
-/// list and is told so. That is the honest outcome: keeper does not know what an
-/// operator's new file is, and guessing `log` would file a stray thought as
-/// history.
+/// it — `None` for a plain markdown file, which the `Untagged` space then lists
+/// and explains (Story 52.4). That is the honest outcome: keeper does not know
+/// what an operator's new file is, and guessing `log` would file a stray thought
+/// as history.
 ///
 /// The two non-markdown kinds:
 ///
@@ -868,7 +885,6 @@ mod tests {
             "/etc/passwd.md",
             "a/../../b.md",
             "sub//deep.md",
-            ".hidden.md",
             "",
         ] {
             assert!(
@@ -876,6 +892,34 @@ mod tests {
                 "{rel} must not be writable"
             );
         }
+    }
+
+    /// A dotted name is refused for its own reason and says so (Story 52.5): it
+    /// is inside the session, so "not a path inside this session" was the one
+    /// wrong thing to tell somebody about it — the fact that matters is that
+    /// keeper's markdown scan skips dotted names, so a file written there is in
+    /// no pool and in no space, not even the Untagged one.
+    #[test]
+    fn a_dotted_name_is_refused_because_nothing_reads_it_back() {
+        for rel in [".hidden.md", ".git/config.md", "notes/.drafts/one.md"] {
+            assert!(
+                matches!(check_rel(rel), Err(FileVerbError::Hidden { .. })),
+                "{rel} is dotted and must be refused as such"
+            );
+        }
+        let said = check_dir(".drafts").expect_err("a dotted directory is not scanned");
+        let said = said.to_string();
+        assert!(said.contains(".drafts"), "{said}");
+        assert!(
+            said.contains("scan"),
+            "the reason is that nothing reads it back: {said}"
+        );
+        // `.` and `..` are dotted too, and stay the containment refusal: what is
+        // wrong with them is that they leave the session, not that they hide.
+        assert!(matches!(
+            check_dir("a/../../b"),
+            Err(FileVerbError::Outside { .. })
+        ));
     }
 
     /// The parent folder is checked as a path in its own right, so `workspace/`
@@ -1107,7 +1151,7 @@ mod tests {
     fn a_folder_shaped_create_composes_the_directory_the_name_and_the_tag() {
         use crate::sessions::shape::{kind_dir, Shape};
 
-        let subdir = kind_dir(Shape::Folder, KindTag::Ref)
+        let subdir = kind_dir(Shape::Folder, KindTag::Ref, "")
             .expect("a folder-shaped session has a home for a reference")
             .expect("and it is a subdirectory, not the root");
         let name = new_stamped("Inputs", "2026-08-16", "0900", &taken(&[]));
@@ -1147,9 +1191,146 @@ mod tests {
 
         // Row 8: the flat arm is unchanged — no subdirectory, a bare root name,
         // and no `MkDir` for a directory that exists by definition.
-        assert_eq!(kind_dir(Shape::Flat, KindTag::Ref), Ok(None));
+        assert_eq!(kind_dir(Shape::Flat, KindTag::Ref, ""), Ok(None));
         let flat = compile_new("active/s", &name, &text).expect("the session root is writable");
         assert_eq!(flat.steps.len(), 1);
+    }
+
+    /// Story 52.5, rows 1, 2, 3 and 6 of spec 52.5's table, at the level this
+    /// crate can reach.
+    ///
+    /// `sessions_file_new_kind` composes exactly these calls with the space's own
+    /// `create_dir` in front of them, and the shell crate does not build on every
+    /// machine this repo is worked in — so the composition is asserted here,
+    /// where it is pure. What the command adds is reading the definition off the
+    /// drive, and running the plan.
+    #[test]
+    fn a_space_that_names_a_directory_composes_it_the_name_and_the_tag() {
+        use crate::sessions::shape::{kind_dir, Shape};
+
+        // Row 2. A flat session, a space that says `logs`, and a log.
+        let subdir = kind_dir(Shape::Flat, KindTag::Log, "logs")
+            .expect("a flat session has a home for a log")
+            .expect("and the space named it");
+        let name = new_stamped("", "2026-08-16", "0900", &taken(&[]));
+        let rel = format!("{subdir}/{name}");
+        assert_eq!(rel, "logs/2026-08-16-0900-untitled.md");
+
+        // Row 3. The tag is still written into frontmatter, which is what makes
+        // the file a log — and row 6: the pool reader derives that kind from the
+        // tag and never from `logs/`, so the same directory holding a `ref` holds
+        // a reference.
+        let text = render_new(
+            NewFileKind::Markdown,
+            Some(KindTag::Log),
+            "",
+            ULID,
+            "2026-08-16",
+        );
+        let pool = crate::sessions::pool::read(&[crate::sessions::pool::PoolFile {
+            rel: &rel,
+            text: &text,
+        }]);
+        let entry = pool.first().expect("one file in, one entry out");
+        assert_eq!(entry.kind, Some(KindTag::Log));
+        assert_eq!(entry.rel, "logs/2026-08-16-0900-untitled.md");
+        let as_ref = render_new(
+            NewFileKind::Markdown,
+            Some(KindTag::Ref),
+            "",
+            ULID,
+            "2026-08-16",
+        );
+        let pool = crate::sessions::pool::read(&[crate::sessions::pool::PoolFile {
+            rel: &rel,
+            text: &as_ref,
+        }]);
+        assert_eq!(
+            pool.first().expect("one entry").kind,
+            Some(KindTag::Ref),
+            "a file in logs/ tagged ref is a reference (AD-120)"
+        );
+
+        // Row 2's second half: the directory is made if absent, by the same
+        // journaled `MkDir` the folder verb uses — one plan, one journal row.
+        let plan = compile_new("active/s", &rel, &text).expect("logs/ is writable");
+        assert_eq!(
+            plan.steps,
+            vec![
+                PlanStep::MkDir {
+                    path: "active/s/logs".to_owned()
+                },
+                PlanStep::WriteFile {
+                    path: "active/s/logs/2026-08-16-0900-untitled.md".to_owned(),
+                    content: text.clone(),
+                },
+            ]
+        );
+
+        // Row 1. A space that named nothing produces the plan it always
+        // produced: one step, at the root, and no directory to make.
+        assert_eq!(kind_dir(Shape::Flat, KindTag::Log, ""), Ok(None));
+        let plain = compile_new("active/s", &name, &text).expect("the session root is writable");
+        assert_eq!(
+            plain.steps,
+            vec![PlanStep::WriteFile {
+                path: "active/s/2026-08-16-0900-untitled.md".to_owned(),
+                content: text,
+            }]
+        );
+    }
+
+    /// Story 52.5, rows 4 and 5: three destinations keeper refuses, each with its
+    /// own reason, and all three refused by the guard the create verb already
+    /// asks about whatever `kind_dir` hands back — not by a second rule written
+    /// beside it.
+    ///
+    /// A destination that is a *symlink* out of the session is the fourth, and it
+    /// cannot be reached from a pure test: it is refused at the write, by
+    /// `WriteScope::in_session_workspace`'s sibling fence on the resolved path
+    /// (AD-113), which is the one check that looks at the drive.
+    #[test]
+    fn a_destination_a_space_named_meets_the_same_three_refusals() {
+        use crate::sessions::shape::{kind_dir, Shape};
+
+        let named = |dir: &'static str| {
+            kind_dir(Shape::Flat, KindTag::Log, dir)
+                .expect("the mapping answers for a log")
+                .expect("and it is the space's own directory")
+        };
+
+        let escaping = check_dir(named("../elsewhere"))
+            .expect_err("a destination may not leave the session")
+            .to_string();
+        assert!(
+            escaping.contains("not a path inside this session"),
+            "{escaping}"
+        );
+
+        let scratch = check_dir(named("workspace"))
+            .expect_err("a destination may not be scratch")
+            .to_string();
+        assert!(
+            scratch.contains("dies with the session"),
+            "the reason is that it is thrown away: {scratch}"
+        );
+
+        let hidden = check_dir(named(".drafts"))
+            .expect_err("a destination may not be dotted")
+            .to_string();
+        assert!(
+            hidden.contains("scan"),
+            "the reason is that nothing reads it back: {hidden}"
+        );
+
+        // And the plan is never compiled for any of them, so the refusal cannot
+        // be skipped by a caller that forgot to ask.
+        for dir in ["../elsewhere", "workspace", ".drafts"] {
+            assert!(
+                compile_new("active/s", &format!("{dir}/a.md"), "x").is_err(),
+                "{dir} must not compile a plan"
+            );
+        }
     }
 
     #[test]
@@ -1348,19 +1529,23 @@ mod tests {
 
     /// Row 5. Refused before anything is opened — the domain performs no IO
     /// (AD-108), so these never reach a `create_dir_all`.
+    ///
+    /// Two lists and two refusals since Story 52.5: a folder that walks out of
+    /// the session is a containment failure, and a dotted one is a folder keeper
+    /// would make and then never read back.
     #[test]
     fn a_folder_path_cannot_walk_out_of_the_session() {
-        for rel in [
-            "../escape",
-            "/abs",
-            ".hidden",
-            "log/../../etc",
-            "a/.git",
-            "side\\ways",
-        ] {
+        for rel in ["../escape", "/abs", "log/../../etc", "side\\ways"] {
             assert!(
                 matches!(dir_rel(rel), Err(FileVerbError::Outside { .. })),
                 "{rel} must not be a folder keeper makes"
+            );
+            assert!(compile_dir_new("active/s", rel).is_err());
+        }
+        for rel in [".hidden", "a/.git"] {
+            assert!(
+                matches!(dir_rel(rel), Err(FileVerbError::Hidden { .. })),
+                "{rel} is dotted and must be refused as such"
             );
             assert!(compile_dir_new("active/s", rel).is_err());
         }

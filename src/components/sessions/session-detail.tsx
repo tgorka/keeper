@@ -87,19 +87,6 @@ export const SESSION_DETAIL_WORKSPACE_CAVEAT =
 export const SESSION_DETAIL_NO_LOG = "No log entries yet.";
 
 /**
- * The `unfiled` notice (AD-119): root markdown that declares no kind.
- *
- * Not an error and not styled as one — a hand-dropped note is an ordinary way
- * to use a folder, and a person mid-thought should not be scolded by their own
- * tooling. It is a *nudge*, and it exists because in a flat session an untagged
- * file is invisible to every space: it would sit on disk being skipped by the
- * one surface that was supposed to show it.
- */
-export const SESSION_DETAIL_UNFILED_HEADING = "Unfiled";
-export const SESSION_DETAIL_UNFILED_HINT =
-  "No kind tag, so no space will list these. Add tags: [log], [ref], [prompt] or [task] to file them.";
-
-/**
  * Open the session's record in the strip.
  *
  * **One name, one label, since Story 52.1.** The record was `about.md` under the
@@ -433,10 +420,60 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             </section>
           )}
 
-          {/* The session's own file tree, in the zone's own order (FR-254) —
-              FIRST, and fully expanded. In a flat session the files ARE the
-              structure, so this is both the map and the contents; anything
-              above it would be read past. */}
+          {/* The zone's saved queries, read against this session (FR-261) —
+              ABOVE the files since Story 52.4, on the operator's own instruction
+              (*"umiesc spaces ponad files"*).
+
+              It sat after the tree until then, and the argument written here was
+              that the tree is what is there and this is what it means, so a
+              person should see the filenames before reading a grouping of them.
+              That is an argument about which is more FUNDAMENTAL. The order is
+              about which is read more OFTEN: About, Tasks and Log are what a
+              person opens a session for, and the tree is where they go when a
+              space has not surfaced something — which is the second question and
+              now sits second. Nothing here depends on the sequence: the two
+              sections share no `aria` relationship, the tree's roving `tabindex`
+              is its own, and neither takes focus on mount. The two sentences that
+              DID depend on it are Rust's, and they now say "Files below"
+              (`spaces::Refusal`). */}
+          <SessionSpaces
+            rootId={rootId}
+            sessionId={sessionId}
+            // The section lists AND writes under both contracts (Story 50.1):
+            // `sessions_file_new_kind` writes where the shape keeps the kind,
+            // and a kind this session's shape keeps no home for arrives as a
+            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
+            // does not travel: one reader of `shape::kind_dir`, in Rust.
+            spaces={spaces}
+            selections={spaceFiles}
+            // The verb a space offers where its create is refused because the
+            // record already exists (Story 51.7, FR-299). WHICH space that is is
+            // Rust's answer, per space, on `openRecord`; the label and the target
+            // are the header's own, because the record is one fixed name at a
+            // known place and this surface already opens it from up there.
+            recordLabel={SESSION_DETAIL_OPEN_RECORD_LABEL}
+            onOpenRecord={openRecord}
+            // The same flag the Files heading below is handed — both surfaces
+            // offer a create that posts an empty title, and one filename is
+            // what they would collide on.
+            writing={writing}
+            onWriting={setWriting}
+            onChanged={() => setReload((n) => n + 1)}
+          />
+
+          {/* The session's own file tree, in the zone's own order (FR-254),
+              fully expanded. In a flat session the files ARE the structure, so
+              this is both the map and the contents — which is why it is second
+              and not last: the spaces above are a reading of exactly these
+              files, and everything below is a reading of a subset of them.
+
+              The `Unfiled` badge list used to sit directly under this tree
+              (AD-119): root markdown declaring no kind, as a row of static
+              badges with no count, no fold and no verb on any of them. Story
+              52.4 replaced it with the `Untagged` space above, which is the same
+              set of files with the same row menu, count and fold every other
+              space's rows have — and `pool.unfiled` no longer crosses the
+              boundary at all. */}
           <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
             <div className="flex items-center justify-between gap-2">
               <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
@@ -467,61 +504,6 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               onChanged={() => setReload((n) => n + 1)}
             />
           </section>
-
-          {/* Root markdown that declares no kind (AD-119) — directly under the
-              tree, because the fix is to edit one of the files just listed.
-              Absent for a clean session, which is what makes it a signal. */}
-          {detail.unfiled.length > 0 && (
-            <section
-              aria-label={SESSION_DETAIL_UNFILED_HEADING}
-              className="flex flex-col gap-1 rounded-md border border-border border-dashed px-3 py-2"
-            >
-              <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-                {SESSION_DETAIL_UNFILED_HEADING}
-              </h3>
-              <p className="text-muted-foreground text-xs">{SESSION_DETAIL_UNFILED_HINT}</p>
-              <ul className="flex flex-wrap gap-1">
-                {detail.unfiled.map((name) => (
-                  <li key={name}>
-                    <Badge variant="outline" className="font-mono text-xs">
-                      {name}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-
-          {/* The zone's saved queries, read against this session (FR-261) —
-              AFTER the files, on the operator's own ordering. The tree is what
-              is there; this is what it means. A person who has just seen the
-              filenames can read a section called Tasks and know which of those
-              files it is talking about; the reverse order would ask them to
-              trust a grouping before seeing the thing grouped. */}
-          <SessionSpaces
-            rootId={rootId}
-            sessionId={sessionId}
-            // The section lists AND writes under both contracts (Story 50.1):
-            // `sessions_file_new_kind` writes where the shape keeps the kind,
-            // and a kind this session's shape keeps no home for arrives as a
-            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
-            // does not travel: one reader of `shape::kind_dir`, in Rust.
-            spaces={spaces}
-            selections={spaceFiles}
-            // The verb a space offers where its create is refused because the
-            // record already exists (Story 51.7, FR-299). WHICH space that is is
-            // Rust's answer, per space, on `openRecord`; the label and the target
-            // are the header's own, because the record is one fixed name at a
-            // known place and this surface already opens it from up there.
-            recordLabel={SESSION_DETAIL_OPEN_RECORD_LABEL}
-            onOpenRecord={openRecord}
-            // The same flag the Files heading above is handed — both surfaces
-            // offer a create that posts an empty title, and one filename is
-            // what they would collide on.
-            writing={writing}
-            onWriting={setWriting}
-            onChanged={() => setReload((n) => n + 1)}
-          />
 
           {/* The board (FR-263) — after the spaces, because a space is the
               question "which files are tasks?" and the board is what those files

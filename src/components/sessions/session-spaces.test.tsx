@@ -35,6 +35,7 @@ import {
   SESSION_SPACE_ROWS_LESS,
   SESSION_SPACE_ROWS_MORE,
   SESSION_SPACE_SETTINGS_SUBTITLE,
+  SESSION_SPACE_UNTAGGED_KEY,
   SESSION_SPACES_EMPTY,
   SESSION_SPACES_LOADING,
   SESSION_SPACES_NEW,
@@ -44,6 +45,10 @@ import {
   SESSION_SPACES_RESTORE_NOTHING,
   SessionSpaces,
 } from "@/components/sessions/session-spaces";
+import {
+  SPACE_ROW_DELETE_LABEL,
+  SPACE_ROW_OPEN_HERE_LABEL,
+} from "@/components/sessions/space-row-menu";
 import {
   notesSpaceTerms,
   notesTree,
@@ -95,6 +100,9 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // Story 51.3, so no existing assertion changes meaning.
     folded: p.folded ?? null,
     rows: p.rows ?? null,
+    // Story 52.5's key: no destination named, which is today's behaviour
+    // byte-for-byte.
+    createDir: p.createDir ?? "",
   };
 }
 
@@ -104,9 +112,9 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
  * Written out here as FIXTURE data and never imported from the component:
  * `shape::KindHasNoHome` composes these once and `shape.rs`'s own tests own
  * their wording. What this file claims is narrower and is the only half that
- * is the webview's — whatever sentence arrives on `noHome` is printed where
- * the button would have been, and the button is gone. Story 50.1 shipped a
- * TypeScript copy of the mapping AND of these sentences; the copy had already
+ * is the webview's — whatever sentence arrives on `noHome` is what the create
+ * control describes itself with, and the control is disabled. Story 50.1 shipped
+ * a TypeScript copy of the mapping AND of these sentences; the copy had already
  * forked the wording, and importing a constant back out of the component would
  * be this suite testing that copy against itself.
  */
@@ -118,6 +126,30 @@ session to the flat shape, where every kind is a tag on a file at the root.";
 const NO_LOG_FILE =
   "a folder-shaped session's log is a `### ` entry under `## Log` in README.md, not a file — use \
 New log, which appends one there.";
+
+/**
+ * `KindHasNoHome::OnlyOne`, as `shape.rs` words it since story 52.1 — one
+ * filename under both contracts.
+ */
+const ONE_RECORD =
+  "a session has one about record — README.md, under both contracts — and keeper edits it rather \
+than making a second.";
+
+/** `spaces::Refusal::ManyTerms`. */
+const MANY_TERMS =
+  "this space asks for more than one thing, so there is no single kind a file made here could \
+be: every term has to hold for a file to appear, and a create writes one kind with one tag. \
+Narrow the query to a single `tag:` term to write into this space, or make the file from Files \
+below and tag it so this space picks it up.";
+
+/** `spaces::Refusal::Negated` — the `Untagged` default's own refusal. */
+const NEGATED =
+  "this space asks for what is left over — every one of its terms is a negation — so it names no \
+kind, and a create writes one kind with one tag. There is nothing a file made here could be: \
+make the file from Files below, and it appears here until you give it a kind tag.";
+
+/** The `Untagged` default's query, as `DEFAULT_SESSION_SPACES` spells it. */
+const UNTAGGED_QUERY = "-tag:about -tag:log -tag:prompt -tag:ref -tag:task";
 
 function selection(
   spaceId: string,
@@ -573,28 +605,74 @@ describe("SessionSpaces new note", () => {
     expect(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} ${name}` })).toBeEnabled();
   });
 
-  /** The four shapes Rust refuses, and the fault sentence row 5 carries. */
-  const noKind: Array<[string, string, string, string | null]> = [
-    ["2", "tag:about", "About", null],
-    ["3", "tag:log AND date:today", "Today's log", null],
+  /**
+   * The refusals Rust WORDS — and the whole of Story 52.4's item 7: each of
+   * these renders a create control that is present, disabled, and describes
+   * itself with that sentence.
+   *
+   * It used to be one matrix asserting the control was ABSENT for all four, on
+   * the `showNoteInFiles` precedent that a control existing only to refuse
+   * teaches nothing. Two of the four rows were also HOLLOW: `tag:about` and a
+   * two-term query both make `create_refused` answer with a sentence, and the
+   * fixtures paired `newFileKind: null` with `noHome: null`, which is a payload
+   * Rust does not produce for either query. So the matrix asserted absence
+   * against a state that could not occur, and the owner's report — *"about space
+   * nie ma przycisku dodaj jak inne"* — was about exactly the space it was
+   * pretending to cover.
+   */
+  const worded: Array<[string, string, string, string]> = [
+    ["2", "tag:about", "About", ONE_RECORD],
+    ["3", "tag:log tag:task", "Both kinds", MANY_TERMS],
+    ["52.4/6", UNTAGGED_QUERY, "Untagged", NEGATED],
+  ];
+
+  it.each(
+    worded,
+  )("row %s: renders a disabled create described by Rust's refusal", (_row, query, name, why) => {
+    open(
+      [
+        space({ id: `_spaces/${name}.md`, query, name, newFileKind: null }),
+        space({ newFileKind: "task" }),
+      ],
+      // A row, so the residue space is not hidden for being empty — its own
+      // rule, asserted below.
+      [selection(`_spaces/${name}.md`, ["stray.md"], null, why), selection("_spaces/tasks.md", [])],
+    );
+
+    const create = screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} ${name}` });
+    expect(create).toBeDisabled();
+    // Resolved through the accessibility tree, not by reading the attribute: a
+    // dangling `aria-describedby` renders byte-identically, every query still
+    // passes, and the control would then describe itself with nothing.
+    expect(create).toHaveAccessibleDescription(why);
+    // The sentence is on screen once, not twice — the control points at the
+    // paragraph rather than repeating it.
+    expect(screen.getAllByText(why)).toHaveLength(1);
+    // And the space beside it is untouched: per space, which one payload
+    // shared by two sections could not show.
+    expect(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` })).toBeEnabled();
+  });
+
+  /**
+   * And the refusals Rust does NOT word: absent, which is where the
+   * `showNoteInFiles` precedent still holds. `tag:project/alpha` names a tag
+   * that is not a kind and a query that will not parse says so through its own
+   * fault lamp; a control that refuses without explaining teaches nothing, and
+   * there is nothing here to teach.
+   *
+   * A creatable space is rendered BESIDE the refused one, so what this proves is
+   * "absent here" and not "absent everywhere": read as it first shipped, every
+   * row of this matrix stayed green against a build with no create control at
+   * all.
+   */
+  const silent: Array<[string, string, string, string | null]> = [
     ["5", "tag:(", "Broken", "This space's query can't be read: unclosed ("],
     ["6", "tag:project/alpha", "Alpha", null],
   ];
 
-  /**
-   * Absent, never disabled — the `showNoteInFiles` precedent. A control that
-   * exists only to refuse teaches nobody what the space is for, and the four
-   * reasons above are indistinguishable from the webview's side: they all
-   * arrive as `newFileKind: null`, which is the point of deriving it in Rust.
-   *
-   * A creatable space is rendered BESIDE the refused one, so what this proves
-   * is "absent here" and not "absent everywhere": read as it first shipped,
-   * every row of this matrix stayed green against a build with no create
-   * control at all.
-   */
   it.each(
-    noKind,
-  )("row %s: offers nothing in a space Rust gave no kind", (_row, query, name, error) => {
+    silent,
+  )("row %s: offers nothing where Rust gave neither a kind nor a reason", (_row, query, name, error) => {
     open(
       [
         space({ id: `_spaces/${name}.md`, query, name, newFileKind: null, error }),
@@ -633,26 +711,29 @@ describe("SessionSpaces new note", () => {
 
   /**
    * Row 12. The folder contract has no tasks file — `shape::kind_dir` refuses
-   * `(Folder, Task)` and `sessions_space_files` puts that refusal on the
-   * payload — so the control is absent, and the section says WHY, where the
-   * button would have been. Absent AND silent is the state the owner reported
-   * as "I only see the count".
+   * `(Folder, Task)` and `sessions_space_files` puts that refusal on the payload
+   * — so the control refuses and says WHY. It was absent until Story 52.4;
+   * absent AND silent was the state the owner reported as "I only see the count",
+   * and absent-but-explained still left a gap where every other space has a
+   * button.
    *
    * **The shape does not appear in this test, because it no longer reaches the
    * component.** Story 50.1 fed a `shape` prop to a TypeScript copy of
    * `kind_dir`, so this row tested that copy against a fixture of its own
    * input; the day Rust gave the folder contract a tasks home it would have
    * stayed green while the button stayed hidden. What is asserted now is the
-   * only thing the webview decides: a sentence on `noHome` suppresses the
-   * create and is printed instead of it.
+   * only thing the webview decides: a sentence on `noHome` disables the create
+   * and becomes what it describes itself with.
    */
-  it("row 12: says a folder-shaped session keeps no tasks file, and offers no create", () => {
+  it("row 12: says a folder-shaped session keeps no tasks file, on the create itself", () => {
     open([space({ newFileKind: "task" })], [selection("_spaces/tasks.md", [], null, NO_TASK_HOME)]);
 
-    expect(screen.queryByRole("button", { name: /^New note in/ })).toBeNull();
+    const create = screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(NO_TASK_HOME);
     expect(screen.getByText(NO_TASK_HOME)).toBeInTheDocument();
     // The LISTING is true under both contracts, so the section is not hidden —
-    // only its write verb is.
+    // only its write verb is refused.
     expect(screen.getByRole("button", { name: `${SESSION_SPACE_EDIT} Tasks` })).toBeInTheDocument();
   });
 
@@ -672,7 +753,9 @@ describe("SessionSpaces new note", () => {
       [selection("_spaces/log.md", [], null, NO_LOG_FILE)],
     );
 
-    expect(screen.queryByRole("button", { name: /^New note in/ })).toBeNull();
+    const create = screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Log` });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(NO_LOG_FILE);
     expect(screen.getByText(NO_LOG_FILE)).toBeInTheDocument();
     expect(screen.queryByText(NO_TASK_HOME)).toBeNull();
   });
@@ -700,11 +783,12 @@ describe("SessionSpaces new note", () => {
    * One space refused and one offered, side by side in one payload.
    *
    * The two cases above each render a single space, so neither can tell "this
-   * space's create is suppressed" from "no create renders at all" — the shape
-   * of the bug the section shipped with. `no_home` is per space, and this is
-   * the assertion that it is read per space.
+   * space's create refuses" from "every create on the surface refuses" — the
+   * shape of the bug the section shipped with. `no_home` is per space, and this
+   * is the assertion that it is read per space: two controls, one pressable and
+   * one not, and only one of them carrying a description.
    */
-  it("suppresses only the space whose kind has no home, and only its button", () => {
+  it("refuses only the space whose kind has no home, and only its button", () => {
     open(
       [
         space({ newFileKind: "task" }),
@@ -713,11 +797,14 @@ describe("SessionSpaces new note", () => {
       [selection("_spaces/tasks.md", [], null, NO_TASK_HOME), selection("_spaces/refs.md", [])],
     );
 
-    const controls = screen.getAllByRole("button", { name: /^New note in/ });
-    expect(controls).toHaveLength(1);
-    expect(controls[0]).toBe(
-      screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` }),
-    );
+    const refused = screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` });
+    const offered = screen.getByRole("button", {
+      name: `${SESSION_SPACE_NEW_NOTE} References`,
+    });
+    expect(refused).toBeDisabled();
+    expect(refused).toHaveAccessibleDescription(NO_TASK_HOME);
+    expect(offered).toBeEnabled();
+    expect(offered).toHaveAccessibleDescription("");
     expect(screen.getByText(NO_TASK_HOME)).toBeInTheDocument();
   });
 
@@ -789,7 +876,17 @@ describe("SessionSpaces new note", () => {
     fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} References` }));
 
     await waitFor(() =>
-      expect(mockNewKind).toHaveBeenCalledWith("p1", "01J5AAAAAAAAAAAAAAAAAAAAAA", "ref", ""),
+      expect(mockNewKind).toHaveBeenCalledWith(
+        "p1",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        "ref",
+        "",
+        // The space that pressed it (Story 52.5) — asserted rather than
+        // loosened, because this argument is the only thing that tells Rust
+        // which space's destination to use, and an `expect.anything()` here
+        // would go green the day it stopped being sent.
+        "_spaces/refs.md",
+      ),
     );
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     await waitFor(() =>
@@ -864,7 +961,13 @@ describe("SessionSpaces new note", () => {
     fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} Tasks` }));
 
     await waitFor(() =>
-      expect(mockNewKind).toHaveBeenCalledWith("p1", "01J5AAAAAAAAAAAAAAAAAAAAAA", "task", ""),
+      expect(mockNewKind).toHaveBeenCalledWith(
+        "p1",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        "task",
+        "",
+        "_spaces/tasks.md",
+      ),
     );
     expect(mockNewKind).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
@@ -1397,10 +1500,14 @@ describe("SessionSpaces row cap", () => {
  * a refusal the record cannot answer puts none there.
  */
 describe("SessionSpaces open the record", () => {
-  /** Rust's sentence for the one-record refusal, written out as FIXTURE data for
-   *  {@link NO_TASK_HOME}'s reason — `shape.rs` owns the wording. */
-  const ONE_RECORD =
-    "a session has one about record — about.md under the flat contract, README.md under the folder one — and keeper edits it rather than making a second.";
+  /**
+   * Rust's sentence for the one-record refusal — the module-level
+   * {@link ONE_RECORD}, imported into this scope by NOT shadowing it. It used to
+   * be re-declared here with the pre-52.1 wording ("about.md under the flat
+   * contract, README.md under the folder one"), which stopped being what
+   * `shape.rs` says the day both contracts settled on `README.md` and stayed
+   * green because a fixture cannot disagree with itself.
+   */
 
   /**
    * Row 3. Where Rust says the record this space wanted already exists, the verb
@@ -1418,10 +1525,17 @@ describe("SessionSpaces open the record", () => {
     );
 
     const section = screen.getByRole("region", { name: "About" });
-    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+    // Both verbs, side by side: the record's, which applies, and the create,
+    // which refuses and says why (Story 52.4). They were mutually exclusive
+    // until then because the create was absent.
     fireEvent.click(within(section).getByRole("button", { name: RECORD_LABEL }));
-
     expect(onOpenRecord).toHaveBeenCalledTimes(1);
+
+    const create = within(section).getByRole("button", {
+      name: `${SESSION_SPACE_NEW_NOTE} About`,
+    });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(ONE_RECORD);
   });
 
   /** And it is absent where the refusal is a different one: a folder-shaped
@@ -1435,5 +1549,139 @@ describe("SessionSpaces open the record", () => {
 
     const section = screen.getByRole("region", { name: "Tasks" });
     expect(within(section).queryByRole("button", { name: RECORD_LABEL })).toBeNull();
+  });
+});
+
+/**
+ * The residue space (Story 52.4, item 12): the one space that renders only when
+ * it selected something.
+ *
+ * Its identity is `defaultKey`, never its name — {@link SESSION_SPACE_UNTAGGED_KEY}
+ * states why, and the last case here is the witness for it.
+ */
+describe("SessionSpaces and the Untagged space", () => {
+  const untagged = (over: Partial<SessionSpaceVm> = {}) =>
+    space({
+      id: "_spaces/untagged.md",
+      name: "Untagged",
+      query: UNTAGGED_QUERY,
+      sort: "name asc",
+      sortEffective: "name asc",
+      icon: "inbox",
+      defaultKey: SESSION_SPACE_UNTAGGED_KEY,
+      order: 6,
+      newFileKind: null,
+      ...over,
+    });
+
+  /**
+   * Row 3. It renders with a count and rows like any other space, and last — the
+   * rail order is Rust's (`order: 6`), so what this asserts is that the section
+   * draws the definitions in the order it was handed rather than sorting them
+   * again.
+   */
+  it("lists what declares no kind, last, with its count", () => {
+    open(
+      [space({ newFileKind: "task" }), untagged()],
+      [
+        selection("_spaces/tasks.md", ["do-it.md"]),
+        selection("_spaces/untagged.md", ["stray.md", "pasted.md"], null, NEGATED),
+      ],
+    );
+
+    const section = screen.getByRole("region", { name: "Untagged" });
+    expect(within(section).getByText("2")).toBeInTheDocument();
+    expect(within(section).getByText("stray")).toBeInTheDocument();
+    expect(within(section).getByText("pasted")).toBeInTheDocument();
+
+    const sections = screen.getAllByRole("region");
+    expect(sections[sections.length - 1]).toBe(section);
+  });
+
+  /**
+   * Row 4. Nothing untagged, so no section at all — not an empty one saying
+   * "Nothing in this session yet", which is what every other space says and what
+   * this one must not: it would be a permanent row on a clean session reporting
+   * the absence of a problem.
+   */
+  it("renders no Untagged section when every file declares a kind", () => {
+    open(
+      [space({ newFileKind: "task" }), untagged()],
+      [
+        selection("_spaces/tasks.md", ["do-it.md"]),
+        selection("_spaces/untagged.md", [], null, NEGATED),
+      ],
+    );
+
+    expect(screen.queryByRole("region", { name: "Untagged" })).toBeNull();
+    // The zone still HAS spaces, so the "no spaces" sentence must not appear
+    // either — and the space beside it is untouched.
+    expect(screen.queryByText(SESSION_SPACES_EMPTY)).toBeNull();
+    expect(screen.getByRole("region", { name: "Tasks" })).toBeInTheDocument();
+  });
+
+  /**
+   * And it does not flash. While the selections are out there is no answer, so
+   * the section stays out rather than appearing, saying "Reading…", and vanishing
+   * a tick later on every clean session — which is a wrong answer shown
+   * confidently, the same defect `SESSION_SPACES_LOADING` exists to avoid for the
+   * create verb.
+   */
+  it("stays out while the selections are still out, rather than appearing empty", () => {
+    open([untagged()], null);
+
+    expect(screen.queryByRole("region", { name: "Untagged" })).toBeNull();
+    expect(screen.queryByText(SESSION_SPACES_LOADING)).toBeNull();
+  });
+
+  /**
+   * Row 5. It folds, and its rows carry the same menu every other space's rows
+   * carry — asserted by opening the menu on one of them, because "it renders a
+   * wrapper" is exactly the claim a component that mounted nothing would also
+   * satisfy.
+   */
+  it("folds, and its rows carry the row menu", async () => {
+    open([untagged()], [selection("_spaces/untagged.md", ["stray.md"], null, NEGATED)]);
+
+    const row = screen.getByRole("button", { name: /^stray/ });
+    fireEvent.contextMenu(row);
+    // Named verbs and not a pattern: the menu holds six, and a regex that
+    // matched several of them would pass on a menu missing the one it meant.
+    for (const label of [SPACE_ROW_OPEN_HERE_LABEL, SPACE_ROW_DELETE_LABEL]) {
+      expect(await screen.findByRole("menuitem", { name: label })).toBeInTheDocument();
+    }
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    // The count stays in the header when it is shut, which is what tells a
+    // person a folded space is folded rather than empty.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Untagged" }));
+    expect(screen.getByRole("button", { name: "Expand Untagged" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("1")).toBeInTheDocument();
+  });
+
+  /**
+   * The rule follows the KEY and not the name (AD-79): a space the operator
+   * renamed is still the residue space and still hides when empty, and a
+   * hand-written space of theirs that happens to be called Untagged is an
+   * ordinary space that renders and says it has nothing — because they made it
+   * and its absence would read as keeper having deleted it.
+   */
+  it("keys the rule on defaultKey, so a rename keeps it and a lookalike does not borrow it", () => {
+    const { unmount } = open(
+      [untagged({ name: "Loose ends" })],
+      [selection("_spaces/untagged.md", [], null, NEGATED)],
+    );
+    expect(screen.queryByRole("region", { name: "Loose ends" })).toBeNull();
+    unmount();
+
+    open(
+      [untagged({ id: "_spaces/untagged-2.md", defaultKey: null })],
+      [selection("_spaces/untagged-2.md", [], null, NEGATED)],
+    );
+    const mine = screen.getByRole("region", { name: "Untagged" });
+    expect(within(mine).getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
   });
 });

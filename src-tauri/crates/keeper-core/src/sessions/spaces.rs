@@ -79,12 +79,13 @@ pub struct DefaultSessionSpace {
     pub order: f64,
 }
 
-/// The five, in the order a session is read in.
+/// The six, in the order a session is read in.
 ///
 /// **The order is the reading order, and it is the operator's own**: what this
 /// session is, what is left to do, what happened, what it points at, what it was
-/// told. It is not alphabetical, and it is not the order the deleted directories
-/// happened to sort in — a space's position is a real field now
+/// told, and last what it has not said anything about. It is not alphabetical,
+/// and it is not the order the deleted directories happened to sort in — a
+/// space's position is a real field now
 /// ([`crate::notes::sort::rail_order`]), so it can carry a meaning.
 ///
 /// **They start at 1, not 0.** [`crate::notes::sort::DEFAULT_SPACE_ORDER`] is
@@ -94,13 +95,31 @@ pub struct DefaultSessionSpace {
 /// the two by name — putting a hand-made "Archive" above the About that is
 /// supposed to be read first. One is the smallest number that is a statement.
 ///
-/// **Each query is one `tag:` term and nothing else**, which is the flat
-/// contract restated as data: a file's kind is what it says it is (AD-120), so
-/// the space that shows a kind asks exactly that and infers nothing from a name,
-/// a folder or a position. The board's `field:status=` columns are composed on
-/// top of the Tasks query rather than baked into it — four spaces would be four
-/// places to edit when the tag changes.
-pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 5] = [
+/// **The five that show a kind ask one `tag:` term and nothing else**, which is
+/// the flat contract restated as data: a file's kind is what it says it is
+/// (AD-120), so the space that shows a kind asks exactly that and infers nothing
+/// from a name, a folder or a position. The board's `field:status=` columns are
+/// composed on top of the Tasks query rather than baked into it — four spaces
+/// would be four places to edit when the tag changes.
+///
+/// **The sixth asks for the residue**, and it is the same grammar read the other
+/// way round: `-tag:about -tag:log -tag:prompt -tag:ref -tag:task` is every kind
+/// in [`crate::sessions::shape::KINDS`], negated. A file declaring none of them
+/// used to reach the operator as a badge list the detail drew from
+/// [`crate::sessions::pool::Pool::unfiled`] — no count, no fold, no row verbs —
+/// and it is one ordinary space now, folding and counting like its five
+/// siblings. Deriving the string from `KINDS` was the alternative and a `const`
+/// cannot format one, so `the_untagged_query_negates_every_kind` zips the two
+/// instead: a sixth kind then fails a test rather than quietly leaving its files
+/// in a space that claims to hold everything unclaimed.
+///
+/// **It is a default like the other five, not a mechanism beside them**
+/// (AD-121): one file in `_spaces/`, seeded by the same [`plan`], deleted by the
+/// same verb, and — because the directory is the ledger — deleted for good.
+/// Synthesising it on every read was the rejected alternative, and it would have
+/// been the one row on the rail an operator could not rename, reposition, fold
+/// or throw away.
+pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 6] = [
     DefaultSessionSpace {
         key: "about",
         name: "About",
@@ -149,6 +168,29 @@ pub const DEFAULT_SESSION_SPACES: [DefaultSessionSpace; 5] = [
         sort: "name asc",
         icon: "message-square",
         order: 5.0,
+    },
+    DefaultSessionSpace {
+        key: "untagged",
+        name: "Untagged",
+        // Every kind in `KINDS`, negated — the residue, and nothing else.
+        query: "-tag:about -tag:log -tag:prompt -tag:ref -tag:task",
+        // A to Z by the title a person reads — [`sort::SortKey::Name`] is
+        // `title_order`, not the filename — because the residue has no order of
+        // its own: these files are whatever was dropped in, and a title is the
+        // only thing about them keeper can put in a stable row. `modified desc`
+        // was the alternative and it is worse here: it would reshuffle the
+        // section every time an agent touched one of them, which is exactly the
+        // list a person is trying to work through.
+        sort: "name asc",
+        // The notes rail's Inbox glyph, for the notes rail's reason: `inbox` is
+        // already what this product draws over "the honest home of the unfiled"
+        // ([`crate::notes::default_spaces`]), and a second glyph for the same
+        // idea would make the two rails disagree about what a file nothing has
+        // claimed looks like.
+        icon: "inbox",
+        // Last, which is the whole of the operator's instruction about it: the
+        // residue is read after everything that has said what it is.
+        order: 6.0,
     },
 ];
 
@@ -205,6 +247,23 @@ pub struct SessionSpace {
     /// height of a card in a rail, and a section that had *selected* three of
     /// twelve files could not honestly say how many it was not showing.
     pub rows: Option<u32>,
+    /// `keeper.create_dir`: the directory this space's creates go INTO,
+    /// session-relative — empty when it names none, which is every space until
+    /// somebody types one (Story 52.5, FR-309).
+    ///
+    /// **A destination for writes, and never a source for reads.** AD-120 says a
+    /// file's kind is the tag it carries, and this key does not soften that by a
+    /// millimetre: [`crate::sessions::pool::read_one`] still derives the kind
+    /// from tags alone, so a file sitting in `logs/` tagged `ref` is a reference,
+    /// and this space lists what it lists because its QUERY matched a tag. What
+    /// the key changes is one thing — where
+    /// [`crate::sessions::shape::kind_dir`] puts the next file.
+    ///
+    /// Stored as the file spells it, trimmed: a directory whose name ends in a
+    /// space is a trap, and the path itself is validated where it is used, by
+    /// the one guard [`crate::sessions::files::check_dir`], rather than by a
+    /// second rule here that would have to agree with it forever.
+    pub create_dir: String,
     /// What keeper could not read and worked around, already worded. Empty for
     /// a file it understood entirely.
     pub warnings: Vec<String>,
@@ -237,6 +296,7 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
         order: sort::DEFAULT_SPACE_ORDER,
         folded: None,
         rows: None,
+        create_dir: String::new(),
         warnings: Vec::new(),
     };
     if let Some(FieldValue::Map(pairs)) = fm.get("keeper") {
@@ -271,6 +331,15 @@ pub fn read_one(rel: &str, text: &str) -> SessionSpace {
                     Some(Err(warning)) => space.warnings.push(warning),
                     None => {}
                 },
+                // Trimmed like `icon` and not stored verbatim like `query`,
+                // because this one is a PATH: a trailing blank or separator is
+                // not part of a directory's name, and `logs/` is the same
+                // request as `logs` (`files::dir_rel`'s own rule). A leading
+                // `/` is left exactly as written — it makes the path absolute,
+                // which is a refusal and not a spelling to repair.
+                ("create_dir", FieldValue::Str(dir)) => {
+                    space.create_dir = dir.trim().trim_end_matches('/').to_owned();
+                }
                 ("default", FieldValue::Str(raw)) => {
                     space.default_key = by_key(raw.trim()).map(|d| d.key.to_owned());
                 }
@@ -385,7 +454,7 @@ pub fn plan(
     existing: Option<&[SessionSpace]>,
 ) -> Vec<&'static DefaultSessionSpace> {
     match (mode, existing) {
-        // Never seeded: the zone gets the five it was designed around.
+        // Never seeded: the zone gets the six it was designed around.
         (_, None) => DEFAULT_SESSION_SPACES.iter().collect(),
         // The directory is the ledger.
         (SeedMode::FirstRun, Some(_)) => Vec::new(),
@@ -583,7 +652,7 @@ pub fn select(space: &SessionSpace, candidates: &[Candidate<'_>], now_ms: i64) -
 /// TypeScript would be a second grammar from the day it was written (AD-20,
 /// AD-58). What crosses the boundary is a kind or nothing.
 ///
-/// **Exactly one `tag:` term, or nothing.** Four of the five defaults are
+/// **Exactly one `tag:` term, or nothing.** Four of the six defaults are
 /// single `tag:` queries ([`DEFAULT_SESSION_SPACES`]), and for those "what
 /// would a file made here have to be?" has one answer. A second term does not
 /// narrow that answer, it breaks it: a create in `tag:log date:today` would
@@ -612,9 +681,10 @@ pub fn select(space: &SessionSpace, candidates: &[Candidate<'_>], now_ms: i64) -
 /// **`None` is not the same as nothing to say.** [`create_refused`] is the
 /// sibling that words the refusal, and it reads the query through the same
 /// [`read_create`] this does: About renders no button and a sentence, a space
-/// asking for two things renders no button and a different sentence, and a
-/// space asking for an ordinary tag renders neither. Before Story 51.7 all
-/// three rendered nothing at all.
+/// asking for two things renders no button and a different sentence, the
+/// Untagged space asks for what is left over and renders a third, and a space
+/// asking for an ordinary tag renders neither. Before Story 51.7 all of them
+/// rendered nothing at all.
 #[must_use]
 pub fn creatable_kind(query: &str) -> Option<KindTag> {
     read_create(query).kind
@@ -623,11 +693,12 @@ pub fn creatable_kind(query: &str) -> Option<KindTag> {
 /// What one query says about writing into the space it defines, from **one**
 /// read of the grammar.
 ///
-/// Private, and one struct rather than three public predicates each parsing
-/// again: the three facts are three halves of one question — what would a file
-/// made here be, is the record what this space is about, and does the query ask
-/// for more than one thing — and separate readers would parse `keeper.space`
-/// three times per space per read to answer them.
+/// Private, and one struct rather than four public predicates each parsing
+/// again: the four facts are four quarters of one question — what would a file
+/// made here be, is the record what this space is about, does the query ask for
+/// more than one thing, and does it ask for anything positive at all — and
+/// separate readers would parse `keeper.space` four times per space per read to
+/// answer them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CreateVerdict {
     /// The kind a create here would write — [`creatable_kind`]'s whole answer.
@@ -640,9 +711,16 @@ struct CreateVerdict {
     record: bool,
     /// Whether the query asks for more than one thing.
     many: bool,
+    /// Whether every term is a negation, so no term of it could name a kind.
+    ///
+    /// Not the same fact as a `kind` of `None`, which `tag:project/alpha`
+    /// produces too: this one is why the `Untagged` default has no create to
+    /// offer, and `tag:project/alpha` is a space that never offered one to miss.
+    /// [`create_refused`] tells the two apart and only words the first.
+    negated: bool,
 }
 
-/// Read one query once, for all three.
+/// Read one query once, for all four.
 fn read_create(query: &str) -> CreateVerdict {
     // Nothing offered and nothing to explain: the two states a space already
     // reports in its own words. A query keeper cannot read carries
@@ -653,6 +731,7 @@ fn read_create(query: &str) -> CreateVerdict {
         kind: None,
         record: false,
         many: false,
+        negated: false,
     };
     if query::parse(query).is_err() {
         return silent;
@@ -669,6 +748,10 @@ fn read_create(query: &str) -> CreateVerdict {
         }
         KindTag::of(&[tags::normalise(&term.value)?])
     };
+    // Asked of every term, and `all` over an empty slice is why the emptiness
+    // is checked first: a query with no terms at all is the space that has not
+    // been told what to show, which already says so in its own words.
+    let negated = terms.iter().all(|term| term.negated);
     match terms.as_slice() {
         [] => silent,
         [term] => {
@@ -679,12 +762,14 @@ fn read_create(query: &str) -> CreateVerdict {
                 kind: kind.filter(|kind| *kind != KindTag::About),
                 record: kind == Some(KindTag::About),
                 many: false,
+                negated,
             }
         }
         terms => CreateVerdict {
             kind: None,
             record: terms.iter().any(|term| named(term) == Some(KindTag::About)),
             many: true,
+            negated,
         },
     }
 }
@@ -718,8 +803,8 @@ pub struct CreateRefused {
 ///
 /// Sentences rather than codes, [`KindHasNoHome`]'s own rule, and *that* enum is
 /// wrapped rather than restated: a session's contract already owns the wording
-/// of "a session has one about record", and this type exists to add the one
-/// refusal that is the QUERY's rather than the contract's.
+/// of "a session has one about record", and this type exists to add the
+/// refusals that are the QUERY's rather than the contract's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     /// This session's contract keeps nowhere to put that kind — including the
@@ -728,13 +813,33 @@ pub enum Refusal {
     NoHome(#[from] KindHasNoHome),
     /// The query asks for more than one thing, so there is no single kind a
     /// create could write.
+    ///
+    /// **"Files below"**, and the direction is load-bearing: Story 52.4 put the
+    /// SPACES section above FILES on the detail, so a sentence rendered in a
+    /// space that sent a person upwards would send them past the record's header
+    /// and out of the surface.
     #[error(
         "this space asks for more than one thing, so there is no single kind a file made here \
          could be: every term has to hold for a file to appear, and a create writes one kind \
          with one tag. Narrow the query to a single `tag:` term to write into this space, or make \
-         the file from Files above and tag it so this space picks it up."
+         the file from Files below and tag it so this space picks it up."
     )]
     ManyTerms,
+    /// Every term is a negation, so the query names no kind at all — which is
+    /// the `Untagged` default's own state and the reason it has a control that
+    /// refuses rather than no control (Story 52.4).
+    ///
+    /// The instruction is the opposite of every other refusal's: a file made
+    /// somewhere else appears HERE by default, and leaves when it is told what it
+    /// is. That is the whole of what this space is for, so the sentence says it
+    /// rather than sending anybody to narrow a query.
+    #[error(
+        "this space asks for what is left over — every one of its terms is a negation — so it \
+         names no kind, and a create writes one kind with one tag. There is nothing a file made \
+         here could be: make the file from Files below, and it appears here until you give it a \
+         kind tag."
+    )]
+    Negated,
 }
 
 /// Why this space offers no create under this session's contract, and whether
@@ -747,6 +852,13 @@ pub enum Refusal {
 /// and not by the record, which is the honest answer for a query that would
 /// still have no single kind if the record were creatable tomorrow.
 ///
+/// **[`Refusal::Negated`] is the one exception to that order**, and it is an
+/// exception because arity is not the obstacle it names. `ManyTerms` ends by
+/// telling the person to narrow the query to a single `tag:` term; narrowing
+/// `-tag:about -tag:log` leaves `-tag:about`, which still names no kind, so the
+/// advice would send them round a loop. A query made entirely of negations is
+/// refused for what its terms are, however many of them there are.
+///
 /// `shape` is taken rather than read, because a space definition is zone-level
 /// and a contract is one session's: the caller has the session, and the
 /// alternative — projecting a sentence per shape onto the zone's definition —
@@ -756,8 +868,13 @@ pub fn create_refused(query: &str, shape: Shape) -> CreateRefused {
     let verdict = read_create(query);
     let why = if let Some(kind) = verdict.kind {
         // The query offers a create, so the only thing left that can refuse it
-        // is this session's own contract.
-        kind_dir(shape, kind).err().map(Refusal::NoHome)
+        // is this session's own contract. No destination override is passed: a
+        // space's `create_dir` moves a create the contract already ALLOWS, and
+        // cannot make a refused kind creatable, so the refusal is the contract's
+        // alone (Story 52.5).
+        kind_dir(shape, kind, "").err().map(Refusal::NoHome)
+    } else if verdict.negated {
+        Some(Refusal::Negated)
     } else if verdict.many {
         Some(Refusal::ManyTerms)
     } else if verdict.record {
@@ -765,7 +882,9 @@ pub fn create_refused(query: &str, shape: Shape) -> CreateRefused {
         // contract that ever gave the record a home would make this space
         // creatable, and going quiet is then the same silence as before this
         // function existed rather than a sentence that has stopped being true.
-        kind_dir(shape, KindTag::About).err().map(Refusal::NoHome)
+        kind_dir(shape, KindTag::About, "")
+            .err()
+            .map(Refusal::NoHome)
     } else {
         None
     };
@@ -799,6 +918,14 @@ pub struct SpaceEdit {
     /// How many rows the section renders, or `None` to write no key — the
     /// editor's cap box, empty.
     pub rows: Option<u32>,
+    /// The directory this space's creates go into, or empty for none — the
+    /// editor's destination box, left blank (Story 52.5, FR-309).
+    ///
+    /// Sent on every save for the reason [`SessionSpace::folded`] is: this
+    /// function's map REPLACES the file's, so a form that omitted the field
+    /// would delete the operator's destination the next time they renamed the
+    /// space.
+    pub create_dir: String,
 }
 
 /// The `keeper:` map both renderers write, minus `default`.
@@ -841,6 +968,19 @@ fn keeper_pairs(edit: &SpaceEdit) -> Vec<(String, FieldValue)> {
     }
     if let Some(rows) = edit.rows {
         pairs.push(("rows".to_owned(), FieldValue::Num(f64::from(rows))));
+    }
+
+    // Last of the keys, after the presentation ones, because it is the only one
+    // that is about WRITING rather than about what the space shows or how: an
+    // operator diffing an old definition against a re-saved one sees one line
+    // added at the end and not a reshuffle. Empty writes no key at all —
+    // `icon`'s rule — so a space nobody gave a destination keeps the
+    // frontmatter it had.
+    if !edit.create_dir.is_empty() {
+        pairs.push((
+            "create_dir".to_owned(),
+            FieldValue::Str(edit.create_dir.clone()),
+        ));
     }
     pairs
 }
@@ -1258,7 +1398,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The five
+    // The six
     // -----------------------------------------------------------------------
 
     /// The seeded set has to be usable the moment it lands: every query parses,
@@ -1310,8 +1450,9 @@ mod tests {
     }
 
     /// The rail renders them in reading order — what this is, what is left, what
-    /// happened, what it points at, what it was told — and **not**
-    /// alphabetically, which is what an unpositioned set would do.
+    /// happened, what it points at, what it was told, and last what has said
+    /// nothing about itself — and **not** alphabetically, which is what an
+    /// unpositioned set would do.
     ///
     /// Written down because the alphabetical order (About, Log, Prompts,
     /// References, Tasks) is a plausible-looking accident: it is what the rail
@@ -1340,7 +1481,15 @@ mod tests {
             .into_iter()
             .map(|space| space.name)
             .collect();
-        assert_eq!(names, ["About", "Tasks", "Log", "References", "Prompts"]);
+        assert_eq!(
+            names,
+            ["About", "Tasks", "Log", "References", "Prompts", "Untagged"]
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("Untagged"),
+            "the residue is read last, which is the whole of the instruction about it"
+        );
 
         let mut alphabetical = names.clone();
         alphabetical.sort();
@@ -1398,6 +1547,7 @@ mod tests {
                 "_spaces/log.md",
                 "_spaces/references.md",
                 "_spaces/prompts.md",
+                "_spaces/untagged.md",
             ]
         );
     }
@@ -1414,7 +1564,10 @@ mod tests {
             .iter()
             .map(|space| space.key)
             .collect();
-        assert_eq!(keys, ["about", "tasks", "log", "refs", "prompts"]);
+        assert_eq!(
+            keys,
+            ["about", "tasks", "log", "refs", "prompts", "untagged"]
+        );
 
         // Present and empty: the operator deleted all five, and an automatic run
         // must not put them back. This is the assertion the JSON ledger exists
@@ -1431,7 +1584,7 @@ mod tests {
             .iter()
             .map(|space| space.key)
             .collect();
-        assert_eq!(keys, ["tasks", "refs", "prompts"]);
+        assert_eq!(keys, ["tasks", "refs", "prompts", "untagged"]);
 
         let all: Vec<SessionSpace> = DEFAULT_SESSION_SPACES
             .iter()
@@ -1506,10 +1659,11 @@ mod tests {
         ]
     }
 
-    /// **The whole point of the module, end to end.** Each of the five picks
+    /// **The whole point of the module, end to end.** Each of the six picks
     /// exactly the files of its kind out of one real pool, and nothing else —
-    /// including the unfiled `README.md`, which is what a half-migrated session
-    /// leaves behind and which no space may quietly adopt.
+    /// and the unfiled `README.md`, which is what a half-migrated session leaves
+    /// behind and which no space of a kind may quietly adopt, is picked by the
+    /// one space whose whole job is the residue.
     #[test]
     fn each_default_space_selects_its_own_kind_and_nothing_else() {
         let files = session();
@@ -1522,6 +1676,7 @@ mod tests {
             ),
             ("refs", vec!["the-spec.md"]),
             ("prompts", vec!["01-kickoff.md"]),
+            ("untagged", vec!["README.md"]),
         ] {
             assert_eq!(
                 run(&seeded(key), &files).unwrap_or_else(|e| panic!("{key}: {e}")),
@@ -1556,7 +1711,7 @@ mod tests {
     /// A hand-written space is an ordinary saved query over the same pool: the
     /// board's own column, a free-text term reading real bytes, and a negation.
     ///
-    /// This is what makes the five *defaults* rather than *the feature*.
+    /// This is what makes the six *defaults* rather than *the feature*.
     #[test]
     fn a_hand_written_space_reaches_the_whole_query_language() {
         let files = session();
@@ -1777,10 +1932,10 @@ mod tests {
     }
 
     /// Every kind reachable from the space that collects it, so a sixth added
-    /// to [`KINDS`] later cannot be silently uncreatable — and the five spaces
+    /// to [`KINDS`] later cannot be silently uncreatable — and the six spaces
     /// an operator actually meets on first run, which is the acceptance
     /// sentence: References, Tasks, Log and Prompts can be written into, About
-    /// cannot.
+    /// and Untagged cannot.
     #[test]
     fn every_kind_but_about_is_reachable_from_the_space_that_collects_it() {
         for kind in KINDS {
@@ -1796,7 +1951,15 @@ mod tests {
             .collect();
         assert_eq!(
             offered,
-            [None, Some("task"), Some("log"), Some("ref"), Some("prompt")]
+            [
+                None,
+                Some("task"),
+                Some("log"),
+                Some("ref"),
+                Some("prompt"),
+                // The residue names no kind, so nothing can be written into it.
+                None
+            ]
         );
     }
 
@@ -1820,7 +1983,7 @@ mod tests {
             );
             assert_eq!(
                 refused.why.map(|why| why.to_string()),
-                kind_dir(shape, KindTag::About)
+                kind_dir(shape, KindTag::About, "")
                     .err()
                     .map(|no_home| no_home.to_string()),
                 "the sentence is the contract's, not this module's"
@@ -1890,20 +2053,142 @@ mod tests {
     /// nothing is on [`Selection::error`], and a space asking for an ordinary tag
     /// never offered a create to miss — three states where a sentence here would
     /// be keeper answering a question the person can already see answered.
+    ///
+    /// `-tag:about` used to be a fourth entry in this list and is now
+    /// [`Refusal::Negated`]'s: a negated query says nothing about itself
+    /// anywhere else, so silence there was the "offers nothing and says nothing"
+    /// state Story 51.7 exists to remove. See
+    /// `a_query_of_negations_is_refused_for_naming_no_kind`.
     #[test]
     fn a_space_that_already_says_why_is_left_to_say_it() {
-        for query in [
-            "",
-            "   ",
-            "(tag:log",
-            "tag:log |",
-            "tag:project/alpha",
-            "-tag:about",
-        ] {
+        for query in ["", "   ", "(tag:log", "tag:log |", "tag:project/alpha"] {
             let refused = create_refused(query, Shape::Flat);
             assert_eq!(refused.why, None, "{query:?}");
             assert!(!refused.record, "{query:?}");
         }
+    }
+
+    /// Row 6. A query made entirely of negations names no kind, so its create is
+    /// present-and-refused rather than absent, and the sentence says which of
+    /// the two things a person can do instead.
+    ///
+    /// **Whatever the arity**, which is the ordering claim: one negation and
+    /// five negations meet the same refusal, because narrowing a negated query
+    /// does not produce a creatable one. `ManyTerms` would have told the person
+    /// to narrow to a single `tag:` term, which is a loop.
+    ///
+    /// And **not** where a positive term survives: `tag:task -tag:done` is two
+    /// things and is refused for being two things, unchanged.
+    #[test]
+    fn a_query_of_negations_is_refused_for_naming_no_kind() {
+        for query in [
+            "-tag:about",
+            "-tag:task",
+            "-tag:project/alpha",
+            by_key("untagged")
+                .expect("the Untagged default exists")
+                .query,
+        ] {
+            let refused = create_refused(query, Shape::Flat);
+            assert_eq!(refused.why, Some(Refusal::Negated), "{query:?}");
+            assert!(
+                !refused.record,
+                "a negation names nothing, so it does not name the record either: {query:?}"
+            );
+            assert_eq!(creatable_kind(query), None, "{query:?}");
+            let sentence = refused.why.expect("a refusal").to_string();
+            assert!(sentence.contains("left over"), "{sentence}");
+            assert!(
+                !sentence.contains("Narrow the query"),
+                "the advice that sends a negated query round a loop: {sentence}"
+            );
+        }
+
+        // A surviving positive term is still the arity refusal, so the exception
+        // above is exactly as narrow as it says.
+        assert_eq!(
+            create_refused("tag:task -tag:done", Shape::Flat).why,
+            Some(Refusal::ManyTerms)
+        );
+    }
+
+    /// Rows 3 and 5, at the level the space is defined. The `Untagged` query is
+    /// every kind in [`KINDS`] negated, and this zips the two rather than
+    /// restating the string: a sixth kind added to `KINDS` then fails HERE
+    /// instead of quietly leaving its files in a space that claims to hold
+    /// everything unclaimed.
+    #[test]
+    fn the_untagged_query_negates_every_kind() {
+        let space = by_key("untagged").expect("the Untagged default exists");
+        let terms = query::conjunction(space.query).expect("a flat conjunction");
+        assert_eq!(terms.len(), KINDS.len(), "{}", space.query);
+        for (term, kind) in terms.iter().zip(KINDS) {
+            assert!(term.negated, "{}", term.source);
+            assert_eq!(term.key.as_deref(), Some("tag"), "{}", term.source);
+            assert_eq!(term.value, kind.as_str(), "{}", term.source);
+        }
+        assert!(query::parse(space.query).is_ok(), "{}", space.query);
+    }
+
+    /// Row 3, over a real pool: the space picks the kindless file and nothing
+    /// else, including the file that carries a tag which is not a kind — which
+    /// is the case `is:untagged` would have got wrong, and the reason the query
+    /// is the negation and not that flag.
+    #[test]
+    fn the_untagged_space_picks_what_declares_no_kind_including_the_merely_tagged() {
+        let mut files = session();
+        files.push((
+            "pasted.md",
+            "---\ntags: [project/alpha]\n---\n# Pasted in\n",
+        ));
+        assert_eq!(
+            run(&seeded("untagged"), &files).expect("untagged"),
+            // `name asc` is the TITLE's order, so "Pasted in" precedes
+            // "Something someone dropped in" — asserted the way the space
+            // actually draws it rather than the way the filenames sort, which is
+            // the mistake this spelling invites.
+            ["pasted.md", "README.md"],
+            "and the `project/alpha` file is unclaimed by any kind"
+        );
+
+        // Row 4's other half, at this level: a session where every file declares
+        // a kind gives the space nothing to show, which is what the surface then
+        // keys its absence on.
+        let filed: Vec<(&str, &str)> = session()
+            .into_iter()
+            .filter(|(rel, _)| *rel != "README.md")
+            .collect();
+        assert_eq!(
+            run(&seeded("untagged"), &filed).expect("untagged"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Row 7 (AD-121). The residue space is a default like the other five, so
+    /// the directory-is-the-ledger rule already covers it: a zone that has
+    /// `_spaces/` and no `untagged.md` is a zone somebody deleted it out of, and
+    /// an automatic run adds nothing back. Restore — asked for by hand — is the
+    /// only way it returns.
+    #[test]
+    fn an_untagged_space_the_operator_deleted_stays_deleted() {
+        let kept: Vec<SessionSpace> = DEFAULT_SESSION_SPACES
+            .iter()
+            .filter(|space| space.key != "untagged")
+            .map(|space| seeded(space.key))
+            .collect();
+
+        assert!(
+            plan(SeedMode::FirstRun, Some(&kept)).is_empty(),
+            "the next scan must not put it back"
+        );
+        assert_eq!(
+            plan(SeedMode::Restore, Some(&kept))
+                .iter()
+                .map(|space| space.key)
+                .collect::<Vec<_>>(),
+            ["untagged"],
+            "and pressing Restore is how a person asks for it again"
+        );
     }
 
     /// The record verb and the create can never be offered together, which is
@@ -1940,7 +2225,96 @@ mod tests {
             order: 2.0,
             folded: None,
             rows: None,
+            create_dir: String::new(),
         }
+    }
+
+    /// Story 52.5, acceptance 7: the destination survives a save and a read, and
+    /// clearing the box removes the key rather than writing an empty one — the
+    /// space is then back to today's behaviour with nothing left in the file to
+    /// explain.
+    #[test]
+    fn a_destination_round_trips_and_clearing_it_writes_no_key() {
+        let source = render_new(
+            &SpaceEdit {
+                create_dir: "logs".to_owned(),
+                ..edit("Log", "tag:log")
+            },
+            "01ABC",
+            "2026-08-17",
+        );
+        assert!(source.contains("create_dir: logs"), "{source}");
+        assert_eq!(read_one("_spaces/log.md", &source).create_dir, "logs");
+
+        let cleared = render_edit(
+            "_spaces/log.md",
+            &source,
+            &SpaceEdit {
+                create_dir: String::new(),
+                ..edit("Log", "tag:log")
+            },
+        );
+        assert!(
+            !cleared.contains("create_dir"),
+            "an empty destination writes no key: {cleared}"
+        );
+        assert_eq!(read_one("_spaces/log.md", &cleared).create_dir, "");
+    }
+
+    /// A destination is a path, so what is read is the path and not the
+    /// operator's whitespace: `logs/` is the same request as `logs`
+    /// (`files::dir_rel`'s rule), and a key holding blanks names nothing.
+    #[test]
+    fn a_destination_is_read_as_the_directory_it_names() {
+        for (written, expected) in [
+            ("logs", "logs"),
+            ("logs/", "logs"),
+            ("notes/2026", "notes/2026"),
+            ("  logs  ", "logs"),
+            ("   ", ""),
+        ] {
+            let text =
+                format!("---\nkeeper:\n  space: tag:log\n  create_dir: {written}\n---\n# Log\n");
+            assert_eq!(
+                read_one("_spaces/log.md", &text).create_dir,
+                expected,
+                "{written:?}"
+            );
+        }
+        // A file that says nothing about a destination is every space until
+        // somebody types one, and it must read as empty rather than as absent-
+        // and-therefore-something.
+        assert_eq!(
+            read_one(
+                "_spaces/log.md",
+                "---\nkeeper:\n  space: tag:log\n---\n# Log\n"
+            )
+            .create_dir,
+            ""
+        );
+    }
+
+    /// Story 52.5, acceptance 6 — AD-120 with a directory in play. A file inside
+    /// a space's own directory is the kind its TAG declares: the reference filed
+    /// into `logs/` is picked by the References space and never by the Log one,
+    /// and both spaces find it there because the pool reads markdown wherever it
+    /// sits (FR-285) and the query matches a tag rather than a path.
+    #[test]
+    fn a_file_in_a_spaces_directory_is_the_kind_its_tag_says() {
+        let files = vec![
+            ("logs/2026-08-17-0900-the-spec.md", REF),
+            ("logs/2026-08-17-0901-opened.md", LOG_A),
+        ];
+        assert_eq!(
+            run(&seeded("refs"), &files).expect("the References space"),
+            ["logs/2026-08-17-0900-the-spec.md"],
+            "a `ref` in logs/ is a reference"
+        );
+        assert_eq!(
+            run(&seeded("log"), &files).expect("the Log space"),
+            ["logs/2026-08-17-0901-opened.md"],
+            "and the directory adopted nothing"
+        );
     }
 
     /// FR-121 in one assertion: prose, unknown keys and key order all survive a

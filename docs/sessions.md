@@ -71,9 +71,11 @@ migrates has to keep working.
 **Flat is one markdown pool.** Every file declares its own kind as a tag —
 `about`, `task`, `log`, `prompt`, `ref` — so moving a file never changes what it
 is, and a new kind of thing is a new tag rather than a new directory. `refs/`,
-`prompts/` and `logs/` do not exist; the five lists you see are saved queries over
-the tags. A file declaring none of them is **unfiled**, which is not an error but
-does mean nothing surfaces it.
+`prompts/` and `logs/` do not exist; the lists you see are saved queries over
+the tags. A file declaring none of them is **untagged**, which is not an error:
+the last space, **Untagged**, is the saved query for exactly those files — every
+kind negated — so it is listed, counted and foldable like anything else, and it
+is absent from a session where every file has said what it is.
 
 The known cost is real: a flat session opened in Finder is an undifferentiated pile
 of markdown until something reads the tags. `AGENTS.md` is the mitigation and is
@@ -86,7 +88,7 @@ about *versioning*, not about kind, and no tag can replace that.
 **Markdown is found wherever it sits.** keeper reads a session's markdown in
 subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
 file is in the pool, the space whose tag it carries lists it, and a file carrying no tag
-is **unfiled** rather than invisible. Two folders are never read, in both shapes —
+is listed by **Untagged** rather than invisible. Two folders are never read, in both shapes —
 `artifacts/`, which is output, and `workspace/`, which is scratch that dies with the
 session — and neither is anything dotted, like `.git` or `.obsidian`. A folder-shaped
 session's root is read the same way, beside its `README.md`: the record stays the record
@@ -357,13 +359,13 @@ nobody made.
   session: a per-session copy of a saved query is the thing this shape exists to avoid, so
   these files land beside `_template/` and never inside `active/`. Seeding only ever fills a
   hole. A space your zone already has — by file name, by title, or as one of keeper's own
-  five — is left exactly as you tuned it, because a verb you press several times a week must
-  not be able to rewrite a query you wrote once. An entry keeper cannot run — one with no
-  query in it, or a query that does not parse, or something that is not a `.md` sitting
+  defaults — is left exactly as you tuned it, because a verb you press several times a week
+  must not be able to rewrite a query you wrote once. An entry keeper cannot run — one with
+  no query in it, or a query that does not parse, or something that is not a `.md` sitting
   directly inside `_spaces/` — is skipped and named in the log, and the session is still
   created: a typo in a template's space file is not a reason to refuse you a session. The
   one case keeper declines outright is a zone with no `_spaces/` directory at all, since an
-  absent one is how keeper knows to write you the five defaults; open the sessions board
+  absent one is how keeper knows to write you the defaults; open the sessions board
   once and the zone has them, and a template can fill in from there.
 - **Rename a template** — offered on a **named** template's row, and only there. The name
   you type is folded to a directory name exactly as *New template* folds it, the move
@@ -654,30 +656,47 @@ is re-read when you open it again, not while you watch it.
 
 ## Spaces, tasks and the log
 
-Below Files, a session shows three more surfaces. All three read the same pool, and
-none of them stores anything except the fold you leave a space in.
+**Spaces come first, then Files.** A session's own sections read: what it is (the record's
+header), then the spaces, then the file tree, then what it points at, then the log. The
+spaces sat *after* the tree until they were moved: the tree is what the session holds and a
+space is a reading of it, so the contents came first. The order asks a different question —
+which of the two you read more often — and About, Tasks and Log are what a session gets
+opened for. The tree is where you go when a space has not surfaced something, which is the
+second question. It is not a setting.
+
+All of these surfaces read the same pool, and none of them stores anything except the fold
+you leave a space in.
 
 **Spaces** are the zone's saved queries, one markdown file each under
-`60-sessions/_spaces/`. Five ship by default — About, Tasks, Log, References, Prompts —
-and they are ordinary files: rename them, reorder them, delete one, write your own. The
-query language is the notes vault's, the same grammar and the same chip editor, because a
-`tag:` that meant one thing in notes and another in sessions would be a trap. A broken
-query selects nothing and says so; an unreadable sort still runs the query.
+`60-sessions/_spaces/`. Six ship by default — About, Tasks, Log, References, Prompts, and
+**Untagged** last — and they are ordinary files: rename them, reorder them, delete one,
+write your own. A default you delete stays deleted; *Restore default spaces* is how you ask
+for it back. The query language is the notes vault's, the same grammar and the same chip
+editor, because a `tag:` that meant one thing in notes and another in sessions would be a
+trap. A broken query selects nothing and says so; an unreadable sort still runs the query.
+
+**Untagged** is that grammar read the other way round: `-tag:about -tag:log -tag:prompt
+-tag:ref -tag:task`, which is every kind negated, so it holds exactly the files that have
+not said what they are. It sorts last and it renders **only when it has something** — on a
+session where every file declares a kind there is no such section, because a permanent
+empty row reporting the absence of a problem is noise. Its rows fold, count and carry the
+same menu as any other space's.
 
 **A space you can write into.** A space whose query names exactly one kind carries its
 own **New note** button — Tasks, Log, References and Prompts do, and so does any space you
 write that asks for one of those tags. The button is always there, not revealed by
 hovering: it is the one thing a space exists to let you do. Edit and delete stay on
 hover, because they are maintenance. The file is tagged as it is created, so it lands in
-the space you made it from rather than in Unfiled, and it opens immediately.
+the space you made it from rather than in Untagged, and it opens immediately.
 
 **Where the new file goes is your session's shape.** A flat session keeps everything in
 one pool, so the file is written at the session root. A folder-shaped session keeps
 references in `refs/` and prompts in `prompts/`, so that is where they are written —
 exactly the directories that shape reads its pool from, which is what makes the new file
 appear in the space you pressed. The directory is *where keeper puts it*; the tag is what
-makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` is still
-unfiled, in either shape, and keeper will say so rather than guessing from the folder.
+makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` still
+declares no kind, in either shape — it is listed by **Untagged** — and keeper will say so
+rather than guessing from the folder.
 
 **How a file gets filed.** A file that already exists — one you wrote in your editor, one
 an agent dropped in, the `README.md` a session has had since the day it was made — gets
@@ -701,30 +720,39 @@ rather than a panel that would refuse.
 **One boundary that used to exist and does not any more.** A folder-shaped session's
 pool was once its `README.md` plus `refs/` and `prompts/`, so markdown sitting loose at
 the root of one was in no pool at all — tagging it filed it nowhere, and it did not even
-show up as Unfiled. It is read now, in both shapes: tag a root file and the space whose
-tag it carries lists it, leave it untagged and it is Unfiled. The record itself is still
-the record and never doubles as an ordinary file.
+show up as untagged. It is read now, in both shapes: tag a root file and the space whose
+tag it carries lists it, leave it untagged and **Untagged** lists it. The record itself is
+still the record and never doubles as an ordinary file.
 
-Two spaces are told plainly that they have no button, in one line where the button
-would have been — both of them a folder-shaped session's:
+**A space that cannot be written into still has the button, and the button says why.**
+It is there, greyed out, and the reason is what it describes itself with — so the answer
+to "why has this space no *New note* when every other one does" is on the control itself
+rather than left for you to work out. Three spaces are in that state:
 
-- **Tasks.** That contract has no tasks file — keeper will not write one where the shape
-  keeps none — so there is nowhere to put one. *Convert to flat* is how such a session
-  gets a place for keeper to write tasks into. (The board itself is not flat-only; see
-  **Tasks** below.)
-- **Log.** That shape's log is a `### ` entry under `## Log` inside `README.md`, not a
-  file at all, and **New log** on the Files header already writes one there.
+- **Tasks**, on a folder-shaped session. That contract has no tasks file — keeper will
+  not write one where the shape keeps none — so there is nowhere to put one. *Convert to
+  flat* is how such a session gets a place for keeper to write tasks into. (The board
+  itself is not flat-only; see **Tasks** below.)
+- **Log**, on a folder-shaped session. That shape's log is a `### ` entry under `## Log`
+  inside `README.md`, not a file at all, and **New log** on the Files header already
+  writes one there.
+- **Untagged**, on any session. Its query is every kind negated, so it names no kind at
+  all and there is nothing a file made there could be. Make the file from **Files** and it
+  appears in Untagged until you give it a kind tag — which is the whole of what the space
+  is for.
 
 **About says why too**, and offers the verb that does apply. A session has one about
 record — `README.md`, under both contracts — and keeper edits it rather than making a
-second, so where the button would have been the space says exactly that and offers
-**Open README** instead. If
-the space's query asks for more than one thing — the About space on the live drives asks
-`tag:about tag:recordings` — that is what it says instead, because a create would have
-to pick one kind and the query names two. A space asking for two ordinary tags gets the
-same line. Absent rather than present and refusing, in every case; and a space whose
-query keeper cannot read still carries its own fault line rather than a second sentence
-about creating.
+second, so its create is greyed out saying exactly that, and **Open README** sits beside
+it. If the space's query asks for more than one thing — the About space on the live drives
+asks `tag:about tag:recordings` — that is what it says instead, because a create would
+have to pick one kind and the query names two. A space asking for two ordinary tags gets
+the same line.
+
+The button is **absent** in only one case: where keeper has neither a kind nor a reason to
+give you. A space asking for an ordinary tag that is not a kind — `tag:project/alpha` —
+never offered a create to miss, and a space whose query keeper cannot read carries its own
+fault line rather than a second sentence about creating.
 
 **What a row opens as.** A row is a single click and behaves like one everywhere: it
 replaces what the panel you pressed in was showing rather than adding a panel beside it.
@@ -795,6 +823,35 @@ be read on arrival, and *Start spaces folded* is where "shut them all" belongs.
 
 Both survive editing anything else. Rename a space, retag it, change its sort — the two
 keys come back out of the file unchanged.
+
+**A space that says where its new files go.** One more optional key, and it is the only
+one about *writing* rather than about what the space shows:
+
+```yaml
+keeper:
+  space: tag:log
+  create_dir: logs    # New note here writes logs/2026-08-17-0914-untitled.md
+```
+
+The editor calls it **New files go in**, and an empty box — which is every space until you
+type something — means what it has always meant: new files land at the session's own root.
+Set it and keeper makes the folder if it is not there, in the same write that creates the
+file. `logs` and `logs/` are the same request, and `notes/2026` is allowed.
+
+**It does not change what a file *is*.** The new file still carries the kind tag in its
+frontmatter, and that tag is the only reason any space lists it: a file in `logs/` tagged
+`ref` is a **reference**, and the References space is where it appears. keeper never reads a
+kind out of a folder. Nothing already in the session moves either — the key governs creates
+and nothing else — and the **New log** and **New prompt** buttons on the Files header belong
+to no space, so they keep writing where the session's own contract keeps that kind.
+
+Three destinations are refused when you save the space, each saying which rule it broke:
+one that leaves the session, `workspace/` — scratch that is not synced and dies with the
+session — and any folder starting with a dot, because keeper's markdown scan never enters
+one, so a file filed there would be in no space, on no board and not even Untagged. On a
+session still in the **folder** shape the contract's own `refs/` and `prompts/` keep
+winning, because that shape's pool reads exactly those two folders and the root: convert
+the session to flat and the key takes effect.
 
 **Where your own fold is kept.** Per space, in a cookie in keeper's own webview — not in the
 zone, not in `keeper.toml`, not in any file on your drives. It survives a restart and it

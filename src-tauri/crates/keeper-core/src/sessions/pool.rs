@@ -194,9 +194,25 @@ pub struct Pool {
     pub refs: Vec<PoolEntry>,
     /// By `order`, then title.
     pub tasks: Vec<PoolEntry>,
-    /// Files declaring no kind: the migration residue and the hand-dropped
-    /// file. Empty for a clean session, and non-empty is the signal that
-    /// something is not filed yet.
+    /// Files declaring no kind: the migration residue and the hand-dropped file.
+    ///
+    /// **No surface renders this** (Story 52.4). It used to cross as
+    /// `SessionDetailVm::unfiled` and be drawn as a badge list — no count, no
+    /// fold, no row verbs, and no way to act on any of it. The residue is a
+    /// *space* now: the `Untagged` entry in
+    /// [`crate::sessions::spaces::DEFAULT_SESSION_SPACES`], whose query is every
+    /// kind negated, selected by [`crate::sessions::spaces::select`] out of the
+    /// whole pool like any other saved query — so it folds, counts, and its rows
+    /// carry the same menu every other space's rows carry.
+    ///
+    /// What still wants this field is the caller that needs **every** markdown
+    /// file whatever its kind: `sessions_ref_candidates` offers each of them as a
+    /// place a pointer could be written, and a `ref` list an operator has not
+    /// tagged yet is exactly the file they mean.
+    /// `the_untagged_space_selects_exactly_this_bucket` holds the two answers
+    /// together, because "which files declare no kind?" asked twice — once as a
+    /// match on [`KindTag::of`] and once as a string of negations — is the pair
+    /// that drifts the day a sixth kind is added.
     pub unfiled: Vec<PoolEntry>,
 }
 
@@ -725,6 +741,81 @@ mod tests {
         assert_eq!(pool.unfiled[0].rel, "README.md");
     }
 
+    /// Row 3, from the pool's side: the two answers to "which files declare no
+    /// kind?" are one set.
+    ///
+    /// [`Pool::unfiled`] matches on [`KindTag::of`]; the `Untagged` space asks
+    /// `-tag:about -tag:log -tag:prompt -tag:ref -tag:task`. Neither can see the
+    /// other, and both are edited by hand, so a sixth kind added to
+    /// [`crate::sessions::shape::KINDS`] teaches the match arm at once and the
+    /// query only if somebody remembers a string. This is where that is noticed.
+    ///
+    /// Compared as **sets**: which files belong is the claim, and the order they
+    /// are drawn in is the space's own `sort`, asserted where the space is
+    /// defined.
+    #[test]
+    fn the_untagged_space_selects_exactly_this_bucket() {
+        use crate::sessions::spaces;
+
+        let files = [
+            file("about.md", "---\ntags: [about]\n---\n# About\n"),
+            file("2026-08-12-0900-x.md", "---\ntags: [log]\n---\n# Opened\n"),
+            file("01-kickoff.md", "---\ntags: [prompt]\n---\n# Kickoff\n"),
+            file("the-spec.md", "---\ntags: [ref]\n---\n# The spec\n"),
+            file("do-it.md", "---\ntags: [task]\n---\n# Do it\n"),
+            file("README.md", "# Left over from migration\n"),
+            // A tag that is not a kind — the case `is:untagged` would have got
+            // wrong, and the reason the query is the negation and not that flag.
+            file(
+                "pasted.md",
+                "---\ntags: [project/alpha]\n---\n# Pasted in\n",
+            ),
+        ];
+
+        let untagged = spaces::by_key("untagged").expect("the Untagged default exists");
+        let definition = spaces::read_one(
+            &spaces::rel_of(untagged),
+            &spaces::render_note(
+                untagged,
+                "01J5AAAAAAAAAAAAAAAAAAAAAA",
+                "2026-08-14T10:00:00+02:00",
+            ),
+        );
+        let entries = read(&files);
+        let candidates: Vec<spaces::Candidate<'_>> = entries
+            .iter()
+            .zip(files.iter())
+            .map(|(entry, source)| spaces::Candidate {
+                entry,
+                mtime_ns: 1_700_000_000_000_000_000,
+                text: source.text,
+            })
+            .collect();
+        let selection = spaces::select(&definition, &candidates, 1_760_000_000_000);
+        assert_eq!(selection.error, None, "the seeded query has to parse");
+
+        let mut picked: Vec<&str> = selection
+            .picked
+            .iter()
+            .map(|index| candidates[*index].entry.rel.as_str())
+            .collect();
+        picked.sort_unstable();
+        let pool = read_pool(&files);
+        let mut bucket: Vec<&str> = pool
+            .unfiled
+            .iter()
+            .map(|entry| entry.rel.as_str())
+            .collect();
+        bucket.sort_unstable();
+
+        assert_eq!(picked, bucket);
+        assert_eq!(
+            bucket,
+            ["README.md", "pasted.md"],
+            "and neither is empty, or the equality above proves nothing"
+        );
+    }
+
     /// AD-120, from the read side, and the guard Story 50.1 owes its own fix.
     ///
     /// 50.1 teaches the create verb where a folder-shaped session keeps each
@@ -733,9 +824,10 @@ mod tests {
     /// concludes the directory is now what makes a file a reference, and drops
     /// the tag from the write. It does not: the reader derives the kind from
     /// tags alone and never looks at the path, so an untagged file in `refs/`
-    /// is *unfiled* — present in the pool, listed by no space, and named by the
-    /// detail's Unfiled notice. The directory is where a create PUTS a file;
-    /// the tag is what makes it that kind.
+    /// is *unfiled* — present in the pool, listed by no space of a kind, and
+    /// surfaced by the `Untagged` space, which is what a residue with a count and
+    /// a fold looks like. The directory is where a create PUTS a file; the tag is
+    /// what makes it that kind.
     #[test]
     fn a_file_in_refs_without_the_tag_is_still_unfiled() {
         let pool = read_pool(&[
@@ -763,7 +855,7 @@ mod tests {
     /// the tag from a write into `log/`. It does not: the reader derives the
     /// kind from tags alone and never looks at the path, so an untagged file in
     /// the directory logs are filed in is *unfiled* — in the pool, listed by no
-    /// space, and named by the detail's Unfiled notice rather than silently
+    /// space of a kind, and surfaced by the `Untagged` space rather than silently
     /// absent.
     #[test]
     fn a_file_in_a_log_directory_without_the_tag_is_still_unfiled() {

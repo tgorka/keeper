@@ -1048,10 +1048,10 @@ pub async fn sessions_create(
     // for a template.
     //
     // **Only into a `_spaces/` that already exists.** An absent one is the
-    // signal `sessions_spaces` reads to write the zone the five defaults it was
+    // signal `sessions_spaces` reads to write the zone the defaults it was
     // designed around ("the directory is the ledger"); a create that minted the
     // directory to drop one template space into it would consume that signal,
-    // and the zone would never be offered the other four. So the create fills
+    // and the zone would never be offered the rest. So the create fills
     // holes and `sessions_spaces` digs the well — and the one zone this can
     // decline for says so rather than seeding nothing in silence.
     let space_seeds = if outcome.seeds.is_empty() {
@@ -1712,7 +1712,7 @@ pub fn sessions_unarchive(root_id: String, session_id: String) -> Result<(), Ipc
 
 /// One zone's space definitions, in rail order (FR-261).
 ///
-/// Seeds on first sight: a zone with **no** `_spaces/` gets the five defaults
+/// Seeds on first sight: a zone with **no** `_spaces/` gets every default
 /// written before the list answers, so the operator's first look at a session is
 /// the grouped one rather than an empty rail with a button on it. A zone that
 /// has the directory is theirs — an empty one stays empty, which is what makes a
@@ -1795,6 +1795,11 @@ fn space_vm(
         // the cap is a render cap the section applies to its own rows.
         folded: space.folded,
         rows: space.rows,
+        // The destination is carried and never resolved either: where a create
+        // lands is `shape::kind_dir`'s answer, which needs a session's shape
+        // and this payload is the ZONE's. The editor shows the field, the
+        // create verb sends the space's id, and Rust composes the path (AD-65).
+        create_dir: space.create_dir.clone(),
         warnings: space.warnings.clone(),
         error: query::parse(&space.query).err().map(|error| error.message),
         new_file_kind: spaces::creatable_kind(&space.query).map(|kind| kind.as_str().to_owned()),
@@ -1916,6 +1921,16 @@ pub fn sessions_space_files(root_id: String, session_id: String) -> Result<Vec<(
 /// refuses one and for the same reason: a stored space that selects nothing
 /// silently is worse than a save that says no. The editor's own refusal to save
 /// an empty chip set sits on top of this; this is the backstop under it.
+///
+/// **A destination keeper will not write into is refused here too** (Story 52.5,
+/// FR-309), and by the one guard the file verbs already ask —
+/// [`keeper_core::sessions::files::check_dir`]. Three refusals, each with its
+/// own sentence: a path that leaves the session, `workspace/` because it is
+/// scratch that dies with the session (AD-113), and a dotted directory because
+/// keeper's own markdown scan never reads one back, so a file filed there would
+/// be in no space at all. Refusing at the save rather than at the create is what
+/// puts the sentence in the form the operator is looking at, instead of in a
+/// notice weeks later beside a button that will not work.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_space_save(
@@ -1923,7 +1938,7 @@ pub async fn sessions_space_save(
     space: keeper_core::sessions::vm::SessionSpaceReq,
 ) -> Result<String, IpcError> {
     use keeper_core::notes::query;
-    use keeper_core::sessions::spaces;
+    use keeper_core::sessions::{files, spaces};
 
     query::parse(&space.query).map_err(|error| IpcError {
         code: IpcErrorCode::Internal,
@@ -1931,6 +1946,13 @@ pub async fn sessions_space_save(
         account_id: None,
         retriable: false,
     })?;
+    // Folded exactly as the reader folds it, so what is validated is what a
+    // create will compose: `logs/` and `logs` are one request, and blanks name
+    // no directory at all.
+    let create_dir = space.create_dir.trim().trim_end_matches('/').to_owned();
+    if !create_dir.is_empty() {
+        files::check_dir(&create_dir).map_err(file_verb_error)?;
+    }
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let read = crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
 
@@ -1941,11 +1963,12 @@ pub async fn sessions_space_save(
         icon: space.icon.clone(),
         order: space.order,
         // Straight through from the form, which seeded them from `space_vm`.
-        // `render_edit` replaces the whole `keeper:` map, so dropping either
-        // here would delete the operator's answer on the next Save of anything
-        // else — the one failure this story is arranged to prevent.
+        // `render_edit` replaces the whole `keeper:` map, so dropping any of
+        // them here would delete the operator's answer on the next Save of
+        // anything else — the one failure this story is arranged to prevent.
         folded: space.folded,
         rows: space.rows,
+        create_dir,
     };
     // An id names a file that must already be there. A save against one that is
     // gone — deleted in another window, or on the far side of a sync — is
@@ -3390,25 +3413,36 @@ pub async fn sessions_dir_new(
 /// `log` asked of THIS command on a folder-shaped session is refused with a
 /// sentence pointing at that one rather than growing a second log writer.
 ///
-/// **Where it writes is the shape's answer, not this command's**
+/// **Where it writes is the shape's answer and the SPACE's, not this command's**
 /// ([`keeper_core::sessions::shape::kind_dir`]). A flat session keeps every
 /// kind at its root; a folder-shaped one keeps references in `refs/` and
 /// prompts in `prompts/`, which are exactly the directories its pool reads back
 /// (`crate::sessions_root::read_ref_sources`). Until Story 50.1 this always
 /// wrote the root, so on a folder-shaped session the file landed somewhere no
-/// space and no *Unfiled* notice could ever see — which is why the surface
+/// space could ever see, the Untagged one included — which is why the surface
 /// suppressed the button instead of fixing the write.
+///
+/// **`space_id` is which space pressed the button, and `""` is nobody** (Story
+/// 52.5, FR-309). A space may name a directory its creates go into, and until
+/// this parameter existed the verb could not honour one because it was never
+/// told which query the operator was writing into — the *Files* heading's *New
+/// log* and *New prompt* are exactly that case and still send `""`. The
+/// definition is read here and the destination handed to `kind_dir`; the path
+/// itself is composed in Rust (AD-65) and checked by the one guard
+/// `files::check_dir`, which is what refuses an escaping, scratch or dotted
+/// directory somebody hand-wrote into a definition file.
 ///
 /// The name is `YYYY-MM-DD-HHMM-<slug>.md` and the tag is written into
 /// frontmatter, because those two together are what decide whether the zone's
 /// spaces will ever list the file. The directory is *not* the third half of
 /// that: [`keeper_core::sessions::pool::read_one`] derives a kind from tags
 /// alone (AD-120), so a file in `refs/` without `tags: [ref]` is unfiled no
-/// matter which folder it is in.
+/// matter which folder it is in — and a file in a space's own `logs/` is a
+/// reference if that is what its tag says.
 ///
-/// Rejects with: `internal` (unknown root or session, an unknown kind tag, a
-/// kind this session's shape has no home for, a refused path, a failed write),
-/// `unsupported` (mobile).
+/// Rejects with: `internal` (unknown root or session, a space that is no longer
+/// there, an unknown kind tag, a kind this session's shape has no home for, a
+/// refused path, a failed write), `unsupported` (mobile).
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_file_new_kind(
@@ -3417,6 +3451,7 @@ pub async fn sessions_file_new_kind(
     session_id: String,
     kind: String,
     title: String,
+    space_id: String,
 ) -> Result<String, IpcError> {
     use keeper_core::sessions::files;
     use keeper_core::sessions::shape::{self, KINDS};
@@ -3442,6 +3477,32 @@ pub async fn sessions_file_new_kind(
     } else {
         title.trim().to_owned()
     };
+    // Which space pressed the button, and what it says about where its files
+    // go. `_spaces/` is read only when there is a space to look up, so the
+    // *Files* heading's own creates cost exactly what they cost before and a
+    // space that named no directory produces the same plan byte for byte.
+    //
+    // A definition that is gone is refused rather than treated as "no
+    // destination": the operator asked for a file in a place, and writing it
+    // somewhere else silently is the failure this story was reported as.
+    let asked = space_id.trim();
+    let create_dir = if asked.is_empty() {
+        String::new()
+    } else {
+        let read =
+            crate::sessions_root::zone_spaces(&root_id).ok_or_else(|| root_error(&root_id))?;
+        let Some(space) = read.spaces.iter().find(|space| space.rel == asked) else {
+            return Err(IpcError {
+                code: IpcErrorCode::Internal,
+                message: "that space is no longer there, so keeper does not know where its \
+                          files belong; nothing was written. Re-open the session and try again."
+                    .to_owned(),
+                account_id: None,
+                retriable: false,
+            });
+        };
+        space.create_dir.clone()
+    };
     let root = zone_root.join(&row.path);
 
     // Which contract this session follows, from its own top-level names —
@@ -3455,7 +3516,11 @@ pub async fn sessions_file_new_kind(
     // a second one would give `shape()` two answers. The refusal is the
     // domain's sentence rather than one written here, so the rule and the
     // wording it is explained with cannot drift apart.
-    let subdir = shape::kind_dir(session_shape, tag).map_err(|no_home| IpcError {
+    //
+    // The space's own directory rides in as the third argument and the
+    // contract's answer is the fallback, so a space that named nothing is
+    // answered exactly as it was before this story (Story 52.5).
+    let subdir = shape::kind_dir(session_shape, tag, &create_dir).map_err(|no_home| IpcError {
         code: IpcErrorCode::Internal,
         message: no_home.to_string(),
         account_id: None,
@@ -3463,10 +3528,12 @@ pub async fn sessions_file_new_kind(
     })?;
     // The containment rule is asked of the directory in its own right, exactly
     // as `sessions_file_new` asks it of the `parent` it is handed: `check_dir`
-    // refuses `workspace/`, traversal and dotfolders, and a rule that only
-    // holds because the mapping happened to return a safe constant is not a
+    // refuses `workspace/`, traversal and dotted directories, and a rule that
+    // only holds because the mapping happened to return a safe constant is not a
     // rule (`files::check_dir`'s own argument). No second guard is written
-    // here; this is that one, asked.
+    // here; this is that one, asked — and it is what stands between a
+    // hand-edited `create_dir: ../../etc` in a definition file and a write
+    // outside the session.
     if let Some(subdir) = subdir {
         files::check_dir(subdir).map_err(file_verb_error)?;
     }
@@ -3917,8 +3984,9 @@ pub fn sessions_file_new_kind(
     session_id: String,
     kind: String,
     title: String,
+    space_id: String,
 ) -> Result<String, IpcError> {
-    let _ = (root_id, session_id, kind, title);
+    let _ = (root_id, session_id, kind, title, space_id);
     Err(unsupported())
 }
 
@@ -4132,16 +4200,20 @@ pub fn sessions_ref_candidates(
     // wrote `references.md` into the session ROOT — a real file, on the
     // operator's disk, that the folder pool never reads
     // (`sessions_root::read_ref_sources` takes `README.md` by name and then
-    // walks `refs/` and `prompts/`), invisible to every space and to the
-    // *Unfiled* notice alike. A write into a blind spot, and the very failure
+    // walks `refs/` and `prompts/`), invisible to every space, the Untagged one
+    // included. A write into a blind spot, and the very failure
     // the spaces surface had suppressed its own create button to avoid.
     //
     // `Ref` has a home under both contracts, so the refusal arm is unreachable
     // today; the session root is the honest answer if that ever changes,
     // because this command only OFFERS a destination and `sessions_ref_add`
     // re-checks whatever it is handed.
+    //
+    // No space asked, so no destination: this is the reference LIST's own file,
+    // one per session, and a space's `create_dir` governs the files a space
+    // creates rather than where the list lives (Story 52.5).
     let top_level: Vec<String> = taken_in(&zone_root.join(&row.path)).into_iter().collect();
-    let default_target = match shape::kind_dir(shape::shape(&top_level), KindTag::Ref) {
+    let default_target = match shape::kind_dir(shape::shape(&top_level), KindTag::Ref, "") {
         Ok(Some(dir)) => format!("{dir}/{DEFAULT_REF_FILE}"),
         Ok(None) | Err(_) => DEFAULT_REF_FILE.to_owned(),
     };

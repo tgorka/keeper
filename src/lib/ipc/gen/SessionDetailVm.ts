@@ -55,17 +55,6 @@ log: Array<SessionLogEntryVm>,
  */
 shape: string, 
 /**
- * Root markdown declaring no kind: a leftover `README.md`, a file someone
- * dropped in, anything mid-migration. Session-relative paths.
- *
- * Surfaced rather than swallowed. The flat contract's whole premise is
- * that a file says what it is, so a file that says nothing is exactly the
- * case the operator needs to see — and it is what makes a half-finished
- * migration visible instead of merely survivable. Empty for a clean
- * session, in both shapes.
- */
-unfiled: Array<string>, 
-/**
  * The work items, ready for the board — under **either** contract.
  *
  * The folder shape used to have none, because the detail read the pool only

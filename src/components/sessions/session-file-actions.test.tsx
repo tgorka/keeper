@@ -10,8 +10,13 @@ const sessionsDirNew = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   sessionsFileNew: (root: unknown, session: unknown, parent: unknown, t: unknown, k: unknown) =>
     sessionsFileNew(root, session, parent, t, k),
-  sessionsFileNewKind: (root: unknown, session: unknown, tag: unknown, slug: unknown) =>
-    sessionsFileNewKind(root, session, tag, slug),
+  sessionsFileNewKind: (
+    root: unknown,
+    session: unknown,
+    tag: unknown,
+    slug: unknown,
+    space: unknown,
+  ) => sessionsFileNewKind(root, session, tag, slug, space),
   sessionsLogToday: (root: unknown, session: unknown) => sessionsLogToday(root, session),
   sessionsDirNew: (root: unknown, session: unknown, rel: unknown) =>
     sessionsDirNew(root, session, rel),
@@ -116,11 +121,14 @@ describe("SessionFileActions", () => {
     screen.getByRole("button", { name: SESSION_FILE_NEW_LOG_LABEL }).click();
     await waitFor(() => {
       // The tag, not a name: keeper chooses both, which is what makes the file
-      // findable by the zone's own Log space.
+      // findable by the zone's own Log space. And no space id, because this
+      // button is the *Files* heading's own — the file lands where the session's
+      // contract keeps a log, not in a space's directory (Story 52.5).
       expect(sessionsFileNewKind).toHaveBeenCalledWith(
         "tgdrive",
         "active/2026-08-10-keeper",
         "log",
+        "",
         "",
       );
     });
@@ -176,6 +184,7 @@ describe("SessionFileActions", () => {
         "active/2026-08-10-keeper",
         "prompt",
         "",
+        "",
       );
     });
     // The other two are unchanged: a folder session still logs — through the
@@ -192,6 +201,7 @@ describe("SessionFileActions", () => {
         "tgdrive",
         "active/2026-08-10-keeper",
         "prompt",
+        "",
         "",
       );
     });

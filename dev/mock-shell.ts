@@ -478,14 +478,18 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     error: null,
     // `about` is the one kind `sessions_file_new_kind` refuses: a session has
     // one record, and a second would give `shape()` two answers. So this space
-    // shows no create control — the state the section must render as ABSENT
-    // rather than disabled.
+    // renders a create that is PRESENT and DISABLED, describing itself with the
+    // sentence on `noHome` below (Story 52.4) — the state the owner reported as
+    // "about space nie ma przycisku dodaj jak inne".
     newFileKind: null,
     // Says nothing about how it opens or how much it shows, which is what four
     // of the five defaults do — the plain case, so the fixture still shows a
     // space that behaves exactly as it did before Story 51.3.
     folded: null,
     rows: null,
+    // Names no directory, which is what every space does until somebody types
+    // one: a create lands where this session's contract keeps that kind.
+    createDir: "",
   },
   {
     id: "_spaces/tasks.md",
@@ -505,6 +509,7 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // list would render the control never, which is the state that hides a
     // regression rather than showing it.
     rows: 2,
+    createDir: "",
   },
   {
     id: "_spaces/log.md",
@@ -523,6 +528,10 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // to carry or nobody sees it until a real zone sets it.
     folded: true,
     rows: null,
+    // The one fixture that files its creates somewhere (Story 52.5): a new log
+    // goes into `logs/`, keeper makes the directory, and the space still lists
+    // the file because its QUERY matched the tag rather than the folder.
+    createDir: "logs",
   },
   {
     id: "_spaces/refs.md",
@@ -548,6 +557,7 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // read. Two warnings on one space is the list the editor prints in full.
     folded: null,
     rows: null,
+    createDir: "",
   },
   {
     id: "_spaces/prompts.md",
@@ -567,6 +577,27 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     newFileKind: null,
     folded: null,
     rows: null,
+    createDir: "",
+  },
+  {
+    id: "_spaces/untagged.md",
+    name: "Untagged",
+    // Every kind negated (Story 52.4): the residue, which the detail used to
+    // draw as a badge list with no count, no fold and no row verbs.
+    query: "-tag:about -tag:log -tag:prompt -tag:ref -tag:task",
+    sort: "name asc",
+    sortEffective: "name asc",
+    icon: "inbox",
+    defaultKey: "untagged",
+    order: 6,
+    warnings: [],
+    error: null,
+    // A negated query names no kind, so there is nothing a create here could
+    // write — present and disabled, with the sentence below.
+    newFileKind: null,
+    folded: null,
+    rows: null,
+    createDir: "",
   },
 ];
 
@@ -661,6 +692,24 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     files: [],
     error: "Unexpected end of query after `AND`.",
     noHome: null,
+    openRecord: false,
+  },
+  {
+    spaceId: "_spaces/untagged.md",
+    // The one untagged file the tree also shows, because a clean fixture would
+    // never render the state this space exists for — and a half-migrated session
+    // is the state the operator will actually meet. It stood on `unfiled` until
+    // Story 52.4, which is a field this payload no longer has.
+    files: [spaceFile("stray-thought.md", "stray-thought", [], 8)],
+    error: null,
+    // `spaces::Refusal::Negated`, restated as fixture bytes for the reason the
+    // record's refusal above is: this shell never runs in the app, and Rust owns
+    // the wording wherever it does.
+    noHome:
+      "this space asks for what is left over — every one of its terms is a negation — so it " +
+      "names no kind, and a create writes one kind with one tag. There is nothing a file made " +
+      "here could be: make the file from Files below, and it appears here until you give it a " +
+      "kind tag.",
     openRecord: false,
   },
 ];
@@ -957,10 +1006,6 @@ const ANSWERS: Record<string, unknown> = {
       { date: "2026-08-12", title: "Opened the session", body: "" },
     ],
     shape: "flat",
-    // One untagged file, because a clean fixture would never show the state the
-    // `unfiled` list exists for — and a half-migrated session is the state the
-    // operator will actually meet.
-    unfiled: ["stray-thought.md"],
     tasks: SESSION_TASKS,
   },
   sessions_tree: { entries: SESSION_ENTRIES, truncated: false },
@@ -1074,8 +1119,8 @@ function fallback(command: string): unknown {
  */
 /**
  * The pre-flat session, as `pool.rs` never sees it: `log` comes from the
- * README's `### ` entries, `unfiled` and `tasks` are empty because neither
- * exists before the migration, and `shape` says so. Everything the flat detail
+ * README's `### ` entries, `tasks` is empty because no task file exists before
+ * the migration, and `shape` says so. Everything the flat detail
  * shows is absent here, which is the point — this is the fixture that proves
  * the detail degrades instead of erroring on a session it cannot group.
  */
@@ -1096,7 +1141,6 @@ const FOLDER_DETAIL = {
     { date: "2026-06-30", title: "", body: "" },
   ],
   shape: "folder",
-  unfiled: [],
   tasks: [],
 };
 
@@ -1167,6 +1211,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       // exactly the surface built to catch it. `null` writes no key.
       folded: typeof req.folded === "boolean" ? req.folded : null,
       rows: typeof req.rows === "number" ? req.rows : null,
+      createDir: typeof req.createDir === "string" ? req.createDir.trim() : "",
     };
     const at = SESSION_SPACES.findIndex((space) => space.id === id);
     if (at === -1) {
@@ -1261,7 +1306,20 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const now = new Date(ago(0));
     const pad = (value: number) => String(value).padStart(2, "0");
     const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
-    const relPath = `${stamp}-${slug}.md`;
+    // Which space asked, and what it says about where its files go (Story
+    // 52.5). The real backend reads the definition and composes the path in
+    // Rust (AD-65); the fixture mirrors it, because a `bun dev` that put a
+    // space's creates at the root would show the defect this story fixed.
+    // Only a space matched BY ID names a directory — the Files heading sends no
+    // id, so its own creates keep landing at the session root.
+    const asked = SESSION_SPACES.find((space) => space.id === String(payload.spaceId ?? ""));
+    const dir = (asked?.createDir ?? "").trim().replace(/\/+$/, "");
+    const relPath = `${dir === "" ? "" : `${dir}/`}${stamp}-${slug}.md`;
+    if (dir !== "" && !SESSION_ENTRIES.some((entry) => entry.relPath === dir)) {
+      // `compile_new` leads with the same `MkDir`, so the directory appears in
+      // the tree on the first create rather than after a restart.
+      SESSION_ENTRIES.push(sessionEntry(dir, true, null, 0));
+    }
     SESSION_ENTRIES.push(sessionEntry(relPath, false, 96, 0));
     // …and into the SPACE that asked for this kind, which is the whole of what
     // FR-273 does and the one thing a screenshot of the tree cannot show. The
@@ -1270,7 +1328,11 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     // fixture, so the row has to be put where that read would have found it.
     // Without this the press adds a line to the tree and leaves Tasks exactly
     // as empty as before — a mock that renders the control and not its outcome.
-    const target = SESSION_SPACES.find((space) => space.newFileKind === kind);
+    //
+    // By kind and not by the id above, because the Files heading's creates
+    // belong to a space too: what makes a file appear in one is its TAG
+    // (AD-120), whichever directory it sits in.
+    const target = asked ?? SESSION_SPACES.find((space) => space.newFileKind === kind);
     const listing = SESSION_SPACE_FILES.find((row) => row.spaceId === target?.id);
     listing?.files.unshift(
       spaceFile(relPath, String(payload.title ?? "").trim() || "untitled", [kind], 0),

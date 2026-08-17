@@ -760,8 +760,6 @@ pub fn detail(
         })
         .collect();
 
-    let unfiled: Vec<String> = pool.unfiled.iter().map(|entry| entry.rel.clone()).collect();
-
     let (status, archived_year) = (row.status.clone(), row.archived_year);
     Some(SessionDetailVm {
         id: row.id,
@@ -777,7 +775,6 @@ pub fn detail(
         summary: section_snippet(body, "## Summary"),
         log,
         shape: shape.as_str().to_owned(),
-        unfiled,
         tasks,
     })
 }
