@@ -190,6 +190,16 @@ export interface TextFileFrameProps {
    */
   properties: FilePropertiesCoordinates | null;
   /**
+   * Re-address this surface at the file the properties panel just RENAMED, or
+   * omitted when the host holds no panel target to move (Story 52.2, FR-302).
+   *
+   * `next` is the file's new profile-relative subpath exactly as
+   * `sessions_file_rename` answered it (AD-65) — the frame joins nothing. A
+   * host that omits this keeps today's behaviour precisely: the panel calls
+   * `onWritten` and this frame re-reads the address it already holds.
+   */
+  onPropertiesRenamed?: (next: string) => void;
+  /**
    * The standing sentence for a file keeper will write and does not manage, or
    * `null` (Story 46.14, AD-102).
    *
@@ -232,6 +242,7 @@ export function TextFileFrame({
   writeRefusal = null,
   csv,
   properties,
+  onPropertiesRenamed,
   preview,
   csvOptions,
 }: TextFileFrameProps): React.ReactElement {
@@ -392,6 +403,7 @@ export function TextFileFrame({
             profileId={propertiesPanel.profileId}
             relativePath={propertiesPanel.relativePath}
             onWritten={() => void reload()}
+            onRenamed={onPropertiesRenamed}
           />
         </div>
       )}

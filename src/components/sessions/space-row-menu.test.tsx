@@ -70,10 +70,25 @@ const ABSOLUTE = `/Users/t/tgdrive/${SUBPATH}`;
 const BLOCK = "---\ntitle: untitled\n---\n";
 const ROW_LABEL = "untitled";
 
+/**
+ * What Rust answers a rename with in the Story 52.2 cases below.
+ *
+ * A different DIRECTORY, and a filename that is neither the old one nor the
+ * typed title — so nothing on this side could have composed it from `SUBPATH`
+ * plus "Kick Off". An assertion that finds this string got it from the command
+ * (AD-65). The `beforeEach` default deliberately stays a plausible sibling path,
+ * because the tests that are not about re-pointing should read like real life.
+ */
+const MOVED_SUBPATH = "60-sessions/archive/2026-02/kick-off-notes.md";
+
 function mount(
-  handlers: { onOpen?: () => void; onChanged?: () => void; onNotice?: () => void } = {},
+  handlers: {
+    onOpen?: (subpath: string) => void;
+    onChanged?: () => void;
+    onNotice?: () => void;
+  } = {},
 ) {
-  const onOpen = vi.fn(handlers.onOpen);
+  const onOpen = vi.fn<(subpath: string) => void>(handlers.onOpen);
   const onChanged = vi.fn(handlers.onChanged);
   const onNotice = vi.fn(handlers.onNotice);
   render(
@@ -286,6 +301,62 @@ describe("a space row's context menu", () => {
     fireEvent.keyDown(field, { key: "Enter" });
 
     await waitFor(() => expect(sessionsFileRename).toHaveBeenCalledTimes(1));
+  });
+
+  /**
+   * Story 52.2, FR-302. The rename's answer is the file's new subpath, and a
+   * pane left on the old one renders "is no longer in tgdrive" over a file that
+   * merely changed its name — the owner's report, reachable from this menu as
+   * well as from the properties panel.
+   *
+   * Through `onOpen`, which is the section's own opener, for the reason the
+   * open-in-this-panel case above gives: a `setActiveTarget` call here would be a
+   * second implementation of the row's click.
+   */
+  it("re-points the pane that was showing the file at the subpath the rename answered with", async () => {
+    sessionsFileRename.mockResolvedValue(MOVED_SUBPATH);
+    // The reader's pane, on the file that is about to be renamed.
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: ROOT, relativePath: SUBPATH });
+    const { row, onOpen } = mount();
+    await openMenu(row);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }));
+    const field = await screen.findByRole("textbox", { name: SPACE_ROW_RENAME_FIELD_LABEL });
+    fireEvent.change(field, { target: { value: "Kick Off" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() => expect(onOpen).toHaveBeenCalledWith(MOVED_SUBPATH));
+  });
+
+  /**
+   * The difference between following a rename and hijacking a panel. Only the
+   * active panel can be re-pointed, so a rename of a row the reader is NOT
+   * looking at must leave what they are looking at exactly where it is — a menu
+   * verb that replaced the open file would be a worse defect than the banner.
+   */
+  it("leaves a pane that was showing another file where it was", async () => {
+    const OTHER = "60-sessions/active/2026-08-16-keeper/README.md";
+    sessionsFileRename.mockResolvedValue(MOVED_SUBPATH);
+    panelsStore.getState().setActiveTarget({ kind: "file", profileId: ROOT, relativePath: OTHER });
+    const { row, onOpen, onChanged } = mount();
+    await openMenu(row);
+
+    fireEvent.click(screen.getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }));
+    const field = await screen.findByRole("textbox", { name: SPACE_ROW_RENAME_FIELD_LABEL });
+    fireEvent.change(field, { target: { value: "Kick Off" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    // The space is still re-read — the pool changed — but nothing moved.
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(onOpen).not.toHaveBeenCalled();
+    const { panels, activeId } = panelsStore.getState();
+    expect(panels.find((panel) => panel.id === activeId)?.target).toEqual({
+      kind: "file",
+      profileId: ROOT,
+      relativePath: OTHER,
+    });
   });
 
   /**

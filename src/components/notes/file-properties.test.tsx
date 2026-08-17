@@ -64,8 +64,15 @@ const ABOUT_BLOCK = "---\ntags:\n  - about\n---\n";
 const PROFILE = "tgdrive";
 const REL = "60-sessions/active/weekly/README.md";
 
-function mount(onWritten = vi.fn()) {
-  render(<FileProperties profileId={PROFILE} relativePath={REL} onWritten={onWritten} />);
+function mount(onWritten = vi.fn(), onRenamed?: (next: string) => void) {
+  render(
+    <FileProperties
+      profileId={PROFILE}
+      relativePath={REL}
+      onWritten={onWritten}
+      onRenamed={onRenamed}
+    />,
+  );
   return onWritten;
 }
 
@@ -348,13 +355,42 @@ describe("a session file's title, changed in the panel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
   });
 
-  it("tells its host the file changed, because the file it was showing has moved", async () => {
+  /**
+   * A subpath no string surgery on this side could have produced: a different
+   * directory, and a filename that is not the title that was typed. So an
+   * assertion that finds it can only have got it from the command's answer,
+   * which is the whole of what AD-65 asks this side to prove.
+   */
+  const MOVED = "60-sessions/archive/2026-02/kick-off-notes.md";
+
+  it("tells its host WHERE the file moved to, in the subpath Rust answered with", async () => {
     syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    const onRenamed = vi.fn<(next: string) => void>();
+    const onWritten = mount(vi.fn(), onRenamed);
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick Off");
+
+    await waitFor(() => expect(onRenamed).toHaveBeenCalledWith(MOVED));
+    // And NOT the news alone: `onWritten` means "read the address you have
+    // again", and after a rename that address is the one the rename emptied —
+    // which is what put "is no longer in tgdrive" over a file that had only been
+    // renamed. A host told where it went must not also be told to look where it
+    // no longer is.
+    expect(onWritten).not.toHaveBeenCalled();
+  });
+
+  it("still just says the file changed to a host that cannot re-address itself", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
     const onWritten = mount();
     await screen.findByRole("region", { name: PROPERTIES_LABEL });
 
     await retitle("Kick Off");
 
+    // Exactly today's behaviour for the note embed and every other host that
+    // holds no panel target, so adding the second hook changed no caller.
     await waitFor(() => expect(onWritten).toHaveBeenCalledTimes(1));
   });
 });

@@ -854,6 +854,20 @@ export interface FilePropertiesProps {
    * put the old block back.
    */
   onWritten: () => void;
+  /**
+   * The rename landed and the file is at `nextRelativePath` now, so whatever is
+   * showing it should be re-ADDRESSED rather than re-read (Story 52.2, FR-302).
+   *
+   * Supplied only by a host that holds a panel target it can move. Called
+   * INSTEAD of {@link onWritten} for a rename, because the two are opposite
+   * instructions: `onWritten` says "read the address you have again", and after
+   * a rename that address is the one Rust just emptied — which is what put "is
+   * no longer in tgdrive" over a file that had merely been renamed.
+   *
+   * `nextRelativePath` is the subpath `sessions_file_rename` answered with,
+   * passed through untouched. Never the old path plus the new title (AD-65).
+   */
+  onRenamed?: (nextRelativePath: string) => void;
 }
 
 /**
@@ -881,17 +895,29 @@ export interface FilePropertiesProps {
  * and a probe written in TypeScript would be a second definition of "is this in a
  * session" that could disagree with the first.
  *
- * **What happens to the panel the file was open in is `panel-strip.tsx`'s
- * existing rule, and that is deliberate.** A panel stores an identity, resolves
- * it on every render, and a `file` target that stops resolving *keeps its place*
- * and renders Rust's reason — the rule written for a file renamed on another
- * device, which is exactly what this now is when it is renamed on this one. So a
- * retitle from here leaves the strip saying where the file used to be until it is
- * reopened under its new name. Re-pointing the panel would mean a new verb on the
- * panels store, and a store verb invented to smooth over one surface's write is
- * how a store comes to have five of them.
+ * # The pane the file was open in follows it (Story 52.2, FR-302)
+ *
+ * A rename used to leave the open panel on the address Rust had just emptied,
+ * where `panel-strip.tsx`'s standing rule for a `file` target that stops
+ * resolving renders Rust's reason — "is no longer in tgdrive. It was moved,
+ * renamed or deleted outside keeper." That rule is right for a file renamed on
+ * another device and wrong here, because here keeper knows exactly where the
+ * file went: `sessions_file_rename` answers with the new subpath for this
+ * purpose (`sessions_ipc.rs:3419-3420`).
+ *
+ * So a host that holds a panel target passes {@link FilePropertiesProps.onRenamed}
+ * and re-points it with that answer. No new store verb was needed — the panels
+ * store's own `setActiveTarget` is the retarget-in-place gesture every other
+ * sessions surface already opens a file with. A host that passes no `onRenamed`
+ * is unchanged, which is what keeps the note embed and every other caller on
+ * today's behaviour.
  */
-export function FileProperties({ profileId, relativePath, onWritten }: FilePropertiesProps) {
+export function FileProperties({
+  profileId,
+  relativePath,
+  onWritten,
+  onRenamed,
+}: FilePropertiesProps) {
   const [block, setBlock] = useState<string | null>(null);
   // Bumped by the re-read the clobber refusal offers. A counter rather than a
   // second copy of the effect: re-reading is the same read.
@@ -941,11 +967,24 @@ export function FileProperties({ profileId, relativePath, onWritten }: FilePrope
         // The block is not adopted from the answer here, unlike `write` above:
         // this command answers with the file's new SUBPATH, and the block the
         // panel is holding now belongs to a path this component is no longer
-        // addressed by. `onWritten` is what tells the host to look again.
+        // addressed by.
+        //
+        // That subpath is forwarded rather than dropped, because it is the only
+        // thing that can tell a host WHERE the file went — Rust returns it for
+        // exactly this (`sessions_ipc.rs:3419-3420`) and joining the old path to
+        // the new title here would be the webview composing a path (AD-65). A
+        // host that can re-address itself gets `onRenamed` and does not want
+        // `onWritten`: re-reading the old address is what rendered "is no longer
+        // in tgdrive" over a file that had only been renamed. A host with no
+        // panel target to move gets today's `onWritten` unchanged.
         rename: (nextBlock) =>
           sessionsFileRename(profileId, relativePath, block, nextBlock).then(
-            () => {
-              onWritten();
+            (nextRelativePath) => {
+              if (onRenamed === undefined) {
+                onWritten();
+                return;
+              }
+              onRenamed(nextRelativePath);
             },
             (error: unknown) => {
               throw new Error(refusalSentence(error, FILE_WRITE_FAILED));

@@ -32,6 +32,9 @@ const notesCsvRead = vi.fn<(vaultId: string, target: string) => Promise<NoteCsvV
 const notesTree = vi.fn<(vaultId: string, relDir: string) => Promise<NoteFolderVm>>();
 const notesResolveLink = vi.fn<(vaultId: string, target: string) => Promise<NoteRefVm | null>>();
 const notesVaultSetActive = vi.fn<(vaultId: string) => Promise<void>>();
+const syncReadFrontmatter = vi.fn<(profileId: string, subpath: string) => Promise<string>>();
+const sessionsFileRename =
+  vi.fn<(profileId: string, subpath: string, expected: string, block: string) => Promise<string>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   syncReadText: (profileId: string, subpath: string) => syncReadText(profileId, subpath),
@@ -54,7 +57,14 @@ vi.mock("@/lib/ipc/client", () => ({
   // throws where the panel READS it, so these are needed even by the tests that
   // never touch a property. `syncReadFrontmatter` resolving to `""` is a file
   // with no frontmatter, which is what every fixture here is.
-  syncReadFrontmatter: vi.fn(async () => ""),
+  //
+  // Story 52.2 made both of these controllable, because a rename's answer is the
+  // panel target the viewer re-addresses itself with, and only a test can say
+  // what that answer was.
+  syncReadFrontmatter: (profileId: string, subpath: string) =>
+    syncReadFrontmatter(profileId, subpath),
+  sessionsFileRename: (profileId: string, subpath: string, expected: string, block: string) =>
+    sessionsFileRename(profileId, subpath, expected, block),
   syncWriteFrontmatter: vi.fn(async () => ""),
   notesSave: vi.fn(),
   recordingNoteTargets: vi.fn(async () => null),
@@ -64,6 +74,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
+import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
@@ -242,6 +253,11 @@ beforeEach(() => {
   notesResolveLink.mockReset();
   notesVaultSetActive.mockReset();
   notesVaultSetActive.mockResolvedValue(undefined);
+  syncReadFrontmatter.mockReset();
+  // No frontmatter, which is what the panel's own suite calls an unblocked file
+  // and what every fixture here was before Story 52.2 made this controllable.
+  syncReadFrontmatter.mockResolvedValue("");
+  sessionsFileRename.mockReset();
   resetNotesVaultsStoreForTest();
   resetPanelsStoreForTest();
   primaryViewStore.getState().setView("files");
@@ -1119,5 +1135,113 @@ describe("a session log opens in three modes (Story 51.5)", () => {
     const tabs = screen.getAllByRole("tab").map((tab) => tab.textContent);
     expect(tabs).toEqual(["Preview", "Source"]);
     expect(screen.getByText(WORKSPACE_REFUSAL)).toBeInTheDocument();
+  });
+});
+
+/**
+ * The owner's report, closed at the surface that showed it (Story 52.2, FR-302).
+ *
+ * *"zmiana title property zmienia nazwe teraz ale tez wyswietla '<path> is no
+ * longer in tgdrive…' zamiast przeladowac plik z nowa nazwa"* — the rename
+ * landed and the pane reported the file missing, because the panel told its host
+ * only that something had changed and the host re-read the address the rename had
+ * just emptied.
+ *
+ * **The assertion is the panel's target, not a rendered sentence.** What was
+ * broken is WHERE this surface points after a rename, and the target is that,
+ * exactly. The missing-file sentence is `panel-strip.tsx`'s and is asserted in
+ * its own suite; reproducing it here would need the strip mounted around a
+ * viewer this suite deliberately renders on its own (`openThroughTheRegistry`).
+ */
+describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
+  /** A block with a title, which is the field a rename is committed from. */
+  const TITLED = "---\ntitle: untitled\n---\n";
+
+  /**
+   * What Rust answers the rename with — and the point of the fixture: a
+   * different DIRECTORY, and a filename that is not the title that was typed.
+   * No string surgery on this side could compose it from `SESSION_README` plus
+   * "Kick Off", so a panel target holding it can only have got it from the
+   * command's return value, which is the whole of what AD-65 asks this half to
+   * prove.
+   */
+  const MOVED = "60-sessions/archive/2026-02/kick-off-notes.md";
+
+  /** Commit the title row, which is a blur — the panel's own suite's gesture. */
+  async function retitle(next: string): Promise<void> {
+    const field = await screen.findByRole("textbox", { name: "title" });
+    fireEvent.change(field, { target: { value: next } });
+    fireEvent.blur(field);
+  }
+
+  it("re-points the active panel at the subpath the rename answered with", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    // The pane the reader is already in, showing the file about to be renamed —
+    // without it there is no active panel to follow anything.
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "profile-1", relativePath: SESSION_README });
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    await waitFor(() => {
+      const { panels, activeId } = panelsStore.getState();
+      const active = panels.find((panel) => panel.id === activeId);
+      expect(active?.target).toEqual({
+        kind: "file",
+        profileId: "profile-1",
+        relativePath: MOVED,
+      });
+    });
+  });
+
+  it("moves the pane it was in rather than opening a second one", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "profile-1", relativePath: SESSION_README });
+    const before = panelsStore.getState().panels.length;
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toContainEqual({
+        kind: "file",
+        profileId: "profile-1",
+        relativePath: MOVED,
+      }),
+    );
+    // Following a file is a retarget, not an open: a second panel would leave the
+    // emptied address on screen beside the file, which is the banner this story
+    // exists to remove.
+    expect(panelsStore.getState().panels).toHaveLength(before);
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).not.toContainEqual({
+      kind: "file",
+      profileId: "profile-1",
+      relativePath: SESSION_README,
+    });
+  });
+
+  it("offers no properties panel for a file in no profile, so no rename can strand it", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    openThroughTheRegistry(
+      target({ name: "loose.md", relativePath: "archive/loose.md", profileId: null }),
+    );
+    await settle();
+
+    // The spec's one Block-if: with no profile there is no address to re-point,
+    // and this surface answers it by having no rename to offer at all — not by
+    // offering one whose success would re-read a path that had moved.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(syncReadFrontmatter).not.toHaveBeenCalled();
+    expect(sessionsFileRename).not.toHaveBeenCalled();
   });
 });

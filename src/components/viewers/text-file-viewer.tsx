@@ -82,6 +82,38 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
   }, [vaults, file.profileId, file.relativePath]);
 
   /**
+   * Re-point this panel at the file the properties panel just renamed (Story
+   * 52.2, FR-302).
+   *
+   * `next` is the new profile-relative subpath `sessions_file_rename` answered
+   * with, passed to the store untouched: the old path plus the new title is a
+   * path composed in the webview, and AD-65 puts that in Rust. `setActiveTarget`
+   * retargets the panel in place — the gesture `session-detail.tsx` and
+   * `session-spaces.tsx` already open a session file with — so the reader keeps
+   * the pane they were reading in, now showing the same file at its new name.
+   *
+   * Guarded INSIDE rather than by withholding the handler. Withholding it would
+   * type-check just as well — a profile-less file mounts no `properties` and so
+   * offers no rename to answer today — but it makes the file's no-profile case
+   * fall back to `onWritten`, which means "re-read the address you have", and
+   * after a rename that is the address the rename emptied. Supplying it always
+   * means no arrangement of the frame's gate can turn this surface into one that
+   * re-reads a path a rename just moved. Shaped after {@link openInNotes}, which
+   * guards the same field the same way.
+   */
+  const repointAfterRename = useCallback(
+    (next: string) => {
+      if (file.profileId === null) {
+        return;
+      }
+      panelsStore
+        .getState()
+        .setActiveTarget({ kind: "file", profileId: file.profileId, relativePath: next });
+    },
+    [file.profileId],
+  );
+
+  /**
    * Follow a wikilink written in this file (Story 45.18).
    *
    * The second host of the decoration layer, and the reason the following lives
@@ -196,6 +228,11 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
               ? null
               : { profileId: file.profileId, relativePath: file.relativePath }
           }
+          // Story 52.2: a rename moves the file, so the pane showing it is
+          // re-ADDRESSED rather than left to re-read the address the rename just
+          // emptied — which is what put "is no longer in tgdrive" over a file the
+          // reader had merely retitled.
+          onPropertiesRenamed={repointAfterRename}
           preview={preview}
         />
       </div>

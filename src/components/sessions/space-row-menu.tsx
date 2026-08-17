@@ -72,7 +72,7 @@ import {
   syncReadFrontmatter,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
-import { panelsStore } from "@/lib/stores/panels";
+import { panelsStore, sameTarget } from "@/lib/stores/panels";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /**
@@ -241,7 +241,23 @@ export function SpaceRowMenu({
             : spliceProperty(block, entry, serialiseScalar(next, entry.quoted));
         return sessionsFileRename(rootId, subpath, block, nextBlock);
       })
-      .then(() => {
+      .then((nextSubpath) => {
+        // Story 52.2: the rename answers with the file's new profile-relative
+        // subpath, and a pane left on the old one renders "is no longer in
+        // tgdrive" over a file that merely changed its name. So the pane follows
+        // it — through `onOpen`, the section's own opener, because a
+        // `setActiveTarget` call here would be a second implementation of the
+        // row's click. The subpath is passed through untouched (AD-65).
+        //
+        // Guarded on the active panel actually SHOWING this file, which is the
+        // difference between following a rename and hijacking a panel: only the
+        // active panel can be re-pointed, and if it is showing something else
+        // then nothing here is stale and a rename must not change what it shows.
+        const { panels, activeId } = panelsStore.getState();
+        const active = panels.find((panel) => panel.id === activeId);
+        if (active !== undefined && sameTarget(active.target, target)) {
+          onOpen(nextSubpath);
+        }
         onChanged();
       })
       .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SPACE_ROW_RENAME_FAILED)));
