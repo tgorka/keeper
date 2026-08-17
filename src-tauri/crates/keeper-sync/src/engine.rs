@@ -169,6 +169,21 @@ pub struct VerifyReport {
     pub bad: Vec<(String, String)>,
 }
 
+/// What one repair pass could and could not put back (DW-208).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepublishReport {
+    /// Objects the server does not have, whatever became of them here.
+    pub missing: u64,
+    /// Of those, the ones this machine can still supply and has queued.
+    pub queued: u64,
+    /// What that will cost to send.
+    pub queued_bytes: u64,
+    /// The rest: named, because a human knowing which files to go looking for
+    /// on which other machine is the only thing that can still recover them.
+    pub unrecoverable: Vec<lfs::audit::MissingObject>,
+}
+
 /// Why a path is not synced yet (Story 32.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Internally tagged, like `WorkKind`: the UI reads this as a discriminated
@@ -5212,6 +5227,118 @@ impl Engine {
             .with_auth_refresh(self.lfs_auth_refresh(&profile, auth.clone()));
         let specs = client.download(&objects).await?;
         Ok(lfs::audit::report(&specs, &paths, checked, bytes))
+    }
+
+    /// Re-publish anything the server is missing that this machine can still
+    /// supply (DW-208).
+    ///
+    /// # Why nothing else does this
+    ///
+    /// `WorkKind::LfsUpload` is enqueued in exactly one place — `commit_local`,
+    /// for files being *freshly staged in that commit*. That is correct for the
+    /// path it serves and it means an obligation, once dropped, is never picked
+    /// up again: a file that is committed and unchanged produces no staging, so
+    /// no upload, so a pointer whose object silently never reached the server
+    /// stays that way forever. [`Self::rescan`] cannot help either — it forgets
+    /// the remembered tree state and asks for a walk, and a walk finds nothing
+    /// to stage in a file that has not changed.
+    ///
+    /// Measured on a real folder: 4 objects, 1.69 GB, committed 2026-08-10 and
+    /// still absent from the server a week later, through dozens of syncs,
+    /// several restarts and a "Recheck all files". Nothing in the engine was
+    /// ever going to try again.
+    ///
+    /// [`Self::audit_remote_objects`] is the half that *finds* them. This is
+    /// the half that fixes the ones that are fixable, and it is deliberately
+    /// separate: detection is read-only and safe to run anywhere, repair moves
+    /// gigabytes.
+    ///
+    /// # What "can still supply" means
+    ///
+    /// Two sources, in order of cost. The object may still be in this machine's
+    /// own store, in which case the upload is queued and the bytes are already
+    /// there. Otherwise the worktree file may *be* the content: re-cleaning it
+    /// hashes it back into the store and proves it, because a file whose digest
+    /// no longer matches the pointer is a different file and publishing it
+    /// under that oid would be a lie.
+    ///
+    /// Anything neither source can produce is reported, not papered over. Those
+    /// bytes exist on some other machine or nowhere, and the only thing that
+    /// helps is a human knowing which files to go looking for.
+    pub async fn republish_missing_objects(&self, id: &str) -> Result<RepublishReport> {
+        let audit = self.audit_remote_objects(id).await?;
+        let mut report = RepublishReport {
+            missing: audit.missing.len() as u64,
+            ..RepublishReport::default()
+        };
+        if audit.is_intact() {
+            return Ok(report);
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        store.ensure_layout()?;
+        let now = self.platform.now_ms();
+        // One upload per object, however many paths name it.
+        let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for object in &audit.missing {
+            if queued.contains(&object.oid) {
+                continue;
+            }
+            let absolute = profile.local_path.join(&object.path);
+            let have = store.contains(&object.oid, object.size) || {
+                // Not in the store. The worktree file may still be the content
+                // — that is the ordinary state on the machine that recorded it
+                // — so hash it back in and check what came out.
+                match lfs::stage::clean(&store, &absolute) {
+                    Ok(pointer) => pointer.oid == object.oid && pointer.size == object.size,
+                    Err(err) => {
+                        tracing::debug!(
+                            path = %object.path,
+                            error = %err,
+                            "cannot rebuild a missing object from the worktree"
+                        );
+                        false
+                    }
+                }
+            };
+            if !have {
+                report.unrecoverable.push(object.clone());
+                continue;
+            }
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            queued.insert(object.oid.clone());
+            report.queued += 1;
+            report.queued_bytes += object.size;
+        }
+
+        if report.queued > 0 {
+            // Look now: the whole point of pressing the button is not to wait.
+            self.wake_now(&profile.id);
+            tracing::info!(
+                profile = profile.name,
+                queued = report.queued,
+                bytes = report.queued_bytes,
+                "re-publishing objects the server was missing"
+            );
+        }
+        for object in &report.unrecoverable {
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!(
+                    "{} is not on the server and its content is not on this machine — {} bytes that only another machine can still supply",
+                    object.path, object.size
+                ),
+            );
+        }
+        Ok(report)
     }
 
     /// Re-verify stored content for a profile (Story 25.6).

@@ -245,6 +245,10 @@ pub enum Command {
     Verify {
         /// Profile id or name. Omit for all profiles.
         profile: Option<String>,
+        /// Re-publish anything the server is missing that this machine can
+        /// still supply, instead of only reporting it (DW-208). Moves bytes.
+        #[arg(long, requires = "remote")]
+        repair: bool,
         /// Also ask the server whether it holds every object the pointers name.
         ///
         /// The half that finds permanent loss: a pointer whose object never
@@ -513,9 +517,13 @@ pub async fn run(
             let engine = engine_for(&platform, config)?;
             cmd_set_enabled(&printer, &engine, &profile, true)
         }
-        Command::Verify { profile, remote } => {
+        Command::Verify {
+            profile,
+            remote,
+            repair,
+        } => {
             let engine = engine_for(&platform, config)?;
-            cmd_verify(&printer, &engine, profile.as_deref(), remote).await
+            cmd_verify(&printer, &engine, profile.as_deref(), remote, repair).await
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1033,6 +1041,7 @@ async fn cmd_verify(
     engine: &Engine,
     wanted: Option<&str>,
     remote: bool,
+    repair: bool,
 ) -> std::result::Result<(), CliError> {
     let profiles = engine.list_profiles()?;
     let selected: Vec<SyncProfile> = select(&profiles, wanted)?.into_iter().cloned().collect();
@@ -1079,6 +1088,24 @@ async fn cmd_verify(
                 ));
             }
             entry["remote"] = serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null);
+
+            if repair && !audit.is_intact() {
+                let fixed = engine.republish_missing_objects(&profile.id).await?;
+                printer.line(format!(
+                    "{}: queued {} object(s) for re-upload ({:.2} GB); {} beyond this machine",
+                    profile.name,
+                    fixed.queued,
+                    fixed.queued_bytes as f64 / 1_073_741_824.0,
+                    fixed.unrecoverable.len()
+                ));
+                for object in &fixed.unrecoverable {
+                    printer.line(format!("  {} ({} bytes)", object.path, object.size));
+                }
+                // Only what nobody here can put back still counts against the
+                // exit code: an upload that is queued is a problem being fixed.
+                missing_total -= audit.missing.len() - fixed.unrecoverable.len();
+                entry["repair"] = serde_json::to_value(&fixed).unwrap_or(serde_json::Value::Null);
+            }
         }
         reports.push(entry);
     }
