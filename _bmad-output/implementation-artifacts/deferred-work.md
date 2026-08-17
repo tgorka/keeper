@@ -308,6 +308,55 @@ note: 2026-08-17 (story 52.7) — the entry stays OPEN, and the reason it stays 
   visibility with `opacity-0` (not `hidden`), so it stays in the DOM, in the tab
   order and in the accessibility tree — asserted at both the widget and the session
   mount point.
+note: 2026-08-17 (story 53.1) — the entry stays OPEN, and what it asks for is now the
+  ONLY thing still missing: a non-gesture reorder for pins on the desktop. 52.7's note
+  above is superseded in one respect — the `dataTransfer` lines it added were correct
+  and still did not work, because the defect was below the page. Tauri installs a wry
+  drag-drop handler whose closure always returns `true`
+  (`tauri-runtime-wry-2.11.4/src/lib.rs:4862-4896`); wry implements
+  `NSDraggingDestination` on the macOS WKWebView subclass itself
+  (`wry-0.55.1/src/wkwebview/class/wry_web_view.rs:77-112`) and forwards
+  `performDragOperation:` to `super` only when that closure answers `false`
+  (`wry-0.55.1/src/wkwebview/drag_drop.rs:88-95`). So the drop is claimed in Rust
+  before WebKit performs it and the page's `drop` cannot fire at all — for ANY HTML5
+  drag in this app, on any surface, whatever it writes to the store. `dragDropEnabled`
+  is per-window and config-time; turning it off would take Story 3.7's
+  drop-an-OS-file-to-attach with it (`layout/conversation-pane.tsx:814-848`, the app's
+  only `onDragDropEvent` consumer), so it was not touched.
+  53.1 therefore replaced the gesture rather than the data it carried. HTML5 drag is
+  GONE from both surfaces — no `draggable`, `onDragStart`, `onDragOver`, `onDrop` or
+  `dataTransfer` remains in `layout/pins-strip.tsx` or `notes/task-board.tsx`, and each
+  suite asserts the rendered DOM carries no `[draggable]` at all, because two
+  mechanisms for one verb is how the dead one survived two epics. Both now press,
+  move and release through one state machine, `hooks/use-pointer-drag.ts`
+  (`pointerdown` → slop → `setPointerCapture` → `pointermove` → `pointerup`), which
+  starts no OS drag session and so cannot be claimed by the native layer.
+  What is now TRUE on which surface:
+  - pins strip, desktop: reorder works by pointer for the first time since story 4.3.
+    A press needs no hold, becomes a drag past 10 px, previews the reordered strip
+    while carried (there is no HTML5 ghost left to lean on, so the preview IS the cue)
+    and persists the full order on release. A press that does not travel is still the
+    click that selects the room; the click after a drag is swallowed.
+  - pins strip, phone: unchanged in behaviour. The long-press lift (story 13.6) was
+    always pointer-only and always worked; it now enters the same hook, so the
+    stale-index guards and the release arithmetic exist once instead of twice. A
+    stationary lift still opens the pin's menu.
+  - pins strip, keyboard: STILL NOTHING on the desktop, which is this entry's actual
+    subject. "Move up" / "Move down" remain gated on `phone &&`. The close is still to
+    ungate them — a UX decision about the desktop menu's contents, and 53.1 had no
+    more licence to make it than 52.7 did.
+  - task board (`notes/task-board.tsx`, both the session and the widget mount): the
+    gesture works AND the dead drop zone is fixed. The whole column box is the target
+    now — its padding, its header and the empty space below the last card — where the
+    `<ul>` used to take the drop, not fill the box, and the box drew the highlight; the
+    cue is drawn on the element that accepts the release. This entry is still NOT
+    extended to the board: its per-card column menu remains the keyboard path,
+    hover/`focus-within` revealed with `opacity-0` (not `hidden`), untouched by 53.1.
+  Every claim above is mutation-proven: removing the slop, the click suppression, the
+  vacated-slot arithmetic, the card-midpoint tally, the column bounds, the cue's
+  source, the pins stale-index guard, or re-cutting the target at the old `<ul>`'s
+  edges each fails a named test in `notes/task-board.test.tsx`,
+  `sessions/session-board.test.tsx` or `layout/pins-strip.test.tsx`.
 
 ### DW-38: A favourited chat has no unread/mention affordance anywhere in the inbox view — the Favorites section renders compact rows as avatar + name only, and favourited rooms are removed from the Inbox window, so an unread favourited conversation shows no bold-name/dot/mention badge on any surface.
 
