@@ -275,7 +275,7 @@ describe("SessionFileActions", () => {
    * composed here would be the second namer (AD-65).
    */
   it("creates a folder from the path typed, and re-reads the tree", async () => {
-    const { onChanged } = mount();
+    const { onChanged, rerender } = mount();
     screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
     const dialog = await screen.findByRole("dialog");
     fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
@@ -289,18 +289,64 @@ describe("SessionFileActions", () => {
         "Interview Kit",
       );
     });
-    // Nothing to open: a folder is a row in the tree, not a document. The
-    // re-read is what makes it one — and therefore an option in *New file*'s
-    // Folder menu.
+    // Nothing to open: a folder is a row in the tree, not a document.
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     expect(panelsStore.getState().panels.find((p) => p.target?.kind === "file")).toBeUndefined();
     expect(sessionsFileNew).not.toHaveBeenCalled();
+
+    // …and the other half of row 12, which the re-read assertion alone does not
+    // buy: the row has to become a DESTINATION. `entries` is the parent's, so
+    // this plays the re-read the component just asked for and then creates a
+    // file into what came back. Without it, "the new folder is a row, and a
+    // file can be created into it" was asserted nowhere but in the dev mock.
+    rerender(
+      <Harness
+        onChanged={onChanged}
+        entries={[...entries(), entry({ name: "interview-kit", isDir: true, size: null })]}
+      />,
+    );
+    screen.getByRole("button", { name: SESSION_FILE_NEW_LABEL }).click();
+    const second = await screen.findByRole("dialog");
+    const folder = within(second).getByLabelText<HTMLSelectElement>(SESSION_FILE_NEW_FOLDER_LABEL);
+    const offered = within(folder).getAllByRole<HTMLOptionElement>("option");
+    expect(offered.map((option) => option.value)).toEqual(["", "artifacts", "interview-kit"]);
+    fireEvent.change(within(second).getByLabelText(SESSION_FILE_NEW_NAME_LABEL), {
+      target: { value: "Questions" },
+    });
+    fireEvent.change(folder, { target: { value: "interview-kit" } });
+    within(second).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM }).click();
+    await waitFor(() => {
+      expect(sessionsFileNew).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "interview-kit",
+        "Questions",
+        "md",
+      );
+    });
   });
 
-  /** Offered under both contracts: a container is a container in either. */
-  it("offers the folder button on a folder-shaped session too", () => {
+  /**
+   * Offered under both contracts, and it WORKS under both: a container is a
+   * container in either.
+   *
+   * Driven to the command rather than stopping at `toBeInTheDocument`, because
+   * this button is rendered unconditionally — an assertion that it exists could
+   * not fail unless somebody deleted it, and the thing being guarded is the
+   * absence of a `shape === "flat"` gate like the one *New prompt* used to
+   * carry. Pressing it through is what a re-introduced gate would fail.
+   */
+  it("makes a folder on a folder-shaped session too", async () => {
     mount({ shape: "folder" });
-    expect(screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL })).toBeInTheDocument();
+    screen.getByRole("button", { name: SESSION_DIR_NEW_LABEL }).click();
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(SESSION_DIR_NEW_NAME_LABEL), {
+      target: { value: "log" },
+    });
+    within(dialog).getByRole("button", { name: SESSION_FILE_NEW_CONFIRM }).click();
+    await waitFor(() => {
+      expect(sessionsDirNew).toHaveBeenCalledWith("tgdrive", "active/2026-08-10-keeper", "log");
+    });
   });
 
   it("cannot create a folder with no path", async () => {

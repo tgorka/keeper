@@ -31,6 +31,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormatAction } from "@/components/notes/editor/format-commands";
 import { FormatToolbar } from "@/components/notes/format-toolbar";
 import { isOversizeForEditing, mountTextEditor, type TextEditorMount } from "./text-editor-host";
+import type { FileOrigin } from "./use-text-file";
 
 export interface TextEditorSurfaceProps {
   /** The buffer. Controlled: a change to this prop is adopted by the live view. */
@@ -70,6 +71,15 @@ export interface TextEditorSurfaceProps {
   /** The profile or vault this file sits in, for the same labelling reason. */
   vault?: string | null;
   /**
+   * Which file these bytes came from, or absent when they are not a file — a
+   * paste, a scratch buffer, anything mounted over bytes that never came from
+   * `sync_read_text`.
+   *
+   * Identity and not naming: `path` and `vault` above are what a screen reader
+   * announces, and a name is not an identity. See the mount effect.
+   */
+  loadedFrom?: FileOrigin;
+  /**
    * Whether this buffer is markdown a save can follow, and therefore gets the
    * format toolbar, the slash menu and emoji completion (Story 50.3, FR-233).
    *
@@ -102,6 +112,7 @@ export function TextEditorSurface({
   onSave,
   path,
   vault,
+  loadedFrom,
   writingTools = false,
 }: TextEditorSurfaceProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -143,13 +154,21 @@ export function TextEditorSurface({
     mountRef.current?.runFormat?.(action);
   }, []);
 
-  // Keyed on `language` and on whether the tools are wanted: an extension list
-  // is fixed at construction, so a buffer that becomes read-only past the size
-  // limit has to be rebuilt to lose the tools rather than keep a slash menu no
-  // insertion can follow. A grammar cannot be swapped into a live view without
-  // a compartment handle, and swapping the FILE under an editor is not a thing
-  // this component does — 45.4 remounts it. Both rebuilds are therefore correct
-  // and rare.
+  // Keyed on the grammar, on whether the tools are wanted, and on WHICH FILE
+  // this is. An extension list is fixed at construction, so a buffer that
+  // becomes read-only past the size limit has to be rebuilt to lose the tools
+  // rather than keep a slash menu no insertion can follow, and a grammar cannot
+  // be swapped into a live view without a compartment handle.
+  //
+  // The file is in the key because nothing above remounts this component when
+  // the file changes — which is what the comment here used to claim, and it was
+  // never true: `RawRenderedView` renders one editor in one position, so a panel
+  // that replaces its target in place (story 51.5's `MarkdownPane` records the
+  // same defect from the other side) hands this same view a different file's
+  // bytes. Without it the undo history spans two files, and one undo followed by
+  // one save writes the previous file's text into this one. Absent coordinates
+  // mean the buffer is not a file, and then there is nothing to key on.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `loadedFrom`'s two halves are rebuild triggers, not reads — see above.
   useEffect(() => {
     const host = hostRef.current;
     if (host === null) {
@@ -203,7 +222,7 @@ export function TextEditorSurface({
       // host for the whole of the next async mount.
       setMounted(false);
     };
-  }, [language, tools]);
+  }, [language, tools, loadedFrom?.profileOrVaultId, loadedFrom?.relativePath]);
 
   useEffect(() => {
     mountRef.current?.setContent(content);

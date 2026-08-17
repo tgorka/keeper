@@ -210,9 +210,27 @@ pub fn check_rel(rel: &str) -> Result<(), FileVerbError> {
 /// instead of relying on the joined path to catch it — the join is the caller's,
 /// and a rule that only holds after a caller does the right thing is not a rule.
 ///
+/// **The scratch fence compares folded, and it does so here rather than in one
+/// caller.** The fence's whole job is to keep writes out of one real directory,
+/// and on the case-insensitive volumes keeper ships on (APFS by default, NTFS)
+/// `Workspace/notes` IS `workspace/notes` — so a case-sensitive `==` refuses
+/// `workspace` and waves `Workspace/notes` through to the same inode. Every
+/// caller has the hole, not just [`dir_rel`]: [`check_rel`] leads with this, so
+/// `Workspace/notes.md` was a *file* keeper would have written into scratch, and
+/// [`super::tasks::compile_move`] would have moved a card there. A fence whose
+/// answer depends on how the operator held the shift key is not a fence, so the
+/// fold belongs where both predicates read it. On a case-sensitive volume this
+/// refuses a genuinely distinct `Workspace/`, which is the correct direction for
+/// a containment rule to err: the sentence names `artifacts/`, and a directory
+/// keeper will not write into is a smaller loss than one it writes into by
+/// accident.
+///
+/// Only the first segment, as before: a nested `notes/workspace/` is an ordinary
+/// folder and never the fenced scratch, which is the session's own.
+///
 /// # Errors
 /// [`FileVerbError::Outside`] for traversal, an absolute path or a dotfolder;
-/// [`FileVerbError::Workspace`] for scratch.
+/// [`FileVerbError::Workspace`] for scratch, however it is capitalised.
 pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
     let owned = || rel.to_owned();
     if rel.is_empty()
@@ -224,7 +242,11 @@ pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
     {
         return Err(FileVerbError::Outside { rel: owned() });
     }
-    if rel == WORKSPACE || rel.starts_with("workspace/") {
+    if rel
+        .split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(WORKSPACE))
+    {
         return Err(FileVerbError::Workspace { rel: owned() });
     }
     Ok(())
@@ -264,8 +286,11 @@ pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
 ///
 /// # Errors
 /// Whatever [`check_dir`] refuses, asked of the typed path **and** of the folded
-/// one, so `Workspace` folds to `workspace` and is refused as scratch rather
-/// than created. [`FileVerbError::Unnameable`] when the fold leaves nothing.
+/// one. The typed ask now catches every capitalisation of the fenced name on its
+/// own (`check_dir` folds the fence), so the second ask is for what the *fold*
+/// invents: `Wörkspace` and `!!!WorkSpace!!!` are names the fence cannot see and
+/// `naming::slug_stem` turns both into `workspace`. [`FileVerbError::Unnameable`]
+/// when the fold leaves nothing.
 pub fn dir_rel(rel: &str) -> Result<String, FileVerbError> {
     // Trailing separators only: `log/` is the same request as `log`, while
     // trimming a LEADING one would turn `/etc` into a path this accepts.
@@ -292,6 +317,9 @@ pub fn dir_rel(rel: &str) -> Result<String, FileVerbError> {
         Some(parent) => format!("{parent}/{name}"),
         None => name,
     };
+    // The fold is a namer, so its output is a path the rule has not been asked
+    // about yet: a typed name the fence cannot recognise can still *become* the
+    // fenced one here.
     check_dir(&folded)?;
     Ok(folded)
 }
@@ -1208,27 +1236,84 @@ mod tests {
     }
 
     /// Row 4. Scratch is fenced (AD-113), and a folder there would invite writes
-    /// the engine refuses — including a `Workspace` that only becomes the fenced
-    /// name after the fold, which is why the folded path is checked as well.
+    /// the engine refuses — whatever case the fenced name is typed in, and at any
+    /// depth below it.
+    ///
+    /// `Workspace/notes` is the case this test was written without and the fence
+    /// let through: only the LAST segment folds, so the parent travelled verbatim
+    /// past a case-sensitive `==`, and on the case-insensitive volume keeper
+    /// ships on the directory it minted was the fenced one. Both spellings are
+    /// asserted at both depths so that neither half can be relaxed alone.
     #[test]
     fn no_folder_is_made_inside_the_workspace() {
-        assert!(matches!(
-            dir_rel("workspace"),
-            Err(FileVerbError::Workspace { .. })
-        ));
-        assert!(matches!(
-            dir_rel("workspace/x"),
-            Err(FileVerbError::Workspace { .. })
-        ));
-        assert!(
-            matches!(dir_rel("Workspace"), Err(FileVerbError::Workspace { .. })),
-            "the fold is what makes this the fenced directory, so the fold is checked"
-        );
-        assert!(compile_dir_new("active/s", "workspace/iter-3").is_err());
+        for typed in [
+            "workspace",
+            "workspace/x",
+            "Workspace",
+            "Workspace/notes",
+            "WORKSPACE/iter-3/deep",
+            "WorkSpace",
+        ] {
+            assert!(
+                matches!(dir_rel(typed), Err(FileVerbError::Workspace { .. })),
+                "{typed} is the fenced directory on the volume keeper ships on"
+            );
+            assert!(compile_dir_new("active/s", typed).is_err());
+        }
+        // The second ask, of the FOLDED path, is what these two need: the fence
+        // cannot recognise either spelling, and `slug_stem` turns both into the
+        // fenced name.
+        for folds_to_scratch in ["Wörkspace", "!!!WorkSpace!!!"] {
+            assert!(
+                matches!(
+                    dir_rel(folds_to_scratch),
+                    Err(FileVerbError::Workspace { .. })
+                ),
+                "{folds_to_scratch} folds to workspace and must be refused as scratch"
+            );
+        }
         // A folder merely *named* like the workspace is not in it, and
         // `artifacts/` is the place the refusal itself points at.
         assert_eq!(dir_rel("workspace-notes").as_deref(), Ok("workspace-notes"));
         assert_eq!(dir_rel("artifacts").as_deref(), Ok("artifacts"));
+        // The fence is the session's own scratch, so it is the first segment and
+        // only the first: a `notes/workspace` is an ordinary folder.
+        assert_eq!(
+            dir_rel("notes/Workspace").as_deref(),
+            Ok("notes/workspace"),
+            "a nested folder of that name is not the fenced directory"
+        );
+    }
+
+    /// The fence lives in `check_dir`, so it holds for the FILE verbs too — the
+    /// hole `dir_rel` exposed was never `dir_rel`'s alone.
+    ///
+    /// Without the fold here, `Workspace/notes.md` is a file `compile_new` would
+    /// have written and `check_deletable` would have deleted, inside the very
+    /// directory AD-113 fences, and `sessions_file_new`'s parent check would have
+    /// agreed. Asserted through the two public entry points rather than through
+    /// `check_dir` alone, because those are what the shell calls.
+    #[test]
+    fn the_scratch_fence_holds_for_a_file_however_it_is_capitalised() {
+        for rel in ["Workspace/notes.md", "WORKSPACE/notes.md"] {
+            assert!(
+                matches!(check_rel(rel), Err(FileVerbError::Workspace { .. })),
+                "{rel} is scratch, and a file verb must refuse it too"
+            );
+            assert!(compile_new("active/s", rel, "x").is_err());
+            assert!(matches!(
+                check_deletable(rel),
+                Err(FileVerbError::Workspace { .. })
+            ));
+        }
+        assert!(matches!(
+            check_dir("Workspace"),
+            Err(FileVerbError::Workspace { .. })
+        ));
+        // And the neighbour that only shares a prefix still passes, at both
+        // spellings — the fence is a segment, not a `starts_with`.
+        assert!(check_dir("Workspace-notes").is_ok());
+        assert!(check_rel("Workspace-notes/plan.md").is_ok());
     }
 
     /// Row 5. Refused before anything is opened — the domain performs no IO

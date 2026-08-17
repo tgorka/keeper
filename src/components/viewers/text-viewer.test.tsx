@@ -216,6 +216,53 @@ describe("TextEditorSurface, in a real EditorView", () => {
     expect(await liveView()).toBe(before);
   });
 
+  it("rebuilds for another file of the same name, so no undo crosses between them", async () => {
+    // The same defect story 51.5's markdown pane had, on this side of the toggle:
+    // nothing above this component remounts it when a panel replaces its target,
+    // so keying only on the grammar left one undo history spanning two files —
+    // one undo restores the other file's text, `onChange` reports it, and the
+    // next save writes it here. `fileName` is identical in both renders on
+    // purpose: a display name is not an identity.
+    function Outside() {
+      const [inLog, setInLog] = useState(true);
+      return (
+        <>
+          <TextEditorSurface
+            content={inLog ? "the log's plan" : "the root plan"}
+            language={null}
+            fileName="plan.md"
+            loadedFrom={{
+              profileOrVaultId: "p1",
+              relativePath: inLog ? "log/plan.md" : "plan.md",
+            }}
+          />
+          <button type="button" onClick={() => setInLog(false)}>
+            open the other one
+          </button>
+        </>
+      );
+    }
+    render(<Outside />);
+    await content("the log's plan");
+    // Imported here rather than at module scope, for the reason `liveView` gives
+    // about `EditorView`: a static value import would pull the editing commands
+    // into this test's own graph and hide whether the component loaded them.
+    const { undoDepth } = await import("@codemirror/commands");
+    const before = await liveView();
+    before.dispatch({
+      changes: { from: before.state.doc.length, insert: "!" },
+      userEvent: "input.type",
+    });
+    expect(undoDepth(before.state)).toBeGreaterThan(0);
+
+    fireEvent.click(document.querySelector("button") as HTMLElement);
+    await content("the root plan");
+
+    const after = await liveView();
+    expect(after).not.toBe(before);
+    expect(undoDepth(after.state)).toBe(0);
+  });
+
   it("does not re-dispatch when the prop comes back unchanged", async () => {
     // The controlled-input loop, which runs on EVERY keystroke: type -> onChange
     // -> parent state -> the same string back as `content` -> the reconcile

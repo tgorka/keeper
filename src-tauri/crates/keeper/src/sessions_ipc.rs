@@ -534,7 +534,7 @@ fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
     out
 }
 
-/// What each root markdown file of a **flat** pattern declares itself to be
+/// What each markdown file of a **flat** pattern declares itself to be
 /// (FR-268, AD-120).
 ///
 /// The flat contract puts a file's kind in its frontmatter, so the question
@@ -542,11 +542,23 @@ fn pattern_files(dir: &std::path::Path) -> Vec<(String, bool)> {
 /// the way `prompts/**` answers it in the folder contract. The domain decides
 /// what each kind means; this only reads the bytes it needs to ask (AD-108).
 ///
-/// Bounded on purpose. Only root markdown is read — a flat session's pool is
-/// however much prose the operator wrote, while `artifacts/` and `workspace/`
-/// are decided by path and never opened, which is what keeps "make a session
-/// like this one" from costing a walk of a folder holding a video render. An
-/// unreadable file is simply absent from the map, and an absent kind is
+/// **The reader's own rule about where markdown lives, asked rather than
+/// restated.** Every directory on the way to a file is put to
+/// [`crate::sessions_root::scans_markdown`] — the one list, which is
+/// [`crate::sessions_root::UNSCANNED_DIRS`] plus the dotted prefix. So a
+/// `ref`-tagged file in a `spaces/` the operator made is classified and travels,
+/// exactly as the pool, every space, References and the detail already list it
+/// (FR-285), while `artifacts/` and `workspace/` are still decided by path and
+/// never opened — which is what keeps "make a session like this one" from
+/// costing a walk of a folder holding a video render.
+///
+/// A second spelling of that rule here is how the create side and the read side
+/// come to disagree, silently: reading root markdown only left a byte-identical
+/// file travelling from the session root and staying behind from `spaces/`,
+/// classified `None` and therefore `SkipReason::Loose`. The suffix is folded for
+/// the same reason — the walk reads a `.MD` file, so this reads one too.
+///
+/// An unreadable file is simply absent from the map, and an absent kind is
 /// `Loose`: it stays behind, which is the safe direction.
 #[cfg(desktop)]
 fn flat_kinds(
@@ -557,7 +569,15 @@ fn flat_kinds(
 
     files
         .iter()
-        .filter(|(rel, is_dir)| !*is_dir && !rel.contains('/') && rel.ends_with(".md"))
+        .filter(|(rel, is_dir)| {
+            !*is_dir
+                && rel.to_lowercase().ends_with(".md")
+                && rel
+                    .split('/')
+                    .rev()
+                    .skip(1)
+                    .all(crate::sessions_root::scans_markdown)
+        })
         .filter_map(|(rel, _)| {
             let text = std::fs::read_to_string(dir.join(rel)).ok()?;
             let entry = read_one(PoolFile {
@@ -3115,14 +3135,18 @@ pub async fn sessions_file_new(
 /// question the write already answers. The room's verb needs one because it also
 /// refuses an absent parent, which this deliberately does not.
 ///
-/// **Two fences, both asked.** `files::dir_rel` refuses `workspace/`, traversal,
-/// an absolute path and any dotted segment on shape grounds with no knowledge of
-/// zones; then this asks
+/// **Two fences, both asked, and neither defeated by the shift key.**
+/// `files::dir_rel` refuses `workspace/`, traversal, an absolute path and any
+/// dotted segment on shape grounds with no knowledge of zones; then this asks
 /// [`keeper_sync::files_write::WriteScope::in_session_workspace`] about the
 /// profile-relative subpath, which is the fence the product is measured against
-/// (AD-113). [`resolve_session_file`] is the same pair for a *file* and cannot be
-/// reused: it leads with `check_rel`, which requires one of three extensions, and
-/// a folder has none.
+/// (AD-113). Both compare the scratch segment folded — `keeper_core`'s in
+/// `files::check_dir`, sync's in `WriteScope`'s own segment walk — because they
+/// used to share one blind spot and a pair of predicates that are blind the same
+/// way is one predicate: `Workspace/notes` passed both and IS `workspace/notes`
+/// on the case-insensitive volume keeper ships on. [`resolve_session_file`] is
+/// the same pair for a *file* and cannot be reused: it leads with `check_rel`,
+/// which requires one of three extensions, and a folder has none.
 ///
 /// Rejects with: `internal` (unknown root or session, a name that folds to
 /// nothing, `workspace/`, a path that leaves the session, a dotted segment, a
@@ -3137,9 +3161,11 @@ pub async fn sessions_dir_new(
 ) -> Result<(), IpcError> {
     use keeper_core::sessions::files;
 
-    // Folded first, and everything after it is about the folded path: `Workspace`
-    // becomes `workspace`, and a fence asked about what was typed would have
-    // missed it.
+    // Folded first, because everything after this is about the folded path and
+    // the shell must not be the second namer (AD-65). The scratch refusal is no
+    // longer the fold's job — `check_dir` compares that segment case-blind for
+    // every caller — but `!!!WorkSpace!!!` still only becomes the fenced name
+    // here.
     let rel = files::dir_rel(&rel).map_err(file_verb_error)?;
 
     let zone_root = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
@@ -3473,16 +3499,23 @@ pub async fn sessions_file_rename(
     // The renamed file's own bytes carry both edits when it also pointed at
     // itself; every other pool file carries only the rewrite, and a file with no
     // pointer to it is left out of the plan rather than written back unchanged.
+    //
+    // Each body is handed the path it was read from, because a pointer resolves
+    // beside the file that holds it: `refs::candidates` opens a `notes.md` inside
+    // `spaces/plan.md` as `spaces/notes.md`, so the rewrite has to recognise that
+    // spelling or the rename would break exactly the pointers the reader follows.
+    // For the moved file itself the source and the old path are the same string —
+    // it is the file being renamed, reading its own bytes.
     let mut rewrites = vec![files::Rewrite {
         rel: rel.clone(),
         expect_len: text.len(),
-        content: refs::rewrite_pointers(&titled, &rel, &to).unwrap_or(titled),
+        content: refs::rewrite_pointers(&titled, &rel, &rel, &to).unwrap_or(titled),
     }];
     rewrites.extend(pool.files.iter().filter_map(|(candidate, body, _)| {
         if *candidate == rel {
             return None;
         }
-        refs::rewrite_pointers(body, &rel, &to).map(|content| files::Rewrite {
+        refs::rewrite_pointers(body, candidate, &rel, &to).map(|content| files::Rewrite {
             rel: candidate.clone(),
             expect_len: body.len(),
             content,
@@ -3873,6 +3906,15 @@ pub fn sessions_ref_candidates(
     // Where a reference could go: the session's `ref`-tagged markdown first,
     // then its other markdown. Composed in Rust so the picker offers a list and
     // never a path it built itself (AD-65).
+    //
+    // A destination may sit at depth, because the pool reads markdown wherever
+    // it sits (FR-285) and a `ref` list the operator filed into `spaces/` is a
+    // real ref list. What `sessions_ref_add` writes into it is
+    // `add_ref::link_path`'s session-relative spelling, and
+    // `refs::candidates` probes a pointer beside its own file first and then
+    // beside the session — so a line written here resolves from any depth, and
+    // the widget's row opens the file the operator picked rather than a
+    // same-named one at the root.
     let targets = match crate::sessions_root::session_pool(&root_id, &session_id) {
         Some(pool_read) => {
             let pool = read_pool(
@@ -4292,9 +4334,57 @@ async fn run_zone_search(
 /// a Tauri handle. They are also where the story's refusals are decided, so the
 /// matrix rows about names live here rather than in a UI test that can only see
 /// the sentence.
+///
+/// [`flat_kinds`] joins them: it takes a directory and a listing, so a temporary
+/// folder is the whole world it needs.
 #[cfg(all(test, desktop))]
 mod tests {
-    use super::{template_at, template_mint};
+    use super::{flat_kinds, pattern_files, template_at, template_mint};
+
+    /// The create side classifies what the read side reads (FR-285). A
+    /// `ref`-tagged file in a folder the operator made travels into a new
+    /// session, where reading root markdown only left it behind as `Loose` while
+    /// its byte-identical twin at the session root was carried — one file in two
+    /// places, two answers, no notice.
+    #[test]
+    fn a_flat_patterns_kinds_are_read_wherever_the_pool_reads_the_file() {
+        use keeper_core::sessions::shape::KindTag;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path();
+        for rel in ["spaces", "artifacts", "workspace"] {
+            std::fs::create_dir_all(source.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(source.join(rel), body).expect("write");
+        };
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("inputs.md", "---\ntags: [ref]\n---\n# Root inputs\n");
+        write(
+            "spaces/inputs.md",
+            "---\ntags: [ref]\n---\n# Filed inputs\n",
+        );
+        write("spaces/PLAN.MD", "---\ntags: [prompt]\n---\n# Shouted\n");
+        write("artifacts/report.md", "---\ntags: [ref]\n---\n# Output\n");
+        write("workspace/scratch.md", "---\ntags: [ref]\n---\n# Scratch\n");
+
+        let kinds = flat_kinds(source, &pattern_files(source));
+        assert_eq!(
+            kinds
+                .iter()
+                .map(|(rel, kind)| (rel.as_str(), *kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("about.md", KindTag::About),
+                ("inputs.md", KindTag::Ref),
+                ("spaces/PLAN.MD", KindTag::Prompt),
+                ("spaces/inputs.md", KindTag::Ref),
+            ],
+            "the filed file declares its kind like the root one, and a shouted \
+             suffix is markdown to the walk so it is markdown here; \
+             `artifacts/` and `workspace/` are decided by path and never opened"
+        );
+    }
 
     /// Row 5's naming half: what a person types becomes keeper's folding of it,
     /// which is the spelling `sessions_patterns` will answer with afterwards.

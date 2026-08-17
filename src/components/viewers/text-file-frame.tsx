@@ -235,7 +235,7 @@ export function TextFileFrame({
   preview,
   csvOptions,
 }: TextFileFrameProps): React.ReactElement {
-  const { vm, content, setContent, dirty, save, reload, error, loading } = state;
+  const { vm, content, setContent, dirty, save, reload, error, loading, loadedFrom } = state;
 
   if (loading) {
     return (
@@ -398,6 +398,14 @@ export function TextFileFrame({
       <div className="min-h-0 flex-1">
         <RawRenderedView
           fileName={fileName}
+          // Which file this is, straight off the loader that read it rather than
+          // down a second prop chain: the two hosts address a file differently —
+          // a sync profile and a subpath here, a notes vault and a resolved
+          // target in an embed (AD-65 forbids deriving either from the other) —
+          // and `useTextBuffer` is already where that difference is absorbed. So
+          // the identity cannot come to disagree with the bytes it describes,
+          // which a prop each host assembled for itself could.
+          loadedFrom={loadedFrom}
           format={entry.format}
           rendered={entry.rendered}
           language={entry.language}

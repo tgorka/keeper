@@ -18,8 +18,11 @@
  *
  * A rendered pane that is blank because something threw is the single outcome
  * this story forbids, and that has to hold for the throw nobody has found yet.
- * So the construction is wrapped, and a failure comes back as a sentence the
- * reader can act on with the raw — editable — view underneath it (AD-88).
+ * So both places a document reaches a view are wrapped — the construction, and
+ * the adoption {@link MarkdownPreview.setContent} performs — and a failure comes
+ * back as a sentence the reader can act on with the raw, editable view
+ * underneath it (AD-88). Never as an exception: `setContent` is called from a
+ * host effect with no `try` around it, so a throw there takes the panel down.
  *
  * **DW-165 used to be caught here and no longer is.** Until Story 45.10 the
  * renderer supplied a block decoration from a `ViewPlugin`, CodeMirror refused
@@ -144,7 +147,8 @@ export interface MarkdownPreview {
   /** Null when the document rendered. A finished sentence when it did not. */
   failure: string | null;
   /**
-   * Adopt text that came from outside this view.
+   * Adopt text that came from outside this view: `null` when it landed, and a
+   * finished sentence when it could not.
    *
    * The same contract as `TextEditorMount.setContent` in `text-editor-host.ts`,
    * including the no-op when the document already reads that way — which is
@@ -154,15 +158,21 @@ export interface MarkdownPreview {
    * `[text]`, which is what the pane used to do, destroys the caret, the undo
    * stack and the scroll position instead.
    *
-   * A throw from an update is deliberately NOT turned into a {@link failure}
-   * the way a throw from construction is: a refusal reported half-way through
-   * an update would leave a live view in a state this module cannot describe,
-   * and construction is where every failure this module has actually seen
-   * happens (DW-165).
+   * **A throw from an update is reported the same way a throw from construction
+   * is** — a sentence, in the {@link failure} shape, which the host renders
+   * above the raw view (AD-88). It is the same reader in the same position:
+   * this document cannot be drawn and the source below it can. The two
+   * alternatives were both worse. Propagating leaves the exception to the
+   * host's effect and takes the panel down, which is the one outcome this
+   * module's first paragraph forbids. Swallowing leaves a live view showing the
+   * PREVIOUS text with nothing on screen saying so, which is how a reader
+   * concludes their file changed — and it was silently reachable only because
+   * `setContent` is new: before Story 51.5 every text arrived through the
+   * construction path, which has always been caught.
    *
    * Always safe to call, including after a failure.
    */
-  setContent: (next: string) => void;
+  setContent: (next: string) => string | null;
   /** Always safe to call, including after a failure. */
   destroy: () => void;
 }
@@ -175,6 +185,14 @@ export interface MarkdownPreview {
  * than allowed to block a pane.
  */
 const PARSE_BUDGET_MS = 250;
+
+/** What an exception has to say for itself. Four call sites — the log line and
+ *  the reader's sentence, for a throw from construction and for a throw from an
+ *  adoption — and they have to word an unknown the same way or the log and the
+ *  banner describe one failure differently. */
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 /**
  * Mount `text` into `host` as the note editor's preview.
@@ -315,11 +333,21 @@ export async function mountMarkdownPreview(
       failure: null,
       setContent: (next: string) => {
         if (mounted.state.doc.toString() === next) {
-          return;
+          return null;
         }
         adopting = true;
         try {
           mounted.dispatch({ changes: { from: 0, to: mounted.state.doc.length, insert: next } });
+          return null;
+        } catch (error) {
+          // A `StateField` throwing during a dispatch is DW-165's shape arriving
+          // through the one path that did not use to exist — and CodeMirror
+          // swallows a view plugin's throw where it does not swallow a field's,
+          // so this is the class of failure that reaches a caller at all.
+          console.info(
+            `viewers: the markdown preview could not adopt a change, showing the source instead: ${reason(error)}`,
+          );
+          return `keeper could not draw this document after it changed, so the source is below: ${reason(error)}`;
         } finally {
           adopting = false;
         }
@@ -328,18 +356,17 @@ export async function mountMarkdownPreview(
     };
   } catch (error) {
     console.info(
-      `viewers: the markdown preview could not be built, showing the source instead: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      `viewers: the markdown preview could not be built, showing the source instead: ${reason(error)}`,
     );
     // The host may hold a half-built view's nodes. Emptied rather than left,
     // so what the reader sees is the raw view and not a fragment of a render.
     host.replaceChildren();
     return {
       failure:
-        "keeper could not draw this document, so the source is below, unchanged: " +
-        (error instanceof Error ? error.message : String(error)),
-      setContent: () => {},
+        "keeper could not draw this document, so the source is below, unchanged: " + reason(error),
+      // Nothing to adopt into, so nothing can fail: the host is showing the raw
+      // view, which holds the same buffer this would have received.
+      setContent: () => null,
       destroy: () => {},
     };
   }

@@ -349,4 +349,57 @@ describe("mountMarkdownPreview, editable", () => {
     expect(viewIn(host).state.doc.toString()).toBe("alpha\r\nbeta\r\n");
     preview.destroy();
   });
+
+  it("answers null when an adoption lands, including the no-op", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+
+    // One value to check for both outcomes, so a host cannot forget the failing
+    // one: null is "the view is showing these bytes".
+    expect(preview.setContent("gamma\n")).toBeNull();
+    expect(preview.setContent("gamma\n")).toBeNull();
+    preview.destroy();
+  });
+
+  it("turns an adoption the view refuses into a sentence, and stays reportable", async () => {
+    const host = document.createElement("div");
+    const recorded: { changes: string[]; saves: string[] } = { changes: [], saves: [] };
+    const preview = await mountMarkdownPreview(host, "alpha\n", {
+      vaultId: "vault-1",
+      editing: editing(recorded),
+    });
+    const view = viewIn(host);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    // The dispatch is the only place an adoption can fail, and a `StateField`
+    // throwing inside one is DW-165's shape — `mermaidLayer` is such a field, and
+    // CodeMirror swallows a view plugin's throw where it does not swallow a
+    // field's. Made to throw here rather than contrived through a document,
+    // because what is being asserted is this module's handling and not the
+    // grammar's.
+    const dispatch = vi.spyOn(view, "dispatch").mockImplementation(() => {
+      throw new Error("a field refused this update");
+    });
+
+    // A throw would fail the test on this line, which is the whole contract: the
+    // host's effect has no `try` around it, so an exception here takes the panel
+    // down instead of falling back to the source (AD-88).
+    const refusal = preview.setContent("gamma\n");
+
+    expect(refusal).toContain("a field refused this update");
+    expect(refusal).toContain("the source is below");
+    expect(info).toHaveBeenCalled();
+
+    // And the adoption flag was put back. A catch that skipped the reset would
+    // leave `adopting` true for the life of the view, and every later keystroke
+    // would be silently dropped instead of reported to the host that saves it —
+    // a worse defect than the one being handled.
+    dispatch.mockRestore();
+    view.dispatch({ changes: { from: 0, insert: "x" }, userEvent: "input.type" });
+    expect(recorded.changes).toEqual(["xalpha\n"]);
+    preview.destroy();
+  });
 });

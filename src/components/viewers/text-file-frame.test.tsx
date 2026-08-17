@@ -106,6 +106,9 @@ function state(over: Partial<UseTextFileResult> = {}): UseTextFileResult {
     reload: vi.fn(async () => {}),
     error: null,
     loading: false,
+    // Which file the loader read. The frame does not decide it and does not read
+    // it — it hands it to the views, which key their editors on it.
+    loadedFrom: { profileOrVaultId: "p1", relativePath: "60-sessions/active/s/README.md" },
     ...over,
   };
 }

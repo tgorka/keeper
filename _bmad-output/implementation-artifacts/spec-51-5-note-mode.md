@@ -29,9 +29,18 @@ live-preview and editable, and all three share the file's single content state a
 
 **Always.**
 - One buffer, one dirty flag, one Save. Switching modes does not lose an unsaved edit.
-- `setContent` on mode switch, never remount-on-text: `MarkdownPane`'s effect is keyed `[text]`
-  (`raw-rendered-view.tsx:348`), which would destroy the view — caret, undo stack and scroll — on every
-  keystroke. Note mode adopts `TextEditorMount`'s pattern (`text-editor-host.ts:292-301`).
+- `setContent`, never remount-on-text: `MarkdownPane`'s effect was keyed `[text]`
+  (`raw-rendered-view.tsx:348`), which destroys the view — caret, undo stack and scroll — on every
+  keystroke, so the buffer is adopted through `TextEditorMount`'s pattern
+  (`text-editor-host.ts:292-301`) instead.
+- What the pane IS rebuilt on: the mode, the FILE, and the options the decoration layer is built with.
+  The review pass found the first cut keyed on `[editable, fileName]` and that is two defects: a file
+  whose vault hydrates a frame after the first paint kept the out-of-vault degrade for the life of the
+  panel, and two files with one basename in two directories — which story 51.1 makes an ordinary
+  session layout — shared one view and one undo stack. The file is therefore the coordinates the
+  buffer was **loaded from** (`FileOrigin`, carried out of `useTextBuffer`), never the display name.
+- An adoption that fails is a sentence, not an exception: `setContent` answers `null` or the same
+  refusal shape construction answers with, and the host falls back to Source out loud (AD-88).
 - Note mode is offered for **markdown, writable** files only — the same predicate story 50.3 built,
   including Rust's own `writeRefusal`.
 - The remembered mode preference validates against the widened vocabulary, so an old cookie value still
@@ -70,6 +79,9 @@ live-preview and editable, and all three share the file's single content state a
 | 12 | Note mode outside a vault, a file with `![[x]]` | the documented degrade, not a crash |
 | 13 | `Mod-s` in Note mode | saves through the same path as Source |
 | 14 | the note editor's own suite | untouched and green |
+| 15 | an in-vault file whose vault list arrives after the first paint | the pane is rebuilt with the vault; the buffer moving still does not rebuild it |
+| 16 | two files named `plan.md`, in `log/` and at the root, opened into one panel | two views: no undo, and no save, reaches back into the other file |
+| 17 | the pane refuses a change it is handed | the refusal is a sentence, the source is shown, the panel stands |
 
 </intent-contract>
 
@@ -79,9 +91,12 @@ live-preview and editable, and all three share the file's single content state a
 |---|---|
 | `src/components/viewers/view-mode.ts:41-57` | `ViewMode` widens to `"raw" \| "rendered" \| "note"`; `isViewMode` follows; the default is unchanged |
 | `src/components/viewers/markdown-preview.ts:100-140` | the two clamping facets become a parameter; the module doc records that the refusal's write-path half still holds and how |
-| `src/components/viewers/raw-rendered-view.tsx:133-141,478-521` | a third tab; `MarkdownPane` gains `setContent` instead of remount-on-text and reports edits upward |
-| `src/components/viewers/text-file-frame.tsx` | the third mode is offered under the same markdown-and-writable predicate as the writing tools |
-| tests | rows 1–13 in the viewer suites; row 14 is the note editor's own suite, unedited |
+| `src/components/viewers/raw-rendered-view.tsx:133-141,478-521` | a third tab; `MarkdownPane` gains `setContent` instead of remount-on-text and reports edits upward; it is rebuilt on the mode, the file and the preview options |
+| `src/components/viewers/use-text-file.ts` | `FileOrigin` — the profile-or-vault id and the relative path the buffer was read from — carried out of the loader, because the two hosts address a file differently and neither may derive the other's coordinates (AD-65) |
+| `src/components/viewers/text-viewer.tsx` | the raw editor is rebuilt per file for the same reason, which it never was |
+| `src/components/notes/editor/file-embed-host.tsx` | the embed states the coordinates it can prove: its vault, and the bracket text it was asked for |
+| `src/components/viewers/text-file-frame.tsx` | the third mode is offered under the same markdown-and-writable predicate as the writing tools; the loader's `loadedFrom` is handed to the views |
+| tests | rows 1–17 in the viewer suites; row 14 is the note editor's own suite, unedited |
 
 ## Tasks & Acceptance
 
@@ -90,14 +105,49 @@ live-preview and editable, and all three share the file's single content state a
 - [ ] offered only for writable markdown (rows 7–9)
 - [ ] Preview still read-only (row 6); no autosave anywhere
 - [ ] `docs/notes.md` / `docs/sessions.md`: three modes and what each is for
+- [ ] the pane is rebuilt on the file and on the preview options, and on nothing else (rows 15–16)
+- [ ] a refused adoption is reported rather than thrown or swallowed (row 17)
 
 **Acceptance.** The owner opens a session log, presses **Note**, and writes in it the way he writes in
 Notes — rendered as he types, saved when he says so.
 
 ## Design Notes
 
-_(filled at review)_
+**The identity comes out of the loader, not down a second prop chain.** The two hosts do not address a
+file the same way — a Files panel holds a sync profile id and a profile-relative subpath, a note embed
+holds a notes vault id and the bracket text Rust resolves — and AD-65 forbids deriving either from the
+other in the webview. So `TextFileSource` states which container its `label` is relative to,
+`useTextBuffer` hands the pair out as `FileOrigin`, and `TextFileFrame` passes what the loader read.
+A prop each host assembled for itself could disagree with the bytes it describes; this cannot. The
+embed is not made to invent a profile: it states the vault, which is what a note can prove.
+
+**Presence, not identity, for the preview callbacks.** The options `livePreview` is built with are read
+once at construction, so the pane is keyed on them — but on the vault id as a value and the five
+callbacks as present-or-absent. Keying on closure identity would rebuild the pane on every render for a
+host that spells one inline, which is the caret-losing defect that dropping the `[text]` key fixed.
+
+**An external change in Note mode is handled exactly as it is in Source.** Both adopt through one
+minimal dispatch into the live view; neither annotates it out of the undo history, so an undo after a
+reload reaches back to the reader's own text in both. That parity is deliberate: one buffer under two
+views that disagreed about what an outside write means would be worse than either behaviour. The
+cross-FILE case is what the file key closes, and it is the case that could lose a file.
+
+**A refused adoption reports, and does not swallow.** `setContent` answers a sentence, the host renders
+it and falls back to Source. Propagating would take the panel down through an effect with no `try`
+around it; swallowing would leave a live view showing the previous bytes with nothing on screen saying
+so, which is how a reader concludes their file changed.
 
 ## Verification
 
-_(filled at review)_
+`bun run test src/components/viewers` — 11 files, 296 tests, all passing (287 before this pass).
+`bun run typecheck` clean. No cargo, no biome, no git; the shell crate is not buildable here.
+
+Mutations, each run and each reverted:
+
+| mutation | outcome |
+|---|---|
+| `raw-rendered-view.tsx` mount deps → `[editable, fileName]` | 2 failures: rows 15 and 16, and nothing else |
+| `raw-rendered-view.tsx` drop the `disposed` guard | 2 failures: the mid-mount unmount and the two-switch test |
+| `raw-rendered-view.tsx` drop the adoption's `onOutcome` report | 1 failure: row 17 |
+| `markdown-preview.ts` return `null` from the adoption's `catch` (the reviewer's `setContent-swallow`) | 1 failure: "turns an adoption the view refuses into a sentence" |
+| `text-viewer.tsx` mount deps → `[language, tools]` | 1 failure: the raw editor's own same-name file test |

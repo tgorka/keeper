@@ -36,7 +36,8 @@
  * Everything AD-88 asks for is unchanged: an edit in Note mode is the same
  * `onChange` the Source tab reports, `Mod-s` is the same `onSave` it calls, and
  * there is no autosave on either. What the two panes must NOT share is a
- * remount-on-text — see {@link MarkdownPane}.
+ * remount-on-text, and what they must both be keyed on is the FILE rather than
+ * its display name — see {@link MarkdownPane}, which records both and why.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
@@ -49,6 +50,7 @@ import type { JsonParseError, JsonRow, JsonStructure } from "./json-structure";
 import { parseJsonlStructure, parseJsonStructure } from "./json-structure";
 import type { MarkdownEditing, MarkdownPreview, MarkdownPreviewOptions } from "./markdown-preview";
 import { mountMarkdownPreview } from "./markdown-preview";
+import type { FileOrigin } from "./use-text-file";
 import type { ViewMode } from "./view-mode";
 import { viewModeCookie, viewModeFor } from "./view-mode";
 
@@ -77,6 +79,14 @@ export interface RawEditorProps {
    *  tab's editor is the only place they can mount, which is why this shape
    *  names them at all: the rendered half is read-only (AD-88). */
   writingTools?: boolean;
+  /**
+   * Which file these bytes came from, for the editor to key its view on. The
+   * identity and not the label: `path` and `vault` above are what the raw
+   * editor announces to a screen reader, and a name is not an identity — two
+   * files with one basename in two directories are one ordinary session layout
+   * (story 51.1), and a panel replaces its target in place.
+   */
+  loadedFrom?: FileOrigin;
 }
 
 /** What 44.16's CSV commands understand. A **notes vault** id and a target
@@ -89,6 +99,15 @@ export interface CsvCoordinates {
 export interface RawRenderedViewProps {
   /** The file's own name. Display and aria only; never a path. */
   fileName: string;
+  /**
+   * Which file the buffer in front of the reader came from (story 51.5's fix).
+   *
+   * Not a second address to write through — the host owns every command — and
+   * not display: it is what the two live views are rebuilt on, so a new FILE
+   * gets a new editor while new BYTES do not. {@link fileName} cannot answer
+   * that question, which is the defect this prop exists for.
+   */
+  loadedFrom: FileOrigin;
   /** The registry row's format — the key the remembered view is stored under. */
   format: ViewerFormat;
   /** The registry row's rendered view, or null when raw is the only one. */
@@ -335,6 +354,33 @@ function CsvPane({
 }
 
 /**
+ * What `livePreview` was built with, as one comparable value.
+ *
+ * `mountMarkdownPreview` reads its options once, at construction, so a change to
+ * one of them cannot reach a live view: the pane has to be rebuilt for it to
+ * take, and {@link MarkdownPane}'s effect is keyed on this.
+ *
+ * The vault id is a value and compares as one. The five callbacks are compared
+ * by PRESENCE and deliberately not by identity: what the reader sees differs
+ * between a host that can follow a wikilink and one that cannot, while a host
+ * that spells a closure inline would rebuild the pane on every render if
+ * identity counted — destroying the caret and the undo stack that dropping the
+ * `[text]` key exists to keep. A host that changes what a callback DOES without
+ * changing whether it has one is therefore not adopted; that is the one gap this
+ * leaves, and both real hosts memoise their closures per vault.
+ */
+function previewShape(options: MarkdownPreviewOptions | undefined): string {
+  const answers =
+    (options?.assetUrl === undefined ? "" : "a") +
+    (options?.onOpenLink === undefined ? "" : "l") +
+    (options?.onOpenUrl === undefined ? "" : "u") +
+    (options?.listFolder === undefined ? "" : "f") +
+    (options?.mountWidget === undefined ? "" : "w");
+  // The vault id last, so nothing it can hold looks like one of the answers.
+  return `${answers}:${options?.vaultId ?? ""}`;
+}
+
+/**
  * The note editor's own live-preview layer over a file — read-only for the
  * Preview tab, editable for Note mode — reporting a refusal upward rather than
  * leaving an empty box behind.
@@ -346,13 +392,16 @@ function CsvPane({
  */
 function MarkdownPane({
   fileName,
+  loadedFrom,
   text,
   options,
   editing,
   onOutcome,
 }: {
-  /** Display and aria only — and the identity that rebuilds the view. */
+  /** Display and aria only. Which file this is is {@link loadedFrom}. */
   fileName: string;
+  /** Which file the buffer came from. See the effect below. */
+  loadedFrom: FileOrigin;
   text: string;
   options: MarkdownPreviewOptions | undefined;
   /**
@@ -369,17 +418,32 @@ function MarkdownPane({
   const latest = useRef({ text, options, editing, onOutcome });
   latest.current = { text, options, editing, onOutcome };
   const editable = editing !== null;
+  const shape = previewShape(options);
 
-  // NOT keyed on `[text]`, which is what this effect used to be. An editable
-  // pane reports every keystroke upward and gets the identical string straight
-  // back as a prop, so a text key would tear the view down and rebuild it on
-  // every character — caret, undo stack and scroll position with it. The buffer
-  // is adopted below instead, the way the raw editor has always adopted it.
+  // What rebuilds this pane and what does not, because the next person will ask.
   //
-  // What DOES rebuild it: the mode, because an extension list is fixed at
-  // construction and there is no compartment here; and the file, because an
-  // undo stack that reaches back into a previous file's text is a worse thing
-  // to own than a remount nobody can see.
+  // REBUILDS. The MODE (`editable`), because the extension list is fixed at
+  // construction and there is no compartment here. The FILE — both halves of
+  // `loadedFrom`, and `fileName` with them because the editable region is named
+  // from it — because an undo stack that reaches back into a previous file's
+  // text is one ⌘Z and one ⌘S away from writing that file's bytes over this
+  // one. A panel replaces its target in place, and story 51.1 made two markdown
+  // files with one basename in two directories an ordinary session layout, so
+  // the display name cannot answer which file this is. The decoration layer's
+  // own OPTIONS (`shape`), because `livePreview` reads them once: a file inside
+  // a vault learns its vault a frame after the first paint (`text-file-viewer`
+  // hydrates the mirror in an effect), and while nothing was keyed on them that
+  // file rendered the out-of-vault degrade — and resolved every wikilink against
+  // `""` — for the life of the panel.
+  //
+  // DOES NOT REBUILD. The BUFFER, which is what this effect used to be keyed on.
+  // An editable pane reports every keystroke upward and gets the identical
+  // string straight back as a prop, so a text key tore the view down on every
+  // character — caret, undo stack and scroll position with it. The buffer flows
+  // through `setContent` below instead, the way the raw editor has always
+  // adopted it. Nor the CALLBACKS in `editing` and `onOutcome`: they are reached
+  // through `latest` because the view outlives every render.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `loadedFrom`'s two halves and `shape` are rebuild triggers, not reads — see above.
   useEffect(() => {
     const host = hostRef.current;
     if (host === null) {
@@ -408,8 +472,10 @@ function MarkdownPane({
       mountRef.current = mounted;
       // The buffer may have moved while the editor chunk was in flight. A no-op
       // when it has not, which is the ordinary case.
-      mounted.setContent(latest.current.text);
-      latest.current.onOutcome(mounted.failure);
+      const refused = mounted.setContent(latest.current.text);
+      // One report for both refusals, because the reader's position is the same
+      // either way: this document is not drawn and the source is.
+      latest.current.onOutcome(mounted.failure ?? refused);
     })();
     return () => {
       disposed = true;
@@ -417,10 +483,17 @@ function MarkdownPane({
       mountRef.current = null;
       host.replaceChildren();
     };
-  }, [editable, fileName]);
+  }, [editable, fileName, loadedFrom.profileOrVaultId, loadedFrom.relativePath, shape]);
 
   useEffect(() => {
-    mountRef.current?.setContent(text);
+    // Reported only when the adoption refused. A `null` here would clear a
+    // construction failure that is still true of these bytes — the host keys its
+    // refusal on the text it was about, and this effect runs for text that
+    // never reached a view.
+    const refused = mountRef.current?.setContent(text);
+    if (refused != null) {
+      latest.current.onOutcome(refused);
+    }
   }, [text]);
 
   return <div ref={hostRef} className="h-full min-h-0 overflow-auto" />;
@@ -439,6 +512,7 @@ const DOCUMENT_COOKIE = {
 
 export function RawRenderedView({
   fileName,
+  loadedFrom,
   format,
   rendered,
   language,
@@ -611,6 +685,7 @@ export function RawRenderedView({
             content={content}
             language={language}
             fileName={fileName}
+            loadedFrom={loadedFrom}
             sizeLabel={sizeLabel}
             readOnly={readOnly}
             onChange={onChange}
@@ -620,6 +695,7 @@ export function RawRenderedView({
         ) : rendered === "markdown" ? (
           <MarkdownPane
             fileName={fileName}
+            loadedFrom={loadedFrom}
             text={content}
             options={preview}
             // One buffer and one Save, which is the whole of how Note mode adds

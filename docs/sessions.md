@@ -95,9 +95,15 @@ and does not also appear as an ordinary file.
 **Moving a file still never changes what it is.** The tag decides the kind, so a sitting
 you drag into `log/` is still a log, and a file you drag into `spaces/` is whatever it
 said it was before you moved it. keeper itself keeps writing at the session root — the
-folders are yours to make and yours to file into. The scan is budgeted, because a session
-is not a vault index: a tree too big to read is reported as truncated rather than quietly
-cut short.
+folders are yours to make and yours to file into. A sitting is dated by its **filename**,
+which is where the clock is written, so the log you filed into `log/` sorts by its own date
+and the board row and the session's Log agree about which sitting is the newest one.
+
+**The scan is budgeted, because a session is not a vault index.** It stops after a fixed
+number of entries and after ten megabytes of prose, and either stop is reported as
+truncated rather than quietly cutting the list short — as is a folder keeper is not allowed
+to read, because a card that leaves a board with nothing anywhere saying so is the worst
+kind of failure there is.
 
 **Which one a folder is** is decided by presence, not absence: a folder holding
 `AGENTS.md` or `about.md` is flat. A folder holding both `README.md` and `AGENTS.md`
@@ -425,7 +431,7 @@ where your session's shape keeps that kind: a prompt at the root of a flat sessi
 folder-shaped one appends a heading to `README.md`, which is where that shape's log is.
 
 **New folder** sits beside them (FR-287), always offered, under either shape. Its field
-takes the **path inside the session** — `log` at its root, `artifacts/2026` inside a
+takes the **path inside the session** — `log` at its root, `log/2026` inside a
 folder that is already there — because only the last thing you type is folded to a name
 and the parts in front of it address folders that exist. `Interview Kit` becomes
 `interview-kit`, the way a template's folder name does; unlike a template's, a session
@@ -433,10 +439,12 @@ folder folds the whole segment, dots included, since there is no filename here t
 extension for and a directory that reads as a filename is a trap in a pool that walks
 subdirectories. Making a folder that is already there writes nothing and is not an error,
 and `a/b/c` arrives as one journaled plan. Refused, each for its own reason: `workspace/`
-or anything inside it (scratch is fenced — keeper never writes there, so a folder there
-would be a place for writes keeper goes on refusing), a path that leaves the session, a
-dotted name (the tree does not list one, so it would be a folder you could not undo), and
-a name with nothing in it — `###` is not a folder name and keeper will not invent one.
+or anything inside it **however it is capitalised** (scratch is fenced — keeper never
+writes there, so a folder there would be a place for writes keeper goes on refusing, and
+`Workspace/notes` is that same directory on the drive keeper ships on), a path that leaves
+the session, a dotted name (the tree does not list one, so it would be a folder you could
+not undo), and a name with nothing in it — `###` is not a folder name and keeper will not
+invent one.
 
 **What a folder in a session is for, and what it is not.** A kind is still a tag and never
 a directory: markdown in a folder you make is read exactly as markdown in the session root
@@ -538,15 +546,17 @@ each with a real test behind it:
 - **recording** — a note whose frontmatter carries a `session:` key. That is what makes a
   recording a recording; a loose `.m4a` sitting in the session is a *file*, and calling it
   a recording because of its extension would be a guess.
-- **file** — a path that exists, looked for beside the session first and then from the
-  drive root, so `artifacts/notes.md` and `40-media/clip.mov` both work as written.
+- **file** — a path that exists, looked for beside the file the pointer was written in
+  first, then beside the session, then from the drive root — so `notes.md` inside
+  `spaces/plan.md` means `spaces/notes.md`, the way it does in every other markdown
+  reader, while `artifacts/notes.md` and `40-media/clip.mov` still work as written.
 - **session** — a path that lands inside another session in the same zone.
 - **link** — an external URL, reported without being fetched. Keeper does not know whether
   a website is up, and a red row that only means "no internet" is worse than no row.
 - **missing** — the path resolves to nothing.
 
 **Missing sorts first and says what keeper looked for.** "Keeper could not find it" sends
-somebody searching four hundred folders; naming both paths it tried usually shows the file
+somebody searching four hundred folders; naming every path it tried usually shows the file
 is one `mv` away. The heading states the count, so a session with nothing broken says so
 in a sentence instead of making a person read thirty good rows to conclude it.
 

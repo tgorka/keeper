@@ -343,6 +343,7 @@ fn write_journal(journal: &Path, row: &JournalRow) -> Result<(), ExecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keeper_core::sessions::files::compile_dir_new;
     use keeper_core::sessions::plan::{
         compile_archive, compile_create, compile_delete, ArchiveDecision,
     };
@@ -732,5 +733,82 @@ mod tests {
             "the rename error is what says the list was stale: {error}"
         );
         assert!(!dir.join("record.md").exists(), "and nothing was created");
+    }
+
+    /// `MkDir`'s idempotence, executed against a filesystem instead of asserted
+    /// about a plan (Story 51.2, FR-287).
+    ///
+    /// `files.rs` compares two pure `compile_dir_new` calls, which says nothing
+    /// about the disk: swap `create_dir_all` for `create_dir` and that assertion
+    /// stays green while both halves of the paragraph break. Both halves are
+    /// here — parents that are not there yet, and a directory that already is —
+    /// because they fail differently (`NotFound` and `AlreadyExists`) and a test
+    /// holding only one of them would let the other rot.
+    #[test]
+    fn a_dir_new_plan_makes_missing_parents_and_absorbs_a_second_run() {
+        let zone = zone();
+        std::fs::create_dir_all(zone.path().join("active/s")).expect("mkdir");
+        let deep = zone.path().join("active/s/a/b/c");
+
+        let plan = compile_dir_new("active/s", "a/b/c").expect("a session may hold a folder");
+        run(zone.path(), plan).expect("one step makes the whole path");
+        assert!(
+            deep.is_dir(),
+            "MkDir made the parents, so the plan is one step"
+        );
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+
+        // A file inside is what makes the second run's claim testable: a
+        // directory that was re-made would be an empty one, and "changes
+        // nothing" is the promise, not merely "does not error".
+        std::fs::write(deep.join("note.md"), "kept").expect("write");
+        let again = compile_dir_new("active/s", "a/b/c").expect("the same request twice");
+        run(zone.path(), again).expect("a folder already there is not a failure");
+        assert_eq!(
+            std::fs::read_to_string(deep.join("note.md")).expect("read"),
+            "kept",
+            "the second press left the folder and its contents alone"
+        );
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+
+        // The shallow case too: one new segment under a session that exists is
+        // the ordinary press, and it must not be the only one the suite runs.
+        let shallow = compile_dir_new("active/s", "log").expect("a session may hold a log/");
+        run(zone.path(), shallow).expect("runs");
+        assert!(zone.path().join("active/s/log").is_dir());
+    }
+
+    /// A folder verb pointed at a path that is already a FILE refuses, and the
+    /// file is still the operator's file afterwards.
+    ///
+    /// `sessions_dir_new` deliberately runs no pre-flight `is_file`, on the
+    /// stated grounds that "the executor's `create_dir_all` fails on it and says
+    /// so". Nothing executed that, so the sentence was a claim about a code path
+    /// no test had ever taken. `create_dir_all` answers `Ok` for an existing
+    /// DIRECTORY and an error for an existing file, and the difference between
+    /// those two is the whole reason the verb may skip the pre-flight.
+    #[test]
+    fn a_mkdir_onto_an_existing_file_refuses_and_leaves_the_file_alone() {
+        let zone = zone();
+        std::fs::create_dir_all(zone.path().join("active/s")).expect("mkdir");
+        let taken = zone.path().join("active/s/log");
+        std::fs::write(&taken, "somebody's file").expect("write");
+
+        let plan = compile_dir_new("active/s", "log").expect("the name itself is a legal folder");
+        let error = run(zone.path(), plan).expect_err("a file is in the way");
+        assert!(
+            matches!(&error, ExecError::Refused(said) if said.starts_with("mkdir active/s/log")),
+            "the refusal names the step that did not happen: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&taken).expect("read"),
+            "somebody's file",
+            "a folder verb never writes over a file"
+        );
+        assert!(taken.is_file(), "and never turns one into a directory");
+        assert!(
+            !zone.path().join(JOURNAL_REL).exists(),
+            "the refusal clears the journal, so the next press re-plans"
+        );
     }
 }

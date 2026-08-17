@@ -104,10 +104,22 @@ export const SESSION_FILE_NEW_PROMPT_FAILED =
   "keeper couldn't create that prompt. Nothing was written.";
 export const SESSION_DIR_NEW_FAILED = "keeper couldn't create that folder. Nothing was written.";
 
-/** The folder dialog's own words. */
+/**
+ * The folder dialog's own words.
+ *
+ * The body names the one exception rather than promising what the reader does
+ * not do: `dir_rel` refuses `workspace/` and nothing else, so `artifacts` is a
+ * folder this dialog will happily make — and `sessions_root::UNSCANNED_DIRS`
+ * skips it at every depth, so markdown created into it is in no pool, no space
+ * and not even *Unfiled*. That is a legitimate folder to want (it is where
+ * promoted output lives), so the honest fix is the sentence and not a refusal.
+ * The example moved off `artifacts/` for the same reason: an example is the
+ * strongest thing in a dialog, and this one used to point at the one folder
+ * whose markdown vanishes.
+ */
 export const SESSION_DIR_NEW_TITLE = "New folder";
 export const SESSION_DIR_NEW_BODY =
-  "The path inside this session — log at its root, artifacts/2026 inside a folder that is already there. Only the last part is folded to a name; markdown you put in it is read like markdown in the root. Kinds are still tags, so a folder is a container and not a filing system.";
+  "The path inside this session — log at its root, log/2026 inside a folder that is already there. Only the last part is folded to a name; markdown you put in it is read like markdown in the root, except in artifacts, which keeper leaves to the tools that write there. Kinds are still tags, so a folder is a container and not a filing system.";
 export const SESSION_DIR_NEW_NAME_LABEL = "Folder";
 
 /** The three writable extensions, in the order the menu offers them. */
