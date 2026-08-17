@@ -380,12 +380,15 @@ impl WorkKind {
     pub const PUSH: &'static str = "push";
     /// The `kind` column spelling for one LFS object upload. Same reason.
     pub const LFS_UPLOAD: &'static str = "lfsUpload";
+    /// The `kind` column spelling for a pull. Same reason — a rejected push
+    /// queues one and has to be able to assert it did (DW-207).
+    pub const PULL: &'static str = "pull";
 
     /// Discriminant used as the journal's `kind` column, so a row can be
     /// filtered without deserializing its payload.
     pub fn tag(&self) -> &'static str {
         match self {
-            Self::Pull => "pull",
+            Self::Pull => Self::PULL,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
             Self::LfsDownload { .. } => "lfsDownload",

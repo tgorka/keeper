@@ -939,7 +939,16 @@ pub(crate) fn classify_message(
     if DIVERGED.iter().any(|needle| lower.contains(needle)) {
         return Some(SyncError::Diverged {
             profile: label.to_owned(),
-            reason: first_line(text),
+            // Every line, not the first one. `git push` leads with "error:
+            // failed to push some refs to '<url>'" — a summary naming the
+            // remote and nothing else — and puts the reason underneath, or on
+            // stdout under `--porcelain`. Reporting only the summary made every
+            // rejected push in the field read identically whatever had
+            // happened, telling the reader the one thing they already knew
+            // (DW-207). This is the case [`one_line`] was written for: line one
+            // is the symptom, line two is the cause, and a settings row shows
+            // one line — so they are joined rather than chosen between.
+            reason: one_line(text),
         });
     }
 
@@ -1329,6 +1338,40 @@ mod tests {
         .expect("classified");
         match err {
             SyncError::Diverged { profile, .. } => assert_eq!(profile, "tgdrive"),
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+    }
+
+    /// What the field actually shows, and why it showed nothing useful.
+    ///
+    /// `git push --porcelain` puts its rejection on stdout and leads stderr
+    /// with a summary naming only the remote. keeper concatenates the two, so
+    /// the *first* line is that summary — and reporting it meant every rejected
+    /// push read "error: failed to push some refs to '<url>'" whatever had
+    /// happened, which is the one thing the reader already knew (DW-207).
+    #[test]
+    fn a_rejection_is_reported_by_the_line_that_says_why() {
+        let err = classify_message(
+            "error: failed to push some refs to 'https://forge.example.com/o/r.git'\n\
+             To https://forge.example.com/o/r.git\n\
+             !\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\n\
+             Done",
+            "neuradrive",
+            None,
+            &[],
+        )
+        .expect("classified");
+        match err {
+            SyncError::Diverged { reason, .. } => {
+                assert!(
+                    reason.contains("fetch first"),
+                    "the line that diagnoses it has to reach the reader: {reason}"
+                );
+                assert!(
+                    reason.contains("failed to push some refs"),
+                    "and so does git's own account of what was refused: {reason}"
+                );
+            }
             other => panic!("expected Diverged, got {other:?}"),
         }
     }
