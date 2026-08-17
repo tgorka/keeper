@@ -1,0 +1,66 @@
+src-tauri/crates/keeper/src/lib.rs
+  s_2a6cf9f4dd637c::t_420a514cebbbbb 103,108-124
+src-tauri/crates/keeper-sync/src/lfs/pktline.rs
+  s_2a6cf9f4dd637c::t_3b7620458d60a0 183-184,187-193
+  s_2a6cf9f4dd637c::t_dbf0d6357703be 1-182,185-186,194-235
+src-tauri/crates/keeper-sync/src/lfs/mod.rs
+  s_2a6cf9f4dd637c::t_0b6bf42d4f13ba 80
+  s_2a6cf9f4dd637c::t_1ce933f253fd43 86
+src-tauri/crates/keeper-sync/src/lfs/filter.rs
+  s_2a6cf9f4dd637c::t_990ae9a1f88407 89-100
+  s_2a6cf9f4dd637c::t_3944075babe4df 622-624,631-642,651-657
+  s_2a6cf9f4dd637c::t_970acfde607adf 334,429-433,880,1004-1006
+  s_2a6cf9f4dd637c::t_047a0d40e071fc 82,85
+  s_2a6cf9f4dd637c::t_457c2c75ad8251 537-543
+  s_2a6cf9f4dd637c::t_2e3c206796d5a0 674-683
+  s_2a6cf9f4dd637c::t_2ca8ce5eb518d0 253-333,335-428,434-536,544-606
+  s_2a6cf9f4dd637c::t_23854cb41370b7 37-79
+  s_2a6cf9f4dd637c::t_8e2ecea6294ddf 717-737,743-747,759-773,776-777,779,784,786-790
+  s_2a6cf9f4dd637c::t_1e1bc6f6b09108 794-879,881-1003,1007-1023
+docs/sync.md
+  s_2a6cf9f4dd637c::t_6fa1ed4324b887 279-327
+src-tauri/crates/keeper-sync/src/lfs/audit.rs
+  s_2a6cf9f4dd637c::t_855c1ee23e6b09 58-63,65-74
+  s_2a6cf9f4dd637c::t_0ca53841e58b21 1-57,64,75-165,168-189,191-209,211,217-251
+  s_2a6cf9f4dd637c::t_3e0907a9d49bf8 190
+  s_2a6cf9f4dd637c::t_9e1401759dffc5 166-167
+  s_2a6cf9f4dd637c::t_138d7927ea8783 212-216
+  s_2a6cf9f4dd637c::t_970acfde607adf 210
+src-tauri/crates/keeper-syncd/src/commands.rs
+  s_2a6cf9f4dd637c::t_c9ddac23181443 1028,1035,1048,1056-1076,1078-1082,1090-1095
+  s_2a6cf9f4dd637c::t_dd86000dc8a7f8 241-248
+  s_2a6cf9f4dd637c::t_2627f5808a2e12 300-308
+  s_2a6cf9f4dd637c::t_f43fe4eb3a5700 509,511
+  s_2a6cf9f4dd637c::t_a2ae8d79251bd1 1703-1704,1708-1711
+  s_2a6cf9f4dd637c::t_dc34fa94186e94 1096-1097
+src-tauri/crates/keeper-sync/src/lfs/stage.rs
+  s_2a6cf9f4dd637c::t_6f2fef45ebeb57 1132-1232
+  s_2a6cf9f4dd637c::t_de10cd6437b221 11,13,20-27
+  s_2a6cf9f4dd637c::t_bb2a6aa4a72a6d 799-831
+  s_2a6cf9f4dd637c::t_ef7d719354d5f7 28
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_2a6cf9f4dd637c::t_f1543d733d33f7 3829-3845
+  s_2a6cf9f4dd637c::t_1b424ae20ecef4 5016-5086
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_2a6cf9f4dd637c::t_10b3ba20c6bd16 2001-2035
+  s_2a6cf9f4dd637c::t_fb7a9741efa7a7 497-513
+  s_2a6cf9f4dd637c::t_b7199053d6c15d 557-561,568-570
+src-tauri/crates/keeper-sync/tests/lfs_pointer_stat.rs
+  s_2a6cf9f4dd637c::t_f4dfdc44e53e9b 4-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "d2f942d91cfc6951ccd86eae7119cedc9b87ca7e",
+  "prompts": {},
+  "sessions": {
+    "s_2a6cf9f4dd637c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6bc3d69a-e2a2-4d7e-893b-7eebe6936df4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
