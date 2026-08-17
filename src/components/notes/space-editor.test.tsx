@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 
@@ -143,11 +143,18 @@ describe("editing a space changes what it selects", () => {
 
     await screen.findByRole("button", { name: /Tag client\/acme/ });
     const field = screen.getByLabelText("Add a tag");
-    // The list is populated before a key is pressed — that is the browse half
-    // the `<select>` this replaced was the only half of. `draft` is absent
-    // because the space already carries it. Scoped to the combobox's own
-    // listbox, because Story 44.4 put two real `<select>`s on this form and
-    // their `<option>`s answer to the same role.
+    // Re-anchored by Story 53.2. The browse half is unchanged — the list is
+    // populated before a key is pressed, which is the half the `<select>` this
+    // replaced was the only one of — but it now costs arriving at the field.
+    // Focus, not a press on a control of its own: an opener is the shape 44.13
+    // refused, and this dialog has nothing to unmount the chooser with, so a
+    // list that never folds is a list this form wears the height of all day.
+    // `draft` is absent because the space already carries it. Scoped to the
+    // combobox's own listbox, because Story 44.4 put two real `<select>`s on
+    // this form and their `<option>`s answer to the same role.
+    act(() => {
+      field.focus();
+    });
     expect(
       within(screen.getByRole("listbox"))
         .getAllByRole("option")
@@ -160,6 +167,53 @@ describe("editing a space changes what it selects", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().query).toBe("tag:client/acme -tag:draft tag:urgent");
+  });
+
+  it("opens with the tag list folded rather than wearing its height (Story 53.2)", async () => {
+    // This dialog mounts the chooser unconditionally and passes no `onDismiss`,
+    // so before 53.2 the list was on screen from the moment the dialog opened —
+    // above the Save button, whether or not anybody had come to choose a tag.
+    open();
+
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    expect(screen.getByLabelText("Add a tag")).toBeInTheDocument();
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("option", { name: "client" })).toBeNull();
+  });
+
+  it("folds the list when the caret moves to another field of the form (Story 53.2)", async () => {
+    // Focus leaving, not Escape, is this surface's fold. Escape inside a Radix
+    // dialog is claimed at the document in the CAPTURE phase
+    // (`@radix-ui/react-dismissable-layer`), so it closes the whole editor
+    // before the chooser's own handler runs — which is the pre-existing
+    // behaviour of this dialog and not something to fight from inside a
+    // combobox. What this form needed was a fold that costs no press at all.
+    const { onClose } = open();
+
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+    const field = screen.getByLabelText("Add a tag");
+    act(() => {
+      field.focus();
+    });
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    const name = screen.getByLabelText("Name");
+    // The press, in the order a browser fires it: the fold must not happen
+    // between the pointer going down and the click landing, or the Save button
+    // under this list moves out from under the cursor.
+    fireEvent.pointerDown(name);
+    act(() => {
+      name.focus();
+    });
+    fireEvent.pointerUp(name);
+    fireEvent.click(name);
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(document.activeElement).toBe(name);
+    // The dialog is untouched: folding a list is not dismissing a form.
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
   });
 
   it("takes a tag the vault does not have yet, because a space is authored (Story 44.13)", async () => {

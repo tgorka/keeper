@@ -1,4 +1,4 @@
-import { createEvent, fireEvent, render, screen } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { describe, expect, it, type Mock, vi } from "vitest";
 import {
@@ -28,6 +28,64 @@ function open(props: Partial<ComponentProps<typeof TagCombobox>> = {}): Mock {
   return onChoose;
 }
 
+/**
+ * Move the real DOM focus, and let React flush the render that focus caused.
+ * The `act` is the test runner's requirement, not the control's: jsdom does
+ * dispatch `focusin`/`focusout` with a `relatedTarget` from a bare `.focus()`
+ * (that is the mechanism this control uses), but an update scheduled outside
+ * `act` in a React act-environment is left unflushed. `fireEvent` gets the same
+ * wrapping for free, which is why only the focus moves need this.
+ */
+function focusOn(element: HTMLElement): void {
+  act(() => {
+    element.focus();
+  });
+}
+
+/**
+ * Render and put the caret in the field, which is what unfolds the list (Story
+ * 53.2). Focus, not a press: a chooser you have to open with a control of its
+ * own is the shape 44.13 refused, so every flow that reads the list starts by
+ * arriving at the field the way a person does.
+ */
+function browsing(props: Partial<ComponentProps<typeof TagCombobox>> = {}): Mock {
+  const onChoose = open(props);
+  focusOn(field());
+  return onChoose;
+}
+
+/** A focus target outside the chooser, so leaving it is a real focus-out with a
+ *  `relatedTarget` rather than a synthesised event. */
+function elsewhere(): HTMLElement {
+  return screen.getByRole("button", { name: "Elsewhere" });
+}
+
+/** The chooser plus something to move to. `onPress` is what the outside control
+ *  does when it is clicked, so a test can prove a commit still lands. */
+function withNeighbour(onPress: () => void = () => {}): Mock {
+  const onChoose = vi.fn();
+  render(
+    <>
+      <TagCombobox label="Add a tag" vocabulary={VAULT} onChoose={onChoose} />
+      <button type="button" onClick={onPress}>
+        Elsewhere
+      </button>
+    </>,
+  );
+  focusOn(field());
+  return onChoose;
+}
+
+/** The list element itself, hidden or not — `getByRole` would refuse a folded
+ *  one, and "is it still built" is a separate question from "is it on screen". */
+function listbox(): HTMLElement {
+  const found = document.querySelector('[role="listbox"]');
+  if (found === null) {
+    throw new Error("the chooser rendered no listbox at all");
+  }
+  return found as HTMLElement;
+}
+
 /** The field, by the accessible role the control claims to have. */
 const field = () => screen.getByRole("combobox", { name: "Add a tag" });
 
@@ -43,26 +101,33 @@ function activeOption(): string | null {
 
 describe("the list is browsable before anything is typed", () => {
   it("renders every tag with an empty query, in the vault's own order", () => {
-    open();
+    browsing();
 
     expect(offered()).toEqual(VAULT);
   });
 
   it("says so rather than rendering an empty box when the vault has no tags", () => {
-    open({ vocabulary: [] });
+    browsing({ vocabulary: [] });
 
     expect(screen.queryAllByRole("option")).toHaveLength(0);
-    expect(screen.getByText(TAG_COMBOBOX_NO_VOCABULARY)).toBeInTheDocument();
+    expect(screen.getByText(TAG_COMBOBOX_NO_VOCABULARY)).toBeVisible();
   });
 
-  it("reports itself as a combobox whose options are on screen", () => {
-    // The list is permanent, so `aria-expanded` is permanently true. A control
-    // that reported itself collapsed while showing options would tell a screen
-    // reader the opposite of what is there.
+  it("reports the state its list is actually in", () => {
+    // Re-anchored by Story 53.2. This assertion used to read `aria-expanded` as
+    // permanently `true`, which was honest while the list was permanent. It now
+    // has a folded state, and a combobox reporting itself expanded over a
+    // hidden listbox would tell a screen-reader user the opposite of what is
+    // there — the same reason the literal was right before.
     open();
 
+    expect(field()).toHaveAttribute("aria-expanded", "false");
+    expect(field()).toHaveAttribute("aria-controls", listbox().id);
+
+    focusOn(field());
+
     expect(field()).toHaveAttribute("aria-expanded", "true");
-    expect(field()).toHaveAttribute("aria-controls", screen.getByRole("listbox").id);
+    expect(screen.getByRole("listbox")).toBe(listbox());
   });
 });
 
@@ -143,7 +208,7 @@ describe("a tag the vocabulary does not have", () => {
   });
 
   it("leaves a chosen tag out of the list it offers", () => {
-    open({ chosen: ["client/acme"] });
+    browsing({ chosen: ["client/acme"] });
 
     expect(offered()).toEqual(["client", "client/acme/renewal", "standup"]);
   });
@@ -152,7 +217,7 @@ describe("a tag the vocabulary does not have", () => {
 describe("the whole control works from the keyboard", () => {
   it("arrows to a tag and Enters it without the caret ever leaving the field", () => {
     const onChoose = open();
-    field().focus();
+    focusOn(field());
 
     fireEvent.keyDown(field(), { key: "ArrowDown" });
     fireEvent.keyDown(field(), { key: "ArrowDown" });
@@ -189,6 +254,10 @@ describe("the whole control works from the keyboard", () => {
   it("clears the query and the selection once a tag is taken", () => {
     // Tagging happens in runs. A control that kept the query would make the
     // second tag start by deleting the first one's name.
+    //
+    // Story 53.2 left this alone on purpose: choosing is not "done choosing",
+    // so the whole vault is offered again with the list still up. What closes
+    // it is the user leaving — asserted in the folding suite below.
     open();
 
     fireEvent.change(field(), { target: { value: "acme" } });
@@ -283,7 +352,7 @@ describe("the whole control works from the keyboard", () => {
     // assertion is on the prevented default rather than on `activeElement`:
     // that IS the mechanism, and it is what disappears if the handler goes.
     const onChoose = open();
-    field().focus();
+    focusOn(field());
 
     const option = screen.getByText("standup");
     const press = createEvent.mouseDown(option);
@@ -293,5 +362,157 @@ describe("the whole control works from the keyboard", () => {
     expect(press.defaultPrevented).toBe(true);
     expect(onChoose).toHaveBeenCalledWith("standup");
     expect(document.activeElement).toBe(field());
+  });
+});
+
+/**
+ * Folding the list away when the choosing stops (Story 53.2, FR-315).
+ *
+ * The ask was "fold back the list of tags when I stop choosing (in all views)",
+ * and the half at risk here is what "folded" means. These assertions read the
+ * accessibility tree and the `hidden` attribute rather than a class, because a
+ * class that changes while the box still occupies the column is exactly the
+ * defect this story would ship: the owner's complaint is about height. The
+ * other half is that folding is not a retraction of 44.13 — the same list, in
+ * the same order, is one focus away and is still BUILT while hidden.
+ */
+describe("the list folds away when the choosing stops (Story 53.2)", () => {
+  it("is folded before anybody has come to the field", () => {
+    open();
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+    expect(listbox()).not.toBeVisible();
+  });
+
+  it("folds once a tag is taken and the focus moves on, without unmounting the list", () => {
+    const onChoose = withNeighbour();
+
+    fireEvent.change(field(), { target: { value: "acme" } });
+    fireEvent.keyDown(field(), { key: "Enter" });
+    expect(onChoose).toHaveBeenCalledWith("client/acme");
+    // Choosing alone is not stopping: the list is still up for the next tag.
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    focusOn(elsewhere());
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+    expect(listbox()).toHaveAttribute("hidden");
+    expect(listbox()).not.toBeVisible();
+    // Hidden, not unmounted: the rows are still there to come back to.
+    expect(listbox().querySelectorAll('[role="option"]')).toHaveLength(VAULT.length);
+    expect(field()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("brings the same list back when the focus returns", () => {
+    withNeighbour();
+
+    focusOn(elsewhere());
+    expect(screen.queryByRole("listbox")).toBeNull();
+
+    focusOn(field());
+
+    expect(offered()).toEqual(VAULT);
+    expect(field()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("holds the fold through a press on an outside control, so that press still lands", () => {
+    // The trap. The rows prevent the mousedown default precisely so a click on
+    // THEM cannot blur the field — but a press on anything else does blur it,
+    // and folding a list that sits above a dialog's Save button between
+    // mousedown and mouseup moves that button out from under the cursor, so the
+    // press the user meant lands on nothing. The fold therefore waits for the
+    // click, by which time the browser has settled what was hit.
+    const pressed = vi.fn();
+    withNeighbour(pressed);
+
+    fireEvent.pointerDown(elsewhere());
+    // What the browser does as the mousedown's default action, and the moment a
+    // naive `onBlur` would have folded the list under the cursor.
+    focusOn(elsewhere());
+
+    expect(screen.getByRole("listbox")).toBeVisible();
+
+    fireEvent.pointerUp(elsewhere());
+    fireEvent.click(elsewhere());
+
+    expect(pressed).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("folds on a click outside it", () => {
+    withNeighbour();
+
+    fireEvent.click(document.body);
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("stays up for a click inside it, including the one that takes a tag", () => {
+    const onChoose = withNeighbour();
+
+    // The label is part of the control, and pressing it is not leaving.
+    fireEvent.click(screen.getByText("Add a tag"));
+    expect(offered()).toEqual(VAULT);
+
+    fireEvent.click(screen.getByText("standup"));
+
+    expect(onChoose).toHaveBeenCalledWith("standup");
+    expect(offered()).toEqual(VAULT);
+  });
+
+  it("folds on Escape with no host to dismiss, which is the space editors' whole close", () => {
+    // Both space editors mount this control unconditionally and pass no
+    // `onDismiss`, because there is nothing of theirs to unmount. Before this
+    // story that left those two surfaces with no close path in the product.
+    browsing();
+
+    fireEvent.keyDown(field(), { key: "Escape" });
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    // The caret never left, so the next keystroke is enough to bring it back.
+    expect(document.activeElement).toBe(field());
+
+    fireEvent.change(field(), { target: { value: "acme" } });
+
+    expect(offered()).toEqual(["client/acme", "client/acme/renewal"]);
+  });
+
+  it("still gives a host its one Escape, and folds in the same press", () => {
+    const onDismiss = vi.fn();
+    browsing({ onDismiss });
+
+    fireEvent.keyDown(field(), { key: "Escape" });
+
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("takes nothing on Enter while it is folded, and still swallows the key", () => {
+    // There is no highlight to act on when there is no list on screen, and a
+    // commit nobody could see is not what Enter means. It is still swallowed,
+    // because the dialog behind this control would otherwise save.
+    const onChoose = open();
+
+    const press = createEvent.keyDown(field(), { key: "Enter" });
+    fireEvent(field(), press);
+
+    expect(onChoose).not.toHaveBeenCalled();
+    expect(press.defaultPrevented).toBe(true);
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("unfolds and moves the highlight in the one arrow press", () => {
+    const onChoose = open();
+
+    fireEvent.keyDown(field(), { key: "ArrowUp" });
+
+    expect(offered()).toEqual(VAULT);
+    expect(activeOption()).toBe("standup");
+
+    fireEvent.keyDown(field(), { key: "Enter" });
+
+    expect(onChoose).toHaveBeenCalledWith("standup");
   });
 });
