@@ -1,7 +1,7 @@
 # Spec 52.8 — A file row you can right-click
 
 story: 52.8
-status: in-progress
+status: review
 branch: `work/epic-52-file-row-menu` (on top of `work/epic-52-drag-drops`)
 baseline_revision: c873fa6
 final_revision: ''

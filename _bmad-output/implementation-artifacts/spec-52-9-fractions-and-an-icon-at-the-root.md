@@ -1,7 +1,7 @@
 # Spec 52.9 — Fractions, and an icon at the root
 
 story: 52.9
-status: in-progress
+status: review
 branch: `work/epic-52-fractions-and-icon` (on top of `work/epic-52-file-row-menu`)
 baseline_revision: c873fa6
 final_revision: ''

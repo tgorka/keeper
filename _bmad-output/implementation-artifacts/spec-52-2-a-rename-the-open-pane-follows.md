@@ -1,7 +1,7 @@
 # Spec 52.2 — A rename the open pane follows
 
 story: 52.2
-status: in-progress
+status: review
 branch: `work/epic-52-rename-follows` (on top of `work/epic-52-readme-record`)
 baseline_revision: c873fa6
 final_revision: ''

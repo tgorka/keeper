@@ -1,7 +1,7 @@
 # Spec 52.6 — A form you can reach both ends of
 
 story: 52.6
-status: in-progress
+status: review
 branch: `work/epic-52-dialog-scrolls` (on top of `work/epic-52-space-create-dir`)
 baseline_revision: c873fa6
 final_revision: ''

@@ -1,7 +1,7 @@
 # Spec 52.4 — Spaces first, and one for the untagged
 
 story: 52.4
-status: in-progress
+status: review
 branch: `work/epic-52-spaces-first` (on top of `work/epic-52-note-mode-writes`)
 baseline_revision: c873fa6
 final_revision: ''

@@ -1,7 +1,7 @@
 # Spec 52.7 — A card you can actually drop
 
 story: 52.7
-status: in-progress
+status: review
 branch: `work/epic-52-drag-drops` (on top of `work/epic-52-dialog-scrolls`)
 baseline_revision: c873fa6
 final_revision: ''

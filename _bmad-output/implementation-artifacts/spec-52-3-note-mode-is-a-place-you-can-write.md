@@ -1,7 +1,7 @@
 # Spec 52.3 — Note mode is a place you can write
 
 story: 52.3
-status: in-progress
+status: review
 branch: `work/epic-52-note-mode-writes` (on top of `work/epic-52-rename-follows`)
 baseline_revision: c873fa6
 final_revision: ''

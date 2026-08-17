@@ -1,7 +1,7 @@
 # Spec 52.1 — The record is called README
 
 story: 52.1
-status: in-progress
+status: review
 branch: `work/epic-52-readme-record`
 baseline_revision: c873fa6
 final_revision: ''

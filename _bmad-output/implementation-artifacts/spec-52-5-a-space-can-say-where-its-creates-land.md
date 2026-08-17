@@ -1,7 +1,7 @@
 # Spec 52.5 — A space can say where its creates land
 
 story: 52.5
-status: in-progress
+status: review
 branch: `work/epic-52-space-create-dir` (on top of `work/epic-52-spaces-first`)
 baseline_revision: c873fa6
 final_revision: ''
