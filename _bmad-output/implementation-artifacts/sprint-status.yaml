@@ -637,6 +637,60 @@ development_status:
   50-4-a-files-own-properties: review
   epic-50-retrospective: optional
 
+  # ── EPIC 51, 2026-08-16: fourteen items, and four of them were not what they ──
+  # looked like. Five read-only scouts checked every one against the code before
+  # the spine existed, which changed the epic twice over:
+  #
+  #   ALREADY SHIPPED, UNREACHABLE (2). Tasks drag-and-drop has worked since the
+  #     board was written — the BOARD renders only for a flat session, and his are
+  #     folder-shaped, so he had never seen it. And the "spaces directory" he asked
+  #     for exists at zone level (`_spaces/`, AD-121); what he could not do was put
+  #     markdown in a subdirectory and have anything read it.
+  #   ONE CAPABILITY BEHIND THREE ITEMS. `read_ref_sources` read one level, files
+  #     only. That single fact hid `spaces/`, `log/` AND his root `references.md`.
+  #   PUSHED BACK, NOT BUILT (1). Renaming the flat record `about.md` → `README.md`
+  #     is UNSAFE as asked: `shape()` keys on the presence of `about.md`, so adding
+  #     `README.md` to that predicate flips every folder-shaped session to Flat in
+  #     one rescan — his live, unmigrated data. The safe form deletes a documented
+  #     fallback, promotes `AGENTS.md` to mandatory and needs `migrate` rewritten,
+  #     and it reverses his own earlier instruction ("the navigation file is
+  #     AGENTS.md, and a README beside it would be a second answer"). Two options
+  #     are written into the epic; neither was taken unilaterally.
+  #   DELIBERATE, KEPT (2). A second `about` record would give `shape()` two
+  #     answers, so About still offers no create — it now SAYS so, in Rust's words,
+  #     and offers *Open the record* instead. And `kind_dir(Flat) → root` stays, so
+  #     a `log/` works if the operator makes one and keeper does not file there.
+  #
+  # Shipped as a five-PR stack on top of epic 50's five and epic 49's five:
+  #
+  #   #153  feat/51-1-markdown-found-wherever-it-sits   -> chore/the-epic-50-ledger
+  #   #154  feat/51-2-a-folder-you-can-make             -> #153
+  #   #155  feat/51-5-note-mode                         -> #154
+  #   #156  feat/51-wave-b-spaces-templates-rename-board -> #155  (51.3/51.4/51.6/51.7)
+  #   #157  fix/what-epic-51s-review-found              -> #156
+  #
+  # Two review layers over wave A both returned `incorrect` with four P1s, and the
+  # sharpest one is worth keeping: the wave's own thesis was "one walk, so the row
+  # and the pool cannot disagree" — and `pool::group` was never re-keyed, so the
+  # board row and the detail's Log named different newest sittings. A test hid it
+  # by sorting before asserting. Third epic running, the same shape: a claim in a
+  # comment that no test owns.
+  #
+  # Two finds worth recording beyond their stories: `notesRename` (FR-97) has been
+  # shipped with ZERO call sites since epic 39 — story 51.6 is its first — and the
+  # workspace fence (AD-113) was case-blind in BOTH predicates, so `Workspace/x`
+  # was writable scratch on every Mac keeper ships to.
+  epic-51: in-progress
+  51-1-markdown-is-found-wherever-it-sits: review
+  51-2-a-folder-you-can-make: review
+  51-3-a-space-that-says-how-it-opens: review
+  51-4-a-template-that-defines-spaces: review
+  51-5-note-mode: review
+  51-6-a-row-you-can-right-click: review
+  51-7-about-explains-itself: review
+  51-8-the-record-is-called-readme: blocked
+  epic-51-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

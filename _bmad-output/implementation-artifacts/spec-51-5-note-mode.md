@@ -151,3 +151,25 @@ Mutations, each run and each reverted:
 | `raw-rendered-view.tsx` drop the adoption's `onOutcome` report | 1 failure: row 17 |
 | `markdown-preview.ts` return `null` from the adoption's `catch` (the reviewer's `setContent-swallow`) | 1 failure: "turns an adoption the view refuses into a sentence" |
 | `text-viewer.tsx` mount deps → `[language, tools]` | 1 failure: the raw editor's own same-name file test |
+| `markdown-preview.ts` remove the import wave's `.catch` | 1 failure: "resolves with a sentence rather than rejecting" |
+
+### What CI found that this box did not
+
+GitHub's macOS runner reported the Frontend job **red with all 4375 tests
+passing** and `Errors 17 errors`: `EnvironmentTeardownError: Cannot load
+'/src/lib/viewers/registry.ts'`, reached through
+`markdown-preview.ts → live-preview.ts → file-embed.ts → registry.ts`. A host was
+unmounted while this story's six-module `import()` wave was in flight, the wave
+rejected, and the rejection travelled out of `mountMarkdownPreview` — whose own
+doc comment three lines above the wave says it never rejects, which is why no
+caller wraps it. The same shape in production is an offline reader or a deploy
+that moved a chunk: a blank pane with nothing said.
+
+It never reproduced on this container across four full runs — the module runner
+here resolves the wave before any unmount — so the fix is verified by the new
+`markdown-preview-load-failure.test.ts` (its own file: `markdown-preview.test.ts`
+imports the real grammar statically on purpose, and a module mocked for one would
+be mocked for both), by the mutation above, and by CI going green on the pushed
+branch. Recorded here because it is the second time in two epics that a green
+local suite and a green hesperia gate were both blind to a class only the third
+toolchain saw.
