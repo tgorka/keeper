@@ -659,6 +659,13 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // `false` on its own account — the wait is on the uploads, not on a
         // clock, and pressing "Sync now" again cannot shorten it.
         SyncError::LfsUploadPending { .. } => IpcErrorCode::SyncUnavailable,
+        // The same shape one line up: a wait rather than a fault. Another
+        // machine reached the shared branch first, so this pass published
+        // nothing and the reconcile it queued is what makes the next one land
+        // (DW-207). `syncUnavailable` says "sync cannot continue right now",
+        // which is the truth for the moment it lasts — and `internal` would
+        // dress a routine race as a defect in front of the user.
+        SyncError::RemoteMoved { .. } => IpcErrorCode::SyncUnavailable,
         // Everything else keeps the `internal` this funnel has always given it.
         // Spelled out rather than defaulted so that growing the taxonomy asks
         // the question here instead of answering it.
