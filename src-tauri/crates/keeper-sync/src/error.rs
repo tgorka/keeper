@@ -143,6 +143,20 @@ pub enum SyncError {
     #[error("{profile}: {reason}")]
     Diverged { profile: String, reason: String },
 
+    /// The remote moved between this profile's last reconcile and its push, so
+    /// git refused the update (DW-207).
+    ///
+    /// The same git output as [`Self::Diverged`] and a different condition. On
+    /// a bidirectional profile sharing a branch with another machine, being
+    /// overtaken between merge and push is *routine* — the other machine
+    /// pushed, which is the entire point of sharing the branch. The answer is
+    /// the reconcile loop keeper already owns: fetch, merge, push again. So
+    /// this is transient and needs nobody, where `Diverged` is permanent and
+    /// needs a human, and telling them apart is what stops a shared folder from
+    /// parking itself every time two machines are awake at once.
+    #[error("{profile}: the remote moved while pushing ({reason}) — reconciling")]
+    RemoteMoved { profile: String, reason: String },
+
     /// The durable journal or profile store could not be read or written.
     /// Treated as fatal for the profile: without the journal we cannot promise
     /// NFR-24, and continuing would risk losing work silently.
@@ -212,7 +226,11 @@ impl SyncError {
             | Self::Config(_) => Retriability::Permanent,
             // Ambiguous by nature; a bounded retry is cheaper than parking a
             // profile on a transient EINTR or a momentarily locked file.
-            Self::Git(_) | Self::Io { .. } => Retriability::Transient,
+            //
+            // `RemoteMoved` joins them deliberately: another machine pushing
+            // first is the ordinary weather of a shared branch, and the retry
+            // lands after the reconcile that `do_push` queues alongside it.
+            Self::Git(_) | Self::Io { .. } | Self::RemoteMoved { .. } => Retriability::Transient,
             Self::Cancelled => Retriability::Permanent,
         }
     }
@@ -251,6 +269,7 @@ impl SyncError {
             Self::Integrity { .. } => "integrity",
             Self::Quota { .. } => "quota",
             Self::Diverged { .. } => "diverged",
+            Self::RemoteMoved { .. } => "remote-moved",
             Self::Journal(_) => "journal",
             Self::Git(_) => "git",
             Self::Io { .. } => "io",

@@ -2182,12 +2182,19 @@ impl Engine {
     ///   answers where one is needed.
     /// * **`problem` is the profile's last recorded *permanent* failure, not a
     ///   push-specific one.** That is the engine's only record of a failure in
-    ///   words, and a refused push is one — a rejected ref classifies as
-    ///   [`SyncError::Diverged`], which is permanent and lands there verbatim.
-    ///   A failure still being retried deliberately carries no sentence yet
-    ///   (`record_failure`'s policy, not this one), which is right: work that
-    ///   is about to be retried is not something to hand a recorder words
+    ///   words. A failure still being retried deliberately carries no sentence
+    ///   yet (`record_failure`'s policy, not this one), which is right: work
+    ///   that is about to be retried is not something to hand a recorder words
     ///   about.
+    ///
+    ///   A refused push used to land here, because a rejected ref classified as
+    ///   [`SyncError::Diverged`] whatever the profile was. On a shared
+    ///   bidirectional branch it no longer does: being overtaken is a race, it
+    ///   comes back as [`SyncError::RemoteMoved`], and it reconciles on its own
+    ///   (DW-207). So the honest reading of a recording in that window is
+    ///   `committed` without `pushed` and **no sentence** — the publication has
+    ///   not failed, it is a step behind. A race that genuinely will not settle
+    ///   still parks eventually, and parking is what records the words.
     ///
     /// # What is a refusal
     ///
@@ -3588,6 +3595,59 @@ impl Engine {
     /// `push_unit` is this push's own journal row, when a journaled unit is
     /// driving. It is handed to the commit so the rows it records can name the
     /// work that will publish them (Story 34.16).
+    /// What a refused push means for *this* profile (DW-207).
+    ///
+    /// git says the same thing however the folder is configured — "! [rejected]
+    /// … (fetch first)", "failed to push some refs" — and
+    /// [`git::cli::classify_message`] can only read that text, so it answers
+    /// [`SyncError::Diverged`]: permanent, and needing a human. On a one-way
+    /// lane that is exactly right, because a human deciding is the point
+    /// (AD-50).
+    ///
+    /// On a **bidirectional profile sharing a branch** it is wrong, and wrong in
+    /// the way that stops a folder working. Being overtaken between the merge
+    /// and the push is what two machines syncing the same branch *do* — the
+    /// other one pushed first, which is the entire point of sharing it — and
+    /// the answer is the reconcile loop this engine already owns. Parking
+    /// instead makes every such race a manual chore, and each parked unit
+    /// leaves its commit unpublished while the next tick queues another push
+    /// that fails identically. Field shape: a folder whose PROBLEMS list is
+    /// dozens of identical "Push · stopped after 2 attempts", while its LFS
+    /// objects upload perfectly, because the objects never needed the ref.
+    ///
+    /// The reconcile has to be *queued*, not merely retried: a `Push` unit
+    /// re-runs [`Self::do_push`] alone, which would meet the same remote and
+    /// fail the same way. `Pull` is what fetches and merges, so it goes in
+    /// front, and the transient error is what brings the push back after it.
+    ///
+    /// `Diverged`'s own doc says bidirectional profiles never produce it. This
+    /// is the code that makes that true.
+    fn after_rejected_push(&self, profile: &SyncProfile, err: SyncError) -> Result<SyncError> {
+        let SyncError::Diverged { reason, .. } = &err else {
+            return Ok(err);
+        };
+        // A lane, or a one-way profile: the remote moving is a decision, and
+        // the human who owns the lane is the one who takes it.
+        if profile.lane == SyncLane::Worktree || profile.direction == SyncDirection::PushOnly {
+            return Ok(err);
+        }
+        let reason = reason.clone();
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now))?;
+        // ...and look now rather than at the end of the poll interval: the
+        // remote has already moved, so there is nothing to wait for.
+        Self::lock(&self.next_scan_ms).remove(&profile.id);
+        tracing::info!(
+            profile = profile.name,
+            %reason,
+            "the remote moved while pushing; reconciling and retrying"
+        );
+        Ok(SyncError::RemoteMoved {
+            profile: profile.name.clone(),
+            reason,
+        })
+    }
+
     async fn do_push(
         &self,
         profile: &SyncProfile,
@@ -3653,11 +3713,14 @@ impl Engine {
         // session that claims "one push at the end" has to be able to show it
         // even when that push failed (Story 41.5).
         self.bump_counters(&profile.id, |counters| counters.pushes += 1);
-        tokio::task::spawn_blocking(move || {
+        let pushed = tokio::task::spawn_blocking(move || {
             git.push(&repo_path, "origin", &refspec, credential.as_ref())
         })
         .await
-        .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
+        .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))?;
+        if let Err(err) = pushed {
+            return Err(self.after_rejected_push(profile, err)?);
+        }
 
         if count > 0 {
             let mut event = self.progress(profile, SyncPhase::Pushing);
@@ -5760,6 +5823,115 @@ mod tests {
             "https://git.invalid/x/y.git",
         )
     }
+    /// A shared branch overtaken by the other machine is weather, not a
+    /// decision (DW-207).
+    ///
+    /// Field shape this reproduces: dozens of identical "Push · stopped after 2
+    /// attempts" on a bidirectional folder, while its LFS objects uploaded
+    /// perfectly — the objects never needed the ref. Each parked unit left its
+    /// commit unpublished and the next tick queued another that failed the same
+    /// way, so the folder never converged again without a human.
+    #[test]
+    fn a_bidirectional_push_the_remote_overtook_reconciles_instead_of_parking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let profile = profile(dir.path());
+        engine.upsert_profile(&profile).expect("store the profile");
+
+        let rejected = SyncError::Diverged {
+            profile: profile.name.clone(),
+            reason: "! refs/heads/main:refs/heads/main [rejected] (fetch first)".to_owned(),
+        };
+        let mapped = engine
+            .after_rejected_push(&profile, rejected)
+            .expect("mapping must not fail");
+
+        match &mapped {
+            SyncError::RemoteMoved { profile: named, .. } => assert_eq!(named, &profile.name),
+            other => panic!("expected RemoteMoved, got {other:?}"),
+        }
+        assert_eq!(
+            mapped.retriability(),
+            Retriability::Transient,
+            "a race has to come back on its own"
+        );
+        assert!(
+            !mapped.needs_user_action(),
+            "nobody has a decision to make here"
+        );
+
+        // Queued, not merely retried: a `Push` unit re-runs the push alone and
+        // would meet the same remote. `Pull` is what fetches and merges.
+        let queued = engine
+            .with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::PULL))
+            .expect("count");
+        assert_eq!(queued, 1, "the reconcile has to be in front of the retry");
+    }
+
+    /// The case the permanent classification was written for stays permanent:
+    /// on a one-way lane a human deciding is the entire point (AD-50).
+    #[test]
+    fn a_one_way_lane_still_parks_on_a_rejected_push() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        // A worktree lane is only valid as pushOnly, so the two one-way shapes
+        // are "a lane" and "a pushOnly profile on the main lane".
+        for mutate in [
+            (|p: &mut SyncProfile| {
+                p.lane = SyncLane::Worktree;
+                p.direction = SyncDirection::PushOnly;
+            }) as fn(&mut SyncProfile),
+            |p: &mut SyncProfile| p.direction = SyncDirection::PushOnly,
+        ] {
+            let mut profile = profile(dir.path());
+            mutate(&mut profile);
+            engine.upsert_profile(&profile).expect("store the profile");
+
+            let mapped = engine
+                .after_rejected_push(
+                    &profile,
+                    SyncError::Diverged {
+                        profile: profile.name.clone(),
+                        reason: "(fetch first)".to_owned(),
+                    },
+                )
+                .expect("mapping must not fail");
+            assert!(
+                matches!(mapped, SyncError::Diverged { .. }),
+                "a lane keeps its human: {mapped:?}"
+            );
+            assert_eq!(mapped.retriability(), Retriability::Permanent);
+        }
+    }
+
+    /// Only a rejection is re-read. Everything else keeps the classification it
+    /// arrived with — an auth failure that started retrying itself would spin
+    /// against a credential that will never work.
+    #[test]
+    fn any_other_push_failure_passes_through_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let profile = profile(dir.path());
+        engine.upsert_profile(&profile).expect("store the profile");
+
+        let mapped = engine
+            .after_rejected_push(
+                &profile,
+                SyncError::Auth {
+                    host: "forge.example.com".to_owned(),
+                },
+            )
+            .expect("mapping must not fail");
+        assert!(matches!(mapped, SyncError::Auth { .. }), "{mapped:?}");
+        assert_eq!(mapped.retriability(), Retriability::Permanent);
+    }
+
     /// The supervisor ticks at 1 Hz so queued work starts promptly. Walking the
     /// tree at that rate is what made the menu-bar glyph blink on an idle
     /// folder, and it re-stats every file on the drive once a second.
@@ -11070,18 +11242,25 @@ mod tests {
             "the recording did not fail — its publication did: {durability:?}"
         );
         assert!(!durability.pushed, "and it is not on the remote");
-        let problem = durability
-            .problem
-            .expect("a refused publication must be able to say why");
-        assert_eq!(
-            Some(problem.clone()),
-            engine.status(&p.id).expect("status").error,
-            "verbatim: the sentence the engine recorded, not a second wording of it"
-        );
+        // No sentence, and that is the answer now (DW-207). This profile is
+        // bidirectional, so being overtaken by the rival is a race rather than
+        // a decision: it comes back as `RemoteMoved`, which is transient, and
+        // `record_failure` deliberately hands no words to a recorder about work
+        // that is about to be retried. The recording is a step behind, not
+        // broken, and saying so in red would be a lie that recurs every time
+        // two machines are awake at once.
         assert!(
-            problem.to_ascii_lowercase().contains("failed to push"),
-            "the reason has to be git's own account of the refused publication — the recording \
-             did not fail — got: {problem}"
+            durability.problem.is_none(),
+            "a race that heals itself must not be reported as a failed publication: {durability:?}"
+        );
+        // What *is* asserted: the reconcile is queued, so the retry meets a
+        // remote it can fast-forward from rather than the same rejection.
+        let reconcile = engine
+            .with_db(|conn| db::outstanding_count(conn, &p.id, WorkKind::PULL))
+            .expect("count the queue");
+        assert_eq!(
+            reconcile, 1,
+            "the push has to be preceded by the fetch and merge that make it land"
         );
         // The recording itself is untouched by any of it.
         assert!(segment.exists());

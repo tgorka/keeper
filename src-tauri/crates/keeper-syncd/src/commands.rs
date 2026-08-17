@@ -149,6 +149,13 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         | SyncError::Integrity { .. }
         | SyncError::Quota { .. }
         | SyncError::Diverged { .. }
+        // Beside `Diverged`, and for a one-shot run only. In the supervisor
+        // being overtaken is a race the next reconcile settles (DW-207), but a
+        // `sync --once` that ends here published nothing this pass — and a pass
+        // that did not publish is a failed pass, which is exactly what
+        // `Restart=on-failure` should see. The restart meets a fetch first, so
+        // it converges rather than looping.
+        | SyncError::RemoteMoved { .. }
         | SyncError::Journal(_)
         | SyncError::Git(_)
         | SyncError::Io { .. } => EXIT_FAILURE,
