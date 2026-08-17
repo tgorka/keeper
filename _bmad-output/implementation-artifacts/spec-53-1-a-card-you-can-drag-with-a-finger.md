@@ -1,7 +1,7 @@
 # Spec 53.1 — A card you can drag with a finger
 
 story: 53.1
-status: in-progress
+status: review
 branch: `work/epic-53-pointer-drag`
 baseline_revision: 8c8a3eb
 final_revision: ''

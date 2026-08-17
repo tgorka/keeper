@@ -1,7 +1,7 @@
 # Spec 53.4 — A space you can narrow in one press
 
 story: 53.4
-status: in-progress
+status: review
 branch: `work/epic-53-narrow-a-space` (on top of `work/epic-53-fold-and-merge`)
 baseline_revision: 8c8a3eb
 final_revision: ''

@@ -1,7 +1,7 @@
 # Spec 53.2 — A chooser that closes when you are done
 
 story: 53.2
-status: in-progress
+status: review
 branch: `work/epic-53-tag-chooser-folds` (on top of `work/epic-53-pointer-drag`)
 baseline_revision: 8c8a3eb
 final_revision: ''

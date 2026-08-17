@@ -720,6 +720,43 @@ development_status:
   52-9-fractions-and-an-icon-at-the-root: review
   epic-52-retrospective: optional
 
+  # -- EPIC 53, 2026-08-17: the gesture, the fold, and the folder --------------
+  #
+  # The seventh field report. Five items, five PRs #172..#176 bottom to top.
+  # 53.4 and 53.5 share #175 (one Rust surface, 60-odd interleaved hunks).
+  #
+  # ITEM 4 WAS THE THIRD REPORT OF THE SAME BUG, and the first two fixes failed
+  # because the JavaScript was never wrong. A librarian read Tauri's own source:
+  # tauri-runtime-wry installs a drag-drop handler that always returns `true`,
+  # and wry's macOS WryWebView implements NSDraggingDestination ON the WKWebView
+  # subclass, forwarding to `super` only when that closure returns `false`. So
+  # `performDragOperation:` is claimed in Rust and the page's `drop` can never
+  # fire. `dragDropEnabled: false` would fix it and break Story 3.7's
+  # file-drop-to-attach, so the gesture moved to pointer events instead.
+  #
+  # ITEM 3 WAS NOT A CODE DEFECT. `spaces.rs` has always had `tag:about`; the
+  # two-term query is in the owner's own `_spaces/about.md`, and a persisted
+  # definition shadows the default completely (AD-121). Editing the const would
+  # have looked like the fix and changed nothing, so the story is a repair he
+  # presses instead.
+  #
+  # ITEM 5 SHIPPED LAST NIGHT AND DID NOTHING FOR HIM: 52.5 gave `create_dir` a
+  # default of empty and specified empty as "today's behaviour". The rule that
+  # actually reaches an existing zone is absent-vs-empty, on READ.
+  #
+  # REVIEW FOUND A P1 IN THE FIX FOR ITEM 4, in the one half jsdom still cannot
+  # see: React moves the pressed node when the preview reorders a keyed list,
+  # DOM pre-insert removes it from its parent first, and the implicit pointer
+  # release tore the press down on step one of every strip drag. Fixed in the
+  # shared hook by discriminating moved-vs-unmounted on `isConnected`.
+  epic-53: in-progress
+  53-1-a-card-you-can-drag-with-a-finger: review
+  53-2-a-chooser-that-closes-when-you-are-done: review
+  53-3-one-title-bar-and-two-folds: review
+  53-4-a-space-you-can-narrow-in-one-press: review
+  53-5-a-create-that-lands-where-the-space-says: review
+  epic-53-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
