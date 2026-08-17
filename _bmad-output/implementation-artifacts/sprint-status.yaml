@@ -691,6 +691,35 @@ development_status:
   51-8-the-record-is-called-readme: blocked
   epic-51-retrospective: optional
 
+  # -- EPIC 52, 2026-08-17: the sixth field report, fourteen items ----------
+  #
+  # Six read-only scouts measured every claim against main c873fa6 before the
+  # spine was written. Four items turned out to be recorded refusals, and the
+  # owner asked for three of them anyway:
+  #   8  about.md -> README.md  - refused as 51.8, now built by NARROWING
+  #      shape()'s predicate to AGENTS alone plus one journaled migration
+  #   9  Note as the default    - spec-51-5:62 recorded the opposite as a
+  #      non-goal; the owner overrides his own earlier instruction
+  #   7  About's add button     - the single-record rule stays; the refusal
+  #      becomes visible instead of absent
+  #   4  creates land in a space's folder - AD-120 stands; a space may name a
+  #      create DESTINATION, and reading still derives kind from the tag
+  # Two items a shipped story claimed and did not deliver: 1 (no toolbar in
+  # Note mode) and 11 (the FILES tree never got the 51.6 menu). One shipped
+  # feature is broken only on WebKit: 6, because no drag ever called setData -
+  # and jsdom cannot see that, which is why its tests were green.
+  epic-52: in-progress
+  52-1-the-record-is-called-readme: backlog
+  52-2-a-rename-the-open-pane-follows: backlog
+  52-3-note-mode-is-a-place-you-can-write: backlog
+  52-4-spaces-first-and-one-for-the-untagged: backlog
+  52-5-a-space-can-say-where-its-creates-land: backlog
+  52-6-a-form-you-can-reach-both-ends-of: backlog
+  52-7-a-card-you-can-actually-drop: backlog
+  52-8-a-file-row-you-can-right-click: backlog
+  52-9-fractions-and-an-icon-at-the-root: backlog
+  epic-52-retrospective: optional
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

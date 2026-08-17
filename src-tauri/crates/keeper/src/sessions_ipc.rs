@@ -899,24 +899,32 @@ pub async fn sessions_create(
     let shape = keeper_core::sessions::shape::shape(&pattern_top);
     let flat = shape == keeper_core::sessions::shape::Shape::Flat;
 
-    // The stamped record. Folder-shaped: the pattern's own headings, empty,
-    // with the title and date in place — a template README that grows a section
-    // grows it for every new session, and a continued session inherits the
-    // shape it earned. Flat: the same idea against `about.md`, falling back to
-    // the shipped default (FR-268) when the pattern has none to inherit from.
-    let record_name = if flat {
-        keeper_core::sessions::shape::ABOUT
-    } else {
-        model::README
-    };
-    let pattern_record = std::fs::read_to_string(pattern_dir.join(record_name)).ok();
+    // The stamped record. The pattern's own headings, empty, with the title and
+    // date in place — a template record that grows a section grows it for every
+    // new session, and a continued session inherits the shape it earned. Falling
+    // back to the shipped default (FR-268) when the pattern has none to inherit
+    // from.
+    //
+    // **One name, since story 52.1**: the record is `README.md` under both
+    // contracts, so the `if flat { about.md } else { README.md }` that used to
+    // stand here is gone. The `about.md` fallback below is not that branch coming
+    // back — it is the *unmigrated pattern* case, and it exists so a zone whose
+    // `_template/` still keeps its record under the old name keeps inheriting its
+    // headings instead of silently dropping to the shipped default. It reads a
+    // file; it decides nothing.
+    let pattern_record =
+        std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::model::README))
+            .ok()
+            .or_else(|| {
+                std::fs::read_to_string(pattern_dir.join(keeper_core::sessions::shape::ABOUT)).ok()
+            });
     let body = match (&pattern_record, flat) {
         (Some(text), _) => {
             let (_, body_at) = keeper_core::notes::frontmatter::Frontmatter::parse(text);
             plan::skeleton_from(&text[body_at..], &title, &date)
         }
-        // No record to inherit: the default template's own `about.md` body,
-        // reached through the same renderer so the two cannot drift.
+        // No record to inherit: the default template's own record body, reached
+        // through the same renderer so the two cannot drift.
         (None, true) => template::about_only(&title, &date),
         (None, false) => plan::skeleton_from(
             "# <session title>\n\n## Summary\n\n## Log\n\n## Promote\n\n| workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n",
@@ -959,7 +967,7 @@ pub async fn sessions_create(
     // continuation is not short of examples — it was made from a session that
     // has real ones. Seeding it anyway would put a "Nothing has happened yet"
     // log at the top of a session continuing months of work.
-    let mut stamped = vec![(record_name.to_owned(), readme.clone())];
+    let mut stamped = vec![(model::README.to_owned(), readme.clone())];
     if flat {
         let carried: std::collections::BTreeSet<&str> =
             copies.iter().map(|(rel, _)| rel.as_str()).collect();
@@ -980,7 +988,7 @@ pub async fn sessions_create(
             template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
         for file in seeds {
             let is_contract = file.name == keeper_core::sessions::shape::AGENTS;
-            if file.name == keeper_core::sessions::shape::ABOUT
+            if file.name == model::README
                 || carried.contains(file.name.as_str())
                 || file.kind.is_some_and(|kind| carried_kinds.contains(&kind))
                 || (!is_contract && source.is_some())
@@ -1023,8 +1031,11 @@ pub async fn sessions_create(
         Some(row) => plan::compile_create_from_shaped(
             &dir_name,
             &row.path,
-            &std::fs::read_to_string(pattern_dir.join(record_name)).unwrap_or_default(),
-            record_name,
+            // The SOURCE's record, read from the name the lineage append will be
+            // written back to. Never `pattern_record` — that one falls back to an
+            // unmigrated `about.md`, and a guard read from one file and written to
+            // another is a guard that always mismatches.
+            &std::fs::read_to_string(pattern_dir.join(model::README)).unwrap_or_default(),
             &id,
             &copies,
             &expanded,
@@ -1140,7 +1151,9 @@ pub async fn sessions_log_today(
         account_id: None,
         retriable: false,
     })?;
-    let readme_path = zone.join(&row.path).join("README.md");
+    let readme_path = zone
+        .join(&row.path)
+        .join(keeper_core::sessions::model::README);
     let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
     if let Some((compiled, _caret)) = plan::compile_log_today(&row.path, &readme, &today()) {
         let zone_for_run = zone.clone();
@@ -1172,6 +1185,27 @@ pub fn sessions_log_today(root_id: String, session_id: String) -> Result<(), Ipc
     Err(unsupported())
 }
 
+/// One session directory's own entry names — the listing
+/// [`keeper_core::sessions::shape::shape`] keys on, and the one the record rename
+/// keys on too.
+///
+/// Best-effort: a directory that vanished between the scan and the verb reads as
+/// empty, which compiles to a plan that does nothing rather than to a plan that
+/// names files it cannot find. A flat listing, not a recursive one — the shape
+/// signal is a file at the root, and an `AGENTS.md` somebody archived three
+/// folders down does not get to decide the contract.
+#[cfg(desktop)]
+fn top_level_names(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read one session for migration: what shape it is, and every file the
 /// compiler needs to plan the conversion.
 ///
@@ -1187,14 +1221,7 @@ fn migrate_input(
     use keeper_core::sessions::migrate::{MigrateFile, MigrateInput};
 
     let dir = zone.join(session_rel);
-    let top_level: Vec<String> = std::fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    let top_level = top_level_names(&dir);
 
     let mut carried = Vec::new();
     for kind in ["refs", "prompts"] {
@@ -1224,7 +1251,8 @@ fn migrate_input(
     let mut input = MigrateInput {
         session: session_rel.to_owned(),
         top_level,
-        readme: std::fs::read_to_string(dir.join("README.md")).unwrap_or_default(),
+        readme: std::fs::read_to_string(dir.join(keeper_core::sessions::model::README))
+            .unwrap_or_default(),
         carried,
         ids: Vec::new(),
         today: today(),
@@ -1341,6 +1369,152 @@ pub fn sessions_migrate(root_id: String, session_id: String) -> Result<(), IpcEr
     Err(unsupported())
 }
 
+/// Move a session's record from `about.md` to `README.md` (FR-300, FR-301).
+///
+/// One journaled plan per session through the same executor every other
+/// lifecycle verb runs on (AD-111), so a crash resumes and a completed rename
+/// compiles to an empty plan the second time — pressing the button twice is not
+/// two renames.
+///
+/// **`session_id` is optional, and the absent case is the point.** The record's
+/// name is a *zone-wide* contract: a session whose record is still `about.md`
+/// renders with no record at all after story 52.1, because
+/// `keeper_core::sessions::shape::shape` no longer reads that name. Asking about
+/// one session is for the operator who wants to see it happen once; asking about
+/// none is the whole zone, in board order.
+///
+/// **The zone is read once, before anything runs.** Two plans compiled from two
+/// reads could disagree about which sessions still hold an `about.md`, and that
+/// fact is exactly what decides whether a pointer in one session gets rewritten
+/// for another session's rename — so the sweep is one read shared by every plan.
+/// The pointer rewrites are compiled as guarded writes against those bytes, and
+/// two plans that rewrite one shared file compute the same content from the same
+/// bytes, which the executor's `GuardedWrite` recognises as its own output rather
+/// than as a conflict.
+///
+/// Answers with how many sessions the verb actually changed, so a zone-wide run
+/// can say "nothing needed moving" instead of looking identical to a failure.
+///
+/// Rejects with: `internal` (unknown root, a root that has never scanned, an
+/// unknown session, a `README.md` in the way that no migration wrote, a failed
+/// step), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_record_migrate(
+    root_id: String,
+    session_id: Option<String>,
+) -> Result<u32, IpcError> {
+    use keeper_core::sessions::migrate::{compile_record_rename, PointerFile, RecordRenameInput};
+    use keeper_core::sessions::shape::ABOUT;
+
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let rows = crate::sessions_root::rows(&root_id).ok_or_else(|| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "{root_id} has not finished a scan yet, so keeper does not know which sessions are in \
+             it. Open the board and try again once the rows are there."
+        ),
+        account_id: None,
+        retriable: true,
+    })?;
+
+    // Which sessions the rename is asked about. The pointer sweep below is the
+    // whole zone either way, because a link at one session's record can be
+    // written in another.
+    let targets: Vec<keeper_core::sessions::vm::SessionRowVm> = match &session_id {
+        Some(id) => vec![rows
+            .iter()
+            .find(|row| row.id == *id)
+            .cloned()
+            .ok_or_else(|| session_error(id))?],
+        None => rows.iter().cloned().collect(),
+    };
+
+    let mut pointers: Vec<PointerFile> = Vec::new();
+    let mut with_about: Vec<String> = Vec::new();
+    let mut top_levels: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in rows.iter() {
+        let names = top_level_names(&zone.join(&row.path));
+        if names.iter().any(|name| name == ABOUT) {
+            with_about.push(row.path.clone());
+        }
+        top_levels.insert(row.path.clone(), names);
+        if let Some(pool) = crate::sessions_root::session_pool(&root_id, &row.id) {
+            pointers.extend(
+                pool.files
+                    .into_iter()
+                    .map(|(rel, text, _mtime)| PointerFile {
+                        session: row.path.clone(),
+                        rel,
+                        text,
+                    }),
+            );
+        }
+    }
+
+    // One input, its expensive halves set once: a zone's whole markdown cloned
+    // per session would be quadratic in a zone the operator actually has.
+    let mut input = RecordRenameInput {
+        session: String::new(),
+        top_level: Vec::new(),
+        readme: String::new(),
+        title: String::new(),
+        pointers,
+        with_about,
+    };
+    let mut moved = 0u32;
+    for row in targets {
+        input.top_level = top_levels.get(&row.path).cloned().unwrap_or_default();
+        input.readme = std::fs::read_to_string(
+            zone.join(&row.path)
+                .join(keeper_core::sessions::model::README),
+        )
+        .unwrap_or_default();
+        input.title = row.title.clone();
+        input.session = row.path.clone();
+
+        let compiled = compile_record_rename(&input).map_err(|refusal| IpcError {
+            code: IpcErrorCode::Internal,
+            message: refusal.to_string(),
+            account_id: None,
+            retriable: false,
+        })?;
+        if compiled.steps.is_empty() {
+            // Nothing to move. Not an error: the operator asked for an outcome
+            // that already holds, which for a zone-wide run is most of the zone.
+            continue;
+        }
+        let zone_for_run = zone.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::sessions_exec::run(&zone_for_run, compiled)
+        })
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("record-migrate task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+        moved += 1;
+    }
+    if moved > 0 {
+        crate::sessions_root::rescan(&root_id);
+    }
+    Ok(moved)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_record_migrate(
+    root_id: String,
+    session_id: Option<String>,
+) -> Result<u32, IpcError> {
+    let _ = (root_id, session_id);
+    Err(unsupported())
+}
+
 /// Pin or unpin a session (FR-232): one frontmatter boolean through the one
 /// byte-preserving writer.
 #[cfg(desktop)]
@@ -1359,7 +1533,9 @@ pub async fn sessions_set_pinned(
         account_id: None,
         retriable: false,
     })?;
-    let readme_path = zone.join(&row.path).join("README.md");
+    let readme_path = zone
+        .join(&row.path)
+        .join(keeper_core::sessions::model::README);
     let readme = std::fs::read_to_string(&readme_path).map_err(|error| IpcError {
         code: IpcErrorCode::Internal,
         message: format!("could not read the session README: {error}"),
@@ -1834,7 +2010,7 @@ pub fn sessions_space_save(root_id: String, space: ()) -> Result<String, IpcErro
 /// The path is checked against [`keeper_core::sessions::spaces::is_space_path`]
 /// before anything is compiled. The executor's own check only proves a path
 /// cannot escape the zone, which would still happily accept a session's
-/// `about.md`.
+/// `README.md`.
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_space_delete(root_id: String, space_id: String) -> Result<(), IpcError> {
@@ -2115,7 +2291,7 @@ pub fn sessions_template_install(
 /// The walk, and not the pattern's *decision* about it: the picker's *Copies*
 /// list is this same walk put through
 /// [`keeper_core::sessions::pattern::apply`], which stamps a record rather than
-/// copying it, so `about.md` is a row here and never a row there. That is the
+/// copying it, so the record is a row here and never a row there. That is the
 /// one intended difference between the two surfaces — the room is where a
 /// template's record is edited, which is the whole of FR-270 — and it is a
 /// difference in what the create does with a file, not in what the directory
@@ -3342,10 +3518,12 @@ pub async fn sessions_file_new_kind(
 /// in a session is something somebody wrote, and a delete button that erases
 /// bytes is one nobody presses without making a copy first.
 ///
-/// `about.md` and `AGENTS.md` are refused by
-/// [`keeper_core::sessions::files::check_deletable`] — they are the two names
-/// `shape()` reads, so deleting one turns a flat session back into a
-/// folder-shaped one and hides every log behind a section that no longer exists.
+/// `README.md` and `AGENTS.md` are refused by
+/// [`keeper_core::sessions::files::check_deletable`]: `AGENTS.md` is the name
+/// `shape()` reads, so deleting it turns a flat session back into a
+/// folder-shaped one and hides every log behind a section that no longer exists,
+/// and `README.md` is the record under both contracts (story 52.1), so deleting
+/// it drops the session to a `path:` id and loses its title, pins and lineage.
 ///
 /// Rejects with: `internal` (unknown root or session, a refused path, a failed
 /// move), `unsupported` (mobile).
@@ -4358,7 +4536,7 @@ mod tests {
         let write = |rel: &str, body: &str| {
             std::fs::write(source.join(rel), body).expect("write");
         };
-        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("README.md", "---\ntags: [about]\n---\n# The session\n");
         write("inputs.md", "---\ntags: [ref]\n---\n# Root inputs\n");
         write(
             "spaces/inputs.md",
@@ -4375,7 +4553,7 @@ mod tests {
                 .map(|(rel, kind)| (rel.as_str(), *kind))
                 .collect::<Vec<_>>(),
             vec![
-                ("about.md", KindTag::About),
+                ("README.md", KindTag::About),
                 ("inputs.md", KindTag::Ref),
                 ("spaces/PLAN.MD", KindTag::Prompt),
                 ("spaces/inputs.md", KindTag::Ref),

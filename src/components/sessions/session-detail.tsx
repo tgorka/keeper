@@ -100,15 +100,17 @@ export const SESSION_DETAIL_UNFILED_HINT =
   "No kind tag, so no space will list these. Add tags: [log], [ref], [prompt] or [task] to file them.";
 
 /**
- * Open the session's record in the strip — whose NAME depends on the shape.
+ * Open the session's record in the strip.
  *
- * A flat session's record is `about.md`; a folder-shaped one's is `README.md`,
- * where it has always been. The button says which, because "Open record" would
- * be keeper's word for a file the operator knows by its filename, and the whole
+ * **One name, one label, since Story 52.1.** The record was `about.md` under the
+ * flat contract and `README.md` under the folder one, so this was a pair of
+ * labels picked by shape. Both contracts keep the record at `README.md` now, so
+ * there is one file to name and the button names it — "Open record" would be
+ * keeper's word for a file the operator knows by its filename, and the whole
  * point of the flat contract is that the files are the truth.
  */
-export const SESSION_DETAIL_OPEN_ABOUT_LABEL = "Open about.md";
-export const SESSION_DETAIL_OPEN_README_LABEL = "Open README";
+export const SESSION_RECORD_NAME = "README.md";
+export const SESSION_DETAIL_OPEN_RECORD_LABEL = "Open README";
 
 export interface SessionDetailProps {
   rootId: string;
@@ -343,18 +345,9 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     [rootId],
   );
 
-  // The record's filename is the shape's, not a guess: `shape` is decided in
-  // Rust from the session's own listing (AD-119) and arrives on the VM, so this
-  // reads a field rather than probing the disk for which file exists.
-  const recordName = detail?.shape === "flat" ? "about.md" : "README.md";
-
-  // And the label naming it, once. The spaces section offers the same verb where
-  // a create is refused because the record already exists (Story 51.7, FR-299),
-  // and two places composing "which file is the record called" is how the header
-  // and the section come to name different files for one contract.
-  const recordLabel =
-    detail?.shape === "flat" ? SESSION_DETAIL_OPEN_ABOUT_LABEL : SESSION_DETAIL_OPEN_README_LABEL;
-
+  // The record's filename is a constant, not a guess and no longer a branch on
+  // the shape (Story 52.1): both contracts keep it at `README.md`, so `shape` is
+  // read here for what the surface OFFERS and never for what a file is called.
   const openRecord = useCallback(() => {
     if (detail === null) {
       return;
@@ -362,9 +355,9 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     panelsStore.getState().setActiveTarget({
       kind: "file",
       profileId: rootId,
-      relativePath: `${subfolder}/${detail.path}/${recordName}`,
+      relativePath: `${subfolder}/${detail.path}/${SESSION_RECORD_NAME}`,
     });
-  }, [detail, recordName, rootId, subfolder]);
+  }, [detail, rootId, subfolder]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -395,7 +388,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               </Badge>
               <Button type="button" variant="outline" size="sm" onClick={openRecord}>
                 <Pencil aria-hidden className="size-3.5" />
-                {recordLabel}
+                {SESSION_DETAIL_OPEN_RECORD_LABEL}
               </Button>
             </div>
             {detail.summary !== "" && (
@@ -520,7 +513,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             // Rust's answer, per space, on `openRecord`; the label and the target
             // are the header's own, because the record is one fixed name at a
             // known place and this surface already opens it from up there.
-            recordLabel={recordLabel}
+            recordLabel={SESSION_DETAIL_OPEN_RECORD_LABEL}
             onOpenRecord={openRecord}
             // The same flag the Files heading above is handed — both surfaces
             // offer a create that posts an empty title, and one filename is

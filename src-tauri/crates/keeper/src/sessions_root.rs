@@ -29,9 +29,7 @@ use keeper_core::sessions::model::{
     README, WORKSPACE_DIR,
 };
 use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
-use keeper_core::sessions::shape::{
-    shape as shape_of, KindTag, Shape, ABOUT, PROMPTS_DIR, REFS_DIR,
-};
+use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, PROMPTS_DIR, REFS_DIR};
 use keeper_core::sessions::spaces::{self, SessionSpace, SPACES_DIR};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
@@ -366,9 +364,9 @@ fn session_dirs(zone: &Path) -> Vec<String> {
 ///
 /// The shape signal and nothing else, which is why it stays a flat listing
 /// while the markdown scan walks the tree: the signal is a *file* at the root
-/// (`AGENTS.md` or `about.md`), so a directories-only listing would report
-/// every flat session as folder-shaped, and a recursive one would let an
-/// `about.md` somebody archived three folders down decide the contract.
+/// (`AGENTS.md`), so a directories-only listing would report every flat session
+/// as folder-shaped, and a recursive one would let an `AGENTS.md` somebody
+/// archived three folders down decide the contract.
 /// [`dir_names`] answers the first of those wrongly and [`markdown_rels`] the
 /// second, so neither can be reused here.
 fn entry_names(path: &Path) -> Vec<String> {
@@ -455,19 +453,23 @@ fn dir_names(path: &Path) -> Vec<String> {
 /// Project one session directory into its board row. `None` only when the
 /// directory vanished mid-scan.
 ///
-/// The row is read from whichever file this session's shape calls the record —
-/// `README.md` for a folder session, `about.md` for a flat one. That branch is
-/// what makes migration non-destructive: identity, title, tags, pinned state and
-/// lineage all live in the record's frontmatter, so a row that kept reading
-/// `README.md` after migration would silently unpin every migrated session and
-/// drop it to a `path:` id, which the board would render as a *different*
-/// session that had lost its history.
+/// **The row is read from `README.md`, and that is now one name rather than a
+/// branch (story 52.1).** It was `README.md` for a folder session and `about.md`
+/// for a flat one, and the branch was what made migration non-destructive:
+/// identity, title, tags, pinned state and lineage all live in the record's
+/// frontmatter, so a row that read the wrong file would silently unpin every
+/// migrated session and drop it to a `path:` id, which the board would render as
+/// a *different* session that had lost its history. That warning has not
+/// weakened, it has only lost its branch: both contracts keep the record at
+/// `README.md`, and a session whose record is still an unmigrated `about.md`
+/// reads here as a session with no record — which is exactly what
+/// `sessions_record_migrate` exists to fix, and what the empty-parse degradation
+/// below already survives.
 fn row_for(dir: &Path, rel: &str, status: SessionStatus) -> Option<SessionRowVm> {
     let folder_name = rel.rsplit('/').next().unwrap_or(rel);
     let names = entry_names(dir);
     let flat = shape_of(&names) == Shape::Flat;
-    let record_name = if flat { ABOUT } else { README };
-    let readme = std::fs::read_to_string(dir.join(record_name)).unwrap_or_default();
+    let readme = std::fs::read_to_string(dir.join(README)).unwrap_or_default();
     let (fm, body_at) = Frontmatter::parse(&readme);
     let body = &readme[body_at..];
 
@@ -648,16 +650,16 @@ fn last_log(body: &str) -> (String, String) {
 /// log, and the file sections (FR-233). One directory read plus one record
 /// parse; every field derivable from files alone (AD-110).
 ///
-/// **Both contracts, one payload.** Which file holds the record and where the
-/// log lives differ by shape, and *nothing downstream of here knows that*: the
-/// header, the properties widget and the timeline render identically either
-/// way. The shape is reported so the UI can decide what to **offer** — a
-/// migrate button, a new-log button — never what a file means.
+/// **Both contracts, one payload.** Where the log lives differs by shape, and
+/// *nothing downstream of here knows that*: the header, the properties widget and
+/// the timeline render identically either way. The shape is reported so the UI can
+/// decide what to **offer** — a migrate button, a new-log button — never what a
+/// file means. Since story 52.1 the record's *name* is not one of the
+/// differences: both contracts keep it at `README.md`.
 pub fn detail(
     root_id: &str,
     session_id: &str,
 ) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
-    use keeper_core::sessions::shape::ABOUT;
     use keeper_core::sessions::vm::{
         SessionDetailVm, SessionLogEntryVm, SessionPropertyVm, SessionTaskVm,
     };
@@ -672,17 +674,14 @@ pub fn detail(
     let (sources, _truncated, shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
     let flat = shape == Shape::Flat;
 
-    // The record: `about.md` under the flat contract, `README.md` under the
-    // folder one. Under the flat shape a missing `about.md` is ordinary — a
-    // session may be nothing but logs — and an empty parse degrades exactly the
-    // way an empty README already does.
-    let record_name = if flat { ABOUT } else { README };
-    let record = sources
+    // The record, `README.md` under both contracts since story 52.1. A missing
+    // one is ordinary under the flat shape — a session may be nothing but logs —
+    // and an empty parse degrades exactly the way an empty README always did.
+    let readme = sources
         .iter()
-        .find(|source| source.rel == record_name)
+        .find(|source| source.rel == README)
         .map(|source| source.text.clone())
-        .unwrap_or_else(|| std::fs::read_to_string(dir.join(record_name)).unwrap_or_default());
-    let readme = record;
+        .unwrap_or_else(|| std::fs::read_to_string(dir.join(README)).unwrap_or_default());
     let (fm, body_at) = Frontmatter::parse(&readme);
     let body = &readme[body_at..];
     let line = lineage(&fm);
@@ -798,9 +797,10 @@ pub fn detail(
 /// **The record is left out, and only under the folder contract.** `README.md`
 /// declares no kind, so feeding it in would report the one file keeper reads the
 /// session's identity, title, tags and lineage out of as *unfiled* — an
-/// accusation against the file that is doing its job. A flat session's
-/// `about.md` needs no such exclusion: it carries `tags: [about]`, which is the
-/// flat contract's whole premise, so that pool is byte-for-byte what it was.
+/// accusation against the file that is doing its job. A flat session's record is
+/// the same file under the same name since story 52.1, and it needs no such
+/// exclusion: it carries `tags: [about]`, which is the flat contract's whole
+/// premise, so that pool is byte-for-byte what it was.
 fn detail_pool(sources: &[RefSource], shape: Shape) -> keeper_core::sessions::pool::Pool {
     use keeper_core::sessions::pool::{read_pool, PoolFile};
 
@@ -1286,7 +1286,7 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) 
     take(README.to_owned(), &dir.join(README), &mut budget);
     // The rest of the root, beside the record (FR-286). Skipping the record
     // itself is the whole of "not duplicated": one file is one entry, which is
-    // what the flat shape's `about.md` gets too. Folded, because a case-
+    // what the flat shape's record gets too. Folded, because a case-
     // insensitive drive answers `README.md` with whatever spelling it holds and
     // the record must not come back a second time under it.
     let (root_names, root_truncated) = markdown_rels(dir, false);
@@ -1722,7 +1722,7 @@ mod tests {
             std::fs::write(session.join(rel), body).expect("write");
         };
         write("AGENTS.md", "how to read this folder");
-        write("about.md", "the record");
+        write("README.md", "the record");
         write("2026-08-12-1400-second.md", "later sitting");
         write("2026-08-12-0900-first.md", "earlier sitting");
         write("01-prompt.md", "reusable text");
@@ -1741,8 +1741,8 @@ mod tests {
                 "01-prompt.md",
                 "2026-08-12-0900-first.md",
                 "2026-08-12-1400-second.md",
-                "about.md",
                 "AGENTS.md",
+                "README.md",
             ],
             "every root .md in name order — which for logs is date order, since \
              the filename carries the clock; artifacts and workspace are still \
@@ -1810,8 +1810,10 @@ mod tests {
                 .map(|e| e.rel.as_str())
                 .collect::<Vec<_>>(),
             vec!["AGENTS.md", "README.md"],
-            "the navigation file declares no kind, and the residual README is \
-             visible rather than merely survivable"
+            "the navigation file declares no kind, and after story 52.1 an \
+             untagged README is the half-migrated session's leftover — visible \
+             rather than merely survivable, which is what says the record rename \
+             has not run here yet"
         );
     }
 
@@ -1837,7 +1839,7 @@ mod tests {
             std::fs::write(session.join(rel), body).expect("write");
         };
         write("AGENTS.md", "---\ntags: []\n---\nhow to read this folder\n");
-        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("README.md", "---\ntags: [about]\n---\n# The session\n");
         write(
             "spaces/plan.md",
             "---\ntags: [task]\nstatus: todo\n---\n# Plan it\n",
@@ -1856,14 +1858,14 @@ mod tests {
         write("spaces/.draft.md", "furniture one level down");
 
         let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
-        assert_eq!(shape, Shape::Flat, "about.md declares the flat contract");
+        assert_eq!(shape, Shape::Flat, "AGENTS.md declares the flat contract");
         assert!(!truncated);
         let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
         assert_eq!(
             read,
             vec![
-                "about.md",
                 "AGENTS.md",
+                "README.md",
                 "log/2026-08-16-0900-note.md",
                 "log/older/2026-08-01-0900-first.md",
                 "spaces/plan.md",
@@ -2049,7 +2051,10 @@ mod tests {
 
     /// The other half of the same reader: a flat session's pool is what it was.
     /// Its record carries `tags: [about]`, so it needs no exclusion — and adding
-    /// one would have taken `about.md` out of the About space.
+    /// one would have taken the record out of the About space. Story 52.1: the
+    /// file this asserts about is `README.md` now, and the exclusion the folder
+    /// contract applies to that very name is still not applied here, because
+    /// under the flat contract it is a tagged pool member.
     #[test]
     fn the_detail_pool_leaves_a_flat_sessions_record_in_the_pool_where_it_was() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2057,7 +2062,7 @@ mod tests {
         let write = |rel: &str, body: &str| {
             std::fs::write(session.join(rel), body).expect("write");
         };
-        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("README.md", "---\ntags: [about]\n---\n# The session\n");
         write("AGENTS.md", "how to read this folder\n");
         write(
             "ship-it.md",
@@ -2073,7 +2078,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.rel.as_str())
                 .collect::<Vec<_>>(),
-            vec!["about.md"]
+            vec!["README.md"]
         );
         assert_eq!(pool.tasks.len(), 1, "the board is unchanged");
         assert_eq!(
@@ -2098,7 +2103,7 @@ mod tests {
             std::fs::write(session.join(rel), body).expect("write");
         };
         write("AGENTS.md", "how to read this folder\n");
-        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("README.md", "---\ntags: [about]\n---\n# The session\n");
         write(
             "log/2026-08-15-0900-filed.md",
             "---\ntags: [log]\n---\n# filed\n\nthe sitting he moved\n",
@@ -2122,7 +2127,12 @@ mod tests {
         let second = tempfile::tempdir().expect("tempdir");
         let filed = second.path();
         std::fs::create_dir_all(filed.join("log")).expect("mkdir");
-        std::fs::write(filed.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        // Story 52.1: `AGENTS.md` is what declares a flat session, and the
+        // record it carries is `README.md`. A bare `about.md` reads as
+        // folder-shaped now, which would have this session looking for a record
+        // that is not there — the shape this fixture is not about.
+        std::fs::write(filed.join("AGENTS.md"), "how to read this folder\n").expect("write");
+        std::fs::write(filed.join("README.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
         std::fs::write(
             filed.join("log/2026-08-16-1200-only.md"),
             "---\ntags: [log]\n---\n# only\n\nthe only sitting\n",
@@ -2263,7 +2273,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let session = dir.path();
         std::fs::create_dir_all(session.join("spaces")).expect("mkdir");
-        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        // Story 52.1: AGENTS.md declares the flat shape, README.md is the record.
+        std::fs::write(session.join("AGENTS.md"), "how to read this folder\n").expect("write");
+        std::fs::write(session.join("README.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
         std::fs::write(
             session.join("spaces/plan.md"),
             "---\ntags: [task]\n---\n# Plan\n",
@@ -2292,7 +2304,9 @@ mod tests {
                 .iter()
                 .map(|file| file.rel.as_str())
                 .collect::<Vec<_>>(),
-            vec!["about.md"],
+            // Story 52.1: the flat session's two root files are now the contract
+            // file and the record it names, in reading order.
+            vec!["AGENTS.md", "README.md"],
             "the task under the unreadable directory is in no pool"
         );
         assert!(
@@ -2351,7 +2365,12 @@ mod tests {
     fn a_tree_past_the_entry_budget_stops_and_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
         let session = dir.path();
-        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        // Story 52.1: the flat shape is what makes `read_ref_sources` descend at
+        // all — a folder-shaped session reads only the root plus `refs/` and
+        // `prompts/`, so the budget below would never be reached. `AGENTS.md`
+        // declares it and `README.md` is the record it carries.
+        std::fs::write(session.join("AGENTS.md"), "how to read this folder\n").expect("write");
+        std::fs::write(session.join("README.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
         // Spread wide enough that the stop lands mid-walk rather than at the
         // root, and one folder past the budget: dirents are what is counted, so
         // the directories count too.
@@ -2373,7 +2392,9 @@ mod tests {
             rels.len(),
             folders * per_folder + 1
         );
-        assert_eq!(rels[0], "about.md", "what it did read is in reading order");
+        // Case-folded, `agents.md` sorts before `readme.md` and before every
+        // `d000/` the loop below made, so this is the first thing the walk reads.
+        assert_eq!(rels[0], "AGENTS.md", "what it did read is in reading order");
 
         let (_files, reported, _shape) = read_ref_sources(session, REF_SCAN_BUDGET);
         assert!(

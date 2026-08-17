@@ -120,8 +120,8 @@ pub fn compile_create(
 /// file keeper composes itself, session-relative name and bytes (FR-268).
 ///
 /// The shape-aware seam, and the only one. A folder-shaped create stamps one
-/// `README.md`; a flat one stamps `AGENTS.md`, `about.md` and its two seed
-/// files. Everything else about a create — where the copies come from, that
+/// `README.md`; a flat one stamps `AGENTS.md`, that same `README.md` and its two
+/// seed files. Everything else about a create — where the copies come from, that
 /// directories precede their contents, that the stamped files are written last
 /// so a pattern carrying its own copy loses to them — is identical, and putting
 /// the difference here rather than in the shell is what keeps it to one line of
@@ -222,7 +222,6 @@ pub fn compile_create_from(
         dir_name,
         source_session,
         source_readme,
-        super::model::README,
         new_id,
         copies,
         &[],
@@ -231,26 +230,23 @@ pub fn compile_create_from(
 }
 
 /// The general form of [`compile_create_from`] (FR-268): the shaped create
-/// plus the lineage append, written to the record under **its own name**.
+/// plus the lineage append, written to the source's record.
 ///
-/// `record_name` is `README.md` for a folder-shaped source and `about.md` for a
-/// flat one. It is a parameter rather than a lookup because the caller already
-/// knows the shape — it read the directory to decide what to copy — and because
-/// guessing here would mean this function opening a file, which is the one thing
-/// the domain does not do (AD-108). Get it wrong and the append lands on a file
-/// that does not exist; the executor's `GuardedWrite` refuses a length mismatch,
-/// so the failure is loud rather than a half-written lineage.
-// Eight, and each one is a distinct fact about the create the caller already
+/// **The record's name is the constant, since story 52.1.** It used to be a
+/// parameter — `README.md` for a folder-shaped source and `about.md` for a flat
+/// one — passed in because the caller had already read the directory and knew the
+/// shape. Both contracts call the record `README.md` now, so there is nothing for
+/// the caller to know and nothing for it to get wrong: the append cannot land on
+/// a file that does not exist because the shape was misread one call up.
+// Seven, and each one is a distinct fact about the create the caller already
 // holds separately. Bundling them into a `CreateRequest` would obscure that
 // `copies`, `expanded` and `stamped` are three different answers to "where do
 // these bytes come from" — which is the one thing a reader of this function has
 // to keep straight.
-#[allow(clippy::too_many_arguments)]
 pub fn compile_create_from_shaped(
     dir_name: &str,
     source_session: &str,
     source_record: &str,
-    record_name: &str,
     new_id: &str,
     copies: &[(String, bool)],
     expanded: &[(String, String)],
@@ -261,7 +257,7 @@ pub fn compile_create_from_shaped(
     // The source-side lineage append, byte-preserving outside the key.
     let updated = append_lineage(source_record, KEY_CONTINUED_BY, new_id);
     plan.steps.push(PlanStep::GuardedWrite {
-        path: format!("{source_session}/{record_name}"),
+        path: format!("{source_session}/{}", super::model::README),
         expect_len: source_record.len(),
         content: updated,
     });

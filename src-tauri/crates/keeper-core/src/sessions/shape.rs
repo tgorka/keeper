@@ -26,8 +26,14 @@
 /// existence means "someone has stated how to read this folder".
 pub const AGENTS: &str = "AGENTS.md";
 
-/// The flat contract's record — what the folder-shaped session kept in
-/// `README.md`. Summary, decisions, and the `## Promote` table.
+/// The name a flat session's record carried until story 52.1 moved it to
+/// `README.md`.
+///
+/// Nothing keeper authors writes this name any more. It is still spelled here
+/// because an unmigrated `about.md` is on the operator's drives right now, and
+/// three rules have to keep working for it: a rename still refuses it (a
+/// half-renamed record is worse than a refused one), the migration still moves
+/// it, and [`shape`] deliberately no longer reads it.
 pub const ABOUT: &str = "about.md";
 
 /// Which on-disk contract one session follows.
@@ -71,19 +77,26 @@ impl Shape {
 /// - A file keeper's own template writes is positive evidence, and it is what
 ///   the operator sees in Finder.
 ///
-/// `AGENTS` **or** `ABOUT`, not both: a hand-built flat session may start with
-/// either, and requiring both would misclassify an honest one.
+/// **`AGENTS` alone, since story 52.1.** The predicate used to be `AGENTS` **or**
+/// `about.md`, because a hand-built flat session might start with either. The
+/// record's rename spent that: the flat contract's record is `README.md` now, and
+/// adding *that* name to the disjunction would flip every folder-shaped session
+/// on disk to Flat on one rescan. Narrowing is the only safe direction, so
+/// `AGENTS.md` is what makes a session flat and it is now mandatory for one.
 ///
-/// A folder holding `README.md` *and* `AGENTS.md` reads as [`Shape::Flat`].
-/// That is deliberate and it is the safe direction: `AGENTS.md` exists only
-/// because migration wrote it or a person did, and both mean "read me as flat".
-/// The residual README becomes an ordinary untagged file in the pool — which
-/// the detail surfaces as *unfiled*, so a half-finished migration is visible
-/// rather than merely survivable. The other default would hide every migrated
-/// log behind a `## Log` section that no longer exists.
+/// The case that costs is a hand-built session holding `about.md` and no
+/// `AGENTS.md`: it reads as [`Shape::Folder`] here. It is **migrated rather than
+/// special-cased** — [`super::migrate::compile_record_rename`] writes its
+/// `AGENTS.md` *before* it moves the record, because without that step the move
+/// would leave the session silently folder-shaped with its record in the right
+/// place and nothing to say so.
+///
+/// A folder holding `README.md` *and* `AGENTS.md` reads as [`Shape::Flat`], and
+/// that is now the shape of an ordinary migrated session rather than a
+/// half-finished one: under the flat contract `README.md` **is** the record, and
+/// it carries `tags: [about]` like every other record.
 pub fn shape(top_level: &[String]) -> Shape {
-    let has = |name: &str| top_level.iter().any(|entry| entry == name);
-    if has(AGENTS) || has(ABOUT) {
+    if top_level.iter().any(|entry| entry == AGENTS) {
         Shape::Flat
     } else {
         Shape::Folder
@@ -217,12 +230,13 @@ pub enum KindHasNoHome {
 
     /// One per session, under every contract.
     ///
-    /// `shape` is carried and not rendered: the sentence names both records
-    /// because a person who has just been refused wants to know which file to
-    /// open, and a caller that wants to branch on the shape still can.
+    /// `shape` is carried and not rendered: since story 52.1 both contracts call
+    /// the record `README.md`, so there is one filename to name and no branch to
+    /// render — and a caller that wants to branch on the shape for some other
+    /// reason still can.
     #[error(
-        "a session has one {} record — about.md under the flat contract, README.md under the \
-         folder one — and keeper edits it rather than making a second.",
+        "a session has one {} record — README.md, under both contracts — and keeper edits it \
+         rather than making a second.",
         .kind.as_str(),
     )]
     OnlyOne { shape: Shape, kind: KindTag },
@@ -355,18 +369,23 @@ mod tests {
         entries.iter().map(|e| (*e).to_owned()).collect()
     }
 
-    /// Detection is presence of a file the flat contract writes — either one,
-    /// never a parse, never an absence.
+    /// Detection is presence of `AGENTS.md` — never a parse, never an absence.
+    ///
+    /// **Story 52.1 inverted the second row.** It read
+    /// `shape(["about.md", …]) == Flat` with "a hand-built flat session may start
+    /// with either file"; the flat record is `README.md` now, so `about.md` is no
+    /// longer a shape signal and such a session reads as Folder until the record
+    /// migration writes it an `AGENTS.md`.
     #[test]
-    fn agents_md_or_about_md_makes_a_session_flat() {
+    fn agents_md_alone_makes_a_session_flat() {
         assert_eq!(
             shape(&names(&["AGENTS.md", "artifacts", "workspace"])),
             Shape::Flat
         );
         assert_eq!(
             shape(&names(&["about.md", "2026-08-12-0900-opened.md"])),
-            Shape::Flat,
-            "a hand-built flat session may start with either file"
+            Shape::Folder,
+            "story 52.1: an unmigrated about.md is not a shape signal — it is a migration's input"
         );
         assert_eq!(
             shape(&names(&["README.md", "refs", "prompts", "workspace"])),
@@ -378,14 +397,20 @@ mod tests {
             "a bare record is the original contract"
         );
         assert_eq!(
+            shape(&names(&["AGENTS.md", "README.md"])),
+            Shape::Flat,
+            "story 52.1: the migrated session — the record IS the README, and AGENTS.md says so"
+        );
+        assert_eq!(
             shape(&[]),
             Shape::Folder,
             "an empty folder is not evidence of the new shape"
         );
     }
 
-    /// The half-migrated folder resolves toward flat, so the leftover README
-    /// shows up as unfiled rather than shadowing the migrated logs.
+    /// A folder holding all three names reads as flat, which after story 52.1 is
+    /// the *half-migrated* session: `AGENTS.md` and a `README.md` beside an
+    /// `about.md` the record rename has not moved yet.
     #[test]
     fn a_folder_with_readme_and_agents_reads_as_flat() {
         let half = names(&["README.md", "AGENTS.md", "about.md", "refs"]);

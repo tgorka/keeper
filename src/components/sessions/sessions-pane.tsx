@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { SessionActions } from "@/components/sessions/session-actions";
-import { SessionDetail } from "@/components/sessions/session-detail";
+import { SESSION_RECORD_NAME, SessionDetail } from "@/components/sessions/session-detail";
 import {
   SESSION_PATTERN_INSTALL_FAILED,
   SessionPatternPicker,
@@ -142,18 +142,26 @@ export function SessionsPane() {
   const filtered = rows === null ? [] : filterRows(rows, { text, status, pinnedOnly, unreadOnly });
   const anyFilter = text.trim() !== "" || status !== "all" || pinnedOnly || unreadOnly;
 
-  // Opening a session opens its README in the panel strip — the SAME file
+  // Opening a session opens its RECORD in the panel strip — the SAME file
   // target the Files pane sets and the SAME editor behind it (AD-109,
   // UX-DR91): the target is `(profileId, relativePath)`, the profile id IS
   // the root id (AD-107), and the path is the zone subfolder joined with the
   // session's folder. Everything downstream — the markdown editor, live
   // external changes, the raw/rendered toggle — is Epic 45/46 machinery,
   // reused rather than rebuilt.
+  //
+  // **The name is imported, not typed.** This composed a literal `README.md`
+  // with no shape branch, which was wrong for every flat session on the drive:
+  // a flat session's record was `about.md`, so opening a row from here landed
+  // the operator on the missing-file sentence. That was broken before Story
+  // 52.1 and is fixed here on its own merits — by reading the one constant the
+  // detail's own header reads, so the two surfaces cannot come to name
+  // different files again.
   const openReadme = useCallback((rootId: string, subfolder: string, sessionPath: string) => {
     panelsStore.getState().setActiveTarget({
       kind: "file",
       profileId: rootId,
-      relativePath: `${subfolder}/${sessionPath}/README.md`,
+      relativePath: `${subfolder}/${sessionPath}/${SESSION_RECORD_NAME}`,
     });
   }, []);
   // A row click drills into the detail (FR-233): the rendered log, the file

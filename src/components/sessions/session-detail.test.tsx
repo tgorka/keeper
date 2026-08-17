@@ -82,8 +82,7 @@ import {
 import {
   SESSION_DETAIL_FILES_HEADING,
   SESSION_DETAIL_LOG_HEADING,
-  SESSION_DETAIL_OPEN_ABOUT_LABEL,
-  SESSION_DETAIL_OPEN_README_LABEL,
+  SESSION_DETAIL_OPEN_RECORD_LABEL,
   SESSION_DETAIL_PROPERTIES_HEADING,
   SESSION_DETAIL_UNFILED_HEADING,
   SESSION_DETAIL_UNFILED_HINT,
@@ -350,25 +349,32 @@ describe("SessionDetail", () => {
     }
   });
 
-  it("names the record by shape: about.md when flat, README when not", async () => {
-    mount();
-    expect(
-      await screen.findByRole("button", { name: SESSION_DETAIL_OPEN_README_LABEL }),
-    ).toBeInTheDocument();
+  /**
+   * Story 52.1 inverted this test. It was "names the record by shape: about.md
+   * when flat, README when not", and it asserted that a flat session's record
+   * opened at `…/about.md` — "opening README.md would open the migration's
+   * signpost instead of the session". Both contracts keep the record at
+   * `README.md` now, there is no signpost to open, and the shape must NOT reach
+   * the filename at all.
+   */
+  it("names the record once, under both shapes, and opens the one file", async () => {
+    for (const shape of ["folder", "flat"] as const) {
+      cleanup();
+      panelsStore.setState(panelsStore.getInitialState(), true);
+      sessionsDetail.mockResolvedValue(detail({ shape }));
+      mount();
 
-    cleanup();
-    sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
-    mount();
-    const open = await screen.findByRole("button", { name: SESSION_DETAIL_OPEN_ABOUT_LABEL });
-    open.click();
-    await waitFor(() => {
-      const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;
-      // The flat session's record is `about.md`; opening README.md would open
-      // the migration's signpost instead of the session.
-      expect(target).toMatchObject({
-        relativePath: "60-sessions/active/2026-08-10-keeper/about.md",
+      const open = await screen.findByRole("button", {
+        name: SESSION_DETAIL_OPEN_RECORD_LABEL,
       });
-    });
+      open.click();
+      await waitFor(() => {
+        const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;
+        expect(target).toMatchObject({
+          relativePath: "60-sessions/active/2026-08-10-keeper/README.md",
+        });
+      });
+    }
   });
 
   it("shows unfiled root markdown as a nudge, and shows nothing when there is none", async () => {
@@ -601,8 +607,8 @@ describe("SessionDetail", () => {
    * space offers the verb that does apply — and it opens the same file the
    * header's own button opens, through the one file target (AD-109).
    *
-   * The label is the shape's: this fixture is folder-shaped, so it is `README`,
-   * and the section is handed it rather than composing one. `session-spaces.tsx`
+   * The label is one name under both shapes since Story 52.1, and the section is
+   * handed it rather than composing one. `session-spaces.tsx`
    * owns "the button renders and calls back" (`session-spaces.test.tsx`); what
    * only this suite can see is that the callback and the label the section is
    * handed are the ones that name and open this session's record.
@@ -618,15 +624,17 @@ describe("SessionDetail", () => {
         files: [],
         error: null,
         noHome:
-          "a session has one about record — about.md under the flat contract, README.md under " +
-          "the folder one — and keeper edits it rather than making a second.",
+          "a session has one about record — README.md, under both contracts — and keeper edits " +
+          "it rather than making a second.",
         openRecord: true,
       },
     ]);
     mount();
 
     const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
-    const open = within(section).getByRole("button", { name: SESSION_DETAIL_OPEN_README_LABEL });
+    const open = within(section).getByRole("button", {
+      name: SESSION_DETAIL_OPEN_RECORD_LABEL,
+    });
     fireEvent.click(open);
 
     const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;

@@ -20,22 +20,27 @@
 //!   a session directory is an undifferentiated pile of markdown until
 //!   something reads the tags; this file is the mitigation, and it is written
 //!   for whoever — or whatever — is handed the folder with no other context.
-//! - `about.md` — the record. What the folder-shaped session kept in
-//!   `README.md`, including the `## Promote` table.
+//! - `README.md` — the record. Summary, decisions, and the `## Promote` table.
 //! - one seed log — so the log space is not empty on day one, and so the
 //!   filename convention is visible as an example rather than only as a rule.
 //! - one seed prompt — same reason, for the prompt space.
 //!
-//! **Why no README.** The operator's instruction was explicit: the navigation
-//! file is `AGENTS.md`, and a README beside it would be a second answer to the
-//! same question. A folder-shaped session keeps its README forever; a flat one
-//! never grows one.
+//! **Why the record is `README.md` (story 52.1).** It shipped as `about.md`,
+//! with the reasoning that `AGENTS.md` is the navigation file and a README
+//! beside it would be a second answer to the same question. The owner asked
+//! twice for the record to be the README, and the two answers turned out not to
+//! collide: `AGENTS.md` says *how to read the folder* and `README.md` says
+//! *what this session is* — different questions, and only the second is the one
+//! every other tool, host and human already opens by name. One name under both
+//! contracts also deleted the `if flat { about.md } else { README.md }` pair
+//! from five call sites.
 //!
 //! Everything here is content, not IO. The caller supplies the title, the date
 //! and the timestamp, because the domain has no clock (AD-56) — and because a
 //! resumed journal must replay the stamp it recorded rather than a fresh one.
 
-use super::shape::{KindTag, ABOUT, AGENTS};
+use super::model::README;
+use super::shape::{KindTag, AGENTS};
 
 /// One entry of the template, ready to write: bytes, or a directory to make.
 ///
@@ -92,16 +97,16 @@ impl TemplateFile {
 pub const AGENTS_MD: &str = r#"# How to work in this session
 
 This folder is one work session. Everything in it is markdown in a single flat
-pool — there are no `refs/`, `prompts/` or `logs/` directories, and there is no
-README. A file's **kind is a tag in its own frontmatter**, not the folder it
-sits in, so moving a file never changes what it is.
+pool — there are no `refs/`, `prompts/` or `logs/` directories. A file's
+**kind is a tag in its own frontmatter**, not the folder it sits in, so moving a
+file never changes what it is.
 
-Read this file first. It is the only file whose job is to tell you how to read
-the others.
+Read this file first — it is the only file whose job is to tell you how to read
+the others. Then read `README.md`, which is this session's record.
 
 ## Start here, in this order
 
-1. **`about.md`** — what this session is for, and the `## Promote` table.
+1. **`README.md`** — what this session is for, and the `## Promote` table.
 2. **The tasks** — every file tagged `task`. Its `status` says where it stands:
    `in-preparation`, `todo`, `done`, `deferred`. That is the whole answer to
    "what has been done, what is now, what is next".
@@ -147,7 +152,7 @@ between them is about *versioning*, not about kind:
 - **`workspace/`** — scratch. Never synced, never backed up, and
   **keeper will not write here**. Assume everything in it is gone tomorrow.
   If something in here starts to matter, promote it to `artifacts/` and record
-  the move in the `## Promote` table in `about.md`.
+  the move in the `## Promote` table in `README.md`.
 
 A new *kind* of thing is a new tag, not a new folder — that is the whole point
 of this layout, and it is the rule that does not bend. A directory is still good
@@ -235,14 +240,14 @@ fn seed_log_body(title: &str) -> String {
 const SEED_PROMPT_BODY: &str = "# Hand this session to an agent\n\
     \n\
     > You have been given a work-session folder. Read `AGENTS.md` in its root\n\
-    > first — it states how the folder is organised. Then read `about.md`, the\n\
+    > first — it states how the folder is organised. Then read `README.md`, the\n\
     > files tagged `task`, and the two newest files tagged `log`. Tell me where\n\
     > things stand before you change anything.\n\
     \n\
     Keep this prompt, adjust it, or delete it.\n";
 
 /// The record's body alone, for a flat create whose pattern carries no
-/// `about.md` to inherit a shape from.
+/// `README.md` to inherit a shape from.
 ///
 /// The same renderer the full template uses, exposed rather than duplicated:
 /// the fallback record and the seeded one are the same document, and a create
@@ -282,10 +287,10 @@ pub fn default_template(title: &str, date: &str, stamp: &str, ids: [&str; 3]) ->
             dir: false,
         },
         TemplateFile {
-            name: ABOUT.to_owned(),
-            // `about` is the kind tag; the frontmatter is what makes the About
-            // space find it rather than its filename, which is only a
-            // convention.
+            name: README.to_owned(),
+            // `about` is the kind tag, and it is still the tag even though the
+            // filename is now `README.md` (story 52.1): the About space finds
+            // this file by what it declares, never by what it is called.
             content: format!(
                 "{}{}",
                 frontmatter(ids[0], date, "about"),
@@ -355,7 +360,7 @@ pub fn zone_skeleton(date: &str, id: &str) -> Vec<TemplateFile> {
             dir: false,
         },
         TemplateFile {
-            name: ABOUT.to_owned(),
+            name: README.to_owned(),
             content: format!(
                 "{}{}",
                 frontmatter(id, date, "about"),
@@ -487,11 +492,12 @@ pub fn compile_rename(from: &str, to: &str) -> super::plan::Plan {
 // four act on what is in it, and they live here rather than in
 // [`super::files`] because that module's rules are a *session's*: it refuses
 // `workspace/` because scratch is fenced off from every write (AD-113), and it
-// refuses deleting `AGENTS.md`/`about.md` because those two names are what
-// [`super::shape::shape`] reads to decide which contract a session follows.
+// refuses deleting `AGENTS.md`/`README.md` because the first is what
+// [`super::shape::shape`] reads to decide which contract a session follows and
+// the second is the session's record.
 // Neither reason survives the trip into `_template/`: a template's `workspace/`
 // is a skeleton directory a create copies, and a template has no shape to flip —
-// deleting its `about.md` only changes what the next create carries, which
+// deleting its `README.md` only changes what the next create carries, which
 // [`about_only`] already covers. Reusing those checks would inherit two
 // refusals whose reasons are false here, which is worse than restating the one
 // rule that is true: stay inside the template.
@@ -912,7 +918,7 @@ mod tests {
     use super::*;
     use crate::notes::frontmatter::Frontmatter;
     use crate::notes::tags::note_tags;
-    use crate::sessions::shape::{shape, KindTag, Shape};
+    use crate::sessions::shape::{shape, KindTag, Shape, ABOUT};
 
     fn rendered() -> Vec<TemplateFile> {
         default_template(
@@ -925,13 +931,23 @@ mod tests {
 
     /// The template's own output must read as flat, or a session born from it
     /// would be parsed by the wrong reader on its first render.
+    ///
+    /// **Story 52.1 inverted the second assertion.** It asserted no `README.md`
+    /// was among the names — "the navigation file is AGENTS.md; a README would be
+    /// a second answer". The record IS the README now, so its absence would mean
+    /// a session created with no record at all.
     #[test]
     fn a_session_built_from_the_default_reads_as_flat() {
         let names: Vec<String> = rendered().into_iter().map(|file| file.name).collect();
         assert_eq!(shape(&names), Shape::Flat);
         assert!(
-            !names.iter().any(|name| name == "README.md"),
-            "the navigation file is AGENTS.md; a README would be a second answer"
+            names.iter().any(|name| name == README),
+            "story 52.1: the record is README.md, and a create that wrote none would ship a \
+             session with no identity, no title and nowhere to promote into"
+        );
+        assert!(
+            !names.iter().any(|name| name == ABOUT),
+            "story 52.1: nothing keeper authors writes about.md any more"
         );
     }
 
@@ -969,15 +985,19 @@ mod tests {
 
     /// An empty promote table is the zone's scaffold, and the record has to
     /// carry it or a promotion has nowhere to be written.
+    ///
+    /// Story 52.1: the name asserted here was `about.md`.
     #[test]
     fn the_record_ships_the_promote_scaffold_and_the_title() {
         let files = rendered();
-        let about = &files[1];
-        assert_eq!(about.name, "about.md");
-        assert!(about.content.contains("# Round two"));
-        assert!(about.content.contains("- **Date:** 2026-08-14"));
-        assert!(about.content.contains("## Promote"));
-        assert!(about.content.contains("| workspace | → artifacts | note |"));
+        let record = &files[1];
+        assert_eq!(record.name, "README.md");
+        assert!(record.content.contains("# Round two"));
+        assert!(record.content.contains("- **Date:** 2026-08-14"));
+        assert!(record.content.contains("## Promote"));
+        assert!(record
+            .content
+            .contains("| workspace | → artifacts | note |"));
     }
 
     /// The ids are the caller's, in order, so a replayed journal writes the
@@ -1056,7 +1076,7 @@ mod tests {
             // press of the button, and the case that must not destroy anything.
             &[
                 AGENTS.to_owned(),
-                ABOUT.to_owned(),
+                README.to_owned(),
                 "artifacts".to_owned(),
                 "workspace".to_owned(),
             ],
@@ -1085,7 +1105,7 @@ mod tests {
             .collect();
         assert_eq!(
             trashes,
-            vec!["_template/AGENTS.md", "_template/about.md"],
+            vec!["_template/AGENTS.md", "_template/README.md"],
             "only the two FILES are recoverable-then-rewritten"
         );
         // And no bytes are invented for a directory: no `.gitkeep`, no empty
@@ -1098,7 +1118,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(writes, vec!["_template/AGENTS.md", "_template/about.md"]);
+        assert_eq!(writes, vec!["_template/AGENTS.md", "_template/README.md"]);
     }
 
     /// A rename is a location change and nothing else: one move, the two names
@@ -1191,8 +1211,9 @@ mod tests {
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         // Row 8. Two files and the two directories every session has (FR-288) —
         // the pair `standard_dirs` already keeps for this shape, so the skeleton
-        // and a create cannot disagree about which two.
-        assert_eq!(names, vec![AGENTS, ABOUT, "workspace", "artifacts"]);
+        // and a create cannot disagree about which two. Story 52.1 renamed the
+        // second name from `about.md`.
+        assert_eq!(names, vec![AGENTS, README, "workspace", "artifacts"]);
         assert_eq!(
             &names[2..],
             crate::sessions::pattern::standard_dirs(Shape::Flat),

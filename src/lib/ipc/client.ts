@@ -5877,20 +5877,52 @@ export async function sessionsMigratePreview(
 }
 
 /**
- * Convert one folder-shaped session to the flat contract (FR-257): the README's
- * record becomes `about.md`, each `### ` log entry becomes its own stamped
- * file, `refs/` and `prompts/` are hoisted into the root pool with their kind
- * as a tag, and the two directories are trashed last.
+ * Convert one folder-shaped session to the flat contract (FR-257): the record
+ * stays in `README.md` minus its `## Log` section and plus the `about` kind tag,
+ * each `### ` log entry becomes its own stamped file, `refs/` and `prompts/` are
+ * hoisted into the root pool with their kind as a tag, and the two directories
+ * are trashed last.
  *
  * Journaled and idempotent — a crash mid-run resumes from the journal, and a
  * session that is already flat resolves without writing. **Never automatic**:
  * only the operator triggers it.
+ *
+ * A session whose record is still an unmigrated `about.md` is declined here and
+ * belongs to {@link sessionsRecordMigrate} instead.
  *
  * Rejects with: `internal` (unknown root or session; a failed step — the
  * journal survives and the run is retriable), `unsupported`.
  */
 export async function sessionsMigrate(rootId: string, sessionId: string): Promise<void> {
   await invoke<void>("sessions_migrate", { rootId, sessionId });
+}
+
+/**
+ * Move a session's record from `about.md` to `README.md` (Story 52.1, FR-300,
+ * FR-301) — one journaled plan per session, through the same executor every
+ * other lifecycle verb runs on.
+ *
+ * Omit `sessionId` for the whole zone, which is the ordinary case: the record's
+ * name is a zone-wide contract, and a session still keeping its `about.md`
+ * renders with no record at all now that `AGENTS.md` alone decides the shape.
+ *
+ * What it does per session: writes `AGENTS.md` first where a hand-built session
+ * never had one (without it the move would silently leave the session
+ * folder-shaped), trashes an older migration's README signpost into
+ * `.keeper/trash/`, rewrites every prose pointer at the record across the zone,
+ * and moves the file last. The record's bytes are never recomposed — every
+ * frontmatter key, the `pinned` flag and the `keeper:` lineage map arrive
+ * untouched.
+ *
+ * Answers with how many sessions actually changed, so a run that needed nothing
+ * does not look like one that failed.
+ *
+ * Rejects with: `internal` (unknown root, a root that has not scanned yet, an
+ * unknown session, a `README.md` in the way that no migration wrote — the
+ * refusal names both paths and nothing is written), `unsupported`.
+ */
+export async function sessionsRecordMigrate(rootId: string, sessionId?: string): Promise<number> {
+  return await invoke<number>("sessions_record_migrate", { rootId, sessionId });
 }
 
 /**

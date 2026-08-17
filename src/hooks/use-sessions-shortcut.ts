@@ -8,6 +8,7 @@
  * (the physical key — `event.key` under Alt is layout-dependent).
  */
 import { useEffect } from "react";
+import { SESSION_RECORD_NAME } from "@/components/sessions/session-detail";
 import { sessionsLogToday } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 import { panelsStore } from "@/lib/stores/panels";
@@ -42,10 +43,15 @@ export async function logTodayInCurrentSession(): Promise<void> {
   const subfolder =
     sessionsRootsStore.getState().roots?.find((root) => root.id === rootId)?.subfolder ??
     "60-sessions";
+  // The record, by the one name the detail and the board both read. This
+  // composed a literal `README.md` with no shape branch, so ⌘⌥L in a flat
+  // session opened a file that did not exist and landed the operator on the
+  // missing-file sentence: broken before Story 52.1, fixed here on its own
+  // merits by importing the name instead of retyping it.
   panelsStore.getState().setActiveTarget({
     kind: "file",
     profileId: rootId,
-    relativePath: `${subfolder}/${ref.path}/README.md`,
+    relativePath: `${subfolder}/${ref.path}/${SESSION_RECORD_NAME}`,
   });
 }
 

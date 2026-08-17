@@ -436,8 +436,11 @@ pub struct SessionMigrationVm {
     pub needed: bool,
     /// Session-relative paths that will be created, in write order.
     pub creates: Vec<String>,
-    /// Paths that will be rewritten in place — today only `README.md`, which
-    /// becomes a signpost pointing at `about.md`.
+    /// Paths that will be rewritten in place — today only `README.md`, which is
+    /// the record itself: since story 52.1 the migration strips the `## Log`
+    /// section out of it and adds the `about` kind tag, leaving every other byte
+    /// where the operator put it. It used to become a signpost pointing at a new
+    /// `about.md`, and there is nowhere for such a signpost to point now.
     pub rewrites: Vec<String>,
     /// Directories that will be moved to the trash, last and irreversibly.
     pub trashes: Vec<String>,
