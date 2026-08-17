@@ -63,6 +63,7 @@ import {
   tagChipState,
   withTagTerm,
 } from "@/lib/stores/notes-filters";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** How many icons the chooser shows before it needs its own scroll region. */
@@ -181,6 +182,18 @@ export const SESSION_SPACE_ROWS_LABEL = "Rows";
 export const SESSION_SPACE_ROWS_NOTE =
   "How many rows to show before the rest folds behind a “Show more”. The space still finds every file, and the count beside its name is the whole list. Leave it empty to show all of them.";
 
+/**
+ * Where this space's creates land, and the sentence that keeps the field from
+ * being read as a filter (Story 52.5, FR-309).
+ *
+ * The note says *new files* and never *files*: the key governs writes only, and
+ * nothing moves when it is set. It also has to say the three places keeper will
+ * not write, because the alternative is finding out at Save.
+ */
+export const SESSION_SPACE_CREATE_DIR_LABEL = "New files go in";
+export const SESSION_SPACE_CREATE_DIR_NOTE =
+  "A folder inside the session for files this space creates — “logs”, or “notes/2026”. keeper makes it if it is not there, and the new file still carries this space's tag, which is what makes it appear here. Nothing already in the session moves. Leave it empty to keep putting new files at the session's root. Not workspace/, which is scratch that dies with the session; not a folder starting with a dot, which keeper never reads back; and nothing outside the session.";
+
 /** The editable half of a space's query, once the chips can hold all of it. */
 interface Draft {
   tags: readonly TagChip[];
@@ -250,6 +263,7 @@ export function SessionSpaceEditor({
   const orderId = useId();
   const foldedId = useId();
   const rowsId = useId();
+  const createDirId = useId();
   const iconGroupId = useId();
   const [name, setName] = useState(space?.name ?? "");
   const [icon, setIcon] = useState<string | null>(space?.icon ?? null);
@@ -281,6 +295,9 @@ export function SessionSpaceEditor({
   // Text for `order`'s reason, one comment up. An empty box is "no cap", which
   // is what a missing key already means.
   const [rows, setRows] = useState(() => (space?.rows == null ? "" : String(space.rows)));
+  // Text, and empty is "the session's root" — which is what an absent key
+  // already means, so there is nothing to resolve here.
+  const [createDir, setCreateDir] = useState(space?.createDir ?? "");
   // A create starts with chips and an empty draft; only a stored query has to be
   // decomposed, and only a stored query can turn out to be unrepresentable.
   const [terms, setTerms] = useState<Terms>(
@@ -410,10 +427,20 @@ export function SessionSpaceEditor({
         // section with no rows under a header that still counts them is not a
         // cap somebody meant.
         rows: /^\d+$/.test(rows.trim()) ? Number.parseInt(rows.trim(), 10) || null : null,
+        // Sent on every save for `folded`'s reason. Trimmed only: this is a
+        // path, and Rust owns what a path may be — an escaping, scratch or
+        // dotted directory comes back as a rejection with its own sentence,
+        // which is what the catch below now shows.
+        createDir: createDir.trim(),
       });
       onSaved();
-    } catch {
-      setFailure(SESSION_SPACE_SAVE_FAILED);
+    } catch (raw: unknown) {
+      // Rust's own sentence, not a generic one. A refused destination names which
+      // rule it broke — scratch that dies with the session, a dotted folder the
+      // scan never reads back, a path that leaves the session — and three
+      // different refusals reading identically is the silence this surface is
+      // supposed to have ended.
+      setFailure(syncErrorMessage(raw, SESSION_SPACE_SAVE_FAILED));
       setSaving(false);
     }
   }
@@ -427,7 +454,42 @@ export function SessionSpaceEditor({
         }
       }}
     >
-      <DialogContent className="sm:max-w-lg">
+      {/* The form scrolls, and the panel is what caps it (Story 52.6, FR-310).
+
+          This form is taller than a 900px window — the icon chooser, five
+          selects, two help paragraphs and the term chips — and the shadcn panel
+          constrains WIDTH only (`ui/dialog.tsx:55`), centred with `top-1/2
+          -translate-y-1/2`. A transform creates no scroll container, so the top
+          of the form was not merely clipped, it was unreachable.
+
+          The override is the one Settings already established
+          (`settings-dialog.tsx:110`), copied rather than reinvented: the panel
+          becomes a height-capped flex column that clips, the header and footer
+          size to content, and the body between them is `flex-1 min-h-0` so it
+          takes the remaining bounded height and scrolls inside it. `min-h-0` is
+          load-bearing — a flex child defaults to `min-height:auto` (= its
+          content size), which grows past the cap and bleeds out of the dialog
+          instead of scrolling. `min-w-0` lets the help copy wrap instead of
+          clipping on the right, and `-mr-2 pr-2` keeps the scrollbar off the
+          controls. Never the `grid-rows-[…minmax(0,1fr)]` alternative: Tailwind's
+          arbitrary-value parser drops the comma inside `minmax()` and emits no
+          rule at all, so the cap silently never applies.
+
+          One extra step this form needs that Settings did not: two of the body's
+          children hold a scroll region of their own — the icon grid's
+          `ICON_GRID_MAX_HEIGHT` and the tag combobox's always-rendered
+          `max-h-48` listbox. A flex item whose own overflow is not `visible` has
+          an automatic minimum size of ZERO, so those two are the only children
+          that can give ground, and the flex algorithm hands them the whole
+          negative free space: the icon chooser and the tag list collapse to a
+          sliver and the body never scrolls at all. Same algorithm, other axis, as
+          the pane-header defect in `files-pane.tsx:2063`. `shrink-0` on the icon
+          fieldset and the Terms section is what makes the overflow land on the
+          body, where the scrollbar is.
+
+          `notes/space-editor.tsx` is this surface's deliberate twin and carries
+          the identical pair. */}
+      <DialogContent className="flex max-h-[85vh] flex-col gap-4 overflow-hidden sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>
             {space === null ? SESSION_SPACE_NEW_TITLE : SESSION_SPACE_EDIT_TITLE}
@@ -435,7 +497,7 @@ export function SessionSpaceEditor({
           <DialogDescription>{SESSION_SPACE_SCOPE_HINT}</DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4">
+        <div className="-mr-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor={nameId}>Name</Label>
             <Input
@@ -451,7 +513,11 @@ export function SessionSpaceEditor({
               section. "No icon" stays outside the search, because it is not an
               icon and no query names it — filtering it away would make "take the
               glyph off" a thing you can only do by clearing the box first. */}
-          <fieldset className="flex flex-col gap-1.5">
+          {/* `shrink-0` because this fieldset holds a scroll region: without it
+              it is one of the only two children that can give ground and the
+              body's overflow collapses it instead of scrolling. See the panel
+              comment above. */}
+          <fieldset className="flex shrink-0 flex-col gap-1.5">
             <legend className="font-medium text-sm">Icon</legend>
             <Input
               type="search"
@@ -623,7 +689,26 @@ export function SessionSpaceEditor({
             {SESSION_SPACE_ROWS_NOTE}
           </p>
 
-          <section aria-label="Terms" className="flex flex-col gap-2">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={createDirId}>{SESSION_SPACE_CREATE_DIR_LABEL}</Label>
+            <Input
+              id={createDirId}
+              // The placeholder is the default, spelled: an empty box is the
+              // session's own folder, which is where every create has always
+              // gone.
+              placeholder="The session's own folder"
+              value={createDir}
+              onChange={(event) => setCreateDir(event.target.value)}
+            />
+            <p data-slot="create-dir-note" className="text-muted-foreground text-sm">
+              {SESSION_SPACE_CREATE_DIR_NOTE}
+            </p>
+          </div>
+
+          {/* `shrink-0` for the same reason as the icon fieldset: the tag
+              combobox's listbox is a scroll region, which would otherwise make
+              this section absorb the body's overflow instead of scrolling it. */}
+          <section aria-label="Terms" className="flex shrink-0 flex-col gap-2">
             <span className="font-medium text-sm">Terms</span>
             {terms.kind === "pending" && (
               <p className="text-muted-foreground text-sm">Reading this space's terms…</p>

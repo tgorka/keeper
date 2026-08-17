@@ -754,6 +754,100 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
   });
 });
 
+describe("AddFolderForm fractional numbers (Story 52.9, FR-313)", () => {
+  /** Fill the required fields and open the Advanced disclosure. */
+  async function openAdvanced() {
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+  }
+
+  it("lets the three numeric boxes hold a fraction the browser will accept", async () => {
+    // The measured bug: no `step`, so HTML's implicit step is 1 and 1.5 is a
+    // stepMismatch — which in a real form with a native submit and no
+    // `noValidate` makes WKWebView refuse the save with no message at all.
+    // Typing and submitting proves nothing here: jsdom runs no INTERACTIVE
+    // validation, so a fireEvent submit succeeds against the bug too. The
+    // attribute and the ValidityState jsdom does compute are the honest ones.
+    render(<AddFolderForm />);
+    await openAdvanced();
+
+    for (const label of [SYNC_LFS_THRESHOLD_LABEL, SYNC_SETTLE_LABEL, SYNC_POLL_LABEL]) {
+      const box = screen.getByLabelText(label) as HTMLInputElement;
+      expect(box).toHaveAttribute("step", "any");
+      expect(box).toHaveAttribute("inputmode", "decimal");
+      fireEvent.change(box, { target: { value: "1.5" } });
+      expect(box.validity.stepMismatch).toBe(false);
+      expect(box.checkValidity()).toBe(true);
+    }
+  });
+
+  it("saves 1.5 MB as exactly 1572864 bytes, rounded once", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL), {
+      target: { value: "1.5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    // The exact byte count, not a whole MB: the one rounding on the way out
+    // exists to keep Rust's `u64` integral, never to quantise the ask.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ lfsThresholdBytes: 1_572_864 }),
+      ),
+    );
+  });
+
+  it("takes a fractional wait and cadence as whole milliseconds", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_SETTLE_LABEL), { target: { value: "7.5" } });
+    fireEvent.change(screen.getByLabelText(SYNC_POLL_LABEL), { target: { value: "12.5" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ settleMs: 7_500, pollIntervalMs: 12_500 }),
+      ),
+    );
+  });
+
+  it("opens a sub-MB profile at 0.25 and saves an unrelated change from it", async () => {
+    // The worse face of the same bug, and the reason this is not a nicety: the
+    // docs' own 256 KiB example (`docs/sync.md`) renders as 0.25, so before the
+    // `step` the form refused EVERY save on such a profile — including one that
+    // only came to fix the remote URL.
+    const profile = profileVm({ lfsThresholdBytes: 262_144 });
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    const threshold = screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL) as HTMLInputElement;
+    expect(threshold).toHaveValue(0.25);
+    expect(threshold.checkValidity()).toBe(true);
+
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/notes-2.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // The threshold rides along untouched: a fraction survives the round trip,
+    // so an edit form cannot silently round the user's stored setting up to 1 MB.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "p2",
+          remoteUrl: "git@github.com:alice/notes-2.git",
+          lfsThresholdBytes: 262_144,
+        }),
+      ),
+    );
+  });
+});
+
 describe("AddFolderForm recordings switch (Story 41.7, AD-66)", () => {
   /** A folder that already holds recordings, as Rust reports it. */
   function flagged(): SyncProfileVm {

@@ -37,6 +37,27 @@ function room(id: string, overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
   };
 }
 
+/**
+ * A stand-in for the drag data store, because jsdom implements none.
+ *
+ * The store is the half of a drag that can be asserted here at all: whether the
+ * strip named the pin and declared the effect. Whether WebKit then delivers the
+ * `drop` is not observable in jsdom, which is why the reorder tests below were
+ * green for a year over a strip that could not be reordered on macOS.
+ */
+function store() {
+  const written = new Map<string, string>();
+  const fake = {
+    dropEffect: "none",
+    effectAllowed: "uninitialized",
+    setData: (format: string, value: string) => {
+      written.set(format, value);
+    },
+    getData: (format: string) => written.get(format) ?? "",
+  };
+  return fake as unknown as DataTransfer & typeof fake;
+}
+
 afterEach(() => {
   vi.clearAllMocks();
 });
@@ -88,6 +109,37 @@ describe("PinsStrip", () => {
       { accountId: "acctA", roomId: "!c" },
       { accountId: "acctA", roomId: "!a" },
     ]);
+  });
+
+  it("names the pin it carries in the drag data store, and calls the drag a move", () => {
+    // The defect DW-37 recorded as "pointer drag works, keyboard does not" was
+    // half wrong: the pointer drag did not work either, because WebKit fires no
+    // `drop` for a drag that wrote nothing. jsdom cannot see the gesture, but it
+    // can be made to see the store.
+    render(<PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} />);
+    const data = store();
+    fireEvent.dragStart(screen.getAllByRole("button")[0], { dataTransfer: data });
+    expect(data.getData("text/plain")).toBe("acctA:!a");
+    expect(data.effectAllowed).toBe("move");
+  });
+
+  it("answers a drag over a pin with a move, not with a no-drop badge", () => {
+    render(<PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} />);
+    const data = store();
+    const buttons = screen.getAllByRole("button");
+    fireEvent.dragStart(buttons[0], { dataTransfer: data });
+    fireEvent.dragOver(buttons[1], { dataTransfer: data });
+    expect(data.dropEffect).toBe("move");
+  });
+
+  it("carries nothing while filtered, so a drag that cannot be honoured says nothing", () => {
+    render(
+      <PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} reorderable={false} />,
+    );
+    const data = store();
+    fireEvent.dragStart(screen.getAllByRole("button")[0], { dataTransfer: data });
+    expect(data.getData("text/plain")).toBe("");
+    expect(data.effectAllowed).toBe("uninitialized");
   });
 
   it("does not dispatch a reorder when dropped on itself", () => {

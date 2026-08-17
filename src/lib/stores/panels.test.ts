@@ -140,6 +140,129 @@ describe("the panel list", () => {
   });
 });
 
+/**
+ * A rename, which is neither of the two click gestures (Story 52.2, FR-302).
+ *
+ * It shipped as `setActiveTarget`, and that was wrong in two ways that this
+ * suite is the only place able to say plainly. It moved the panel with FOCUS
+ * rather than the panel holding the file — and a title commits on blur, so
+ * "type the new title, then click the other pane" hands focus to the other pane
+ * first. And it recorded the rename as a PREVIEW of the path the rename had just
+ * emptied, which `openPanel`'s restore branch then put back.
+ */
+describe("a file that was renamed under the panels showing it", () => {
+  /** Where the rename answered it went: a different folder and a different
+   *  filename, so nothing here could have been composed from `A`. */
+  const RENAMED: PanelTargetVm = {
+    kind: "file",
+    profileId: "p1",
+    relativePath: "archive/2026-02/a-renamed.md",
+  };
+
+  it("moves the panel holding the file even when another one has focus", () => {
+    // The blur-then-click-the-other-pane sequence, in the state it leaves behind:
+    // the reader renamed from the left pane and then clicked into the right one,
+    // so by the time the command answers the right pane is the active one.
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    const [left, right] = store().panels;
+    if (left === undefined || right === undefined) {
+      throw new Error("expected two panels");
+    }
+    expect(store().activeId).toBe(right.id);
+
+    store().retargetPanels(A, RENAMED);
+
+    // The pane that was showing it followed; the pane the reader clicked into
+    // kept what it was showing, and still has focus.
+    expect(shown()).toEqual([RENAMED, B]);
+    expect(store().activeId).toBe(right.id);
+  });
+
+  it("moves every panel holding the file, not whichever one is focused", () => {
+    store().setActiveTarget(A);
+    store().openPanel(B);
+    store().setActiveTarget(A);
+
+    expect(shown()).toEqual([A, A]);
+
+    store().retargetPanels(A, RENAMED);
+
+    // Both, or the second one persists a dead path into the cookie and comes back
+    // after a restart showing "is no longer in tgdrive".
+    expect(shown()).toEqual([RENAMED, RENAMED]);
+  });
+
+  it("does not flag the panel as a preview of the address the rename emptied", () => {
+    // The resurrection: the panel really held `A`, so recording the retarget as a
+    // preview would record `was: A` — the path that no longer exists. Then the
+    // double click that opens the renamed file from the tree hits `openPanel`'s
+    // restore branch, puts `A` back and appends the file beside it, so the reader
+    // gets the missing-file banner they had just been spared plus a second panel.
+    store().openPanel(A);
+    store().retargetPanels(A, RENAMED);
+
+    store().openPanel(RENAMED);
+
+    expect(shown()).toEqual([RENAMED]);
+    expect(store().panels[0]?.replaced).toBeNull();
+  });
+
+  it("leaves a preview a click before it recorded alone when the rename moved nothing", () => {
+    // The session record keeps its filename, so `sessions_file_rename` answers
+    // with the path it was given. Nothing follows anything — and the preview the
+    // click before it recorded has to survive, or the double click it is half of
+    // stops putting the displaced document back.
+    store().openPanel(A);
+    store().setActiveTarget(B);
+
+    store().retargetPanels(B, B);
+
+    expect(store().panels[0]?.replaced).toEqual({ was: A });
+    store().openPanel(B);
+    expect(shown()).toEqual([A, B]);
+  });
+
+  it("leaves the arrangement untouched when no panel is holding the file", () => {
+    store().setActiveTarget(B);
+    const before = store().panels;
+
+    store().retargetPanels(A, RENAMED);
+
+    // The same list, not an equal one: a rename of a file nobody is looking at
+    // must not rewrite the cookie either.
+    expect(store().panels).toBe(before);
+  });
+
+  it("keeps a folded panel folded, because it is still the document it folded", () => {
+    store().setActiveTarget(A);
+    const only = store().panels[0];
+    if (only === undefined) {
+      throw new Error("expected one panel");
+    }
+    store().toggleFold(only.id);
+
+    store().retargetPanels(A, RENAMED);
+
+    // Every other verb that gives a panel a target unfolds it, because it is
+    // showing the reader something new. This one is not: springing a pane open
+    // because somebody retitled the file already in it is keeper rearranging the
+    // workspace on its own.
+    expect(shown()).toEqual([RENAMED]);
+    expect(folds()).toEqual([true]);
+  });
+
+  it("writes the new address to the cookie, so the restart does not restore the old one", () => {
+    store().setActiveTarget(A);
+
+    store().retargetPanels(A, RENAMED);
+
+    resetPanelsStoreForTest();
+    hydratePanels(document.cookie);
+    expect(shown()).toEqual([RENAMED]);
+  });
+});
+
 describe("closing a panel", () => {
   it("refuses the last one", () => {
     store().setActiveTarget(A);

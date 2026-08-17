@@ -178,6 +178,41 @@ describe("SessionBoard", () => {
     expect(sessionsTaskMove).not.toHaveBeenCalled();
   });
 
+  it("names the task in the drag data store by the path keeper moves it by", () => {
+    // WebKit fires no `drop` for a drag that wrote nothing to the store, so for
+    // two epics this board drew a ghost on macOS and moved nothing — under the
+    // drag tests above, which pass because jsdom implements no store to be empty.
+    // What only this suite can say is WHICH identity is carried: the session
+    // board addresses a card by its session-relative path, because that is the
+    // argument `sessions_task_move` takes.
+    mount();
+    const written = new Map<string, string>();
+    const data = {
+      dropEffect: "none",
+      effectAllowed: "uninitialized",
+      setData: (format: string, value: string) => {
+        written.set(format, value);
+      },
+    } as unknown as DataTransfer;
+    fireEvent.dragStart(cardOf("Draft the plan"), { dataTransfer: data });
+    expect(written.get("text/plain")).toBe("draft-the-plan.md");
+    expect(data.effectAllowed).toBe("move");
+  });
+
+  it("keeps every card's column menu in the session's DOM, revealed rather than drawn", () => {
+    // The menu is demoted to hover/focus, and demoted is not deleted: this is
+    // the session board's only pointer-free way to move a card, and
+    // `session-detail.test.tsx` asserts the board is live through it.
+    mount();
+    const menu = screen.getByLabelText(`${SESSION_BOARD_MOVE_LABEL} — Draft the plan`);
+    expect(menu.className).toContain("opacity-0");
+    expect(menu.className).toContain("group-hover:opacity-100");
+    expect(menu.className).toContain("focus-within:opacity-100");
+    expect(menu).not.toBeDisabled();
+    menu.focus();
+    expect(menu).toHaveFocus();
+  });
+
   it("moves a card without a pointer, to the end of the column it joins", async () => {
     mount();
     const select = screen.getByLabelText(`${SESSION_BOARD_MOVE_LABEL} — Draft the plan`);

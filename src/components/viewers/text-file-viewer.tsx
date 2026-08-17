@@ -82,6 +82,48 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
   }, [vaults, file.profileId, file.relativePath]);
 
   /**
+   * Re-point the pane(s) showing this file at the file the properties panel just
+   * renamed (Story 52.2, FR-302).
+   *
+   * `next` is the new profile-relative subpath `sessions_file_rename` answered
+   * with, passed to the store untouched: the old path plus the new title is a
+   * path composed in the webview, and AD-65 puts that in Rust.
+   *
+   * `retargetPanels` and not `setActiveTarget`, which is what this shipped with
+   * and was wrong in two ways the store's own doc spells out. The one that bites
+   * here: the title field commits on BLUR and a pane takes focus on
+   * `onMouseDown`, so "type the new title, then click the other pane" runs the
+   * focus change FIRST — and the single-click verb would then have re-pointed the
+   * pane the reader had just clicked into, destroying what it was showing and
+   * leaving this one on the address the rename emptied. Matching on the target
+   * moves whichever panes are actually holding this file, however many, whoever
+   * has focus by the time the command answers.
+   *
+   * Guarded INSIDE rather than by withholding the handler. Withholding it would
+   * type-check just as well — a profile-less file mounts no `properties` and so
+   * offers no rename to answer today — but it makes the file's no-profile case
+   * fall back to `onWritten`, which means "re-read the address you have", and
+   * after a rename that MOVED the file that is the address the rename emptied.
+   * Supplying it always means no arrangement of the frame's gate can turn this
+   * surface into one that re-reads a path a rename just moved. Shaped after
+   * {@link openInNotes}, which guards the same field the same way.
+   */
+  const repointAfterRename = useCallback(
+    (next: string) => {
+      if (file.profileId === null) {
+        return;
+      }
+      panelsStore
+        .getState()
+        .retargetPanels(
+          { kind: "file", profileId: file.profileId, relativePath: file.relativePath },
+          { kind: "file", profileId: file.profileId, relativePath: next },
+        );
+    },
+    [file.profileId, file.relativePath],
+  );
+
+  /**
    * Follow a wikilink written in this file (Story 45.18).
    *
    * The second host of the decoration layer, and the reason the following lives
@@ -196,6 +238,11 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
               ? null
               : { profileId: file.profileId, relativePath: file.relativePath }
           }
+          // Story 52.2: a rename moves the file, so the pane showing it is
+          // re-ADDRESSED rather than left to re-read the address the rename just
+          // emptied — which is what put "is no longer in tgdrive" over a file the
+          // reader had merely retitled.
+          onPropertiesRenamed={repointAfterRename}
           preview={preview}
         />
       </div>

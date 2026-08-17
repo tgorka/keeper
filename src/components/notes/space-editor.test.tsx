@@ -916,3 +916,92 @@ describe("a space names the template its notes start from", () => {
     expect(select.value).toBe("templates/journal-entry.md");
   });
 });
+
+describe("the space editor is a form you can reach both ends of", () => {
+  /**
+   * Story 52.6, FR-310, and the twin of
+   * `sessions/session-space-editor.test.tsx`'s "SessionSpaceEditor reach" — this
+   * surface and that one are deliberate twins, so the scroll fix and its guard
+   * exist in both or drift.
+   *
+   * The form is taller than a 900px window, and the shadcn panel constrains width
+   * only, centred by a transform — a transform creates no scroll container, so
+   * the top of the form was unreachable rather than merely clipped.
+   *
+   * jsdom cannot measure that: `src/test/setup.ts:84-103` shims every rect to
+   * 1024×768, so `getBoundingClientRect()` and `scrollHeight` here are fiction.
+   * The assertion is therefore by className — the pattern this repo already uses
+   * for caps CSS-less jsdom cannot compute (`chat/composer.test.tsx:992`) — and
+   * the real measurement is owed in a browser at 900×900: the panel's
+   * `getBoundingClientRect().top >= 0` and the body's
+   * `scrollHeight > clientHeight`.
+   */
+  it("caps the panel height and scrolls the form inside it, so both ends are reachable", async () => {
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    const panel = screen.getByRole("dialog");
+    // A height-capped flex column that clips — the Settings idiom
+    // (`settings-dialog.tsx:110`), not a second invention.
+    expect(panel.className).toContain("max-h-[85vh]");
+    expect(panel.className).toContain("overflow-hidden");
+    expect(panel.className).toContain("flex");
+    expect(panel.className).toContain("flex-col");
+    // The width the surface already had is untouched; only the height gained a cap.
+    expect(panel.className).toContain("sm:max-w-lg");
+    // The panel clips. It is never the thing that scrolls.
+    expect(panel.className).not.toContain("overflow-y-auto");
+
+    const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");
+    expect(body).not.toBeNull();
+    // `min-h-0` is load-bearing, not decoration. A flex child defaults to
+    // `min-height:auto`, which is its *content* size, so without `min-h-0` this
+    // body grows straight past the panel's cap and bleeds out of the dialog
+    // instead of scrolling — the exact bug this test exists for. Removing it "to
+    // simplify" reopens it. `min-w-0` lets the help copy wrap instead of clipping
+    // on the right; `flex-1` is what makes the body take the bounded remainder.
+    expect(body?.className).toContain("min-h-0");
+    expect(body?.className).toContain("min-w-0");
+    expect(body?.className).toContain("flex-1");
+
+    // And it is the *form* that scrolls, between a pinned header and footer — so
+    // the classes cannot quietly drift onto some empty wrapper.
+    expect(body?.contains(screen.getByLabelText("Name"))).toBe(true);
+    expect(body?.contains(screen.getByRole("button", { name: "Save" }))).toBe(false);
+    expect(body?.contains(screen.getByText("Edit space"))).toBe(false);
+  });
+
+  /**
+   * The half of the fix that is easy to delete because it looks decorative, and
+   * the twin of the sessions editor's own guard. The body holds two children that
+   * own a scroll region — the icon grid and the tag combobox's always-rendered
+   * listbox — and a flex item whose own overflow is not `visible` has an
+   * automatic minimum size of ZERO. They are therefore the only children that can
+   * give ground, so without `shrink-0` the flex algorithm hands them the body's
+   * entire negative free space: the icon chooser and the tag list collapse to a
+   * sliver and the body never scrolls at all. It is the same algorithm that
+   * squeezed the files pane's prose to one word per line
+   * (`files-pane.test.tsx:2897`), in the other axis.
+   */
+  it("keeps the icon chooser and the terms section from absorbing the body's overflow", async () => {
+    open();
+    await screen.findByRole("button", { name: /Tag client\/acme/ });
+
+    const panel = screen.getByRole("dialog");
+    const body = panel.querySelector<HTMLElement>(":scope > .overflow-y-auto");
+    const iconGroup = screen.getByRole("group", { name: "Icon" });
+    const terms = screen.getByRole("region", { name: "Terms" });
+
+    // Both are direct children of the scrolling body, and neither may shrink.
+    expect(iconGroup.parentElement).toBe(body);
+    expect(terms.parentElement).toBe(body);
+    expect(iconGroup.className).toContain("shrink-0");
+    expect(terms.className).toContain("shrink-0");
+
+    // And each still contains the scroll region that is the reason for it.
+    expect(iconGroup.querySelector(".overflow-y-auto")).not.toBeNull();
+    expect(terms.querySelector<HTMLElement>("[role='listbox']")?.className).toContain(
+      "overflow-y-auto",
+    );
+  });
+});

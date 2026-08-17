@@ -691,6 +691,81 @@ development_status:
   51-8-the-record-is-called-readme: blocked
   epic-51-retrospective: optional
 
+  # -- EPIC 52, 2026-08-17: the sixth field report, fourteen items ----------
+  #
+  # Six read-only scouts measured every claim against main c873fa6 before the
+  # spine was written. Four items turned out to be recorded refusals, and the
+  # owner asked for three of them anyway:
+  #   8  about.md -> README.md  - refused as 51.8, now built by NARROWING
+  #      shape()'s predicate to AGENTS alone plus one journaled migration
+  #   9  Note as the default    - spec-51-5:62 recorded the opposite as a
+  #      non-goal; the owner overrides his own earlier instruction
+  #   7  About's add button     - the single-record rule stays; the refusal
+  #      becomes visible instead of absent
+  #   4  creates land in a space's folder - AD-120 stands; a space may name a
+  #      create DESTINATION, and reading still derives kind from the tag
+  # Two items a shipped story claimed and did not deliver: 1 (no toolbar in
+  # Note mode) and 11 (the FILES tree never got the 51.6 menu). One shipped
+  # feature is broken only on WebKit: 6, because no drag ever called setData -
+  # and jsdom cannot see that, which is why its tests were green.
+  epic-52: in-progress
+  52-1-the-record-is-called-readme: review
+  52-2-a-rename-the-open-pane-follows: review
+  52-3-note-mode-is-a-place-you-can-write: review
+  52-4-spaces-first-and-one-for-the-untagged: review
+  52-5-a-space-can-say-where-its-creates-land: review
+  52-6-a-form-you-can-reach-both-ends-of: review
+  52-7-a-card-you-can-actually-drop: review
+  52-8-a-file-row-you-can-right-click: review
+  52-9-fractions-and-an-icon-at-the-root: review
+  epic-52-retrospective: optional
+
+  # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
+  #
+  # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
+  # share one PR (#165): they touch spaces.rs, vm.rs, sessions_ipc.rs and
+  # session-spaces.tsx across 60-odd interleaved hunks, so a hunk split would
+  # have produced two branches that each fail to compile alone.
+  #
+  #   #161  52.1  the record is called README        -> main
+  #   #162  52.2  a rename the open pane follows     -> #161
+  #   #163  52.3  note mode is a place you can write -> #162
+  #   #164  52.9  fractions, and an icon at the root -> #163
+  #   #165  52.4 + 52.5  spaces first, untagged, and where creates land -> #164
+  #   #166  52.6  a form you can reach both ends of  -> #165
+  #   #167  52.7  a card you can actually drop       -> #166
+  #   #168  52.8  a file row you can right-click     -> #167
+  #   #169  fix   what epic 52's review pass found   -> #168
+  #
+  # TWO REVIEWERS, BOTH `incorrect`, TWO P1s that would have reached the drive:
+  #   * 52.1 registered and wrapped `sessions_record_migrate` and invoked it
+  #     from nowhere, while narrowing shape() and repointing row_for at
+  #     README.md - so every flat session already on the drive would have
+  #     parsed an EMPTY record on the next rescan (id -> `path:`, title, pin
+  #     and lineage gone) with the only remedy unreachable.
+  #   * 52.2 replaced onWritten with onRenamed unconditionally, so a retitle
+  #     that does not MOVE the file - the record itself, or any title whose
+  #     slug is unchanged - reloaded nothing and the next Save silently wrote
+  #     the old title back. Invisible because every fixture was a README while
+  #     every mock returned a moved path, which the real command cannot answer
+  #     for those files.
+  #
+  # THE MACOS GATE EARNED ITS KEEP AGAIN. The shell crate does not compile on
+  # Linux, so `bun run check:rust:macos` was the FIRST compile of four call
+  # sites: 4 x E0433 (`model` unresolved in scopes that never imported it) and
+  # then 3 shell-crate test failures whose fixtures built a flat session the
+  # old way - about.md with no AGENTS.md, which after the narrowing reads as
+  # folder-shaped. All of it landed in 52.1, where the code lives, not at the
+  # tip.
+  #
+  # OWED, and honest about it:
+  #   * the 900x900 browser measurement for 52.6 (no Chromium in the container;
+  #     jsdom shims every rect to 1024x768, so the panel top and the icon
+  #     grid's height after shrink-0 are unmeasured here)
+  #   * the WebKit drag click-through for 52.7 (jsdom implements no
+  #     DataTransfer and no drag session, which is exactly why four green
+  #     desktop-drag tests sat on a dead drag for two epics)
+
   # PHASE 6 IS CODE-COMPLETE as of 2026-08-08. Every story of epics 40, 41 and 42
   # is implemented, gated and open as a stacked PR; none is `done`, because in
   # this repo `done` means the PR merged and the ledger closed, and the stack has

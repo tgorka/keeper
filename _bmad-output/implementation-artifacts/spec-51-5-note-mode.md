@@ -59,13 +59,17 @@ live-preview and editable, and all three share the file's single content state a
   `syncWriteEntry(profileId, subpath, content)` is last-write-wins (`use-text-file.ts:301`). An
   autosaving live-preview editor over that is a data-loss machine, and the Save button is the guard.
 - Never a second renderer, a second markdown extension set, or a second save path.
-- Never make Note the default: a person opening a file to read it should not land in an editor.
+- ~~Never make Note the default: a person opening a file to read it should not land in an editor.~~
+  **SUPERSEDED by story 52.3** (epic 52, item 9): the owner asked for the reverse twice, so Note is
+  now the default wherever it is offered. A remembered choice still wins — the jar is keyed per
+  FORMAT (`viewModeFor(cookie, format, offered)`), never per file — so nothing he had already
+  clicked changed under him.
 
 **I/O and edge-case matrix.**
 
 | # | input | expected |
 |---|---|---|
-| 1 | a session markdown file | three tabs: Preview, Source, Note; Preview is default |
+| 1 | a session markdown file | three tabs: Preview, Source, Note; ~~Preview is default~~ → **Note is default since story 52.3** |
 | 2 | Note mode, typing | the text renders live and the buffer is dirty; Save writes it |
 | 3 | Note mode, an edit, switch to Source | the same text, unsaved, no loss |
 | 4 | Source, an edit, switch to Note | the same text, and the caret does not jump to the top |

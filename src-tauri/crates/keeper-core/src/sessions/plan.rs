@@ -120,8 +120,8 @@ pub fn compile_create(
 /// file keeper composes itself, session-relative name and bytes (FR-268).
 ///
 /// The shape-aware seam, and the only one. A folder-shaped create stamps one
-/// `README.md`; a flat one stamps `AGENTS.md`, `about.md` and its two seed
-/// files. Everything else about a create — where the copies come from, that
+/// `README.md`; a flat one stamps `AGENTS.md`, that same `README.md` and its two
+/// seed files. Everything else about a create — where the copies come from, that
 /// directories precede their contents, that the stamped files are written last
 /// so a pattern carrying its own copy loses to them — is identical, and putting
 /// the difference here rather than in the shell is what keeps it to one line of
@@ -221,8 +221,8 @@ pub fn compile_create_from(
     compile_create_from_shaped(
         dir_name,
         source_session,
-        source_readme,
         super::model::README,
+        source_readme,
         new_id,
         copies,
         &[],
@@ -231,15 +231,26 @@ pub fn compile_create_from(
 }
 
 /// The general form of [`compile_create_from`] (FR-268): the shaped create
-/// plus the lineage append, written to the record under **its own name**.
+/// plus the lineage append, written to the source's record.
 ///
-/// `record_name` is `README.md` for a folder-shaped source and `about.md` for a
-/// flat one. It is a parameter rather than a lookup because the caller already
-/// knows the shape — it read the directory to decide what to copy — and because
-/// guessing here would mean this function opening a file, which is the one thing
-/// the domain does not do (AD-108). Get it wrong and the append lands on a file
-/// that does not exist; the executor's `GuardedWrite` refuses a length mismatch,
-/// so the failure is loud rather than a half-written lineage.
+/// **`record_name` is the name the bytes in `source_record` were READ from, and
+/// the two travel together for that reason.** Story 52.1 removed it, on the
+/// argument that both contracts call the record `README.md` now and the caller
+/// therefore has nothing to get wrong. That is true of what keeper *writes* and
+/// false of what is on the operator's drives: a flat session created before that
+/// story keeps its record in `about.md` until `sessions_record_migrate` has swept
+/// the zone, and continuing one is a thing an operator does on day one. With the
+/// name fixed, the shell read the source's `README.md` — absent — and compiled
+/// `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`, which
+/// `sessions_exec` reads before writing and refuses with a raw ENOENT; the append
+/// is pushed AFTER the create steps, so the operator got an errno, a new session
+/// already on disk, and no `continues`/`continued-by` pair — precisely the loss
+/// AD-112 exists to prevent. Worse in the half-migrated shape, where an old
+/// README signpost is still there: the lengths agree, and the lineage lands in
+/// the signpost.
+///
+/// A guard read from one file and written to another is a guard that always
+/// mismatches, so this takes the name rather than assuming it.
 // Eight, and each one is a distinct fact about the create the caller already
 // holds separately. Bundling them into a `CreateRequest` would obscure that
 // `copies`, `expanded` and `stamped` are three different answers to "where do
@@ -249,8 +260,8 @@ pub fn compile_create_from(
 pub fn compile_create_from_shaped(
     dir_name: &str,
     source_session: &str,
-    source_record: &str,
     record_name: &str,
+    source_record: &str,
     new_id: &str,
     copies: &[(String, bool)],
     expanded: &[(String, String)],
@@ -605,6 +616,80 @@ mod tests {
         assert_eq!(path, "archive/2025/2025-03-01-old/README.md");
         assert_eq!(*expect_len, source_readme.len());
         assert!(content.contains("session-continued-by"));
+    }
+
+    /// Continuing a session whose record has NOT been migrated yet — which is the
+    /// state of every flat session on the operator's drives the day story 52.1
+    /// ships.
+    ///
+    /// The append has to land on the file the bytes came out of. When the name was
+    /// a constant, the shell read `<source>/README.md` (absent), got `""`, and
+    /// compiled `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`:
+    /// `sessions_exec` reads the target before writing and maps the ENOENT to
+    /// `Refused`, so the step failed with an errno *after* the create steps had
+    /// already put the new session on disk — a stray session and no
+    /// `continues`/`continued-by` pair, the loss AD-112 exists to prevent.
+    ///
+    /// The half-migrated shape is the sharper one: an old migration's README
+    /// signpost is still sitting where the record used to be, so `expect_len`
+    /// MATCHES the bytes read from it, the guard is satisfied, and the lineage is
+    /// appended into a three-line redirect instead of into the record. Nothing in
+    /// this crate can see that happen — it is decided by which file the shell
+    /// read — which is exactly why the name and the bytes are one pair of
+    /// arguments here, and why `sessions_ipc` reads them together.
+    #[test]
+    fn a_create_from_an_unmigrated_source_appends_to_the_record_that_exists() {
+        const ABOUT: &str = "about.md";
+        let source_record =
+            "---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ntags: [about]\n---\n# old flat session\n";
+        let plan = compile_create_from_shaped(
+            "2026-08-17-continuation",
+            "active/2026-03-01-old",
+            ABOUT,
+            source_record,
+            "01J6BBBBBBBBBBBBBBBBBBBBBB",
+            &[],
+            &[],
+            &[(super::super::model::README.to_owned(), "# new\n".to_owned())],
+        );
+        let Some(PlanStep::GuardedWrite {
+            path,
+            expect_len,
+            content,
+        }) = plan.steps.last()
+        else {
+            panic!("the source write is the last step: {:?}", plan.steps);
+        };
+        assert_eq!(
+            path, "active/2026-03-01-old/about.md",
+            "the lineage is appended to the file the guard's bytes were read from"
+        );
+        assert_eq!(*expect_len, source_record.len());
+        assert!(
+            content.contains("session-continued-by")
+                && content.contains("01J6BBBBBBBBBBBBBBBBBBBBBB"),
+            "{content}"
+        );
+
+        // Row for the migrated source, from the same function: the name is what
+        // decides, and nothing else in the plan changes with it.
+        let migrated = compile_create_from_shaped(
+            "2026-08-17-continuation",
+            "active/2026-03-01-old",
+            super::super::model::README,
+            source_record,
+            "01J6BBBBBBBBBBBBBBBBBBBBBB",
+            &[],
+            &[],
+            &[(super::super::model::README.to_owned(), "# new\n".to_owned())],
+        );
+        assert!(
+            matches!(migrated.steps.last(), Some(PlanStep::GuardedWrite { path, .. })
+                if path == "active/2026-03-01-old/README.md"),
+            "{:?}",
+            migrated.steps.last()
+        );
+        assert_eq!(migrated.steps.len(), plan.steps.len());
     }
 
     /// The skeleton takes headings, never prose, and re-scaffolds the

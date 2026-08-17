@@ -53,7 +53,7 @@ migrates has to keep working.
 ```text
 2026-08-10-keeper/          # FLAT — what keeper's own template now writes
   AGENTS.md                 # how to read this folder. The navigation contract.
-  about.md                  # the record: summary, decisions, promote table
+  README.md                 # the record: summary, decisions, promote table
   2026-08-10-0930-opened.md # a log — one sitting, tagged `log`
   ship-it.md                # a task — tagged `task`, carrying `status` and `order`
   house-style.md            # a prompt — tagged `prompt`
@@ -71,9 +71,11 @@ migrates has to keep working.
 **Flat is one markdown pool.** Every file declares its own kind as a tag —
 `about`, `task`, `log`, `prompt`, `ref` — so moving a file never changes what it
 is, and a new kind of thing is a new tag rather than a new directory. `refs/`,
-`prompts/` and `logs/` do not exist; the five lists you see are saved queries over
-the tags. A file declaring none of them is **unfiled**, which is not an error but
-does mean nothing surfaces it.
+`prompts/` and `logs/` do not exist; the lists you see are saved queries over
+the tags. A file declaring none of them is **untagged**, which is not an error:
+the last space, **Untagged**, is the saved query for exactly those files — every
+kind negated — so it is listed, counted and foldable like anything else, and it
+is absent from a session where every file has said what it is.
 
 The known cost is real: a flat session opened in Finder is an undifferentiated pile
 of markdown until something reads the tags. `AGENTS.md` is the mitigation and is
@@ -86,7 +88,7 @@ about *versioning*, not about kind, and no tag can replace that.
 **Markdown is found wherever it sits.** keeper reads a session's markdown in
 subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
 file is in the pool, the space whose tag it carries lists it, and a file carrying no tag
-is **unfiled** rather than invisible. Two folders are never read, in both shapes —
+is listed by **Untagged** rather than invisible. Two folders are never read, in both shapes —
 `artifacts/`, which is output, and `workspace/`, which is scratch that dies with the
 session — and neither is anything dotted, like `.git` or `.obsidian`. A folder-shaped
 session's root is read the same way, beside its `README.md`: the record stays the record
@@ -106,10 +108,13 @@ to read, because a card that leaves a board with nothing anywhere saying so is t
 kind of failure there is.
 
 **Which one a folder is** is decided by presence, not absence: a folder holding
-`AGENTS.md` or `about.md` is flat. A folder holding both `README.md` and `AGENTS.md`
-reads as flat — the safe direction, because the residual README then shows up as an
-unfiled file and a half-finished migration is visible rather than merely survivable.
-Nothing is stored to say which shape a session is; the files are the truth.
+`AGENTS.md` is flat, and that is the whole test. A flat session's record is
+`README.md`, so the record's name cannot be the signal — adding it to the test
+would flip every folder-shaped session on your drives to flat on one rescan.
+A folder holding neither is folder-shaped, including a hand-built one that has an
+`about.md` and no `AGENTS.md`: that session is *migrated* rather than
+special-cased (see **Migrating the record's name** below). Nothing is stored to
+say which shape a session is; the files are the truth.
 
 ### What keeper promises
 
@@ -125,8 +130,13 @@ Nothing is stored to say which shape a session is; the files are the truth.
 
 ## The session's record
 
-`about.md` in a flat session, `README.md` in a folder-shaped one. Same file, same job,
-two names — everything below is true of whichever one your session has.
+`README.md`, in both shapes. Same file, same name, same job.
+
+It was `about.md` in a flat session until story 52.1 moved it, because `AGENTS.md`
+was meant to be the only navigation file and a README beside it looked like a
+second answer to one question. It is not: `AGENTS.md` says *how to read this
+folder* and `README.md` says *what this session is*, and only the second is the
+file every other tool, host and human already opens by name.
 
 The record's frontmatter is the session's identity, tags, properties and pins, under the
 notes three-tier contract: keeper-owned (`id` — a ULID minted on first index; `pinned`;
@@ -172,8 +182,10 @@ nobody made.
   by neither reader.
 
   Choosing a template copies it, minus its record and plus two directories:
-  `about.md` and `README.md` are restamped with *your* title and today's date, since
-  copying the template's would name every new session after the template. `AGENTS.md`
+  `README.md` is restamped with *your* title and today's date, since copying the
+  template's would name every new session after the template. An unmigrated
+  template that still keeps its record in `about.md` is read for its headings all
+  the same, so nothing you already have stops inheriting. `AGENTS.md`
   travels untouched — a zone that edited its own navigation contract meant it. A markdown
   file that carries a `{{placeholder}}` arrives with it filled in; everything else is
   copied byte for byte. See *Templates* below for the list, and for the `_spaces/` a
@@ -199,7 +211,7 @@ nobody made.
 
   A zone with no `_template/` offers its sessions alone; a zone with neither offers no
   picker at all and creates a flat session from keeper's own default: `AGENTS.md`,
-  `about.md`, one seed log and one seed prompt. The seeds exist so the log and prompt
+  `README.md`, one seed log and one seed prompt. The seeds exist so the log and prompt
   lists are not empty on day one and so the filename convention is visible as an example
   rather than only as a rule — delete them freely, nothing depends on them. A
   continuation gets the contract but not the seeds: it was made from a session that has
@@ -213,7 +225,7 @@ nobody made.
   putting your own seed log in `_template/` works exactly as you would expect, and why
   keeper's own does not end up beside it.
 - **Write keeper's template into this zone** — offered under the picker to a zone with no
-  `_template/` of its own. What lands is a **skeleton**: `AGENTS.md`, an `about.md` titled
+  `_template/` of its own. What lands is a **skeleton**: `AGENTS.md`, a `README.md` titled
   `<session title>`, and `artifacts/` and `workspace/` — and deliberately not the seeds. A
   template has no title and no minute — freezing either would name every session after the
   moment you pressed the button — so the seeds stay something keeper writes per create,
@@ -233,7 +245,7 @@ nobody made.
   out of that rather than out of a second walk. Arrow keys walk it and `Enter` opens a file
   or folds a folder, as in a session's own tree. The one difference is the create's, not the
   room's — a new session gets a
-  *stamped* record rather than a copied one, so `about.md` is a row here and never under
+  *stamped* record rather than a copied one, so `README.md` is a row here and never under
   *Copies*. Press a file to open it in the panel beside the board: the same editor a
   session's record opens in, because editing a template is editing a file and nothing more.
   A template whose directory has since been removed in Finder lists as empty rather than as
@@ -246,7 +258,7 @@ nobody made.
   the one you already have. Typing the name a named template already has is **refused in
   the list**, without asking Rust: case-insensitively, because the drives this syncs to
   are, and because the command underneath would move that template's own `AGENTS.md` and
-  `about.md` into `.keeper/trash/` and write keeper's in their place — recoverable, and
+  `README.md` into `.keeper/trash/` and write keeper's in their place — recoverable, and
   still not what "one beside it" means. The refusal is on the name as typed, so a name
   that only *folds* onto an existing one (`Interview Kit` where `_template/interview-kit`
   is) does reach the command, and does trash-then-write those two files. The search box and
@@ -285,7 +297,7 @@ nobody made.
     becomes `kick-off.md` and never `kick-off-md`, and a name typed without an extension keeps
     the one the file has. The entry stays in its folder — this renames, it does not move
     between folders. What a rename may **not** do is carry a file out of the set keeper
-    writes: `about.md` cannot become `about.sh`, because that would author through a rename
+    writes: `README.md` cannot become `README.sh`, because that would author through a rename
     exactly what *New file* refuses to author. Keeping an extension the file already has is
     always free, whatever it is — `logo.png` renamed to `Logo Mark` stays a `.png`, since
     those bytes were already in the template. A name already taken is refused, naming it; a
@@ -333,7 +345,7 @@ nobody made.
 
   Three limits worth knowing. Only `.md` files are expanded — a `.png` whose bytes happen
   to contain `{{title}}` is a PNG and is copied untouched. The record keeper stamps for you
-  (`README.md` or `about.md`) is composed from your template's headings and is never
+  (`README.md`) is composed from your template's headings and is never
   expanded, because it was never copied. And **your template is not edited**: the expansion
   happens on the way into the new session, so the file in `_template/` still says
   `{{title}}` afterwards. `{{date}}` and `{{time}}` are one reading of the clock, the same
@@ -347,13 +359,13 @@ nobody made.
   session: a per-session copy of a saved query is the thing this shape exists to avoid, so
   these files land beside `_template/` and never inside `active/`. Seeding only ever fills a
   hole. A space your zone already has — by file name, by title, or as one of keeper's own
-  five — is left exactly as you tuned it, because a verb you press several times a week must
-  not be able to rewrite a query you wrote once. An entry keeper cannot run — one with no
-  query in it, or a query that does not parse, or something that is not a `.md` sitting
+  defaults — is left exactly as you tuned it, because a verb you press several times a week
+  must not be able to rewrite a query you wrote once. An entry keeper cannot run — one with
+  no query in it, or a query that does not parse, or something that is not a `.md` sitting
   directly inside `_spaces/` — is skipped and named in the log, and the session is still
   created: a typo in a template's space file is not a reason to refuse you a session. The
   one case keeper declines outright is a zone with no `_spaces/` directory at all, since an
-  absent one is how keeper knows to write you the five defaults; open the sessions board
+  absent one is how keeper knows to write you the defaults; open the sessions board
   once and the zone has them, and a template can fill in from there.
 - **Rename a template** — offered on a **named** template's row, and only there. The name
   you type is folded to a directory name exactly as *New template* folds it, the move
@@ -511,9 +523,11 @@ title is not written either*, because a file renamed halfway is exactly what the
 was afraid of. A name already taken in the folder is refused, naming the file it would
 have overwritten — a *create* counts up to `-2`, because a create has no expectation about
 its name, but somebody who typed a title expects the file to be called after it. The
-session's record and its contract file — `about.md`, `AGENTS.md`, `README.md` — change
-their title and keep their filename, because those are the three names keeper reads to
-decide how to read the folder at all. And `workspace/` refuses, with the fence's own
+session's record and its contract file — `README.md`, `AGENTS.md`, and an unmigrated
+`about.md` — change their title and keep their filename: `AGENTS.md` is the name keeper
+reads to decide how to read the folder at all, `README.md` is the record, and an
+`about.md` still holding a record would be renamed halfway, which is worse than refused.
+And `workspace/` refuses, with the fence's own
 sentence.
 
 What a rename still cannot fix, and does not pretend to: a reference written in *another*
@@ -595,22 +609,27 @@ A session's text files open in keeper's own editor, in the panel beside the boar
 markdown file gets three tabs, and they are three views of one buffer rather than three
 copies of the file:
 
-- **Preview** — the rendered document, mermaid included. It is where a file opens, because
-  a person opening a file to read it should not land in an editor, and it is read-only:
-  the characters in the file and the picture of them can never disagree.
+- **Preview** — the rendered document, mermaid included, and read-only: the characters in
+  the file and the picture of them can never disagree.
 - **Source** — the characters, with the code editor's line numbers and grammar.
-- **Note** — the same live preview as the first tab, editable. It renders as you type, the
-  way writing in Notes does, and it is offered only for a markdown file keeper can
-  actually write: not in `workspace/`, not past the size limit, not a format keeper
-  refuses. Where it cannot be offered the tab is absent rather than present and refusing.
+- **Note** — the same live preview as the first tab, editable, and where a markdown file
+  keeper can write OPENS. It renders as you type, the way writing in Notes does, and it is
+  offered only for a markdown file keeper can actually write: not in `workspace/`, not past
+  the size limit, not a format keeper refuses. Where it cannot be offered the tab is absent
+  rather than present and refusing, and the file opens in Preview instead. A view you
+  picked yourself is remembered per format and still wins over that default.
 
 Switching tabs never loses an unsaved edit and never resets the caret — there is one
 buffer under all three, and one Save. Every other text format gets the code editor: line
 numbers, a grammar, byte-for-byte line endings. `workspace/` files open read-only, because
 that folder refuses every write.
 
-**A session log writes like a note.** On the Source tab a markdown file has the format
-toolbar, the `/` command menu and `:shortcode:` emoji completion. Not copies of the
+When a file's own properties are on screen as a form above the views, the Preview and Note
+tabs stop drawing that same `---` block as document text. It is hidden from the view, never
+from the file: the Source tab shows every byte and a save writes them all.
+
+**A session log writes like a note.** On both the Source and Note tabs a markdown file has
+the format toolbar, the `/` command menu and `:shortcode:` emoji completion. Not copies of the
 ones in Notes — *the same ones*: they live in one module both editors import, so a table
 inserted from `/` in a session log and one inserted in a note are the same bytes, and a
 change to either is a change to both. There is no autosave for a file, on purpose — in
@@ -637,30 +656,47 @@ is re-read when you open it again, not while you watch it.
 
 ## Spaces, tasks and the log
 
-Below Files, a session shows three more surfaces. All three read the same pool, and
-none of them stores anything except the fold you leave a space in.
+**Spaces come first, then Files.** A session's own sections read: what it is (the record's
+header), then the spaces, then the file tree, then what it points at, then the log. The
+spaces sat *after* the tree until they were moved: the tree is what the session holds and a
+space is a reading of it, so the contents came first. The order asks a different question —
+which of the two you read more often — and About, Tasks and Log are what a session gets
+opened for. The tree is where you go when a space has not surfaced something, which is the
+second question. It is not a setting.
+
+All of these surfaces read the same pool, and none of them stores anything except the fold
+you leave a space in.
 
 **Spaces** are the zone's saved queries, one markdown file each under
-`60-sessions/_spaces/`. Five ship by default — About, Tasks, Log, References, Prompts —
-and they are ordinary files: rename them, reorder them, delete one, write your own. The
-query language is the notes vault's, the same grammar and the same chip editor, because a
-`tag:` that meant one thing in notes and another in sessions would be a trap. A broken
-query selects nothing and says so; an unreadable sort still runs the query.
+`60-sessions/_spaces/`. Six ship by default — About, Tasks, Log, References, Prompts, and
+**Untagged** last — and they are ordinary files: rename them, reorder them, delete one,
+write your own. A default you delete stays deleted; *Restore default spaces* is how you ask
+for it back. The query language is the notes vault's, the same grammar and the same chip
+editor, because a `tag:` that meant one thing in notes and another in sessions would be a
+trap. A broken query selects nothing and says so; an unreadable sort still runs the query.
+
+**Untagged** is that grammar read the other way round: `-tag:about -tag:log -tag:prompt
+-tag:ref -tag:task`, which is every kind negated, so it holds exactly the files that have
+not said what they are. It sorts last and it renders **only when it has something** — on a
+session where every file declares a kind there is no such section, because a permanent
+empty row reporting the absence of a problem is noise. Its rows fold, count and carry the
+same menu as any other space's.
 
 **A space you can write into.** A space whose query names exactly one kind carries its
 own **New note** button — Tasks, Log, References and Prompts do, and so does any space you
 write that asks for one of those tags. The button is always there, not revealed by
 hovering: it is the one thing a space exists to let you do. Edit and delete stay on
 hover, because they are maintenance. The file is tagged as it is created, so it lands in
-the space you made it from rather than in Unfiled, and it opens immediately.
+the space you made it from rather than in Untagged, and it opens immediately.
 
 **Where the new file goes is your session's shape.** A flat session keeps everything in
 one pool, so the file is written at the session root. A folder-shaped session keeps
 references in `refs/` and prompts in `prompts/`, so that is where they are written —
 exactly the directories that shape reads its pool from, which is what makes the new file
 appear in the space you pressed. The directory is *where keeper puts it*; the tag is what
-makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` is still
-unfiled, in either shape, and keeper will say so rather than guessing from the folder.
+makes it a reference. A file dropped into `refs/` by hand with no `tags: [ref]` still
+declares no kind, in either shape — it is listed by **Untagged** — and keeper will say so
+rather than guessing from the folder.
 
 **How a file gets filed.** A file that already exists — one you wrote in your editor, one
 an agent dropped in, the `README.md` a session has had since the day it was made — gets
@@ -684,30 +720,39 @@ rather than a panel that would refuse.
 **One boundary that used to exist and does not any more.** A folder-shaped session's
 pool was once its `README.md` plus `refs/` and `prompts/`, so markdown sitting loose at
 the root of one was in no pool at all — tagging it filed it nowhere, and it did not even
-show up as Unfiled. It is read now, in both shapes: tag a root file and the space whose
-tag it carries lists it, leave it untagged and it is Unfiled. The record itself is still
-the record and never doubles as an ordinary file.
+show up as untagged. It is read now, in both shapes: tag a root file and the space whose
+tag it carries lists it, leave it untagged and **Untagged** lists it. The record itself is
+still the record and never doubles as an ordinary file.
 
-Two spaces are told plainly that they have no button, in one line where the button
-would have been — both of them a folder-shaped session's:
+**A space that cannot be written into still has the button, and the button says why.**
+It is there, greyed out, and the reason is what it describes itself with — so the answer
+to "why has this space no *New note* when every other one does" is on the control itself
+rather than left for you to work out. Three spaces are in that state:
 
-- **Tasks.** That contract has no tasks file — keeper will not write one where the shape
-  keeps none — so there is nowhere to put one. *Convert to flat* is how such a session
-  gets a place for keeper to write tasks into. (The board itself is not flat-only; see
-  **Tasks** below.)
-- **Log.** That shape's log is a `### ` entry under `## Log` inside `README.md`, not a
-  file at all, and **New log** on the Files header already writes one there.
+- **Tasks**, on a folder-shaped session. That contract has no tasks file — keeper will
+  not write one where the shape keeps none — so there is nowhere to put one. *Convert to
+  flat* is how such a session gets a place for keeper to write tasks into. (The board
+  itself is not flat-only; see **Tasks** below.)
+- **Log**, on a folder-shaped session. That shape's log is a `### ` entry under `## Log`
+  inside `README.md`, not a file at all, and **New log** on the Files header already
+  writes one there.
+- **Untagged**, on any session. Its query is every kind negated, so it names no kind at
+  all and there is nothing a file made there could be. Make the file from **Files** and it
+  appears in Untagged until you give it a kind tag — which is the whole of what the space
+  is for.
 
 **About says why too**, and offers the verb that does apply. A session has one about
-record — `about.md` under the flat contract, `README.md` under the folder one — and
-keeper edits it rather than making a second, so where the button would have been the
-space says exactly that and offers **Open README** (or **Open about.md**) instead. If
-the space's query asks for more than one thing — the About space on the live drives asks
-`tag:about tag:recordings` — that is what it says instead, because a create would have
-to pick one kind and the query names two. A space asking for two ordinary tags gets the
-same line. Absent rather than present and refusing, in every case; and a space whose
-query keeper cannot read still carries its own fault line rather than a second sentence
-about creating.
+record — `README.md`, under both contracts — and keeper edits it rather than making a
+second, so its create is greyed out saying exactly that, and **Open README** sits beside
+it. If the space's query asks for more than one thing — the About space on the live drives
+asks `tag:about tag:recordings` — that is what it says instead, because a create would
+have to pick one kind and the query names two. A space asking for two ordinary tags gets
+the same line.
+
+The button is **absent** in only one case: where keeper has neither a kind nor a reason to
+give you. A space asking for an ordinary tag that is not a kind — `tag:project/alpha` —
+never offered a create to miss, and a space whose query keeper cannot read carries its own
+fault line rather than a second sentence about creating.
 
 **What a row opens as.** A row is a single click and behaves like one everywhere: it
 replaces what the panel you pressed in was showing rather than adding a panel beside it.
@@ -779,6 +824,35 @@ be read on arrival, and *Start spaces folded* is where "shut them all" belongs.
 Both survive editing anything else. Rename a space, retag it, change its sort — the two
 keys come back out of the file unchanged.
 
+**A space that says where its new files go.** One more optional key, and it is the only
+one about *writing* rather than about what the space shows:
+
+```yaml
+keeper:
+  space: tag:log
+  create_dir: logs    # New note here writes logs/2026-08-17-0914-untitled.md
+```
+
+The editor calls it **New files go in**, and an empty box — which is every space until you
+type something — means what it has always meant: new files land at the session's own root.
+Set it and keeper makes the folder if it is not there, in the same write that creates the
+file. `logs` and `logs/` are the same request, and `notes/2026` is allowed.
+
+**It does not change what a file *is*.** The new file still carries the kind tag in its
+frontmatter, and that tag is the only reason any space lists it: a file in `logs/` tagged
+`ref` is a **reference**, and the References space is where it appears. keeper never reads a
+kind out of a folder. Nothing already in the session moves either — the key governs creates
+and nothing else — and the **New log** and **New prompt** buttons on the Files header belong
+to no space, so they keep writing where the session's own contract keeps that kind.
+
+Three destinations are refused when you save the space, each saying which rule it broke:
+one that leaves the session, `workspace/` — scratch that is not synced and dies with the
+session — and any folder starting with a dot, because keeper's markdown scan never enters
+one, so a file filed there would be in no space, on no board and not even Untagged. On a
+session still in the **folder** shape the contract's own `refs/` and `prompts/` keep
+winning, because that shape's pool reads exactly those two folders and the root: convert
+the session to flat and the key takes effect.
+
 **Where your own fold is kept.** Per space, in a cookie in keeper's own webview — not in the
 zone, not in `keeper.toml`, not in any file on your drives. It survives a restart and it
 does not sync: folding is a lens you chose rather than a fact about the session, so
@@ -815,17 +889,75 @@ source.
 **Sessions → the row menu → Convert to flat.** Never automatic, and never on a timetable:
 this rewrites files on your drive, so it is a verb you press.
 
-The preview shows every write before any of them happens — `about.md` from the README's
-own prose, one `YYYY-MM-DD-HHMM-<slug>.md` per `### ` log entry, and every file hoisted
-out of `refs/` and `prompts/` with its kind tag added. The README is not deleted; it is
-replaced by a three-line signpost, because every link and agent instruction that ever
-pointed at a session pointed at its README.
+The preview shows every write before any of them happens — the record rewritten in
+`README.md` from its own prose minus its `## Log`, one `YYYY-MM-DD-HHMM-<slug>.md` per
+`### ` log entry, and every file hoisted out of `refs/` and `prompts/` with its kind tag
+added. The record write is guarded on the bytes it was planned against, so an agent
+editing your README while you migrate refuses the run rather than losing the edit. There
+is no signpost to leave any more: the record IS the README, so every link and agent
+instruction that ever pointed at a session's README still resolves to the record it always
+named.
 
 It is a journaled plan like every other lifecycle verb: `AGENTS.md` is written only after
 everything the flat shape needs exists, so there is no moment where the session reads as
 flat but its logs are missing, and the two directory removals run last. Run it twice and
 the second run does nothing — the answer for an already-flat session is "no plan", which
-is idempotence stated in the type rather than promised in prose.
+is idempotence stated in the type rather than promised in prose. A session whose record is
+still an `about.md` is declined here and belongs to the verb below.
+
+## Migrating the record's name
+
+**Sessions → open the session → *Move records to README.md*.** Every flat session written
+before story 52.1 keeps its record in `about.md`, and `AGENTS.md` alone decides the shape
+now — so such a session reads with no record at all until its record is moved: no title, no
+pins, no lineage, and a board row that has lost its history. The session's own page says so
+and offers the verb, because that is the page whose emptiness is the symptom. Like every
+other verb that writes to your drive, it is a button you press.
+
+**One press moves the whole zone**, not just the session you are looking at. The record's
+name is a zone-wide contract and the pointer pass is zone-wide anyway, so fixing one row at
+a time would be forty presses for a break you did not make. It is a journaled plan per
+session and a session already at `README.md` compiles no plan at all, so the rest of the
+zone costs nothing. When it finishes it tells you how many records moved and names any
+session it had to skip.
+
+What it does, per session, in this order:
+
+- **Writes `AGENTS.md` if the session has none.** A hand-built session with an `about.md`
+  and no `AGENTS.md` reads as folder-shaped, and moving its record without writing the
+  contract file would leave it folder-shaped with a flat pool — every log invisible behind
+  a `## Log` heading that is not there.
+- **Trashes whatever is standing on `README.md`**, into `.keeper/trash/`, never an unlink.
+  Two things can be: an older migration's signpost, recognised by being tagged `ref` *and*
+  pointing at `about.md`; or, in a session with **no `AGENTS.md`**, a `README.md` you put
+  there yourself. The second one is trashed too, and that is a decision worth stating: such
+  a session was *flat* before story 52.1, so `about.md` was its record and the `README.md`
+  was an ordinary file no reader ever took for one. It goes to the trash under its own key
+  so you can put it back under another name — and without that, the session had no way
+  forward at all, since keeper will not delete or rename a `README.md`.
+- **Refuses when the session HAS its `AGENTS.md` and a `README.md` you wrote.** There
+  keeper is already reading that `README.md` as the record while your `id`, pins and
+  lineage sit in `about.md`: two files hold record content and keeper chooses neither. The
+  refusal names both, and asks you to merge them by hand — the sweep goes on to the next
+  session and reports this one as skipped.
+- **Rewrites every prose pointer at the record, across the zone.** Two spellings: `about.md`
+  or `[[about]]` beside the file that says it, and the record's full path from the drive
+  root (`60-sessions/active/2026-08-10-keeper/about.md`), which is the only way a file in
+  *another* session can name this record and have keeper resolve it. A session still
+  holding its own `about.md` keeps its bare `[[about]]` — that resolves to *that* session's
+  record, and its own run will move it — but a full path naming this session is followed
+  wherever it was written.
+- **Moves the file, last.** One rename, never a copy-then-delete, so the bytes travel
+  verbatim: every frontmatter key, the `id`, the `pinned` flag and the `keeper:` lineage
+  map arrive untouched. The one thing left stale on purpose is a link the record holds *at
+  itself*, because a byte-for-byte move cannot also edit what it moves.
+
+**`about.md` is still not deletable, and will not be until this has run everywhere.**
+`README.md`, `AGENTS.md` and `about.md` are the three a delete refuses: moving the record's
+name moved nobody's files, so until a session's record has actually been moved, its
+`about.md` is the only place its identity, pins and lineage exist — and it renders in the
+About space as an ordinary row. That row's Delete is refused for the same reason
+`README.md`'s is.
 
 ## Finding things
 

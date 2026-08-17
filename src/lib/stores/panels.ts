@@ -154,6 +154,38 @@ export interface PanelsState {
    */
   setActiveTarget: (target: PanelTargetVm) => void;
   /**
+   * A rename landed: every panel showing `from` now shows `to` (Story 52.2,
+   * FR-302).
+   *
+   * Deliberately not {@link setActiveTarget}, and the two differences between
+   * them are the whole reason this verb exists.
+   *
+   * **It moves the panels holding the FILE, not the one holding focus.** A
+   * title is committed on blur, and clicking into another pane focuses it
+   * before the blur fires (`panel-strip.tsx`'s `onMouseDown`), so "type the new
+   * title, then click the other pane" would have re-pointed the OTHER pane at
+   * the renamed file — destroying what it was showing, and leaving the pane the
+   * reader renamed from on the address the rename had just emptied. Matching on
+   * the target answers the real requirement instead — do not move a panel that
+   * is not showing this file — and answers it for every panel, so a file open in
+   * two panes follows in both rather than in whichever one had focus while the
+   * command was in flight.
+   *
+   * **It is not a preview.** {@link setActiveTarget} is the single-click gesture
+   * and records {@link Panel.replaced} so the second click of a double click can
+   * put back what the first displaced. A rename displaced nothing. Recorded
+   * anyway, the panel would be flagged as a preview whose real document is the
+   * path the rename just emptied, and {@link openPanel}'s restore branch would
+   * put that dead path back — double-clicking the renamed file in the tree would
+   * resurrect the missing-file banner beside it.
+   *
+   * A rename that moved nothing is `from === to` and does nothing here: the
+   * session record keeps its filename, and a panel that is already on the right
+   * address must not have a preview a click before it recorded cleared out from
+   * under the next double click.
+   */
+  retargetPanels: (from: PanelTargetVm, to: PanelTargetVm) => void;
+  /**
    * Double click: open this beside what is already open, and focus it.
    *
    * Two cases it deliberately does not append in, each because appending
@@ -539,6 +571,32 @@ export const panelsStore = createStore<PanelsState>()((set, get) => ({
         replaced: panel.replaced ?? { was: panel.target },
       }),
     );
+    set({ panels: next });
+    persist(next, activeId);
+  },
+
+  retargetPanels: (from, to) => {
+    const { panels, activeId } = get();
+    if (sameTarget(from, to)) {
+      return;
+    }
+    let holder = false;
+    const next = panels.map((panel) => {
+      if (!sameTarget(panel.target, from)) {
+        return panel;
+      }
+      holder = true;
+      // The fold is kept, unlike every other verb that gives a panel a target:
+      // `shown`'s rule is for a target arriving in a panel that was not showing
+      // it, and this panel WAS showing it. Unfolding here would spring open a
+      // pane the reader deliberately folded because somebody retitled a file.
+      return { ...panel, target: to, replaced: null };
+    });
+    if (!holder) {
+      // Nothing was showing it, so nothing follows it — and no cookie is
+      // rewritten over a list that did not change.
+      return;
+    }
     set({ panels: next });
     persist(next, activeId);
   },

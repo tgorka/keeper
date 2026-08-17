@@ -23,7 +23,14 @@ import {
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NoteCsvVm, NoteFolderVm, NoteRefVm, NoteRowVm, TextFileVm } from "@/lib/ipc/client";
+import type {
+  NoteCsvVm,
+  NoteFolderVm,
+  NoteRefVm,
+  NoteRowVm,
+  PanelTargetVm,
+  TextFileVm,
+} from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
 
 const syncReadText = vi.fn<(profileId: string, subpath: string) => Promise<TextFileVm>>();
@@ -32,6 +39,9 @@ const notesCsvRead = vi.fn<(vaultId: string, target: string) => Promise<NoteCsvV
 const notesTree = vi.fn<(vaultId: string, relDir: string) => Promise<NoteFolderVm>>();
 const notesResolveLink = vi.fn<(vaultId: string, target: string) => Promise<NoteRefVm | null>>();
 const notesVaultSetActive = vi.fn<(vaultId: string) => Promise<void>>();
+const syncReadFrontmatter = vi.fn<(profileId: string, subpath: string) => Promise<string>>();
+const sessionsFileRename =
+  vi.fn<(profileId: string, subpath: string, expected: string, block: string) => Promise<string>>();
 
 vi.mock("@/lib/ipc/client", () => ({
   syncReadText: (profileId: string, subpath: string) => syncReadText(profileId, subpath),
@@ -54,7 +64,14 @@ vi.mock("@/lib/ipc/client", () => ({
   // throws where the panel READS it, so these are needed even by the tests that
   // never touch a property. `syncReadFrontmatter` resolving to `""` is a file
   // with no frontmatter, which is what every fixture here is.
-  syncReadFrontmatter: vi.fn(async () => ""),
+  //
+  // Story 52.2 made both of these controllable, because a rename's answer is the
+  // panel target the viewer re-addresses itself with, and only a test can say
+  // what that answer was.
+  syncReadFrontmatter: (profileId: string, subpath: string) =>
+    syncReadFrontmatter(profileId, subpath),
+  sessionsFileRename: (profileId: string, subpath: string, expected: string, block: string) =>
+    sessionsFileRename(profileId, subpath, expected, block),
   syncWriteFrontmatter: vi.fn(async () => ""),
   notesSave: vi.fn(),
   recordingNoteTargets: vi.fn(async () => null),
@@ -64,6 +81,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
+import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
@@ -242,6 +260,11 @@ beforeEach(() => {
   notesResolveLink.mockReset();
   notesVaultSetActive.mockReset();
   notesVaultSetActive.mockResolvedValue(undefined);
+  syncReadFrontmatter.mockReset();
+  // No frontmatter, which is what the panel's own suite calls an unblocked file
+  // and what every fixture here was before Story 52.2 made this controllable.
+  syncReadFrontmatter.mockResolvedValue("");
+  sessionsFileRename.mockReset();
   resetNotesVaultsStoreForTest();
   resetPanelsStoreForTest();
   primaryViewStore.getState().setView("files");
@@ -782,10 +805,10 @@ function liveView(editor: HTMLElement): EditorView {
 /**
  * Open a session log and put the caret at the end of its Source tab.
  *
- * Markdown opens in its RENDERED view by default (`DEFAULT_VIEW_MODE`), and
- * AD-88 keeps that half read-only — so the tools belong to the tab a person
- * writes in, and a test about them has to press it first, exactly as a person
- * does.
+ * A savable markdown file opens in NOTE since story 52.3 (`defaultViewMode`), so
+ * the press below is what makes these tests about the SOURCE tab's tools rather
+ * than about whichever pane happened to be selected. Both panes have the toolbar
+ * now; the Source tab is the one 50.3 wired and the one these tests own.
  */
 async function openSessionLog(text: string): Promise<{ editor: HTMLElement; view: EditorView }> {
   syncReadText.mockResolvedValue(vm({ text }));
@@ -931,7 +954,12 @@ describe("a file that is not prose keeps the editor it had (Story 50.3)", () => 
     openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
     await settle();
 
-    // Row 5. The default view for markdown, which is where a person lands.
+    // Row 5, re-anchored by story 52.3: a savable markdown file now LANDS in
+    // Note, so the read-only half is reached by pressing Preview — which is what
+    // this test is about and always was. What must not change is what Preview is:
+    // a drawing of the document that nothing can type into (AD-88).
+    fireEvent.click(screen.getByRole("tab", { name: "Preview" }));
+    await settle();
     expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
     expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
 
@@ -1064,7 +1092,7 @@ describe("markdown keeper will not write gets no writing tools (Story 50.3)", ()
  * loader, the decoration layer and the one write path.
  */
 describe("a session log opens in three modes (Story 51.5)", () => {
-  it("previews by default, writes in Note, and saves only when asked", async () => {
+  it("opens in Note, writes there, and saves only when asked", async () => {
     syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
     syncWriteEntry.mockResolvedValue(undefined);
     openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
@@ -1075,9 +1103,11 @@ describe("a session log opens in three modes (Story 51.5)", () => {
       "Source",
       "Note",
     ]);
-    expect(screen.getByRole("tab", { name: "Preview" })).toHaveAttribute("aria-selected", "true");
+    // Story 52.3, end to end: he lands where he writes, with no press at all —
+    // and the pane he lands in is the editable one, not the Preview that used to
+    // be selected here.
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
 
-    fireEvent.click(screen.getByRole("tab", { name: "Note" }));
     const editor = await editorHost();
     const view = liveView(editor);
     expect(view.state.readOnly).toBe(false);
@@ -1119,5 +1149,307 @@ describe("a session log opens in three modes (Story 51.5)", () => {
     const tabs = screen.getAllByRole("tab").map((tab) => tab.textContent);
     expect(tabs).toEqual(["Preview", "Source"]);
     expect(screen.getByText(WORKSPACE_REFUSAL)).toBeInTheDocument();
+  });
+});
+
+/**
+ * The owner's report, closed at the surface that showed it (Story 52.2, FR-302).
+ *
+ * *"zmiana title property zmienia nazwe teraz ale tez wyswietla '<path> is no
+ * longer in tgdrive…' zamiast przeladowac plik z nowa nazwa"* — the rename
+ * landed and the pane reported the file missing, because the panel told its host
+ * only that something had changed and the host re-read the address the rename had
+ * just emptied.
+ *
+ * **The assertion is the panel's target, not a rendered sentence.** What was
+ * broken is WHERE this surface points after a rename, and the target is that,
+ * exactly. The missing-file sentence is `panel-strip.tsx`'s and is asserted in
+ * its own suite; reproducing it here would need the strip mounted around a
+ * viewer this suite deliberately renders on its own (`openThroughTheRegistry`).
+ */
+describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
+  /** A block with a title, which is the field a rename is committed from. */
+  const TITLED = "---\ntitle: untitled\n---\n";
+
+  /**
+   * What Rust answers the rename with — and the point of the fixture: a
+   * different DIRECTORY, and a filename that is not the title that was typed.
+   * No string surgery on this side could compose it from `SESSION_README` plus
+   * "Kick Off", so a panel target holding it can only have got it from the
+   * command's return value, which is the whole of what AD-65 asks this half to
+   * prove.
+   */
+  const MOVED = "60-sessions/archive/2026-02/kick-off-notes.md";
+
+  /** Commit the title row, which is a blur — the panel's own suite's gesture. */
+  async function retitle(next: string): Promise<void> {
+    const field = await screen.findByRole("textbox", { name: "title" });
+    fireEvent.change(field, { target: { value: next } });
+    fireEvent.blur(field);
+  }
+
+  it("re-points the active panel at the subpath the rename answered with", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    // The pane the reader is already in, showing the file about to be renamed —
+    // without it there is no active panel to follow anything.
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "profile-1", relativePath: SESSION_README });
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    await waitFor(() => {
+      const { panels, activeId } = panelsStore.getState();
+      const active = panels.find((panel) => panel.id === activeId);
+      expect(active?.target).toEqual({
+        kind: "file",
+        profileId: "profile-1",
+        relativePath: MOVED,
+      });
+    });
+  });
+
+  it("moves the pane it was in rather than opening a second one", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "profile-1", relativePath: SESSION_README });
+    const before = panelsStore.getState().panels.length;
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toContainEqual({
+        kind: "file",
+        profileId: "profile-1",
+        relativePath: MOVED,
+      }),
+    );
+    // Following a file is a retarget, not an open: a second panel would leave the
+    // emptied address on screen beside the file, which is the banner this story
+    // exists to remove.
+    expect(panelsStore.getState().panels).toHaveLength(before);
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).not.toContainEqual({
+      kind: "file",
+      profileId: "profile-1",
+      relativePath: SESSION_README,
+    });
+  });
+
+  /** Somewhere else in the same profile, for the pane that must not move. */
+  const OTHER: PanelTargetVm = {
+    kind: "file",
+    profileId: "profile-1",
+    relativePath: `${SESSION_DIR}/notes.md`,
+  };
+
+  /** The README as a panel target — what the pane showing this file holds. */
+  const README: PanelTargetVm = {
+    kind: "file",
+    profileId: "profile-1",
+    relativePath: SESSION_README,
+  };
+
+  /**
+   * The sequence the owner will actually perform, and the one that made the
+   * first cut of this feature a worse defect than the banner it removed.
+   *
+   * The title field commits on BLUR and a pane takes focus on `onMouseDown`
+   * (`panel-strip.tsx`), so "type the new title, then click into the other pane"
+   * runs the focus change FIRST and the commit second. Re-pointing "the active
+   * panel" then moves the pane the reader has just clicked into — destroying what
+   * it was showing — and leaves the pane they renamed from on the emptied
+   * address, still rendering "is no longer in tgdrive". The rename is held open
+   * across the focus change here rather than assumed to be, because that is what
+   * the real round trip does.
+   */
+  it("moves the pane holding the file, not the one that took focus while the title was committing", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    let answer: (subpath: string) => void = () => {};
+    sessionsFileRename.mockReturnValue(
+      new Promise<string>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    // Two panes: the left one on another file, the right one on the README the
+    // reader is renaming from.
+    panelsStore.getState().setActiveTarget(OTHER);
+    panelsStore.getState().openPanel(README);
+    const [left, right] = panelsStore.getState().panels;
+    if (left === undefined || right === undefined) {
+      throw new Error("expected two panels");
+    }
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+    // The click into the other pane, which is what a blur means when it is a
+    // click and not a Tab.
+    await act(async () => {
+      panelsStore.getState().focusPanel(left.id);
+    });
+    await act(async () => {
+      answer(MOVED);
+    });
+
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([
+        OTHER,
+        { kind: "file", profileId: "profile-1", relativePath: MOVED },
+      ]),
+    );
+    // And the pane the reader clicked into keeps focus as well as its document: a
+    // rename is not a navigation.
+    expect(panelsStore.getState().activeId).toBe(left.id);
+  });
+
+  /**
+   * The same file in two panes — the shape a panel strip exists for, and the one
+   * where "move the active panel" leaves a dead path behind with no second click
+   * involved at all. The pane that did not follow persists that path to the
+   * panels cookie, so the banner comes back after a restart too.
+   */
+  it("moves every pane holding the file, not only the focused one", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    panelsStore.getState().setActiveTarget(README);
+    panelsStore.getState().openPanel(OTHER);
+    panelsStore.getState().setActiveTarget(README);
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([README, README]);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+
+    const moved = { kind: "file", profileId: "profile-1", relativePath: MOVED };
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved, moved]),
+    );
+  });
+
+  /**
+   * The re-point is not a PREVIEW, and this is the gesture that proves it costs
+   * something to pretend otherwise.
+   *
+   * `setActiveTarget` records {@link Panel.replaced} so the second click of a
+   * double click can put back what the first displaced. Used for a rename it
+   * records `was:` the path the rename just emptied — and `openPanel`'s restore
+   * branch is live, so double-clicking the renamed file in the tree puts that dead
+   * path back and opens the file beside it. The reader gets the banner they were
+   * just spared, plus a second panel.
+   */
+  it("leaves no preview memory of the emptied path for a later double click to restore", async () => {
+    syncReadText.mockResolvedValue(vm({ text: "# Session\n\nalpha\n" }));
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    sessionsFileRename.mockResolvedValue(MOVED);
+    // Pinned, not previewed: this pane really holds the README.
+    panelsStore.getState().openPanel(README);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    await retitle("Kick Off");
+    const moved: PanelTargetVm = { kind: "file", profileId: "profile-1", relativePath: MOVED };
+    await waitFor(() =>
+      expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved]),
+    );
+
+    // The double click, on the renamed row.
+    panelsStore.getState().openPanel(moved);
+
+    expect(panelsStore.getState().panels.map((panel) => panel.target)).toEqual([moved]);
+  });
+
+  it("offers no properties panel for a file in no profile, so no rename can strand it", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    openThroughTheRegistry(
+      target({ name: "loose.md", relativePath: "archive/loose.md", profileId: null }),
+    );
+    await settle();
+
+    // The spec's one Block-if: with no profile there is no address to re-point,
+    // and this surface answers it by having no rename to offer at all — not by
+    // offering one whose success would re-read a path that had moved.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(syncReadFrontmatter).not.toHaveBeenCalled();
+    expect(sessionsFileRename).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The block is drawn once, and saved whole (Story 52.3, FR-304).
+ *
+ * *"note tab w sesions nie musi renderowac czesci properties jak juz jest powyzej
+ * formularz"* — on a file the buffer IS the whole file, so the YAML block was on
+ * screen twice: once as the panel's controls, once as `---` lines in the reader's
+ * own document.
+ *
+ * End to end here rather than in `text-file-frame.test.tsx`, deliberately: what
+ * has to hold is that the frame's verdict REACHES the pane and that a save still
+ * writes the block, and both need the real panel above a real editor over real
+ * bytes. A frame test could only assert the prop it just passed.
+ */
+describe("the properties block is drawn once, not twice (Story 52.3)", () => {
+  /** A file with properties, as `file_properties` writes them, and its body. */
+  const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
+  const BODY = "# Weekly\n\nalpha\n";
+
+  it("keeps the block out of Note mode and puts it back in the bytes a save writes", async () => {
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncReadText.mockResolvedValue(vm({ text: BLOCK + BODY }));
+    syncWriteEntry.mockResolvedValue(undefined);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+
+    // The form is genuinely above the pane. Without this the test would pass over
+    // a surface that had no panel at all, which is the case where the block SHOULD
+    // be document text.
+    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+
+    const editor = await editorHost();
+    const view = liveView(editor);
+    // Story 52.3's default put the reader here with no press, and what he is
+    // looking at is his document — not his document with its own metadata pasted
+    // at the top of it.
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    expect(view.state.doc.toString()).toBe(BODY);
+
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+
+    // Byte for byte, through the same one write path: the block the reader was
+    // never shown is still the first thing in the file. A save that wrote what the
+    // pane was holding would delete the properties the form above it is editing.
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      `${BLOCK}# Weekly\n\nalpha\nbeta\n`,
+    );
+  });
+
+  it("still shows every byte on the Source tab, which is the file's characters", async () => {
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncReadText.mockResolvedValue(vm({ text: BLOCK + BODY }));
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    const view = liveView(await editorHost());
+
+    // AD-88's one buffer, visible in full in the one view that is always the
+    // source. Hiding anything here would be a lie about what Save writes.
+    expect(view.state.doc.toString()).toBe(BLOCK + BODY);
   });
 });

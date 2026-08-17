@@ -211,6 +211,8 @@ export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
+export type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
+export type { SessionRecordSkipVm } from "./gen/SessionRecordSkipVm";
 export type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 export type { SessionRefAddReq } from "./gen/SessionRefAddReq";
 export type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
@@ -363,6 +365,7 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
 import type { SessionRefCandidatesVm } from "./gen/SessionRefCandidatesVm";
@@ -5595,10 +5598,10 @@ export type SessionFileKind = "md" | "csv" | "json";
  * composed here would be a second namer, and the two would disagree about
  * collisions the instant an agent wrote a file between the read and the create.
  *
- * A new `.md` declares no kind, so it lands in the detail's *unfiled* list and
- * is told so — keeper does not know what an operator's new file is, and guessing
- * `log` would file a stray thought as history. {@link sessionsFileNewKind} is
- * the verb for the two it does know.
+ * A new `.md` declares no kind, so the `Untagged` space lists it and explains
+ * itself there (Story 52.4) — keeper does not know what an operator's new file
+ * is, and guessing `log` would file a stray thought as history.
+ * {@link sessionsFileNewKind} is the verb for the kinds it does know.
  *
  * Rejects with: `internal` (unknown root or session; a path inside `workspace/`,
  * which is scratch keeper never writes to; an extension outside the closed set),
@@ -5671,17 +5674,33 @@ export async function sessionsDirNew(
  * whether the zone's spaces will ever list the file, which is why keeper spells
  * both rather than leaving them to whoever is typing.
  *
- * Rejects with: `internal` (unknown root or session, or `about` — a session has
- * one record and a second would give the shape reader two answers),
- * `unsupported`.
+ * **`spaceId` is the space that pressed the button, and `""` is nobody** (Story
+ * 52.5). A space may name a directory its creates go into
+ * ({@link SessionSpaceVm.createDir}), and Rust reads that definition and composes
+ * the path (AD-65) — pass the space's own id and nothing else. The *Files*
+ * heading's own creates belong to no space and send `""`, which produces the
+ * write it always produced. Nothing here joins a directory to a filename, and a
+ * directory keeper will not write into was already refused when the space was
+ * saved.
+ *
+ * Rejects with: `internal` (unknown root or session, a space that is no longer
+ * there, or `about` — a session has one record and a second would give the shape
+ * reader two answers), `unsupported`.
  */
 export async function sessionsFileNewKind(
   rootId: string,
   sessionId: string,
   kind: string,
   title: string,
+  spaceId: string,
 ): Promise<string> {
-  return await invoke<string>("sessions_file_new_kind", { rootId, sessionId, kind, title });
+  return await invoke<string>("sessions_file_new_kind", {
+    rootId,
+    sessionId,
+    kind,
+    title,
+    spaceId,
+  });
 }
 
 /**
@@ -5877,20 +5896,58 @@ export async function sessionsMigratePreview(
 }
 
 /**
- * Convert one folder-shaped session to the flat contract (FR-257): the README's
- * record becomes `about.md`, each `### ` log entry becomes its own stamped
- * file, `refs/` and `prompts/` are hoisted into the root pool with their kind
- * as a tag, and the two directories are trashed last.
+ * Convert one folder-shaped session to the flat contract (FR-257): the record
+ * stays in `README.md` minus its `## Log` section and plus the `about` kind tag,
+ * each `### ` log entry becomes its own stamped file, `refs/` and `prompts/` are
+ * hoisted into the root pool with their kind as a tag, and the two directories
+ * are trashed last.
  *
  * Journaled and idempotent — a crash mid-run resumes from the journal, and a
  * session that is already flat resolves without writing. **Never automatic**:
  * only the operator triggers it.
+ *
+ * A session whose record is still an unmigrated `about.md` is declined here and
+ * belongs to {@link sessionsRecordMigrate} instead.
  *
  * Rejects with: `internal` (unknown root or session; a failed step — the
  * journal survives and the run is retriable), `unsupported`.
  */
 export async function sessionsMigrate(rootId: string, sessionId: string): Promise<void> {
   await invoke<void>("sessions_migrate", { rootId, sessionId });
+}
+
+/**
+ * Move a session's record from `about.md` to `README.md` (Story 52.1, FR-300,
+ * FR-301) — one journaled plan per session, through the same executor every
+ * other lifecycle verb runs on.
+ *
+ * Omit `sessionId` for the whole zone, which is the ordinary case: the record's
+ * name is a zone-wide contract, and a session still keeping its `about.md`
+ * renders with no record at all now that `AGENTS.md` alone decides the shape.
+ *
+ * What it does per session: writes `AGENTS.md` first where a hand-built session
+ * never had one (without it the move would silently leave the session
+ * folder-shaped), trashes into `.keeper/trash/` whatever is standing on the
+ * destination — an older migration's README signpost, or somebody's own
+ * `README.md` in a session that has no `AGENTS.md` and therefore kept its record
+ * in `about.md` — rewrites every prose pointer at the record across the zone, and
+ * moves the file last. The record's bytes are never recomposed: every frontmatter
+ * key, the `pinned` flag and the `keeper:` lineage map arrive untouched.
+ *
+ * Answers with `moved` and one `skipped` row per session keeper declined to
+ * compile a plan for — a `README.md` in the way of a session that HAS its
+ * `AGENTS.md`, where two files hold record content and keeper chooses neither.
+ * A refusal never ends the sweep: the rest of the zone still migrates, and the
+ * answer says which rows did not.
+ *
+ * Rejects with: `internal` (unknown root, a root that has not scanned yet, an
+ * unknown session, a step that failed to write), `unsupported`.
+ */
+export async function sessionsRecordMigrate(
+  rootId: string,
+  sessionId?: string,
+): Promise<SessionRecordMigrateVm> {
+  return await invoke<SessionRecordMigrateVm>("sessions_record_migrate", { rootId, sessionId });
 }
 
 /**

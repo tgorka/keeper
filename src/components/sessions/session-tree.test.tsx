@@ -1,15 +1,26 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntryVm } from "@/lib/ipc/client";
 
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
 const sessionsFileDelete = vi.fn();
+// Story 52.8 pulled `SpaceRowMenu` onto every row, so this suite now loads its
+// three commands too. Declared rather than left to the proxy: a verb that reads
+// an undefined key off a mocked module fails with vitest's own message instead
+// of the assertion that would say which wire is loose.
+const sessionsFilePath = vi.fn();
+const sessionsFileRename = vi.fn();
+const syncReadFrontmatter = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
   revealPath: (path: unknown) => revealPath(path),
   sessionsFileDelete: (root: unknown, session: unknown, rel: unknown) =>
     sessionsFileDelete(root, session, rel),
+  sessionsFilePath: (root: unknown, subpath: unknown) => sessionsFilePath(root, subpath),
+  sessionsFileRename: (root: unknown, subpath: unknown, block: unknown, next: unknown) =>
+    sessionsFileRename(root, subpath, block, next),
+  syncReadFrontmatter: (root: unknown, subpath: unknown) => syncReadFrontmatter(root, subpath),
 }));
 
 import { FILES_SYNC_MARK_TESTID } from "@/components/layout/sync-status-mark";
@@ -24,6 +35,16 @@ import {
   SESSION_TREE_TRUNCATED,
   SessionTree,
 } from "@/components/sessions/session-tree";
+import {
+  SPACE_ROW_COPY_PATH_LABEL,
+  SPACE_ROW_DELETE_LABEL,
+  SPACE_ROW_OPEN_BESIDE_LABEL,
+  SPACE_ROW_OPEN_HERE_LABEL,
+  SPACE_ROW_OPEN_LABEL,
+  SPACE_ROW_RENAME_KEEPS_NAME,
+  SPACE_ROW_RENAME_LABEL,
+  SPACE_ROW_REVEAL_LABEL,
+} from "@/components/sessions/space-row-menu";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const NOW = Date.now();
@@ -145,10 +166,44 @@ function mount(over: Partial<React.ComponentProps<typeof SessionTree>> = {}) {
   return { ...result, onOpen, onChanged };
 }
 
+/**
+ * Right-click a row, which is the gesture story 52.8 exists for.
+ *
+ * Returns the menu rather than asserting inside it, because Radix's menu is
+ * modal: with one open the tree behind it is `aria-hidden`, so every row a case
+ * needs must be held before this is called.
+ */
+async function openMenu(row: HTMLElement): Promise<HTMLElement> {
+  fireEvent.contextMenu(row);
+  return await screen.findByRole("menu");
+}
+
+/**
+ * What the menu offers, by accessible name and in order.
+ *
+ * `aria-label` first because two items carry a sentence beside their label — a
+ * refusal, or what a rename of the record does instead — and the label is the
+ * name while the sentence is the description (`attach-file-button.tsx:211-218`).
+ * Reading `textContent` alone would compare against "Deletekeeper deletes one
+ * file at a time…", which is the string nobody can say.
+ */
+function verbs(menu: HTMLElement): string[] {
+  return within(menu)
+    .getAllByRole("menuitem")
+    .map((item) => item.getAttribute("aria-label") ?? item.textContent ?? "");
+}
+
 beforeEach(() => {
   syncOpenEntry.mockResolvedValue(undefined);
   revealPath.mockResolvedValue(undefined);
   sessionsFileDelete.mockResolvedValue(null);
+  sessionsFilePath.mockResolvedValue(
+    "/Users/tgorka/tgdrive/60-sessions/active/2026-08-10-keeper/artifacts/release-notes.md",
+  );
+  syncReadFrontmatter.mockResolvedValue("---\ntitle: notes\n---\n");
+  sessionsFileRename.mockResolvedValue(
+    "60-sessions/active/2026-08-10-keeper/artifacts/release-notes.md",
+  );
   capabilitiesStore.setState({
     capabilities: { ...DEFAULT_CAPABILITIES, revealInFileManager: true },
     hydrated: true,
@@ -395,5 +450,260 @@ describe("SessionTree", () => {
     );
     expect(screen.queryByText(SESSION_TREE_DELETE_FAILED)).not.toBeInTheDocument();
     expect(onChanged).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Story 52.8, FR-312 — *"prawy klawisz myszy wciaz nie dziala w session files"*.
+ *
+ * Story 51.6 built one `ContextMenu` for this app's session surface and scoped
+ * itself to a SPACE row; the rows the owner was right-clicking are these. Every
+ * case below opens the menu on a row **`SessionTree` rendered**, which is the
+ * whole point of the suite: `space-row-menu.test.tsx` mounts the component around
+ * a synthetic `<button>` and proves the component works, which says nothing about
+ * which rows have it.
+ */
+describe("SessionTree — the row's context menu", () => {
+  /** Row 1. The space row's seven verbs, on a file in the tree. */
+  it("answers a right-click on a file row with the seven verbs a space row has", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "release-notes.md" });
+
+    expect(verbs(await openMenu(row))).toEqual([
+      SPACE_ROW_OPEN_HERE_LABEL,
+      SPACE_ROW_OPEN_BESIDE_LABEL,
+      SPACE_ROW_OPEN_LABEL,
+      SPACE_ROW_REVEAL_LABEL,
+      SPACE_ROW_COPY_PATH_LABEL,
+      SPACE_ROW_RENAME_LABEL,
+      SPACE_ROW_DELETE_LABEL,
+    ]);
+  });
+
+  /**
+   * Row 2. A folder is not a panel target and has no title to write, so the three
+   * verbs that address a file and the rename are gone — `files-pane.tsx`'s own
+   * answer for this row (`files-pane.test.tsx:1938-1942`), plus the Delete this
+   * tree's rows carry. Delete is the one it keeps and cannot use: Rust refuses
+   * every directory, so it is there with the refusal rather than absent.
+   */
+  it("answers a right-click on a folder row with the verbs a folder actually has", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "artifacts" });
+
+    const menu = await openMenu(row);
+    expect(verbs(menu)).toEqual([
+      SPACE_ROW_REVEAL_LABEL,
+      SPACE_ROW_COPY_PATH_LABEL,
+      SPACE_ROW_DELETE_LABEL,
+    ]);
+    const remove = within(menu).getByRole("menuitem", { name: SPACE_ROW_DELETE_LABEL });
+    expect(remove.closest("[data-disabled]")).not.toBeNull();
+    expect(remove).toHaveAccessibleDescription(DIR_UNDELETABLE);
+  });
+
+  /**
+   * Row 3. The menu never offers a verb that would fail afterwards, and the
+   * reason is Rust's sentence rather than a re-wording: `undeletable` is
+   * `check_deletable`'s own refusal and is `Some` for everything under
+   * `workspace/`, which is what the fence says about this file.
+   */
+  it("disables Delete on a locked row and describes it in the fence's own words", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "iter-3.md" });
+
+    const remove = within(await openMenu(row)).getByRole("menuitem", {
+      name: SPACE_ROW_DELETE_LABEL,
+    });
+    expect(remove.closest("[data-disabled]")).not.toBeNull();
+    expect(remove).toHaveAccessibleDescription(expect.stringContaining("never writes there"));
+  });
+
+  /**
+   * Row 4. `files::renames` answers *false* for the record, and what that means
+   * is that the title is written and the file does not move (`files.rs:405-416`)
+   * — so the item stays live and says what it will do. This tree labels its rows
+   * with the FILENAME, which is exactly why the sentence is needed here: without
+   * it the verb's whole effect is off screen.
+   */
+  it("says the record keeps its filename, rather than looking like it did nothing", async () => {
+    mount();
+    const record = screen.getByRole("treeitem", { name: "README.md" });
+
+    const rename = within(await openMenu(record)).getByRole("menuitem", {
+      name: SPACE_ROW_RENAME_LABEL,
+    });
+    expect(rename).toHaveAccessibleDescription(SPACE_ROW_RENAME_KEEPS_NAME);
+
+    // And the confirmation says it too, because the body it would otherwise show
+    // promises a file that follows its title — the one thing this rename does not
+    // do.
+    fireEvent.click(rename);
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(SPACE_ROW_RENAME_KEEPS_NAME);
+  });
+
+  /** And an ordinary pool file says nothing of the kind — the row's name follows. */
+  it("promises nothing of the sort on a file whose name does follow its title", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "release-notes.md" });
+
+    expect(
+      within(await openMenu(row)).getByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL }),
+    ).toHaveAccessibleDescription("");
+  });
+
+  /**
+   * A rename writes a frontmatter `title:`, so it is a verb only markdown has —
+   * and the registry is what says which files those are. The row is still a panel
+   * target, which is the difference between this case and the folder above.
+   */
+  it("offers no Rename on a file with no frontmatter to write", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "board.png" });
+
+    const menu = await openMenu(row);
+    expect(within(menu).queryByRole("menuitem", { name: SPACE_ROW_RENAME_LABEL })).toBeNull();
+    expect(
+      within(menu).getByRole("menuitem", { name: SPACE_ROW_OPEN_HERE_LABEL }),
+    ).toBeInTheDocument();
+  });
+
+  /**
+   * Row 5. Five of these verbs have no other route from this row — the three
+   * hover buttons are open-externally, reveal and delete — so a menu only a mouse
+   * can open would be five verbs behind a pointer. The keystroke lives in the
+   * component; this asserts the tree's row is where it arrives.
+   */
+  it("opens the menu on the focused row from Shift+F10", async () => {
+    mount();
+    const row = screen.getByRole("treeitem", { name: "release-notes.md" });
+    row.focus();
+
+    fireEvent.keyDown(row, { key: "F10", shiftKey: true });
+
+    expect(
+      within(await screen.findByRole("menu")).getByRole("menuitem", {
+        name: SPACE_ROW_OPEN_HERE_LABEL,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  /**
+   * The event collision, asserted rather than reasoned about. The row now has two
+   * `onKeyDown` handlers — the tree's own and the trigger's summon key — and Radix
+   * composes them child-first, so the tree keeps every key it had and the menu
+   * takes only the two it answers to.
+   */
+  it("keeps the tree's arrows and Enter while the row is also a menu trigger", () => {
+    const { onOpen } = mount();
+    screen.getByRole("treeitem", { name: "artifacts" }).focus();
+
+    fireEvent.keyDown(document.activeElement as Element, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(screen.getByRole("treeitem", { name: "release-notes.md" }));
+    fireEvent.keyDown(document.activeElement as Element, { key: "Enter" });
+
+    expect(onOpen).toHaveBeenCalledWith(
+      expect.objectContaining({ relPath: "artifacts/release-notes.md" }),
+    );
+    // Enter is the row's, not the menu's: a tree whose Enter opened a menu would
+    // have lost the gesture that opens the file.
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  /**
+   * Row 6. Through the tree's own `onOpen` — the surface already has exactly one
+   * function that opens a session file, and a `setActiveTarget` in the menu would
+   * be a second implementation of the row's click.
+   */
+  it("opens the file the row names in this panel", async () => {
+    const { onOpen } = mount();
+    const row = screen.getByRole("treeitem", { name: "release-notes.md" });
+
+    const menu = await openMenu(row);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: SPACE_ROW_OPEN_HERE_LABEL }));
+
+    await waitFor(() =>
+      expect(onOpen).toHaveBeenCalledWith(
+        expect.objectContaining({
+          relPath: "artifacts/release-notes.md",
+          subpath: "60-sessions/active/2026-08-10-keeper/artifacts/release-notes.md",
+        }),
+      ),
+    );
+  });
+
+  /**
+   * The delete verb, end to end from the menu, because the session id is the one
+   * argument this tree supplies and a menu wired with the wrong one would refuse
+   * every delete at the far end.
+   */
+  it("deletes through the menu with the session the tree was given", async () => {
+    const { onChanged } = mount();
+    const row = screen.getByRole("treeitem", { name: "README.md" });
+
+    const menu = await openMenu(row);
+    fireEvent.click(within(menu).getByRole("menuitem", { name: SPACE_ROW_DELETE_LABEL }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(sessionsFileDelete).not.toHaveBeenCalled();
+    within(dialog).getByRole("button", { name: SPACE_ROW_DELETE_LABEL }).click();
+
+    await waitFor(() =>
+      expect(sessionsFileDelete).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "README.md",
+      ),
+    );
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  /**
+   * The house pattern's other half (`files-pane.test.tsx:1959`). A ≥500ms
+   * stationary press dispatches the synthetic `contextmenu` the Radix trigger
+   * already listens for, so the phone gets the same menu rather than a second
+   * one — and this exists to prove the bridge is wired to the row rather than
+   * merely imported.
+   */
+  it("opens the same menu on a phone-tier long press", async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        matches: query.includes("prefers-reduced-motion") ? false : 390 <= maxWidth,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+    try {
+      mount();
+      const row = screen.getByRole("treeitem", { name: "release-notes.md" });
+
+      // Fake timers only around the hold: the query below polls on real ones.
+      vi.useFakeTimers();
+      fireEvent.pointerDown(row, { pointerId: 1, clientX: 30, clientY: 30 });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      vi.useRealTimers();
+
+      expect(verbs(await screen.findByRole("menu"))).toEqual([
+        SPACE_ROW_OPEN_HERE_LABEL,
+        SPACE_ROW_OPEN_BESIDE_LABEL,
+        SPACE_ROW_OPEN_LABEL,
+        SPACE_ROW_REVEAL_LABEL,
+        SPACE_ROW_COPY_PATH_LABEL,
+        SPACE_ROW_RENAME_LABEL,
+        SPACE_ROW_DELETE_LABEL,
+      ]);
+    } finally {
+      vi.useRealTimers();
+      window.matchMedia = originalMatchMedia;
+    }
   });
 });

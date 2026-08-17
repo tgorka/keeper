@@ -41,6 +41,7 @@ import { Button } from "@/components/ui/button";
 import type {
   SessionDetailVm,
   SessionEntryVm,
+  SessionRecordMigrateVm,
   SessionReferencesVm,
   SessionSpaceFilesVm,
   SessionSpaceVm,
@@ -49,6 +50,7 @@ import type {
 import {
   listenSessionsChanged,
   sessionsDetail,
+  sessionsRecordMigrate,
   sessionsRefs,
   sessionsSpaceFiles,
   sessionsSpaces,
@@ -87,28 +89,66 @@ export const SESSION_DETAIL_WORKSPACE_CAVEAT =
 export const SESSION_DETAIL_NO_LOG = "No log entries yet.";
 
 /**
- * The `unfiled` notice (AD-119): root markdown that declares no kind.
+ * Open the session's record in the strip.
  *
- * Not an error and not styled as one — a hand-dropped note is an ordinary way
- * to use a folder, and a person mid-thought should not be scolded by their own
- * tooling. It is a *nudge*, and it exists because in a flat session an untagged
- * file is invisible to every space: it would sit on disk being skipped by the
- * one surface that was supposed to show it.
- */
-export const SESSION_DETAIL_UNFILED_HEADING = "Unfiled";
-export const SESSION_DETAIL_UNFILED_HINT =
-  "No kind tag, so no space will list these. Add tags: [log], [ref], [prompt] or [task] to file them.";
-
-/**
- * Open the session's record in the strip — whose NAME depends on the shape.
- *
- * A flat session's record is `about.md`; a folder-shaped one's is `README.md`,
- * where it has always been. The button says which, because "Open record" would
- * be keeper's word for a file the operator knows by its filename, and the whole
+ * **One name, one label, since Story 52.1.** The record was `about.md` under the
+ * flat contract and `README.md` under the folder one, so this was a pair of
+ * labels picked by shape. Both contracts keep the record at `README.md` now, so
+ * there is one file to name and the button names it — "Open record" would be
+ * keeper's word for a file the operator knows by its filename, and the whole
  * point of the flat contract is that the files are the truth.
  */
-export const SESSION_DETAIL_OPEN_ABOUT_LABEL = "Open about.md";
-export const SESSION_DETAIL_OPEN_README_LABEL = "Open README";
+export const SESSION_RECORD_NAME = "README.md";
+export const SESSION_DETAIL_OPEN_RECORD_LABEL = "Open README";
+
+/**
+ * The record-name migration, and the one place in the product it can be pressed
+ * (Story 52.1, FR-300).
+ *
+ * `sessions_record_migrate` shipped registered, wrapped and unreachable: nothing
+ * called it. That was not a missing convenience — story 52.1 narrowed
+ * `shape::shape` to `AGENTS.md` and repointed `sessions_root::row_for` at
+ * `README.md`, so every flat session already on somebody's drive (an `AGENTS.md`
+ * and an `about.md`, no `README.md`) parses an EMPTY record on the next rescan and
+ * loses its `id` to a `path:` fallback, with its title, its `pinned` flag and its
+ * `keeper:` lineage. `files::check_deletable` calls that "the worst failure shape
+ * there is because nothing looks broken". The remedy existed and could not be run.
+ *
+ * **Here, and sweeping the whole ZONE.** Two decisions:
+ *
+ * - The detail is where the failure is legible. This is the surface that draws the
+ *   record — its title, its properties, its log — so a session whose record keeps
+ *   its old name is a session that renders wrong *here*, which is where a person
+ *   arrives asking why. The board's row menu offers the shape verb ("Convert to
+ *   flat") per session; the record's name is not a per-session property.
+ * - `sessionId` is omitted, so one press moves every session in the zone. The
+ *   record's name is a zone-wide contract, the pointer pass is zone-wide whatever
+ *   is asked, and a per-session run would leave the operator pressing a button
+ *   once per broken row to fix a break they did not make. Per session it is
+ *   idempotent — an already-migrated session compiles an empty plan — so a sweep
+ *   costs the rest of the zone nothing.
+ *
+ * Offered only where this session still has an `about.md` at its root, read off
+ * the tree keeper already loaded: the button appears exactly where the failure is
+ * and disappears when it is fixed, rather than sitting on every session forever
+ * as a verb with nothing to do.
+ */
+export const SESSION_RECORD_MIGRATE_LABEL = "Move records to README.md";
+export const SESSION_RECORD_MIGRATE_NOTICE =
+  "This session's record is still about.md, so keeper reads it as a session with no record at all — no title, no pins, no lineage. Moving it is a verb you press; it runs for every session in this zone and keeps every byte of each record.";
+
+/**
+ * The answer's own label, so the sweep's outcome is addressable rather than "the
+ * one live region on the surface" — the spaces section has its own.
+ */
+export const SESSION_RECORD_MIGRATE_RESULT_LABEL = "Record migration";
+
+/** What the sweep answered, in the zone's own voice. */
+export function recordMigrateSentence(moved: number): string {
+  return moved === 0
+    ? "Nothing needed moving — every record in this zone is already at README.md."
+    : `Moved ${moved} ${moved === 1 ? "record" : "records"} to README.md.`;
+}
 
 export interface SessionDetailProps {
   rootId: string;
@@ -157,6 +197,19 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
    * crate's to make; this is what removes the press a person can perform.
    */
   const [writing, setWriting] = useState(false);
+
+  /**
+   * The record-name sweep: in flight, and what it answered.
+   *
+   * The answer is kept rather than discarded because a zone-wide run has two
+   * halves — what moved, and what keeper declined to move — and the second one is
+   * the whole reason the command reports rows instead of a count. A rejection is
+   * separate: that is a step that failed to write, and it has no `moved` to sit
+   * beside.
+   */
+  const [migrating, setMigrating] = useState(false);
+  const [migrated, setMigrated] = useState<SessionRecordMigrateVm | null>(null);
+  const [migrateError, setMigrateError] = useState<string | null>(null);
 
   /**
    * Restore the spaces' fold, and read the default it falls back to
@@ -343,18 +396,9 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     [rootId],
   );
 
-  // The record's filename is the shape's, not a guess: `shape` is decided in
-  // Rust from the session's own listing (AD-119) and arrives on the VM, so this
-  // reads a field rather than probing the disk for which file exists.
-  const recordName = detail?.shape === "flat" ? "about.md" : "README.md";
-
-  // And the label naming it, once. The spaces section offers the same verb where
-  // a create is refused because the record already exists (Story 51.7, FR-299),
-  // and two places composing "which file is the record called" is how the header
-  // and the section come to name different files for one contract.
-  const recordLabel =
-    detail?.shape === "flat" ? SESSION_DETAIL_OPEN_ABOUT_LABEL : SESSION_DETAIL_OPEN_README_LABEL;
-
+  // The record's filename is a constant, not a guess and no longer a branch on
+  // the shape (Story 52.1): both contracts keep it at `README.md`, so `shape` is
+  // read here for what the surface OFFERS and never for what a file is called.
   const openRecord = useCallback(() => {
     if (detail === null) {
       return;
@@ -362,9 +406,39 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
     panelsStore.getState().setActiveTarget({
       kind: "file",
       profileId: rootId,
-      relativePath: `${subfolder}/${detail.path}/${recordName}`,
+      relativePath: `${subfolder}/${detail.path}/${SESSION_RECORD_NAME}`,
     });
-  }, [detail, recordName, rootId, subfolder]);
+  }, [detail, rootId, subfolder]);
+
+  /**
+   * Whether this session still keeps its record under the old name, read off the
+   * tree this surface already has.
+   *
+   * The files are the truth (AD-110), and an `about.md` at the session's own root
+   * is the whole of the condition: `shape::shape` stopped reading that name in
+   * Story 52.1, so a session holding one renders from a record keeper never found.
+   * A tree that failed to load offers nothing rather than guessing.
+   */
+  const unmigrated =
+    tree?.entries.some((entry) => !entry.isDir && entry.relPath === "about.md") === true;
+
+  // The zone-wide sweep, with no `sessionId` — see SESSION_RECORD_MIGRATE_LABEL.
+  // Rust rescans the root when anything moved, so the record, the tree and the
+  // spaces all re-read through the changed event rather than from here.
+  const migrateRecords = useCallback(() => {
+    setMigrating(true);
+    setMigrateError(null);
+    sessionsRecordMigrate(rootId).then(
+      (report) => {
+        setMigrated(report);
+        setMigrating(false);
+      },
+      (e: unknown) => {
+        setMigrateError(e instanceof Error ? e.message : String(e));
+        setMigrating(false);
+      },
+    );
+  }, [rootId]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -395,7 +469,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               </Badge>
               <Button type="button" variant="outline" size="sm" onClick={openRecord}>
                 <Pencil aria-hidden className="size-3.5" />
-                {recordLabel}
+                {SESSION_DETAIL_OPEN_RECORD_LABEL}
               </Button>
             </div>
             {detail.summary !== "" && (
@@ -422,6 +496,56 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             </div>
           </header>
 
+          {/* The record's own name, where a session still keeps the old one
+              (Story 52.1, FR-300). A notice rather than a bare button: the
+              operator did not break this, keeper's own predicate change did, so
+              the surface says what happened before it offers the verb. */}
+          {unmigrated && (
+            <section
+              aria-label={SESSION_RECORD_MIGRATE_LABEL}
+              className="flex flex-col gap-2 rounded-md border border-border bg-muted/40 px-3 py-2"
+            >
+              <p className="text-muted-foreground text-sm">{SESSION_RECORD_MIGRATE_NOTICE}</p>
+              <div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={migrating}
+                  onClick={migrateRecords}
+                >
+                  {SESSION_RECORD_MIGRATE_LABEL}
+                </Button>
+              </div>
+            </section>
+          )}
+          {/* Outside the notice, because the notice disappears the moment the
+              record moves and the answer has to outlive it. */}
+          {migrated !== null && (
+            <div
+              role="status"
+              aria-label={SESSION_RECORD_MIGRATE_RESULT_LABEL}
+              className="rounded-md border border-border px-3 py-2 text-sm"
+            >
+              <p>{recordMigrateSentence(migrated.moved)}</p>
+              {migrated.skipped.length > 0 && (
+                <ul className="mt-1 flex flex-col gap-1 text-muted-foreground">
+                  {migrated.skipped.map((skip) => (
+                    <li key={skip.session}>
+                      <span className="font-medium">{skip.title}</span> ({skip.session}):{" "}
+                      {skip.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {migrateError !== null && (
+            <div role="alert" className="rounded-md bg-destructive/10 p-3 text-destructive text-sm">
+              {migrateError}
+            </div>
+          )}
+
           {/* The properties widget (FR-227): user-tier frontmatter, read here,
               edited in the README's own properties panel — one writer. */}
           {detail.properties.length > 0 && (
@@ -440,10 +564,60 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             </section>
           )}
 
-          {/* The session's own file tree, in the zone's own order (FR-254) —
-              FIRST, and fully expanded. In a flat session the files ARE the
-              structure, so this is both the map and the contents; anything
-              above it would be read past. */}
+          {/* The zone's saved queries, read against this session (FR-261) —
+              ABOVE the files since Story 52.4, on the operator's own instruction
+              (*"umiesc spaces ponad files"*).
+
+              It sat after the tree until then, and the argument written here was
+              that the tree is what is there and this is what it means, so a
+              person should see the filenames before reading a grouping of them.
+              That is an argument about which is more FUNDAMENTAL. The order is
+              about which is read more OFTEN: About, Tasks and Log are what a
+              person opens a session for, and the tree is where they go when a
+              space has not surfaced something — which is the second question and
+              now sits second. Nothing here depends on the sequence: the two
+              sections share no `aria` relationship, the tree's roving `tabindex`
+              is its own, and neither takes focus on mount. The two sentences that
+              DID depend on it are Rust's, and they now say "Files below"
+              (`spaces::Refusal`). */}
+          <SessionSpaces
+            rootId={rootId}
+            sessionId={sessionId}
+            // The section lists AND writes under both contracts (Story 50.1):
+            // `sessions_file_new_kind` writes where the shape keeps the kind,
+            // and a kind this session's shape keeps no home for arrives as a
+            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
+            // does not travel: one reader of `shape::kind_dir`, in Rust.
+            spaces={spaces}
+            selections={spaceFiles}
+            // The verb a space offers where its create is refused because the
+            // record already exists (Story 51.7, FR-299). WHICH space that is is
+            // Rust's answer, per space, on `openRecord`; the label and the target
+            // are the header's own, because the record is one fixed name at a
+            // known place and this surface already opens it from up there.
+            recordLabel={SESSION_DETAIL_OPEN_RECORD_LABEL}
+            onOpenRecord={openRecord}
+            // The same flag the Files heading below is handed — both surfaces
+            // offer a create that posts an empty title, and one filename is
+            // what they would collide on.
+            writing={writing}
+            onWriting={setWriting}
+            onChanged={() => setReload((n) => n + 1)}
+          />
+
+          {/* The session's own file tree, in the zone's own order (FR-254),
+              fully expanded. In a flat session the files ARE the structure, so
+              this is both the map and the contents — which is why it is second
+              and not last: the spaces above are a reading of exactly these
+              files, and everything below is a reading of a subset of them.
+
+              The `Unfiled` badge list used to sit directly under this tree
+              (AD-119): root markdown declaring no kind, as a row of static
+              badges with no count, no fold and no verb on any of them. Story
+              52.4 replaced it with the `Untagged` space above, which is the same
+              set of files with the same row menu, count and fold every other
+              space's rows have — and `pool.unfiled` no longer crosses the
+              boundary at all. */}
           <section aria-label={SESSION_DETAIL_FILES_HEADING} className="flex flex-col gap-1">
             <div className="flex items-center justify-between gap-2">
               <h3 className="flex items-baseline gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide">
@@ -474,61 +648,6 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               onChanged={() => setReload((n) => n + 1)}
             />
           </section>
-
-          {/* Root markdown that declares no kind (AD-119) — directly under the
-              tree, because the fix is to edit one of the files just listed.
-              Absent for a clean session, which is what makes it a signal. */}
-          {detail.unfiled.length > 0 && (
-            <section
-              aria-label={SESSION_DETAIL_UNFILED_HEADING}
-              className="flex flex-col gap-1 rounded-md border border-border border-dashed px-3 py-2"
-            >
-              <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-                {SESSION_DETAIL_UNFILED_HEADING}
-              </h3>
-              <p className="text-muted-foreground text-xs">{SESSION_DETAIL_UNFILED_HINT}</p>
-              <ul className="flex flex-wrap gap-1">
-                {detail.unfiled.map((name) => (
-                  <li key={name}>
-                    <Badge variant="outline" className="font-mono text-xs">
-                      {name}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          )}
-
-          {/* The zone's saved queries, read against this session (FR-261) —
-              AFTER the files, on the operator's own ordering. The tree is what
-              is there; this is what it means. A person who has just seen the
-              filenames can read a section called Tasks and know which of those
-              files it is talking about; the reverse order would ask them to
-              trust a grouping before seeing the thing grouped. */}
-          <SessionSpaces
-            rootId={rootId}
-            sessionId={sessionId}
-            // The section lists AND writes under both contracts (Story 50.1):
-            // `sessions_file_new_kind` writes where the shape keeps the kind,
-            // and a kind this session's shape keeps no home for arrives as a
-            // sentence on `SessionSpaceFilesVm.noHome`. So the shape itself
-            // does not travel: one reader of `shape::kind_dir`, in Rust.
-            spaces={spaces}
-            selections={spaceFiles}
-            // The verb a space offers where its create is refused because the
-            // record already exists (Story 51.7, FR-299). WHICH space that is is
-            // Rust's answer, per space, on `openRecord`; the label and the target
-            // are the header's own, because the record is one fixed name at a
-            // known place and this surface already opens it from up there.
-            recordLabel={recordLabel}
-            onOpenRecord={openRecord}
-            // The same flag the Files heading above is handed — both surfaces
-            // offer a create that posts an empty title, and one filename is
-            // what they would collide on.
-            writing={writing}
-            onWriting={setWriting}
-            onChanged={() => setReload((n) => n + 1)}
-          />
 
           {/* The board (FR-263) — after the spaces, because a space is the
               question "which files are tasks?" and the board is what those files

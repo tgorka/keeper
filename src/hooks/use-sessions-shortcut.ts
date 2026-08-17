@@ -8,6 +8,7 @@
  * (the physical key — `event.key` under Alt is layout-dependent).
  */
 import { useEffect } from "react";
+import { SESSION_RECORD_NAME } from "@/components/sessions/session-detail";
 import { sessionsLogToday } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 import { panelsStore } from "@/lib/stores/panels";
@@ -42,10 +43,16 @@ export async function logTodayInCurrentSession(): Promise<void> {
   const subfolder =
     sessionsRootsStore.getState().roots?.find((root) => root.id === rootId)?.subfolder ??
     "60-sessions";
+  // The record, by the one name the detail and the board both read. The string it
+  // resolves to is the `README.md` this line already composed, so ⌘⌥L opens
+  // exactly what it opened before Story 52.1: what the constant buys is a single
+  // reader of the record's name, not a fix. A session whose record has not been
+  // moved yet still has no `README.md` to open, and moving it is
+  // `sessions_record_migrate`'s job — offered on the session detail.
   panelsStore.getState().setActiveTarget({
     kind: "file",
     profileId: rootId,
-    relativePath: `${subfolder}/${ref.path}/README.md`,
+    relativePath: `${subfolder}/${ref.path}/${SESSION_RECORD_NAME}`,
   });
 }
 

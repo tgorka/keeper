@@ -46,6 +46,7 @@ import {
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { SyncStatusMark } from "@/components/layout/sync-status-mark";
+import { SpaceRowMenu } from "@/components/sessions/space-row-menu";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -57,12 +58,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { useLongPress } from "@/hooks/use-long-press";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionEntryVm } from "@/lib/ipc/client";
 import { revealPath, sessionsFileDelete, syncOpenEntry } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
-import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
+import { extensionOf, resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
 /** The tree's accessible name. */
 export const SESSION_TREE_LABEL = "Session files";
@@ -202,6 +204,11 @@ export function SessionTree({
   const [deleting, setDeleting] = useState<SessionEntryVm | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  // One instance for every row (Story 52.8), which is what the hook's own doc
+  // says it is for: it tracks a single press at a time and captures the pressed
+  // element per press, so a hook per row would be one timer per row.
+  // `files-pane.tsx:717` mounts it exactly here, for exactly this.
+  const longPress = useLongPress();
   const nowMs = Date.now();
 
   const confirmDelete = useCallback(() => {
@@ -321,11 +328,25 @@ export function SessionTree({
           const lockId = entry.locked === null ? null : `session-lock-${key}`;
           const describedBy =
             [sizeId, ageId, lockId].filter((id) => id !== null).join(" ") || undefined;
-          return (
+          // What the menu may offer about THIS row (Story 52.8). Rename writes a
+          // frontmatter `title:` and Rust re-derives the filename from it, so it
+          // is a verb only a markdown file has: the registry answers which those
+          // are (`viewers/registry.ts:205`), rather than a second extension list
+          // living here.
+          const renamable =
+            !entry.isDir && resolveViewer({ name: entry.name, kind: "file" }).format === "markdown";
+          // The rename field opens on a TITLE and this tree labels its rows with
+          // a FILENAME, so the seed is the name without its extension — the
+          // closest thing to a title a tree row holds, and what
+          // `session-templates.tsx` seeds its own rename with. Rust keeps any
+          // date stamp, so an unedited field renames the file onto itself.
+          const extension = extensionOf(entry.name);
+          const stem =
+            extension === null ? entry.name : entry.name.slice(0, -(extension.length + 1));
+          const row = (
             // A `div`, as above: this is the `treeitem` of the tree opened
             // above, and a `li` would need a `ul` the roving tabindex fights.
             <div
-              key={entry.relPath}
               ref={(element) => {
                 if (element === null) {
                   rowRefs.current.delete(entry.relPath);
@@ -344,6 +365,12 @@ export function SessionTree({
               onFocus={() => setActiveKey(entry.relPath)}
               className="group flex items-center gap-1 rounded-sm px-2 py-1 hover:bg-accent/50 focus-visible:outline-2 focus-visible:outline-ring"
               style={{ paddingInlineStart: `${(entry.depth - 1) * INDENT_PX + PAD_PX}px` }}
+              // Story 52.8: the phone tier's way into the same menu the
+              // right-click opens — a ≥500ms stationary press dispatches the
+              // synthetic `contextmenu` the Radix trigger below already listens
+              // for. `files-pane.tsx:1770`'s spread, on every row here because
+              // every row here HAS a menu. Off the phone tier each is a no-op.
+              {...longPress}
             >
               <Button
                 type="button"
@@ -489,6 +516,50 @@ export function SessionTree({
                 </span>
               )}
             </div>
+          );
+          return (
+            /* The verbs the row has beyond its three hover buttons (Story 52.8,
+               FR-312). The house pattern, and the ONE `ContextMenu` in this
+               folder: `space-row-menu.tsx` mounted `asChild` around the row, so
+               the DOM the ARIA tree and the roving tabindex see is unchanged
+               (`files-pane.tsx:1963`, `session-spaces.tsx:828`). Not a second
+               menu — story 51.6 built this component for a SPACE row and the
+               rows the owner was right-clicking were these.
+
+               **The key moves out here** because this is now the element the map
+               returns; the trigger renders the same `div` it always did.
+
+               `onNotice` is `setNotice`, so a refusal from the menu lands in the
+               live region at the bottom of this tree where the delete button's
+               refusals already land — not in a second paragraph of its own. */
+            <SpaceRowMenu
+              key={entry.relPath}
+              rootId={rootId}
+              sessionId={sessionId}
+              relPath={entry.relPath}
+              subpath={entry.subpath}
+              title={stem}
+              directory={entry.isDir}
+              renamable={renamable}
+              // The wider of the two refusals this row carries, and the one that
+              // covers the other: `SessionEntryVm::undeletable` is
+              // `check_deletable`'s own sentence and is `Some` for every
+              // directory and for everything under `workspace/`, which is what
+              // `locked` answers on its own (`SessionEntryVm:74-90`).
+              deleteRefusal={entry.undeletable}
+              // Story 52.2: a rename answers with the file's new subpath, and
+              // the panel that was showing it must follow. The entry itself when
+              // nothing moved; a re-addressed copy when it did — one field
+              // deep, because AD-65 forbids this side deriving the rest of a
+              // path, and `onChanged` re-reads the tree in the same tick.
+              onOpen={(nextSubpath) =>
+                onOpen(nextSubpath === entry.subpath ? entry : { ...entry, subpath: nextSubpath })
+              }
+              onChanged={onChanged}
+              onNotice={setNotice}
+            >
+              {row}
+            </SpaceRowMenu>
           );
         })}
       </div>

@@ -41,4 +41,12 @@ folded: boolean | null,
  * How many rows the section renders; `null` writes no key, and zero is not
  * a legal cap (Story 51.3).
  */
-rows: number | null, };
+rows: number | null, 
+/**
+ * The directory this space's creates go into; empty writes no key.
+ *
+ * Sent on every save for `folded`'s reason: `render_edit` replaces the
+ * whole `keeper:` map, so a form that omitted this would delete the
+ * operator's destination on the next unrelated Save.
+ */
+createDir: string, };

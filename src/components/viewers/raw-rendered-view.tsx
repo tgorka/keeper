@@ -38,10 +38,26 @@
  * there is no autosave on either. What the two panes must NOT share is a
  * remount-on-text, and what they must both be keyed on is the FILE rather than
  * its display name — see {@link MarkdownPane}, which records both and why.
+ *
+ * **And it is where a person writes, so it is the default and it has the
+ * toolbar.** Story 52.3: Note mode mounts the same writing tools the Notes
+ * surface has, its toolbar is rendered by {@link MarkdownPane} because that is
+ * what holds the live view, and a savable markdown file with no remembered
+ * choice opens in it. A remembered choice still wins — the jar is read first and
+ * only an absent answer takes the default — and that memory is PER FORMAT, which
+ * is `view-mode.ts`'s own rule rather than a per-file one: the answer a reader
+ * gave for markdown is the answer for every markdown file, and no stored answer
+ * moves under anyone. A `note` choice this file cannot honour still lights
+ * Preview. The two live panes also stop drawing the leading `---` block the
+ * properties FORM above them is HOLDING — the form's own bytes, never a second
+ * parse of the buffer — without changing one byte of what a save writes.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
 import { renderCsvTableInto } from "@/components/notes/editor/csv-table";
+import type { FormatAction } from "@/components/notes/editor/format-commands";
+import { FormatToolbar } from "@/components/notes/format-toolbar";
+import { readFrontmatter } from "@/components/notes/properties-panel";
 import { writeCookie } from "@/components/ui/cookie-writer";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { notesCsvSetCell } from "@/lib/ipc/client";
@@ -51,7 +67,7 @@ import { parseJsonlStructure, parseJsonStructure } from "./json-structure";
 import type { MarkdownEditing, MarkdownPreview, MarkdownPreviewOptions } from "./markdown-preview";
 import { mountMarkdownPreview } from "./markdown-preview";
 import type { FileOrigin } from "./use-text-file";
-import type { ViewMode } from "./view-mode";
+import type { OfferedViews, ViewMode } from "./view-mode";
 import { viewModeCookie, viewModeFor } from "./view-mode";
 
 /**
@@ -160,6 +176,32 @@ export interface RawRenderedViewProps {
    * refusal — the shape 45.2 spent a paragraph rejecting.
    */
   noteMode?: boolean;
+  /**
+   * The `---` block the properties FORM above these views is holding, or `null`
+   * when there is no form, when its read has not landed yet, and when that read
+   * refused (Story 52.3, FR-304).
+   *
+   * The BLOCK, and never a boolean about whether a form was mounted. The form's
+   * content is Rust's `file_properties::block_of` over the file ON DISK; a
+   * boolean made this component re-parse the live BUFFER to guess which bytes
+   * that form was drawing, and two recognisers over two sources is exactly how a
+   * form and a pane come to disagree. They did, four ways: the block was hidden
+   * from the first frame, before the read that fills the form had landed — and
+   * for good if that read refused; a file carrying a byte-order mark had its
+   * block drawn TWICE, because Rust skips the mark and `readFrontmatter` wants
+   * `---` at byte zero; a document whose first line is a `---` thematic break had
+   * its own first heading hidden from every view but Source; and typing `---` ⏎
+   * `---` at the top of a document made the shown text shorten under the caret,
+   * mid-edit.
+   *
+   * It is a DISPLAY concern and only that. The block stays in {@link content},
+   * the Source tab still shows every character of the file, and an edit made in
+   * Note mode is reported with the block back in front of it, byte for byte —
+   * which is what keeps AD-88's one buffer true. On a note the frontmatter is a
+   * separate store field and this question never arises; on a file the buffer IS
+   * the whole file, which is why the duplicate could exist at all.
+   */
+  frontmatterInForm?: string | null;
   /** The rendered view wrote the file; the host's buffer is now stale. */
   onExternalWrite?: () => void;
   /** 45.6's editor. See the module comment for why it is injected. */
@@ -381,6 +423,38 @@ function previewShape(options: MarkdownPreviewOptions | undefined): string {
 }
 
 /**
+ * The bytes at the head of `content` that ARE `block` — the block itself, or a
+ * byte-order mark and then the block — or `null` when the buffer does not carry
+ * that block at all (Story 52.3, FR-304).
+ *
+ * `block` is the properties form's own, so nothing here recognises where a block
+ * starts or ends: this only asks whether the buffer still begins with the bytes
+ * the form is holding. That is the whole difference from the `readFrontmatter`
+ * parse this replaced — a pane may hide bytes because something else on screen
+ * is drawing them, and never because a second parser thinks they look like
+ * frontmatter.
+ *
+ * The mark is admitted because Rust deliberately leaves it out of its answer
+ * (`file_properties::block_of` says why, and `replace_block` re-attaches it), so
+ * without this a file Excel had touched would show its block in the form AND in
+ * the pane. It belongs to the PREFIX rather than to the body, so that what goes
+ * back in front of an edit is exactly what came off the front of it.
+ *
+ * Exported for `text-file-frame.tsx`, which splices a landed block over this
+ * same prefix rather than re-reading the file over somebody's unsaved text.
+ */
+export function leadingFormBlock(content: string, block: string | null | undefined): string | null {
+  if (block === null || block === undefined || block === "") {
+    return null;
+  }
+  if (content.startsWith(block)) {
+    return block;
+  }
+  const mark = "\u{feff}";
+  return content.startsWith(mark) && content.startsWith(block, mark.length) ? mark + block : null;
+}
+
+/**
  * The note editor's own live-preview layer over a file — read-only for the
  * Preview tab, editable for Note mode — reporting a refusal upward rather than
  * leaving an empty box behind.
@@ -389,6 +463,11 @@ function previewShape(options: MarkdownPreviewOptions | undefined): string {
  * them (Story 51.5). A second component would be a second place for the file
  * surface and the note surface to disagree about what markdown looks like,
  * which is what `markdown-preview.ts` refuses in its first paragraph.
+ *
+ * It also renders Note mode's format toolbar (Story 52.3), because the control
+ * has to sit with the view it acts on: the extensions and their translation live
+ * inside `mountMarkdownPreview`, and a handle passed upward is how a press lands
+ * in a view that has since been replaced by the Preview tab.
  */
 function MarkdownPane({
   fileName,
@@ -415,10 +494,26 @@ function MarkdownPane({
 }): React.ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const mountRef = useRef<MarkdownPreview | null>(null);
+  // Whether there is a live view behind `mountRef` *right now*, as state rather
+  // than as the ref itself, because the toolbar's presence is a render decision
+  // and a ref does not cause one. The same flag and the same reason
+  // `text-viewer.tsx` records for the Source tab's toolbar: the mount is several
+  // dynamic imports deep and the cleanup nulls the ref again at the start of
+  // every rebuild, so a toolbar drawn from `editable` alone is clickable over no
+  // editor for the whole of both windows, and every press in them is swallowed.
+  const [mounted, setMounted] = useState(false);
   const latest = useRef({ text, options, editing, onOutcome });
   latest.current = { text, options, editing, onOutcome };
   const editable = editing !== null;
   const shape = previewShape(options);
+
+  const runFormat = useCallback((action: FormatAction) => {
+    // Optional twice over, and both are defence rather than a live path: the
+    // toolbar is drawn only when the pane is editable AND mounted, so there is a
+    // view, and the same `editing` that made it editable is what put the writing
+    // extensions in it, so its translation is non-null.
+    mountRef.current?.runFormat?.(action);
+  }, []);
 
   // What rebuilds this pane and what does not, because the next person will ask.
   //
@@ -451,7 +546,7 @@ function MarkdownPane({
     }
     let disposed = false;
     void (async () => {
-      const mounted = await mountMarkdownPreview(host, latest.current.text, {
+      const pane = await mountMarkdownPreview(host, latest.current.text, {
         vaultId: null,
         ...latest.current.options,
         // Indirected through the ref because the view outlives every render: a
@@ -466,22 +561,31 @@ function MarkdownPane({
           : undefined,
       });
       if (disposed) {
-        mounted.destroy();
+        pane.destroy();
         return;
       }
-      mountRef.current = mounted;
+      mountRef.current = pane;
       // The buffer may have moved while the editor chunk was in flight. A no-op
       // when it has not, which is the ordinary case.
-      const refused = mounted.setContent(latest.current.text);
+      const refused = pane.setContent(latest.current.text);
       // One report for both refusals, because the reader's position is the same
       // either way: this document is not drawn and the source is.
-      latest.current.onOutcome(mounted.failure ?? refused);
+      latest.current.onOutcome(pane.failure ?? refused);
+      // Beside the assignment and never apart from it: this is the render the
+      // toolbar is allowed to appear on, and the whole point is that it is the
+      // one where a press has somewhere to go.
+      setMounted(true);
     })();
     return () => {
       disposed = true;
       mountRef.current?.destroy();
       mountRef.current = null;
       host.replaceChildren();
+      // Cleared for the rebuild case, which is the guaranteed one: a switch into
+      // Preview, a new file or a hydrated vault tears the view down while
+      // `editable` may still be true, and without this the toolbar would sit
+      // over an empty host for the whole of the next async mount.
+      setMounted(false);
     };
   }, [editable, fileName, loadedFrom.profileOrVaultId, loadedFrom.relativePath, shape]);
 
@@ -496,7 +600,17 @@ function MarkdownPane({
     }
   }, [text]);
 
-  return <div ref={hostRef} className="h-full min-h-0 overflow-auto" />;
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {/* Directly over the text it formats, which is the note editor's own
+          placement and the Source tab's — a person who learned the toolbar in
+          Notes finds it in the same place over a session log. Here rather than in
+          the tab strip above for `text-viewer.tsx`'s reason: a toolbar acts on a
+          live view, and this component is the one that mounts it. */}
+      {editable && mounted ? <FormatToolbar onAction={runFormat} /> : null}
+      <div ref={hostRef} className="min-h-0 flex-1 overflow-auto" />
+    </div>
+  );
 }
 
 /** The remembered view, in the one durable store the frontend uses for a pane
@@ -526,24 +640,103 @@ export function RawRenderedView({
   preview,
   writingTools,
   noteMode,
+  frontmatterInForm,
   onExternalWrite,
   editor: Editor,
   csvOptions,
   cookie = DOCUMENT_COOKIE,
 }: RawRenderedViewProps): React.ReactElement {
-  const [chosen, setChosen] = useState<ViewMode>(() => viewModeFor(cookie.read(), format));
+  // Story 51.5's third mode, and both halves of the question are here. WHETHER
+  // this file may be written is `noteMode` — the frame's verdict, which reads
+  // the registry's format, the size guard and Rust's own write refusal, and is
+  // never re-derived in this component. WHETHER there is a live-preview view to
+  // make editable is `rendered === "markdown"`, which is this component's own
+  // question and the registry's answer to it.
+  //
+  // `readOnly` is belt as well as braces. A caller that passes `readOnly` and
+  // `noteMode` together is contradicting itself, and the safe reading of a
+  // contradiction is the one that does not put an editor over a buffer nothing
+  // will accept.
+  //
+  // Read before the remembered view rather than after it (Story 52.3): this is
+  // also the predicate the DEFAULT is a function of, so it has to be known
+  // before the first render picks one.
+  const noteOffered = rendered === "markdown" && noteMode === true && readOnly !== true;
+
+  // What this file can offer, for `viewModeFor` to default from. A fresh literal
+  // at both call sites rather than a memo: it is read during a render and never
+  // compared, so a stable identity would buy nothing.
+  const offered: OfferedViews = { note: noteOffered };
+
+  // The jar first, the default second — `viewModeFor` records why that order is
+  // the whole of how changing the default leaves a reader's own answer alone.
+  const [chosen, setChosen] = useState<ViewMode>(() => viewModeFor(cookie.read(), format, offered));
   // Derived from a prop, so it is adopted during render rather than in an
   // effect: an effect would paint one frame of the previous format's view.
+  //
+  // What is deliberately NOT adopted here is a mid-life change to what is
+  // OFFERED. Both hosts settle `noteMode` before this component is mounted at
+  // all — the frame renders "opening …" until the loader has a VM, and every
+  // input to its verdict rides in on that VM — so a flip would mean a caller
+  // changed its mind about a file it was already showing, and re-defaulting
+  // under the reader on that would move the view he is looking at. The reverse
+  // direction is handled below, where a `note` choice this file cannot honour
+  // lights Preview instead.
   const lastFormat = useRef(format);
   if (lastFormat.current !== format) {
     lastFormat.current = format;
-    setChosen(viewModeFor(cookie.read(), format));
+    setChosen(viewModeFor(cookie.read(), format, offered));
   }
+
+  // Story 52.3's second ask, and it is a DISPLAY concern only.
+  //
+  // On a file the buffer IS the whole file, YAML block included — unlike a note,
+  // where frontmatter is a separate store field — so a host that draws the block
+  // as a form above these views was drawing it twice: once as controls and once
+  // as document text. `frontmatterInForm` is the block that form is HOLDING,
+  // which is the only thing that can say which bytes the second drawing is.
+  //
+  // Three things must be true to hide anything, and each one is a way this got it
+  // wrong while it was a boolean about whether a form was mounted:
+  //
+  // 1. The form holds a block. Nothing is hidden while its read is in flight —
+  //    a stat and a read that is hundreds of ms on a pendrive — or after it
+  //    refused, where the block would otherwise have been in neither the form nor
+  //    the text, for good.
+  // 2. The buffer's first bytes ARE that block (`leadingFormBlock`, which admits
+  //    the byte-order mark Rust leaves out of its answer). Nothing is hidden from
+  //    a buffer that has been typed into since, or from one that never matched:
+  //    hiding a length rather than a known prefix is what shortened the shown
+  //    text under the caret when somebody typed `---` ⏎ `---` at the top.
+  // 3. The form DRAWS those bytes. `readFrontmatter` here is the same call
+  //    `PropertiesPanel` makes on the same string, so it is the form's own answer
+  //    to "will the reader see these characters above the pane" and not a second
+  //    opinion about where a block is. It says no for a leading block that holds
+  //    no `key: value` line at all — `---\n# Heading\n---\nbody`, whose first
+  //    line is a thematic break — and that document's heading has to stay on
+  //    screen: the panel shows a tag row and nothing of it.
+  //
+  // The prefix is kept rather than discarded, because every byte of it goes back
+  // in front of an edit before it reaches `onChange` or `onSave` below. The
+  // Source tab is untouched: it is the file's characters, and hiding any of them
+  // there would be a lie about what a save writes.
+  const inForm = rendered === "markdown" ? (frontmatterInForm ?? null) : null;
+  const carried = leadingFormBlock(content, inForm);
+  const drawnByForm = inForm === null ? null : readFrontmatter(inForm);
+  const hiddenBlock =
+    carried !== null &&
+    drawnByForm !== null &&
+    (drawnByForm.unparsed || drawnByForm.entries.length > 0)
+      ? carried
+      : "";
+  /** What the live-preview panes are given. The whole buffer when nothing is
+   *  hidden, which is every host that draws no properties form. */
+  const shown = hiddenBlock === "" ? content : content.slice(hiddenBlock.length);
 
   /** A preview that refused, and the text it refused — so the refusal does not
    *  outlive the bytes it was about. */
   const [refusal, setRefusal] = useState<{ text: string; message: string } | null>(null);
-  const previewFailure = refusal !== null && refusal.text === content ? refusal : null;
+  const previewFailure = refusal !== null && refusal.text === shown ? refusal : null;
 
   const structure = useMemo<JsonStructure | null>(() => {
     if (rendered !== "structure") {
@@ -578,19 +771,6 @@ export function RawRenderedView({
 
   const refusalMessage = previewFailure?.message ?? structureRefusal ?? csvRefusal;
 
-  // Story 51.5's third mode, and both halves of the question are here. WHETHER
-  // this file may be written is `noteMode` — the frame's verdict, which reads
-  // the registry's format, the size guard and Rust's own write refusal, and is
-  // never re-derived in this component. WHETHER there is a live-preview view to
-  // make editable is `rendered === "markdown"`, which is this component's own
-  // question and the registry's answer to it.
-  //
-  // `readOnly` is belt as well as braces. A caller that passes `readOnly` and
-  // `noteMode` together is contradicting itself, and the safe reading of a
-  // contradiction is the one that does not put an editor over a buffer nothing
-  // will accept.
-  const noteOffered = rendered === "markdown" && noteMode === true && readOnly !== true;
-
   // What the reader asked for, resolved against what THIS file can offer. A jar
   // holding `note` for a file with no Note tab — a `workspace/` markdown file,
   // an oversize one — lights the Preview tab rather than lighting nothing at
@@ -615,10 +795,13 @@ export function RawRenderedView({
   };
 
   const onOutcome = useCallback(
+    // The text the PANE was given, which is the buffer minus anything hidden from
+    // it: a refusal has to stop applying when the document the renderer choked on
+    // changes, and the document it was handed is what it choked on.
     (failure: string | null) => {
-      setRefusal(failure === null ? null : { text: content, message: failure });
+      setRefusal(failure === null ? null : { text: shown, message: failure });
     },
-    [content],
+    [shown],
   );
 
   const renderedLabel = rendered === null ? null : RENDERED_LABEL[rendered];
@@ -696,14 +879,23 @@ export function RawRenderedView({
           <MarkdownPane
             fileName={fileName}
             loadedFrom={loadedFrom}
-            text={content}
+            text={shown}
             options={preview}
             // One buffer and one Save, which is the whole of how Note mode adds
             // no write path: an edit here is the same `onChange` the Source tab
             // reports and `Mod-s` is the same `onSave` it calls.
+            //
+            // `hiddenBlock` goes back in front of the edit, byte for byte, and it
+            // is `""` for every host that hides nothing. That is what keeps the
+            // hiding a display concern: the pane is looking at the body, the
+            // buffer this reports is the whole file, and a save writes the block
+            // it was never shown.
             editing={
               showing === "note"
-                ? { onChange: (next) => onChange?.(next), onSave: (next) => void onSave?.(next) }
+                ? {
+                    onChange: (next) => onChange?.(hiddenBlock + next),
+                    onSave: (next) => void onSave?.(hiddenBlock + next),
+                  }
                 : null
             }
             onOutcome={onOutcome}

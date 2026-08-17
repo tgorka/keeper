@@ -2,17 +2,22 @@
  * The session's spaces (FR-261, AD-121) — the saved queries a zone reads every
  * one of its sessions through.
  *
- * The tree above lists what the session *holds*, in the order the filesystem
+ * The tree below lists what the session *holds*, in the order the filesystem
  * hands it over. This lists the same files *by what they are*: the log entries
  * together and newest first, the tasks in board order, the references
  * alphabetically. In the flat contract there are no `logs/` or `refs/` folders
  * to make that grouping for free, so these sections ARE the folders — with the
  * advantage that a file can be in two of them and the disadvantage, stated
- * plainly on the tree above, that on disk it is one pile of markdown.
+ * plainly on the tree itself, that on disk it is one pile of markdown.
  *
- * **After the files, deliberately** (the operator's own ordering): the tree is
- * the ground truth and this is a reading of it, so a person scanning down meets
- * the session's contents before meeting keeper's opinions about them.
+ * **Above the files, deliberately** (Story 52.4, the operator's own
+ * instruction: *"umiesc spaces ponad files"*). It used to sit after them, and
+ * the reason written here was that the tree is the ground truth and this is a
+ * reading of it, so a person scanning down should meet the contents before
+ * meeting keeper's opinions about them. That argument is about which is more
+ * FUNDAMENTAL; the order is about which is read more OFTEN, and this is what a
+ * person opens a session to read. The tree is where they go when a space has
+ * not surfaced something — which is the second question, and now sits second.
  *
  * **The `error`/`warnings` split is notes' split, exactly** (Story 44.4): a
  * query that will not parse is an `error`, the space then selects **nothing**,
@@ -63,12 +68,17 @@
  * already forked the sentence on the day it was written. The shape does not
  * travel to this component at all any more.
  *
- * **The create is the one control here that does not hide.** Edit and Delete
- * are maintenance and keep the rail's hover-reveal (`space-list.tsx`); create
- * is the verb a person comes to a space for, and the report that opened Story
- * 50.1 was literally "I don't see the button". The session create verbs the
- * same person already knows (`session-file-actions.tsx`) are always-visible
- * labelled buttons.
+ * **The create is the one control here that does not hide, and it is present
+ * even where it must refuse** (Story 52.4). Edit and Delete are maintenance and
+ * keep the rail's hover-reveal (`space-list.tsx`); create is the verb a person
+ * comes to a space for, and the report that opened Story 50.1 was literally "I
+ * don't see the button". The report that opened 52.4 was its sibling — *"about
+ * space nie ma przycisku dodaj jak inne"* — so where Rust has a REASON there is
+ * now a disabled control carrying that reason as its accessible description,
+ * rather than a gap a person has to interpret. Absent still, and only, where
+ * Rust has neither a kind nor a sentence: a control that refuses without
+ * explaining teaches nothing. The session create verbs the same person already
+ * knows (`session-file-actions.tsx`) are always-visible labelled buttons.
  *
  * And a space can be SHUT (Story 49.3, FR-275, FR-276). Each one renders
  * through `FoldSection`, the app's one fold mechanism, with its title as the
@@ -89,7 +99,7 @@
  * choice into a filter that hides work.
  */
 import { FilePlus, FileText, FolderPlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { spaceIcon } from "@/components/notes/space-icons";
 import { SessionSpaceEditor } from "@/components/sessions/session-space-editor";
@@ -137,6 +147,30 @@ export const SESSION_SPACES_EMPTY = "This zone has no spaces. Restore the defaul
 
 /** What one space with nothing to show says. */
 export const SESSION_SPACES_NO_FILES = "Nothing in this session yet.";
+
+/**
+ * The seeded default that shows what declares no kind (Story 52.4).
+ *
+ * **The identity is `defaultKey`, never the name** — `@/lib/recordings-space`'s
+ * rule, for its reason: a default space is renameable like any other (AD-79), so
+ * matching on "Untagged" would change this section's behaviour for anyone who
+ * called theirs "Loose ends", and a space of the operator's own that happens to
+ * be called Untagged would borrow a rule it was never given.
+ *
+ * The rule it keys is that this one space renders **only when it selected
+ * something**. Every other space is a question worth seeing answered — an empty
+ * Tasks says the session has no tasks and offers to make one — but this space's
+ * whole subject is a residue, and there is nothing to say about a residue that
+ * does not exist. It is also the one space keeper can be sure of that about,
+ * because its query names no kind and can therefore never be written into: an
+ * empty section here offers nothing and asks for nothing.
+ *
+ * The string is `DEFAULT_SESSION_SPACES`' own key in
+ * `keeper-core/src/sessions/spaces.rs`, which Rust writes into the file's
+ * `keeper.default` and nothing else writes. `renders no Untagged section when
+ * every file declares a kind` is the witness on this side of that boundary.
+ */
+export const SESSION_SPACE_UNTAGGED_KEY = "untagged";
 
 /**
  * What a space says while its selections have not arrived.
@@ -297,8 +331,8 @@ export function SessionSpaces({
   // session's own rather than the zone's, and taken from what the spaces already
   // selected rather than from a sixth command: the pool was read once to answer
   // `sessions_space_files`, and asking for it again to build a word list would
-  // be a second walk for a dropdown. A file no space lists is a file with no
-  // kind tag, which the Unfiled notice above already names.
+  // be a second walk for a dropdown. A file no space of a kind lists is a file
+  // with no kind tag, which the `Untagged` space itself names.
   const vocabulary = useMemo(() => {
     const seen = new Set<string>();
     for (const selection of selections ?? []) {
@@ -318,6 +352,30 @@ export function SessionSpaces({
     }
     return map;
   }, [selections]);
+
+  /**
+   * The spaces this session actually draws a section for.
+   *
+   * Every definition, minus the residue space when there is no residue — see
+   * {@link SESSION_SPACE_UNTAGGED_KEY}. A selection that has not arrived is not
+   * an empty one: while `selections` is `null` this space stays out, so it
+   * appears WITH its rows rather than appearing, saying "Reading…", and then
+   * disappearing because the answer was zero.
+   *
+   * The zone-has-no-spaces sentence below still keys on `spaces`, not on this: a
+   * zone whose only definition is a residue space with nothing in it has a space,
+   * and telling the operator it has none would send them to Restore for a file
+   * that is already there.
+   */
+  const drawn = useMemo(
+    () =>
+      spaces.filter(
+        (space) =>
+          space.defaultKey !== SESSION_SPACE_UNTAGGED_KEY ||
+          (byId.get(space.id)?.files.length ?? 0) > 0,
+      ),
+    [spaces, byId],
+  );
 
   /**
    * Re-create the defaults this zone is missing.
@@ -436,7 +494,7 @@ export function SessionSpaces({
       {spaces.length === 0 ? (
         <p className="text-muted-foreground text-xs">{SESSION_SPACES_EMPTY}</p>
       ) : (
-        spaces.map((space) => (
+        drawn.map((space) => (
           <SpaceSection
             key={space.id}
             space={space}
@@ -556,17 +614,35 @@ function SpaceSection({
   const kind = space.newFileKind;
   // …and whether this session's contract keeps anywhere to put that kind, in
   // Rust's own words. `shape::kind_dir` decides it, `sessions_space_files`
-  // projects its `KindHasNoHome` sentence onto this payload, and this file
-  // prints it. There is deliberately no TypeScript reading of the mapping: a
-  // second one drifts, and the copy that lived here had already forked the
-  // refusal's wording on the day it was written.
+  // projects `create_refused`'s sentence onto this payload, and this file prints
+  // it. There is deliberately no TypeScript reading of the mapping: a second one
+  // drifts, and the copy that lived here had already forked the refusal's wording
+  // on the day it was written.
+  const refusal = selection?.noHome ?? null;
+  // The create has THREE states, and Rust decides which by answering with a
+  // kind, a sentence, or neither (Story 52.4).
   //
-  // Absent AND explained, rather than absent in silence: a section that offers
-  // nothing and says nothing is the report that opened this story. While the
-  // selections have not arrived there is no answer yet, so the verb waits with
-  // the rows rather than appearing and then vanishing.
-  const noHome = selection?.noHome ?? null;
-  const creatable = kind !== null && selection !== null && noHome === null;
+  // - a kind and no refusal: present and pressable;
+  // - a refusal: present, DISABLED, and described BY that refusal — About's "a
+  //   session has one about record", the Untagged space's "every one of its terms
+  //   is a negation", a two-term query's "more than one thing". This is the
+  //   story's own report: *"about space nie ma przycisku dodaj jak inne"*. A
+  //   refusal a person can read beats a control that is silently absent, and the
+  //   sentence is not repeated here — the control points at the one Rust already
+  //   worded in the notice below;
+  // - neither: ABSENT, which is the one case the `showNoteInFiles` precedent
+  //   still governs. `tag:project/alpha` names a tag that is not a kind and a
+  //   query keeper cannot parse says so through its own fault lamp; a control
+  //   that refuses without explaining teaches nothing.
+  //
+  // While the selections have not arrived there is no answer to any of this, so
+  // the verb waits with the rows rather than appearing and then vanishing.
+  const creatable = kind !== null && refusal === null;
+  const showCreate = selection !== null && (creatable || refusal !== null);
+  // The refusal's own element, so the disabled control can point at it. `useId`
+  // rather than the space id: a space id is a path and may hold whitespace, which
+  // an IDREF cannot (see {@link SESSION_SPACE_FOLD_ID}).
+  const refusalId = useId();
 
   // Whether this space is folded, and where that is remembered (Story 49.3,
   // FR-275; Story 51.3, FR-289). Keyed by root and space id rather than by
@@ -614,7 +690,10 @@ function SpaceSection({
     }
     onWriting(true);
     onNotice(null);
-    sessionsFileNewKind(rootId, sessionId, kind, "")
+    // The space that pressed it (Story 52.5): a space may name the directory its
+    // creates land in, and Rust reads that definition — this file sends an id and
+    // composes no path.
+    sessionsFileNewKind(rootId, sessionId, kind, "", space.id)
       .then((subpath) => {
         onChanged();
         onOpen(subpath);
@@ -632,7 +711,7 @@ function SpaceSection({
         ),
       )
       .finally(() => onWriting(false));
-  }, [kind, rootId, sessionId, space.name, onOpen, onNotice, onChanged, onWriting]);
+  }, [kind, rootId, sessionId, space.id, space.name, onOpen, onNotice, onChanged, onWriting]);
 
   return (
     <FoldSection
@@ -702,11 +781,17 @@ function SpaceSection({
               truncating name, a dot and a count, and at the narrowest card this
               app draws a fourth button would leave the space's own name about a
               word wide — which is also why the disclosure is the title rather
-              than a fourth button. When the space cannot be written into,
-              create is ABSENT and not disabled — a control that exists only to
-              refuse teaches nothing (the `showNoteInFiles` precedent) — and
-              when the reason is this session's shape, {@link noHome} says it in
-              the notice below rather than leaving a gap. */}
+              than a fourth button.
+
+              **A space that cannot be written into still gets the control**
+              (Story 52.4), disabled and described by Rust's own refusal. The
+              `showNoteInFiles` precedent — a control that exists only to refuse
+              teaches nothing — still governs the case where there is nothing to
+              teach: no kind AND no sentence, which is `tag:project/alpha` and a
+              query that will not parse. Where there IS a sentence, absence was
+              the worse answer, because "why is there no button on About when
+              every other space has one" is a question the surface was leaving
+              the person to answer for themselves. */}
           {/* Where a create is refused because the record ALREADY EXISTS, the
               verb that applies is opening it (Story 51.7, FR-299) — in the
               create's own slot, because it answers the same question a person
@@ -727,15 +812,25 @@ function SpaceSection({
               <FileText aria-hidden="true" className="size-3.5" />
             </button>
           )}
-          {creatable && (
+          {showCreate && (
             <button
               type="button"
               aria-label={`${SESSION_SPACE_NEW_NOTE} ${space.name}`}
+              // Rust's sentence, referenced rather than repeated: it is already
+              // rendered once in the notice below, and a second copy on this
+              // control is a second thing to keep in step. `undefined` and not
+              // the id when there is no refusal, so the attribute never points
+              // at an element that is not in the DOM.
+              aria-describedby={refusal === null ? undefined : refusalId}
               onClick={newNote}
-              disabled={writing}
+              disabled={writing || !creatable}
               className={cn(
                 "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
                 "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                // Not `disabled:pointer-events-none`, which the rail's own
+                // buttons carry: this control is disabled for a REASON a person
+                // is meant to read, so it keeps the cursor that says so.
+                "disabled:cursor-not-allowed disabled:opacity-50",
               )}
             >
               <FilePlus aria-hidden="true" className="size-3.5" />
@@ -793,14 +888,20 @@ function SpaceSection({
           {selection?.error != null && selection.error !== space.error && (
             <p className="text-destructive text-xs">{selection.error}</p>
           )}
-          {/* Why this space offers no create, in Rust's words — the session's
-              own contract keeping that kind nowhere, or the query asking for
-              more than one thing so that "what would a file made here be?" has
-              no single answer. Muted, not destructive: nothing is broken and
-              nothing failed, and the person is entitled to know which. */}
-          {noHome !== null && (
-            <p data-slot="space-no-home" className="text-muted-foreground text-xs">
-              {noHome}
+          {/* Why this space offers no create, in Rust's words — this session's
+              contract keeping that kind nowhere, the query asking for more than
+              one thing so that "what would a file made here be?" has no single
+              answer, or every one of its terms being a negation so that it names
+              no kind at all. Muted, not destructive: nothing is broken and
+              nothing failed, and the person is entitled to know which.
+
+              It carries the id the disabled create points at (Story 52.4), which
+              is why it renders here whether or not the rows are showing: an
+              `aria-describedby` whose target had folded away would describe
+              nothing. */}
+          {refusal !== null && (
+            <p id={refusalId} data-slot="space-no-home" className="text-muted-foreground text-xs">
+              {refusal}
             </p>
           )}
         </>

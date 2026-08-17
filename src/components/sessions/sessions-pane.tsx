@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { SessionActions } from "@/components/sessions/session-actions";
-import { SessionDetail } from "@/components/sessions/session-detail";
+import { SESSION_RECORD_NAME, SessionDetail } from "@/components/sessions/session-detail";
 import {
   SESSION_PATTERN_INSTALL_FAILED,
   SessionPatternPicker,
@@ -142,18 +142,28 @@ export function SessionsPane() {
   const filtered = rows === null ? [] : filterRows(rows, { text, status, pinnedOnly, unreadOnly });
   const anyFilter = text.trim() !== "" || status !== "all" || pinnedOnly || unreadOnly;
 
-  // Opening a session opens its README in the panel strip — the SAME file
+  // Opening a session opens its RECORD in the panel strip — the SAME file
   // target the Files pane sets and the SAME editor behind it (AD-109,
   // UX-DR91): the target is `(profileId, relativePath)`, the profile id IS
   // the root id (AD-107), and the path is the zone subfolder joined with the
   // session's folder. Everything downstream — the markdown editor, live
   // external changes, the raw/rendered toggle — is Epic 45/46 machinery,
   // reused rather than rebuilt.
+  //
+  // **The name is imported, not typed.** This composed a literal `README.md` and
+  // still does: `SESSION_RECORD_NAME` is that same string, so nothing about what
+  // this opens changed with Story 52.1 — the refactor buys one reader of the
+  // record's name instead of three, so the board, the detail and the ⌘⌥L handler
+  // cannot come to name different files. What makes a row's target CORRECT for a
+  // session written before that story is the record having been moved:
+  // `sessions_record_migrate`, offered on the detail. Until it has run for a
+  // session, this path names a file that is not there, and no spelling of the
+  // constant here can change that.
   const openReadme = useCallback((rootId: string, subfolder: string, sessionPath: string) => {
     panelsStore.getState().setActiveTarget({
       kind: "file",
       profileId: rootId,
-      relativePath: `${subfolder}/${sessionPath}/README.md`,
+      relativePath: `${subfolder}/${sessionPath}/${SESSION_RECORD_NAME}`,
     });
   }, []);
   // A row click drills into the detail (FR-233): the rendered log, the file

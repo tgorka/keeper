@@ -281,6 +281,33 @@ origin: migrated from legacy ledger (spec-4-3-pins.md), 2026-07-06
 location: src/components/.../pins-strip.tsx
 reason: `pins-strip.tsx` avatars are `draggable` buttons reordered via `onDragStart`/`onDragOver`/`onDrop`; there is no arrow-key move or move-up/down menu affordance, so keyboard/assistive-tech users cannot reorder (Pin/Unpin themselves remain keyboard-operable via the context menu). The epic's accessibility floor mentions keyboard operability but the spec specified only drag reorder. Deferred as an a11y enhancement (e.g. a keyboard reorder affordance or the Epic 9 single-key verbs) rather than expanding this story's scope.
 status: open
+note: 2026-08-17 (story 52.7) — the entry stays OPEN, and the reason it stays open is
+  now narrower and the premise it rested on was wrong. It said reordering is "native
+  HTML5 pointer drag only"; on macOS it was neither. `pins-strip.tsx` never wrote
+  anything to the drag data store, and WebKit — the engine keeper ships — fires no
+  `drop` for a drag that set no data, so the pointer path this entry treated as the
+  working one had also been dead in the real app since story 4.3, under the four green
+  desktop-drag tests that could not see a store jsdom does not implement. 52.7 fixed the
+  pointer path on both surfaces that had the hole: `pins-strip.tsx` `onDragStart`
+  now names the pin (`text/plain`, `account:room`) and declares
+  `effectAllowed = "move"`, `onDragOver` answers `dropEffect = "move"`, and `onDrop`
+  calls `preventDefault` now that the drag carries text WebKit would otherwise act
+  on itself; `notes/task-board.tsx` got the identical three lines. Both are asserted
+  against a fake `DataTransfer` (`pins-strip.test.tsx`,
+  `notes/task-board.test.tsx`, `sessions/session-board.test.tsx`), each mutation-
+  proven to fail with the fix removed. What this entry actually asks for — a
+  non-gesture reorder for pins — is still absent on desktop: story 13.6 added
+  "Move up" / "Move down" to the pin context menu on the PHONE tier only
+  (`pins-strip.tsx`, `phone &&`), so a desktop keyboard user still cannot reorder.
+  The obvious close is to stop gating those two menu items on `phone` — the strip's
+  context menu is already keyboard-reachable and the items are already written,
+  guarded and tested — but that is a UX decision about the desktop menu's contents
+  and belongs to whoever owns the strip, not to a story about a drag defect.
+  52.7 does NOT extend this entry to the task board: the board ships a per-card
+  column menu as its keyboard path, which 52.7 demoted to hover/`focus-within`
+  visibility with `opacity-0` (not `hidden`), so it stays in the DOM, in the tab
+  order and in the accessibility tree — asserted at both the widget and the session
+  mount point.
 
 ### DW-38: A favourited chat has no unread/mention affordance anywhere in the inbox view — the Favorites section renders compact rows as avatar + name only, and favourited rooms are removed from the Inbox window, so an unread favourited conversation shows no bold-name/dot/mention badge on any surface.
 

@@ -1,4 +1,5 @@
-//! Folder-shaped session → flat markdown pool, compiled to a plan (FR-257).
+//! Folder-shaped session → flat markdown pool, and the record's own rename,
+//! each compiled to a plan (FR-257, FR-300, FR-301).
 //!
 //! Migration is a *verb someone chooses*, never something a scan does on the
 //! operator's behalf: the zones are real folders on real drives, and a reader
@@ -7,11 +8,23 @@
 //! verb compiles, and the shell runs it with the same executor and the same
 //! crash-resume story (AD-111).
 //!
-//! What it converts:
+//! ## Two verbs, and what each owns
 //!
-//! - `README.md` → `about.md`, minus its `## Log` section, keeping every other
-//!   byte of the record — including the `## Promote` table, which is the
-//!   session's contract with the archive checklist and travels verbatim.
+//! [`compile_migrate`] converts the *shape*: a folder-shaped session becomes a
+//! flat pool. [`compile_record_rename`] converts one *name*: a session whose
+//! record is still `about.md` gets it moved to `README.md` (story 52.1). They do
+//! not overlap — `compile_migrate` declines a session with an `about.md` at its
+//! root and points at the other verb, because composing a fresh empty record
+//! beside a real one is not a migration, it is a loss.
+//!
+//! What [`compile_migrate`] converts:
+//!
+//! - `README.md` → `README.md`, minus its `## Log` section and plus the `about`
+//!   kind tag, keeping every other byte of the record — including the
+//!   `## Promote` table, which is the session's contract with the archive
+//!   checklist and travels verbatim. Guarded on the bytes it was planned
+//!   against, so a concurrent agent write refuses the migration rather than
+//!   losing an edit.
 //! - each `### <date> — <title>` log entry → one `YYYY-MM-DD-HHMM-slug.md`
 //!   tagged `log`, so the pool self-sorts in Finder, in `ls`, and in keeper.
 //! - each `refs/*.md` and `prompts/*.md` → a root file with `ref` or `prompt`
@@ -31,16 +44,18 @@
 //!
 //! ## What it does not do
 //!
-//! It does not delete the README. Every link, bookmark and agent instruction in
-//! the operator's world points at that filename, so it is rewritten into a
-//! three-line signpost instead. It does not touch `artifacts/` or `workspace/`:
-//! those are the two subtrees that are not markdown, and the flat contract keeps
-//! both (AD-119).
+//! It does not delete the README, and since story 52.1 it does not need a
+//! signpost either: the record IS the README, so every link, bookmark and agent
+//! instruction in the operator's world that pointed at that filename still
+//! resolves to the record it always named. It does not touch `artifacts/` or
+//! `workspace/`: those are the two subtrees that are not markdown, and the flat
+//! contract keeps both (AD-119).
 
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming::slug;
 use crate::sessions::model::{log_entries, README};
 use crate::sessions::plan::{Plan, PlanStep};
+use crate::sessions::refs;
 use crate::sessions::shape::{kind_dir, shape, KindTag, Shape, ABOUT, AGENTS, KINDS};
 
 /// One markdown file the migration carries into the pool, as the shell read it.
@@ -97,11 +112,21 @@ pub fn id_count(input: &MigrateInput) -> usize {
     1 + log_entries(&input.readme[body_at..]).len() + input.carried.len()
 }
 
-/// Compile the migration, or `None` when this session is already flat.
+/// Compile the migration, or `None` when there is no shape conversion to do.
 ///
 /// Idempotence is stated in the return type rather than left to the executor:
 /// re-running the verb on a migrated session is not a no-op plan, it is *no
 /// plan*, so the UI can grey the button out from the same fact the compiler uses.
+///
+/// **Two reasons for `None`, and the second one is story 52.1's.** A session that
+/// is already [`Shape::Flat`] has nothing to convert. A session holding an
+/// `about.md` at its root belongs to [`compile_record_rename`] instead: since the
+/// shape predicate narrowed to `AGENTS.md`, such a session reads as
+/// [`Shape::Folder`] even though its record is right there, and running the shape
+/// conversion over it would compose a fresh, empty `README.md` beside the real
+/// record and leave the real one behind as an untagged pool file. Declining is
+/// the honest answer: the record rename is the verb that applies, and it is the
+/// one the surface should offer.
 ///
 /// `TrashDir` is emitted **only for directories present in
 /// [`MigrateInput::top_level`]**. The executor's `TrashDir` is idempotent on
@@ -109,7 +134,8 @@ pub fn id_count(input: &MigrateInput) -> usize {
 /// existed at all, so the guard has to live at compile time. A session with no
 /// `refs/` is not a broken migration; it is a session nobody put a reference in.
 pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
-    if shape(&input.top_level) == Shape::Flat {
+    if shape(&input.top_level) == Shape::Flat || input.top_level.iter().any(|entry| entry == ABOUT)
+    {
         return None;
     }
 
@@ -123,7 +149,10 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
     let mut next_id = || ids.next().map(String::as_str).unwrap_or("");
 
     // Reserved before anything is named, so no carried file can land on one of
-    // the three structural names and quietly replace it.
+    // the three structural names and quietly replace it. `about.md` stays
+    // reserved after story 52.1 even though nothing is written there: a
+    // `refs/about.md` hoisted onto that name would land on a file the record
+    // rename is going to move.
     let mut taken: Vec<String> = vec![
         ABOUT.to_owned(),
         AGENTS.to_owned(),
@@ -133,27 +162,46 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
     ];
     let mut steps = Vec::new();
 
-    // 1. The record. The README's own frontmatter travels whole — `id`,
-    //    `created`, `pinned` and the `keeper:` lineage map are the session's
-    //    identity, and a migration that dropped them would silently unpin the
-    //    session and orphan both ends of every continuation (AD-112).
+    // 1. The record, rewritten **where it already is** (story 52.1). The
+    //    README's own frontmatter travels whole — `id`, `created`, `pinned` and
+    //    the `keeper:` lineage map are the session's identity, and a migration
+    //    that dropped them would silently unpin the session and orphan both ends
+    //    of every continuation (AD-112). What changes is the `## Log` section,
+    //    which becomes one file per entry below, and the `about` kind tag, which
+    //    is what makes the About space find this file rather than its name.
+    //
+    //    Guarded on the bytes it was planned against, because unlike the
+    //    `about.md` this used to write, the target is a file that already exists
+    //    and holds the operator's prose: a plain write would lose an agent's edit
+    //    made between the read and the run. A session with no README at all has
+    //    nothing to guard and nothing to lose, and `GuardedWrite` cannot express
+    //    that — the executor reads the target first — so that one case is an
+    //    ordinary write.
     let title = crate::notes::naming::title_from_body(body);
-    let about_id = match fm.as_string("id") {
+    let record_id = match fm.as_string("id") {
         Some(existing) if !existing.trim().is_empty() => existing.to_owned(),
         _ => next_id().to_owned(),
     };
     let record_body = without_log_section(body);
-    let mut about = format!("{header}{record_body}");
-    if !about_id.is_empty() {
-        about = Frontmatter::set_in(&about, "id", FieldValue::Str(about_id));
+    let mut record = format!("{header}{record_body}");
+    if !record_id.is_empty() {
+        record = Frontmatter::set_in(&record, "id", FieldValue::Str(record_id));
     }
     if fm.as_string("created").is_none() {
-        about = Frontmatter::set_in(&about, "created", FieldValue::Str(input.today.clone()));
+        record = Frontmatter::set_in(&record, "created", FieldValue::Str(input.today.clone()));
     }
-    about = with_tag(&about, KindTag::About);
-    steps.push(PlanStep::WriteFile {
-        path: at(ABOUT),
-        content: about,
+    record = with_tag(&record, KindTag::About);
+    steps.push(if input.readme.is_empty() {
+        PlanStep::WriteFile {
+            path: at(README),
+            content: record,
+        }
+    } else {
+        PlanStep::GuardedWrite {
+            path: at(README),
+            expect_len: input.readme.len(),
+            content: record,
+        }
     });
 
     // 2. One file per log entry. The README recorded a date and never a time,
@@ -208,24 +256,7 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
         content: agents_md(&title),
     });
 
-    // 5. The signpost, guarded on the README's current length so a concurrent
-    //    agent write refuses the migration instead of losing an edit.
-    //
-    //    It is tagged `ref`, which is not a dodge: a redirect is a pointer at
-    //    something that lives elsewhere, which is this codebase's definition of
-    //    a reference. Leaving it untagged would put one permanent row in
-    //    `unfiled` on every session that ever migrated, and `unfiled` is worth
-    //    more than that — with the stub filed, a non-empty `unfiled` means
-    //    exactly one thing: a migration that stopped between steps 4 and 5 and
-    //    left the *original* README behind. The signal PR 1 wanted survives,
-    //    and it now fires only when something is actually wrong.
-    steps.push(PlanStep::GuardedWrite {
-        path: at(README),
-        expect_len: input.readme.len(),
-        content: readme_stub(&title),
-    });
-
-    // 6. Irreversible, and therefore last.
+    // 5. Irreversible, and therefore last.
     //
     //    The directories are asked of [`kind_dir`] rather than listed here, for
     //    [`carried_kind`]'s reason and to keep its claim true: a fourth
@@ -233,9 +264,12 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
     //    free, and this is the step that would otherwise leave it on disk —
     //    a half-migrated session whose stale kind directory `shape()` cannot
     //    see, because it keys on `AGENTS.md` and not on what is left behind.
+    //    `""` for the destination: this asks the CONTRACT what it keeps, and a
+    //    space's own directory (Story 52.5) is where a create goes rather than
+    //    a directory the migration owns and empties.
     for dir in KINDS
         .into_iter()
-        .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+        .filter_map(|kind| kind_dir(Shape::Folder, kind, "").ok().flatten())
     {
         if input.top_level.iter().any(|entry| entry == dir) {
             steps.push(PlanStep::TrashDir {
@@ -250,6 +284,382 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
         session: input.session.clone(),
         steps,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The record's own rename (story 52.1, FR-300, FR-301)
+// ---------------------------------------------------------------------------
+
+/// One markdown file the pointer pass may rewrite, as the shell read it.
+///
+/// Split into the session and the path inside it, rather than carried as one
+/// zone-relative string, because the two are needed for different things: the
+/// plan step names the joined path, and [`refs::rewrite_pointers`] is handed the
+/// session-relative one because a pointer resolves *beside the file that holds
+/// it* — the same frame `sessions_file_rename` hands it per file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerFile {
+    /// The session this file belongs to, zone-relative:
+    /// `active/2026-08-10-keeper`.
+    pub session: String,
+    /// Its path inside that session, `/`-joined: `spaces/plan.md`.
+    pub rel: String,
+    pub text: String,
+}
+
+impl PointerFile {
+    /// Where this file is, zone-relative — the path a plan step names.
+    fn path(&self) -> String {
+        format!("{}/{}", self.session, self.rel)
+    }
+}
+
+/// Everything [`compile_record_rename`] needs, all of it read by the shell.
+///
+/// Pure in, pure out, [`MigrateInput`]'s rule: no clock, no id generator, no
+/// filesystem. Unlike that one it needs no ULIDs, because nothing here composes
+/// a file that could want an identity — the record keeps its own, which is the
+/// whole point of moving it rather than rewriting it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordRenameInput {
+    /// The session whose record moves, zone-relative.
+    pub session: String,
+    /// That session directory's own entry names — what decides which case this
+    /// is. Names, not paths, not recursive.
+    pub top_level: Vec<String>,
+    /// `README.md`'s current bytes at that root. Empty when there is none, which
+    /// is the ordinary case.
+    pub readme: String,
+    /// The session's title, for the `AGENTS.md` a hand-built flat session is
+    /// owed. Empty is survivable — [`agents_md`] carries its own fallback
+    /// heading.
+    pub title: String,
+    /// Every markdown file in every session of the ZONE, this session's
+    /// included: the pointer pass's scope.
+    ///
+    /// Zone-wide because a link at a session's record can be written in another
+    /// session — a continuation names what it continues — and a rename that only
+    /// swept its own folder would leave exactly those pointing at a filename
+    /// nothing answers to.
+    pub pointers: Vec<PointerFile>,
+    /// The zone's own path from the drive root — `60-sessions`, and empty when
+    /// the zone IS that root.
+    ///
+    /// The pointer pass needs it because a link written in ANOTHER session can
+    /// only reach this record by spelling it in full, from the drive root: that
+    /// is [`refs::resolve`]'s third probe — "the target as written", the spelling
+    /// the drives' own `AGENTS.md` asks for — and therefore the only cross-session
+    /// spelling that resolves at all. Without it the zone-wide pass would rewrite
+    /// exactly what a one-session pass rewrites, and the scope's own
+    /// justification would be unmet.
+    pub prefix: String,
+    /// Every session in the zone that still holds an `about.md` at its root,
+    /// this one included.
+    ///
+    /// The pointer pass's one exclusion, and it is a *resolution* fact rather
+    /// than a preference: a `[[about]]` written inside a session that has its own
+    /// `about.md` resolves to THAT session's record ([`refs::resolve`] probes
+    /// beside the file and then beside the session), so rewriting it while that
+    /// session is unmigrated would break a link that works. Those files are left
+    /// for their own session's rename, which is what makes running the verb over
+    /// the whole zone and running it one session at a time end in the same place.
+    pub with_about: Vec<String>,
+}
+
+/// Why a record rename refused. One variant, because there is one thing that
+/// can be in the way.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordRenameError {
+    /// A `README.md` that is not an older migration's signpost sits where the
+    /// record is going, **in a session that has an `AGENTS.md`**.
+    ///
+    /// That last clause is the whole of what makes refusing right here and wrong
+    /// one case over. With `AGENTS.md` present the session is flat under both
+    /// contracts, so `sessions_root::row_for` is reading this `README.md` as the
+    /// record right now: two files hold record content and neither is
+    /// authoritative. Without it the session read as FLAT before story 52.1
+    /// narrowed the shape predicate, so its `about.md` was its record and this
+    /// `README.md` was an ordinary pool file — nothing to choose between, and
+    /// [`compile_record_rename`] trashes it rather than refusing.
+    ///
+    /// Both paths in the sentence, because the person reading it has to open one
+    /// and decide about the other, and "a file already exists" without a name is
+    /// a sentence that sends them looking. What the sentence does NOT say any
+    /// more is "move {to} aside": [`crate::sessions::files::check_deletable`]
+    /// refuses a delete of `README.md` and `RECORD_NAMES` refuses renaming it, so
+    /// the old remedy named a move keeper itself forbids.
+    #[error(
+        "{from} cannot move to {to}: this session has an AGENTS.md, so keeper already reads {to} \
+         as its record — and {from} is where its id, its pinned flag and its keeper: lineage \
+         still are. Two files hold record content and keeper will not choose between them: open \
+         both, copy what you want to keep into {to}, and take {from} out of the session in Finder \
+         once it holds nothing you need. keeper will not delete it for you — it cannot tell your \
+         session's only record from a leftover."
+    )]
+    Collision { from: String, to: String },
+}
+
+/// Compile the record's rename: `about.md` → `README.md`, as one journaled plan.
+///
+/// **An empty plan is the no-op**, not `None` as [`compile_migrate`] uses. The
+/// difference is what the caller does with it: migration's `None` greys a button
+/// out, while this verb is run across a zone and "this session needed nothing"
+/// has to compose with "that one needed three steps". An empty `steps` runs to
+/// completion doing nothing, which is what a replayable executor wants anyway.
+///
+/// ## The six cases, from the files
+///
+/// - **Already migrated, or folder-shaped** — no `about.md` at the root, so
+///   nothing to move and no pointer to rewrite: an empty plan.
+/// - **keeper-created flat** (`AGENTS.md` + `about.md`) — one
+///   [`PlanStep::MoveFile`].
+/// - **Half-migrated** (`AGENTS.md` + `about.md` + the signpost an older
+///   `compile_migrate` left where the README was) — the signpost is *trashed*
+///   into `.keeper/trash/`, never unlinked, and only then is the move legal.
+/// - **Hand-built flat** (`about.md`, no `AGENTS.md`) — `AGENTS.md` is WRITTEN
+///   first. Without that step the session reads as [`Shape::Folder`] the instant
+///   the record lands at `README.md`, which is a folder-shaped session with a
+///   flat pool: every log invisible behind a `## Log` heading that is not there.
+/// - **Hand-built flat with somebody's `README.md` in it** (`about.md` +
+///   `README.md`, no `AGENTS.md`) — the README is trashed under its own key, the
+///   signpost's own recoverable move. Two facts make that the honest answer
+///   rather than a clobber: with no `AGENTS.md` this session read as
+///   [`Shape::Flat`] before story 52.1 narrowed the shape predicate, so
+///   `about.md` was its record and that `README.md` was a pool file no reader
+///   ever took for one; and every other exit is now closed — both verbs used to
+///   decline this shape ([`compile_migrate`] returns `None` for an `about.md` at
+///   the root, this one refused), while
+///   [`crate::sessions::files::check_deletable`] and `files::RECORD_NAMES` refuse
+///   to delete or rename a `README.md`. The only way out was Finder, for a shape
+///   keeper's own predicate change created.
+/// - **A `README.md` in the way of a session that HAS its `AGENTS.md`** —
+///   refused, naming both paths. There the README is what the board is already
+///   rendering as the record, so the two files genuinely compete and keeper
+///   chooses neither. Never clobbered.
+///
+/// ## Why the move is last
+///
+/// Every other step here is idempotent on replay: `WriteFile` overwrites,
+/// `TrashFile` answers `Ok` when the source is gone and the trash holds it, and
+/// `GuardedWrite` recognises its own output. `MoveFile` is the one that is not —
+/// `sessions_exec` deliberately refuses a `MoveFile` whose target exists, because
+/// its only previous caller ran plans it had just stat'd and a gone source there
+/// means a stale list rather than a completed move. So the move sorts last, the
+/// place this codebase already puts a step whose replay is not free
+/// ([`crate::sessions::plan`]'s second invariant): a crash after it leaves the
+/// verb *complete*, and the resume that re-runs it refuses loudly over work that
+/// is already done rather than over work that still needs doing.
+///
+/// # Errors
+/// [`RecordRenameError::Collision`] when a foreign `README.md` is in the way.
+pub fn compile_record_rename(input: &RecordRenameInput) -> Result<Plan, RecordRenameError> {
+    let session = input.session.as_str();
+    let at = |rel: &str| format!("{session}/{rel}");
+    let has = |name: &str| input.top_level.iter().any(|entry| entry == name);
+    let plan = |steps: Vec<PlanStep>| Plan {
+        verb: "record-rename".to_owned(),
+        session: input.session.clone(),
+        steps,
+    };
+
+    if !has(ABOUT) {
+        return Ok(plan(Vec::new()));
+    }
+
+    let mut steps = Vec::new();
+
+    // 1. The shape file a hand-built session never had. Before the move, or the
+    //    move is what turns the session folder-shaped.
+    if !has(AGENTS) {
+        steps.push(PlanStep::WriteFile {
+            path: at(AGENTS),
+            content: agents_md(&input.title),
+        });
+    }
+
+    // 2. Whatever is standing on the destination. A signpost is an older
+    //    migration's own output; a foreign README in a session with no AGENTS.md
+    //    is a pool file under the contract that session was written under. Both
+    //    are TRASHED — into `.keeper/trash/` under distinct keys, so a person who
+    //    disagrees gets their bytes back and can see which of the two happened.
+    //    A foreign README beside an AGENTS.md is the one shape keeper refuses:
+    //    see [`RecordRenameError::Collision`].
+    if has(README) {
+        let signpost = is_signpost(&input.readme);
+        if !signpost && has(AGENTS) {
+            return Err(RecordRenameError::Collision {
+                from: at(ABOUT),
+                to: at(README),
+            });
+        }
+        let why = if signpost {
+            "record-signpost"
+        } else {
+            "foreign-readme"
+        };
+        steps.push(PlanStep::TrashFile {
+            path: at(README),
+            trash_key: format!("{}-{why}", session.replace('/', "-")),
+        });
+    }
+
+    // 3. The prose that names the record, zone-wide. Before the move for no
+    //    reason but the move being last; a pointer rewritten a moment early
+    //    dangles for the length of one rename.
+    steps.extend(pointer_rewrites(input));
+
+    // 4. The rename itself, and the only step that cannot be replayed for free.
+    steps.push(PlanStep::MoveFile {
+        from: at(ABOUT),
+        to: at(README),
+    });
+
+    Ok(plan(steps))
+}
+
+/// One [`PlanStep::GuardedWrite`] per zone file whose prose names the record.
+///
+/// Guarded rather than written, for [`crate::sessions::files::Rewrite`]'s reason:
+/// the bytes were read when the plan was compiled, and a file an agent has
+/// touched since should refuse the migration rather than lose the edit.
+///
+/// ## Two spellings, because a session file can be named two ways
+///
+/// **`about.md`, beside the file that says it.** [`refs::rewrite_pointers`]
+/// matches the bare name, its wikilink stem, and either written relative to the
+/// holding file's own directory — the three forms [`refs::resolve`] probes first.
+/// This is the spelling almost every pointer uses, and it is the one the
+/// [`RecordRenameInput::with_about`] exclusion protects: `[[about]]` inside a
+/// session that still has its own `about.md` resolves to THAT session's record,
+/// so it is left for that session's own run.
+///
+/// **`60-sessions/active/…/about.md`, from the drive root.** The zone-wide scope
+/// is justified by a continuation link crossing sessions, and this is the only
+/// spelling by which it can: bare `about.md` in another session's file resolves
+/// beside that file and then beside that session, never here, so a genuine
+/// cross-session pointer has to name the record in full — `candidates`' third
+/// probe, "the target as written", which is what the drives' own `AGENTS.md`
+/// asks for. Without this pass the zone-wide sweep reached exactly what a
+/// per-session sweep reaches and the scope paid for nothing.
+///
+/// That second pass is **not** subject to the `with_about` exclusion, and for the
+/// exclusion's own reason: a path naming this session's folder resolves to this
+/// session's record no matter who wrote it, so there is no working link to
+/// preserve. It is skipped only when it would be the first pass repeated — a zone
+/// at the drive root spells both the same way, and [`refs::rewrite_pointers`]
+/// answers `None` for `from == to` anyway.
+///
+/// **The record itself is never in here.** Its bytes travel verbatim — that is
+/// the whole reason this verb moves the file instead of recomposing it — so a
+/// pointer the record holds *at itself* survives the rename stale. That is the
+/// deliberate half of the trade: one dangling link inside one file, against a
+/// guarantee that every byte of frontmatter, every `keeper:` lineage entry and
+/// the `pinned` flag arrive untouched.
+fn pointer_rewrites(input: &RecordRenameInput) -> Vec<PlanStep> {
+    let record = format!("{}/{}", input.session, ABOUT);
+    let from_root = |rel: &str| match input.prefix.as_str() {
+        "" => format!("{}/{rel}", input.session),
+        prefix => format!("{prefix}/{}/{rel}", input.session),
+    };
+    let (qualified_from, qualified_to) = (from_root(ABOUT), from_root(README));
+    input
+        .pointers
+        .iter()
+        .filter(|file| file.path() != record)
+        .filter_map(|file| {
+            let beside = file.session == input.session || !input.with_about.contains(&file.session);
+            let mut rewritten = if beside {
+                refs::rewrite_pointers(&file.text, &file.rel, ABOUT, README)
+            } else {
+                None
+            };
+            if let Some(next) = refs::rewrite_pointers(
+                rewritten.as_deref().unwrap_or(&file.text),
+                &file.rel,
+                &qualified_from,
+                &qualified_to,
+            ) {
+                rewritten = Some(next);
+            }
+            rewritten.map(|content| PlanStep::GuardedWrite {
+                path: file.path(),
+                expect_len: file.text.len(),
+                content,
+            })
+        })
+        .collect()
+}
+
+/// Whether these bytes are the redirect an older `compile_migrate` wrote where
+/// the README used to be.
+///
+/// **Two facts together, and the pair is the whole test:** the file is tagged
+/// `ref` — the tag that migration gave its signpost so it would not sit
+/// permanently in `unfiled` — and it names `about.md`. A README a person wrote
+/// carries their own frontmatter and does not send its reader to another file in
+/// the same folder; one that somehow does both is *trashed* rather than unlinked,
+/// so the cost of guessing wrong is a file in `.keeper/trash/`.
+///
+/// Recognised rather than regenerated. Story 52.1 deleted the writer, and
+/// comparing against a regenerated copy would have made a reader of old bytes
+/// depend on a writer nothing calls — dead code kept alive by one caller, which
+/// is how a "temporary" compatibility path becomes permanent.
+fn is_signpost(readme: &str) -> bool {
+    let (fm, body_at) = Frontmatter::parse(readme);
+    let tagged = fm
+        .as_list("tags")
+        .is_some_and(|tags| tags.iter().any(|tag| tag == KindTag::Ref.as_str()));
+    tagged && readme[body_at..].contains(ABOUT)
+}
+
+/// Which of the two record names a session's record is actually at, given both
+/// files' bytes as the shell read them — and those bytes back, so a caller that
+/// needs to guard a write on them cannot pair the name with a second read.
+///
+/// `README.md` is the record under both contracts (story 52.1), and this exists
+/// because saying so did not move anybody's files: until
+/// `sessions_record_migrate` has swept a zone, a flat session written before that
+/// story keeps its record at `about.md`, and any caller that must WRITE to the
+/// record has to know which. A caller that only reads the record can take
+/// `README.md` and degrade; a caller compiling a
+/// [`crate::sessions::plan::PlanStep::GuardedWrite`] cannot, because a guard read
+/// from one file and written to another always mismatches — and in the
+/// half-migrated shape it does something worse than mismatch, see below.
+///
+/// **The `id` is the discriminator, not the filename order.** A README-first
+/// preference gets the half-migrated session wrong: `AGENTS.md` + `about.md` + the
+/// signpost an older `compile_migrate` left where the README was. There a README
+/// exists, so a name chosen by order names the signpost — whose length matches its
+/// own bytes, so a guarded write onto it is *accepted*, and a session's lineage
+/// lands in a three-line redirect. The record is the file carrying the session's
+/// identity, which is the same fact `sessions_root::row_for` degrades on when it
+/// finds none, so that is what is asked.
+///
+/// `None` only when the session has neither file, which is a session with no
+/// record at all — the shape `row_for` renders from a `path:` id.
+#[must_use]
+pub fn record_at<'a>(
+    readme: Option<&'a str>,
+    about: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    let carries_id = |text: &str| {
+        let (fm, _) = Frontmatter::parse(text);
+        fm.get("id")
+            .is_some_and(|id| !id.index_string().trim().is_empty())
+    };
+    match (readme, about) {
+        // Both present: the README wins unless it is the one without an identity
+        // and the `about.md` has one. Neither having one is the degraded session,
+        // and there the contract's own name is the honest answer.
+        (Some(readme), Some(about)) => Some(if carries_id(readme) || !carries_id(about) {
+            (README, readme)
+        } else {
+            (ABOUT, about)
+        }),
+        (Some(readme), None) => Some((README, readme)),
+        (None, Some(about)) => Some((ABOUT, about)),
+        (None, None) => None,
+    }
 }
 
 /// `HHMM` for the nth entry of a date, counting from midnight in minutes.
@@ -302,7 +712,7 @@ fn unique(name: &str, taken: &mut Vec<String>) -> String {
 fn carried_kind(rel: &str) -> Option<KindTag> {
     KINDS
         .into_iter()
-        .find(|kind| match kind_dir(Shape::Folder, *kind) {
+        .find(|kind| match kind_dir(Shape::Folder, *kind, "") {
             // `strip_prefix` plus the separator rather than
             // `starts_with("refs/")`: no allocation, and `refsy/x.md` is a
             // different folder that a bare `starts_with(dir)` would match.
@@ -400,18 +810,6 @@ fn log_file(id: &str, date: &str, title: &str, body: &str) -> String {
     out
 }
 
-/// The signpost the README becomes: a pointer, tagged as one.
-fn readme_stub(title: &str) -> String {
-    let heading = if title.is_empty() { "Session" } else { title };
-    format!(
-        "---\ntags: [ref]\n---\n\
-         # {heading}\n\n\
-         This session follows the flat contract: the record moved to \
-         [about.md](about.md), and every other file says what it is in its own \
-         frontmatter `tags:`. Read [AGENTS.md](AGENTS.md) first.\n"
-    )
-}
-
 /// The navigation file: how to read a flat session, written for whoever — or
 /// whatever — is handed the folder.
 ///
@@ -437,7 +835,7 @@ pub fn agents_md(title: &str) -> String {
          its own frontmatter `tags:` — there are no per-kind subfolders, so **read the tags, \
          not the paths**.\n\n\
          ## Start here\n\n\
-         1. `about.md` — what this session is for, what was decided, and the promote table.\n\
+         1. `README.md` — what this session is for, what was decided, and the promote table.\n\
          2. Files tagged `task` — what is in flight. Each carries `status:` \
          (`in-preparation`, `todo`, `done`, `deferred`) and `order:`.\n\
          3. Files tagged `log`, newest first — they are named \
@@ -456,7 +854,7 @@ pub fn agents_md(title: &str) -> String {
          - `artifacts/` — output worth keeping. Versioned and synced. Put finished things here.\n\
          - `workspace/` — scratch. **Not versioned, not backed up, and it dies with the \
          session.** Nothing in it is safe. Promote anything you want to keep into \
-         `artifacts/` and record the move in `about.md`'s promote table.\n\n\
+         `artifacts/` and record the move in `README.md`'s promote table.\n\n\
          ## When you finish a sitting\n\n\
          Write a new `log` file — `YYYY-MM-DD-HHMM-slug.md`, tagged `log` — saying what you \
          did and what the next person needs to know. Update the `status:` of any task you \
@@ -526,10 +924,18 @@ Release drafted; DMG attached.\n\n\
 
     /// Migrating a migrated session is not an empty plan, it is no plan — so
     /// the button greys out from the same fact the compiler uses.
+    ///
+    /// Row 2 is the same assertion for a new reason (story 52.1): an `about.md`
+    /// at the root used to make the session read Flat, and now makes it the
+    /// *record rename's* session. Either way this verb declines.
     #[test]
     fn an_already_flat_session_compiles_to_nothing() {
         assert!(compile_migrate(&input(LIVE, &["AGENTS.md", "artifacts"], &[])).is_none());
         assert!(compile_migrate(&input(LIVE, &["about.md"], &[])).is_none());
+        assert!(
+            compile_migrate(&input(LIVE, &["AGENTS.md", "about.md", "README.md"], &[])).is_none(),
+            "story 52.1: a half-migrated session is the record rename's, not this verb's"
+        );
         assert!(compile_migrate(&input(LIVE, &["README.md", "refs"], &[])).is_some());
     }
 
@@ -557,11 +963,14 @@ Release drafted; DMG attached.\n\n\
                 })
                 .unwrap_or_else(|| panic!("no step for {needle}"))
         };
-        assert!(position("/about.md") < position("/AGENTS.md"));
+        assert!(
+            position("/README.md") < position("/AGENTS.md"),
+            "story 52.1: the record is rewritten where it is, and that write used to be an \
+             about.md — it still lands before the shape flip"
+        );
         assert!(position("2026-08-10-0000-opened.md") < position("/AGENTS.md"));
         assert!(position("/inputs.md") < position("/AGENTS.md"));
-        assert!(position("/AGENTS.md") < position("/README.md"));
-        assert!(position("/README.md") < position("/refs"));
+        assert!(position("/AGENTS.md") < position("/refs"));
 
         // Irreversible last, both of them, after every write.
         let first_trash = plan
@@ -580,7 +989,8 @@ Release drafted; DMG attached.\n\n\
     /// The live README's three hazards, all survived: the empty-title entry
     /// becomes a real file rather than being dropped, the header-only promote
     /// table is copied verbatim, and a README with no frontmatter at all still
-    /// produces a well-formed `about.md`.
+    /// produces a well-formed record. Story 52.1: that record is the `README.md`
+    /// itself, rewritten in place, where it used to be a new `about.md`.
     #[test]
     fn the_live_readme_migrates_without_losing_a_byte_that_matters() {
         let plan = compile_migrate(&input(LIVE, &["README.md", "refs", "prompts"], &[]))
@@ -594,7 +1004,7 @@ Release drafted; DMG attached.\n\n\
                 .1
         };
 
-        let about = find("/about.md");
+        let about = find("/README.md");
         assert!(about.contains("## Summary"), "the record survives");
         assert!(about.contains("State as of opening. Two tracks."));
         assert!(
@@ -633,8 +1043,8 @@ Release drafted; DMG attached.\n\n\
         let plan = compile_migrate(&input(LIVE, &["README.md"], &[])).expect("migrates");
         let about = writes(&plan)
             .into_iter()
-            .find(|(path, _)| path.ends_with("/about.md"))
-            .expect("about")
+            .find(|(path, _)| path.ends_with("/README.md"))
+            .expect("the record")
             .1;
         let (fm, body_at) = Frontmatter::parse(about);
         assert!(fm.unparsed().is_none(), "the write parses clean: {about}");
@@ -645,7 +1055,7 @@ Release drafted; DMG attached.\n\n\
     }
 
     /// The session's identity is not a thing a migration gets to change: an
-    /// existing id, `pinned`, and both lineage directions move to `about.md`
+    /// existing id, `pinned`, and both lineage directions stay in the record
     /// verbatim, because the board reads the record and would otherwise
     /// silently unpin the session and orphan every continuation (AD-112).
     #[test]
@@ -656,8 +1066,8 @@ Release drafted; DMG attached.\n\n\
         let plan = compile_migrate(&input(readme, &["README.md"], &[])).expect("migrates");
         let about = writes(&plan)
             .into_iter()
-            .find(|(path, _)| path.ends_with("/about.md"))
-            .expect("about")
+            .find(|(path, _)| path.ends_with("/README.md"))
+            .expect("the record")
             .1;
         let (fm, _) = Frontmatter::parse(about);
         assert_eq!(
@@ -829,7 +1239,7 @@ Release drafted; DMG attached.\n\n\
     fn the_migration_trashes_exactly_the_directories_the_mapping_names() {
         let dirs: Vec<&str> = KINDS
             .into_iter()
-            .filter_map(|kind| kind_dir(Shape::Folder, kind).ok().flatten())
+            .filter_map(|kind| kind_dir(Shape::Folder, kind, "").ok().flatten())
             .collect();
         assert!(!dirs.is_empty(), "the folder contract keeps directories");
 
@@ -862,10 +1272,16 @@ Release drafted; DMG attached.\n\n\
         );
     }
 
-    /// The README write is guarded on its current length, so an agent editing
-    /// it while the operator migrates refuses rather than losing the edit.
+    /// The record write is guarded on the README's current length, so an agent
+    /// editing it while the operator migrates refuses rather than losing the edit.
+    ///
+    /// **Story 52.1 inverted what this file becomes.** It asserted the README was
+    /// rewritten into a three-line signpost pointing at `about.md`. The record IS
+    /// the README now, so the guarded write carries the record itself — and the
+    /// old assertion, that the content names `about.md`, is exactly the thing that
+    /// must no longer be true.
     #[test]
-    fn the_readme_becomes_a_guarded_signpost() {
+    fn the_record_is_rewritten_in_place_and_guarded() {
         let plan = compile_migrate(&input(LIVE, &["README.md"], &[])).expect("migrates");
         let Some(PlanStep::GuardedWrite {
             path,
@@ -880,11 +1296,52 @@ Release drafted; DMG attached.\n\n\
         };
         assert_eq!(path, "active/2026-08-10-keeper/README.md");
         assert_eq!(*expect_len, LIVE.len());
-        assert!(content.contains("about.md"), "it points at the record");
-        assert!(content.contains("AGENTS.md"), "and at the navigation file");
+        assert!(
+            content.contains("State as of opening. Two tracks."),
+            "the record's own prose, not a redirect to it"
+        );
+        assert!(
+            !content.contains("about.md"),
+            "story 52.1: there is no signpost, because there is nowhere to point: {content}"
+        );
         assert!(
             content.contains("keeper — rolling work session"),
-            "and keeps the session's name so a link still lands somewhere legible"
+            "and the session keeps its name"
+        );
+
+        // One write to the README and one only: the record used to be composed
+        // into `about.md` and the README overwritten a second time, and a plan
+        // with two writes to one path is a plan whose order decides the outcome.
+        assert_eq!(
+            plan.steps
+                .iter()
+                .filter(|step| matches!(
+                    step,
+                    PlanStep::WriteFile { path, .. } | PlanStep::GuardedWrite { path, .. }
+                        if path.ends_with("/README.md")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    /// A folder-shaped session with no README at all still migrates: there is
+    /// nothing to guard, so the record is an ordinary write.
+    ///
+    /// `GuardedWrite` reads its target before comparing, so guarding a file that
+    /// does not exist would refuse the migration of a session whose whole content
+    /// is a `refs/` folder.
+    #[test]
+    fn a_session_with_no_readme_writes_its_record_unguarded() {
+        let plan = compile_migrate(&input("", &["refs"], &[("refs/a.md", "# a\n")]))
+            .expect("a session that is nothing but references still migrates");
+        assert!(
+            matches!(
+                &plan.steps[0],
+                PlanStep::WriteFile { path, .. } if path == "active/2026-08-10-keeper/README.md"
+            ),
+            "an absent README is written, not guarded: {:?}",
+            plan.steps[0]
         );
     }
 
@@ -906,12 +1363,12 @@ Release drafted; DMG attached.\n\n\
             let plan = compile_migrate(&case).expect("migrates");
             let used = writes(&plan)
                 .iter()
-                .filter(|(path, _)| !path.ends_with("/AGENTS.md") && !path.ends_with("/README.md"))
+                .filter(|(path, _)| !path.ends_with("/AGENTS.md"))
                 .count();
             assert_eq!(expected, used, "one id per authored pool file");
             // Every one of them actually carries the id it was given.
             for (path, content) in writes(&plan) {
-                if path.ends_with("/AGENTS.md") || path.ends_with("/README.md") {
+                if path.ends_with("/AGENTS.md") {
                     continue;
                 }
                 let (fm, _) = Frontmatter::parse(content);
@@ -929,7 +1386,7 @@ Release drafted; DMG attached.\n\n\
         let plan = compile_migrate(&short).expect("still migrates");
         let files: Vec<(&str, &str)> = writes(&plan)
             .into_iter()
-            .filter(|(path, _)| !path.ends_with("/AGENTS.md") && !path.ends_with("/README.md"))
+            .filter(|(path, _)| !path.ends_with("/AGENTS.md"))
             .collect();
         let with_id = files
             .iter()
@@ -977,15 +1434,18 @@ Release drafted; DMG attached.\n\n\
         // the record and the navigation file are both orienting documents, and
         // the About space is where someone opening this session should find
         // both. `Pool::about` is a list for exactly this reason.
+        //
+        // Story 52.1 changed the ORDER as a consequence of the rename: the pool
+        // sorts by folded name, so `README.md` now sorts after `AGENTS.md` where
+        // `about.md` sorted before it. Asserted rather than papered over, because
+        // a surface that wants the record first has to sort for it and not hope.
         assert_eq!(
             pool.about
                 .iter()
                 .map(|e| e.rel.as_str())
                 .collect::<Vec<_>>(),
-            ["about.md", "AGENTS.md"],
-            "the record before the navigation file, which is the order someone \
-             opening the session wants and which the case-folded name sort gives \
-             for free"
+            ["AGENTS.md", "README.md"],
+            "the folded-name sort, which after the rename puts the navigation file first"
         );
         assert_eq!(pool.logs.len(), 3, "every sitting became a file");
         assert_eq!(
@@ -995,8 +1455,9 @@ Release drafted; DMG attached.\n\n\
         assert_eq!(pool.logs[2].title, "opened");
         assert_eq!(
             pool.refs.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
-            ["inputs.md", "README.md"],
-            "the signpost is filed as the pointer it is, and sorts by folded name"
+            ["inputs.md"],
+            "story 52.1: the carried pointer and nothing else — the README signpost \
+             that used to be filed here does not exist any more"
         );
         assert_eq!(pool.prompts.len(), 1);
         assert!(pool.tasks.is_empty(), "a folder session had no board");
@@ -1076,7 +1537,7 @@ Release drafted; DMG attached.\n\n\
     #[test]
     fn carrying_a_file_out_of_a_directory_inverts_the_create_mapping() {
         for kind in KINDS {
-            let Ok(Some(dir)) = kind_dir(Shape::Folder, kind) else {
+            let Ok(Some(dir)) = kind_dir(Shape::Folder, kind, "") else {
                 continue;
             };
             assert_eq!(
@@ -1096,5 +1557,692 @@ Release drafted; DMG attached.\n\n\
         // out of one either — there is nowhere they could have been.
         assert_eq!(carried_kind("tasks/a.md"), None);
         assert_eq!(carried_kind("logs/a.md"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The record's own rename (story 52.1) — the spec's acceptance table
+    // -----------------------------------------------------------------------
+
+    /// The session under test, and a second one that links at its record.
+    const SESSION: &str = "active/2026-08-10-keeper";
+    const OTHER: &str = "active/2026-08-01-old";
+
+    /// A record somebody edited by hand, with everything a recomposition would
+    /// quietly normalise: trailing whitespace, a tab, a `pinned` flag, a
+    /// `keeper:` lineage map and a promote table.
+    const HAND_EDITED: &str = "---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ncreated: 2026-08-10\n\
+                               pinned: true\ntags: [about]\nkeeper:\n  \
+                               session-continues: [01J4ZZZZZZZZZZZZZZZZZZZZZZ]\n---\n\
+                               # keeper — rolling work session\n\n\
+                               A line with trailing spaces   \nand a tab\there.\n\n\
+                               ## Promote\n\n| workspace | → artifacts | note |\n\
+                               | --------- | ----------- | ---- |\n";
+
+    /// The three-line redirect an older `compile_migrate` wrote where the README
+    /// was, reproduced here because story 52.1 deleted the writer — this is the
+    /// shape `is_signpost` has to recognise on somebody's live drive.
+    const SIGNPOST: &str = "---\ntags: [ref]\n---\n# keeper\n\n\
+                            This session follows the flat contract: the record moved to \
+                            [about.md](about.md), and every other file says what it is in its own \
+                            frontmatter `tags:`. Read [AGENTS.md](AGENTS.md) first.\n";
+
+    /// The zone's own place on the drive — what a pointer in another session has
+    /// to spell to reach this record at all.
+    const ZONE: &str = "60-sessions";
+
+    fn rename_input(top_level: &[&str]) -> RecordRenameInput {
+        RecordRenameInput {
+            session: SESSION.to_owned(),
+            top_level: top_level.iter().map(|s| (*s).to_owned()).collect(),
+            readme: String::new(),
+            title: "keeper — rolling work session".to_owned(),
+            pointers: Vec::new(),
+            prefix: ZONE.to_owned(),
+            with_about: vec![SESSION.to_owned()],
+        }
+    }
+
+    fn at(session: &str, rel: &str) -> String {
+        format!("{session}/{rel}")
+    }
+
+    /// The plan's effect on a zone, as a map of zone-relative path → bytes.
+    ///
+    /// A four-step interpreter, and deliberately only the four steps
+    /// [`compile_record_rename`] emits, with the semantics `sessions_exec` gives
+    /// them: a guarded write that recognises its own output, a trash that keeps
+    /// the basename under its key, a move that refuses an occupied target. It
+    /// exists because this crate touches no filesystem by rule — `text_file`'s
+    /// own note says as much — and the acceptance this verb owes is a claim about
+    /// *bytes after a run*, not about a list of steps.
+    fn apply(zone: &mut std::collections::BTreeMap<String, String>, plan: &Plan) {
+        for step in &plan.steps {
+            match step {
+                PlanStep::WriteFile { path, content } => {
+                    zone.insert(path.clone(), content.clone());
+                }
+                PlanStep::GuardedWrite {
+                    path,
+                    expect_len,
+                    content,
+                } => {
+                    let current = zone
+                        .get(path)
+                        .expect("a guarded write reads its target first");
+                    assert!(
+                        current.len() == *expect_len || current == content,
+                        "{path} changed under the plan"
+                    );
+                    zone.insert(path.clone(), content.clone());
+                }
+                PlanStep::TrashFile { path, trash_key } => {
+                    let name = path.rsplit('/').next().expect("a basename");
+                    let bytes = zone
+                        .remove(path)
+                        .expect("a trash step names a file that is there");
+                    zone.insert(format!(".keeper/trash/{trash_key}/{name}"), bytes);
+                }
+                PlanStep::MoveFile { from, to } => {
+                    assert!(
+                        !zone.contains_key(to),
+                        "{to} is occupied — the move would refuse"
+                    );
+                    let bytes = zone
+                        .remove(from)
+                        .expect("a move names a file that is there");
+                    zone.insert(to.clone(), bytes);
+                }
+                other => panic!("this verb does not emit {other:?}"),
+            }
+        }
+    }
+
+    /// One session's top-level entry names, out of a zone map — what `shape`
+    /// reads.
+    fn top_level_of(
+        zone: &std::collections::BTreeMap<String, String>,
+        session: &str,
+    ) -> Vec<String> {
+        let prefix = format!("{session}/");
+        zone.keys()
+            .filter_map(|path| path.strip_prefix(&prefix))
+            .filter(|rel| !rel.contains('/'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Row 2. A keeper-created flat session moves its record and does nothing
+    /// else, and the bytes that arrive at `README.md` are the bytes that were at
+    /// `about.md` — every one of them, because a rename carries no content and
+    /// therefore cannot normalise any.
+    #[test]
+    fn a_keeper_created_flat_session_moves_its_record_and_every_byte_survives() {
+        let input = rename_input(&[AGENTS, ABOUT, "artifacts", "workspace"]);
+        let plan = compile_record_rename(&input).expect("nothing is in the way");
+
+        assert_eq!(plan.verb, "record-rename");
+        assert_eq!(plan.session, SESSION);
+        assert_eq!(
+            plan.steps,
+            vec![PlanStep::MoveFile {
+                from: at(SESSION, ABOUT),
+                to: at(SESSION, README),
+            }],
+            "one move, and nothing that carries bytes"
+        );
+
+        let mut zone =
+            std::collections::BTreeMap::from([(at(SESSION, ABOUT), HAND_EDITED.to_owned())]);
+        apply(&mut zone, &plan);
+        assert_eq!(
+            zone.get(&at(SESSION, README)).map(String::as_str),
+            Some(HAND_EDITED),
+            "byte for byte: trailing spaces, the tab, the promote table"
+        );
+        assert!(
+            !zone.contains_key(&at(SESSION, ABOUT)),
+            "and the old name is gone rather than duplicated"
+        );
+
+        // The three facts the board would silently lose to a recomposition.
+        let (fm, _) = Frontmatter::parse(&zone[&at(SESSION, README)]);
+        assert_eq!(fm.as_string("id"), Some("01J5AAAAAAAAAAAAAAAAAAAAAA"));
+        assert_eq!(fm.as_bool("pinned"), Some(true));
+        assert_eq!(
+            crate::sessions::model::lineage(&fm).continues,
+            vec!["01J4ZZZZZZZZZZZZZZZZZZZZZZ"]
+        );
+    }
+
+    /// Row 3. A hand-built `about.md`-only session is written its `AGENTS.md`
+    /// FIRST, and reads [`Shape::Flat`] afterwards.
+    ///
+    /// Without that step the move alone would leave a session whose record is in
+    /// the right place and whose shape says folder — every log invisible behind a
+    /// `## Log` heading that is not there. The last assertion is the proof that
+    /// the write is what prevents it, rather than a coincidence of the listing.
+    #[test]
+    fn a_hand_built_session_gets_agents_md_before_the_move_and_still_reads_flat() {
+        let input = rename_input(&[ABOUT, "2026-08-12-0900-opened.md"]);
+        assert_eq!(
+            shape(&input.top_level),
+            Shape::Folder,
+            "story 52.1: which is exactly why AGENTS.md has to be written"
+        );
+
+        let plan = compile_record_rename(&input).expect("nothing is in the way");
+        assert!(
+            matches!(
+                &plan.steps[0],
+                PlanStep::WriteFile { path, .. } if *path == at(SESSION, AGENTS)
+            ),
+            "the shape file is step one: {:?}",
+            plan.steps
+        );
+        assert!(
+            matches!(plan.steps.last(), Some(PlanStep::MoveFile { .. })),
+            "and the move is last: {:?}",
+            plan.steps
+        );
+
+        let mut zone = std::collections::BTreeMap::from([
+            (at(SESSION, ABOUT), HAND_EDITED.to_owned()),
+            (
+                at(SESSION, "2026-08-12-0900-opened.md"),
+                "---\ntags: [log]\n---\n# opened\n".to_owned(),
+            ),
+        ]);
+        apply(&mut zone, &plan);
+
+        let after = top_level_of(&zone, SESSION);
+        assert_eq!(
+            shape(&after),
+            Shape::Flat,
+            "the session still reads flat: {after:?}"
+        );
+        let without_agents: Vec<String> = after
+            .iter()
+            .filter(|name| *name != AGENTS)
+            .cloned()
+            .collect();
+        assert_eq!(
+            shape(&without_agents),
+            Shape::Folder,
+            "and the AGENTS.md write is the only reason it does"
+        );
+        assert_eq!(
+            zone.get(&at(SESSION, README)).map(String::as_str),
+            Some(HAND_EDITED),
+            "the record still travelled verbatim"
+        );
+    }
+
+    /// Row 4. A half-migrated session trashes the signpost before it moves, and
+    /// the trash holds it — recoverable, never unlinked.
+    #[test]
+    fn a_half_migrated_session_trashes_the_signpost_first_and_the_trash_holds_it() {
+        let mut input = rename_input(&[AGENTS, ABOUT, README]);
+        input.readme = SIGNPOST.to_owned();
+
+        let plan = compile_record_rename(&input).expect("a signpost is not a collision");
+        let step_at = |want: fn(&PlanStep) -> bool| {
+            plan.steps
+                .iter()
+                .position(want)
+                .unwrap_or_else(|| panic!("no such step: {:?}", plan.steps))
+        };
+        assert!(
+            step_at(|step| matches!(step, PlanStep::TrashFile { .. }))
+                < step_at(|step| matches!(step, PlanStep::MoveFile { .. })),
+            "the destination is cleared before the move, or the move refuses itself"
+        );
+
+        let mut zone = std::collections::BTreeMap::from([
+            (at(SESSION, ABOUT), HAND_EDITED.to_owned()),
+            (at(SESSION, README), SIGNPOST.to_owned()),
+        ]);
+        apply(&mut zone, &plan);
+
+        assert_eq!(
+            zone.get(".keeper/trash/active-2026-08-10-keeper-record-signpost/README.md")
+                .map(String::as_str),
+            Some(SIGNPOST),
+            "recoverable in the zone's trash: {:?}",
+            zone.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            zone.get(&at(SESSION, README)).map(String::as_str),
+            Some(HAND_EDITED),
+            "and the record is what is at the name now"
+        );
+    }
+
+    /// Row 5. A session with no `about.md` is untouched — including its prose,
+    /// which is what would otherwise be rewritten for a rename that is not
+    /// happening.
+    #[test]
+    fn a_session_with_nothing_to_rename_compiles_an_empty_plan() {
+        for top in [
+            vec![README, "refs", "prompts"],
+            vec![AGENTS, README],
+            vec![AGENTS],
+        ] {
+            let mut input = rename_input(&top);
+            input.readme = "# a record somebody wrote\n".to_owned();
+            input.with_about = Vec::new();
+            input.pointers = vec![PointerFile {
+                session: SESSION.to_owned(),
+                rel: "2026-08-11-0900-note.md".to_owned(),
+                text: "See [[about]].\n".to_owned(),
+            }];
+            let plan = compile_record_rename(&input).expect("nothing to refuse");
+            assert!(
+                plan.steps.is_empty(),
+                "{top:?} has no about.md to move: {:?}",
+                plan.steps
+            );
+        }
+    }
+
+    /// Row 6. A `README.md` nobody's migration wrote refuses the move **in a session
+    /// that has its `AGENTS.md`**, naming both paths, and the three near-misses are
+    /// refused too: the signpost is recognised by its `ref` tag AND its pointer,
+    /// never by either alone.
+    ///
+    /// The remedy the sentence offers is asserted, not just its presence. The
+    /// original said "move {to} aside", which is the one move keeper forbids —
+    /// `check_deletable` refuses a delete of `README.md` and `RECORD_NAMES`
+    /// refuses renaming it — so a refusal that said it sent the operator to press
+    /// two buttons that both decline.
+    #[test]
+    fn a_readme_that_is_not_a_signpost_refuses_and_names_both_paths() {
+        let mut input = rename_input(&[AGENTS, ABOUT, README]);
+        input.readme =
+            "---\nid: 01J5CCCCCCCCCCCCCCCCCCCCCC\n---\n# The session, as written\n".to_owned();
+
+        let error = compile_record_rename(&input).expect_err("a foreign README is in the way");
+        assert_eq!(
+            error,
+            RecordRenameError::Collision {
+                from: at(SESSION, ABOUT),
+                to: at(SESSION, README),
+            }
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains(&at(SESSION, ABOUT)) && said.contains(&at(SESSION, README)),
+            "both paths, because the person has to open one and decide about the other: {said}"
+        );
+        assert!(
+            said.contains("AGENTS.md") && said.contains("already reads"),
+            "the true reason: keeper is reading the README as this session's record: {said}"
+        );
+        assert!(
+            !said.contains("aside"),
+            "and never a remedy keeper's own verbs refuse: {said}"
+        );
+
+        // Tagged `ref` but pointing at nothing: somebody's own notes file.
+        input.readme = "---\ntags: [ref]\n---\n# Links I keep here\n".to_owned();
+        assert!(compile_record_rename(&input).is_err());
+        // The signpost's prose without its tag: a README that mentions the record.
+        input.readme = "# see [about.md](about.md) for the record\n".to_owned();
+        assert!(compile_record_rename(&input).is_err());
+        // Both together is the signpost, and only then.
+        input.readme = SIGNPOST.to_owned();
+        assert!(compile_record_rename(&input).is_ok());
+    }
+
+    /// The `{about.md, README.md}` session, which had no way forward at all.
+    ///
+    /// Exactly two of the eight `{AGENTS.md, about.md, README.md}` combinations
+    /// changed meaning when story 52.1 narrowed `shape()` to `has(AGENTS)`, and
+    /// this is the one the spec did not cover: a hand-built flat session somebody
+    /// dropped a README into (a create is unrestricted, `files::compile_new`).
+    /// Before, it was [`Shape::Flat`] with `about.md` for a record. After, it is
+    /// [`Shape::Folder`] and `sessions_root::row_for` reads the record out of a
+    /// different file — while the id, the pins and the lineage stay in `about.md`.
+    /// Then NEITHER verb moved it: [`compile_migrate`] declines an `about.md` at
+    /// the root and this one refused, and the refusal's remedy was a move
+    /// `check_deletable` and `RECORD_NAMES` both forbid. The only exit was Finder.
+    ///
+    /// So the foreign README gets the signpost's treatment — trashed under its own
+    /// key, recoverable, distinguishable in `.keeper/trash/` from a signpost — and
+    /// the session ends the run genuinely flat, with its own record at `README.md`
+    /// and every byte of it intact.
+    #[test]
+    fn a_hand_built_session_with_a_foreign_readme_trashes_it_instead_of_stranding_the_session() {
+        const FOREIGN: &str = "# Notes to whoever finds this\n\nNothing to do with keeper.\n";
+
+        let mut input = rename_input(&[ABOUT, README]);
+        input.readme = FOREIGN.to_owned();
+
+        let plan = compile_record_rename(&input).expect("the way out is not a refusal");
+        assert_eq!(
+            plan.steps,
+            vec![
+                PlanStep::WriteFile {
+                    path: at(SESSION, AGENTS),
+                    content: agents_md(&input.title),
+                },
+                PlanStep::TrashFile {
+                    path: at(SESSION, README),
+                    trash_key: "active-2026-08-10-keeper-foreign-readme".to_owned(),
+                },
+                PlanStep::MoveFile {
+                    from: at(SESSION, ABOUT),
+                    to: at(SESSION, README),
+                },
+            ],
+            "{:?}",
+            plan.steps
+        );
+
+        // What the zone holds afterwards: the record where every reader now looks,
+        // byte for byte, and somebody's README recoverable under a key that says
+        // which branch took it.
+        let mut zone = std::collections::BTreeMap::from([
+            (at(SESSION, ABOUT), HAND_EDITED.to_owned()),
+            (at(SESSION, README), FOREIGN.to_owned()),
+        ]);
+        apply(&mut zone, &plan);
+        assert_eq!(zone[&at(SESSION, README)], HAND_EDITED);
+        assert_eq!(
+            zone[".keeper/trash/active-2026-08-10-keeper-foreign-readme/README.md"], FOREIGN,
+            "trashed, never unlinked: the cost of keeper guessing wrong is one file to restore"
+        );
+        assert!(!zone.contains_key(&at(SESSION, ABOUT)));
+        assert_eq!(
+            shape(&top_level_of(&zone, SESSION)),
+            Shape::Flat,
+            "and the session reads flat, which is the whole point of writing AGENTS.md first"
+        );
+
+        // A signpost still says so: the two branches are told apart in the trash,
+        // because a person restoring one wants to know which happened.
+        input.readme = SIGNPOST.to_owned();
+        let signposted = compile_record_rename(&input).expect("a signpost is not a collision");
+        assert!(
+            signposted.steps.contains(&PlanStep::TrashFile {
+                path: at(SESSION, README),
+                trash_key: "active-2026-08-10-keeper-record-signpost".to_owned(),
+            }),
+            "{:?}",
+            signposted.steps
+        );
+    }
+
+    /// The spelling the zone-wide scope is actually justified by.
+    ///
+    /// Row 7 proves a BARE `about.md` in another session is rewritten, and the
+    /// doc justified sweeping the whole zone with "a continuation link crosses
+    /// sessions" — but a bare name cannot cross one. `refs::resolve` probes it
+    /// beside the file that holds it and then beside that file's OWN session, so
+    /// `about.md` written in `active/2026-08-01-old` names that session's record
+    /// and never this one. A pointer that genuinely reaches across has to spell
+    /// the record from the drive root, which is `candidates`' third probe and the
+    /// form the drives' own `AGENTS.md` asks for. Nothing rewrote it before this
+    /// test, so the zone-wide pass reached exactly what a one-session pass reaches
+    /// and the scope was paid for and unused.
+    ///
+    /// Both link spellings, the wikilink stem, and a promote-table cell — the
+    /// three things `rewrite_pointers` knows how to follow — plus the one case the
+    /// `with_about` exclusion must NOT swallow: a qualified path names THIS
+    /// session's folder, so it resolves here whoever wrote it, even a session
+    /// still holding its own unmigrated record.
+    #[test]
+    fn a_cross_session_pointer_spelled_from_the_drive_root_is_rewritten() {
+        const UNMIGRATED: &str = "active/2026-07-01-older";
+
+        let mut input = rename_input(&[AGENTS, ABOUT]);
+        input.with_about = vec![SESSION.to_owned(), UNMIGRATED.to_owned()];
+        input.pointers = vec![
+            PointerFile {
+                session: OTHER.to_owned(),
+                rel: "2026-08-02-0900-handed-over.md".to_owned(),
+                text: format!(
+                    "Continues [the record]({ZONE}/{SESSION}/{ABOUT}), see \
+                     [[{ZONE}/{SESSION}/about]].\n\n## Promote\n\n\
+                     | workspace | → artifacts | note |\n| --------- | ----------- | ---- |\n\
+                     | {ZONE}/{SESSION}/{ABOUT} | out.md | the record |\n"
+                ),
+            },
+            PointerFile {
+                session: UNMIGRATED.to_owned(),
+                rel: "2026-07-02-0900-note.md".to_owned(),
+                text: format!(
+                    "Its own record: [[about]]. Ours: [ours]({ZONE}/{SESSION}/{ABOUT}).\n"
+                ),
+            },
+        ];
+
+        let plan = compile_record_rename(&input).expect("nothing is in the way");
+        let of = |path: &str| {
+            plan.steps.iter().find_map(|step| match step {
+                PlanStep::GuardedWrite {
+                    path: at, content, ..
+                } if at == path => Some(content.clone()),
+                _ => None,
+            })
+        };
+
+        let crossed = of(&at(OTHER, "2026-08-02-0900-handed-over.md"))
+            .expect("a pointer spelled from the drive root is one the resolver resolves");
+        assert!(
+            crossed.contains(&format!("[the record]({ZONE}/{SESSION}/{README})")),
+            "the markdown destination: {crossed}"
+        );
+        assert!(
+            crossed.contains(&format!("[[{ZONE}/{SESSION}/README]]")),
+            "the wikilink, which names the stem: {crossed}"
+        );
+        assert!(
+            crossed.contains(&format!("{ZONE}/{SESSION}/{README} |")),
+            "and the promote row, which no link parser can see: {crossed}"
+        );
+        assert!(
+            !crossed.contains(ABOUT),
+            "nothing left naming the old file: {crossed}"
+        );
+
+        let unmigrated = of(&at(UNMIGRATED, "2026-07-02-0900-note.md"))
+            .expect("the qualified spelling is rewritten even where the bare one is not");
+        assert!(
+            unmigrated.contains("[[about]]"),
+            "that session's own record still resolves for it: {unmigrated}"
+        );
+        assert!(
+            unmigrated.contains(&format!("[ours]({ZONE}/{SESSION}/{README})")),
+            "and ours is followed: {unmigrated}"
+        );
+
+        // A zone AT the drive root spells both the same way, and the two passes
+        // then have nothing to disagree about.
+        input.prefix = String::new();
+        input.pointers = vec![PointerFile {
+            session: OTHER.to_owned(),
+            rel: "note.md".to_owned(),
+            text: format!("See [it]({SESSION}/{ABOUT}).\n"),
+        }];
+        let rooted = compile_record_rename(&input).expect("nothing is in the way");
+        assert!(
+            rooted.steps.iter().any(|step| matches!(
+                step,
+                PlanStep::GuardedWrite { content, .. }
+                    if content == &format!("See [it]({SESSION}/{README}).\n")
+            )),
+            "{:?}",
+            rooted.steps
+        );
+    }
+
+    /// Row 7. A pointer at the record written in ANOTHER session is rewritten by
+    /// the zone-wide pass — the reason the pass is zone-wide at all, since a
+    /// continuation names what it continues.
+    ///
+    /// Three other facts in one test, because they are the same decision seen
+    /// from three sides: this session's own prose is rewritten, the record itself
+    /// never is (its bytes travel verbatim, so a self-link is left stale on
+    /// purpose), and a session still holding its own `about.md` is left for its
+    /// own rename — `[[about]]` there resolves to THAT session's record.
+    #[test]
+    fn a_pointer_in_another_session_is_rewritten_and_an_unmigrated_ones_is_not() {
+        const UNMIGRATED: &str = "active/2026-07-01-older";
+        const SELF_LINK: &str = "---\ntags: [about]\n---\n# keeper\n\nSee [about.md](about.md).\n";
+
+        let mut input = rename_input(&[AGENTS, ABOUT]);
+        input.with_about = vec![SESSION.to_owned(), UNMIGRATED.to_owned()];
+        input.pointers = vec![
+            PointerFile {
+                session: OTHER.to_owned(),
+                rel: "2026-08-02-0900-handed-over.md".to_owned(),
+                text: "Picked up from [[about]] and [the record](about.md).\n".to_owned(),
+            },
+            PointerFile {
+                session: SESSION.to_owned(),
+                rel: "spaces/plan.md".to_owned(),
+                text: "Decided in [the record](about.md).\n".to_owned(),
+            },
+            PointerFile {
+                session: SESSION.to_owned(),
+                rel: ABOUT.to_owned(),
+                text: SELF_LINK.to_owned(),
+            },
+            PointerFile {
+                session: UNMIGRATED.to_owned(),
+                rel: "2026-07-02-0900-note.md".to_owned(),
+                text: "Its own record: [[about]].\n".to_owned(),
+            },
+        ];
+
+        let plan = compile_record_rename(&input).expect("nothing is in the way");
+        let rewritten: Vec<(&str, &str)> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                PlanStep::GuardedWrite { path, content, .. } => {
+                    Some((path.as_str(), content.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        let of = |path: &str| {
+            rewritten
+                .iter()
+                .find(|(candidate, _)| *candidate == path)
+                .map(|(_, content)| *content)
+        };
+
+        assert_eq!(
+            of(&at(OTHER, "2026-08-02-0900-handed-over.md")),
+            Some("Picked up from [[README]] and [the record](README.md).\n"),
+            "a continuation's link crosses sessions, and both spellings are rewritten"
+        );
+        assert_eq!(
+            of(&at(SESSION, "spaces/plan.md")),
+            Some("Decided in [the record](README.md).\n"),
+            "and so is this session's own prose, in a subdirectory"
+        );
+        assert_eq!(
+            of(&at(UNMIGRATED, "2026-07-02-0900-note.md")),
+            None,
+            "a session that still holds its own about.md keeps a link that works"
+        );
+        assert_eq!(
+            of(&at(SESSION, ABOUT)),
+            None,
+            "the record is moved, never rewritten — which is what makes row 2 true"
+        );
+
+        // The stale self-link, stated rather than hidden: it is the price of the
+        // byte-for-byte guarantee, and one dangling link inside one file is the
+        // cheaper half of that trade.
+        let mut zone = std::collections::BTreeMap::from([
+            (at(SESSION, ABOUT), SELF_LINK.to_owned()),
+            (
+                at(SESSION, "spaces/plan.md"),
+                "Decided in [the record](about.md).\n".to_owned(),
+            ),
+            (
+                at(OTHER, "2026-08-02-0900-handed-over.md"),
+                "Picked up from [[about]] and [the record](about.md).\n".to_owned(),
+            ),
+        ]);
+        apply(&mut zone, &plan);
+        assert!(
+            zone[&at(SESSION, README)].contains("(about.md)"),
+            "the record's own bytes are untouched, self-link included"
+        );
+    }
+
+    /// The migration is one plan through the existing executor, and every step
+    /// before the move replays for free (AD-111). The move sorts last for exactly
+    /// that reason: `sessions_exec` refuses a `MoveFile` onto an occupied target,
+    /// so a resume that re-runs it refuses over a verb that has already finished
+    /// rather than over one that still has work to do.
+    #[test]
+    fn every_step_but_the_last_is_replayable_and_the_last_is_the_move() {
+        let mut input = rename_input(&[ABOUT, README]);
+        input.readme = SIGNPOST.to_owned();
+        input.pointers = vec![PointerFile {
+            session: SESSION.to_owned(),
+            rel: "2026-08-11-0900-note.md".to_owned(),
+            text: "See [[about]].\n".to_owned(),
+        }];
+
+        let plan = compile_record_rename(&input).expect("a signpost is not a collision");
+        let (last, rest) = plan.steps.split_last().expect("a non-empty plan");
+        assert!(matches!(last, PlanStep::MoveFile { .. }), "{last:?}");
+        for step in rest {
+            assert!(
+                matches!(
+                    step,
+                    PlanStep::WriteFile { .. }
+                        | PlanStep::GuardedWrite { .. }
+                        | PlanStep::TrashFile { .. }
+                ),
+                "{step:?} is not a step this plan can replay"
+            );
+        }
+        // All four cases at once: the write, the trash, the rewrite, the move.
+        assert_eq!(plan.steps.len(), 4, "{:?}", plan.steps);
+    }
+
+    /// Which file a session's record is in, for the one caller that must WRITE to
+    /// it: `sessions_ipc`'s create-from, whose lineage append is a guarded write.
+    ///
+    /// The half-migrated row is the one that matters. A name chosen by filename
+    /// order picks the signpost, whose `expect_len` matches its own bytes — so the
+    /// guard is satisfied and the session's `continued-by` is appended into a
+    /// redirect instead of into its record. Asking for the `id` is what keeps the
+    /// two apart.
+    #[test]
+    fn the_record_is_the_file_carrying_the_identity_not_the_first_name_tried() {
+        let record = "---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ntags: [about]\n---\n# keeper\n";
+
+        // Migrated, or folder-shaped: the contract's own name, holding the id.
+        assert_eq!(record_at(Some(record), None), Some((README, record)));
+        // Unmigrated flat: nothing at README.md at all.
+        assert_eq!(record_at(None, Some(record)), Some((ABOUT, record)));
+        // Half-migrated: both files, and only one of them is the session.
+        assert_eq!(
+            record_at(Some(SIGNPOST), Some(record)),
+            Some((ABOUT, record)),
+            "the signpost is not the record, however much it looks like one to a \
+             filename test"
+        );
+        // Both carry an id — the shape `compile_record_rename` refuses to choose
+        // between. A reader has to answer something, and the contract's name is
+        // what every other reader in the codebase already uses.
+        let older = "---\nid: 01J4ZZZZZZZZZZZZZZZZZZZZZZ\n---\n# older\n";
+        assert_eq!(record_at(Some(record), Some(older)), Some((README, record)));
+        // Neither carries one: a session on path identity, and the name that
+        // renders is still the one to write to.
+        assert_eq!(
+            record_at(Some("# hand written\n"), Some("# also hand written\n")),
+            Some((README, "# hand written\n"))
+        );
+        // No record at all.
+        assert_eq!(record_at(None, None), None);
     }
 }

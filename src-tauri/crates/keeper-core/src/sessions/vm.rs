@@ -354,15 +354,6 @@ pub struct SessionDetailVm {
     /// to *offer* — migration, a new-log button — never to decide what a file
     /// means; that decision was already made in Rust (AD-7).
     pub shape: String,
-    /// Root markdown declaring no kind: a leftover `README.md`, a file someone
-    /// dropped in, anything mid-migration. Session-relative paths.
-    ///
-    /// Surfaced rather than swallowed. The flat contract's whole premise is
-    /// that a file says what it is, so a file that says nothing is exactly the
-    /// case the operator needs to see — and it is what makes a half-finished
-    /// migration visible instead of merely survivable. Empty for a clean
-    /// session, in both shapes.
-    pub unfiled: Vec<String>,
     /// The work items, ready for the board — under **either** contract.
     ///
     /// The folder shape used to have none, because the detail read the pool only
@@ -436,11 +427,50 @@ pub struct SessionMigrationVm {
     pub needed: bool,
     /// Session-relative paths that will be created, in write order.
     pub creates: Vec<String>,
-    /// Paths that will be rewritten in place — today only `README.md`, which
-    /// becomes a signpost pointing at `about.md`.
+    /// Paths that will be rewritten in place — today only `README.md`, which is
+    /// the record itself: since story 52.1 the migration strips the `## Log`
+    /// section out of it and adds the `about` kind tag, leaving every other byte
+    /// where the operator put it. It used to become a signpost pointing at a new
+    /// `about.md`, and there is nowhere for such a signpost to point now.
     pub rewrites: Vec<String>,
     /// Directories that will be moved to the trash, last and irreversibly.
     pub trashes: Vec<String>,
+}
+
+/// What a record-name sweep did, and what it could not do (story 52.1, FR-300).
+///
+/// The zone-wide run is the ordinary one — the record's name is a zone-wide
+/// contract — so a count alone is not an answer: one session holding a
+/// `README.md` keeper will not choose about is a session the sweep must skip
+/// while migrating every other row, and an operator told only "12" would never
+/// learn that two are still broken. A partial success reports both halves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecordMigrateVm {
+    /// How many sessions actually had their record moved. Zero is an ordinary
+    /// answer — a zone that was already swept — and is why this is not a
+    /// failure.
+    pub moved: u32,
+    /// The sessions the sweep passed over, each with the compiler's own refusal
+    /// sentence. Empty on a clean run.
+    pub skipped: Vec<SessionRecordSkipVm>,
+}
+
+/// One session a record-name sweep could not move, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecordSkipVm {
+    /// Zone-relative folder path — where to go and look.
+    pub session: String,
+    /// The session's own title, so the sentence names what the operator calls it
+    /// rather than only where it is.
+    pub title: String,
+    /// [`crate::sessions::migrate::RecordRenameError`]'s sentence, verbatim: it
+    /// already names both files and what to do about them, and a second wording
+    /// here would be a second contract.
+    pub reason: String,
 }
 
 /// One space definition in a zone's `_spaces/`, projected for the rail and the
@@ -502,6 +532,17 @@ pub struct SessionSpaceVm {
     /// how much it is not showing. Capping the selection instead would make that
     /// count a lie, which is the one thing this key must not do.
     pub rows: Option<u32>,
+    /// The directory this space's creates go into, session-relative — empty when
+    /// it names none, which is today's behaviour for every space (Story 52.5,
+    /// FR-309).
+    ///
+    /// Carried so the editor can show what the file says and send it back
+    /// unchanged; the surface never composes a path out of it and never reads a
+    /// kind out of it. Where a create actually lands is
+    /// [`crate::sessions::shape::kind_dir`]'s answer in Rust (AD-65), which
+    /// takes this as its override and keeps the session's contract as the
+    /// fallback.
+    pub create_dir: String,
     /// Presentation keys keeper could not read, each a finished sentence. The
     /// space still works — this is the "not obeying one line of its own file"
     /// severity, distinct from `error`.
@@ -710,6 +751,12 @@ pub struct SessionSpaceReq {
     /// How many rows the section renders; `null` writes no key, and zero is not
     /// a legal cap (Story 51.3).
     pub rows: Option<u32>,
+    /// The directory this space's creates go into; empty writes no key.
+    ///
+    /// Sent on every save for `folded`'s reason: `render_edit` replaces the
+    /// whole `keeper:` map, so a form that omitted this would delete the
+    /// operator's destination on the next unrelated Save.
+    pub create_dir: String,
 }
 
 /// One thing the operator could reference (FR-265).

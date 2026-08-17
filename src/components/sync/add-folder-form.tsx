@@ -1268,10 +1268,25 @@ export function AddFolderForm({
           </div>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-threshold`}>{SYNC_LFS_THRESHOLD_LABEL}</Label>
+            {/* MB is a scale the user did not choose, so a fraction is ordinary
+                here: keeper's own documented 256 KiB threshold is 0.25 of one.
+                Without a `step` HTML's implicit step is 1, which makes every
+                fraction a stepMismatch — and because this box sits in a real
+                form with a native submit and no `noValidate`, WKWebView refuses
+                the whole save, including one that came to change something else.
+                `step="any"` with `inputMode="decimal"` is the pair
+                `session-space-editor.tsx:566-568` already uses for a fractional
+                box; the integer box beside it there keeps `step="1"`, so the two
+                cases stay distinguishable rather than uniformly loosened.
+                Downstream needs nothing: `pinnedValue` parses with
+                `Number.parseFloat`, and the one rounding at the save keeps the
+                byte count integral for Rust's `u64`. */}
             <Input
               id={`${fieldId}-threshold`}
               type="number"
               min={0}
+              step="any"
+              inputMode="decimal"
               className="w-24"
               placeholder={String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024)}
               value={form.lfsThresholdMb}
@@ -1299,6 +1314,11 @@ export function AddFolderForm({
               id={`${fieldId}-settle`}
               type="number"
               min={0}
+              // Fractional for the same reason as the threshold above: a 7.5 s
+              // window is a legal wait, the save already rounds it to whole
+              // milliseconds, and the implicit step=1 would block the submit.
+              step="any"
+              inputMode="decimal"
               className="w-24"
               // Empty means "keeper picks", so the box shows nothing and the
               // placeholder names what keeper will pick — 10 s on removable
@@ -1328,6 +1348,9 @@ export function AddFolderForm({
               id={`${fieldId}-poll`}
               type="number"
               min={0}
+              // Fractional, as the wait above — the save rounds to whole ms.
+              step="any"
+              inputMode="decimal"
               className="w-24"
               placeholder={String(effectivePollSeconds({ ...form, pollSeconds: "" }))}
               value={form.pollSeconds}

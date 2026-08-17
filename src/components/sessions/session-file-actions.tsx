@@ -13,9 +13,10 @@
  * operator named freehand is a log nothing can find. *New file* is the general
  * escape hatch — any name, three extensions, any folder — and it deliberately
  * writes NO kind tag, because keeper does not know what an operator's new file
- * is and guessing `log` would file a stray thought as history. The detail's
- * *unfiled* list is where such a file surfaces, with the sentence that says how
- * to file it.
+ * is and guessing `log` would file a stray thought as history. The `Untagged`
+ * space is where such a file surfaces (Story 52.4) — with a count, a fold and a
+ * row menu, and a create of its own that is disabled because a file with no kind
+ * is what that space is FOR.
  *
  * **The fourth is *New folder*** (FR-287), and it is a different idea from the
  * other three: it writes no bytes at all. A session's kinds are still tags and
@@ -204,7 +205,10 @@ export function SessionFileActions({
     (tag: string, fallback: string) => {
       onBusy(true);
       setNotice(null);
-      sessionsFileNewKind(rootId, sessionId, tag, "")
+      // No space asked: these two buttons are the *Files* heading's own, so the
+      // file lands where this session's contract keeps that kind and not in some
+      // space's directory (Story 52.5). The empty id is what says so.
+      sessionsFileNewKind(rootId, sessionId, tag, "", "")
         .then(opened)
         .catch((raw: unknown) => setNotice(syncErrorMessage(raw, fallback)))
         .finally(() => onBusy(false));
