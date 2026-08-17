@@ -78,10 +78,52 @@ export const SESSION_TEMPLATES_HEADING = "Templates";
  * What the room says about itself, once, under the heading.
  *
  * The consequence rather than the noun: a template is only interesting because
- * every session made from it starts as a copy of what is left here.
+ * every session made from it starts as a copy of what is left here — and
+ * because the copy is no longer quite verbatim, the sentence now says so. A
+ * person who does not know a `{{title}}` will be substituted is a person who
+ * will one day wonder why their template's literal braces vanished.
  */
 export const SESSION_TEMPLATES_HINT =
-  "The skeletons this zone copies a new session out of. Open a file to edit it — every session made from that template starts with what you leave here.";
+  "The skeletons this zone copies a new session out of. Open a file to edit it — every session made from that template starts with what you leave here, with the placeholders below filled in. keeper expands them into the new session; your template's own bytes are never touched.";
+
+/** What the disclosure holding the placeholder list is called. */
+export const SESSION_TEMPLATES_PLACEHOLDERS_LABEL = "Placeholders you can use in a template file";
+
+/**
+ * The placeholder vocabulary, and what each token means (FR-293).
+ *
+ * **This is a rendering of `keeper-core/src/notes/templates.rs`'s vocabulary,
+ * never a second one.** That module argues the point at length: a template
+ * authored in Obsidian must keep working, so a session template and a note
+ * template speak one grammar. Rust is the only thing that expands anything —
+ * nothing here parses a token — so what this list can go wrong about is being
+ * *stale*, not being wrong at the moment it runs.
+ *
+ * Held as a constant rather than fetched, and that is the trade taken
+ * knowingly: a static list is one more place to edit the day the vocabulary
+ * grows, while the alternative is a new IPC command whose whole payload is six
+ * frozen strings — a round trip, a loading state and an error state, on the
+ * pane's first paint, for text that changes once a year. `expansions` in
+ * `sessions/pattern.rs` is the source of truth; this is the sentence beside the
+ * text field.
+ *
+ * The unknown-token rule is a row of its own because it is the rule that makes
+ * the feature safe to use in a document full of braces, and it is the one thing
+ * a person cannot discover by trying — an unexpanded `{{foo}}` looks exactly
+ * like a bug until you are told it is the contract.
+ */
+export const SESSION_TEMPLATE_PLACEHOLDERS: readonly { token: string; means: string }[] = [
+  { token: "{{title}}", means: "the new session's title, as you typed it" },
+  { token: "{{id}}", means: "the new session's id — the one in its record's frontmatter" },
+  { token: "{{date}}", means: "the day it was created, as 2026-08-17" },
+  { token: "{{date:YYYY-MM}}", means: "that day in a format you choose (YYYY YY MM DD)" },
+  { token: "{{time}}", means: "the minute it was created, as 14:35" },
+  { token: "{{time:HHmm}}", means: "that minute in a format you choose (HH mm ss)" },
+];
+
+/** The rule that makes a template full of literal braces safe to copy. */
+export const SESSION_TEMPLATE_PLACEHOLDERS_UNKNOWN =
+  "Anything else is left exactly as you typed it, so {{TODO}} and {n} survive. Only .md files are expanded, and the record keeper stamps for you is never one of them.";
 
 /** What a zone with no template at all says. */
 export const SESSION_TEMPLATES_EMPTY =
@@ -429,6 +471,24 @@ export function SessionTemplates({
         </Button>
       </div>
       <p className="text-muted-foreground text-xs">{SESSION_TEMPLATES_HINT}</p>
+      {/* A disclosure rather than six always-open rows, and the trade is
+          UX-DR85's own: the pane is ≤512px, what a person came to this room for
+          is the template list, and three lines of vocabulary above it on every
+          visit would push the first template under the fold. The summary is
+          always visible, so nobody has to already know the feature exists —
+          which is the actual failure mode a hidden list would have. */}
+      <details className="text-muted-foreground text-xs">
+        <summary className="cursor-pointer">{SESSION_TEMPLATES_PLACEHOLDERS_LABEL}</summary>
+        <dl className="mt-1 flex flex-col gap-0.5">
+          {SESSION_TEMPLATE_PLACEHOLDERS.map((entry) => (
+            <div key={entry.token} className="flex items-baseline gap-1.5">
+              <dt className="shrink-0 font-mono">{entry.token}</dt>
+              <dd className="min-w-0">{entry.means}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="mt-1">{SESSION_TEMPLATE_PLACEHOLDERS_UNKNOWN}</p>
+      </details>
       {notice !== null && (
         // One live region for the verbs on this surface: create and rename both
         // answer here, and each answer is a sentence. What a READ said belongs to

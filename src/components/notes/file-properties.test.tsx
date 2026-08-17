@@ -23,6 +23,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const syncReadFrontmatter = vi.fn<(id: string, subpath: string) => Promise<string>>();
 const syncWriteFrontmatter =
   vi.fn<(id: string, subpath: string, expected: string, block: string) => Promise<string>>();
+const sessionsFileRename =
+  vi.fn<(id: string, subpath: string, expected: string, block: string) => Promise<string>>();
 const notesSave = vi.fn();
 const recordingNoteTargets = vi.fn<(sessionId: string) => Promise<null>>();
 const revealPath = vi.fn();
@@ -34,6 +36,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncReadFrontmatter: (id: string, subpath: string) => syncReadFrontmatter(id, subpath),
   syncWriteFrontmatter: (id: string, subpath: string, expected: string, block: string) =>
     syncWriteFrontmatter(id, subpath, expected, block),
+  sessionsFileRename: (id: string, subpath: string, expected: string, block: string) =>
+    sessionsFileRename(id, subpath, expected, block),
   notesSave: (...args: unknown[]) => notesSave(...args),
   recordingNoteTargets: (sessionId: string) => recordingNoteTargets(sessionId),
   revealPath: (path: string) => revealPath(path),
@@ -78,6 +82,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   syncReadFrontmatter.mockResolvedValue(NO_BLOCK);
   syncWriteFrontmatter.mockResolvedValue(ABOUT_BLOCK);
+  sessionsFileRename.mockResolvedValue("60-sessions/active/weekly/README.md");
   recordingNoteTargets.mockResolvedValue(null);
   tagsVocabulary.mockResolvedValue({ entries: [] });
   capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES });
@@ -271,5 +276,85 @@ describe("a file written with CRLF endings", () => {
     // One block, and the key that was there is still there.
     expect(block.match(/---/g)).toHaveLength(2);
     expect(readFrontmatter(block).entries.map((entry) => entry.key)).toEqual(["title", "tags"]);
+  });
+});
+
+/**
+ * A title change renames the file (Story 51.6, FR-295; matrix rows 1 and 6).
+ *
+ * **What this side decides, and it is the whole of it: which command.** Whether
+ * the name follows, what it becomes, and what refuses are all
+ * `keeper_core::sessions::files`'s, asserted over real strings there. What can
+ * only go wrong here is routing a retitle to `sync_write_frontmatter`, which
+ * would splice the title and leave the filename — the defect the owner reported.
+ */
+describe("a session file's title, changed in the panel", () => {
+  const TITLED = "---\ntitle: untitled\n---\n";
+
+  /** Change the `title` row's field and commit it, which is a blur or an Enter. */
+  async function retitle(next: string): Promise<void> {
+    const field = await screen.findByRole("textbox", { name: "title" });
+    fireEvent.change(field, { target: { value: next } });
+    fireEvent.blur(field);
+  }
+
+  it("goes to the rename verb, not to the block writer", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    mount();
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick Off");
+
+    await waitFor(() =>
+      expect(sessionsFileRename).toHaveBeenCalledWith(
+        PROFILE,
+        REL,
+        TITLED,
+        "---\ntitle: Kick Off\n---\n",
+      ),
+    );
+    // Never both: two commands over one block would be two journal rows, and the
+    // second would be guarding against the first.
+    expect(syncWriteFrontmatter).not.toHaveBeenCalled();
+  });
+
+  it("leaves every other key on the block writer", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    mount();
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await addTag("about");
+
+    await waitFor(() => expect(syncWriteFrontmatter).toHaveBeenCalledTimes(1));
+    expect(sessionsFileRename).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The two refusals the story exists to make honest, in Rust's own words: a
+   * collision names the file it would have overwritten, and a title that folds to
+   * nothing says the title was not written either — which is the sentence that
+   * stops a reader assuming half of it landed.
+   */
+  it("prints the refusal verbatim, including the one that says the title did not land", async () => {
+    const refusal =
+      '"###" has nothing in it a filename can be named after — it needs letters or digits. keeper will not invent a name, and it has not written the title either: a file renamed halfway is worse than one not renamed at all.';
+    sessionsFileRename.mockRejectedValue({ message: refusal });
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    mount();
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("###");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
+  });
+
+  it("tells its host the file changed, because the file it was showing has moved", async () => {
+    syncReadFrontmatter.mockResolvedValue(TITLED);
+    const onWritten = mount();
+    await screen.findByRole("region", { name: PROPERTIES_LABEL });
+
+    await retitle("Kick Off");
+
+    await waitFor(() => expect(onWritten).toHaveBeenCalledTimes(1));
   });
 });

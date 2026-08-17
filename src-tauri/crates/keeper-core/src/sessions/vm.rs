@@ -363,8 +363,23 @@ pub struct SessionDetailVm {
     /// migration visible instead of merely survivable. Empty for a clean
     /// session, in both shapes.
     pub unfiled: Vec<String>,
-    /// The work items, ready for the board. Empty under the folder contract,
-    /// which has no such thing.
+    /// The work items, ready for the board — under **either** contract.
+    ///
+    /// The folder shape used to have none, because the detail read the pool only
+    /// for a flat session. Story 51.1 put a folder-shaped session's root markdown
+    /// into the pool (FR-286), so a `task`-tagged file there is a card now, and
+    /// this reader was the last place still answering as though it were not.
+    ///
+    /// **This list is also the board's gate** (Story 51.7, FR-299). The surface
+    /// used to render the board for the flat shape only, because a folder-shaped
+    /// session had no pool to tag and its board would have been four empty
+    /// columns saying nothing true. It has a pool now, and the honest gate was
+    /// never the shape: it is whether there is anything tagged, which is exactly
+    /// what this carries. A separate "does it have a pool" flag beside it would
+    /// be a second predicate to keep in step with the first, and it could only
+    /// ever disagree by being wrong — an empty pool selects no tasks either way,
+    /// and the board answers an empty list with the sentence that says what a
+    /// task is rather than with columns.
     pub tasks: Vec<SessionTaskVm>,
 }
 
@@ -466,6 +481,27 @@ pub struct SessionSpaceVm {
     pub default_key: Option<String>,
     /// Rail position; zero means unpositioned, and ties break by name.
     pub order: f64,
+    /// How this space opens when nobody has folded it by hand, or `None` when
+    /// its file says nothing (Story 51.3, FR-289).
+    ///
+    /// The MIDDLE of four layers, and the surface composes them:
+    /// the person's own hand-fold wins, then this, then the user-global
+    /// `sessions.spaces_folded`, then unfolded. `None` is therefore load-bearing
+    /// — it is what lets the setting still mean something — and is why this
+    /// crosses as a nullable boolean rather than as a resolved one. Resolving it
+    /// here was the alternative and it cannot be done: Rust does not know what
+    /// the person folded in this document, because that answer lives in a cookie
+    /// (`session-spaces-fold.ts`).
+    pub folded: Option<bool>,
+    /// How many rows this space's section RENDERS, or `None` for all of them
+    /// (Story 51.3, FR-290).
+    ///
+    /// Not a selection cap. [`crate::notes::vm::NoteSpaceVm`]'s `limit` narrows
+    /// what the query asks the index for; this narrows what one card draws, and
+    /// the header keeps counting the whole selection so a capped section can say
+    /// how much it is not showing. Capping the selection instead would make that
+    /// count a lie, which is the one thing this key must not do.
+    pub rows: Option<u32>,
     /// Presentation keys keeper could not read, each a finished sentence. The
     /// space still works — this is the "not obeying one line of its own file"
     /// severity, distinct from `error`.
@@ -506,24 +542,44 @@ pub struct SessionSpaceFilesVm {
     /// Its query would not parse, already worded. `files` is then empty, and the
     /// section renders the sentence rather than a suspiciously complete list.
     pub error: Option<String>,
-    /// Why THIS session's contract keeps nowhere to put a file of the kind this
-    /// space creates, already worded — or `None` when it keeps somewhere, and
-    /// when the space names no creatable kind at all.
+    /// Why this space offers no create, already worded — or `None` when it has
+    /// one to offer, and when the refusal is nothing a person needs told.
     ///
-    /// [`crate::sessions::shape::KindHasNoHome`]'s own sentence, projected
-    /// rather than restated. [`SessionSpaceVm::new_file_kind`] answers what a
-    /// create here would write and is built for the ZONE, so it cannot know a
-    /// shape; this payload is per session, which is where the question "does
-    /// this session's contract keep a home for that kind" can be answered at
-    /// all. Carrying the sentence rather than a flag is the point:
-    /// `KindHasNoHome` exists to compose the refusal once, and a surface that
-    /// received `true` would have to write a second wording of it — which is
-    /// how "migrate the session" and "migrate it" become two products'
-    /// vocabulary for one rule.
+    /// Two refusals reach this field, and the wording of both is Rust's
+    /// ([`crate::sessions::spaces::create_refused`]). THIS SESSION's contract
+    /// keeping nowhere to put the kind is
+    /// [`crate::sessions::shape::KindHasNoHome`]'s sentence, projected rather
+    /// than restated: [`SessionSpaceVm::new_file_kind`] answers what a create
+    /// here would write and is built for the ZONE, so it cannot know a shape,
+    /// and this payload is per session. The QUERY asking for more than one
+    /// thing is [`crate::sessions::spaces::Refusal::ManyTerms`]'s — the field
+    /// used to be silent for it, because it was only computed when the query
+    /// HAD produced a creatable kind, which is why the About space rendered
+    /// neither a button nor a reason (Story 51.7).
+    ///
+    /// Carrying the sentence rather than a flag is the point: the refusals are
+    /// composed once each, and a surface that received `true` would have to
+    /// write a second wording — which is how "migrate the session" and
+    /// "migrate it" become two products' vocabulary for one rule.
     ///
     /// A create is **absent** where this is `Some`, never present-and-disabled,
     /// and the sentence goes where the button would have been.
     pub no_home: Option<String>,
+    /// Whether the verb that applies here instead of a create is opening the
+    /// session's record (FR-299).
+    ///
+    /// True exactly where the space's query names the record — one per session,
+    /// under either contract, and keeper edits it rather than making a second.
+    /// Never true where a create is offered, which is what lets the surface put
+    /// this verb in the create's own slot.
+    ///
+    /// A flag here and a sentence above, deliberately: this decides whether a
+    /// VERB applies, not how a refusal is worded, and the file it opens is one
+    /// fixed name at a known place that the header already names from
+    /// [`SessionDetailVm::shape`]. Sending a path would be a second answer to
+    /// "where is the record", against the one AD-65 exception that surface is
+    /// documented to keep.
+    pub open_record: bool,
 }
 
 /// One file a space selected — the card a space's section draws.
@@ -642,6 +698,18 @@ pub struct SessionSpaceReq {
     pub icon: Option<String>,
     /// Rail position; zero writes no key, because zero means unpositioned.
     pub order: f64,
+    /// How the section opens when nobody has folded it by hand; `null` writes no
+    /// key (Story 51.3).
+    ///
+    /// Nullable rather than a plain boolean for [`SessionSpaceVm::folded`]'s
+    /// reason, and the form must send back what it read: this request is the
+    /// third hop of the chain that saves a space, and `render_edit` REPLACES the
+    /// whole `keeper:` map — a request that dropped this field would delete the
+    /// operator's answer on the next unrelated Save.
+    pub folded: Option<bool>,
+    /// How many rows the section renders; `null` writes no key, and zero is not
+    /// a legal cap (Story 51.3).
+    pub rows: Option<u32>,
 }
 
 /// One thing the operator could reference (FR-265).

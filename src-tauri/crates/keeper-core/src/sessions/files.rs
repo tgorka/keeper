@@ -33,6 +33,7 @@ use std::collections::BTreeSet;
 
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming;
+use crate::sessions::model::{ARTIFACTS_DIR, README};
 use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::shape::{KindTag, ABOUT, AGENTS};
 
@@ -44,6 +45,26 @@ use crate::sessions::shape::{KindTag, ABOUT, AGENTS};
 /// shell still asks the real one — see [`compile_new`]'s note — because two
 /// predicates that must agree should both run, not take turns.
 const WORKSPACE: &str = "workspace";
+
+/// The three names a rename never touches, session-relative.
+///
+/// [`super::shape::shape`] reads `AGENTS.md` and `about.md` off the session's own
+/// listing to decide which contract the folder follows, and `README.md` is the
+/// folder-shaped record every reader addresses by name — [`super::model::README`]
+/// itself, the `## Promote` table, the session's pins. Renaming one of these
+/// would not break a link; it would break the *session*.
+const RECORD_NAMES: [&str; 3] = [AGENTS, ABOUT, README];
+
+/// How many bytes of a stamped filename are the stamp: `YYYY-MM-DD` is ten and
+/// `HHMM` is four, with a separator on each side of the time.
+///
+/// The reverse of [`new_stamped`]'s `format!("{date}-{time}-{slug}")`, and it
+/// lives here rather than beside [`super::pool`]'s reader because this module is
+/// the *writer* — the arithmetic above is one line from the `format!` it
+/// describes. `pool::stamp_of` reads the same fifteen characters for a different
+/// answer (a clock, not an offset), so one shared helper would have to hand both
+/// back to two callers that each want one.
+const STAMP_LEN: usize = 16;
 
 /// What a new file may be. Closed, for the reason in the module header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +152,28 @@ pub enum FileVerbError {
          keeper folds a folder name to a slug and will not invent one for you."
     )]
     Unnameable { typed: String },
+
+    #[error(
+        "\"{typed}\" has nothing in it a filename can be named after — it needs letters or \
+         digits. keeper will not invent a name, and it has not written the title either: \
+         a file renamed halfway is worse than one not renamed at all."
+    )]
+    UnnameableTitle { typed: String },
+
+    #[error(
+        "renaming {rel} would overwrite {taken}, which is already in this session. keeper \
+         never renames onto bytes somebody else wrote — retitle it to something that does \
+         not collide, or move {taken} out of the way first."
+    )]
+    Collision { rel: String, taken: String },
+
+    #[error(
+        "{rel} is promoted output. A rename rewrites the session's own markdown and never \
+         a deliverable in artifacts/: that name is the promotion contract the record's \
+         table states, and a reference inside an artifact is a reference from the artifact \
+         rather than from the session."
+    )]
+    Artifact { rel: String },
 }
 
 /// Whether a session-relative path is one this module may write or delete.
@@ -279,6 +322,54 @@ pub fn check_deletable(rel: &str) -> Result<(), FileVerbError> {
     Ok(())
 }
 
+/// [`check_rel`], plus the directory a rename neither moves nor rewrites.
+///
+/// `workspace/` is already refused by [`check_rel`] — scratch, AD-113 — and this
+/// adds `artifacts/` for a different reason: a promotion is *"a copy under a
+/// stable name, listed here"* ([`super::promote`]), so the name is the contract
+/// the record's table records, and rewriting a link inside a deliverable would
+/// be keeper editing output it did not write.
+///
+/// Asked of the file being renamed **and** of every file whose pointers are
+/// rewritten, because it is one rule and both ends of a rename can break it. The
+/// reader already declines to walk either directory
+/// (`sessions_root::UNSCANNED_DIRS`), so this is the second of the two
+/// predicates that must agree, not a new one: a rule that holds only because a
+/// scan happened to skip a folder is a rule the day somebody calls this
+/// directly.
+///
+/// # Errors
+/// [`FileVerbError::Artifact`] for promoted output, or whatever [`check_rel`]
+/// refuses.
+pub fn check_rewritable(rel: &str) -> Result<(), FileVerbError> {
+    check_rel(rel)?;
+    if rel
+        .strip_prefix(ARTIFACTS_DIR)
+        .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return Err(FileVerbError::Artifact {
+            rel: rel.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether this file's *name* follows its title.
+///
+/// False for the three names in [`RECORD_NAMES`], and that asymmetry is the
+/// point: the record's title is editable and its filename is not. Refusing the
+/// title edit as well would make the one file whose title is the session's own
+/// headline the one file whose headline cannot be changed — so the rename verb
+/// asks this, writes the title either way, and moves nothing when the answer is
+/// no.
+///
+/// The whole session-relative path is compared, [`check_deletable`]'s way: a
+/// `notes/README.md` somebody wrote is not the record, and it renames.
+#[must_use]
+pub fn renames(rel: &str) -> bool {
+    !RECORD_NAMES.contains(&rel)
+}
+
 /// The name a plainly-created file gets: `<slug>.<ext>`, avoiding `taken`.
 ///
 /// **Undated**, unlike a log. Someone who types "budget" for a `.csv` means a
@@ -323,6 +414,113 @@ pub fn new_stamped(title: &str, date: &str, time: &str, taken: &BTreeSet<String>
         n += 1;
     }
     candidate
+}
+
+/// The `YYYY-MM-DD-HHMM-` a stamped stem leads with, when it has one. `None` for
+/// an ordinary name, which carries no clock and needs none kept.
+fn stamped_prefix(stem: &str) -> Option<&str> {
+    let bytes = stem.as_bytes();
+    let shaped = bytes.len() >= STAMP_LEN
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'-'
+        && bytes[11..15].iter().all(u8::is_ascii_digit)
+        && bytes[15] == b'-';
+    // `get` rather than an index behind the flag: the slice is the answer, and a
+    // range that cannot panic is worth more than one guarded by a `bool` two
+    // lines up.
+    if shaped {
+        stem.get(..STAMP_LEN)
+    } else {
+        None
+    }
+}
+
+/// Rejoin a folded name onto the folder it came out of.
+fn rejoin(dir: Option<&str>, name: &str) -> String {
+    match dir {
+        Some(dir) => format!("{dir}/{name}"),
+        None => name.to_owned(),
+    }
+}
+
+/// The name `rel` takes when its title becomes `new_title` — or the refusal for
+/// a rename keeper will not make (FR-295).
+///
+/// **The stamp survives, the slug is replaced.** A log's leading
+/// `YYYY-MM-DD-HHMM-` is what makes the pool sort itself in Finder, in `ls` and
+/// in any tool that has never heard of keeper ([`new_stamped`]), so a rename that
+/// re-stamped with today's clock would file yesterday's entry as today's work.
+/// The directory and the extension are untouched for the same reason they are
+/// untouched by a title edit: neither is anything the title says.
+///
+/// **A collision refuses rather than counting.** [`new_named`] appends `-2`
+/// because a *create* has no expectation about its name; a rename does — the
+/// person typed a title and expects the file to be called after it, and handing
+/// them `kick-off-2.md` would be keeper answering a different question. So the
+/// refusal names the file that is in the way, which is the only fact that makes
+/// it actionable.
+///
+/// `taken` is the destination folder's names, read fresh by the shell, compared
+/// case-insensitively for [`new_named`]'s reason: APFS and NTFS fold case, so two
+/// names differing only in case are one file on the machine in front of the
+/// person. A candidate that folds onto `rel`'s *own* name is not a collision with
+/// itself — that is a title edit that changes no name, or a case-only rename,
+/// which [`PlanStep::MoveFile`]'s same-file carve-out is what lets through.
+///
+/// # Errors
+/// [`FileVerbError::UnnameableTitle`] for a title that folds to nothing,
+/// [`FileVerbError::Collision`] for a name already in the folder, or whatever
+/// [`check_rewritable`] refuses about either path.
+pub fn rename_target(
+    rel: &str,
+    new_title: &str,
+    taken: &BTreeSet<String>,
+) -> Result<String, FileVerbError> {
+    check_rewritable(rel)?;
+    // `slug_stem` rather than `slug`, and the difference IS the refusal: `slug`
+    // answers `untitled` for a title with nothing in it, so a rename that folded
+    // first and tested for empty afterwards would file somebody's file under
+    // keeper's fallback word and call it the name they chose. Asked here, and the
+    // name composed with `slug` below, so a fold landing on an MS-DOS device name
+    // still gets the suffix `new_named` gives it.
+    if naming::slug_stem(new_title).is_empty() {
+        return Err(FileVerbError::UnnameableTitle {
+            typed: new_title.to_owned(),
+        });
+    }
+    let (dir, name) = match rel.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, rel),
+    };
+    // `check_rewritable` proved there is an extension and that it is one of the
+    // three; this is that fact read back, not a second parse of it.
+    let (stem, ext) = name
+        .rsplit_once('.')
+        .ok_or_else(|| FileVerbError::Extension {
+            rel: rel.to_owned(),
+        })?;
+    let stamp = stamped_prefix(stem).unwrap_or_default();
+    let candidate = format!("{stamp}{}.{ext}", naming::slug(new_title));
+
+    if candidate.eq_ignore_ascii_case(name) {
+        return Ok(rejoin(dir, &candidate));
+    }
+    if let Some(clash) = taken
+        .iter()
+        .find(|existing| existing.eq_ignore_ascii_case(&candidate))
+    {
+        return Err(FileVerbError::Collision {
+            rel: rel.to_owned(),
+            taken: rejoin(dir, clash),
+        });
+    }
+    let to = rejoin(dir, &candidate);
+    check_rewritable(&to)?;
+    Ok(to)
 }
 
 /// The bytes a new file starts with.
@@ -485,6 +683,94 @@ pub fn compile_delete(session: &str, rel: &str, trash_key: &str) -> Result<Plan,
             path: format!("{session}/{rel}"),
             trash_key: trash_key.to_owned(),
         }],
+    })
+}
+
+/// One file a rename rewrites: where it is, how long it was when it was read,
+/// and the bytes it gets.
+///
+/// The length is the guard [`PlanStep::GuardedWrite`] takes, and it is the
+/// *read's* own length rather than anything computed here: the shell read these
+/// bytes to decide what to write, so what the guard is aimed at is a write that
+/// landed between that read and this plan running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rewrite {
+    /// Session-relative path, as it is **before** the move.
+    pub rel: String,
+    /// Length of the bytes this rewrite was computed from.
+    pub expect_len: usize,
+    /// The bytes to write.
+    pub content: String,
+}
+
+/// The plan that renames one session file and fixes what pointed at it
+/// (FR-295, FR-296).
+///
+/// `rel` is where the file is now, `to` is where it is going — both
+/// session-relative, both decided by [`rename_target`] — and `rewrites` is every
+/// file whose bytes change, the renamed file's own title write included, each
+/// addressed at the path it has *before* the move. One plan, one journal row:
+/// either the file moved and the pointers followed, or neither happened
+/// (NFR-38).
+///
+/// **The title write is in here rather than in a `sync_write_frontmatter` call
+/// beside it.** A rename is one act from the person's point of view — they
+/// changed the title — and two commands would mean two journal rows and a window
+/// in which the file says `Kick Off` and is still called `untitled`. That window
+/// is precisely the *"half of it would be worse than none"* `docs/sessions.md`
+/// refused a rename over, so the answer is one plan and not two verbs called in
+/// order.
+///
+/// **`to == rel` is the record's case and compiles to no move at all**, which is
+/// what makes [`renames`] a fact the caller reads rather than a branch it writes:
+/// the plan is then the title write alone, journaled the same way.
+///
+/// **[`PlanStep::MoveFile`] is last.** That is AD-111's rule, and here it is also
+/// the only order that resumes: a re-run guarded write meets its own output and
+/// returns `Ok` (`sessions_exec`'s idempotency-before-guard branch), so the move
+/// is the one step a resume has left to do. Moving first would leave a resumable
+/// prefix in which every remaining rewrite is addressed at a path that has gone.
+///
+/// One window stays open and is worth naming rather than hiding: a crash between
+/// the rename landing and the journal recording it makes the resumed move fail on
+/// a source that is no longer there. The tree is *consistent* in that window —
+/// fully renamed, pointers rewritten — and the resume reports the disk's error
+/// over it. Teaching `MoveFile` to read "source gone, target present" as "already
+/// done" would close it, and `sessions_exec` argues at length against exactly
+/// that: the same test is satisfied by a neighbour a rename must never be told it
+/// ate.
+///
+/// # Errors
+/// Whatever [`check_rewritable`] refuses about either path or about any
+/// rewrite's — the plan is not compiled for a file keeper will not move and not
+/// for a pointer it will not touch.
+pub fn compile_rename(
+    session: &str,
+    rel: &str,
+    to: &str,
+    rewrites: &[Rewrite],
+) -> Result<Plan, FileVerbError> {
+    check_rewritable(rel)?;
+    check_rewritable(to)?;
+    let mut steps = Vec::with_capacity(rewrites.len() + 1);
+    for rewrite in rewrites {
+        check_rewritable(&rewrite.rel)?;
+        steps.push(PlanStep::GuardedWrite {
+            path: format!("{session}/{}", rewrite.rel),
+            expect_len: rewrite.expect_len,
+            content: rewrite.content.clone(),
+        });
+    }
+    if to != rel {
+        steps.push(PlanStep::MoveFile {
+            from: format!("{session}/{rel}"),
+            to: format!("{session}/{to}"),
+        });
+    }
+    Ok(Plan {
+        verb: "file-rename".to_owned(),
+        session: session.to_owned(),
+        steps,
     })
 }
 
@@ -981,5 +1267,212 @@ mod tests {
         assert_eq!(crate::notes::naming::slug("###"), "untitled");
         // A name somebody really typed still passes, fallback word included.
         assert_eq!(dir_rel("untitled").as_deref(), Ok("untitled"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Renaming one file, and the pointers that named it (Story 51.6)
+    // -----------------------------------------------------------------------
+
+    /// Row 1. The stamp is the pool's sort order, so a retitle keeps it and
+    /// replaces only the part of the name the title decides.
+    #[test]
+    fn a_stamped_name_keeps_its_stamp_and_changes_its_slug() {
+        assert_eq!(
+            rename_target(
+                "2026-08-16-1812-untitled.md",
+                "Kick Off",
+                &taken(&["2026-08-16-1812-untitled.md"])
+            )
+            .as_deref(),
+            Ok("2026-08-16-1812-kick-off.md")
+        );
+        // In a subfolder: the folder is not something the title says either.
+        assert_eq!(
+            rename_target("refs/2026-08-16-1812-untitled.md", "Kick Off", &taken(&[])).as_deref(),
+            Ok("refs/2026-08-16-1812-kick-off.md")
+        );
+        // A name that carries no clock takes the whole slug, and keeps the
+        // extension the create chose from a menu.
+        assert_eq!(
+            rename_target("budget.csv", "Q3 Budget", &taken(&[])).as_deref(),
+            Ok("q3-budget.csv")
+        );
+    }
+
+    /// Row 4. A title with nothing in it is refused rather than folded, and the
+    /// refusal says the title was not written either — the sentence is the
+    /// contract, because `slug` would happily have answered `untitled`.
+    #[test]
+    fn a_title_that_folds_to_nothing_refuses_rather_than_inventing_a_name() {
+        for typed in ["###", "🎉", "   "] {
+            assert!(
+                matches!(
+                    rename_target("2026-08-16-1812-untitled.md", typed, &taken(&[])),
+                    Err(FileVerbError::UnnameableTitle { .. })
+                ),
+                "{typed} folds to nothing and must be refused, not filed under a fallback"
+            );
+        }
+        // …and this is why the test cannot be "did the fold come back empty".
+        assert_eq!(crate::notes::naming::slug("###"), "untitled");
+        assert!(
+            rename_target("2026-08-16-1812-untitled.md", "###", &taken(&[]))
+                .expect_err("a title that folds to nothing must refuse")
+                .to_string()
+                .contains("has not written the title either"),
+            "the refusal has to say the title did not land, or a reader will assume it did"
+        );
+    }
+
+    /// Row 5. Refused, and the refusal names the file that would have been
+    /// overwritten — a create counts up, a rename does not.
+    #[test]
+    fn a_rename_onto_a_neighbour_refuses_and_names_it() {
+        let error = rename_target(
+            "refs/2026-08-16-1812-untitled.md",
+            "Kick Off",
+            &taken(&["2026-08-16-1812-kick-off.md"]),
+        )
+        .expect_err("a name already in the folder must refuse");
+        assert_eq!(
+            error,
+            FileVerbError::Collision {
+                rel: "refs/2026-08-16-1812-untitled.md".to_owned(),
+                taken: "refs/2026-08-16-1812-kick-off.md".to_owned(),
+            }
+        );
+        // Case-folded, because APFS and NTFS are: the collision is real on the
+        // machine in front of the person.
+        assert!(matches!(
+            rename_target("a.md", "Kick Off", &taken(&["KICK-OFF.MD"])),
+            Err(FileVerbError::Collision { .. })
+        ));
+    }
+
+    /// A title edit that lands on the name the file already has is not a
+    /// collision with itself, and neither is a case-only one.
+    #[test]
+    fn a_retitle_onto_its_own_name_is_not_a_collision() {
+        assert_eq!(
+            rename_target("kick-off.md", "Kick Off!", &taken(&["kick-off.md"])).as_deref(),
+            Ok("kick-off.md")
+        );
+        assert_eq!(
+            rename_target("Kick-Off.md", "kick off", &taken(&["Kick-Off.md"])).as_deref(),
+            Ok("kick-off.md"),
+            "a case-only rename is `MoveFile`'s same-file carve-out, not a refusal"
+        );
+    }
+
+    /// Row 6. The record's title is editable and its filename is not — `shape()`
+    /// reads two of these names, and the third is what every reader of a
+    /// folder-shaped session addresses.
+    #[test]
+    fn the_record_and_the_contract_file_keep_their_names() {
+        for rel in ["about.md", "AGENTS.md", "README.md"] {
+            assert!(!renames(rel), "{rel} must keep the name shape() reads");
+        }
+        // A file that merely shares the word is an ordinary pool file.
+        assert!(renames("notes/README.md"));
+        assert!(renames("about-the-client.md"));
+        // And the plan for one is the title write alone: no move, still journaled.
+        let plan = compile_rename(
+            "active/s",
+            "about.md",
+            "about.md",
+            &[Rewrite {
+                rel: "about.md".to_owned(),
+                expect_len: 12,
+                content: "---\ntitle: Kick Off\n---\n".to_owned(),
+            }],
+        )
+        .expect("the record's title write compiles");
+        assert_eq!(plan.verb, "file-rename");
+        assert_eq!(plan.steps.len(), 1);
+        assert!(matches!(plan.steps[0], PlanStep::GuardedWrite { .. }));
+    }
+
+    /// Row 7. The fence's own sentence, asked one scope in from where it is
+    /// enforced — both of a rename's ends and every pointer it would rewrite.
+    #[test]
+    fn the_workspace_and_artifacts_are_neither_renamed_nor_rewritten() {
+        assert!(matches!(
+            rename_target("workspace/iter-3.md", "Kick Off", &taken(&[])),
+            Err(FileVerbError::Workspace { .. })
+        ));
+        assert!(matches!(
+            rename_target("artifacts/report.md", "Kick Off", &taken(&[])),
+            Err(FileVerbError::Artifact { .. })
+        ));
+        assert!(matches!(
+            check_rewritable("artifacts/2026/report.md"),
+            Err(FileVerbError::Artifact { .. })
+        ));
+        // A file merely *named* like either directory is in neither.
+        assert!(check_rewritable("artifacts-index.md").is_ok());
+        // And a pointer rewrite aimed at output is refused by the compiler, not
+        // only by the scan that declines to read it.
+        assert!(matches!(
+            compile_rename(
+                "active/s",
+                "a.md",
+                "b.md",
+                &[Rewrite {
+                    rel: "artifacts/report.md".to_owned(),
+                    expect_len: 1,
+                    content: String::new(),
+                }],
+            ),
+            Err(FileVerbError::Artifact { .. })
+        ));
+    }
+
+    /// Row 8. Every guarded write first, the move last: a resume re-runs the
+    /// writes against their own output (a no-op) and has exactly the move left.
+    /// The inverse order would leave a prefix whose remaining steps address a
+    /// path that has already gone.
+    #[test]
+    fn the_move_sorts_after_every_rewrite_so_a_resume_has_one_step_left() {
+        let plan = compile_rename(
+            "active/2026-08-16-keeper",
+            "2026-08-16-1812-untitled.md",
+            "2026-08-16-1812-kick-off.md",
+            &[
+                Rewrite {
+                    rel: "2026-08-16-1812-untitled.md".to_owned(),
+                    expect_len: 30,
+                    content: "titled".to_owned(),
+                },
+                Rewrite {
+                    rel: "README.md".to_owned(),
+                    expect_len: 40,
+                    content: "pointed".to_owned(),
+                },
+            ],
+        )
+        .expect("a rename with one pointer compiles");
+
+        assert_eq!(plan.verb, "file-rename");
+        assert_eq!(plan.session, "active/2026-08-16-keeper");
+        assert_eq!(
+            plan.steps,
+            vec![
+                PlanStep::GuardedWrite {
+                    path: "active/2026-08-16-keeper/2026-08-16-1812-untitled.md".to_owned(),
+                    expect_len: 30,
+                    content: "titled".to_owned(),
+                },
+                PlanStep::GuardedWrite {
+                    path: "active/2026-08-16-keeper/README.md".to_owned(),
+                    expect_len: 40,
+                    content: "pointed".to_owned(),
+                },
+                PlanStep::MoveFile {
+                    from: "active/2026-08-16-keeper/2026-08-16-1812-untitled.md".to_owned(),
+                    to: "active/2026-08-16-keeper/2026-08-16-1812-kick-off.md".to_owned(),
+                },
+            ],
+            "the renamed file is written at the path it still has, and the move is last"
+        );
     }
 }

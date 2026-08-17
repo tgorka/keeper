@@ -1,21 +1,28 @@
 /**
  * Which of a session's spaces are folded, and what an untouched one does
- * (Story 49.3, FR-275, FR-276).
+ * (Story 49.3, FR-275, FR-276; Story 51.3, FR-289).
  *
- * **Two decisions, and they are not the same decision.** Folding one space is
+ * **Three decisions, and they are not the same decision.** Folding one space is
  * chrome the person arranged, so it lives where every other piece of arranged
  * chrome lives — a cookie, TS-only, never IPC (`fold-cookie.ts:29-33`). What a
  * space they have *never touched* does on arrival is a preference a `keeper.toml`
  * may set, so it lives in the settings table and arrives here as
- * {@link SessionSpacesFoldState.defaultFolded}. The composition is the story:
+ * {@link SessionSpacesFoldState.defaultFolded}. And what ONE space does on
+ * arrival is part of that space's definition, so it lives in the space's own
+ * file as `keeper.folded` and arrives per space, not through this store — a
+ * space is a file on disk you can copy into another zone, and a fold kept in
+ * this document's cookie could not travel with it.
  *
- * > a space with no recorded fold follows the setting; a space the person folded
- * > or unfolded by hand keeps their answer.
+ * {@link isSpaceFolded} composes all three, and it is the only place they are
+ * composed:
+ *
+ * > the hand-fold, else the space's own answer, else the setting, else unfolded.
  *
  * That is why the recorded state is a `boolean` per space rather than a set of
- * folded ids. A set can say "folded" and "not folded", and this needs a third
- * answer — "nothing recorded, ask the setting" — or flipping the setting would
- * either be ignored by every space or overwrite every hand-made choice.
+ * folded ids, and why the file's answer crosses as `boolean | null`. A set can
+ * say "folded" and "not folded", and both layers need a third answer —
+ * "nothing here, ask the next layer down" — or flipping the setting would either
+ * be ignored by every space or overwrite every hand-made choice.
  *
  * **A fourth cookie namespace, not a key in an existing one.** `fold-cookie.ts`
  * names this exact collision: the chat sidebar has a group called `spaces`, the
@@ -248,13 +255,36 @@ export interface SessionSpacesFoldState {
 }
 
 /**
- * Whether this space's rows are folded away right now.
+ * Whether this space's rows are folded away right now (Story 51.3, FR-289).
  *
- * The composition rule, in one line and in one place: the recorded answer when
- * there is one, the setting otherwise.
+ * **The layering, stated once and in one place — four steps, most specific
+ * first:**
+ *
+ * 1. what the person folded or unfolded **by hand** in this document (the
+ *    recorded cookie) wins;
+ * 2. else the space's own `keeper.folded`, when its file sets it (`said`);
+ * 3. else `sessions.spaces_folded`, the user-global setting
+ *    ({@link SessionSpacesFoldState.defaultFolded});
+ * 4. else unfolded.
+ *
+ * The setting STAYS, and step 3 is why: it is now the fallback for spaces that
+ * say nothing, which is exactly what a user-global default is for. Reading the
+ * file's answer as a replacement for the setting was the alternative, and it
+ * would have made "fold everything by default" unsayable for the four seeded
+ * spaces — none of which carries the key.
+ *
+ * `said` is REQUIRED rather than optional. An optional third argument would let
+ * a call site drop the middle layer silently, and the result — a space whose
+ * file says `folded: true` arriving unfolded — is indistinguishable from a space
+ * that said nothing, so no test at this level could see the omission. `null` is
+ * the space that said nothing, and it has to be typed out.
  */
-export function isSpaceFolded(state: SessionSpacesFoldState, key: string): boolean {
-  return state.recorded.get(key) ?? state.defaultFolded;
+export function isSpaceFolded(
+  state: SessionSpacesFoldState,
+  key: string,
+  said: boolean | null,
+): boolean {
+  return state.recorded.get(key) ?? said ?? state.defaultFolded;
 }
 
 export const sessionSpacesFoldStore = createStore<SessionSpacesFoldState>()(() => ({

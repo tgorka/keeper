@@ -55,12 +55,15 @@ export const SESSIONS_SPACES_FOLDED_LABEL = "Start spaces folded";
 /**
  * The standing explanation, shown whichever way the switch is set.
  *
- * It names the exception, because the exception is the whole design: somebody
- * who turns this on and finds three spaces still open needs to know that is
- * their own earlier decision being honoured, not the setting failing.
+ * It names both exceptions, because the exceptions are the whole design:
+ * somebody who turns this on and finds three spaces still open needs to know
+ * that is their own earlier decision being honoured, or that space's own file
+ * saying so (Story 51.3's `keeper.folded`) — not the setting failing. A note
+ * that named only the first would send them looking for a bug in the second
+ * case.
  */
 export const SESSIONS_SPACES_FOLDED_NOTE =
-  "New sessions open with their spaces shut, so a long list of saved queries stays out of the way. Spaces you have folded or unfolded yourself keep what you chose.";
+  "New sessions open with their spaces shut, so a long list of saved queries stays out of the way. Spaces you have folded or unfolded yourself keep what you chose, and so do spaces whose own file says how they open.";
 
 /** The Sessions settings, or nothing when no synced folder is a sessions root. */
 export function SessionsSettingsSection({ open }: { open: boolean }) {

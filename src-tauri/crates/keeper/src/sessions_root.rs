@@ -666,7 +666,6 @@ pub fn detail(
     root_id: &str,
     session_id: &str,
 ) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
-    use keeper_core::sessions::pool::{read_pool, PoolFile};
     use keeper_core::sessions::shape::ABOUT;
     use keeper_core::sessions::vm::{
         SessionDetailVm, SessionLogEntryVm, SessionPropertyVm, SessionTaskVm,
@@ -676,9 +675,9 @@ pub fn detail(
     let row = row_of(root_id, session_id)?;
     let dir = zone.join(&row.path);
 
-    // One read of the session root, reused for everything: the shape, and (when
-    // flat) the pool itself. `ref_sources`' own scan is a separate call with a
-    // separate budget, deliberately — the detail must not pay for `refs/`.
+    // One read of the session root, reused for everything: the shape, the pool
+    // and the record. `ref_sources`' own scan is a separate call with a separate
+    // budget, deliberately — the detail must not pay for `refs/`.
     let (sources, _truncated, shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
     let flat = shape == Shape::Flat;
 
@@ -697,23 +696,8 @@ pub fn detail(
     let body = &readme[body_at..];
     let line = lineage(&fm);
 
-    // The pool, for a flat session: parsed once, and the source of the log, the
-    // board and the unfiled list alike. `read_pool` is pure, so this is the
-    // only place the three can disagree — and they cannot, because it is one
-    // call.
-    let pool = if flat {
-        read_pool(
-            &sources
-                .iter()
-                .map(|source| PoolFile {
-                    rel: &source.rel,
-                    text: &source.text,
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        Default::default()
-    };
+    // The pool, under both contracts, from that one scan.
+    let pool = detail_pool(&sources, shape);
 
     // The properties widget (FR-227): user-tier keys only. keeper-owned keys
     // and the Obsidian-native `tags` are projected elsewhere on the header;
@@ -806,6 +790,38 @@ pub fn detail(
         unfiled,
         tasks,
     })
+}
+
+/// The pool the DETAIL reads, out of one markdown scan (FR-286).
+///
+/// Split out of [`detail`] so a test can hand it a scan of a folder rather than
+/// having to register a root, and so the exclusion below has one reader instead
+/// of being a line inside a 150-line projection.
+///
+/// **Both contracts read a pool now** (Story 51.7). The folder shape got one in
+/// Story 51.1 — its root markdown is in [`read_ref_sources`]' walk — and this
+/// was the last reader still answering as though it had none, which is what left
+/// a folder-shaped session's `task`-tagged file out of the board and its
+/// untagged root markdown out of *Unfiled*.
+///
+/// **The record is left out, and only under the folder contract.** `README.md`
+/// declares no kind, so feeding it in would report the one file keeper reads the
+/// session's identity, title, tags and lineage out of as *unfiled* — an
+/// accusation against the file that is doing its job. A flat session's
+/// `about.md` needs no such exclusion: it carries `tags: [about]`, which is the
+/// flat contract's whole premise, so that pool is byte-for-byte what it was.
+fn detail_pool(sources: &[RefSource], shape: Shape) -> keeper_core::sessions::pool::Pool {
+    use keeper_core::sessions::pool::{read_pool, PoolFile};
+
+    let files: Vec<PoolFile<'_>> = sources
+        .iter()
+        .filter(|source| shape == Shape::Flat || source.rel != README)
+        .map(|source| PoolFile {
+            rel: &source.rel,
+            text: &source.text,
+        })
+        .collect();
+    read_pool(&files)
 }
 
 /// The most markdown one session's *detail* reads, in bytes.
@@ -1897,6 +1913,106 @@ mod tests {
             vec!["inputs.md", "references.md", "refs/inputs.md"],
             "`tag:ref` finds the orphan at the root, and a root `inputs.md` and \
              a `refs/inputs.md` are two entries a space can both list"
+        );
+    }
+
+    /// Rows 4 and 7 of Story 51.7: the detail's own pool, under the folder
+    /// contract.
+    ///
+    /// A `task`-tagged file at a folder-shaped session's root is a board card —
+    /// this reader is what the board is drawn from, and it used to hand back
+    /// `Pool::default()` for this shape, so the owner's board was hidden with the
+    /// reason "a folder-shaped one has no pool to tag". Story 51.1 made that
+    /// false.
+    ///
+    /// And the record is not accused: `README.md` declares no kind, so a pool
+    /// that took it would name the session's own identity file as *unfiled*.
+    #[test]
+    fn the_detail_pool_finds_a_folder_sessions_tasks_and_leaves_its_record_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["refs", "prompts"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write(
+            "README.md",
+            "# The session\n\n## Log\n\n### 2026-08-16 first\n",
+        );
+        write(
+            "ship-it.md",
+            "---\ntags: [task]\nstatus: todo\norder: 1.5\n---\n# Ship it\n",
+        );
+        write("notes.md", "# Something nobody filed\n");
+        write("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n");
+
+        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Folder);
+        let pool = detail_pool(&sources, shape);
+
+        assert_eq!(
+            pool.tasks
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ship-it.md"],
+            "the board's cards, on a shape whose board was hidden because it \
+             was said to have no pool to tag"
+        );
+        assert_eq!(
+            pool.unfiled
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"],
+            "root markdown declaring no kind is reported in this shape too, and \
+             the record is not in the list: it is the file keeper reads the \
+             session out of, not a file nobody filed"
+        );
+        assert!(
+            pool.about.is_empty(),
+            "and it is not carried in as an ordinary entry either"
+        );
+    }
+
+    /// The other half of the same reader: a flat session's pool is what it was.
+    /// Its record carries `tags: [about]`, so it needs no exclusion — and adding
+    /// one would have taken `about.md` out of the About space.
+    #[test]
+    fn the_detail_pool_leaves_a_flat_sessions_record_in_the_pool_where_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("AGENTS.md", "how to read this folder\n");
+        write(
+            "ship-it.md",
+            "---\ntags: [task]\nstatus: todo\n---\n# Ship it\n",
+        );
+
+        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Flat);
+        let pool = detail_pool(&sources, shape);
+
+        assert_eq!(
+            pool.about
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["about.md"]
+        );
+        assert_eq!(pool.tasks.len(), 1, "the board is unchanged");
+        assert_eq!(
+            pool.unfiled
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AGENTS.md"],
+            "and so is the unfiled list, `AGENTS.md` included"
         );
     }
 

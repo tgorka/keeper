@@ -963,6 +963,8 @@ pub fn run() {
         sessions_ipc::sessions_dir_new,
         sessions_ipc::sessions_file_new_kind,
         sessions_ipc::sessions_file_delete,
+        sessions_ipc::sessions_file_rename,
+        sessions_ipc::sessions_file_path,
         sessions_ipc::sessions_task_move,
         sessions_ipc::sessions_ref_candidates,
         sessions_ipc::sessions_ref_add,

@@ -79,10 +79,10 @@ wherever there is a pool to tag.
 
 ## Tasks & Acceptance
 
-- [ ] the projection distinguishes the two refusals, rows 1–2, wording from Rust (row 9)
-- [ ] *Open the record*, row 3
-- [ ] the board gate follows the pool, rows 4–8
-- [ ] `docs/sessions.md`
+- [x] the projection distinguishes the two refusals, rows 1–2, wording from Rust (row 9)
+- [x] *Open the record*, row 3
+- [x] the board gate follows the pool, rows 4–8
+- [x] `docs/sessions.md`
 
 **Acceptance.** The About space explains itself and offers the verb that applies; and the owner's
 folder-shaped session has a task board he can drag cards on.

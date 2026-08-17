@@ -38,7 +38,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
+import { type NoteWriteVm, notesGallery, notesRename, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
@@ -696,6 +696,36 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
     [vaultId, noteId],
   );
 
+  /**
+   * A retitle renames the note's file (FR-97), which until now nothing asked for.
+   *
+   * `notes_rename` has been built, registered and wrapped since FR-97 and had
+   * **no call site anywhere in `src/`** — so every note in every vault has been
+   * carrying whatever filename it was created with, however many times its title
+   * changed. This is the call site.
+   *
+   * **Safe because the id is the identity, and the subscription proves it.**
+   * `notes_open` follows its note by ULID and answers a moved file with
+   * `NoteBodyBatch::Renamed`, the panel target is `{kind:"note", noteId}`, and
+   * links, pins and unread marks all resolve through the same id. So the rename
+   * needs no pointer rewriting and the editor does not even reload — which is the
+   * opposite of a session file, whose path *is* its identity and whose rename is
+   * therefore one journaled plan with a link rewrite in it.
+   *
+   * `null` while the pane has no note: there is nothing to rename, and the panel
+   * treats that as "this address has no rename" rather than calling with an empty
+   * id.
+   */
+  const renameNoteFile = useCallback(
+    async (title: string) => {
+      if (noteId === null) {
+        return;
+      }
+      await notesRename(vaultId, noteId, title);
+    },
+    [vaultId, noteId],
+  );
+
   const leaveMode = useCallback(() => {
     setConflictTheirs(null);
     setMode("edit");
@@ -1035,6 +1065,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
               subscriptionId={subscriptionId}
               baseRev={rev}
               onSaved={adoptPanelWrite}
+              rename={noteId === null ? null : renameNoteFile}
             />
           ) : (
             <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />

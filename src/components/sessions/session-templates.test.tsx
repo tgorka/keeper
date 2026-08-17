@@ -28,15 +28,19 @@ import {
   SESSION_TEMPLATE_NEW_FILE_LABEL,
   SESSION_TEMPLATE_NEW_FOLDER,
   SESSION_TEMPLATE_NEW_FOLDER_LABEL,
+  SESSION_TEMPLATE_PLACEHOLDERS,
+  SESSION_TEMPLATE_PLACEHOLDERS_UNKNOWN,
   SESSION_TEMPLATE_RENAME,
   SESSION_TEMPLATE_RENAME_CONFIRM,
   SESSION_TEMPLATE_RENAME_NAME_LABEL,
   SESSION_TEMPLATE_SECTION_TESTID,
   SESSION_TEMPLATES_EMPTY,
+  SESSION_TEMPLATES_HINT,
   SESSION_TEMPLATES_LOADING,
   SESSION_TEMPLATES_NEW,
   SESSION_TEMPLATES_NEW_NAME_LABEL,
   SESSION_TEMPLATES_NO_FILES,
+  SESSION_TEMPLATES_PLACEHOLDERS_LABEL,
   SessionTemplates,
   sessionTemplateTaken,
   templateTree,
@@ -291,6 +295,36 @@ describe("SessionTemplates listing", () => {
     const refused = within(screen.getByTestId(refusedId));
     expect(refused.getByText(said)).toBeInTheDocument();
     expect(refused.queryByText(SESSION_TEMPLATES_LOADING)).not.toBeInTheDocument();
+  });
+
+  // Row 11 of the 51.4 matrix. The room is where somebody stands when they open
+  // a template file to edit it, so it is the room that has to state what a
+  // `{{token}}` does — a table in `docs/sessions.md` is not read by a person
+  // already typing.
+  it("states the placeholder vocabulary, including the rule for an unknown token", async () => {
+    open([zoneTemplate()]);
+
+    // The list is one press away and its summary is always on screen: a person
+    // who does not know the feature exists still meets the sentence.
+    const disclosure = await screen.findByText(SESSION_TEMPLATES_PLACEHOLDERS_LABEL);
+    expect(disclosure).toBeInTheDocument();
+
+    // Every token, with what it means beside it. Asserting the pairs rather than
+    // the tokens alone: a list of six code spans with no explanations would pass
+    // a `getByText("{{title}}")` and teach nobody anything.
+    for (const { token, means } of SESSION_TEMPLATE_PLACEHOLDERS) {
+      expect(screen.getByText(token)).toBeInTheDocument();
+      expect(screen.getByText(means)).toBeInTheDocument();
+    }
+
+    // The rule that makes the feature safe in a document full of braces, and the
+    // one thing trying it cannot teach you: an unexpanded `{{foo}}` looks exactly
+    // like a bug until somebody says it is the contract.
+    expect(screen.getByText(SESSION_TEMPLATE_PLACEHOLDERS_UNKNOWN)).toBeInTheDocument();
+
+    // And the restated copy promise: expansion happens INTO the new session, so
+    // the template's own bytes are still untouched.
+    expect(screen.getByText(SESSION_TEMPLATES_HINT)).toBeInTheDocument();
   });
 });
 

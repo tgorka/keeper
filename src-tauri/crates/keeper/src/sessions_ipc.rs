@@ -810,11 +810,21 @@ pub async fn sessions_create(
     pattern_id: Option<String>,
 ) -> Result<keeper_core::sessions::vm::SessionRefVm, IpcError> {
     use keeper_core::sessions::pattern::{self, PatternKind};
-    use keeper_core::sessions::{model, plan, template};
+    use keeper_core::sessions::{model, plan, spaces, template};
 
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let title = title.trim().to_owned();
-    let date = today();
+    // **One clock read for the whole create**, and not [`today`] plus
+    // [`now_hhmm`], which are two. Two reads were harmless while the only
+    // consumers were a folder name and a frontmatter line: a create spanning
+    // midnight got a stamp from one day and a date from the next, in strings
+    // nobody compares. A template's `{{date}}` and `{{time}}` are read by a
+    // person, often in the same paragraph, so the two have to be one moment.
+    // The two helpers stay for the verbs that need only one of the three.
+    let now = chrono::Local::now();
+    let now_local = now.to_rfc3339();
+    let date = now.format("%Y-%m-%d").to_string();
+    let stamp = format!("{date}-{}", now.format("%H%M"));
     let dir_name = model::session_dir_name(&title, &date, &taken_names(&zone));
     let id = crate::sync_ipc::new_ulid();
 
@@ -916,8 +926,8 @@ pub async fn sessions_create(
     } else {
         std::collections::BTreeMap::new()
     };
-    let copies =
-        pattern::apply_with_kinds(kind, &pattern_files, |rel| kinds.get(rel).copied()).copies;
+    let outcome = pattern::apply_with_kinds(kind, &pattern_files, |rel| kinds.get(rel).copied());
+    let copies = outcome.copies;
 
     // What keeper composes rather than copies. Folder-shaped: the record alone.
     // Flat: the record, always the navigation contract, and — only for a
@@ -946,12 +956,8 @@ pub async fn sessions_create(
                 .filter_map(|(rel, _)| kinds.get(rel).copied())
                 .collect();
         let ulids: Vec<String> = (0..3).map(|_| crate::sync_ipc::new_ulid()).collect();
-        let seeds = template::default_template(
-            &title,
-            &date,
-            &format!("{date}-{}", now_hhmm()),
-            [&ulids[0], &ulids[1], &ulids[2]],
-        );
+        let seeds =
+            template::default_template(&title, &date, &stamp, [&ulids[0], &ulids[1], &ulids[2]]);
         for file in seeds {
             let is_contract = file.name == keeper_core::sessions::shape::AGENTS;
             if file.name == keeper_core::sessions::shape::ABOUT
@@ -965,8 +971,35 @@ pub async fn sessions_create(
         }
     }
 
+    // The placeholders a template's markdown carries. This side reads the
+    // bytes and supplies the context — the clock and the ULID are the shell's
+    // (AD-56) — and `pattern::expansions` decides everything else (AD-108), so
+    // what a `{{title}}` becomes is provable on a host where this crate does
+    // not build.
+    //
+    // The `expands` test is applied here too, as an optimisation rather than a
+    // second rule: it is what stops a template's `.png` being read into memory
+    // at all. A file keeper cannot read as UTF-8 is simply not offered, and
+    // copies byte for byte as it always did.
+    let ctx = keeper_core::notes::templates::TemplateCtx {
+        title: title.clone(),
+        id: id.clone(),
+        now_local,
+    };
+    let markdown: Vec<(String, String)> = copies
+        .iter()
+        .filter(|(rel, is_dir)| !*is_dir && pattern::expands(rel))
+        .filter_map(|(rel, _)| {
+            Some((
+                rel.clone(),
+                std::fs::read_to_string(pattern_dir.join(rel)).ok()?,
+            ))
+        })
+        .collect();
+    let expanded = pattern::expansions(&markdown, &ctx);
+
     let mut compiled = match &source {
-        None => plan::compile_create_shaped(&dir_name, &pattern_root, &copies, &stamped),
+        None => plan::compile_create_shaped(&dir_name, &pattern_root, &copies, &expanded, &stamped),
         Some(row) => plan::compile_create_from_shaped(
             &dir_name,
             &row.path,
@@ -974,9 +1007,65 @@ pub async fn sessions_create(
             record_name,
             &id,
             &copies,
+            &expanded,
             &stamped,
         ),
     };
+    // The spaces the template offers the ZONE (FR-291). Never the session:
+    // AD-121 refused a per-session copy of a query, and `pattern::apply` keeps
+    // these out of `copies` for that reason — `outcome.seeds` is non-empty only
+    // for a template.
+    //
+    // **Only into a `_spaces/` that already exists.** An absent one is the
+    // signal `sessions_spaces` reads to write the zone the five defaults it was
+    // designed around ("the directory is the ledger"); a create that minted the
+    // directory to drop one template space into it would consume that signal,
+    // and the zone would never be offered the other four. So the create fills
+    // holes and `sessions_spaces` digs the well — and the one zone this can
+    // decline for says so rather than seeding nothing in silence.
+    let space_seeds = if outcome.seeds.is_empty() {
+        Vec::new()
+    } else {
+        let read = crate::sessions_root::zone_spaces(&root_id);
+        let seeded = read.as_ref().is_some_and(|read| read.seeded);
+        let existing = read.map(|read| read.spaces).unwrap_or_default();
+        if seeded {
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for rel in &outcome.seeds {
+                match std::fs::read_to_string(pattern_dir.join(rel)) {
+                    Ok(text) => sources.push((rel.clone(), text)),
+                    // One space the zone does not gain, said out loud. Never a
+                    // refusal: a create must not fail over a file it was only
+                    // being offered.
+                    Err(error) => tracing::warn!("{rel} was not seeded: {error}"),
+                }
+            }
+            let borrowed: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(rel, text)| (rel.as_str(), text.as_str()))
+                .collect();
+            let planned = spaces::plan_template_spaces(&pattern_root, &borrowed, &existing);
+            for sentence in &planned.skipped {
+                tracing::warn!("{sentence}");
+            }
+            planned.seeds
+        } else {
+            tracing::warn!(
+                "this zone has no {}/ yet, so the template's spaces were not seeded — they are offered to a zone that already has its own",
+                spaces::SPACES_DIR
+            );
+            Vec::new()
+        }
+    };
+    // Appended after every write into the new session, because the seed lands
+    // OUTSIDE it: a crash before these steps leaves the zone exactly as it was
+    // and the new session still readable, through the spaces the zone already
+    // had. Inside the create's own plan rather than as a second `spaces-seed`
+    // verb, so one press is one journal row and a resume finishes what it began
+    // (AD-111).
+    compiled
+        .steps
+        .extend(spaces::template_seed_steps(&space_seeds));
     compiled.verb = if source.is_some() {
         "create-from".to_owned()
     } else {
@@ -1505,6 +1594,11 @@ fn space_vm(
         icon: space.icon.clone(),
         default_key: space.default_key.clone(),
         order: space.order,
+        // Carried, not resolved: the fold's four layers are composed in the
+        // surface because one of them is a cookie this process cannot read, and
+        // the cap is a render cap the section applies to its own rows.
+        folded: space.folded,
+        rows: space.rows,
         warnings: space.warnings.clone(),
         error: query::parse(&space.query).err().map(|error| error.message),
         new_file_kind: spaces::creatable_kind(&space.query).map(|kind| kind.as_str().to_owned()),
@@ -1573,6 +1667,15 @@ pub fn sessions_space_files(
         .iter()
         .map(|space| {
             let selection = select(space, &candidates, now);
+            // Why this space offers no create, and which verb applies instead —
+            // both the domain's answers, and both worded there (Story 51.7).
+            // This used to ask `creatable_kind` for a kind and then `kind_dir`
+            // for a home, which meant a space that offered NO kind was asked
+            // nothing and said nothing: the About space rendered neither a
+            // button nor a reason, which is the defect the owner reported. One
+            // call now, so the shell composes no refusal of its own and the
+            // order the refusals are reported in is the domain's.
+            let refused = spaces::create_refused(&space.query, session_shape);
             SessionSpaceFilesVm {
                 space_id: space.rel.clone(),
                 files: selection
@@ -1594,16 +1697,8 @@ pub fn sessions_space_files(
                     })
                     .collect(),
                 error: selection.error,
-                // The domain's refusal, projected rather than restated. The
-                // kind is `creatable_kind`'s answer — the same one `space_vm`
-                // puts on `new_file_kind`, so a space that offers no create
-                // asks nothing here — and the sentence is `KindHasNoHome`'s,
-                // which exists precisely so that one wording of "a folder-shaped
-                // session keeps no tasks file" reaches every surface. A boolean
-                // would hand the webview the job of writing a second one.
-                no_home: spaces::creatable_kind(&space.query)
-                    .and_then(|kind| shape::kind_dir(session_shape, kind).err())
-                    .map(|no_home| no_home.to_string()),
+                no_home: refused.why.map(|why| why.to_string()),
+                open_record: refused.record,
             }
         })
         .collect())
@@ -1649,6 +1744,12 @@ pub async fn sessions_space_save(
         sort: space.sort.clone(),
         icon: space.icon.clone(),
         order: space.order,
+        // Straight through from the form, which seeded them from `space_vm`.
+        // `render_edit` replaces the whole `keeper:` map, so dropping either
+        // here would delete the operator's answer on the next Save of anything
+        // else — the one failure this story is arranged to prevent.
+        folded: space.folded,
+        rows: space.rows,
     };
     // An id names a file that must already be there. A save against one that is
     // gone — deleted in another window, or on the far side of a sync — is
@@ -2773,6 +2874,87 @@ fn file_verb_error(error: keeper_core::sessions::files::FileVerbError) -> IpcErr
     }
 }
 
+/// The refusal for a properties block that cannot be spliced, in core's own
+/// words — [`file_verb_error`]'s twin, and here for its reason: the Stale
+/// sentence carries the Re-read advice the surface acts on, so a wording
+/// invented here would be a second answer to one question.
+#[cfg(desktop)]
+fn properties_refusal(error: keeper_core::file_properties::PropertiesRefusal) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Which session a profile-relative subpath is inside, and where in it —
+/// [`resolve_session_file`]'s inverse (Story 51.6).
+///
+/// **Here rather than in the webview, and that is AD-65 read backwards.** The
+/// rule is that Rust composes paths; the corollary nobody had needed until now is
+/// that Rust also *decomposes* them. The properties panel addresses a session file
+/// by `(profile id, subpath)` because a session's `README.md` has no note id
+/// (Story 50.4), so a session verb reachable from that panel has to start from
+/// that address — and the split needs the zone subfolder and the session folder
+/// set, neither of which the frontend holds.
+///
+/// **Asked of the scanned rows**, and the deepest match wins, exactly as
+/// [`crate::sessions_root::session_at`] does it: a path inside a session names
+/// that session and not an ancestor that happens to share its prefix. A second
+/// definition of "is this a session" is the drift `model::classify` exists to
+/// prevent.
+///
+/// # Errors
+/// `internal` when the root is unknown, when the subpath is not under the zone,
+/// or when it is not inside any session the last scan found — three states with
+/// one honest answer, because the caller's next move is the same for all three.
+#[cfg(desktop)]
+fn session_of_subpath(
+    state: &tauri::State<'_, crate::ipc::AppState>,
+    root_id: &str,
+    subpath: &str,
+) -> Result<(String, String), IpcError> {
+    let elsewhere = || IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "{subpath} is not inside a session of this zone, so keeper has no session to rename \
+             it in. Reopen the file from the board if the zone has moved."
+        ),
+        account_id: None,
+        retriable: false,
+    };
+
+    // The profile's own value rather than the registry's copy of it: the zone the
+    // subpath was composed with is the one `resolve_session_file` will compose it
+    // with again, and one source cannot disagree with itself.
+    let profile = crate::sync_ipc::sessions_profile(state, root_id)?;
+    let zone = profile
+        .sessions
+        .as_ref()
+        .map(|sessions| sessions.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let zone_relative = if zone.is_empty() {
+        subpath
+    } else {
+        subpath
+            .strip_prefix(&format!("{zone}/"))
+            .ok_or_else(elsewhere)?
+    };
+
+    let rows = crate::sessions_root::rows(root_id).ok_or_else(|| root_error(root_id))?;
+    let row = rows
+        .iter()
+        .filter(|row| zone_relative.starts_with(&format!("{}/", row.path)))
+        .max_by_key(|row| row.path.len())
+        .ok_or_else(elsewhere)?;
+    let rel = zone_relative
+        .get(row.path.len() + 1..)
+        .filter(|rel| !rel.is_empty())
+        .ok_or_else(elsewhere)?;
+    Ok((row.id.clone(), rel.to_owned()))
+}
+
 /// Resolve a session and ask the **real** write fence about a path in it.
 ///
 /// The fence is `WriteScope`'s, not a copy: `files::check_rel` refuses a
@@ -3169,6 +3351,211 @@ pub async fn sessions_file_delete(
     Ok(())
 }
 
+/// Rename one session file to follow its title, and rewrite what pointed at it
+/// (FR-295, FR-296).
+///
+/// **One command, because it is one act.** The person changed a title; that the
+/// filename derives from it, and that three kinds of pointer name that filename,
+/// is keeper's business and not theirs. So the title write, the move and the
+/// pointer rewrites are one [`keeper_core::sessions::files::compile_rename`] plan
+/// and one journal row — either all of it landed or none of it did (NFR-38).
+/// Calling `sync_write_frontmatter` and then a rename would leave a window in
+/// which the file says `Kick Off` and is still called `untitled`, which is
+/// exactly the *"half of it would be worse than none"* `docs/sessions.md` refused
+/// a rename over.
+///
+/// **The new title is read out of `next_block`, not passed beside it.** The block
+/// is the thing being written, so taking the name from anywhere else would let a
+/// caller rename a file after a title the file will not carry. `block` is the
+/// block the surface was editing, and it is the guard: a concurrent edit to the
+/// properties refuses with
+/// [`keeper_core::file_properties::PropertiesRefusal::Stale`] and its Re-read
+/// sentence, exactly as `sync_write_frontmatter` does (Story 50.4).
+///
+/// **The pool is the rewrite's scope, and that is a fact about the reader rather
+/// than a list kept here.** `session_pool` walks the session's markdown and
+/// enters neither `workspace/` nor `artifacts/` nor any dotted directory
+/// (`sessions_root::UNSCANNED_DIRS`), so a pointer inside scratch or inside a
+/// deliverable is never rewritten — and `files::check_rewritable` refuses both
+/// again as the plan compiles, because two predicates that must agree should both
+/// run.
+///
+/// **Addressed by `(profile_id, subpath)`, which is the properties panel's own
+/// address.** Story 50.4 made a session file's properties reachable through
+/// `(profile id, subpath)` precisely because a session's `README.md` is not a
+/// note and has no id; a rename verb that took `(root, session, session-relative
+/// path)` instead would be reachable from the row menu and unreachable from the
+/// panel, and the panel is where the owner reported this. Splitting the subpath
+/// back into a session and a path inside it happens in Rust
+/// ([`session_of_subpath`]) rather than in the webview, which is AD-65 in the one
+/// direction it had not been asked in yet.
+///
+/// Answers with the file's new profile-relative subpath, so the caller
+/// re-addresses its panel without joining a path (AD-65).
+///
+/// Rejects with: `internal` (a path in no session of this root, a file that has
+/// left the session, a title that names nothing, a collision, a refused path, a
+/// stale properties block, a failed write), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_file_rename(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    profile_id: String,
+    subpath: String,
+    block: String,
+    next_block: String,
+) -> Result<String, IpcError> {
+    use keeper_core::notes::frontmatter::Frontmatter;
+    use keeper_core::sessions::{files, refs};
+
+    let root_id = profile_id;
+    let (session_id, rel) = session_of_subpath(&state, &root_id, &subpath)?;
+    files::check_rewritable(&rel).map_err(file_verb_error)?;
+    // Recomposed rather than trusted, and the recomposition is the round trip's
+    // proof: `resolve_session_file` builds the subpath from the profile's zone and
+    // the row's path, so a `rel` the split got wrong could not come back as the
+    // subpath that was asked about. It is also where the real write fence is asked
+    // (AD-113).
+    let (zone_root, session_path, subpath) =
+        resolve_session_file(&state, &root_id, &session_id, &rel)?;
+
+    // Read once, and rewrite from that read: the pool carries every file's bytes,
+    // which is both what the title splice needs and what every pointer rewrite
+    // needs. A second read per pointer file would be a second answer to "what
+    // does this session say now".
+    let pool = crate::sessions_root::session_pool(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let text = pool
+        .files
+        .iter()
+        .find(|(candidate, _, _)| *candidate == rel)
+        .map(|(_, text, _)| text.as_str())
+        .ok_or_else(|| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!(
+                "{rel} is not in this session any more — someone moved or deleted it while its \
+                 properties were open. Reopen the session to see where its files are now."
+            ),
+            account_id: None,
+            retriable: false,
+        })?;
+
+    // The title write first, so the rewrite below sees the offsets it will
+    // actually be written at: the splice changes the frontmatter's length, and a
+    // pointer rewrite computed against the pre-splice bytes would carry spans
+    // into a body that had moved.
+    let titled = keeper_core::file_properties::replace_block(text, &block, &next_block, &subpath)
+        .map_err(properties_refusal)?;
+    let (fm, _body_at) = Frontmatter::parse(&next_block);
+    let title = fm.as_string("title").unwrap_or_default();
+
+    // Where it lands. The record and the contract file keep their names whatever
+    // their title says — `shape()` reads those names — so `renames` is asked and
+    // the title still gets written either way.
+    let to = if files::renames(&rel) {
+        // The collision set is the DESTINATION folder's, which for a rename is
+        // the folder the file is already in — a retitle does not move a file
+        // between directories, because a directory is not something a title says.
+        // Split on `/` rather than through `Path`: `rel` is a session-relative,
+        // `/`-joined logical path, and `Path`'s separators are the platform's.
+        let dir = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let taken = taken_in(&zone_root.join(&session_path).join(dir));
+        files::rename_target(&rel, title, &taken).map_err(file_verb_error)?
+    } else {
+        rel.clone()
+    };
+    // The destination goes past the real write fence too, not only past the
+    // domain's containment rule: `resolve_session_file` is where
+    // `WriteScope::in_session_workspace` is asked (AD-113), and a rename has two
+    // ends.
+    let (_, _, new_subpath) = resolve_session_file(&state, &root_id, &session_id, &to)?;
+
+    // The renamed file's own bytes carry both edits when it also pointed at
+    // itself; every other pool file carries only the rewrite, and a file with no
+    // pointer to it is left out of the plan rather than written back unchanged.
+    let mut rewrites = vec![files::Rewrite {
+        rel: rel.clone(),
+        expect_len: text.len(),
+        content: refs::rewrite_pointers(&titled, &rel, &to).unwrap_or(titled),
+    }];
+    rewrites.extend(pool.files.iter().filter_map(|(candidate, body, _)| {
+        if *candidate == rel {
+            return None;
+        }
+        refs::rewrite_pointers(body, &rel, &to).map(|content| files::Rewrite {
+            rel: candidate.clone(),
+            expect_len: body.len(),
+            content,
+        })
+    }));
+
+    let compiled =
+        files::compile_rename(&session_path, &rel, &to, &rewrites).map_err(file_verb_error)?;
+    tauri::async_runtime::spawn_blocking(move || crate::sessions_exec::run(&zone_root, compiled))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("file-rename task failed: {join}"),
+            account_id: None,
+            retriable: false,
+        })?
+        .map_err(exec_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(new_subpath)
+}
+
+/// Where one file of this zone is on this machine, absolute — the argument
+/// *Reveal in Finder* and *Copy path* take (FR-297).
+///
+/// **Asked when the verb runs, rather than carried on every row.** AD-65 forbids
+/// the webview joining a path, and
+/// [`keeper_core::sessions::vm::SessionSpaceFileVm`] carries the profile-relative
+/// `subpath` that *opens* a file and nothing more. Widening every row of every
+/// space with an absolute path — a string nine rows in ten will never be asked
+/// for — to serve two items in a menu is the wrong trade; so is reading it out of
+/// [`sessions_tree`], which would pay for a whole tree walk and a sync-engine
+/// pending query per right-click.
+///
+/// **Resolved rather than joined**, through the same `browse::resolve` every read
+/// on this side of the app goes through: it refuses a subpath that leaves the
+/// profile and answers `None` for a file that is not there, so *Reveal* cannot be
+/// handed a location that does not exist. A `local_path.join(subpath)` would have
+/// been shorter and would have said yes to both.
+///
+/// Here rather than in `sync_ipc` because its caller and its wording are this
+/// surface's: a session space row is the only thing that asks, and the day a
+/// second surface needs it, moving it is a rename.
+///
+/// Rejects with: `internal` (unknown profile, a path that leaves it, a file that
+/// is gone), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_file_path(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    profile_id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    let profile = crate::sync_ipc::sessions_profile(&state, &profile_id)?;
+    let gone = || IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!(
+            "{subpath} is not on this disk any more, so there is no location to show. Reopen \
+             the session to see what it holds now."
+        ),
+        account_id: None,
+        retriable: false,
+    };
+    let resolved = keeper_sync::browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| IpcError {
+            code: IpcErrorCode::Internal,
+            message: refusal.to_string(),
+            account_id: None,
+            retriable: false,
+        })?
+        .ok_or_else(gone)?;
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
 /// Move one task card: which column it lands in, and where in that column.
 ///
 /// `status` is one of the four the closed [`TaskStatus`] set names, and `index`
@@ -3332,6 +3719,25 @@ pub fn sessions_file_delete(
     rel: String,
 ) -> Result<(), IpcError> {
     let _ = (root_id, session_id, rel);
+    Err(unsupported())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_file_rename(
+    profile_id: String,
+    subpath: String,
+    block: String,
+    next_block: String,
+) -> Result<String, IpcError> {
+    let _ = (profile_id, subpath, block, next_block);
+    Err(unsupported())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_file_path(profile_id: String, subpath: String) -> Result<String, IpcError> {
+    let _ = (profile_id, subpath);
     Err(unsupported())
 }
 

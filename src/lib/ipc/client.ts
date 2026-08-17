@@ -5704,6 +5704,75 @@ export async function sessionsFileDelete(
 }
 
 /**
+ * Rename one session file so its filename follows its title, and rewrite what
+ * pointed at the old name (FR-295, FR-296).
+ *
+ * **One call, because it is one act.** `block` is the frontmatter block the
+ * surface was editing and `nextBlock` is the block it wants written; Rust reads
+ * the new title out of `nextBlock` rather than taking it beside it, so a caller
+ * cannot rename a file after a title the file will not carry. The title write,
+ * the move and every pointer rewrite are one journaled plan: either all of it
+ * landed or none of it did.
+ *
+ * **Addressed by `(profileId, subpath)`** — the properties panel's own address
+ * (Story 50.4), so the same call serves the panel and the space row's menu. Which
+ * session the subpath is in, and where in it, is worked out in Rust: this side
+ * neither joins a path nor splits one (AD-65).
+ *
+ * What follows the name: a markdown link's destination and a `[[wikilink]]` in
+ * the session's own markdown, and the record's `## Promote` row where it names
+ * the file. What deliberately does not: anything in `workspace/` or
+ * `artifacts/`, a backticked path (an author typing, not an author linking), and
+ * everything keyed on the session rather than the file — pins, unread, lineage,
+ * the recordings lens.
+ *
+ * A stamped name keeps its stamp: `2026-08-16-1812-untitled.md` retitled to
+ * *Kick Off* becomes `2026-08-16-1812-kick-off.md`, because the stamp is what
+ * makes the pool sort itself outside keeper.
+ *
+ * `about.md`, `AGENTS.md` and `README.md` change their title and keep their
+ * filename — those are the names the shape reader keys on.
+ *
+ * Resolves with the file's new profile-relative subpath, so a caller re-addresses
+ * its panel without joining a path.
+ *
+ * Rejects with: `internal` (a title that names nothing — and then the title is
+ * not written either, a collision naming the file it would have overwritten, a
+ * `workspace/` or `artifacts/` path, a properties block that changed on disk, a
+ * file that has left the session), `unsupported`.
+ */
+export async function sessionsFileRename(
+  profileId: string,
+  subpath: string,
+  block: string,
+  nextBlock: string,
+): Promise<string> {
+  return await invoke<string>("sessions_file_rename", {
+    profileId,
+    subpath,
+    block,
+    nextBlock,
+  });
+}
+
+/**
+ * Where one file of a sessions zone is on this machine, absolute — the argument
+ * *Reveal in Finder* and *Copy path* take.
+ *
+ * Asked when the verb runs rather than carried on every row: AD-65 forbids this
+ * side of the wire joining a path, and {@link SessionSpaceFileVm} carries the
+ * profile-relative `subpath` that *opens* a file and nothing more. Rust resolves
+ * it through the same containment rule every read goes through, so a file that is
+ * gone rejects rather than resolving with a location that is not there.
+ *
+ * Rejects with: `internal` (unknown profile, a path that leaves it, a file that
+ * is gone), `unsupported`.
+ */
+export async function sessionsFilePath(profileId: string, subpath: string): Promise<string> {
+  return await invoke<string>("sessions_file_path", { profileId, subpath });
+}
+
+/**
  * Move one task card to a column and a position in it (FR-263).
  *
  * `rel` is the card's session-relative path, as it arrives on

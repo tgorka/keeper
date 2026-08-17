@@ -48,6 +48,31 @@ defaultKey: string | null,
  */
 order: number, 
 /**
+ * How this space opens when nobody has folded it by hand, or `None` when
+ * its file says nothing (Story 51.3, FR-289).
+ *
+ * The MIDDLE of four layers, and the surface composes them:
+ * the person's own hand-fold wins, then this, then the user-global
+ * `sessions.spaces_folded`, then unfolded. `None` is therefore load-bearing
+ * — it is what lets the setting still mean something — and is why this
+ * crosses as a nullable boolean rather than as a resolved one. Resolving it
+ * here was the alternative and it cannot be done: Rust does not know what
+ * the person folded in this document, because that answer lives in a cookie
+ * (`session-spaces-fold.ts`).
+ */
+folded: boolean | null, 
+/**
+ * How many rows this space's section RENDERS, or `None` for all of them
+ * (Story 51.3, FR-290).
+ *
+ * Not a selection cap. [`crate::notes::vm::NoteSpaceVm`]'s `limit` narrows
+ * what the query asks the index for; this narrows what one card draws, and
+ * the header keeps counting the whole selection so a capped section can say
+ * how much it is not showing. Capping the selection instead would make that
+ * count a lie, which is the one thing this key must not do.
+ */
+rows: number | null, 
+/**
  * Presentation keys keeper could not read, each a finished sentence. The
  * space still works — this is the "not obeying one line of its own file"
  * severity, distinct from `error`.

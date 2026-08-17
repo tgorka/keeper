@@ -74,16 +74,26 @@
  * through `FoldSection`, the app's one fold mechanism, with its title as the
  * disclosure and its header — count, lamp, create, edit, delete, and whatever
  * they had to say — outside the folded region. Where the fold is remembered and
- * what an untouched space does are two different questions with two different
- * answers, and {@link "@/lib/stores/session-spaces-fold"} holds both: a cookie
- * for the spaces this person arranged, and `sessions.spaces_folded` for the
- * ones they never touched.
+ * what an untouched space does are different questions with different answers,
+ * and {@link "@/lib/stores/session-spaces-fold"} holds the composition: a cookie
+ * for the spaces this person arranged, the space's own `keeper.folded` for a
+ * definition that says how it opens, and `sessions.spaces_folded` for the ones
+ * nobody has answered for at all (Story 51.3, FR-289).
+ *
+ * **A space can also say how MUCH it shows** (FR-290), and the one thing to keep
+ * straight is that `keeper.rows` caps the rows this file paints and never the
+ * selection Rust made. The header's count stays the whole selection and the
+ * remainder folds behind a *Show N more*, so a capped section always says how
+ * much it is not showing. A notes space's `keeper.limit` is the other feature —
+ * it narrows the query — and blurring the two here would turn a presentation
+ * choice into a filter that hides work.
  */
-import { FilePlus, FolderPlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
+import { FilePlus, FileText, FolderPlus, Pencil, RotateCcw, Trash2 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { spaceIcon } from "@/components/notes/space-icons";
 import { SessionSpaceEditor } from "@/components/sessions/session-space-editor";
+import { SpaceRowMenu } from "@/components/sessions/space-row-menu";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -207,6 +217,19 @@ export const SESSION_SPACE_FILE_TESTID = "session-space-file";
  */
 export const SESSION_SPACE_FOLD_ID = "session-space";
 
+/**
+ * The row cap's control, both directions (Story 51.3, FR-290).
+ *
+ * "Show 7 more" and not the sync card's "Show all 12": there the unfolded size
+ * is a fixed setting, so the button can only honestly name the size it will grow
+ * to, whereas here the remainder is exactly known — the cap is what the file
+ * says and the selection is already in hand. Naming the remainder is also what
+ * makes the control the answer to the question the header raises: the header
+ * says 10, the section shows 3, and the button accounts for the other 7.
+ */
+export const SESSION_SPACE_ROWS_MORE = (n: number) => `Show ${n} more`;
+export const SESSION_SPACE_ROWS_LESS = "Show less";
+
 export interface SessionSpacesProps {
   rootId: string;
   /**
@@ -248,6 +271,10 @@ export interface SessionSpacesProps {
   selections: readonly SessionSpaceFilesVm[] | null;
   /** Re-read both payloads — a write here changes what the other read returns. */
   onChanged: () => void;
+  /** The session record's own name, per shape — `session-detail.tsx` composes it. */
+  recordLabel: string;
+  /** Open that record in the strip. */
+  onOpenRecord: () => void;
 }
 
 export function SessionSpaces({
@@ -258,6 +285,8 @@ export function SessionSpaces({
   spaces,
   selections,
   onChanged,
+  recordLabel,
+  onOpenRecord,
 }: SessionSpacesProps) {
   const [editing, setEditing] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -423,6 +452,8 @@ export function SessionSpaces({
             onChanged={onChanged}
             onEdit={() => setEditing(space.id)}
             onDelete={() => setDeleting(space)}
+            recordLabel={recordLabel}
+            onOpenRecord={onOpenRecord}
           />
         ))
       )}
@@ -487,6 +518,8 @@ function SpaceSection({
   onChanged,
   onEdit,
   onDelete,
+  recordLabel,
+  onOpenRecord,
 }: {
   space: SessionSpaceVm;
   selection: SessionSpaceFilesVm | null;
@@ -506,6 +539,8 @@ function SpaceSection({
   onChanged: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  recordLabel: string;
+  onOpenRecord: () => void;
 }) {
   const broken = space.error !== null;
   const misread = space.warnings.length > 0;
@@ -534,12 +569,32 @@ function SpaceSection({
   const creatable = kind !== null && selection !== null && noHome === null;
 
   // Whether this space is folded, and where that is remembered (Story 49.3,
-  // FR-275). Keyed by root and space id rather than by session: the definition
-  // belongs to the zone, so a person who shut Tasks meant Tasks, not Tasks in
-  // this one session. A space with nothing recorded follows
-  // `sessions.spaces_folded`, which is what {@link isSpaceFolded} composes.
+  // FR-275; Story 51.3, FR-289). Keyed by root and space id rather than by
+  // session: the definition belongs to the zone, so a person who shut Tasks
+  // meant Tasks, not Tasks in this one session. The space's OWN `keeper.folded`
+  // goes in as the middle layer and is never resolved here —
+  // {@link isSpaceFolded} composes all four steps, and doing any of it twice is
+  // how a hand-fold comes to lose to a file.
   const foldKey = spaceFoldKey(rootId, space.id);
-  const folded = useSessionSpacesFold((state) => isSpaceFolded(state, foldKey));
+  const folded = useSessionSpacesFold((state) => isSpaceFolded(state, foldKey, space.folded));
+
+  // How much of the selection this section draws (Story 51.3, FR-290).
+  //
+  // **A render cap, not a selection cap.** `files` is the WHOLE selection —
+  // Rust was asked for all of it, the header counts all of it, and this only
+  // decides how many rows are painted. Notes' `keeper.limit` narrows the query
+  // instead; a session holds tens of files, so there is no read to save here,
+  // and a section that had selected 3 of 12 could not say how many it was
+  // hiding.
+  //
+  // **The remainder folds, it does not scroll.** A nested scroll area inside a
+  // scrolling pane is what the sync card rejected (`sync-pane.tsx:254-319`),
+  // and a session's detail is exactly that pane: two scrollbars a few pixels
+  // apart, one of which swallows the wheel.
+  const [showingAll, setShowingAll] = useState(false);
+  const cap = space.rows;
+  const visible = cap === null || showingAll ? files : files.slice(0, cap);
+  const hidden = files.length - visible.length;
 
   /**
    * Write a file this space will list, and open it (Story 49.2, FR-273).
@@ -652,6 +707,26 @@ function SpaceSection({
               refuse teaches nothing (the `showNoteInFiles` precedent) — and
               when the reason is this session's shape, {@link noHome} says it in
               the notice below rather than leaving a gap. */}
+          {/* Where a create is refused because the record ALREADY EXISTS, the
+              verb that applies is opening it (Story 51.7, FR-299) — in the
+              create's own slot, because it answers the same question a person
+              came to this space with. Rust decides it: `openRecord` is set only
+              where the refusal is `KindHasNoHome::OnlyOne`, so this file reads
+              no query and knows no filename. The label is the header's, which
+              already names `about.md` or `README` from the shape. */}
+          {selection?.openRecord === true && (
+            <button
+              type="button"
+              aria-label={recordLabel}
+              onClick={onOpenRecord}
+              className={cn(
+                "shrink-0 rounded-md p-1 text-muted-foreground outline-none",
+                "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+              )}
+            >
+              <FileText aria-hidden="true" className="size-3.5" />
+            </button>
+          )}
           {creatable && (
             <button
               type="button"
@@ -718,11 +793,11 @@ function SpaceSection({
           {selection?.error != null && selection.error !== space.error && (
             <p className="text-destructive text-xs">{selection.error}</p>
           )}
-          {/* Why this space offers no create, when the reason is the session's
-              own contract rather than its query. Muted, not destructive:
-              nothing is broken and nothing failed — this shape simply keeps
-              that kind somewhere other than in a file, and the person is
-              entitled to know which. */}
+          {/* Why this space offers no create, in Rust's words — the session's
+              own contract keeping that kind nowhere, or the query asking for
+              more than one thing so that "what would a file made here be?" has
+              no single answer. Muted, not destructive: nothing is broken and
+              nothing failed, and the person is entitled to know which. */}
           {noHome !== null && (
             <p data-slot="space-no-home" className="text-muted-foreground text-xs">
               {noHome}
@@ -740,31 +815,73 @@ function SpaceSection({
         )
       ) : (
         <ul aria-label={space.name} className="flex flex-col">
-          {files.map((file) => (
+          {visible.map((file) => (
             <li key={file.relPath} data-testid={`${SESSION_SPACE_FILE_TESTID}-${file.relPath}`}>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                // Path-identified rather than id-identified is recorded, not
-                // drawn: keeper never stamps an `id:` into a file it did not
-                // author, so in a zone of hand-written markdown this would be
-                // true of nearly every row — a badge on all of them is decor,
-                // not information. It reaches a test and a stylesheet here, and
-                // reaches a person only where it changes what they can do (a
-                // rename breaks the reference), which is not this list.
-                data-unstable-identity={file.unstableIdentity ? "" : undefined}
-                className="h-7 w-full min-w-0 justify-start gap-2 px-2 font-normal"
-                onClick={() => onOpen(file.subpath)}
+              {/* Every verb a row has beyond opening it (Story 51.6, FR-297).
+                  A wrapper rather than controls in the row: this header is
+                  ~208px wide and already spends its width on a truncating title
+                  and a date, and the menu is the surface that can hold six verbs
+                  without taking a pixel from either. It renders the Button as its
+                  own trigger, so single-click Open is exactly what it was, and it
+                  reports its refusals into this section's one live region rather
+                  than growing a second sentence inside the row. */}
+              <SpaceRowMenu
+                rootId={rootId}
+                sessionId={sessionId}
+                relPath={file.relPath}
+                subpath={file.subpath}
+                title={file.title}
+                onOpen={onOpen}
+                onChanged={onChanged}
+                onNotice={onNotice}
               >
-                <span className="min-w-0 flex-1 truncate text-sm">{file.title}</span>
-                <span className="figures shrink-0 text-muted-foreground text-xs">
-                  {formatDraftAge(file.mtimeMs, nowMs)}
-                </span>
-              </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  // Path-identified rather than id-identified is recorded, not
+                  // drawn: keeper never stamps an `id:` into a file it did not
+                  // author, so in a zone of hand-written markdown this would be
+                  // true of nearly every row — a badge on all of them is decor,
+                  // not information. It reaches a test and a stylesheet here and
+                  // reaches a person nowhere: a rename now rewrites the pointers
+                  // that named the file, in the same journaled plan (Story 51.6),
+                  // so path identity no longer costs them anything a badge would
+                  // be warning them about.
+                  data-unstable-identity={file.unstableIdentity ? "" : undefined}
+                  className="h-7 w-full min-w-0 justify-start gap-2 px-2 font-normal"
+                  onClick={() => onOpen(file.subpath)}
+                >
+                  <span className="min-w-0 flex-1 truncate text-sm">{file.title}</span>
+                  <span className="figures shrink-0 text-muted-foreground text-xs">
+                    {formatDraftAge(file.mtimeMs, nowMs)}
+                  </span>
+                </Button>
+              </SpaceRowMenu>
             </li>
           ))}
         </ul>
+      )}
+      {/* The cap's control, below the rows it is about — the sync card's
+          placement, and for its reason: the last row shown is where the eye
+          already is when the list runs out. A link-weight control and not a
+          Button, because it changes how much of a list is on screen and must not
+          carry the weight of Open or New.
+
+          Absent when the cap is doing nothing in either direction: no remainder
+          and nothing unfolded means a button that would say "Show 0 more".
+          Named with the space, because a detail with five capped sections would
+          otherwise offer five buttons a screen reader calls the same thing. */}
+      {(hidden > 0 || showingAll) && (
+        <button
+          type="button"
+          data-slot="space-rows-fold"
+          onClick={() => setShowingAll((shown) => !shown)}
+          aria-label={`${showingAll ? SESSION_SPACE_ROWS_LESS : SESSION_SPACE_ROWS_MORE(hidden)}: ${space.name}`}
+          className="self-start text-muted-foreground text-xs underline decoration-dotted hover:text-foreground"
+        >
+          {showingAll ? SESSION_SPACE_ROWS_LESS : SESSION_SPACE_ROWS_MORE(hidden)}
+        </button>
       )}
     </FoldSection>
   );

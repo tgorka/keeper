@@ -111,6 +111,7 @@ pub fn compile_create(
         dir_name,
         pattern_root,
         copies,
+        &[],
         &[(super::model::README.to_owned(), readme.to_owned())],
     )
 }
@@ -128,10 +129,31 @@ pub fn compile_create(
 ///
 /// Stamped writes are last and in the order given. `MkDir` and `WriteFile` are
 /// both idempotent, so the whole plan stays replayable (AD-111).
+///
+/// **`expanded` is how a placeholder reaches the new session** (FR-292):
+/// `(source-relative path, the bytes that path arrives with)` for each pattern
+/// file whose `{{token}}`s the caller has already resolved. Such a file
+/// compiles to a [`PlanStep::WriteFile`] instead of a [`PlanStep::CopyFile`];
+/// every other file still copies byte for byte, and a caller with nothing to
+/// expand passes `&[]` and gets exactly the plan it got before.
+///
+/// **The resolved bytes travel in the plan, not the context that produced
+/// them.** A plan is journaled and replayed (AD-111), and a replay that
+/// re-expanded would have to re-read the clock — so a session resumed at
+/// 00:01 would get yesterday's `{{date}}` in one file and today's in the next.
+/// Carrying `TemplateCtx` in the plan instead would still leave the *renderer*
+/// as a version-to-version variable. Bytes are the only form of the answer
+/// that cannot change between the write and the replay, which is the same
+/// reason `stamped` has always carried bytes rather than a title and a date.
+///
+/// The cost is a fatter journal row for a template full of placeholders, and
+/// it is bounded by the caller: nothing stops it passing only the files
+/// expansion actually changed.
 pub fn compile_create_shaped(
     dir_name: &str,
     pattern_root: &str,
     copies: &[(String, bool)],
+    expanded: &[(String, String)],
     stamped: &[(String, String)],
 ) -> Plan {
     let target = format!("active/{dir_name}");
@@ -143,11 +165,17 @@ pub fn compile_create_shaped(
             steps.push(PlanStep::MkDir {
                 path: format!("{target}/{rel}"),
             });
-        } else {
-            steps.push(PlanStep::CopyFile {
+            continue;
+        }
+        match expanded.iter().find(|(name, _)| name == rel) {
+            Some((_, content)) => steps.push(PlanStep::WriteFile {
+                path: format!("{target}/{rel}"),
+                content: content.clone(),
+            }),
+            None => steps.push(PlanStep::CopyFile {
                 from: format!("{pattern_root}/{rel}"),
                 to: format!("{target}/{rel}"),
-            });
+            }),
         }
     }
     for (name, content) in stamped {
@@ -197,6 +225,7 @@ pub fn compile_create_from(
         super::model::README,
         new_id,
         copies,
+        &[],
         &[(super::model::README.to_owned(), readme.to_owned())],
     )
 }
@@ -211,6 +240,12 @@ pub fn compile_create_from(
 /// the domain does not do (AD-108). Get it wrong and the append lands on a file
 /// that does not exist; the executor's `GuardedWrite` refuses a length mismatch,
 /// so the failure is loud rather than a half-written lineage.
+// Eight, and each one is a distinct fact about the create the caller already
+// holds separately. Bundling them into a `CreateRequest` would obscure that
+// `copies`, `expanded` and `stamped` are three different answers to "where do
+// these bytes come from" — which is the one thing a reader of this function has
+// to keep straight.
+#[allow(clippy::too_many_arguments)]
 pub fn compile_create_from_shaped(
     dir_name: &str,
     source_session: &str,
@@ -218,9 +253,10 @@ pub fn compile_create_from_shaped(
     record_name: &str,
     new_id: &str,
     copies: &[(String, bool)],
+    expanded: &[(String, String)],
     stamped: &[(String, String)],
 ) -> Plan {
-    let mut plan = compile_create_shaped(dir_name, source_session, copies, stamped);
+    let mut plan = compile_create_shaped(dir_name, source_session, copies, expanded, stamped);
     plan.verb = "create-from".to_owned();
     // The source-side lineage append, byte-preserving outside the key.
     let updated = append_lineage(source_record, KEY_CONTINUED_BY, new_id);
@@ -671,5 +707,84 @@ mod tests {
             panic!("a guarded write");
         };
         assert!(content.contains("## Log\n\n### 2026-08-12 — \n"));
+    }
+
+    /// An expanded pattern file compiles to a `WriteFile` carrying the resolved
+    /// bytes, and everything beside it still copies. The bytes ride in the plan
+    /// rather than the context that produced them, so a replay of the journal
+    /// row writes the same file without asking the clock again (AD-111).
+    #[test]
+    fn an_expanded_pattern_file_is_written_and_the_rest_still_copies() {
+        let copies = vec![
+            ("refs".to_owned(), true),
+            ("refs/inputs.md".to_owned(), false),
+            ("logo.png".to_owned(), false),
+            ("plain.md".to_owned(), false),
+        ];
+        let plan = compile_create_shaped(
+            "2026-08-17-ship-it",
+            "_template/house",
+            &copies,
+            &[("refs/inputs.md".to_owned(), "# Ship it\n".to_owned())],
+            &[("README.md".to_owned(), "# stamped\n".to_owned())],
+        );
+        assert!(
+            plan.steps.contains(&PlanStep::WriteFile {
+                path: "active/2026-08-17-ship-it/refs/inputs.md".to_owned(),
+                content: "# Ship it\n".to_owned(),
+            }),
+            "the expanded file is written, not copied: {:?}",
+            plan.steps
+        );
+        assert!(
+            !plan.steps.iter().any(|step| matches!(
+                step,
+                PlanStep::CopyFile { to, .. } if to.ends_with("refs/inputs.md")
+            )),
+            "and never both — a copy then a write is dead work the preview must explain"
+        );
+        for rel in ["logo.png", "plain.md"] {
+            assert!(
+                plan.steps.contains(&PlanStep::CopyFile {
+                    from: format!("_template/house/{rel}"),
+                    to: format!("active/2026-08-17-ship-it/{rel}"),
+                }),
+                "{rel} copies byte for byte"
+            );
+        }
+        // The stamped record is still last, and is not an expansion candidate:
+        // it is composed from the pattern's headings and never copied at all.
+        assert_eq!(
+            plan.steps.last(),
+            Some(&PlanStep::WriteFile {
+                path: "active/2026-08-17-ship-it/README.md".to_owned(),
+                content: "# stamped\n".to_owned(),
+            })
+        );
+    }
+
+    /// A caller with nothing to expand gets exactly the plan it always got —
+    /// the seam is additive, and a template of ordinary prose pays nothing.
+    #[test]
+    fn no_expansions_means_the_plan_is_unchanged() {
+        let copies = vec![("notes.md".to_owned(), false)];
+        let stamped = [("README.md".to_owned(), "# r\n".to_owned())];
+        let bare = compile_create_shaped("2026-08-17-s", "_template", &copies, &[], &stamped);
+        assert_eq!(
+            bare.steps,
+            vec![
+                PlanStep::MkDir {
+                    path: "active/2026-08-17-s".to_owned()
+                },
+                PlanStep::CopyFile {
+                    from: "_template/notes.md".to_owned(),
+                    to: "active/2026-08-17-s/notes.md".to_owned(),
+                },
+                PlanStep::WriteFile {
+                    path: "active/2026-08-17-s/README.md".to_owned(),
+                    content: "# r\n".to_owned(),
+                },
+            ]
+        );
     }
 }

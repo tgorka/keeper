@@ -481,6 +481,11 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     // shows no create control — the state the section must render as ABSENT
     // rather than disabled.
     newFileKind: null,
+    // Says nothing about how it opens or how much it shows, which is what four
+    // of the five defaults do — the plain case, so the fixture still shows a
+    // space that behaves exactly as it did before Story 51.3.
+    folded: null,
+    rows: null,
   },
   {
     id: "_spaces/tasks.md",
@@ -494,6 +499,12 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     warnings: [],
     error: null,
     newFileKind: "task",
+    folded: null,
+    // Four selected, two drawn: the row cap on screen, with *Show 2 more* under
+    // it and the header still counting 4. A fixture capped at or above its own
+    // list would render the control never, which is the state that hides a
+    // regression rather than showing it.
+    rows: 2,
   },
   {
     id: "_spaces/log.md",
@@ -507,6 +518,11 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     warnings: [],
     error: null,
     newFileKind: "log",
+    // Arrives shut on its own say-so, with the setting off — the layer between
+    // the person's hand and `sessions.spaces_folded`, and the one a fixture has
+    // to carry or nobody sees it until a real zone sets it.
+    folded: true,
+    rows: null,
   },
   {
     id: "_spaces/refs.md",
@@ -520,10 +536,18 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     icon: "link",
     defaultKey: "refs",
     order: 4,
-    warnings: ["Couldn't read sort `sideways asc`; using modified desc."],
+    warnings: [
+      "Couldn't read sort `sideways asc`; using modified desc.",
+      'keeper can\'t read the row limit "many", so this space shows every file it selects.',
+    ],
     error: null,
     // A misread `sort` does not stop a create: the query still names one kind.
     newFileKind: "ref",
+    // An unreadable cap is a WARNING and the value is DROPPED: the section shows
+    // everything it selected and says why, beside the sort it also could not
+    // read. Two warnings on one space is the list the editor prints in full.
+    folded: null,
+    rows: null,
   },
   {
     id: "_spaces/prompts.md",
@@ -541,6 +565,8 @@ const SESSION_SPACES: SessionSpaceVm[] = [
     error: "Unexpected end of query after `AND`.",
     // A query that will not parse names no kind, so Rust derives none.
     newFileKind: null,
+    folded: null,
+    rows: null,
   },
 ];
 
@@ -578,8 +604,17 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     files: [spaceFile("about.md", "About this session", ["about"], 45)],
     error: null,
     // Flat mock session: every kind it can hold lives at the root, so no space
-    // has a reason to say otherwise.
-    noHome: null,
+    // has a home to complain about — except the record, which every contract
+    // keeps exactly one of. That refusal is `KindHasNoHome::OnlyOne`'s sentence
+    // and this shell restates it as fixture bytes for the same reason it
+    // restates the namers: it never runs in the app, and Rust owns the wording
+    // wherever it does.
+    noHome:
+      "a session has one about record — about.md under the flat contract, README.md under the " +
+      "folder one — and keeper edits it rather than making a second.",
+    // So the verb this space offers is opening that record, where the create
+    // would have been.
+    openRecord: true,
   },
   {
     spaceId: "_spaces/tasks.md",
@@ -601,6 +636,7 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     ],
     error: null,
     noHome: null,
+    openRecord: false,
   },
   {
     spaceId: "_spaces/log.md",
@@ -611,18 +647,21 @@ const SESSION_SPACE_FILES: SessionSpaceFilesVm[] = [
     ],
     error: null,
     noHome: null,
+    openRecord: false,
   },
   {
     spaceId: "_spaces/refs.md",
     files: [spaceFile("ref-inputs.md", "Inputs", ["ref"], 100)],
     error: null,
     noHome: null,
+    openRecord: false,
   },
   {
     spaceId: "_spaces/prompts.md",
     files: [],
     error: "Unexpected end of query after `AND`.",
     noHome: null,
+    openRecord: false,
   },
 ];
 
@@ -1122,11 +1161,25 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       // kind until the real backend answers; an edited one keeps the kind it
       // already had, below.
       newFileKind: null,
+      // Straight off the request, because the round trip is the thing worth
+      // looking at here: `render_edit` replaces the whole `keeper:` map, so a
+      // mock that dropped either key would make the destroying bug invisible in
+      // exactly the surface built to catch it. `null` writes no key.
+      folded: typeof req.folded === "boolean" ? req.folded : null,
+      rows: typeof req.rows === "number" ? req.rows : null,
     };
     const at = SESSION_SPACES.findIndex((space) => space.id === id);
     if (at === -1) {
       SESSION_SPACES.push(saved);
-      SESSION_SPACE_FILES.push({ spaceId: id, files: [], error: null, noHome: null });
+      // A space the operator invents selects nothing yet and refuses nothing:
+      // the real backend answers both once it has read the query.
+      SESSION_SPACE_FILES.push({
+        spaceId: id,
+        files: [],
+        error: null,
+        noHome: null,
+        openRecord: false,
+      });
     } else {
       SESSION_SPACES[at] = {
         ...SESSION_SPACES[at],

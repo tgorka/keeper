@@ -34,6 +34,7 @@ import type { NoteBodyBatch, NoteVaultVm, NoteWriteVm } from "@/lib/ipc/client";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
+const notesRename = vi.fn<(v: string, n: string, title: string) => Promise<unknown>>();
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(async () => {}),
@@ -48,6 +49,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesBacklinks: vi.fn(async () => []),
   notesResolveConflict: vi.fn(async () => {}),
   notesMarkRead: vi.fn(async () => {}),
+  notesRename: (v: string, n: string, title: string) => notesRename(v, n, title),
   notesDiff: vi.fn(async () => null),
   notesHistory: vi.fn(async () => []),
   notesResolveLink: vi.fn(async () => null),
@@ -137,12 +139,12 @@ function seedVault(): void {
 
 /** Mount the editor on a note, and let its opening `Reset` land. `frame` is
  *  the holding surface's own controls, which only a panel has. */
-async function openEditor(frame?: ReactNode): Promise<void> {
+async function openEditor(frame?: ReactNode, frontmatter = ""): Promise<void> {
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
     onBatch({
       kind: "reset",
       text: BODY,
-      frontmatter: "",
+      frontmatter,
       rev: "r0",
       cursor: null,
       path: NOTE_PATH,
@@ -839,5 +841,59 @@ describe("a panel that will not open in this mode", () => {
       expect(notice()).not.toBeNull();
     });
     expect(notice()?.textContent).toContain(ATTACHMENTS_LABEL);
+  });
+});
+
+/**
+ * A retitle renames the note's file (Story 51.6, FR-97; matrix row 12).
+ *
+ * **The story is reachability, so the test is a call site.** `notes_rename` has
+ * been built, registered and wrapped since FR-97 and had no caller anywhere in
+ * `src/` — the command worked and nothing asked it anything, so every note has
+ * been carrying whatever filename it was created with however often its title
+ * changed. Nothing in the repo would have caught that: a suite over the command
+ * would have passed, and a suite over the panel would not have known the command
+ * existed. What fails without the wiring is this: press the field, and see
+ * whether the verb runs.
+ *
+ * The vault and note ids matter as much as the title. `notes_rename` resolves the
+ * note by ULID and derives the filename itself, which is why a note needs no
+ * pointer rewriting where a session file needs a journaled plan — and why passing
+ * a path here would be the wrong argument for a command whose whole premise is
+ * that the path is not the identity.
+ */
+describe("a note's title, changed in the properties panel", () => {
+  /** Press an item in the note's actions menu, whichever kind of item it is. */
+  function openProperties(): void {
+    openNoteActions();
+    const item =
+      screen.queryByRole("menuitem", { name: PROPERTIES_LABEL }) ??
+      screen.getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL });
+    fireEvent.click(item);
+  }
+
+  it("renames the file, through the command FR-97 shipped and nobody called", async () => {
+    await openEditor(undefined, "---\ntitle: Meeting\n---\n");
+    openProperties();
+
+    const field = await screen.findByRole("textbox", { name: "title" });
+    fireEvent.change(field, { target: { value: "Kick Off" } });
+    fireEvent.blur(field);
+
+    await waitFor(() => expect(notesRename).toHaveBeenCalledWith("v1", "n1", "Kick Off"));
+  });
+
+  it("leaves every other property alone, so nothing else moves a file", async () => {
+    await openEditor(undefined, "---\ntitle: Meeting\nowner: ada\n---\n");
+    openProperties();
+
+    const field = await screen.findByRole("textbox", { name: "owner" });
+    fireEvent.change(field, { target: { value: "grace" } });
+    fireEvent.blur(field);
+
+    // The write happened; the rename did not. A panel that renamed on any write
+    // would move a file because somebody corrected a typo in `owner:`.
+    await waitFor(() => expect(field).toHaveValue("grace"));
+    expect(notesRename).not.toHaveBeenCalled();
   });
 });

@@ -5,6 +5,7 @@ import type {
   SessionEntryVm,
   SessionReferencesVm,
   SessionSpaceVm,
+  SessionTaskVm,
   SessionTreeVm,
 } from "@/lib/ipc/client";
 
@@ -18,6 +19,10 @@ const listenSessionsChanged = vi.fn();
 // The fold default the detail reads on mount (Story 49.3): named here rather
 // than stubbed inline, because the restore cases below turn it on and off.
 const sessionsSpacesFoldedGet = vi.fn();
+// The board's one write (FR-263), named because Story 51.7 asserts it is
+// reachable on a folder-shaped session — the surface where the board itself was
+// absent until this story.
+const sessionsTaskMove = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
@@ -43,7 +48,13 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsLogToday: vi.fn(),
   // And the board's one write (FR-263), imported transitively through
   // SessionBoard.
-  sessionsTaskMove: vi.fn(),
+  sessionsTaskMove: (
+    rootId: unknown,
+    sessionId: unknown,
+    rel: unknown,
+    status: unknown,
+    index: unknown,
+  ) => sessionsTaskMove(rootId, sessionId, rel, status, index),
   // The spaces section resolves a row's note through the vault mirror and the
   // 45.18 bridge (Story 49.2), so the store and the bridge both reach this
   // module. `notesVaults` answering an empty list is a machine with no vault
@@ -63,6 +74,11 @@ vi.mock("@/lib/ipc/client", () => ({
 // somebody presses a link row — mocked because the real plugin talks to Tauri.
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(async () => {}) }));
 
+import {
+  SESSION_BOARD_EMPTY,
+  SESSION_BOARD_HEADING,
+  SESSION_BOARD_MOVE_LABEL,
+} from "@/components/sessions/session-board";
 import {
   SESSION_DETAIL_FILES_HEADING,
   SESSION_DETAIL_LOG_HEADING,
@@ -223,6 +239,13 @@ function space(over: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     warnings: [],
     error: null,
     newFileKind: "log",
+    // Story 51.3's two keys: a space that says nothing about how it opens or
+    // how much it shows, which is what every case here except the fold ones
+    // wants. `null` and not omitted — the field is required on the wire, and a
+    // fixture that could leave it out would let a call site read `undefined`
+    // as "follow the setting" by accident rather than by decision.
+    folded: null,
+    rows: null,
     ...over,
   };
 }
@@ -452,7 +475,7 @@ describe("SessionDetail", () => {
   it("reads the zone's spaces and this session's selections as two calls", async () => {
     sessionsSpaces.mockResolvedValue([space()]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null, openRecord: false },
     ]);
     mount();
 
@@ -479,7 +502,7 @@ describe("SessionDetail", () => {
     sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
     sessionsSpaces.mockResolvedValue([space()]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null, openRecord: false },
     ]);
     sessionsFileNewKind.mockResolvedValue("60-sessions/active/2026-08-10-keeper/untitled.md");
     mount();
@@ -519,7 +542,7 @@ describe("SessionDetail", () => {
       "file — use New log, which appends one there.";
     sessionsSpaces.mockResolvedValue([space()]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: "_spaces/log.md", files: [], error: null, noHome },
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome, openRecord: false },
     ]);
     mount();
 
@@ -529,6 +552,88 @@ describe("SessionDetail", () => {
     expect(within(section).getByText("Log")).toBeInTheDocument();
     expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
     expect(within(section).getByText(noHome)).toBeInTheDocument();
+  });
+
+  /**
+   * Rows 1 and 2 of Story 51.7, at the mount point: a space that offers **no
+   * create at all** still explains itself.
+   *
+   * This is the About space, and the defect it shipped with was that the
+   * sentence was only computed where a create HAD been derived
+   * (`sessions_space_files` asked `creatable_kind` first), so the one space with
+   * three reasons to refuse had none of them on screen. Rust answers both halves
+   * now (`spaces::create_refused`, whose own tests own the wording and which of
+   * the refusals wins); what this asserts is the half that is the webview's — a
+   * sentence arriving beside `newFileKind: null` is printed rather than dropped
+   * on the floor with the button.
+   *
+   * The two-term sentence, deliberately, because that is the live zone's About
+   * query (`tag:about tag:recordings`): the first refusal in the chain is the
+   * query's own, and it is the one a person has to read to understand why.
+   */
+  it("prints the sentence for a space that offers no create at all", async () => {
+    const noHome =
+      "this space asks for more than one thing, so there is no single kind a file made here " +
+      "could be: every term has to hold for a file to appear, and a create writes one kind " +
+      "with one tag. Narrow the query to a single `tag:` term to write into this space, or " +
+      "make the file from Files above and tag it so this space picks it up.";
+    sessionsSpaces.mockResolvedValue([
+      space({
+        id: "_spaces/about.md",
+        name: "About",
+        query: "tag:about tag:recordings",
+        defaultKey: "about",
+        newFileKind: null,
+      }),
+    ]);
+    sessionsSpaceFiles.mockResolvedValue([
+      { spaceId: "_spaces/about.md", files: [], error: null, noHome, openRecord: true },
+    ]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    expect(within(section).getByText(noHome)).toBeInTheDocument();
+    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+  });
+
+  /**
+   * Row 3. Where the create is refused because the record already exists, the
+   * space offers the verb that does apply — and it opens the same file the
+   * header's own button opens, through the one file target (AD-109).
+   *
+   * The label is the shape's: this fixture is folder-shaped, so it is `README`,
+   * and the section is handed it rather than composing one. `session-spaces.tsx`
+   * owns "the button renders and calls back" (`session-spaces.test.tsx`); what
+   * only this suite can see is that the callback and the label the section is
+   * handed are the ones that name and open this session's record.
+   */
+  it("opens the record from the space whose create was refused because it exists", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder" }));
+    sessionsSpaces.mockResolvedValue([
+      space({ id: "_spaces/about.md", name: "About", query: "tag:about", newFileKind: null }),
+    ]);
+    sessionsSpaceFiles.mockResolvedValue([
+      {
+        spaceId: "_spaces/about.md",
+        files: [],
+        error: null,
+        noHome:
+          "a session has one about record — about.md under the flat contract, README.md under " +
+          "the folder one — and keeper edits it rather than making a second.",
+        openRecord: true,
+      },
+    ]);
+    mount();
+
+    const section = await screen.findByRole("region", { name: SESSION_SPACES_HEADING });
+    const open = within(section).getByRole("button", { name: SESSION_DETAIL_OPEN_README_LABEL });
+    fireEvent.click(open);
+
+    const target = panelsStore.getState().panels.find((p) => p.target?.kind === "file")?.target;
+    expect(target).toMatchObject({
+      profileId: "tgdrive",
+      relativePath: "60-sessions/active/2026-08-10-keeper/README.md",
+    });
   });
 
   /**
@@ -543,7 +648,7 @@ describe("SessionDetail", () => {
       space({ id: "_spaces/refs.md", name: "References", query: "tag:ref", newFileKind: "ref" }),
     ]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: "_spaces/refs.md", files: [], error: null, noHome: null },
+      { spaceId: "_spaces/refs.md", files: [], error: null, noHome: null, openRecord: false },
     ]);
     sessionsFileNewKind.mockResolvedValue(
       "60-sessions/active/2026-08-10-keeper/refs/2026-08-16-0900-untitled.md",
@@ -587,7 +692,7 @@ describe("SessionDetail", () => {
     sessionsDetail.mockResolvedValue(detail({ shape: "flat" }));
     sessionsSpaces.mockResolvedValue([space()]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null },
+      { spaceId: "_spaces/log.md", files: [], error: null, noHome: null, openRecord: false },
     ]);
     // The executor form, not `Promise.withResolvers`: the project compiles
     // against `lib: ES2020`, where that constructor method does not exist.
@@ -839,13 +944,14 @@ describe("SessionDetail after a file's properties change", () => {
       ],
       error: null,
       noHome: null,
+      openRecord: false,
     };
   }
 
   it("row 6: lists a file in refs/ that just became tag:ref, on the next read", async () => {
     sessionsSpaces.mockResolvedValue([REFERENCES]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null, openRecord: false },
     ]);
     mount();
 
@@ -863,20 +969,19 @@ describe("SessionDetail after a file's properties change", () => {
     expect(sessionsSpaceFiles).toHaveBeenCalledTimes(2);
   });
 
-  it("row 7: does not list a folder-shaped session's ROOT markdown, however it is tagged", async () => {
-    // The boundary, stated rather than assumed. For a folder-shaped session the
-    // pool reads `README.md`, `refs/` and `prompts/` and nothing else
-    // (`sessions_root::read_ref_sources`, asserted there over real files), so a
-    // root `stray.md` tagged `ref` is in no space at all — not even Unfiled.
-    //
-    // What this surface owes is that it does not invent the row: it lists what
-    // the selection payload holds and never derives membership from a tag it
-    // can see. A test that only asserted row 6 would stay green over a surface
-    // that filed files client-side.
+  it("lists only what the selection payload holds, never what a tag on screen implies", async () => {
+    // Story 50.4 wrote this case as "a folder-shaped session's ROOT markdown is
+    // in no space at all", which was true of the reader it was written against
+    // and is not true now: Story 51.1 put that shape's root markdown into the
+    // pool (FR-286), so a root `stray.md` tagged `ref` IS selectable. The claim
+    // that survives — and the only one this surface ever owed — is the one below:
+    // it lists what the payload holds and never derives membership from a tag it
+    // can see. A test that only asserted the row above would stay green over a
+    // surface that filed files client-side.
     sessionsDetail.mockResolvedValue(detail({ shape: "folder", unfiled: [] }));
     sessionsSpaces.mockResolvedValue([REFERENCES]);
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null, openRecord: false },
     ]);
     mount();
 
@@ -885,12 +990,105 @@ describe("SessionDetail after a file's properties change", () => {
     // Rust re-read the pool and still selected nothing: the root file is not in
     // it to be selected.
     sessionsSpaceFiles.mockResolvedValue([
-      { spaceId: REFERENCES.id, files: [], error: null, noHome: null },
+      { spaceId: REFERENCES.id, files: [], error: null, noHome: null, openRecord: false },
     ]);
     onChanged("tgdrive");
 
     await waitFor(() => expect(sessionsSpaceFiles).toHaveBeenCalledTimes(2));
     expect(within(section).queryByText("stray")).toBeNull();
     expect(within(section).getByText(SESSION_SPACES_NO_FILES)).toBeInTheDocument();
+  });
+});
+
+/**
+ * The board follows the pool, not the shape (Story 51.7, FR-299).
+ *
+ * `session-board.test.tsx` owns the board's own behaviour — the four columns, the
+ * drag, the stray row — and `notes/task-board.tsx` owns the drop arithmetic. What
+ * only this suite can see is the gate: for two epics the board was rendered for a
+ * flat session ONLY, with the reason that a folder-shaped one had no pool to tag,
+ * so the owner of a folder-shaped session had never seen a board at all.
+ */
+describe("SessionDetail's board", () => {
+  function task(over: Partial<SessionTaskVm> = {}): SessionTaskVm {
+    return {
+      id: "path:ship-it.md",
+      relPath: "ship-it.md",
+      title: "Ship it",
+      status: "todo",
+      order: 1.5,
+      orderIsOwn: true,
+      tags: ["task"],
+      unstableIdentity: true,
+      ...over,
+    };
+  }
+
+  /** Row 4. The default fixture IS folder-shaped, which is the point. */
+  it("row 4: draws a folder-shaped session's tagged root markdown as cards", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder", tasks: [task()] }));
+    mount();
+
+    const board = await screen.findByRole("region", { name: SESSION_BOARD_HEADING });
+    expect(within(board).getByRole("button", { name: "Ship it" })).toBeInTheDocument();
+    // In the column its own `status:` names, which is what makes this a board
+    // rather than a list.
+    expect(within(board).getByRole("list", { name: "To do" })).toHaveTextContent("Ship it");
+  });
+
+  /**
+   * Rows 5 and 6. The keyboard path, on the shape that never had one: the
+   * dropdown writes through the same `sessions_task_move` a drop does, so this is
+   * the assertion that the board is LIVE on a folder-shaped session and not just
+   * drawn. The drag's own handlers and the index arithmetic are `task-board`'s
+   * and are tested there — this repo does not ship a pointer-only affordance, so
+   * the reachable-without-a-pointer half is the one worth asserting at the mount
+   * point.
+   */
+  it("rows 5-6: moves a card by keyboard on a folder-shaped session", async () => {
+    sessionsTaskMove.mockResolvedValue(undefined);
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder", tasks: [task()] }));
+    mount();
+
+    const board = await screen.findByRole("region", { name: SESSION_BOARD_HEADING });
+    const move = within(board).getByRole("combobox", {
+      name: `${SESSION_BOARD_MOVE_LABEL} — Ship it`,
+    });
+    fireEvent.change(move, { target: { value: "done" } });
+
+    await waitFor(() =>
+      expect(sessionsTaskMove).toHaveBeenCalledWith(
+        "tgdrive",
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        "ship-it.md",
+        "done",
+        0,
+      ),
+    );
+  });
+
+  /**
+   * Row 7. Nothing tagged — which is also every session with no pool at all,
+   * because a pool with nothing in it selects no tasks either way. The board says
+   * what a task IS rather than drawing four empty columns over a session that has
+   * none: the columns are the thing that would be saying something untrue.
+   */
+  it("row 7: says what a task is instead of drawing columns over nothing", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "folder", tasks: [] }));
+    mount();
+
+    const board = await screen.findByRole("region", { name: SESSION_BOARD_HEADING });
+    expect(within(board).getByText(SESSION_BOARD_EMPTY)).toBeInTheDocument();
+    expect(within(board).queryByRole("list", { name: "To do" })).toBeNull();
+  });
+
+  /** Row 8. The shape the board always had, unchanged in every respect. */
+  it("row 8: draws a flat session's board exactly as before", async () => {
+    sessionsDetail.mockResolvedValue(detail({ shape: "flat", tasks: [task()] }));
+    mount();
+
+    const board = await screen.findByRole("region", { name: SESSION_BOARD_HEADING });
+    expect(within(board).getByRole("list", { name: "To do" })).toHaveTextContent("Ship it");
+    expect(within(board).queryByText(SESSION_BOARD_EMPTY)).toBeNull();
   });
 });

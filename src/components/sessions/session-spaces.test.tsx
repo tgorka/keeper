@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { NoteVaultVm, SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
@@ -32,6 +32,8 @@ import {
   SESSION_SPACE_EDIT,
   SESSION_SPACE_NEW_NOTE,
   SESSION_SPACE_NEW_NOTE_FAILED,
+  SESSION_SPACE_ROWS_LESS,
+  SESSION_SPACE_ROWS_MORE,
   SESSION_SPACE_SETTINGS_SUBTITLE,
   SESSION_SPACES_EMPTY,
   SESSION_SPACES_LOADING,
@@ -59,6 +61,7 @@ import {
   readSessionSpacesFold,
   resetSessionSpacesFoldForTest,
   SESSION_SPACES_FOLD_COOKIE,
+  setSpaceFolded,
   setSpacesFoldedDefault,
   spaceFoldKey,
 } from "@/lib/stores/session-spaces-fold";
@@ -87,6 +90,11 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     // Rust's answer, never derived here: the query above is a fixture detail
     // and this is the contract. `creatable_kind`'s own tests own rows 1–6.
     newFileKind: p.newFileKind ?? null,
+    // Both `null` by default, which is a space file that says nothing about how
+    // it opens or how much it shows — the shape every fixture below had before
+    // Story 51.3, so no existing assertion changes meaning.
+    folded: p.folded ?? null,
+    rows: p.rows ?? null,
   };
 }
 
@@ -120,6 +128,8 @@ function selection(
    * answer, per session, which is what replaced the `shape` prop.
    */
   noHome: string | null = null,
+  /** Rust's per-space answer that the record this space wanted already exists. */
+  openRecord = false,
 ) {
   return {
     spaceId,
@@ -134,6 +144,7 @@ function selection(
     })),
     error,
     noHome,
+    openRecord,
   } satisfies SessionSpaceFilesVm;
 }
 
@@ -190,10 +201,12 @@ function Harness({
   spaces,
   selections,
   onChanged,
+  onOpenRecord,
 }: {
   spaces: SessionSpaceVm[];
   selections: SessionSpaceFilesVm[] | null;
   onChanged: () => void;
+  onOpenRecord: () => void;
 }) {
   const [writing, setWriting] = useState(false);
   return (
@@ -205,17 +218,31 @@ function Harness({
       writing={writing}
       onWriting={setWriting}
       onChanged={onChanged}
+      recordLabel={RECORD_LABEL}
+      onOpenRecord={onOpenRecord}
     />
   );
 }
 
+/** What the detail calls the session's own record — a fixture, since the real
+ *  label is composed from the shape by `session-detail.tsx`. */
+const RECORD_LABEL = "Open about.md";
+
 function open(
   spaces: SessionSpaceVm[],
   selections: SessionSpaceFilesVm[] | null,
-): { onChanged: Mock; unmount: () => void } {
+): { onChanged: Mock; onOpenRecord: Mock; unmount: () => void } {
   const onChanged = vi.fn();
-  const view = render(<Harness spaces={spaces} selections={selections} onChanged={onChanged} />);
-  return { onChanged, unmount: view.unmount };
+  const onOpenRecord = vi.fn();
+  const view = render(
+    <Harness
+      spaces={spaces}
+      selections={selections}
+      onChanged={onChanged}
+      onOpenRecord={onOpenRecord}
+    />,
+  );
+  return { onChanged, onOpenRecord, unmount: view.unmount };
 }
 
 beforeEach(() => {
@@ -1197,5 +1224,216 @@ describe("SessionSpaces folds", () => {
     expect(screen.getByRole("button", { name: `${SESSION_SPACE_NEW_NOTE} ${name}` })).toHaveClass(
       "shrink-0",
     );
+  });
+});
+
+/**
+ * The space's own answer about how it opens (Story 51.3, FR-289, rows 1–4).
+ *
+ * The layering itself is `session-spaces-fold.test.ts`'s — this is the half only
+ * a render can prove: that the section asks with the space's own `folded` in
+ * hand, rather than composing three of the four layers and dropping the file's.
+ * Row 2's cookie precedence is asserted here too, because a component that
+ * passed `folded` in the wrong argument slot would still pass the store's test.
+ */
+describe("SessionSpaces per-space fold", () => {
+  it("row 1: arrives folded on the space's own say-so with the setting off", () => {
+    open(
+      [space({ name: "Tasks", folded: true })],
+      [selection("_spaces/tasks.md", ["task-migrate.md"])],
+    );
+
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand Tasks" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    // The count is still the header's, so a folded space says how much it holds.
+    expect(screen.getByText("1")).toBeInTheDocument();
+  });
+
+  it("row 2: the person's own unfold beats the space's `folded: true`", () => {
+    setSpaceFolded(spaceFoldKey("p1", "_spaces/tasks.md"), false);
+
+    open(
+      [space({ name: "Tasks", folded: true })],
+      [selection("_spaces/tasks.md", ["task-migrate.md"])],
+    );
+
+    expect(screen.getByRole("list", { name: "Tasks" })).toBeInTheDocument();
+  });
+
+  it("row 4: `folded: false` arrives open even with the setting on", () => {
+    setSpacesFoldedDefault(true);
+
+    open(
+      [space({ name: "Tasks", folded: false })],
+      [selection("_spaces/tasks.md", ["task-migrate.md"])],
+    );
+
+    expect(screen.getByRole("list", { name: "Tasks" })).toBeInTheDocument();
+  });
+
+  /** Row 3, and the reason the setting stays: a space that says nothing is
+   *  exactly what a user-global default is for. */
+  it("row 3: a space that says nothing follows the setting", () => {
+    setSpacesFoldedDefault(true);
+
+    open([space({ name: "Tasks" })], [selection("_spaces/tasks.md", ["task-migrate.md"])]);
+
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+  });
+
+  /** Two spaces, two different answers, one render: a component that read the
+   *  file's answer once and reused it would fold both. */
+  it("gives each space its own answer in the same session", () => {
+    open(
+      [
+        space({ name: "Tasks", folded: true }),
+        space({ id: "_spaces/log.md", name: "Log", folded: false }),
+      ],
+      [
+        selection("_spaces/tasks.md", ["task-migrate.md"]),
+        selection("_spaces/log.md", ["2026-08-16.md"]),
+      ],
+    );
+
+    expect(screen.queryByRole("list", { name: "Tasks" })).toBeNull();
+    expect(screen.getByRole("list", { name: "Log" })).toBeInTheDocument();
+  });
+});
+
+/**
+ * The row cap (Story 51.3, FR-290, rows 5–7).
+ *
+ * What every assertion here is really about: `keeper.rows` caps what the section
+ * RENDERS and never what the query SELECTED. So the header's count is checked
+ * beside the row count in the same test — a cap that had narrowed the selection
+ * would pass a rows-only assertion and lie about the total, which is the one
+ * failure this key must not have.
+ */
+describe("SessionSpaces row cap", () => {
+  const TEN = Array.from({ length: 10 }, (_, i) => `task-${i}.md`);
+
+  function rows(): HTMLElement[] {
+    return screen.getAllByRole("listitem");
+  }
+
+  it("row 5: draws the cap, folds the remainder, and still counts the whole selection", () => {
+    open([space({ name: "Tasks", rows: 3 })], [selection("_spaces/tasks.md", TEN)]);
+
+    expect(rows()).toHaveLength(3);
+    expect(screen.getByText("10")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `${SESSION_SPACE_ROWS_MORE(7)}: Tasks` }),
+    ).toBeInTheDocument();
+  });
+
+  it("row 6: the remainder comes back on a press, and folds again", () => {
+    open([space({ name: "Tasks", rows: 3 })], [selection("_spaces/tasks.md", TEN)]);
+
+    fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_ROWS_MORE(7)}: Tasks` }));
+
+    expect(rows()).toHaveLength(10);
+    const less = screen.getByRole("button", { name: `${SESSION_SPACE_ROWS_LESS}: Tasks` });
+    fireEvent.click(less);
+    expect(rows()).toHaveLength(3);
+  });
+
+  /** Row 7's surface half: Rust warned and dropped the value, so the section
+   *  behaves exactly as it did before the key existed — every row, no control. */
+  it("row 7: an unreadable cap caps nothing and offers no control", () => {
+    open(
+      [space({ name: "Tasks", rows: null, warnings: ['keeper can\'t read the row limit "0".'] })],
+      [selection("_spaces/tasks.md", TEN)],
+    );
+
+    expect(rows()).toHaveLength(10);
+    expect(screen.queryByRole("button", { name: /Show \d+ more/ })).toBeNull();
+    // A warning and not a fault: the space still works, and the subtitle says so.
+    expect(screen.getByText(SESSION_SPACE_SETTINGS_SUBTITLE)).toBeInTheDocument();
+  });
+
+  /** A cap nothing reaches is a control that would say "Show 0 more". */
+  it("offers no control when the selection already fits the cap", () => {
+    open([space({ name: "Tasks", rows: 3 })], [selection("_spaces/tasks.md", TEN.slice(0, 3))]);
+
+    expect(rows()).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: /Show/ })).toBeNull();
+  });
+
+  /** The cap lives inside the fold, so a folded capped space draws neither its
+   *  rows nor the control that would reveal more of them. */
+  it("hides the control with the rows when the space is folded", () => {
+    open([space({ name: "Tasks", rows: 3, folded: true })], [selection("_spaces/tasks.md", TEN)]);
+
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: /Show \d+ more/ })).toBeNull();
+    expect(screen.getByText("10")).toBeInTheDocument();
+  });
+
+  /** Each section folds on its own: one capped space unfolded must not unfold
+   *  the next one's remainder. */
+  it("keeps one section's remainder out of another's", () => {
+    open(
+      [space({ name: "Tasks", rows: 3 }), space({ id: "_spaces/log.md", name: "Log", rows: 2 })],
+      [selection("_spaces/tasks.md", TEN), selection("_spaces/log.md", TEN)],
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: `${SESSION_SPACE_ROWS_MORE(7)}: Tasks` }));
+
+    expect(screen.getByRole("list", { name: "Tasks" }).children).toHaveLength(10);
+    expect(screen.getByRole("list", { name: "Log" }).children).toHaveLength(2);
+  });
+});
+
+/**
+ * Opening the record a space wanted to create (Story 51.7, FR-299, row 3).
+ *
+ * Wired here because the render is this file's; the payload that decides it is
+ * `spaces::create_refused(query, shape).record`, and `session-detail.test.tsx`
+ * owns the end-to-end wiring. What is asserted here is narrower and is the only
+ * half a render can prove: the flag puts a verb in the create's own slot, and
+ * a refusal the record cannot answer puts none there.
+ */
+describe("SessionSpaces open the record", () => {
+  /** Rust's sentence for the one-record refusal, written out as FIXTURE data for
+   *  {@link NO_TASK_HOME}'s reason — `shape.rs` owns the wording. */
+  const ONE_RECORD =
+    "a session has one about record — about.md under the flat contract, README.md under the folder one — and keeper edits it rather than making a second.";
+
+  /**
+   * Row 3. Where Rust says the record this space wanted already exists, the verb
+   * that applies is opening it — in the create's own slot, and never beside a
+   * create, because a query that names the record is refused one by definition.
+   *
+   * The label is NOT composed here: the record is `about.md` under one contract
+   * and `README.md` under the other, and the surface that knows which is the
+   * detail's header, which reads `shape` off its own payload.
+   */
+  it("row 3: offers Open the record where the create was refused because it exists", () => {
+    const { onOpenRecord } = open(
+      [space({ id: "_spaces/about.md", name: "About", newFileKind: null })],
+      [selection("_spaces/about.md", [], null, ONE_RECORD, true)],
+    );
+
+    const section = screen.getByRole("region", { name: "About" });
+    expect(within(section).queryByRole("button", { name: /^New note in/ })).toBeNull();
+    fireEvent.click(within(section).getByRole("button", { name: RECORD_LABEL }));
+
+    expect(onOpenRecord).toHaveBeenCalledTimes(1);
+  });
+
+  /** And it is absent where the refusal is a different one: a folder-shaped
+   *  session keeps no tasks file, and opening the record is not the answer to
+   *  that. */
+  it("row 3: offers no record verb for a refusal the record cannot answer", () => {
+    open(
+      [space({ id: "_spaces/tasks.md", name: "Tasks", newFileKind: "task" })],
+      [selection("_spaces/tasks.md", [], null, NO_TASK_HOME, false)],
+    );
+
+    const section = screen.getByRole("region", { name: "Tasks" });
+    expect(within(section).queryByRole("button", { name: RECORD_LABEL })).toBeNull();
   });
 });

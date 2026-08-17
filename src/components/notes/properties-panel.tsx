@@ -92,6 +92,7 @@ import {
   recordingOpenPath,
   recordingSessionMeta,
   revealPath,
+  sessionsFileRename,
   syncReadFrontmatter,
   syncWriteFrontmatter,
   tagsVocabulary,
@@ -304,8 +305,23 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
   };
 }
 
-/** Render a scalar the way it was written, quoting only when it must be. */
-function serialiseScalar(value: string, quoted: boolean): string {
+/**
+ * The frontmatter key whose value also names the file (FR-97, FR-295).
+ *
+ * Named because two things read it: the control that writes it, and the rename
+ * verb the write is routed through when it changes. A string literal in both
+ * places is how one of them comes to be spelled `Title`.
+ */
+export const TITLE_KEY = "title";
+
+/**
+ * Render a scalar the way it was written, quoting only when it must be.
+ *
+ * Exported for the space row's Rename, which sets this same key from a menu
+ * instead of from the panel's own field: two serialisers for one value would
+ * disagree about quoting the first time somebody's title contained a colon.
+ */
+export function serialiseScalar(value: string, quoted: boolean): string {
   const needsQuotes =
     quoted || value === "" || value.trim() !== value || /[:#[\]{}]/.test(value.charAt(0));
   return needsQuotes ? ` "${value.replace(/"/g, '\\"')}"` : ` ${value}`;
@@ -405,6 +421,21 @@ export interface FilePropertiesTarget {
    * matters — and the panel shows it verbatim beside a way out.
    */
   write: ((nextBlock: string) => Promise<void>) | null;
+  /**
+   * Write the block **and** make the filename follow the new title, as one act
+   * (FR-295).
+   *
+   * A second function rather than a flag on {@link FilePropertiesTarget.write},
+   * because the two are different commands with different guarantees: `write`
+   * splices a block, and this compiles a journaled plan that moves the file and
+   * rewrites what pointed at it. `null` where the address has no rename — a file
+   * outside any session, whose name keeper does not derive.
+   *
+   * Rejects with keeper's own sentence, including the two the panel exists to
+   * carry: a title that folds to nothing has not been written either, and a
+   * collision names the file it would have overwritten.
+   */
+  rename: ((nextBlock: string) => Promise<void>) | null;
   /** Read the file again, for the refusal that says it changed underneath. */
   reread: () => void;
 }
@@ -437,6 +468,22 @@ interface NoteAddress {
   baseRev: string;
   /** Adopt the write once Rust has acknowledged it. */
   onSaved: (body: string, write: NoteWriteVm) => void;
+  /**
+   * Rename the note's file to follow its new title (FR-97).
+   *
+   * **Two writes here, one plan on the file address, and the asymmetry is
+   * deliberate.** A note's identity is its ULID, so links, pins and unread marks
+   * survive whichever half lands first — the worst outcome is a filename that
+   * lags its title, which is the state every note in the vault is in today
+   * because `notes_rename` shipped with no call site. A session file's identity
+   * IS its path, so there the two halves must be one journaled plan or the
+   * pointers break.
+   *
+   * Takes the plain new title because that is what `notes_rename` takes: it
+   * derives the filename itself and rewrites nothing, the id having already done
+   * that job.
+   */
+  rename?: ((title: string) => Promise<void>) | null;
   file?: never;
 }
 
@@ -476,33 +523,63 @@ const FILE_WRITE_FAILED = "keeper couldn't write that property. The file is unch
 export const PROPERTIES_REREAD_LABEL = "Re-read";
 
 /**
- * Both addresses, resolved to the two things the panel actually does with one.
+ * Both addresses, resolved to the three things the panel actually does with one.
  *
  * Everything below this function is one panel over one block. `save` is `null`
  * when editing is off — which a note spells `subscriptionId === null` and a file
  * spells `write: null` — and `reread` exists only where a write can refuse
  * rather than fault, which is the file address alone.
  *
+ * `save`'s second argument is **the new title when this write changes it, and
+ * `null` otherwise** (FR-97, FR-295). That is what makes a retitle one act from
+ * the panel's point of view: the panel does not know which surface it is serving
+ * and must not start knowing, so it reports *what changed* and the address
+ * decides what that costs. On a session file it costs a journaled plan that moves
+ * the file and rewrites its pointers; on a note it costs a second command after
+ * the save; on an address with no rename it costs nothing and the property is
+ * written like any other.
+ *
  * A plain function rather than a hook or a branch inside the component so the
  * union narrows once, in one place, instead of at every prop the two halves do
  * not share.
  */
 function addressOf(props: PropertiesPanelProps): {
-  save: ((nextBlock: string) => Promise<void>) | null;
+  save: ((nextBlock: string, retitle: string | null) => Promise<void>) | null;
   reread: (() => void) | null;
 } {
   if (props.file !== undefined) {
-    return { save: props.file.write, reread: props.file.reread };
+    const { write, rename, reread } = props.file;
+    if (write === null) {
+      return { save: null, reread };
+    }
+    return {
+      // The rename command writes the block itself, so this is a choice between
+      // two writers and never both: two commands over one block would be two
+      // journal rows, and the second would be guarding against the first.
+      save: (nextBlock, retitle) =>
+        retitle !== null && rename !== null ? rename(nextBlock) : write(nextBlock),
+      reread,
+    };
   }
   const { subscriptionId, body, baseRev, onSaved } = props;
+  // Normalised once: `rename` is optional on the note address (a call site that
+  // has no vault id cannot supply one), and `undefined` and `null` are the same
+  // fact here — there is no rename.
+  const rename = props.rename ?? null;
   if (subscriptionId === null) {
     return { save: null, reread: null };
   }
   return {
-    save: (nextBlock) =>
+    save: (nextBlock, retitle) =>
       notesSave(subscriptionId, body, baseRev, nextBlock).then(
         (result) => {
           onSaved(body, result);
+          // After the save, never before it: `notes_rename` moves the file and
+          // writes nothing into it, so renaming first would leave the new name on
+          // a file that still says the old title if the save then failed.
+          if (retitle !== null && rename !== null) {
+            return rename(retitle);
+          }
         },
         () => {
           throw new Error(WRITE_FAILED);
@@ -563,11 +640,20 @@ export function PropertiesPanel(props: PropertiesPanelProps) {
     };
   }, [sessionId]);
 
-  const write = (nextBlock: string): void => {
+  /**
+   * The one write funnel, and the one place that notices a title changed.
+   *
+   * `retitle` is the new title's plain text when this write is a title write, and
+   * `null` for every other key — read back through {@link unquote} rather than
+   * threaded down from the control, because the control's job is to produce the
+   * *serialised* value and a second parameter for the raw one would be a second
+   * contract on every kind of control for the sake of one key.
+   */
+  const write = (nextBlock: string, retitle: string | null = null): void => {
     if (save === null) {
       return;
     }
-    void save(nextBlock)
+    void save(nextBlock, retitle)
       .then(() => {
         setFailure(null);
       })
@@ -635,7 +721,15 @@ export function PropertiesPanel(props: PropertiesPanelProps) {
                 ) : (
                   <PropertyControl
                     entry={entry}
-                    onChange={(value) => write(spliceProperty(frontmatter, entry, value))}
+                    onChange={(value) =>
+                      write(
+                        spliceProperty(frontmatter, entry, value),
+                        // The rename is asked for by the same press that writes
+                        // the title, so the two cannot come apart — and on the
+                        // session-file address they are literally one plan.
+                        entry.key === TITLE_KEY ? unquote(value.trim()).text : null,
+                      )
+                    }
                   />
                 )}
               </div>
@@ -775,6 +869,27 @@ export interface FilePropertiesProps {
  * the read through the same `WriteScope` as the write, so a `workspace/` file
  * (AD-113) or one keeper cannot edit rejects — and the panel simply is not
  * there, rather than being there and refusing on the first keystroke.
+ *
+ * # A title change renames the file (Story 51.6, FR-295)
+ *
+ * The `rename` half of the address is `sessions_file_rename`, which writes the
+ * block, moves the file and rewrites the pointers that named it in one journaled
+ * plan. It is offered unconditionally rather than behind a "is this a sessions
+ * zone" test on this side: **the question is Rust's to answer**, and it answers
+ * it by looking the subpath up in the zone's scanned rows. A file in no session
+ * rejects with a sentence, which is the same shape every other refusal here has,
+ * and a probe written in TypeScript would be a second definition of "is this in a
+ * session" that could disagree with the first.
+ *
+ * **What happens to the panel the file was open in is `panel-strip.tsx`'s
+ * existing rule, and that is deliberate.** A panel stores an identity, resolves
+ * it on every render, and a `file` target that stops resolving *keeps its place*
+ * and renders Rust's reason — the rule written for a file renamed on another
+ * device, which is exactly what this now is when it is renamed on this one. So a
+ * retitle from here leaves the strip saying where the file used to be until it is
+ * reopened under its new name. Re-pointing the panel would mean a new verb on the
+ * panels store, and a store verb invented to smooth over one surface's write is
+ * how a store comes to have five of them.
  */
 export function FileProperties({ profileId, relativePath, onWritten }: FilePropertiesProps) {
   const [block, setBlock] = useState<string | null>(null);
@@ -817,6 +932,19 @@ export function FileProperties({ profileId, relativePath, onWritten }: FilePrope
           syncWriteFrontmatter(profileId, relativePath, block, nextBlock).then(
             (landed) => {
               setBlock(landed);
+              onWritten();
+            },
+            (error: unknown) => {
+              throw new Error(refusalSentence(error, FILE_WRITE_FAILED));
+            },
+          ),
+        // The block is not adopted from the answer here, unlike `write` above:
+        // this command answers with the file's new SUBPATH, and the block the
+        // panel is holding now belongs to a path this component is no longer
+        // addressed by. `onWritten` is what tells the host to look again.
+        rename: (nextBlock) =>
+          sessionsFileRename(profileId, relativePath, block, nextBlock).then(
+            () => {
               onWritten();
             },
             (error: unknown) => {

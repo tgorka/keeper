@@ -253,13 +253,13 @@ describe("sessionSpacesFoldCookie", () => {
   });
 });
 
-describe("the composition of a fold and its default", () => {
-  it("follows the setting for a space with nothing recorded", () => {
+describe("the composition of a fold, a space's own answer and the default", () => {
+  it("follows the setting for a space with nothing recorded and nothing said", () => {
     const key = spaceFoldKey(ZONE, "_spaces/tasks.md");
 
-    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key)).toBe(false);
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key, null)).toBe(false);
     setSpacesFoldedDefault(true);
-    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key)).toBe(true);
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key, null)).toBe(true);
   });
 
   /** The rule the whole story is about: a hand-made answer outranks the
@@ -271,9 +271,38 @@ describe("the composition of a fold and its default", () => {
     setSpaceFolded(shut, true);
 
     setSpacesFoldedDefault(true);
-    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), opened)).toBe(false);
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), opened, null)).toBe(false);
     setSpacesFoldedDefault(false);
-    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), shut)).toBe(true);
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), shut, null)).toBe(true);
+  });
+
+  /** Story 51.3 rows 1, 3 and 4: the space's own `keeper.folded` sits between
+   *  the hand-fold and the setting, so a file that says `false` arrives unfolded
+   *  even with the setting ON — the file beats the setting, in both directions.
+   */
+  it("rows 1, 3, 4: the space's own answer beats the setting either way", () => {
+    const key = spaceFoldKey(ZONE, "_spaces/tasks.md");
+
+    // Row 1: the file says folded, the setting is off.
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key, true)).toBe(true);
+    setSpacesFoldedDefault(true);
+    // Row 4: the file says unfolded, the setting is on.
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key, false)).toBe(false);
+    // Row 3: the file says nothing, so the setting is what is left.
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), key, null)).toBe(true);
+  });
+
+  /** Row 2: the person's own hand outranks the file, which is the layer order's
+   *  whole point — a space you shut stays shut until you open it, whatever its
+   *  definition says. */
+  it("row 2: a hand-fold beats the space's own answer", () => {
+    const opened = spaceFoldKey(ZONE, "_spaces/tasks.md");
+    const shut = spaceFoldKey(ZONE, "_spaces/refs.md");
+    setSpaceFolded(opened, false);
+    setSpaceFolded(shut, true);
+
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), opened, true)).toBe(false);
+    expect(isSpaceFolded(sessionSpacesFoldStore.getState(), shut, false)).toBe(true);
   });
 
   it("records a fold in the document and reads it back", () => {
@@ -308,10 +337,10 @@ describe("hydrateSessionSpacesFold", () => {
     );
 
     const state = sessionSpacesFoldStore.getState();
-    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/tasks.md"))).toBe(true);
-    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/refs.md"))).toBe(false);
-    // Nothing recorded, so the setting decides.
-    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/log.md"))).toBe(true);
+    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/tasks.md"), null)).toBe(true);
+    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/refs.md"), null)).toBe(false);
+    // Nothing recorded and nothing said, so the setting decides.
+    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/log.md"), null)).toBe(true);
   });
 
   /** Matrix row 7, end to end: a jar somebody edited into nonsense costs the
@@ -321,7 +350,7 @@ describe("hydrateSessionSpacesFold", () => {
 
     const state = sessionSpacesFoldStore.getState();
     expect(state.recorded.size).toBe(0);
-    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/tasks.md"))).toBe(true);
+    expect(isSpaceFolded(state, spaceFoldKey(ZONE, "_spaces/tasks.md"), null)).toBe(true);
   });
 
   /**

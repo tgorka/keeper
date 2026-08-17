@@ -348,6 +348,13 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
   // reads a field rather than probing the disk for which file exists.
   const recordName = detail?.shape === "flat" ? "about.md" : "README.md";
 
+  // And the label naming it, once. The spaces section offers the same verb where
+  // a create is refused because the record already exists (Story 51.7, FR-299),
+  // and two places composing "which file is the record called" is how the header
+  // and the section come to name different files for one contract.
+  const recordLabel =
+    detail?.shape === "flat" ? SESSION_DETAIL_OPEN_ABOUT_LABEL : SESSION_DETAIL_OPEN_README_LABEL;
+
   const openRecord = useCallback(() => {
     if (detail === null) {
       return;
@@ -388,9 +395,7 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               </Badge>
               <Button type="button" variant="outline" size="sm" onClick={openRecord}>
                 <Pencil aria-hidden className="size-3.5" />
-                {detail.shape === "flat"
-                  ? SESSION_DETAIL_OPEN_ABOUT_LABEL
-                  : SESSION_DETAIL_OPEN_README_LABEL}
+                {recordLabel}
               </Button>
             </div>
             {detail.summary !== "" && (
@@ -510,6 +515,13 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
             // does not travel: one reader of `shape::kind_dir`, in Rust.
             spaces={spaces}
             selections={spaceFiles}
+            // The verb a space offers where its create is refused because the
+            // record already exists (Story 51.7, FR-299). WHICH space that is is
+            // Rust's answer, per space, on `openRecord`; the label and the target
+            // are the header's own, because the record is one fixed name at a
+            // known place and this surface already opens it from up there.
+            recordLabel={recordLabel}
+            onOpenRecord={openRecord}
             // The same flag the Files heading above is handed — both surfaces
             // offer a create that posts an empty title, and one filename is
             // what they would collide on.
@@ -520,27 +532,42 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
 
           {/* The board (FR-263) — after the spaces, because a space is the
               question "which files are tasks?" and the board is what those files
-              say about themselves. Rendered for a flat session only: a
-              folder-shaped one has no pool to tag, so its board would be four
-              empty columns saying nothing true. */}
-          {detail.shape === "flat" && (
-            <SessionBoard
-              rootId={rootId}
-              sessionId={sessionId}
-              tasks={detail.tasks}
-              // A card knows its session-relative path; the path that OPENS it
-              // is the `subpath` Rust composed for the same file in the tree
-              // (AD-65). Looked up rather than joined, so there is still exactly
-              // one place in the app that knows how a zone path is built.
-              onOpen={(relPath) => {
-                const entry = tree?.entries.find((candidate) => candidate.relPath === relPath);
-                if (entry !== undefined) {
-                  openFile(entry);
-                }
-              }}
-              onChanged={() => setReload((n) => n + 1)}
-            />
-          )}
+              say about themselves.
+
+              **Both shapes** (Story 51.7, FR-299). This used to render for a flat
+              session only, and the reason was true when it was written: a
+              folder-shaped session had no pool to tag, so its board would have
+              been four empty columns saying nothing true. Story 51.1 put that
+              shape's root markdown into the pool, so a `task`-tagged file there
+              is a card — and the shape was standing in for the real question,
+              which is whether there is anything tagged.
+
+              That question is `detail.tasks`, and there is deliberately no second
+              predicate beside it: a session with nothing to tag has no cards, and
+              the board answers an empty list with the sentence that says what a
+              task is rather than with columns (`task-board.tsx`). A "does it have
+              a pool" flag could only ever disagree with the cards by being wrong.
+
+              Drag-and-drop and the per-card dropdown are untouched: the drop
+              writes `status:` and `order:` through `sessions_task_move`, which
+              re-reads the column it is dropping into and knows nothing of the
+              shape. */}
+          <SessionBoard
+            rootId={rootId}
+            sessionId={sessionId}
+            tasks={detail.tasks}
+            // A card knows its session-relative path; the path that OPENS it
+            // is the `subpath` Rust composed for the same file in the tree
+            // (AD-65). Looked up rather than joined, so there is still exactly
+            // one place in the app that knows how a zone path is built.
+            onOpen={(relPath) => {
+              const entry = tree?.entries.find((candidate) => candidate.relPath === relPath);
+              if (entry !== undefined) {
+                openFile(entry);
+              }
+            }}
+            onChanged={() => setReload((n) => n + 1)}
+          />
 
           {/* What the session points at (FR-255) — after the files, because it
               is the same question asked the other way: what it holds, then what

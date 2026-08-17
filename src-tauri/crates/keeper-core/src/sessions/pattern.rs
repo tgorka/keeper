@@ -81,7 +81,8 @@ impl SkipReason {
     }
 }
 
-/// What applying a pattern does, whole: what lands, and what stays behind.
+/// What applying a pattern does, whole: what lands, what stays behind, and
+/// what the template offers the zone rather than the session.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PatternOutcome {
     /// `(source-relative path, is_dir)` the plan creates or copies, sorted so
@@ -93,6 +94,15 @@ pub struct PatternOutcome {
     /// empty is in `copies`; only its *contents* are skipped, and each is
     /// named individually so the preview can count them.
     pub skips: Vec<(String, SkipReason)>,
+    /// A **template's** own `_spaces/` entries, source-relative and in path
+    /// order (FR-291).
+    ///
+    /// Neither a copy nor a skip, because it is neither: these files do not
+    /// travel into the new session at all, and they are not left behind
+    /// either — they are candidates the create offers the **zone's**
+    /// `_spaces/`. [`crate::sessions::spaces::plan_template_spaces`] decides
+    /// which of them the zone actually gains.
+    pub seeds: Vec<String>,
 }
 
 /// The four directories a **folder-shaped** session has, whether or not the
@@ -124,6 +134,69 @@ pub fn standard_dirs(shape: super::shape::Shape) -> &'static [&'static str] {
 /// with a true sentence.
 pub fn is_placeholder(rel: &str) -> bool {
     rel.rsplit('/').next() == Some(".gitkeep")
+}
+
+/// Whether a pattern file's bytes are **expanded** on the way into the new
+/// session rather than copied byte for byte (FR-292).
+///
+/// Markdown, and nothing else. The vocabulary
+/// ([`crate::notes::templates::expand_body`]) is a *document* grammar: it was
+/// written for prose somebody reads, and its unknown-token rule only makes
+/// sense where braces are text. A `.png` whose bytes happen to contain
+/// `{{title}}` is not a document with a placeholder in it — it is a PNG, and
+/// rewriting those bytes would corrupt it. An extension test rather than a
+/// content sniff for the same reason the pool uses one: what a file *is* in
+/// this zone is what it is called, and a sniff would make the answer depend on
+/// where in the file the first brace happened to fall.
+pub fn expands(rel: &str) -> bool {
+    rel.ends_with(".md")
+}
+
+/// The bytes each of a pattern's files arrives in the new session with — only
+/// for the ones expansion actually changed (FR-292, FR-293).
+///
+/// `sources` is `(source-relative path, the file as it stands)` for whatever
+/// the caller was able to read; the shell reads, this decides (AD-108). The
+/// answer feeds [`super::plan::compile_create_shaped`]'s `expanded`, so a path
+/// absent from it copies byte for byte exactly as it always did.
+///
+/// **The vocabulary is [`crate::notes::templates::expand_body`]'s and there is
+/// no second one.** A template authored in Obsidian must keep working, and a
+/// session template and a note template are both markdown somebody wrote — two
+/// grammars would mean `{{date:YYYY}}` meaning one thing in a vault and another
+/// in a zone, with neither obviously wrong. That module's unknown-token rule is
+/// also what makes expanding a whole template safe: `{{TODO}}` and `{n}` come
+/// back byte for byte, so a document full of literal braces survives being
+/// copied.
+///
+/// **Unchanged means untouched**, and that is not only an optimisation. The
+/// plan carries the resolved bytes, so returning every markdown file would put
+/// a second copy of the whole skeleton into the journal row for a create that
+/// expanded nothing. It also keeps the preview honest: what compiles to a
+/// `WriteFile` instead of a `CopyFile` is exactly what a placeholder changed.
+///
+/// **The record is not here and cannot be.** `README.md` and `about.md` are
+/// composed from the pattern's headings by [`super::plan::skeleton_from`] and
+/// arrive as `stamped` writes; `fate` already refuses to let them travel as
+/// copies, so there is no path by which one could be expanded twice.
+#[must_use]
+pub fn expansions(
+    sources: &[(String, String)],
+    ctx: &crate::notes::templates::TemplateCtx,
+) -> Vec<(String, String)> {
+    sources
+        .iter()
+        .filter(|(rel, _)| expands(rel))
+        .filter_map(|(rel, text)| {
+            // The caret offset is dropped rather than threaded anywhere: a
+            // `{{cursor}}` asks an editor to put the caret somewhere, and a
+            // create opens no editor. Removing the token — which is what
+            // `expand_body` does — is the honest reading; leaving it in the
+            // file would put keeper's own syntax into a session's prose.
+            let (rendered, _) = crate::notes::templates::expand_body(text, ctx);
+            (rendered != *text).then(|| (rel.clone(), rendered))
+        })
+        .collect()
 }
 
 /// What a pattern id names, resolved once (FR-266).
@@ -259,6 +332,17 @@ pub fn without_dirs(source: &[(String, bool)], dirs: &[String]) -> Vec<(String, 
 /// to explain. A template create is therefore *nearly* verbatim rather than
 /// exactly so: it adds those directories, and never a file.
 ///
+/// **A template's `_spaces/` never travels.** A space is the zone's saved
+/// query and AD-121 refused a per-session copy of one; a `_spaces/` landing
+/// inside `active/<session>/` would be exactly that refusal broken, plus a
+/// directory in a shape whose point is that it has none. So those entries come
+/// back in [`PatternOutcome::seeds`] instead — offered to the zone, which is
+/// the one place a space means anything — and only from a template. A
+/// continuation's source is a session, and a session that somehow holds a
+/// `_spaces/` is holding a mistake; seeding the zone from it would let one
+/// stray directory rewrite the queries every session in the zone is read
+/// through.
+///
 /// **Session** (FR-239): `prompts/**` (reusable by design) and `refs/**`
 /// (pointers worth keeping) travel; artifacts, workspace, the record and any
 /// loose file stay behind, each named with its reason.
@@ -320,6 +404,17 @@ pub fn apply_with_kinds(
         if out.copies.iter().any(|(existing, _)| existing == rel) {
             continue;
         }
+        // Diverted before `fate` is asked, because `fate` answers "does this
+        // travel, and if not why" and the honest answer here is neither: the
+        // file goes somewhere else entirely. A `.gitkeep` holding an empty
+        // `_spaces/` open is a placeholder rather than a definition, by
+        // [`is_placeholder`]'s own rule.
+        if in_dir(rel, super::spaces::SPACES_DIR) {
+            if !is_dir && kind == PatternKind::Template && !is_placeholder(rel) {
+                out.seeds.push(rel.clone());
+            }
+            continue;
+        }
         match fate(kind, shape, rel, &kind_of) {
             None => out.copies.push((rel.clone(), *is_dir)),
             Some(reason) => {
@@ -333,6 +428,7 @@ pub fn apply_with_kinds(
     }
     out.copies.sort_by(|(a, _), (b, _)| a.cmp(b));
     out.skips.sort_by(|(a, _), (b, _)| a.cmp(b));
+    out.seeds.sort();
     out
 }
 
@@ -802,5 +898,132 @@ mod tests {
             .filter(|(rel, is_dir)| !*is_dir && !is_placeholder(rel))
             .count();
         assert_eq!(shown, 2, "01-scope.md and pointer.md, and nothing else");
+    }
+
+    fn ctx() -> crate::notes::templates::TemplateCtx {
+        crate::notes::templates::TemplateCtx {
+            title: "Ship it".to_owned(),
+            id: "01J5BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            now_local: "2026-08-17T14:35:09+02:00".to_owned(),
+        }
+    }
+
+    /// Row 1's precondition: a template's `_spaces/` is neither copied into the
+    /// session nor listed as left behind — it comes back as a seed candidate,
+    /// which is a third answer because it is a third thing.
+    #[test]
+    fn a_templates_spaces_are_seed_candidates_and_never_session_files() {
+        let out = apply(
+            PatternKind::Template,
+            &files(&[
+                ("AGENTS.md", false),
+                ("_spaces", true),
+                ("_spaces/tasks.md", false),
+                ("_spaces/log.md", false),
+                ("_spaces/.gitkeep", false),
+                ("notes.md", false),
+            ]),
+        );
+        assert_eq!(
+            out.seeds,
+            vec!["_spaces/log.md".to_owned(), "_spaces/tasks.md".to_owned()],
+            "in path order, and the placeholder holding the directory open is not a definition"
+        );
+        assert!(
+            !out.copies.iter().any(|(rel, _)| rel.starts_with("_spaces")),
+            "a per-session `_spaces/` is exactly what AD-121 refused"
+        );
+        assert!(
+            !out.skips.iter().any(|(rel, _)| rel.starts_with("_spaces")),
+            "not left behind either — the preview would be saying something false"
+        );
+    }
+
+    /// A continuation's source is a session, and a session holding a `_spaces/`
+    /// is holding a mistake. Seeding the zone from one would let a stray
+    /// directory rewrite the queries every session in the zone is read through.
+    #[test]
+    fn a_session_pattern_offers_no_spaces() {
+        let out = apply(
+            PatternKind::Session,
+            &files(&[
+                ("README.md", false),
+                ("_spaces", true),
+                ("_spaces/tasks.md", false),
+            ]),
+        );
+        assert!(out.seeds.is_empty(), "only a template offers spaces");
+        assert!(!out.copies.iter().any(|(rel, _)| rel.starts_with("_spaces")));
+    }
+
+    /// Row 8. Expansion is a document grammar; a `.png` carrying the bytes
+    /// `{{title}}` is a PNG, and rewriting it would corrupt it.
+    #[test]
+    fn only_markdown_expands() {
+        assert!(expands("notes.md"));
+        assert!(expands("refs/inputs.md"));
+        assert!(!expands("logo.png"));
+        assert!(!expands("data.json"));
+        let out = expansions(
+            &[
+                ("logo.png".to_owned(), "{{title}}".to_owned()),
+                ("notes.md".to_owned(), "{{title}}".to_owned()),
+            ],
+            &ctx(),
+        );
+        assert_eq!(out, vec![("notes.md".to_owned(), "Ship it".to_owned())]);
+    }
+
+    /// Rows 4, 5, 6 and 7 in one file, because the point is that they are one
+    /// vocabulary: the create's own title, its own ULID, its own date and
+    /// stamp, and an unknown token left exactly as typed.
+    #[test]
+    fn the_notes_vocabulary_is_the_one_a_template_speaks() {
+        let source = "# {{title}}\n\nid {{id}}\non {{date}} at {{time:HHmm}}\nyear {{date:YYYY}}\n\
+            \nkeep {{unknown}} and {n} and {{TODO}}\n";
+        let out = expansions(&[("notes.md".to_owned(), source.to_owned())], &ctx());
+        let (_, rendered) = out.first().expect("markdown with placeholders expands");
+        assert_eq!(
+            rendered,
+            "# Ship it\n\nid 01J5BBBBBBBBBBBBBBBBBBBBBB\non 2026-08-17 at 1435\nyear 2026\n\
+            \nkeep {{unknown}} and {n} and {{TODO}}\n"
+        );
+    }
+
+    /// A template of ordinary prose still compiles to the copies it always did.
+    /// The journal row carries the bytes of everything expansion touched, so
+    /// "touched nothing" has to mean "handed nothing over".
+    #[test]
+    fn a_file_without_placeholders_is_not_rewritten() {
+        let out = expansions(
+            &[(
+                "notes.md".to_owned(),
+                "# Ordinary\n\nA sentence with {braces} in it.\n".to_owned(),
+            )],
+            &ctx(),
+        );
+        assert!(
+            out.is_empty(),
+            "unchanged means untouched, and untouched means copied"
+        );
+    }
+
+    /// Row 10, as far as this side can prove it: the answer is bytes, so a
+    /// replay of the plan cannot ask the clock a second question. Expanding
+    /// twice against the same context is the same string; the only clock read
+    /// is the one the caller already made.
+    #[test]
+    fn expansion_is_bytes_and_therefore_replayable() {
+        let source = "{{date}} {{time}} {{id}}\n".to_owned();
+        let first = expansions(&[("log.md".to_owned(), source.clone())], &ctx());
+        let second = expansions(&[("log.md".to_owned(), source)], &ctx());
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![(
+                "log.md".to_owned(),
+                "2026-08-17 14:35 01J5BBBBBBBBBBBBBBBBBBBBBB\n".to_owned()
+            )]
+        );
     }
 }
