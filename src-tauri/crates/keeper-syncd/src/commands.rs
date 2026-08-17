@@ -238,6 +238,14 @@ pub enum Command {
     Verify {
         /// Profile id or name. Omit for all profiles.
         profile: Option<String>,
+        /// Also ask the server whether it holds every object the pointers name.
+        ///
+        /// The half that finds permanent loss: a pointer whose object never
+        /// reached the server is a valid blob, a clean status and content only
+        /// one machine still has. Costs one batch round trip per few hundred
+        /// objects and transfers nothing.
+        #[arg(long)]
+        remote: bool,
     },
     /// Check every prerequisite and report what is broken.
     Doctor,
@@ -286,6 +294,15 @@ pub enum LfsDirection {
     Smudge {
         #[arg(value_name = "PATH")]
         path: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+    },
+    /// Serve git's long-running filter protocol until the pipe closes.
+    ///
+    /// The shape `filter.lfs.process` is registered as, and the one git
+    /// actually uses when it is set — see `keeper_sync::lfs::filter` for why
+    /// registering only clean/smudge left the filter unreachable.
+    FilterProcess {
         #[arg(long, value_name = "DIR")]
         repo: PathBuf,
     },
@@ -489,9 +506,9 @@ pub async fn run(
             let engine = engine_for(&platform, config)?;
             cmd_set_enabled(&printer, &engine, &profile, true)
         }
-        Command::Verify { profile } => {
+        Command::Verify { profile, remote } => {
             let engine = engine_for(&platform, config)?;
-            cmd_verify(&printer, &engine, profile.as_deref()).await
+            cmd_verify(&printer, &engine, profile.as_deref(), remote).await
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1008,12 +1025,14 @@ async fn cmd_verify(
     printer: &Printer,
     engine: &Engine,
     wanted: Option<&str>,
+    remote: bool,
 ) -> std::result::Result<(), CliError> {
     let profiles = engine.list_profiles()?;
     let selected: Vec<SyncProfile> = select(&profiles, wanted)?.into_iter().cloned().collect();
 
     let mut reports = Vec::with_capacity(selected.len());
     let mut bad_total = 0usize;
+    let mut missing_total = 0usize;
     for profile in &selected {
         let report = engine.verify(&profile.id).await?;
         bad_total += report.bad.len();
@@ -1026,7 +1045,7 @@ async fn cmd_verify(
         for (path, reason) in &report.bad {
             printer.line(format!("  {path}: {reason}"));
         }
-        reports.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "profileId": profile.id,
             "profile": profile.name,
             "checked": report.checked,
@@ -1034,14 +1053,46 @@ async fn cmd_verify(
                 .iter()
                 .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
                 .collect::<Vec<_>>(),
-        }));
+        });
+
+        if remote {
+            let audit = engine.audit_remote_objects(&profile.id).await?;
+            missing_total += audit.missing.len();
+            printer.line(format!(
+                "{}: {} pointer(s) on the server, {} missing ({:.2} GB)",
+                profile.name,
+                audit.checked,
+                audit.missing.len(),
+                audit.missing_bytes() as f64 / 1_073_741_824.0
+            ));
+            for object in &audit.missing {
+                printer.line(format!(
+                    "  {} ({} bytes): {}",
+                    object.path, object.size, object.reason
+                ));
+            }
+            entry["remote"] = serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null);
+        }
+        reports.push(entry);
     }
-    printer.json(&serde_json::json!({ "verified": reports, "bad": bad_total }));
+    printer.json(&serde_json::json!({
+        "verified": reports,
+        "bad": bad_total,
+        "missingOnRemote": missing_total,
+    }));
 
     if bad_total > 0 {
         // Corrupt content is a real failure, and a cron wrapper must see it.
         return Err(CliError::Operational(format!(
             "{bad_total} object(s) failed verification"
+        )));
+    }
+    if missing_total > 0 {
+        // Louder than a warning on purpose: content that exists on exactly one
+        // machine is one disk failure from gone, and the only thing that can
+        // still save it is somebody noticing today.
+        return Err(CliError::Operational(format!(
+            "{missing_total} pointer(s) name content the server does not have"
         )));
     }
     Ok(())
@@ -1649,12 +1700,16 @@ fn cmd_update(printer: &Printer, check_only: bool) -> Result<(), CliError> {
 fn cmd_lfs_filter(direction: LfsDirection) -> Result<(), CliError> {
     use keeper_sync::lfs::filter;
 
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
     let (repo, which) = match &direction {
         LfsDirection::Clean { repo, .. } => (repo.clone(), filter::Direction::Clean),
         LfsDirection::Smudge { repo, .. } => (repo.clone(), filter::Direction::Smudge),
+        LfsDirection::FilterProcess { repo } => {
+            filter::run_process(repo, &mut stdin.lock(), &mut stdout.lock())?;
+            return Ok(());
+        }
     };
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
     filter::run(&repo, which, &mut stdin.lock(), &mut stdout.lock())?;
     Ok(())
 }

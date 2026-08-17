@@ -100,12 +100,28 @@ fn served_as_lfs_filter() -> bool {
 
     // Skipping argv[0]: the parse wants the verb first, and argv[0] is the path
     // git invoked us by.
-    let Some((direction, repo)) = filter::parse_args(std::env::args().skip(1)) else {
+    let Some(invocation) = filter::parse_args(std::env::args().skip(1)) else {
         return false;
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    if let Err(err) = filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock()) {
+    let served = match invocation {
+        filter::Invocation::Single { direction, repo } => {
+            filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock())
+        }
+        filter::Invocation::Process { repo } => {
+            filter::run_process(&repo, &mut stdin.lock(), &mut stdout.lock())
+        }
+        // Claimed but not implementable by this build — an older binary reached
+        // by a config a newer one wrote. Exiting non-zero and silent on stdout
+        // is the honest answer; opening the GUI here is what git records as a
+        // filter that succeeded and produced nothing (DW-140).
+        filter::Invocation::Unsupported => {
+            eprintln!("keeper: this build cannot serve that lfs filter invocation");
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = served {
         // stderr, never stdout. git shows this in `GIT_TRACE` and on a required
         // filter's failure, and it is the only channel that is not content.
         eprintln!("keeper: lfs filter failed: {err}");

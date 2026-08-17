@@ -150,8 +150,15 @@ fn build_lfs_fixture(root: &Path) {
     // required. Under a test binary the program is the libtest harness, which
     // answers a filter request with its own argument-parser error — and
     // `required = false` is exactly what makes that recoverable.
+    //
+    // `false` for the long-running driver, which is what the engine itself
+    // passes here: `lfs::filter::serves_process` probes the program and a
+    // libtest harness fails that handshake, so no `process` key is written. The
+    // fixture depends on it — a `process` driver naming a binary that cannot
+    // serve it fails `status` outright rather than recoverably (DW-140).
     let exe = std::env::current_exe().expect("locate the current test executable");
-    git::repo::enforce_local_config_with_filter(&repo, Some(&exe)).expect("register the filter");
+    git::repo::enforce_local_config_with_filter(&repo, Some(&exe), false)
+        .expect("register the filter");
 
     let digest = {
         use sha2::{Digest, Sha256};

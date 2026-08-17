@@ -598,7 +598,7 @@ const IDENTITY_EMAIL: &str = "keeper@keeper.invalid";
 /// hard-failure this prevents. Idempotent: an existing value is overwritten
 /// rather than appended, so repeated calls do not grow the file.
 pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
-    enforce_local_config_with_filter(repo, None)
+    enforce_local_config_with_filter(repo, None, false)
 }
 
 /// As [`enforce_local_config`], additionally registering keeper as the `lfs`
@@ -610,20 +610,49 @@ pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
 /// cache misses — it reports every LFS-tracked file as modified. keeper itself
 /// tolerates that, but nobody running `git status` by hand should have to.
 ///
-/// Single-invocation `clean`/`smudge` rather than the long-running
-/// `filter.lfs.process` protocol: both git and gitoxide support it, it is far
-/// less machinery, and the per-call cost only lands when git's stat cache
-/// already missed. Any `process` key already in this section is **removed**, for
-/// the reason [`drop_foreign_lfs_driver`] spells out: `git lfs install --local`
-/// writes one here, it outranks `clean`/`smudge` in git and replaces them
-/// outright in gitoxide, and keeper owns this section.
+/// All three keys are written, and `filter.lfs.process` is the load-bearing one
+/// (DW-140). git prefers a `process` driver over a `clean`/`smudge` pair
+/// *whatever scope each was defined in*, so the repository-local pair this
+/// function used to write alone was silently outranked by the
+/// `filter.lfs.process` that `git lfs install` leaves in `~/.gitconfig` — on
+/// every machine that has ever had the real git-lfs. The pair is still written
+/// because it costs one line and is what a `git` old enough to lack process
+/// filters would use; the local `process` key is what actually takes effect.
 ///
-/// `required` is deliberately left false. A worktree whose keeper binary has
-/// moved must still be checkout-able — it would just get pointers, which is
-/// recoverable, where a required filter would hard-fail every git command.
+/// # Why this is not what [`drop_foreign_lfs_driver`] already does (DW-206)
+///
+/// The two halves look like the same fix and are not, because they defend
+/// different gits. `drop_foreign_lfs_driver` performs surgery on the merged
+/// snapshot **this `Repository` handle holds** — its own doc says nothing on
+/// disk is touched — so it settles what *gitoxide* consults, in this process.
+/// keeper also shells out: `merge`, `push`, `checkout` and `sparse-checkout`
+/// are the git binary (see the module docs), and that binary re-reads
+/// `~/.gitconfig` for itself. An in-memory removal cannot reach it.
+///
+/// Measured, on the config state DW-206 leaves behind — local `clean`/`smudge`,
+/// no local `process`, global `filter.lfs.process = git-lfs filter-process`:
+/// `git add` staged a **git-lfs** pointer, not the output of keeper's `clean`.
+/// The global driver still won. Writing a repository-scoped `process` key is
+/// what out-ranks it, because git *does* merge keys across scopes with the
+/// narrowest winning — which is the same rule, read from the other side, that
+/// let the global one beat a local `clean`/`smudge` in the first place.
+///
+/// A foreign `process` — what `git lfs install --local` leaves here — is still
+/// stripped, for DW-206's reason: keeper owns this section. The strip runs
+/// *before* the write, so it removes theirs and never ours.
+///
+/// `required` is deliberately left false, and the reasoning changed rather than
+/// survived: it is not that a failure is harmless, it is that
+/// [`crate::lfs::filter::run_process`] no longer *has* the failure mode that
+/// made `false` dangerous. A per-path refusal is reported as `status=error` and
+/// the process stays up, so git falls back for one path instead of emptying the
+/// rest of the checkout. What `false` still buys is the original case: a
+/// worktree whose keeper binary moved must remain checkout-able, as pointers,
+/// rather than hard-failing every git command in the folder.
 pub fn enforce_local_config_with_filter(
     repo: &gix::Repository,
     filter_program: Option<&Path>,
+    serves_process: bool,
 ) -> Result<()> {
     let path = repo.git_dir().join("config");
     let mut config = read_config(&path, gix::config::Source::Local)?;
@@ -664,18 +693,14 @@ pub fn enforce_local_config_with_filter(
             "\"{quoted}\" lfs smudge --repo \"{}\" %f",
             workdir.display()
         );
-        config
-            .set_raw_value("filter.lfs.clean", clean.as_str())
-            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.clean: {err}")))?;
-        config
-            .set_raw_value("filter.lfs.smudge", smudge.as_str())
-            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.smudge: {err}")))?;
-        config
-            .set_raw_value("filter.lfs.required", "false")
-            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
-        // The section exists: `set_raw_value` above created it if it had to.
-        // Several `[filter "lfs"]` sections in one file are legal, so every one
-        // of them is stripped rather than the last.
+        // Strip first, write second (DW-206 + DW-140). Every `process` key here
+        // is somebody else's — `git lfs install --local` writes one, and keeper
+        // owns this section — and clearing them before the write is what lets
+        // the write below be the only one left. Doing it the other way round
+        // would delete the key this function exists to install. Several
+        // `[filter "lfs"]` sections in one file are legal, so every one of them
+        // is stripped rather than the last; a file with no such section yet
+        // yields no ids and the loop does nothing.
         let ids: Vec<_> = config
             .sections_and_ids()
             .filter(|(section, _)| {
@@ -692,6 +717,33 @@ pub fn enforce_local_config_with_filter(
                 while section.remove("process").is_some() {}
             }
         }
+
+        config
+            .set_raw_value("filter.lfs.clean", clean.as_str())
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.clean: {err}")))?;
+        config
+            .set_raw_value("filter.lfs.smudge", smudge.as_str())
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.smudge: {err}")))?;
+        // Only when the program has been *asked* and answered — see
+        // [`crate::lfs::filter::serves_process`]. A `process` key naming a binary
+        // that cannot serve it is worse than none at all: gitoxide's launch
+        // failure is hard whatever `required` says, so the folder stops syncing
+        // rather than degrading to pointers.
+        if serves_process {
+            // No `%f`: the long-running protocol names each path in-band.
+            let process = format!(
+                "\"{quoted}\" lfs filter-process --repo \"{}\"",
+                workdir.display()
+            );
+            config
+                .set_raw_value("filter.lfs.process", process.as_str())
+                .map_err(|err| {
+                    SyncError::Git(format!("could not set filter.lfs.process: {err}"))
+                })?;
+        }
+        config
+            .set_raw_value("filter.lfs.required", "false")
+            .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
     }
 
     write_config_atomically(&config, &path)?;
@@ -2119,6 +2171,55 @@ mod tests {
         );
     }
 
+    /// The key that decides whether keeper's filter is ever reached (DW-140).
+    ///
+    /// git prefers `filter.<drv>.process` over a `clean`/`smudge` pair
+    /// *whatever scope each was defined in*, so a global one — which
+    /// `git lfs install` writes into `~/.gitconfig` on every machine that has
+    /// ever had the real client — outranks the repository-local pair keeper
+    /// used to register alone. Writing a local `process` key is the only way to
+    /// win that comparison, and it is the whole reason this registration
+    /// exists.
+    #[test]
+    fn the_filter_registration_claims_the_key_that_actually_takes_effect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+
+        enforce_local_config_with_filter(
+            &repo,
+            Some(Path::new("/Applications/keeper.app/keeper")),
+            true,
+        )
+        .expect("enforce");
+
+        // Read back through gix rather than off the raw file: the on-disk form
+        // escapes the quotes around the program path, and asserting on that
+        // spelling would test the encoder instead of the registration.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let snapshot = reopened.config_snapshot();
+        let process = snapshot
+            .string("filter.lfs.process")
+            .expect("the long-running form must be registered, not only clean/smudge")
+            .to_string();
+        assert_eq!(
+            process,
+            "\"/Applications/keeper.app/keeper\" lfs filter-process --repo \"".to_owned()
+                + &dir.path().display().to_string()
+                + "\""
+        );
+        // No `%f`: the protocol names each path in-band, and a stray
+        // placeholder would arrive as an argument the filter never asked for.
+        assert!(!process.contains("%f"), "{process}");
+        // The single-shot pair stays: it costs one line and is what a git old
+        // enough to lack process filters would use.
+        assert!(snapshot
+            .string("filter.lfs.clean")
+            .is_some_and(|value| value.to_string().contains("lfs clean")));
+        assert!(snapshot
+            .string("filter.lfs.smudge")
+            .is_some_and(|value| value.to_string().contains("lfs smudge")));
+    }
+
     #[test]
     fn enforce_local_config_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2143,26 +2244,45 @@ mod tests {
         std::fs::write(&config, text).expect("write config");
     }
 
+    /// Somebody else's long-running driver is replaced by keeper's own, not
+    /// merely deleted (DW-206 refined by DW-140).
+    ///
+    /// The original of this test asserted no `process` key survived at all,
+    /// which was right while keeper had none to offer: gitoxide takes `process`
+    /// in preference to the pair below it and fails hard when it cannot be
+    /// launched, whatever `required` says, so a driver keeper could not answer
+    /// made the two keys it had just written unreachable. Now keeper *can*
+    /// answer one, and leaving the slot empty is what loses: git prefers a
+    /// `process` driver from any scope, so an empty local slot hands every
+    /// filtered operation of the git binary back to whatever `~/.gitconfig`
+    /// names. Both halves are asserted below — theirs is gone, ours is there.
     #[test]
-    fn registering_the_filter_removes_a_process_driver_from_the_same_section() {
+    fn registering_the_filter_replaces_a_foreign_process_driver_with_keepers_own() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = gix::init(dir.path()).expect("init");
         with_local_lfs_process(dir.path());
 
-        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")))
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
             .expect("enforce");
 
-        // gitoxide takes `process` in preference to the pair below it and fails
-        // hard when it cannot be launched, whatever `required` says — so leaving
-        // the key in the section keeper owns would make the two keys it just
-        // wrote unreachable.
         let reopened = open(dir.path(), true).expect("reopen");
         let config = reopened.config_snapshot();
-        assert_eq!(
-            config.string("filter.lfs.process"),
-            None,
-            "keeper's own section may not name a long-running driver"
+        let process = config
+            .string("filter.lfs.process")
+            .expect("keeper's own driver must occupy the slot")
+            .to_string();
+        assert!(
+            process.contains("/opt/keeper") && process.contains("lfs filter-process"),
+            "the surviving driver has to be keeper's: {process}"
         );
+        assert!(
+            !process.contains("git-lfs"),
+            "no trace of the driver that was here: {process}"
+        );
+        // Exactly one, so the strip really ran rather than the write landing
+        // beside a survivor in another section.
+        let text = std::fs::read_to_string(dir.path().join(".git/config")).expect("read config");
+        assert_eq!(text.matches("process = ").count(), 1, "{text}");
         assert!(
             config
                 .string("filter.lfs.clean")
@@ -2176,7 +2296,13 @@ mod tests {
     fn a_foreign_lfs_driver_is_dropped_and_the_local_one_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = gix::init(dir.path()).expect("init");
-        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")))
+        // Registered without a long-running driver of keeper's own, which is
+        // what this test needs to arrange: the foreign one has to be the only
+        // `process` in the merged config, or it is not the one gix would launch
+        // and the fixture is not the situation being tested. The case where
+        // keeper *has* registered one is
+        // `keepers_own_process_driver_survives_a_foreign_section`.
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), false)
             .expect("enforce");
         let mut repo = open(dir.path(), true).expect("reopen");
 
@@ -2217,6 +2343,56 @@ mod tests {
                 .string("filter.lfs.clean")
                 .is_some_and(|value| value.to_string().contains("lfs clean")),
             "the repository's own registration is what must remain"
+        );
+    }
+
+    /// The two halves composed: keeper's own long-running driver must survive
+    /// the surgery that removes everybody else's (DW-206 + DW-140).
+    ///
+    /// `drop_foreign_lfs_driver` filters on **scope**, not on content, so this
+    /// is really asking whether the key `enforce_local_config_with_filter`
+    /// writes lands in a repository scope. If it ever did not, the drop would
+    /// take keeper's own driver with it and every filtered operation would fall
+    /// back to whatever `~/.gitconfig` names — the exact silence DW-140 is
+    /// about, reintroduced by the fix for DW-206.
+    #[test]
+    fn keepers_own_process_driver_survives_a_foreign_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
+            .expect("enforce");
+        let mut repo = open(dir.path(), true).expect("reopen");
+
+        let foreign = gix::config::File::from_bytes_owned(
+            &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
+            gix::config::file::Metadata::from(gix::config::Source::User),
+            Default::default(),
+        )
+        .expect("parse the foreign config");
+        {
+            let mut snapshot = repo.config_snapshot_mut();
+            let mut merged = foreign;
+            merged
+                .append(snapshot.clone())
+                .expect("merge the repository's own scopes after it");
+            *snapshot = merged;
+            snapshot.commit().expect("commit the doctored config");
+        }
+
+        drop_foreign_lfs_driver(&mut repo).expect("drop");
+
+        let config = repo.config_snapshot();
+        let surviving = config
+            .string("filter.lfs.process")
+            .map(|value| value.to_string())
+            .expect("keeper's own driver must outlive the drop");
+        assert!(
+            surviving.contains("/opt/keeper") && surviving.contains("lfs filter-process"),
+            "what survived has to be keeper's: {surviving}"
+        );
+        assert!(
+            !surviving.contains("git-lfs"),
+            "and the foreign one has to be gone: {surviving}"
         );
     }
 
