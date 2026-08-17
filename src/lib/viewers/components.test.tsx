@@ -49,6 +49,7 @@ function file(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "1.2 MB",
     openWith: null,
     writeCaveat: null,
+    writeRefusal: null,
     ...overrides,
   };
 }
@@ -149,6 +150,27 @@ describe("two surfaces asking about one file get the same answer", () => {
     vi.spyOn(console, "info").mockImplementation(() => undefined);
     expect(viewerComponentFor(target).entry).toBe(viewerComponentFor({ ...target }).entry);
     expect(viewerComponentFor(target).Component).toBe(viewerComponentFor({ ...target }).Component);
+    vi.restoreAllMocks();
+  });
+
+  it("hands both hosts the same row for a file keeper refuses to write", () => {
+    // `writeRefusal` is the LOCATION's verdict, and this layer must not read
+    // it. Provenance decides what a surface may OFFER over a file — the Save
+    // button, the format toolbar — and the registry decides only what a file
+    // IS. A build that resolved a fenced file to some read-only row would make
+    // the same `.md` two different formats depending on where it sat.
+    const fenced = file({
+      name: "notes.md",
+      relativePath: "60-sessions/active/2026-08-10-keeper/workspace/notes.md",
+      writeRefusal:
+        "60-sessions/active/2026-08-10-keeper/workspace/notes.md is inside a session's " +
+        "workspace — keeper reads it but never writes there.",
+    });
+    const ordinary = file({ name: "notes.md", relativePath: "inbox/notes.md" });
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    expect(viewerComponentFor(fenced).entry).toBe(viewerComponentFor(ordinary).entry);
+    expect(viewerComponentFor(fenced).Component).toBe(viewerComponentFor(ordinary).Component);
     vi.restoreAllMocks();
   });
 });

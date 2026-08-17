@@ -2347,6 +2347,226 @@ enum WriteOutcome {
     Plain(WriteRefusal),
 }
 
+// ---------------------------------------------------------------------------
+// A file's own properties (Story 50.4, FR-283, AD-120)
+// ---------------------------------------------------------------------------
+//
+// Here rather than in `notes_ipc` because the address decides ownership: this
+// pair is `(profile id, profile-relative subpath)`, which is what every command
+// in this file speaks and what no command in `notes_ipc` does — a note is a
+// vault id and a note id. The file these serve most often has no vault behind
+// it at all (a session's `README.md` under a sessions zone, AD-107), and
+// reaching it through `notes_ipc` would mean inventing a vault for a file that
+// is not in one.
+//
+// What they do NOT own is a second frontmatter parser or a second frontmatter
+// writer. Both are `keeper_core::file_properties`, over
+// `keeper_core::notes::frontmatter` — the same span-recording scanner the notes
+// side splices through — so the two surfaces cannot come to disagree about
+// where one file's block ends.
+
+/// The bytes a properties edit may be applied to, or Rust's own reason it may
+/// not be.
+///
+/// One helper for both commands, so the read cannot offer a panel over a file
+/// the write would then decline. A prefix is refused rather than edited: with
+/// `oversize` the string is the first megabyte and writing it back would delete
+/// the rest of the file (`text_file`'s module note).
+fn editable_source(
+    file: keeper_core::text_file::TextFileVm,
+    subpath: &str,
+) -> Result<String, IpcError> {
+    match file.text {
+        Some(text) if !file.oversize => Ok(text),
+        _ => Err(open_failure(file.detail.unwrap_or_else(|| {
+            format!("keeper cannot read {subpath} as text, so it has no properties to show")
+        }))),
+    }
+}
+
+/// Read one file's frontmatter block (Story 50.4, FR-283).
+///
+/// **Routed, not merely resolved, and with the same call the write makes.**
+/// `WriteScope::route` is what refuses a `workspace/` path (AD-113), a
+/// directory, and a subpath that leaves the profile — in `keeper-sync`, where
+/// it is asserted on Linux. Asking it here as well is what makes matrix row 8
+/// true: a file whose properties keeper would refuse to write gets no panel at
+/// all, rather than a panel that refuses on the first keystroke. Story 45.3's
+/// rule, applied to a second pair of commands.
+///
+/// It routes AND resolves because those are two questions: `route` answers
+/// "may keeper write here", and `browse::resolve` — the same call
+/// `sync_read_text` makes — answers "where is it". The route's own path is
+/// deliberately opaque (`UnmanagedPath` keeps its absolute form private so a
+/// `PathBuf` cannot reach a writer from anywhere else), so the second `stat` is
+/// the price of that, and it is one `stat` per panel open.
+///
+/// Returns the block **verbatim**, `""` for a file that has none — the same
+/// shape `NoteBodyBatch.frontmatter` and `NoteWriteVm.frontmatter` carry, so
+/// the properties panel consumes one thing from two addresses and does not
+/// fork. A view-model wrapping one string would be a `gen/` type whose only
+/// field is the string.
+///
+/// Runs on the blocking pool for `sync_read_text`'s reason: a file on a
+/// pendrive can take hundreds of milliseconds to open.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a path that
+/// escapes the root or sits in `workspace/`, a directory, a file that is gone,
+/// a file that is not editable text).
+#[tauri::command]
+pub async fn sync_read_frontmatter(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    scope
+        .route(vault, &profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
+
+    let named = subpath.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = keeper_core::text_file::open_text_file(&resolved)
+            .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))?;
+        let source = editable_source(file, &subpath)?;
+        Ok(keeper_core::file_properties::block_of(&source).to_owned())
+    })
+    .await
+    .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
+}
+
+/// Write one file's frontmatter block, and nothing else in the file
+/// (Story 50.4, FR-283, FR-233, AD-120).
+///
+/// **`expect` is the block the surface read, and the write refuses if the block
+/// on disk is no longer it.** The guard is the block rather than the file
+/// because the body written is the body just read: a person or an agent typing
+/// in the body loses nothing and is refused nothing, and the only edit this
+/// command could drop is a concurrent edit to the properties themselves. The
+/// reasoning, and why that is a better precondition than `GuardedWrite`'s
+/// length or the notes side's whole-file fingerprint, is in
+/// `keeper_core::file_properties` — with the byte tests, which this crate could
+/// not carry (AD-55, AD-56).
+///
+/// A refusal rather than a conflict copy. `notes_save` writes one because it is
+/// saving a document somebody typed; a property is a field they can set again,
+/// and a second file on disk would be a worse answer than a sentence.
+///
+/// **Nothing is stamped.** `notes_save` puts `updated` into the block on every
+/// write and `notes_create` puts an `id` in; neither happens here, because this
+/// is a file keeper did not author and the sessions contract is explicit about
+/// it (`docs/sessions.md`). What lands is exactly the block the person edited.
+///
+/// The two writers, and `WriteScope::route` picking between them, are
+/// `sync_write_entry`'s — including `touch` and `mark_dirty` for a file that
+/// turns out to be inside a vault, and neither for one that is not (AD-102).
+///
+/// Returns the block as it now stands on disk, for the panel to render.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a path that
+/// escapes the root or sits in `workspace/`, a directory, a file that is gone,
+/// a file that is not editable text, a block that changed underneath, a block
+/// that is not well formed, a disk failure).
+#[tauri::command]
+pub async fn sync_write_frontmatter(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    expect: String,
+    frontmatter: String,
+) -> Result<String, IpcError> {
+    // Scoped to this function: nothing else in this module emits, and the
+    // module deliberately spells every other `tauri::` name in full.
+    use tauri::Emitter as _;
+
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    let route = scope
+        .route(vault, &profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
+
+    let named = subpath.clone();
+    let landed = {
+        let route = route.clone();
+        let subpath = subpath.clone();
+        // Read, splice and write in ONE blocking task. Reading on the async
+        // side and writing here would open a window between the guard and the
+        // write that is wider than the one the guard exists to close.
+        tokio::task::spawn_blocking(move || {
+            let file = keeper_core::text_file::open_text_file(&resolved)
+                .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))?;
+            let source = editable_source(file, &subpath)?;
+            let next = keeper_core::file_properties::replace_block(
+                &source,
+                &expect,
+                &frontmatter,
+                &subpath,
+            )
+            .map_err(|refusal| {
+                // `warn!` on `write_refused`'s reasoning (DW-162): a refusal is
+                // exactly what somebody asks about an hour later.
+                tracing::warn!(%refusal, "files: a properties write was refused");
+                IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: refusal.to_string(),
+                    account_id: None,
+                    retriable: false,
+                }
+            })?;
+            match &route {
+                WriteRoute::Vault { vault, path } => {
+                    crate::notes_vault::write_vault_file(vault, path.as_str(), &next)
+                        .map_err(notes_write_error)?;
+                }
+                WriteRoute::Unmanaged(target) => {
+                    files_write::write_unmanaged(target, &next)
+                        .map_err(|refusal| write_refused(&refusal))?;
+                }
+            }
+            Ok::<String, IpcError>(keeper_core::file_properties::block_of(&next).to_owned())
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not save {named}: {err}")))??
+    };
+
+    match route {
+        WriteRoute::Vault { vault, path } => {
+            crate::notes_vault::touch(&vault.id, vec![path.as_str().to_owned()]);
+            crate::notes_vault::mark_dirty(&vault.id);
+            tracing::info!(rel = %path.as_str(), "files: wrote a vault file's properties");
+        }
+        WriteRoute::Unmanaged(target) => tracing::info!(
+            rel = %target.profile_relative(),
+            "files: wrote the properties of a file no vault manages (AD-102)"
+        ),
+    }
+
+    // The re-read, and the narrowest hook there is: the sessions surfaces
+    // already listen for this event and re-issue both space reads on it
+    // (`session-detail.tsx`), so a file that just became `tag:ref` appears in
+    // References without a manual refresh and without one line of new frontend
+    // plumbing. The zone watcher would have said the same thing a debounce
+    // later; saying it now is what turns that race into a guarantee, which is
+    // the reason the detail surface already keeps an explicit re-read beside
+    // the event.
+    //
+    // Only for a profile that holds a sessions zone. A tag written in an
+    // ordinary synced folder changes no space, and an event nobody is listening
+    // for is still a re-read for every open board.
+    if profile.sessions.is_some() {
+        let _ = app.emit(crate::sessions_root::SESSIONS_CHANGED_EVENT, id);
+    }
+    Ok(landed)
+}
+
 /// Word what deleting this selection would do, before it is done (Story 45.3,
 /// FR-175, UX-DR66).
 ///

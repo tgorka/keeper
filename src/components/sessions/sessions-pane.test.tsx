@@ -10,6 +10,9 @@ const sessionsPatterns = vi.fn();
 const sessionsCreate = vi.fn();
 const revealPath = vi.fn();
 const listenSessionsChanged = vi.fn();
+const sessionsTemplateInstall = vi.fn();
+const sessionsTemplateEntries = vi.fn();
+const sessionsTemplateRename = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   sessionsRoots: () => sessionsRoots(),
   sessionsList: (rootId: unknown) => sessionsList(rootId),
@@ -19,6 +22,20 @@ vi.mock("@/lib/ipc/client", () => ({
     sessionsCreate(rootId, title, patternId),
   revealPath: (path: unknown) => revealPath(path),
   listenSessionsChanged: (cb: unknown) => listenSessionsChanged(cb),
+  sessionsTemplateInstall: (rootId: unknown, name: unknown) =>
+    sessionsTemplateInstall(rootId, name),
+  sessionsTemplateEntries: (rootId: unknown, name: unknown) =>
+    sessionsTemplateEntries(rootId, name),
+  sessionsTemplateRename: (rootId: unknown, name: unknown, newName: unknown) =>
+    sessionsTemplateRename(rootId, name, newName),
+  // The templates room's entry verbs (FR-284). Never pressed from this suite —
+  // they are the room's own tests — but the room imports them, and a factory mock
+  // that omits an export turns any future press into a mock error instead of a
+  // failure about the surface.
+  sessionsTemplateFileNew: vi.fn(async () => "60-sessions/_template/notes.md"),
+  sessionsTemplateDirNew: vi.fn(async () => {}),
+  sessionsTemplateRenameEntry: vi.fn(async () => "60-sessions/_template/record.md"),
+  sessionsTemplateDeleteEntry: vi.fn(async () => {}),
   sessionsSetPinned: vi.fn(async () => {}),
   sessionsLogToday: vi.fn(async () => {}),
   sessionsArchive: vi.fn(async () => {}),
@@ -31,6 +48,7 @@ import {
   SESSION_NEW_LIKE_THIS_LABEL,
 } from "@/components/sessions/session-actions";
 import {
+  SESSION_PATTERN_INSTALL_LABEL,
   SESSION_PATTERN_LABEL,
   SESSION_PATTERN_SKIPS_LABEL,
 } from "@/components/sessions/session-pattern-picker";
@@ -40,6 +58,14 @@ import {
   SESSION_ROW_WORKSPACE_TESTID,
 } from "@/components/sessions/session-row";
 import {
+  SESSION_TEMPLATE_RENAME,
+  SESSION_TEMPLATES_EMPTY,
+  SESSION_TEMPLATES_HEADING,
+  SESSION_TEMPLATES_NEW,
+  SESSION_TEMPLATES_NEW_NAME_LABEL,
+  SESSION_TEMPLATES_READING,
+} from "@/components/sessions/session-templates";
+import {
   SESSIONS_LIST_LABEL,
   SESSIONS_NEW_CONFIRM_LABEL,
   SESSIONS_NEW_LABEL,
@@ -48,6 +74,7 @@ import {
   SESSIONS_NO_ROOT_TITLE,
   SESSIONS_PANE_TITLE,
   SESSIONS_RESCAN_LABEL,
+  SESSIONS_TEMPLATES_LABEL,
   SessionsPane,
 } from "@/components/sessions/sessions-pane";
 import { resetSessionsListStoreForTest, sessionsListStore } from "@/lib/stores/sessions-list";
@@ -104,11 +131,11 @@ function templatePattern(): SessionPatternVm {
 }
 
 /** A `_template/<name>/` (FR-266) — a template, addressed by its path. */
-function namedTemplatePattern(): SessionPatternVm {
+function namedTemplatePattern(name = "interview"): SessionPatternVm {
   return {
-    id: "_template/interview",
+    id: `_template/${name}`,
     kind: "template",
-    label: "interview",
+    label: name,
     detail: "a named template — copied whole",
     mtimeMs: NOW - 3 * 24 * 60 * 60_000,
     copies: [{ relPath: "questions.md", isDir: false }],
@@ -148,6 +175,16 @@ beforeEach(() => {
   });
   revealPath.mockResolvedValue(undefined);
   listenSessionsChanged.mockResolvedValue(() => {});
+  sessionsTemplateInstall.mockResolvedValue("_template/interview");
+  sessionsTemplateEntries.mockResolvedValue([
+    {
+      subpath: "60-sessions/_template/AGENTS.md",
+      name: "AGENTS.md",
+      mtimeMs: NOW - 60_000,
+      isDir: false,
+    },
+  ]);
+  sessionsTemplateRename.mockResolvedValue("_template/kick-off");
 });
 
 afterEach(() => {
@@ -281,7 +318,7 @@ describe("SessionsPane", () => {
     );
   });
 
-  it("reads patterns only once the create row is open — a board nobody creates on walks nothing", async () => {
+  it("reads patterns only once a surface needs them — a board at rest walks nothing", async () => {
     render(<SessionsPane />);
     await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
     expect(sessionsPatterns).not.toHaveBeenCalled();
@@ -298,5 +335,167 @@ describe("SessionsPane", () => {
     await waitFor(() => expect(sessionsList).toHaveBeenLastCalledWith("neuradrive"));
     const list = await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
     await within(list).findByText("neura");
+  });
+});
+
+/**
+ * The Templates room (FR-269): a chip that reads as a peer of the status chips
+ * and switches what the board is showing, rather than a fourth filter value over
+ * rows that have no status.
+ */
+describe("SessionsPane templates room", () => {
+  async function enterTemplates() {
+    render(<SessionsPane />);
+    await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
+    fireEvent.click(screen.getByRole("button", { name: SESSIONS_TEMPLATES_LABEL }));
+    return await screen.findByRole("region", { name: SESSION_TEMPLATES_HEADING });
+  }
+
+  it("shows the templates and stands the row-only controls down", async () => {
+    const room = await enterTemplates();
+
+    // The zone's templates, with what Rust says is inside them.
+    expect(await within(room).findByRole("heading", { name: "Zone template" })).toBeInTheDocument();
+    // The exact name: a row carries its own Rename and Delete now, each labelled
+    // with the entry it acts on, so a substring match would find three buttons.
+    expect(await within(room).findByRole("button", { name: "AGENTS.md" })).toBeInTheDocument();
+    // The session rows are not what is showing.
+    expect(screen.queryByRole("list", { name: SESSIONS_LIST_LABEL })).not.toBeInTheDocument();
+    // Search, Pinned and Unread filter session rows; here they would be inert
+    // chrome that looks like it does something.
+    expect(screen.queryByLabelText("Search sessions")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pinned" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Unread" })).not.toBeInTheDocument();
+    // The chips themselves stay: they are how you get back.
+    expect(screen.getByRole("button", { name: "Active" })).toBeInTheDocument();
+  });
+
+  it("comes back to the rows when a status chip is pressed", async () => {
+    await enterTemplates();
+
+    fireEvent.click(screen.getByRole("button", { name: "Active" }));
+
+    expect(await screen.findByRole("list", { name: SESSIONS_LIST_LABEL })).toBeInTheDocument();
+    expect(screen.getByLabelText("Search sessions")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: SESSION_TEMPLATES_HEADING }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("New template sends the name Rust has always accepted, and re-reads after", async () => {
+    await enterTemplates();
+    const reads = sessionsPatterns.mock.calls.length;
+
+    fireEvent.change(screen.getByLabelText(SESSION_TEMPLATES_NEW_NAME_LABEL), {
+      target: { value: "interview" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SESSION_TEMPLATES_NEW }));
+
+    // The name argument, present at last: `sessions_template_install` has taken
+    // it since it was written and the one caller dropped it.
+    await waitFor(() =>
+      expect(sessionsTemplateInstall).toHaveBeenCalledWith("tgdrive", "interview"),
+    );
+    // A create makes a pattern without making a session, so the nonce is the
+    // only signal that re-reads the list — the same one a rename bumps.
+    await waitFor(() => expect(sessionsPatterns.mock.calls.length).toBeGreaterThan(reads));
+  });
+
+  it("keeps the zone-template install reachable from a zone with no template", async () => {
+    sessionsPatterns.mockResolvedValue([sessionPattern()]);
+    await enterTemplates();
+
+    expect(await screen.findByText(SESSION_TEMPLATES_EMPTY)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: SESSION_PATTERN_INSTALL_LABEL }));
+
+    // No name: the zone's own `_template/`, which is what the create row's offer
+    // writes too.
+    await waitFor(() => expect(sessionsTemplateInstall).toHaveBeenCalledWith("tgdrive", undefined));
+  });
+
+  it("re-reads for the new root and shows nothing of the old one while it waits", async () => {
+    sessionsRoots.mockResolvedValue([root(), root({ id: "neuradrive", name: "neuradrive" })]);
+    // A DIFFERENT list per root, and the new root's read held open. Mocking one
+    // list for both roots made the stale-name case this test is named after
+    // impossible to observe: root A's headings ARE root B's headings.
+    let arrive: (list: SessionPatternVm[]) => void = () => {};
+    sessionsPatterns.mockImplementation((rootId: unknown) =>
+      rootId === "neuradrive"
+        ? new Promise<SessionPatternVm[]>((resolve) => {
+            arrive = resolve;
+          })
+        : Promise.resolve([templatePattern(), namedTemplatePattern(), sessionPattern()]),
+    );
+    const room = await enterTemplates();
+    expect(await within(room).findByRole("heading", { name: "interview" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /neuradrive/ }));
+    await waitFor(() => expect(sessionsPatterns).toHaveBeenLastCalledWith("neuradrive"));
+
+    // Mid-flight, and this is the whole point: the previous zone's HEADING is
+    // gone, not merely a file row swapped underneath it. An untagged pattern list
+    // left root A's sections standing for the whole round trip — one directory
+    // walk per pattern — with LIVE Rename buttons, each addressing root B's id
+    // with root A's folder name.
+    expect(screen.queryByRole("heading", { name: "interview" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: `${SESSION_TEMPLATE_RENAME} interview` }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(SESSION_TEMPLATES_READING)).toBeInTheDocument();
+    // And no entries read went out under the new root with the old root's names.
+    expect(sessionsTemplateEntries).not.toHaveBeenCalledWith("neuradrive", "interview");
+
+    arrive([namedTemplatePattern("handbook")]);
+    expect(await screen.findByRole("heading", { name: "handbook" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(sessionsTemplateEntries).toHaveBeenLastCalledWith("neuradrive", "handbook"),
+    );
+  });
+
+  it("says a refused pattern read out loud instead of waiting on it forever", async () => {
+    const said = "no such sessions root: tgdrive";
+    sessionsPatterns.mockRejectedValue({ message: said });
+    render(<SessionsPane />);
+    await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
+
+    fireEvent.click(screen.getByRole("button", { name: SESSIONS_TEMPLATES_LABEL }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(said);
+    // Not "Reading templates…" over a read that already stopped, and not the
+    // room's empty state either: keeper has no list, and said so.
+    expect(screen.queryByText(SESSION_TEMPLATES_READING)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: SESSION_TEMPLATES_HEADING }),
+    ).not.toBeInTheDocument();
+
+    // And there is a way out of it: leaving the room and coming back re-runs the
+    // read, which is what a refusal with no catch left the operator without.
+    sessionsPatterns.mockResolvedValue([templatePattern()]);
+    fireEvent.click(screen.getByRole("button", { name: SESSIONS_TEMPLATES_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: SESSIONS_TEMPLATES_LABEL }));
+
+    expect(await screen.findByRole("heading", { name: "Zone template" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("the Templates chip announces its state and a second press comes back", async () => {
+    render(<SessionsPane />);
+    await screen.findByRole("list", { name: SESSIONS_LIST_LABEL });
+    const chip = () => screen.getByRole("button", { name: SESSIONS_TEMPLATES_LABEL });
+    // A peer of Pinned and Unread, which both announce and both invert.
+    expect(chip()).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(chip());
+    await screen.findByRole("region", { name: SESSION_TEMPLATES_HEADING });
+    expect(chip()).toHaveAttribute("aria-pressed", "true");
+
+    // The way back out of the room, from the control that opened it — not only
+    // from a status chip, which was a rule stated in a comment and nowhere here.
+    fireEvent.click(chip());
+    expect(await screen.findByRole("list", { name: SESSIONS_LIST_LABEL })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: SESSION_TEMPLATES_HEADING }),
+    ).not.toBeInTheDocument();
+    expect(chip()).toHaveAttribute("aria-pressed", "false");
   });
 });

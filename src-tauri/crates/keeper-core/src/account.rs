@@ -3755,6 +3755,31 @@ impl AccountManager {
         registry::set_menu_bar_presence(&data_dir, enabled)
     }
 
+    /// Read the default fold state of a session's spaces (Story 49.3, FR-276). Reads the
+    /// persisted `sessions.spaces_folded` setting (default off — spaces arrive unfolded).
+    /// The default only: a space somebody folded by hand is remembered by the frontend,
+    /// not here.
+    pub fn sessions_spaces_folded_get(
+        &self,
+        platform: &Arc<dyn Platform>,
+    ) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::get_sessions_spaces_folded(&data_dir)
+    }
+
+    /// Set the default fold state of a session's spaces (Story 49.3, FR-276). Persists the
+    /// new value to the `settings` k/v table under `sessions.spaces_folded`. Changing it
+    /// moves only the spaces nobody has folded or unfolded by hand; the ones they have
+    /// keep their answer.
+    pub fn sessions_spaces_folded_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        folded: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_sessions_spaces_folded(&data_dir, folded)
+    }
+
     /// Gracefully shut down **every** active account (Story 10.3, FR-53 — honest quit).
     /// Snapshots the current active account ids under the manager lock, then awaits
     /// [`Self::shutdown`] for each so every account's `SyncService` is stopped and all its

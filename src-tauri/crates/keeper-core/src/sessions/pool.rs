@@ -18,6 +18,7 @@
 //! here writes one — in particular, a file with no `id` is **not** stamped with
 //! a fresh ULID. See [`PoolEntry::id`].
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::notes::frontmatter::Frontmatter;
@@ -31,9 +32,11 @@ use crate::sessions::shape::{KindTag, Shape, TaskStatus};
 /// One markdown file of the pool, already read by the shell.
 ///
 /// `rel` is session-relative with `/` separators — `about.md`,
-/// `2026-08-12-0930-opened.md`. The pool is the session's own root, so these
-/// are bare filenames in practice; the type says `rel` because that is what it
-/// is measured against and because `path:` identity quotes it verbatim.
+/// `2026-08-12-0930-opened.md`, `log/2026-08-16-0900-note.md`. A subdirectory
+/// is ordinary: the shell reads markdown wherever it sits in the session
+/// (FR-285), and the path is what `path:` identity quotes verbatim, so two
+/// files of the same name in two directories are two entries. What a file *is*
+/// is still its tags and never its directory (AD-120).
 #[derive(Debug, Clone, Copy)]
 pub struct PoolFile<'a> {
     pub rel: &'a str,
@@ -197,6 +200,30 @@ pub struct Pool {
     pub unfiled: Vec<PoolEntry>,
 }
 
+/// The last segment of a session-relative path — the filename, which is where
+/// the flat contract puts the clock and where the title fallback comes from.
+fn base_name(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// Two pool paths in the order the flat contract's clock puts them, ascending.
+///
+/// The **basename** first, folded, because that is where `YYYY-MM-DD-HHMM`
+/// lives; a directory carries no clock at all, so comparing the whole path
+/// would let `log/` decide an order a reader is told is chronological — `l`
+/// beats `2`, so every filed sitting would outrank every root one whatever
+/// dates they hold. Then the whole `rel`, which is unique by construction, so
+/// the comparator is total and two same-named files in two directories cannot
+/// swap places between launches.
+///
+/// One rule with two callers — [`group`] orders [`Pool::logs`] with it and
+/// [`log_candidates`] orders the board's cheap probe with it — because the row
+/// and the log view naming two different newest sittings is the one failure
+/// this ordering exists to prevent.
+fn cmp_stamped(a: &str, b: &str) -> Ordering {
+    fold_cmp(base_name(a), base_name(b)).then_with(|| fold_cmp(a, b))
+}
+
 /// Split a `YYYY-MM-DD-HHMM-slug.md` filename into its date and time.
 ///
 /// The flat contract puts the clock in the filename so the folder sorts itself
@@ -207,7 +234,7 @@ pub struct Pool {
 /// Returns `("", "")` for anything that is not shaped that way — an ordinary
 /// name is not an error, it just carries no clock.
 fn stamp_of(rel: &str) -> (String, String) {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let name = base_name(rel);
     let bytes = name.as_bytes();
     // YYYY-MM-DD-HHMM is 15 characters, and the separators are load-bearing.
     let shaped = bytes.len() >= 15
@@ -229,7 +256,7 @@ fn stamp_of(rel: &str) -> (String, String) {
 
 /// The filename stem, for a title fallback.
 fn stem(rel: &str) -> &str {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let name = base_name(rel);
     name.strip_suffix(".md").unwrap_or(name)
 }
 
@@ -309,10 +336,13 @@ pub fn read(files: &[PoolFile<'_>]) -> Vec<PoolEntry> {
 /// Order is decided **once per kind**, here, because each list answers a
 /// different question:
 ///
-/// - **logs** — newest first, by filename descending. The name carries
-///   `YYYY-MM-DD-HHMM`, so this is a string sort that happens to be
-///   chronological, and it matches the folder-shaped contract's own projection
-///   (the file stays newest-last; the *review surface* reverses).
+/// - **logs** — newest first, by the **filename** descending, through
+///   [`cmp_stamped`]. The name carries `YYYY-MM-DD-HHMM`, so this is a string
+///   sort that happens to be chronological, and it matches the folder-shaped
+///   contract's own projection (the file stays newest-last; the *review
+///   surface* reverses). Keyed on the basename rather than on the path because
+///   markdown is read wherever it sits (FR-285): a sitting filed into `log/`
+///   is dated by its name like every other one.
 /// - **tasks** — by `order` through [`f64::total_cmp`], then folded title.
 ///   The same two terms [`crate::notes::order::cmp_order`] uses, for the same
 ///   reason: a comparator that returned `Equal` for two distinct files would
@@ -322,6 +352,9 @@ pub fn read(files: &[PoolFile<'_>]) -> Vec<PoolEntry> {
 ///
 /// Every sort ends on `rel`, which is unique by construction, so all four are
 /// total.
+///
+/// Every order here is the *pool's* order, and the board reads the same rule
+/// rather than a second one — see [`cmp_stamped`].
 pub fn group(entries: Vec<PoolEntry>) -> Pool {
     let mut pool = Pool::default();
     for entry in entries {
@@ -340,7 +373,7 @@ pub fn group(entries: Vec<PoolEntry>) -> Pool {
     pool.prompts.sort_by(by_name);
     pool.refs.sort_by(by_name);
     pool.unfiled.sort_by(by_name);
-    pool.logs.sort_by(|a, b| by_name(b, a));
+    pool.logs.sort_by(|a, b| cmp_stamped(&b.rel, &a.rel));
     pool.tasks.sort_by(|a, b| {
         a.order
             .value
@@ -356,13 +389,21 @@ pub fn read_pool(files: &[PoolFile<'_>]) -> Pool {
     group(read(files))
 }
 
-/// Root `.md` names that could be logs, newest first — from the names alone.
+/// Session-relative `.md` paths that could be logs, newest first — from the
+/// names alone.
 ///
 /// The board draws one row per session and needs each session's newest log
 /// line. Reading every markdown file in every session to find it would make
 /// opening the board cost the whole zone; this narrows the field to the files
 /// whose *name* carries a `YYYY-MM-DD-HHMM` stamp and orders them so the shell
 /// can read the first one or two, stop, and still be right.
+///
+/// Ordered by the filename, newest first, through [`cmp_stamped`] — the same
+/// comparator [`group`] gives [`Pool::logs`], so the row's window and the log
+/// view are ordered by one function. Ordering the paths instead would hand the
+/// shell a window holding the sittings the operator filed into `log/` and none
+/// of the ones keeper is still writing at the root, whatever dates each
+/// carries.
 ///
 /// Only a candidate list, never a verdict: the tag decides whether a file is a
 /// log, and a stamped name is not a tag. The shell reads down this list until
@@ -376,7 +417,7 @@ pub fn log_candidates(names: &[String]) -> Vec<&str> {
         .map(String::as_str)
         .filter(|name| name.ends_with(".md") && !stamp_of(name).0.is_empty())
         .collect();
-    out.sort_by(|a, b| fold_cmp(b, a));
+    out.sort_by(|a, b| cmp_stamped(b, a));
     out
 }
 
@@ -539,6 +580,62 @@ mod tests {
         );
     }
 
+    /// The clock is in the name, and a directory carries none of it: a sitting
+    /// filed into `log/` is ordered by its date like every other one.
+    ///
+    /// This is the disagreement the flat walk made reachable (FR-285) and the
+    /// one the board's row was fixed for first: sorting the whole `rel` puts
+    /// `log/2026-08-15…` above a root `2026-08-17…` because `l` beats `2`, so
+    /// the row would announce the 17th while the detail's Log section listed the
+    /// 15th as the newest sitting. Both orders are asserted here, from the one
+    /// comparator they now share.
+    #[test]
+    fn a_log_filed_in_a_subdirectory_is_ordered_by_its_date_not_its_directory() {
+        let pool = read_pool(&[
+            file(
+                "log/2026-08-15-0900-filed.md",
+                "---\ntags: [log]\n---\n# filed\n",
+            ),
+            file(
+                "2026-08-17-0900-latest.md",
+                "---\ntags: [log]\n---\n# latest\n",
+            ),
+            file(
+                "log/older/2026-08-01-0900-first.md",
+                "---\ntags: [log]\n---\n# first\n",
+            ),
+        ]);
+
+        assert_eq!(
+            pool.logs.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
+            [
+                "2026-08-17-0900-latest.md",
+                "log/2026-08-15-0900-filed.md",
+                "log/older/2026-08-01-0900-first.md",
+            ],
+            "the log view's newest is the newest sitting, at whatever depth"
+        );
+        assert_eq!(
+            log_view(Shape::Flat, "", &pool)
+                .first()
+                .map(|(date, title, _)| (date.clone(), title.clone())),
+            Some(("2026-08-17".to_owned(), "latest".to_owned())),
+            "and the detail renders that order verbatim"
+        );
+
+        let names: Vec<String> = pool.logs.iter().map(|e| e.rel.clone()).collect();
+        assert_eq!(
+            log_candidates(&names),
+            [
+                "2026-08-17-0900-latest.md",
+                "log/2026-08-15-0900-filed.md",
+                "log/older/2026-08-01-0900-first.md",
+            ],
+            "the board's probe reads the same order, so the row and the log \
+             view cannot name two different newest sittings"
+        );
+    }
+
     /// The board's order is the fact the operator set, then a tiebreak a
     /// reader can account for, then a term that makes it total.
     #[test]
@@ -626,6 +723,102 @@ mod tests {
         assert_eq!(pool.logs.len(), 1);
         assert_eq!(pool.unfiled.len(), 1);
         assert_eq!(pool.unfiled[0].rel, "README.md");
+    }
+
+    /// AD-120, from the read side, and the guard Story 50.1 owes its own fix.
+    ///
+    /// 50.1 teaches the create verb where a folder-shaped session keeps each
+    /// kind — `refs/` for a reference, `prompts/` for a prompt
+    /// (`shape::kind_dir`). The risk that change introduces is that somebody
+    /// concludes the directory is now what makes a file a reference, and drops
+    /// the tag from the write. It does not: the reader derives the kind from
+    /// tags alone and never looks at the path, so an untagged file in `refs/`
+    /// is *unfiled* — present in the pool, listed by no space, and named by the
+    /// detail's Unfiled notice. The directory is where a create PUTS a file;
+    /// the tag is what makes it that kind.
+    #[test]
+    fn a_file_in_refs_without_the_tag_is_still_unfiled() {
+        let pool = read_pool(&[
+            file("refs/tagged.md", "---\ntags: [ref]\n---\n# Tagged\n"),
+            file("refs/bare.md", "# Someone wrote this by hand\n"),
+            file("prompts/bare.md", "# And this one\n"),
+        ]);
+
+        assert_eq!(pool.refs.len(), 1, "only the tagged one is a reference");
+        assert_eq!(pool.refs[0].rel, "refs/tagged.md");
+        assert!(pool.prompts.is_empty(), "`prompts/` confers nothing either");
+        let unfiled: Vec<&str> = pool.unfiled.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(unfiled, ["prompts/bare.md", "refs/bare.md"]);
+        // Said once more at the level the mistake would be made at: `read_one`
+        // is handed the `refs/` prefix and still answers `None`.
+        assert_eq!(read_one(file("refs/bare.md", "# x\n")).kind, None);
+    }
+
+    /// AD-120 again, at the two places FR-285 and FR-286 make newly reachable.
+    ///
+    /// Story 51.1 teaches the shell to read markdown wherever it sits: a
+    /// `spaces/` or a `log/` the operator made, and the root of a folder-shaped
+    /// session. That widening introduces the same risk `refs/` introduced —
+    /// that somebody concludes the directory now confers the kind, and drops
+    /// the tag from a write into `log/`. It does not: the reader derives the
+    /// kind from tags alone and never looks at the path, so an untagged file in
+    /// the directory logs are filed in is *unfiled* — in the pool, listed by no
+    /// space, and named by the detail's Unfiled notice rather than silently
+    /// absent.
+    #[test]
+    fn a_file_in_a_log_directory_without_the_tag_is_still_unfiled() {
+        let pool = read_pool(&[
+            file(
+                "log/2026-08-16-0900-filed.md",
+                "---\ntags: [log]\n---\n# Filed\n",
+            ),
+            file("log/2026-08-15-0900-bare.md", "# Moved here by hand\n"),
+            file("spaces/plan.md", "# A plan that declares nothing\n"),
+            // The owner's orphan: read at last (FR-286), and until it says what
+            // it is, it is unfiled rather than a reference.
+            file("references.md", "# What this session points at\n"),
+        ]);
+
+        assert_eq!(pool.logs.len(), 1, "only the tagged one is a log");
+        assert_eq!(pool.logs[0].rel, "log/2026-08-16-0900-filed.md");
+        assert!(pool.tasks.is_empty(), "`spaces/` confers nothing either");
+        let unfiled: Vec<&str> = pool.unfiled.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(
+            unfiled,
+            [
+                "log/2026-08-15-0900-bare.md",
+                "references.md",
+                "spaces/plan.md",
+            ]
+        );
+        // Said once more at the level the mistake would be made at: a stamped
+        // name, in the directory logs live in, still answers `None`.
+        assert_eq!(
+            read_one(file("log/2026-08-16-0900-bare.md", "# x\n")).kind,
+            None
+        );
+    }
+
+    /// An entry is its path, not its basename: `refs/inputs.md` and a root
+    /// `inputs.md` are two entries with two identities, and a space lists both.
+    #[test]
+    fn two_files_of_one_name_in_two_directories_are_two_entries() {
+        let pool = read_pool(&[
+            file("inputs.md", "---\ntags: [ref]\n---\n# Root inputs\n"),
+            file("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n"),
+        ]);
+
+        assert_eq!(
+            pool.refs.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
+            ["inputs.md", "refs/inputs.md"],
+            "both, in folded path order"
+        );
+        assert_eq!(
+            pool.refs.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["path:inputs.md", "path:refs/inputs.md"],
+            "the path identity quotes the whole path, so neither shadows the \
+             other and an edit aimed at one cannot land on the other"
+        );
     }
 
     /// Inline tags count: one tag set, however it was written.

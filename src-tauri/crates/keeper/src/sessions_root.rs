@@ -25,11 +25,13 @@ use std::time::Duration;
 use keeper_core::notes::frontmatter::Frontmatter;
 use keeper_core::notes::naming::title_from_body;
 use keeper_core::sessions::model::{
-    classify, freshness, lineage, Freshness, SessionStatus, ACTIVE_DIR, ARCHIVE_DIR, README,
-    WORKSPACE_DIR,
+    classify, freshness, lineage, Freshness, SessionStatus, ACTIVE_DIR, ARCHIVE_DIR, ARTIFACTS_DIR,
+    README, WORKSPACE_DIR,
 };
 use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
-use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, ABOUT};
+use keeper_core::sessions::shape::{
+    shape as shape_of, KindTag, Shape, ABOUT, PROMPTS_DIR, REFS_DIR,
+};
 use keeper_core::sessions::spaces::{self, SessionSpace, SPACES_DIR};
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
@@ -362,9 +364,13 @@ fn session_dirs(zone: &Path) -> Vec<String> {
 /// Every entry name directly under `path` — files and directories both,
 /// best-effort.
 ///
-/// [`dir_names`] answers a different question and cannot be reused here: the
-/// shape signal is a *file* (`AGENTS.md` or `about.md`), so a directories-only
-/// listing would report every flat session as folder-shaped.
+/// The shape signal and nothing else, which is why it stays a flat listing
+/// while the markdown scan walks the tree: the signal is a *file* at the root
+/// (`AGENTS.md` or `about.md`), so a directories-only listing would report
+/// every flat session as folder-shaped, and a recursive one would let an
+/// `about.md` somebody archived three folders down decide the contract.
+/// [`dir_names`] answers the first of those wrongly and [`markdown_rels`] the
+/// second, so neither can be reused here.
 fn entry_names(path: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(path) else {
         return Vec::new();
@@ -384,9 +390,25 @@ fn entry_names(path: &Path) -> Vec<String> {
 /// down that list until a file's own tags confirm it is a log, giving up after
 /// [`LOG_PROBE_BUDGET`] files.
 ///
+/// Ordered by the filename, which is where the clock is, by [`log_candidates`]
+/// — the same comparator [`keeper_core::sessions::pool::group`] gives the log
+/// view. One comparator with two callers, so the row's window and the detail's
+/// Log section cannot name two different newest sittings: a path order would
+/// fill this window with the sittings the operator filed into `log/` and none
+/// of the ones keeper is still writing at the root.
+///
 /// Giving up means the row says nothing about its last log, which is what the
 /// folder shape already does when its README has no `## Log`. An empty answer
 /// here is "not cheaply knowable", never "no logs".
+///
+/// `names` is [`markdown_rels`]' walk — the same list the pool is read from
+/// (FR-285), not the root listing [`entry_names`] returns. A row whose newest
+/// log came from a narrower source than the log view's would announce one
+/// sitting on the board and open on another, and the cheaper alternative
+/// (probe the root only, and let the two disagree once the operator makes a
+/// `log/`) buys nothing measurable: the row already walks this session's whole
+/// subtree for freshness (see [`walk_freshness`]), including the `workspace/`
+/// this walk skips, so the dirents are paid for either way.
 fn last_log_flat(dir: &Path, names: &[String]) -> (String, String) {
     for name in log_candidates(names).into_iter().take(LOG_PROBE_BUDGET) {
         let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
@@ -476,6 +498,13 @@ fn row_for(dir: &Path, rel: &str, status: SessionStatus) -> Option<SessionRowVm>
     let line = lineage(&fm);
     let fresh = walk_freshness(dir);
     let (last_log_date, last_log_line) = if flat {
+        // The pool's own source list, walked for paths only: the row reads at
+        // most `LOG_PROBE_BUDGET` of these files, the pool reads down the same
+        // list until its byte budget runs out. A walk that stopped short is not
+        // reported on the row — the row is one line about the last sitting, and
+        // "at least this" is what every other bounded signal here promises
+        // (`walk_freshness`'s own rule).
+        let (names, _truncated) = markdown_rels(dir, true);
         last_log_flat(dir, &names)
     } else {
         last_log(body)
@@ -628,7 +657,6 @@ pub fn detail(
     root_id: &str,
     session_id: &str,
 ) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
-    use keeper_core::sessions::pool::{read_pool, PoolFile};
     use keeper_core::sessions::shape::ABOUT;
     use keeper_core::sessions::vm::{
         SessionDetailVm, SessionLogEntryVm, SessionPropertyVm, SessionTaskVm,
@@ -638,9 +666,9 @@ pub fn detail(
     let row = row_of(root_id, session_id)?;
     let dir = zone.join(&row.path);
 
-    // One read of the session root, reused for everything: the shape, and (when
-    // flat) the pool itself. `ref_sources`' own scan is a separate call with a
-    // separate budget, deliberately — the detail must not pay for `refs/`.
+    // One read of the session root, reused for everything: the shape, the pool
+    // and the record. `ref_sources`' own scan is a separate call with a separate
+    // budget, deliberately — the detail must not pay for `refs/`.
     let (sources, _truncated, shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
     let flat = shape == Shape::Flat;
 
@@ -659,23 +687,8 @@ pub fn detail(
     let body = &readme[body_at..];
     let line = lineage(&fm);
 
-    // The pool, for a flat session: parsed once, and the source of the log, the
-    // board and the unfiled list alike. `read_pool` is pure, so this is the
-    // only place the three can disagree — and they cannot, because it is one
-    // call.
-    let pool = if flat {
-        read_pool(
-            &sources
-                .iter()
-                .map(|source| PoolFile {
-                    rel: &source.rel,
-                    text: &source.text,
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        Default::default()
-    };
+    // The pool, under both contracts, from that one scan.
+    let pool = detail_pool(&sources, shape);
 
     // The properties widget (FR-227): user-tier keys only. keeper-owned keys
     // and the Obsidian-native `tags` are projected elsewhere on the header;
@@ -770,6 +783,38 @@ pub fn detail(
     })
 }
 
+/// The pool the DETAIL reads, out of one markdown scan (FR-286).
+///
+/// Split out of [`detail`] so a test can hand it a scan of a folder rather than
+/// having to register a root, and so the exclusion below has one reader instead
+/// of being a line inside a 150-line projection.
+///
+/// **Both contracts read a pool now** (Story 51.7). The folder shape got one in
+/// Story 51.1 — its root markdown is in [`read_ref_sources`]' walk — and this
+/// was the last reader still answering as though it had none, which is what left
+/// a folder-shaped session's `task`-tagged file out of the board and its
+/// untagged root markdown out of *Unfiled*.
+///
+/// **The record is left out, and only under the folder contract.** `README.md`
+/// declares no kind, so feeding it in would report the one file keeper reads the
+/// session's identity, title, tags and lineage out of as *unfiled* — an
+/// accusation against the file that is doing its job. A flat session's
+/// `about.md` needs no such exclusion: it carries `tags: [about]`, which is the
+/// flat contract's whole premise, so that pool is byte-for-byte what it was.
+fn detail_pool(sources: &[RefSource], shape: Shape) -> keeper_core::sessions::pool::Pool {
+    use keeper_core::sessions::pool::{read_pool, PoolFile};
+
+    let files: Vec<PoolFile<'_>> = sources
+        .iter()
+        .filter(|source| shape == Shape::Flat || source.rel != README)
+        .map(|source| PoolFile {
+            rel: &source.rel,
+            text: &source.text,
+        })
+        .collect();
+    read_pool(&files)
+}
+
 /// The most markdown one session's *detail* reads, in bytes.
 ///
 /// Its own constant rather than a share of [`REF_SCAN_BUDGET`], because the two
@@ -855,22 +900,24 @@ pub struct RefSources {
 /// Every pointer written in one session's markdown, with the file it was
 /// written in (FR-255, AD-118).
 ///
-/// **Which files, under the folder contract.** The README and every `.md`
-/// under `refs/` and `prompts/`, in that order — the README first because it is
-/// the record, and `refs/` next because the zone's own contract says that is
-/// where inputs worth keeping are listed.
+/// **Which files, under the folder contract.** The README, then every other
+/// `.md` at the session root, then every `.md` under `refs/` and `prompts/` —
+/// the README first because it is the record, the rest of the root next because
+/// that is where it sits, and `refs/` after because the zone's own contract says
+/// that is where inputs worth keeping are listed. Root markdown is read
+/// (FR-286) because the create verb wrote there before Story 50.1 filed by
+/// kind, and a `references.md` left behind was in no reader at all: not this
+/// one, not a space, not even *Unfiled*.
 ///
-/// **Which files, under the flat contract.** Every `.md` at the session root,
-/// in name order. There is nowhere else for markdown to be: the flat shape's
-/// premise is that kind is a tag, so a pointer's file is not distinguishable by
-/// location and all of them must be read.
+/// **Which files, under the flat contract.** Every `.md` in the session's tree,
+/// each directory's own files before its subdirectories, in name order
+/// (FR-285). The flat shape's premise is that kind is a tag, so a pointer's
+/// file is not distinguishable by location and all of them must be read — and
+/// a file the operator moved into a `spaces/` or a `log/` he made is still one
+/// of them.
 ///
-/// **What is excluded, in both.** `artifacts/` — promoted output is a
-/// deliverable, and a reference inside it is a reference from the artifact, not
-/// from the session. `workspace/` — scratch that dies with the session
-/// (AD-113); a broken pointer in a file nobody keeps is not worth reporting.
-/// Neither exclusion needs restating for the flat shape, because neither is a
-/// root `.md`, but both remain true and both remain the reason.
+/// **What is excluded, in both.** [`UNSCANNED_DIRS`] and dotted directories,
+/// through [`scans_markdown`] — the one list, for the reasons stated there.
 ///
 /// **A byte budget, not an entry budget.** The tree's budget counts dirents
 /// because that is what a `node_modules` inflates; here the cost is parsing
@@ -968,15 +1015,16 @@ fn read_zone_spaces(zone: &Path) -> ZoneSpaces {
 pub struct SessionPool {
     /// Session path, zone-relative — what a `relPath` is joined onto.
     pub path: String,
-    /// `(zone-relative-within-session, text, mtime_ns)`, in name order.
+    /// `(session-relative path, text, mtime_ns)` in reading order — a path
+    /// rather than a name, because markdown is read wherever it sits (FR-285).
     pub files: Vec<(String, String, i128)>,
 }
 
 /// Read one session's pool for space evaluation (FR-261).
 ///
-/// Reuses [`read_ref_sources`]'s scan — the same one read of the session root
-/// that decides the shape — and adds a stat per file. A folder-shaped session
-/// returns its `README.md` and its `refs/`+`prompts/` files, which is what makes
+/// Reuses [`read_ref_sources`]'s scan — the walk that also decides the shape —
+/// and adds a stat per file. A folder-shaped session returns its `README.md`,
+/// its other root markdown and its `refs/`+`prompts/` files, which is what makes
 /// the spaces list *work* rather than sit empty on a session nobody has migrated
 /// yet: a `tag:ref` query over an unmigrated session finds whatever those files
 /// declare, and finds nothing when they declare nothing, which is the honest
@@ -1008,14 +1056,184 @@ pub fn session_pool(root_id: &str, session_id: &str) -> Option<SessionPool> {
 /// anything that would be felt.
 const REF_SCAN_BUDGET: usize = 10 * 1024 * 1024;
 
-/// Where references are read from, after the README, in reading order.
-const REF_DIRS: [&str; 2] = ["refs", "prompts"];
+/// Where references are read from, after the root, in reading order.
+///
+/// The domain's own constants, not a third spelling of two folder names: this
+/// array is the READER that `shape::kind_dir` writes for, and the day the two
+/// disagree a create lands where the pool does not look — the exact defect the
+/// mapping was made public to prevent.
+const REF_DIRS: [&str; 2] = [REFS_DIR, PROMPTS_DIR];
+
+/// The directories a markdown scan of a session never enters, under either
+/// shape.
+///
+/// `artifacts/` — promoted output is a deliverable, and a reference inside it is
+/// a reference from the artifact, not from the session. `workspace/` — scratch
+/// that dies with the session (AD-113), so a task or a log filed there would be
+/// a card that vanishes, and a broken pointer in a file nobody keeps is not
+/// worth reporting.
+///
+/// Public, with [`scans_markdown`], because it is the one list: a directory
+/// keeper offers to create but never reads is a directory whose files are in no
+/// pool, no space and not even *Unfiled* — the exact defect this scan was
+/// widened to fix. Two lists is how the create side and the read side come to
+/// disagree, and the disagreement is silent.
+pub const UNSCANNED_DIRS: [&str; 2] = [ARTIFACTS_DIR, WORKSPACE_DIR];
+
+/// Whether the markdown scan enters a session subdirectory of this name.
+///
+/// Dotted names are furniture — `.git`, `.obsidian`, the zone's own `.keeper` —
+/// and are refused here rather than listed in [`UNSCANNED_DIRS`] because the
+/// rule is a prefix, not a name: the same rule the dotfile filter applies one
+/// level down.
+///
+/// **Folded, because the drive folds.** `Artifacts/` and `artifacts/` are one
+/// directory on the volume keeper ships on, so an exclusion that held for only
+/// one spelling of a name would put promoted output and `workspace/` scratch —
+/// scratch that dies with the session (AD-113) — into the pool, into every
+/// space evaluated over it, and into the *Unfiled* notice. The same reason
+/// `sessions::files::check_dir` folds its own fence.
+pub fn scans_markdown(dir_name: &str) -> bool {
+    !dir_name.starts_with('.')
+        && !UNSCANNED_DIRS
+            .iter()
+            .any(|excluded| dir_name.eq_ignore_ascii_case(excluded))
+}
+
+/// The most directory entries one session's markdown walk visits before it
+/// stops and says so.
+///
+/// [`WORKSPACE_WALK_BUDGET`]'s reason, applied to the side of the session that
+/// is walked now too: the record side is small by the zone's own contract, but
+/// "small" is the operator's word and nothing stops him keeping a checkout in a
+/// folder he made. The byte budget cannot stand in for this one — it is spent in
+/// [`read_ref_sources`]'s `take`, *after* the walk has already materialised
+/// every path — and this walk runs once per board row on top of
+/// [`walk_freshness`], so an unbounded one would allocate a string per markdown
+/// file in the zone to read at most [`LOG_PROBE_BUDGET`] of them per session.
+const MARKDOWN_WALK_BUDGET: usize = 2_000;
+
+/// Every `.md` under `dir`, session-relative and in reading order: each
+/// directory's own files in folded name order, then its subdirectories in the
+/// same order. `descend` false stops at `dir` itself — the folder contract's
+/// listing, whose subdirectories are named by `shape::kind_dir` and read
+/// explicitly rather than discovered.
+///
+/// **Paths only, no bytes.** Two callers with two appetites read down one list:
+/// the pool takes text until its byte budget runs out, the board's newest-log
+/// probe opens at most [`LOG_PROBE_BUDGET`] of them. One walk, so the row and
+/// the pool cannot disagree about what the session contains.
+///
+/// **Bounded, and the bound is reported.** The second value is `true` when this
+/// list is a prefix of what is there: [`MARKDOWN_WALK_BUDGET`] entries were
+/// visited, or a directory could not be listed at all. Two causes, one fact —
+/// *this is not everything* — and it reaches the caller because the pool is what
+/// every space is evaluated over, so a card that quietly left a board with
+/// nothing anywhere saying so is the worst shape a failure has.
+///
+/// **Iterative, and no-follow.** An explicit worklist rather than recursion, so
+/// what bounds the walk is the budget above and not the stack. The type comes
+/// from `read_dir` — one syscall for the directory instead of the stat-per-name
+/// the root listing used to do — so a symlinked directory reports as a symlink,
+/// is neither a directory to enter nor a file to read, and is therefore refused.
+/// Following one is the version that reads somebody's whole home directory
+/// because they linked `~/notes` into a session.
+fn markdown_rels(dir: &Path, descend: bool) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let mut budget = MARKDOWN_WALK_BUDGET;
+    let mut truncated = false;
+    // Session-relative prefixes still to visit. Popped from the end, with each
+    // directory's children pushed in reverse, this is a depth-first walk in
+    // name order without a recursive call.
+    let mut pending: Vec<String> = vec![String::new()];
+    while let Some(prefix) = pending.pop() {
+        if budget == 0 {
+            // Whatever is still pending is unread, and the files already found
+            // in the directory the budget ran out in are kept: a prefix that
+            // says it is a prefix beats an empty answer.
+            truncated = true;
+            break;
+        }
+        let here = if prefix.is_empty() {
+            dir.to_path_buf()
+        } else {
+            dir.join(&prefix)
+        };
+        let Ok(entries) = std::fs::read_dir(&here) else {
+            // A directory keeper cannot list is not a directory with no
+            // markdown: every file under it is missing from the pool, from
+            // every space evaluated over it and from the *Unfiled* notice, so
+            // the caller is told rather than handed a short list that looks
+            // complete.
+            truncated = true;
+            continue;
+        };
+        let mut files: Vec<String> = Vec::new();
+        let mut dirs: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            if budget == 0 {
+                truncated = true;
+                break;
+            }
+            budget -= 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if descend && scans_markdown(&name) {
+                    dirs.push(name);
+                }
+            } else if name.to_lowercase().ends_with(".md")
+                && (file_type.is_file() || entry.path().is_file())
+            {
+                // The type `read_dir` already handed back answers for every
+                // regular file, which is every file in practice. `is_file`
+                // follows, deliberately and only for what that type called
+                // neither a file nor a directory: a symlinked markdown file is
+                // one bounded file and was already read before this walk
+                // existed. A symlinked *directory* fails both arms.
+                files.push(name);
+            }
+        }
+        // Folded, then the name itself. A key that is not injective would leave
+        // two entries that fold equal — `README.md` beside `readme.md`, both
+        // legal on ext4 — in `read_dir`'s order, which is a hash order that is
+        // not stable between runs, so which of the two survived the byte budget
+        // would change between launches. `pool::cmp_stamped`'s tie-break, for
+        // its reason.
+        files.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+        for name in files {
+            out.push(join_rel(&prefix, &name));
+        }
+        dirs.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+        for name in dirs.into_iter().rev() {
+            pending.push(join_rel(&prefix, &name));
+        }
+    }
+    (out, truncated)
+}
+
+/// `prefix/name`, or `name` at the session root.
+fn join_rel(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
 
 /// [`ref_sources`] over a plain directory — the half that is about files rather
 /// than about which session, so a test can hand it a folder.
 ///
-/// The single `read_dir` of the session root does double duty: it decides the
-/// shape and, for a flat session, *is* the file list. One read, one answer.
+/// The `read_dir` of the session root that decides the shape is its own: the
+/// shape is a question about names at one level, and the walk that follows needs
+/// each entry's type. Threading one listing through both would save a cached
+/// directory read and cost the shape signal its independence from the walk's
+/// exclusions.
 fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) {
     let top_level: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
@@ -1029,6 +1247,9 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) 
 
     let mut out: Vec<RefSource> = Vec::new();
     let mut budget = budget;
+    // A walk that stopped short and a budget that ran out are the same fact to
+    // the caller, so they arrive as one flag.
+    let mut incomplete = false;
 
     let mut take = |rel: String, path: &Path, budget: &mut usize| {
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -1047,39 +1268,52 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) 
 
     if shape == Shape::Flat {
         // Name order, which for logs is also date order — the filename carries
-        // `YYYY-MM-DD-HHMM` precisely so that a plain sort is chronological.
-        let mut names: Vec<String> = top_level
-            .iter()
-            .filter(|name| !name.starts_with('.') && name.to_lowercase().ends_with(".md"))
-            .filter(|name| dir.join(name).is_file())
-            .cloned()
-            .collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        for name in names {
+        // `YYYY-MM-DD-HHMM` precisely so that a plain sort is chronological —
+        // and each directory before the ones inside it, so a session still
+        // reads as its root plus whatever the operator filed away.
+        let (rels, walk_truncated) = markdown_rels(dir, true);
+        incomplete |= walk_truncated;
+        for rel in rels {
             if budget == 0 {
                 break;
             }
-            let path = dir.join(&name);
-            take(name, &path, &mut budget);
+            let path = dir.join(&rel);
+            take(rel, &path, &mut budget);
         }
-        return (out, budget == 0, shape);
+        return (out, incomplete || budget == 0, shape);
     }
 
     take(README.to_owned(), &dir.join(README), &mut budget);
-    for section in REF_DIRS {
-        let Ok(entries) = std::fs::read_dir(dir.join(section)) else {
+    // The rest of the root, beside the record (FR-286). Skipping the record
+    // itself is the whole of "not duplicated": one file is one entry, which is
+    // what the flat shape's `about.md` gets too. Folded, because a case-
+    // insensitive drive answers `README.md` with whatever spelling it holds and
+    // the record must not come back a second time under it.
+    let (root_names, root_truncated) = markdown_rels(dir, false);
+    incomplete |= root_truncated;
+    for name in root_names {
+        if budget == 0 {
+            break;
+        }
+        if name.eq_ignore_ascii_case(README) {
             continue;
-        };
-        // Name order inside a section: `prompts/` is numbered by the zone's own
-        // convention (`01-…`, `02-…`), and mtime order would scramble it.
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| entry.path().is_file())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| !name.starts_with('.') && name.to_lowercase().ends_with(".md"))
-            .collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        for name in names {
+        }
+        let path = dir.join(&name);
+        take(name, &path, &mut budget);
+    }
+
+    for section in REF_DIRS {
+        // The same listing as the root's, one directory down — a missing
+        // section is an empty one. Name order inside a section: `prompts/` is
+        // numbered by the zone's own convention (`01-…`, `02-…`), and mtime
+        // order would scramble it.
+        let (section_names, section_truncated) = markdown_rels(&dir.join(section), false);
+        // A missing section is not an unreadable one: `read_dir` on a path that
+        // does not exist is the flag's other cause, and a folder session with no
+        // `prompts/` is ordinary rather than short. Only a section that IS there
+        // and cannot be listed should say so — which is what `is_dir` asks.
+        incomplete |= section_truncated && dir.join(section).is_dir();
+        for name in section_names {
             if budget == 0 {
                 break;
             }
@@ -1089,7 +1323,7 @@ fn read_ref_sources(dir: &Path, budget: usize) -> (Vec<RefSource>, bool, Shape) 
         }
     }
 
-    (out, budget == 0, shape)
+    (out, incomplete || budget == 0, shape)
 }
 
 /// Whether a profile-relative path is inside a session folder of this root,
@@ -1578,6 +1812,606 @@ mod tests {
             vec!["AGENTS.md", "README.md"],
             "the navigation file declares no kind, and the residual README is \
              visible rather than merely survivable"
+        );
+    }
+
+    /// Markdown is legible wherever it sits (FR-285). A file the operator moved
+    /// into a directory he made is in the pool, carries that directory in its
+    /// `rel`, and is listed by whatever its tag says — and the three exclusions
+    /// are the only places the walk does not go.
+    #[test]
+    fn markdown_in_a_flat_sessions_subdirectories_is_read_and_the_exclusions_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in [
+            "spaces",
+            "log",
+            "log/older",
+            "artifacts",
+            "workspace",
+            ".hidden",
+        ] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("AGENTS.md", "---\ntags: []\n---\nhow to read this folder\n");
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write(
+            "spaces/plan.md",
+            "---\ntags: [task]\nstatus: todo\n---\n# Plan it\n",
+        );
+        write(
+            "log/2026-08-16-0900-note.md",
+            "---\ntags: [log]\n---\n# note\n\nthe sitting he filed\n",
+        );
+        write(
+            "log/older/2026-08-01-0900-first.md",
+            "---\ntags: [log]\n---\n# first\n",
+        );
+        write("artifacts/report.md", "the deliverable's own references");
+        write("workspace/scratch.md", "scratch that dies with the session");
+        write(".hidden/x.md", "furniture");
+        write("spaces/.draft.md", "furniture one level down");
+
+        let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Flat, "about.md declares the flat contract");
+        assert!(!truncated);
+        let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(
+            read,
+            vec![
+                "about.md",
+                "AGENTS.md",
+                "log/2026-08-16-0900-note.md",
+                "log/older/2026-08-01-0900-first.md",
+                "spaces/plan.md",
+            ],
+            "each directory's own files before the directories inside it, in \
+             folded name order; `artifacts/`, `workspace/` and a dotted \
+             directory are not read, and a dotfile is furniture at any depth"
+        );
+
+        let pool = keeper_core::sessions::pool::read_pool(
+            &files
+                .iter()
+                .map(|source| keeper_core::sessions::pool::PoolFile {
+                    rel: &source.rel,
+                    text: &source.text,
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            pool.tasks
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["spaces/plan.md"],
+            "the Tasks space lists it, and `rel` carries the subdirectory — so \
+             a `spaces/plan.md` and a root `plan.md` are two entries"
+        );
+        // Order, not merely membership. The log view is newest-first by the
+        // FILENAME, so a sitting filed one directory deeper is dated by its own
+        // name and not by the folder it sits in — and sorting this vector before
+        // asserting is exactly what used to hide `pool::group` ordering the
+        // whole `rel`. The board row keys on the same comparator, so the two
+        // surfaces are asserted together below.
+        assert_eq!(
+            pool.logs
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "log/2026-08-16-0900-note.md",
+                "log/older/2026-08-01-0900-first.md",
+            ],
+            "a `log/` the operator made is a real home: both sittings are in \
+             the log view rather than in no reader at all, newest first"
+        );
+        let (names, _truncated) = markdown_rels(session, true);
+        assert_eq!(
+            last_log_flat(session, &names),
+            ("2026-08-16".to_owned(), "the sitting he filed".to_owned()),
+            "and the row announces the sitting the log view lists first — one \
+             walk, one order, so the board and the detail cannot disagree"
+        );
+    }
+
+    /// The folder shape reads the markdown beside its record (FR-286) — the
+    /// owner's `references.md`, written at the root before Story 50.1 filed by
+    /// kind, becomes visible to References and to every space. The record stays
+    /// the record: one file, one entry.
+    #[test]
+    fn a_folder_sessions_root_markdown_is_read_and_the_record_is_not_duplicated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["refs", "prompts", "artifacts", "workspace"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("README.md", "---\ntags: []\n---\n# The session\n");
+        write(
+            "references.md",
+            "---\ntags: [ref]\n---\n# What this session points at\n",
+        );
+        write("inputs.md", "---\ntags: [ref]\n---\n# Root inputs\n");
+        write("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n");
+        write("prompts/01-house.md", "reusable text");
+        write("artifacts/report.md", "the deliverable's own references");
+        write("workspace/iter-3.md", "scratch that dies with the session");
+
+        let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Folder, "a README with refs/ and prompts/");
+        assert!(!truncated);
+        let read: Vec<&str> = files.iter().map(|file| file.rel.as_str()).collect();
+        assert_eq!(
+            read,
+            vec![
+                "README.md",
+                "inputs.md",
+                "references.md",
+                "refs/inputs.md",
+                "prompts/01-house.md",
+            ],
+            "the record first, then the rest of the root because that is where \
+             it sits, then the contract's own sections in the contract's order"
+        );
+        assert_eq!(
+            read.iter().filter(|rel| **rel == README).count(),
+            1,
+            "the record is taken once — by name, as the record — and the root \
+             listing does not hand it back a second time"
+        );
+
+        let pool = keeper_core::sessions::pool::read_pool(
+            &files
+                .iter()
+                .map(|source| keeper_core::sessions::pool::PoolFile {
+                    rel: &source.rel,
+                    text: &source.text,
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            pool.refs
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["inputs.md", "references.md", "refs/inputs.md"],
+            "`tag:ref` finds the orphan at the root, and a root `inputs.md` and \
+             a `refs/inputs.md` are two entries a space can both list"
+        );
+    }
+
+    /// Rows 4 and 7 of Story 51.7: the detail's own pool, under the folder
+    /// contract.
+    ///
+    /// A `task`-tagged file at a folder-shaped session's root is a board card —
+    /// this reader is what the board is drawn from, and it used to hand back
+    /// `Pool::default()` for this shape, so the owner's board was hidden with the
+    /// reason "a folder-shaped one has no pool to tag". Story 51.1 made that
+    /// false.
+    ///
+    /// And the record is not accused: `README.md` declares no kind, so a pool
+    /// that took it would name the session's own identity file as *unfiled*.
+    #[test]
+    fn the_detail_pool_finds_a_folder_sessions_tasks_and_leaves_its_record_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        for rel in ["refs", "prompts"] {
+            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
+        }
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write(
+            "README.md",
+            "# The session\n\n## Log\n\n### 2026-08-16 first\n",
+        );
+        write(
+            "ship-it.md",
+            "---\ntags: [task]\nstatus: todo\norder: 1.5\n---\n# Ship it\n",
+        );
+        write("notes.md", "# Something nobody filed\n");
+        write("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n");
+
+        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Folder);
+        let pool = detail_pool(&sources, shape);
+
+        assert_eq!(
+            pool.tasks
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ship-it.md"],
+            "the board's cards, on a shape whose board was hidden because it \
+             was said to have no pool to tag"
+        );
+        assert_eq!(
+            pool.unfiled
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"],
+            "root markdown declaring no kind is reported in this shape too, and \
+             the record is not in the list: it is the file keeper reads the \
+             session out of, not a file nobody filed"
+        );
+        assert!(
+            pool.about.is_empty(),
+            "and it is not carried in as an ordinary entry either"
+        );
+    }
+
+    /// The other half of the same reader: a flat session's pool is what it was.
+    /// Its record carries `tags: [about]`, so it needs no exclusion — and adding
+    /// one would have taken `about.md` out of the About space.
+    #[test]
+    fn the_detail_pool_leaves_a_flat_sessions_record_in_the_pool_where_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write("AGENTS.md", "how to read this folder\n");
+        write(
+            "ship-it.md",
+            "---\ntags: [task]\nstatus: todo\n---\n# Ship it\n",
+        );
+
+        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
+        assert_eq!(shape, Shape::Flat);
+        let pool = detail_pool(&sources, shape);
+
+        assert_eq!(
+            pool.about
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["about.md"]
+        );
+        assert_eq!(pool.tasks.len(), 1, "the board is unchanged");
+        assert_eq!(
+            pool.unfiled
+                .iter()
+                .map(|entry| entry.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AGENTS.md"],
+            "and so is the unfiled list, `AGENTS.md` included"
+        );
+    }
+
+    /// The board row's newest-log line follows the pool: the probe reads down
+    /// the same walk, and orders it by the clock the filename carries rather
+    /// than by the directory the file sits in.
+    #[test]
+    fn the_board_rows_newest_log_follows_the_pool_into_a_log_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("log")).expect("mkdir");
+        let write = |rel: &str, body: &str| {
+            std::fs::write(session.join(rel), body).expect("write");
+        };
+        write("AGENTS.md", "how to read this folder\n");
+        write("about.md", "---\ntags: [about]\n---\n# The session\n");
+        write(
+            "log/2026-08-15-0900-filed.md",
+            "---\ntags: [log]\n---\n# filed\n\nthe sitting he moved\n",
+        );
+        write(
+            "2026-08-17-0900-latest.md",
+            "---\ntags: [log]\n---\n# latest\n\nthe newest sitting\n",
+        );
+
+        let row = row_for(session, "active/2026-08-10-keeper", SessionStatus::Active)
+            .expect("a session directory projects to a row");
+        assert_eq!(
+            (row.last_log_date.as_str(), row.last_log_line.as_str()),
+            ("2026-08-17", "the newest sitting"),
+            "the newest sitting wins wherever the older one was filed — a path \
+             sort would have announced the one in `log/`"
+        );
+
+        // And a session whose logs are ALL filed away still has a row that says
+        // so, which is the half the root-only probe used to get wrong.
+        let second = tempfile::tempdir().expect("tempdir");
+        let filed = second.path();
+        std::fs::create_dir_all(filed.join("log")).expect("mkdir");
+        std::fs::write(filed.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        std::fs::write(
+            filed.join("log/2026-08-16-1200-only.md"),
+            "---\ntags: [log]\n---\n# only\n\nthe only sitting\n",
+        )
+        .expect("write");
+
+        let row = row_for(filed, "active/2026-08-16-filed", SessionStatus::Active)
+            .expect("a session directory projects to a row");
+        assert_eq!(
+            (row.last_log_date.as_str(), row.last_log_line.as_str()),
+            ("2026-08-16", "the only sitting"),
+        );
+    }
+
+    /// A walk that runs out of budget stops and says so: a truncated pool is
+    /// reported, never silently short.
+    #[test]
+    fn a_subtree_that_blows_the_budget_is_reported_rather_than_silently_short() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("notes/deeper/deepest")).expect("mkdir");
+        std::fs::write(session.join("AGENTS.md"), "x".repeat(40)).expect("write");
+        std::fs::write(
+            session.join("notes/deeper/deepest/long.md"),
+            "y".repeat(400),
+        )
+        .expect("write");
+
+        let (files, truncated, shape) = read_ref_sources(session, 100);
+        assert_eq!(shape, Shape::Flat);
+        assert_eq!(
+            files.len(),
+            1,
+            "the navigation file fits; the one below it that would blow the \
+             budget is not read"
+        );
+        assert!(truncated, "and the caller is told, not handed a prefix");
+    }
+
+    /// A session is not a vault index: 200 files across 12 directories is one
+    /// walk, inside the budget the scan always had, in a defined order.
+    #[test]
+    fn two_hundred_files_across_twelve_directories_are_one_walk_within_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::write(session.join("AGENTS.md"), "---\ntags: []\n---\nnav\n").expect("write");
+        let (folders, per_folder) = (12, 17);
+        for folder in 0..folders {
+            let sub = session.join(format!("d{folder:02}"));
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            for file in 0..per_folder {
+                std::fs::write(
+                    sub.join(format!("f{file:02}.md")),
+                    "---\ntags: [ref]\n---\n# a pointer\n",
+                )
+                .expect("write");
+            }
+        }
+
+        let (files, truncated, _shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert!(!truncated, "204 short files are nowhere near ten megabytes");
+        assert_eq!(files.len(), folders * per_folder + 1);
+        assert_eq!(files[0].rel, "AGENTS.md", "the root before the tree");
+        assert_eq!(files[1].rel, "d00/f00.md");
+        assert_eq!(
+            files.last().expect("a non-empty scan").rel,
+            "d11/f16.md",
+            "depth-first in folded name order, so the last directory's last \
+             file is last"
+        );
+    }
+
+    /// A symlinked directory would take the walk outside the session, so the
+    /// walk does not follow one: `read_dir` reports it as a symlink, which is
+    /// neither a directory to enter nor a file to read. A symlinked markdown
+    /// *file* is one bounded file and is still read, exactly as the root
+    /// listing read it before the walk existed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_not_followed_out_of_the_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("private")).expect("mkdir");
+        std::fs::write(outside.join("private/secret.md"), "not the session's").expect("write");
+        std::fs::write(outside.join("shared.md"), "linked in on purpose").expect("write");
+        let session = dir.path().join("session");
+        std::fs::create_dir_all(&session).expect("mkdir");
+        std::fs::write(session.join("AGENTS.md"), "how to read this folder\n").expect("write");
+        std::os::unix::fs::symlink(outside.join("private"), session.join("elsewhere"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(outside.join("shared.md"), session.join("shared.md"))
+            .expect("symlink");
+
+        let (files, _truncated, _shape) = read_ref_sources(&session, REF_SCAN_BUDGET);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AGENTS.md", "shared.md"],
+            "the linked directory is refused; the linked file is one file"
+        );
+    }
+
+    /// The one exclusion list, said once, so a verb that offers to create a
+    /// directory can ask the reader whether the reader will look in it.
+    #[test]
+    fn the_scan_names_the_directories_it_does_not_enter() {
+        assert!(!scans_markdown(ARTIFACTS_DIR), "output, not the session");
+        assert!(!scans_markdown(WORKSPACE_DIR), "scratch, AD-113");
+        assert!(!scans_markdown(".obsidian"), "furniture");
+        assert!(
+            !scans_markdown("Artifacts") && !scans_markdown("Workspace"),
+            "and folded: on the volume keeper ships on `Artifacts` IS \
+             `artifacts`, so an exclusion that held for one spelling would put \
+             scratch and promoted output in the pool"
+        );
+        assert!(
+            scans_markdown("spaces") && scans_markdown("log"),
+            "a directory the operator makes is a real home"
+        );
+        assert_eq!(
+            UNSCANNED_DIRS.len(),
+            2,
+            "two names and a prefix rule — a third name would need its own reason"
+        );
+    }
+
+    /// A directory keeper cannot list is not a directory with no markdown.
+    /// Every file under it is missing from the pool, from every space evaluated
+    /// over it and from the *Unfiled* notice, so the scan reports itself short
+    /// rather than handing back a list that looks whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_scan_cannot_list_is_reported_rather_than_silently_short() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::create_dir_all(session.join("spaces")).expect("mkdir");
+        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        std::fs::write(
+            session.join("spaces/plan.md"),
+            "---\ntags: [task]\n---\n# Plan\n",
+        )
+        .expect("write");
+        let locked = session.join("spaces");
+        let restore = |mode: u32| {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        restore(0o000);
+        // uid 0 ignores the mode bits, so on a machine that runs its tests as
+        // root there is no unreadable directory to observe. Put it back and say
+        // nothing, rather than assert a property this machine cannot have.
+        if std::fs::read_dir(&locked).is_ok() {
+            restore(0o755);
+            return;
+        }
+
+        let (files, truncated, shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        restore(0o755);
+
+        assert_eq!(shape, Shape::Flat);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["about.md"],
+            "the task under the unreadable directory is in no pool"
+        );
+        assert!(
+            truncated,
+            "and the caller is told, so a board that lost a card can say why"
+        );
+    }
+
+    /// Two names in one directory that differ only in case are two entries, and
+    /// their order is the walk's rather than `read_dir`'s — which decides which
+    /// of the two survives the byte budget on a session near it.
+    ///
+    /// Under a sort key that folds both to one string the tie is left in hash
+    /// order, and this assertion becomes a coin flip on ext4.
+    #[test]
+    fn two_names_that_differ_only_in_case_are_ordered_by_the_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        std::fs::write(session.join("Plan.md"), "---\ntags: [task]\n---\n# Upper\n")
+            .expect("write");
+        // The volume keeper ships on folds case and cannot hold both: there the
+        // second write IS the first file, under the name the directory already
+        // holds, and one entry is the right answer rather than a skipped test.
+        let folds = session.join("plan.md").exists();
+        std::fs::write(session.join("plan.md"), "---\ntags: [task]\n---\n# Lower\n")
+            .expect("write");
+
+        let (rels, truncated) = markdown_rels(session, true);
+        assert!(!truncated);
+        if folds {
+            assert_eq!(
+                rels,
+                vec!["about.md".to_owned(), "Plan.md".to_owned()],
+                "one file, one entry, under the spelling the drive holds"
+            );
+            return;
+        }
+        assert_eq!(
+            rels,
+            vec![
+                "about.md".to_owned(),
+                "Plan.md".to_owned(),
+                "plan.md".to_owned(),
+            ],
+            "folded equal, so the raw name breaks the tie the same way on every \
+             run and on every machine"
+        );
+    }
+
+    /// The walk is bounded by entries as well as by bytes, and says when the
+    /// bound is what stopped it. Ten megabytes of byte budget is no answer to a
+    /// tree of short files: the budget is spent after the walk has already
+    /// materialised every path, once per board row.
+    #[test]
+    fn a_tree_past_the_entry_budget_stops_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        // Spread wide enough that the stop lands mid-walk rather than at the
+        // root, and one folder past the budget: dirents are what is counted, so
+        // the directories count too.
+        let per_folder = 200;
+        let folders = MARKDOWN_WALK_BUDGET / per_folder + 1;
+        for folder in 0..folders {
+            let sub = session.join(format!("d{folder:03}"));
+            std::fs::create_dir_all(&sub).expect("mkdir");
+            for file in 0..per_folder {
+                std::fs::write(sub.join(format!("f{file:03}.md")), "x").expect("write");
+            }
+        }
+
+        let (rels, truncated) = markdown_rels(session, true);
+        assert!(truncated, "a walk that stopped short says that it stopped");
+        assert!(
+            rels.len() < folders * per_folder,
+            "and it stopped rather than reading the whole tree — {} of {}",
+            rels.len(),
+            folders * per_folder + 1
+        );
+        assert_eq!(rels[0], "about.md", "what it did read is in reading order");
+
+        let (_files, reported, _shape) = read_ref_sources(session, REF_SCAN_BUDGET);
+        assert!(
+            reported,
+            "and the pool carries the fact: bytes to spare, and the list is \
+             still a prefix"
+        );
+    }
+
+    /// Depth is not a limit the walk imposes on the operator's own tree: the
+    /// worklist is on the heap and the only bound is the entry budget, so a file
+    /// at the bottom of a chain he made is in the pool, in reading order.
+    #[test]
+    fn a_deeply_nested_file_is_reached_in_reading_order() {
+        const DEPTH: usize = 150;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = dir.path();
+        std::fs::write(session.join("about.md"), "---\ntags: [about]\n---\n# S\n").expect("write");
+        let mut deep = session.to_path_buf();
+        for _ in 0..DEPTH {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        std::fs::write(deep.join("bottom.md"), "---\ntags: [ref]\n---\n# Deep\n").expect("write");
+
+        let (rels, truncated) = markdown_rels(session, true);
+        assert!(
+            !truncated,
+            "a chain of {DEPTH} directories is well inside the entry budget"
+        );
+        assert_eq!(
+            rels,
+            vec![
+                "about.md".to_owned(),
+                format!("{}/bottom.md", ["d"; DEPTH].join("/")),
+            ],
+            "the root's own markdown first, then the file at the bottom"
         );
     }
 }

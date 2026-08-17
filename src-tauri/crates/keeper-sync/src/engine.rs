@@ -466,6 +466,9 @@ pub struct Engine {
     /// correctness requirement for keeper itself, so a missing path degrades
     /// rather than fails.
     filter_program: Option<PathBuf>,
+    /// Whether [`Self::filter_program`] answered the `lfs filter-process`
+    /// handshake, and may therefore be registered as `filter.lfs.process`.
+    filter_serves_process: bool,
     sinks: Mutex<Vec<(u64, ProgressSink)>>,
     next_sink: AtomicU64,
     interrupt: Arc<AtomicBool>,
@@ -605,6 +608,13 @@ impl Engine {
             // `current_exe` is the daemon in a CLI run and the app binary in a
             // desktop run; both understand `lfs clean|smudge`.
             filter_program: std::env::current_exe().ok(),
+            // ...but "whatever executable linked the engine" understands the
+            // long-running protocol only if it says so, and a `process` driver
+            // that cannot be launched wedges the folder rather than degrading
+            // (DW-140). Asked once, here, rather than per repository open.
+            filter_serves_process: std::env::current_exe()
+                .ok()
+                .is_some_and(|exe| lfs::filter::serves_process(&exe)),
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -3055,7 +3065,11 @@ impl Engine {
             );
             git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
         };
-        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+        git::repo::enforce_local_config_with_filter(
+            &repo,
+            self.filter_program.as_deref(),
+            self.filter_serves_process,
+        )?;
         self.reconcile_sparse_cone(profile, &repo)?;
         Ok(repo)
     }
@@ -3145,7 +3159,11 @@ impl Engine {
         trust_full: bool,
     ) -> Result<gix::Repository> {
         let repo = git::repo::open(&profile.local_path, trust_full)?;
-        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+        git::repo::enforce_local_config_with_filter(
+            &repo,
+            self.filter_program.as_deref(),
+            self.filter_serves_process,
+        )?;
         // A kill between `gix::init` and the config write in `adopt` leaves a
         // repository with no remote, and this branch — taken from then on,
         // because `.git` exists — would otherwise fail every future sync with

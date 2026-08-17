@@ -38,7 +38,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { useNotesBody } from "@/hooks/use-notes-body";
-import { type NoteWriteVm, notesGallery, notesTagTree } from "@/lib/ipc/client";
+import { type NoteWriteVm, notesGallery, notesRename, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
 import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
@@ -452,10 +452,8 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         preview,
         wikilink,
         tags,
-        slash,
         indent,
-        emoji,
-        format,
+        writing,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -466,10 +464,12 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         import("./editor/live-preview"),
         import("./editor/wikilink"),
         import("./editor/tag-complete"),
-        import("./editor/slash-menu"),
         import("./editor/indent-keymap"),
-        import("./editor/emoji-complete"),
-        import("./editor/format-commands"),
+        // The slash menu, emoji and the toolbar's translation, which this editor
+        // no longer owns: Story 50.3 moved them into one module a file viewer
+        // imports too, so a session log gets the same three tools rather than a
+        // second copy of them.
+        import("./editor/writing-tools"),
       ]);
       if (disposed) {
         return;
@@ -555,21 +555,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
               },
             ]),
             markdown.markdown({ base: markdown.markdownLanguage }),
-            autocomplete.autocompletion({
-              override: [
-                wikilink.wikilinkSource(vaultId),
-                tags.tagCompleteSource(async () => {
-                  cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
-                  return cachedTags;
-                }),
-                slash.slashMenuSource(),
-                emoji.emojiCompleteSource(),
-              ],
-            }),
-            // The other half of Story 45.11: a shortcode somebody typed in full
-            // becomes its character as the closing colon lands, so `:tada:`
-            // never has to be recognised as a menu interaction.
-            emoji.emojiShortcodeCommit(),
+            writing.markdownWritingTools([
+              wikilink.wikilinkSource(vaultId),
+              tags.tagCompleteSource(async () => {
+                cachedTags ??= tags.tagPaths((await notesTagTree(vaultId)).nodes);
+                return cachedTags;
+              }),
+            ]),
             preview.livePreview({
               vaultId,
               assetUrl: (rel) =>
@@ -649,7 +641,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         // formatting action IS the user's edit, so it belongs in the undo
         // history and it has to reach Rust through the update listener.
         runFormat: (action: FormatAction) => {
-          format.formatCommand(action)(editorView);
+          writing.runFormatAction(editorView, action);
         },
         focus: () => editorView.focus(),
         destroy: () => editorView.destroy(),
@@ -700,6 +692,36 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
       // its result is the editor's new base and the block Rust hands back — `updated`
       // stamped — is the block the panel now renders.
       markSaved(vaultId, noteId, text, write);
+    },
+    [vaultId, noteId],
+  );
+
+  /**
+   * A retitle renames the note's file (FR-97), which until now nothing asked for.
+   *
+   * `notes_rename` has been built, registered and wrapped since FR-97 and had
+   * **no call site anywhere in `src/`** — so every note in every vault has been
+   * carrying whatever filename it was created with, however many times its title
+   * changed. This is the call site.
+   *
+   * **Safe because the id is the identity, and the subscription proves it.**
+   * `notes_open` follows its note by ULID and answers a moved file with
+   * `NoteBodyBatch::Renamed`, the panel target is `{kind:"note", noteId}`, and
+   * links, pins and unread marks all resolve through the same id. So the rename
+   * needs no pointer rewriting and the editor does not even reload — which is the
+   * opposite of a session file, whose path *is* its identity and whose rename is
+   * therefore one journaled plan with a link rewrite in it.
+   *
+   * `null` while the pane has no note: there is nothing to rename, and the panel
+   * treats that as "this address has no rename" rather than calling with an empty
+   * id.
+   */
+  const renameNoteFile = useCallback(
+    async (title: string) => {
+      if (noteId === null) {
+        return;
+      }
+      await notesRename(vaultId, noteId, title);
     },
     [vaultId, noteId],
   );
@@ -1043,6 +1065,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
               subscriptionId={subscriptionId}
               baseRev={rev}
               onSaved={adoptPanelWrite}
+              rename={noteId === null ? null : renameNoteFile}
             />
           ) : (
             <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />

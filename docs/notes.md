@@ -143,6 +143,32 @@ keeper is a note keeper has taken hostage.
 Sessions use all three, but nothing about them is session-specific: a board is a widget
 that happens to be useful in a session, not a session feature that leaked.
 
+## The writing tools
+
+Three affordances sit over the note body: the **format toolbar** above it, the `/`
+**command menu** at the start of an empty line, and `:shortcode:` **emoji** — either
+picked from the menu or typed straight through, where the closing colon turns `:tada:`
+into 🎉.
+
+Since Story 50.3 those three are not the note editor's private property. They live in one
+module, and keeper's file editor imports the same one — so a markdown file opened from
+Files or from a session has the same toolbar, the same `/` commands and the same emoji, to
+the byte. A second copy would have been a second set of behaviours nobody noticed drifting
+apart.
+
+What stayed here is what needs a **vault**: wikilink and tag completion, `![[…]]` embeds
+and the CSV table are all addressed by a vault plus a vault-relative path, and a file
+outside a vault has neither.
+
+**Live preview did not stay.** This paragraph used to say it had, because a note autosaves
+against a subscription and a file is saved by hand — but that is a fact about *saving*,
+not about *rendering*. Since Story 51.5 a markdown file has a third tab, **Note**, and it
+is this same live-preview layer over the file's own buffer: rendered as you type, in Files
+and in a session exactly as in a note. The distinction the old sentence was protecting is
+intact, because it was never about the renderer — a note saves itself, and Note mode over
+a file writes when you press `⌘S` or Save and at no other moment. One renderer, two save
+contracts, and neither surface borrowed the other's.
+
 ## Finding text
 
 `⌘F` finds inside the note you have open — the editor's own find, so it reaches text below

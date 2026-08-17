@@ -22,4 +22,46 @@ files: Array<SessionSpaceFileVm>,
  * Its query would not parse, already worded. `files` is then empty, and the
  * section renders the sentence rather than a suspiciously complete list.
  */
-error: string | null, };
+error: string | null, 
+/**
+ * Why this space offers no create, already worded — or `None` when it has
+ * one to offer, and when the refusal is nothing a person needs told.
+ *
+ * Two refusals reach this field, and the wording of both is Rust's
+ * ([`crate::sessions::spaces::create_refused`]). THIS SESSION's contract
+ * keeping nowhere to put the kind is
+ * [`crate::sessions::shape::KindHasNoHome`]'s sentence, projected rather
+ * than restated: [`SessionSpaceVm::new_file_kind`] answers what a create
+ * here would write and is built for the ZONE, so it cannot know a shape,
+ * and this payload is per session. The QUERY asking for more than one
+ * thing is [`crate::sessions::spaces::Refusal::ManyTerms`]'s — the field
+ * used to be silent for it, because it was only computed when the query
+ * HAD produced a creatable kind, which is why the About space rendered
+ * neither a button nor a reason (Story 51.7).
+ *
+ * Carrying the sentence rather than a flag is the point: the refusals are
+ * composed once each, and a surface that received `true` would have to
+ * write a second wording — which is how "migrate the session" and
+ * "migrate it" become two products' vocabulary for one rule.
+ *
+ * A create is **absent** where this is `Some`, never present-and-disabled,
+ * and the sentence goes where the button would have been.
+ */
+noHome: string | null, 
+/**
+ * Whether the verb that applies here instead of a create is opening the
+ * session's record (FR-299).
+ *
+ * True exactly where the space's query names the record — one per session,
+ * under either contract, and keeper edits it rather than making a second.
+ * Never true where a create is offered, which is what lets the surface put
+ * this verb in the create's own slot.
+ *
+ * A flag here and a sentence above, deliberately: this decides whether a
+ * VERB applies, not how a refusal is worded, and the file it opens is one
+ * fixed name at a known place that the header already names from
+ * [`SessionDetailVm::shape`]. Sending a path would be a second answer to
+ * "where is the record", against the one AD-65 exception that surface is
+ * documented to keep.
+ */
+openRecord: boolean, };

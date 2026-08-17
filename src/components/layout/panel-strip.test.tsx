@@ -27,6 +27,7 @@ vi.mock(import("@/components/notes/note-editor"), async (importOriginal) => ({
 const syncBrowse = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
+const syncReadText = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncBrowse: (id: unknown, subpath: unknown) => syncBrowse(id, subpath),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
@@ -41,6 +42,16 @@ vi.mock("@/lib/ipc/client", () => ({
   // an empty body: naming a folded strip is its own story's claim, and this
   // one only needs the call not to explode when a note panel mounts.
   notesBodyRead: vi.fn(async () => ({ text: "", frontmatter: "", rev: "r0", path: null })),
+  // Story 50.3's fix reads the listing row's write verdict and hands it to the
+  // text viewer, so a `.md` panel now has something worth asserting. Unset by
+  // default — `mockReset` leaves it answering `undefined`, which the loader
+  // catches into its error sentence, exactly the state every panel test here
+  // has always rendered for a `.md`.
+  syncReadText: (id: unknown, subpath: unknown) => syncReadText(id, subpath),
+  syncWriteEntry: vi.fn(async () => undefined),
+  syncReadFrontmatter: vi.fn(async () => ""),
+  syncWriteFrontmatter: vi.fn(async () => ""),
+  tagsVocabulary: vi.fn(async () => ({ entries: [] })),
 }));
 
 import {
@@ -123,6 +134,7 @@ beforeEach(() => {
   syncBrowse.mockReset();
   syncOpenEntry.mockReset();
   revealPath.mockReset();
+  syncReadText.mockReset();
 });
 
 describe("the panel strip", () => {
@@ -163,6 +175,74 @@ describe("the panel strip", () => {
     expect(within(frame).getByTestId(DOCUMENT_VIEWER_TESTID)).toBeInTheDocument();
     // And the frame names the panel for a reader jumping between them.
     expect(frame).toHaveAttribute("aria-label", "report.pdf");
+  });
+
+  it("hands the viewer the row's write verdict, so a refused file opens read-only", async () => {
+    // **The wire Story 50.3's fix turns on, and the one nothing else can see.**
+    // `FilePanelBody` composes the `ViewerFile`, and every viewer test builds
+    // its own — so a build where this function dropped `writeRefusal` would
+    // leave the frame's own suite green while a session's `workspace/` file got
+    // the toolbar, the slash menu and a Save button back. Asserted here in both
+    // directions, over one sentence Rust composed.
+    const fence =
+      "60-sessions/active/2026-08-10-keeper/workspace/notes.md is inside a session's workspace " +
+      "— scratch that is not versioned, not synced, and dies with the session. keeper reads it " +
+      "but never writes there; promote the file into the session's artifacts instead.";
+    syncReadText.mockResolvedValue({
+      text: "# Scratch\n",
+      sizeBytes: 10,
+      sizeLabel: "10 bytes",
+      oversize: false,
+      binary: false,
+      detail: null,
+    });
+    syncBrowse.mockResolvedValue(
+      listed("60-sessions/active/2026-08-10-keeper/workspace", [
+        {
+          ...entry("notes.md", "60-sessions/active/2026-08-10-keeper/workspace/notes.md"),
+          write: { writable: false, reason: fence, caveat: null },
+        },
+      ]),
+    );
+    panelsStore.getState().setActiveTarget({
+      kind: "file",
+      profileId: "p1",
+      relativePath: "60-sessions/active/2026-08-10-keeper/workspace/notes.md",
+    });
+
+    await mount();
+
+    // Rust's sentence, verbatim, and no Save to press.
+    expect(await screen.findByText(fence)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  });
+
+  it("hands the viewer no refusal for a row keeper will write, so Save is there", async () => {
+    // The other direction, without which the assertion above passes on a build
+    // that hard-codes a refusal for every file.
+    syncReadText.mockResolvedValue({
+      text: "# Notes\n",
+      sizeBytes: 9,
+      sizeLabel: "9 bytes",
+      oversize: false,
+      binary: false,
+      detail: null,
+    });
+    syncBrowse.mockResolvedValue(
+      listed("docs", [
+        {
+          ...entry("notes.md", "docs/notes.md"),
+          write: { writable: true, reason: null, caveat: null },
+        },
+      ]),
+    );
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "docs/notes.md" });
+
+    await mount();
+
+    expect(await screen.findByRole("button", { name: "Save" })).toBeInTheDocument();
   });
 
   it("hands a media viewer the path the listing produced, not the file's name", async () => {

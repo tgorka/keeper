@@ -604,6 +604,106 @@ fn value_of(keys: &[String], key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// How long the probe waits for a binary to say it is a filter.
+///
+/// Generous for a local process that only has to echo two lines, and short
+/// enough that a binary which answers by opening a window instead — an older
+/// build, reached through a config a newer one wrote — costs a startup pause
+/// rather than a hang.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Does `program` actually serve `lfs filter-process`?
+///
+/// # Why this is asked rather than assumed
+///
+/// Registering `filter.lfs.process` is not a hint — it is a promise, and
+/// gitoxide collects on it hard: `maybe_launch_process` fails *before* any
+/// driver leniency is consulted, so a driver that cannot be launched fails
+/// `status` outright whatever `filter.lfs.required` says. Nothing then commits,
+/// the index is never rewritten, and the same entry is re-read on the next pass
+/// forever. DW-206 measured that state in the field: 90 430 identical log lines,
+/// unclearable by restart or reinstall.
+///
+/// [`crate::engine::Engine::open`] registers `std::env::current_exe()`, which is
+/// the app in a desktop run and the daemon in a CLI one — both of which serve
+/// this. But "whatever executable linked the engine" has been wrong before:
+/// DW-121 is the record of the app binary being registered for two verbs it did
+/// not implement, silently, for months. A test harness, a benchmark, a future
+/// CLI — each is an executable that can link `Engine` without ever having heard
+/// of a filter, and under a `process` driver that mistake is no longer silent,
+/// it is fatal to the folder.
+///
+/// So the promise is verified before it is made: one handshake against a
+/// throwaway repository, once per engine. A binary that answers correctly gets
+/// the `process` key; anything else — wrong output, a crash, a hang, a GUI —
+/// gets the single-shot pair alone, which degrades to pointer text instead of
+/// wedging the folder.
+pub fn serves_process(program: &Path) -> bool {
+    use std::process::{Command, Stdio};
+
+    let Ok(probe) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(program)
+        .arg("lfs")
+        .arg("filter-process")
+        .arg("--repo")
+        .arg(probe.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Never inherited: a probe that printed to keeper's stderr would put a
+        // filter's diagnostics in the app log every time an engine opens.
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    // The conversation runs on a thread so a binary that never answers costs a
+    // timeout rather than the process it was spawned from.
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let spoken = (|| -> Result<bool> {
+            pktline::write_line(&mut stdin, "git-filter-client")?;
+            pktline::write_line(&mut stdin, "version=2")?;
+            pktline::write_flush(&mut stdin)?;
+            stdin
+                .flush()
+                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
+            let hello = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
+            if !hello.iter().any(|line| line == "git-filter-server")
+                || !hello.iter().any(|line| line == "version=2")
+            {
+                return Ok(false);
+            }
+            pktline::write_line(&mut stdin, "capability=clean")?;
+            pktline::write_line(&mut stdin, "capability=smudge")?;
+            pktline::write_flush(&mut stdin)?;
+            stdin
+                .flush()
+                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
+            let capabilities = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
+            // Dropping stdin ends the child's loop cleanly, which is the same
+            // shutdown git performs.
+            drop(stdin);
+            Ok(capabilities.iter().any(|line| line == "capability=clean")
+                && capabilities.iter().any(|line| line == "capability=smudge"))
+        })();
+        let _ = tx.send(spoken.unwrap_or(false));
+    });
+
+    let answered = rx.recv_timeout(PROBE_TIMEOUT).unwrap_or(false);
+    // Unconditional: a child that answered has already been told to stop by the
+    // dropped stdin, and one that hung has to be stopped by us.
+    let _ = child.kill();
+    let _ = child.wait();
+    answered
+}
+
 /// Parse the filter invocation out of a raw argument list, if it is one.
 ///
 /// Returns `None` for any argv that is not a filter call, which is the answer a

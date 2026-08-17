@@ -3219,3 +3219,36 @@ reason: 46.12 made two panels on one note share a document by refcount. A captur
   each saves through the same Rust writer and last-write-wins, which is the pre-46.12 behaviour
   and not a new defect; it becomes one the moment either side grows an unsaved-state promise.
 status: open
+
+### DW-206: A foreign `filter.lfs.process` still reaches the clone's own checkout, because `gix::clone::PrepareCheckout` hands out no mutable repository.
+
+origin: found while fixing the field incident of 2026-08-13 (a global `git lfs install` driver
+  failing every `status`), 2026-08-16
+location: `src-tauri/crates/keeper-sync/src/git/repo.rs` — `clone` (`:560-573`), against
+  `drop_foreign_lfs_driver` (`:80`) and `gix::clone::PrepareCheckout::main_worktree`
+reason: `drop_foreign_lfs_driver` removes a non-repository `filter "lfs"` section from the
+  merged in-memory config of a repository handle, and `open` calls it before anybody reads a
+  file — so every status, commit and pull pass is protected. The initial clone is not. gix
+  materializes the worktree from inside `PrepareCheckout`, whose only accessor is
+  `repo(&self) -> &Repository` (gix 0.86, `clone/checkout.rs:156`), and the surgery needs
+  `&mut` for `config_snapshot_mut`. `fetch_then_checkout` builds that value with private
+  fields, so a caller cannot construct one from a `fetch_only` repository either. The
+  consequence is narrow but real: on a machine whose global config names `git-lfs` and whose
+  `PATH` (Finder's, on a desktop launch) does not have it, the FIRST clone of a repository
+  carrying LFS-tracked paths fails with `checkout failed: … Process handshake …` instead of
+  leaving pointer text for keeper's own materialization pass. Every later pass on the same
+  folder is fine, and the message names the cause, so this is a bad first minute rather than a
+  stuck folder.
+  Three routes, none free. (a) Do the checkout ourselves after `fetch_only`: needs
+  `gix_worktree_state::checkout` plus the options gix assembles in `Cache::checkout_options`,
+  which is `pub(crate)` — re-deriving validation, permissions and symlink handling is exactly
+  the code most expensive to get wrong. (b) Pass `open::Options::filter_config_section` (a
+  `fn(&Metadata) -> bool`) through `clone::PrepareFetch::new` so no global section is trusted:
+  one line, but the predicate cannot see the section NAME, so it also drops global `http.*`
+  (proxy, sslVerify), url rewrites and credential helpers for the one operation that talks to
+  the network — a silent regression for anyone behind a proxy. (c) Ask upstream for
+  `PrepareCheckout::repo_mut()`, or for the two gix behaviours that make this bite at all:
+  drivers merged by name across scopes the way git merges them, and an empty `process` treated
+  as absent (git's `apply_filter` tests `*ca->drv->process`, gix's `maybe_launch_process` tests
+  only `Some`). (c) is the honest fix and is not ours to schedule.
+status: open

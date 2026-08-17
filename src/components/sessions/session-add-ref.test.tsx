@@ -283,6 +283,55 @@ describe("SessionAddRef", () => {
     expect(sentRequest().file).toBe("references.md");
   });
 
+  /**
+   * Matrix row 11 (Story 50.1, FR-279): the shape-aware destination, end to
+   * end through this dialog.
+   *
+   * A folder-shaped session keeps its references in `refs/` — the ONLY
+   * directory that shape's pool reads back — so `sessions_ref_candidates`
+   * answers `refs/references.md` and this component must carry that string to
+   * `sessions_ref_add` with the segment intact. Composing a path here would be
+   * a second answer to where a file lives (AD-65), and dropping the segment
+   * would write the file into the session ROOT, where no space and no *Unfiled*
+   * notice can see it: the exact defect Story 50.1 exists to fix.
+   *
+   * **Every other fixture in this file answers the bare `references.md`**, so
+   * before this case the suite passed unchanged on a build with 50.1's
+   * `default_target` block reverted. That is what left the seeded-title defect
+   * — `title: refs/references` in the frontmatter and `# refs/references` as
+   * the H1 — with nothing to catch it; the basename is taken in
+   * `sessions_ipc::sessions_ref_add` now, and the destination this asserts is
+   * that function's input.
+   */
+  it("row 11: carries a folder-shaped session's refs/ destination through untouched", async () => {
+    sessionsRefCandidates.mockResolvedValue({
+      candidates: candidates(),
+      // Nothing in the pool yet, so the offered default is a file keeper would
+      // have to create — the case that seeds a title.
+      targets: [],
+      defaultTarget: "refs/references.md",
+      truncated: false,
+    });
+    const { dialog } = await opened();
+
+    // Offered, marked as one that does not exist, and spelled with its
+    // directory: the menu shows the destination rather than a bare filename
+    // that would read as the session root.
+    const menu = within(dialog).getByLabelText(SESSION_ADD_REF_FILE_LABEL);
+    expect(
+      within(menu as HTMLElement)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([`refs/references.md${SESSION_ADD_REF_NEW_FILE_SUFFIX}`]);
+
+    fireEvent.click(
+      within(dialog).getByTestId(`${SESSION_ADD_REF_ROW_TESTID}-artifacts/report.pdf`),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: SESSION_ADD_REF_CONFIRM }));
+    await waitFor(() => expect(sessionsRefAdd).toHaveBeenCalled());
+    expect(sentRequest().file).toBe("refs/references.md");
+  });
+
   it("keeps the file the operator chose when the list is read again", async () => {
     sessionsRefCandidates.mockResolvedValue({
       candidates: candidates(),

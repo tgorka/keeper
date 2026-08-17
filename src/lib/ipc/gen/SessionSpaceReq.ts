@@ -25,4 +25,20 @@ sort: string, icon: string | null,
 /**
  * Rail position; zero writes no key, because zero means unpositioned.
  */
-order: number, };
+order: number, 
+/**
+ * How the section opens when nobody has folded it by hand; `null` writes no
+ * key (Story 51.3).
+ *
+ * Nullable rather than a plain boolean for [`SessionSpaceVm::folded`]'s
+ * reason, and the form must send back what it read: this request is the
+ * third hop of the chain that saves a space, and `render_edit` REPLACES the
+ * whole `keeper:` map — a request that dropped this field would delete the
+ * operator's answer on the next unrelated Save.
+ */
+folded: boolean | null, 
+/**
+ * How many rows the section renders; `null` writes no key, and zero is not
+ * a legal cap (Story 51.3).
+ */
+rows: number | null, };

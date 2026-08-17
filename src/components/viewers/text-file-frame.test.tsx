@@ -35,6 +35,17 @@ vi.mock("@/lib/ipc/client", () => ({
   syncOpenEntry: vi.fn(async () => undefined),
   syncReadText: vi.fn(),
   syncWriteEntry: vi.fn(),
+  // Story 50.4's panel reaches the client through the frame's import graph now.
+  // A factory that omits an export makes the IMPORT throw, not the call, so
+  // every wrapper `properties-panel` names has to be here even for the tests
+  // that never mount it.
+  notesSave: vi.fn(),
+  recordingNoteTargets: vi.fn(async () => null),
+  recordingOpenPath: vi.fn(async () => undefined),
+  recordingSessionMeta: vi.fn(),
+  tagsVocabulary: vi.fn(async () => ({ entries: [] })),
+  syncReadFrontmatter: vi.fn(async () => ""),
+  syncWriteFrontmatter: vi.fn(async () => ""),
 }));
 
 import {
@@ -42,10 +53,12 @@ import {
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
 } from "@/components/layout/pane-header";
+import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import {
   FILE_SAVE_CLEAN_TITLE,
   FILE_SAVE_LABEL,
   FILE_SAVE_SIZERS,
+  type FilePropertiesCoordinates,
   fileSaveWord,
   TextFileFrame,
 } from "./text-file-frame";
@@ -93,17 +106,28 @@ function state(over: Partial<UseTextFileResult> = {}): UseTextFileResult {
     reload: vi.fn(async () => {}),
     error: null,
     loading: false,
+    // Which file the loader read. The frame does not decide it and does not read
+    // it — it hands it to the views, which key their editors on it.
+    loadedFrom: { profileOrVaultId: "p1", relativePath: "60-sessions/active/s/README.md" },
     ...over,
   };
 }
 
-function mount(over: Partial<UseTextFileResult> = {}, entry: ViewerEntry = MARKDOWN): RenderResult {
+/** The sync-profile address a Files panel would hand over (Story 50.4). */
+const ADDRESS = { profileId: "p1", relativePath: "60-sessions/active/s/README.md" };
+
+function mount(
+  over: Partial<UseTextFileResult> = {},
+  entry: ViewerEntry = MARKDOWN,
+  properties: FilePropertiesCoordinates | null = null,
+): RenderResult {
   return render(
     <TextFileFrame
       fileName="readme.md"
       entry={entry}
       state={state(over)}
       csv={null}
+      properties={properties}
       preview={{ vaultId: null }}
     />,
   );
@@ -216,6 +240,7 @@ describe("the Save control", () => {
         entry={MARKDOWN}
         state={state({ vm: null, error: "keeper could not read gone.md." })}
         csv={null}
+        properties={null}
         preview={{ vaultId: null }}
       />,
     );
@@ -263,6 +288,7 @@ describe("the bar the Save control sits in", () => {
         entry={MARKDOWN}
         state={state({ dirty: false })}
         csv={null}
+        properties={null}
         preview={{ vaultId: null }}
       />,
     );
@@ -303,5 +329,144 @@ describe("the bar the Save control sits in", () => {
     // stays a banner rather than becoming the caption: the status slot is a fixed
     // box, and everything to its right is standing on that.
     expect(bar()?.contains(alert)).toBe(false);
+  });
+});
+
+/**
+ * Story 50.4's half of the frame: WHETHER a file's own properties are offered.
+ *
+ * What they say, and every rule about what may be edited, is
+ * `properties-panel`'s and is asserted there. What this frame owes is that the
+ * panel appears exactly where a save can land over prose, and nowhere else — the
+ * same equality 50.3's writing tools stand on.
+ */
+describe("a file's own properties", () => {
+  it("are offered for a writable markdown file the surface can address", async () => {
+    mount({}, MARKDOWN, ADDRESS);
+
+    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+  });
+
+  it("row 9: are not offered over a CSV, which has no frontmatter to show", () => {
+    // The registry's own CSV row, verbatim: a text viewer, writable, and not
+    // markdown. A `.csv` has no frontmatter, so there is nothing to show.
+    const csvRow: ViewerEntry = {
+      viewer: "text",
+      format: "csv",
+      label: "CSV",
+      icon: "file-table",
+      rendered: "table",
+      language: "csv",
+      writable: true,
+    };
+    mount({}, csvRow, ADDRESS);
+
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+  });
+
+  it("are not offered where no save could follow them", () => {
+    // The format keeper will not rewrite, and the file only the first megabyte
+    // of which was read. Both already take the Save button away; a panel whose
+    // every control announced its own refusal would be strictly worse than not
+    // being there.
+    mount({}, LOCKED, ADDRESS);
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+
+    mount(
+      { vm: vm({ oversize: true, detail: "readme.md is larger than 1.0 MB." }) },
+      MARKDOWN,
+      ADDRESS,
+    );
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+  });
+
+  it("are not offered by a host that holds no sync-profile address", () => {
+    // The note embed. It has a vault id and a vault-relative target, which is a
+    // different identifier over overlapping bytes, and deriving one from the
+    // other in the webview is what AD-65 forbids.
+    mount({}, MARKDOWN, null);
+
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+  });
+});
+
+/**
+ * Story 51.5's half of the frame: WHETHER a markdown file is offered Note mode
+ * (FR-294).
+ *
+ * Deliberately the same predicate as the writing tools and the properties panel,
+ * and asserted here rather than in the view because this is the layer that holds
+ * all three of its inputs — the registry's format, the size guard, and Rust's
+ * own refusal to write the location.
+ */
+describe("Note mode", () => {
+  it("is offered for a writable markdown file, beside Preview and Source", () => {
+    mount({}, MARKDOWN, ADDRESS);
+
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Preview",
+      "Source",
+      "Note",
+    ]);
+  });
+
+  it("row 7: is absent for a `workspace/` file, whose refusal is unchanged", () => {
+    // Rust's own sentence, carried on the listing row (AD-113). The tab is
+    // ABSENT rather than present-and-refusing: an editor over a buffer every
+    // write refuses is a control that announces its own refusal.
+    const refusal = "keeper does not write inside workspace/, which is scratch space";
+    render(
+      <TextFileFrame
+        fileName="notes.md"
+        entry={MARKDOWN}
+        state={state()}
+        writeRefusal={refusal}
+        csv={null}
+        properties={ADDRESS}
+        preview={{ vaultId: null }}
+      />,
+    );
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(refusal);
+  });
+
+  it("row 8: a file with no rendered view has neither a Preview nor a Note tab", () => {
+    // The registry's own `.rs` row, verbatim: a text viewer, writable, one
+    // language and no rendered half. Unchanged by this story — there is no
+    // live-preview view of a `.rs` to make editable.
+    const rust: ViewerEntry = {
+      viewer: "text",
+      format: "source",
+      label: "Rust source",
+      icon: "file-code",
+      rendered: null,
+      language: "rust",
+      writable: true,
+    };
+    mount({}, rust, ADDRESS);
+
+    expect(screen.queryByRole("tablist")).toBeNull();
+  });
+
+  it("row 9: is absent for an oversize file, of which only a prefix was read", () => {
+    mount(
+      { vm: vm({ oversize: true, detail: "readme.md is larger than 1.0 MB." }) },
+      MARKDOWN,
+      ADDRESS,
+    );
+
+    // The same rule the Save button follows: the loader declines a save that
+    // would truncate the rest of the file, so there is nothing for a third
+    // editing tab to save.
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Source" })).toBeInTheDocument();
+  });
+
+  it("is absent for a format keeper will not rewrite", () => {
+    mount({}, LOCKED, ADDRESS);
+
+    expect(screen.queryByRole("tab", { name: "Note" })).toBeNull();
   });
 });

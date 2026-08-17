@@ -18,7 +18,11 @@ import {
 } from "@/components/notes/space-editor";
 import {
   SESSION_SPACE_EDIT_TITLE,
+  SESSION_SPACE_FOLDED_LABEL,
+  SESSION_SPACE_FOLDED_NOTE,
   SESSION_SPACE_NEW_TITLE,
+  SESSION_SPACE_ROWS_LABEL,
+  SESSION_SPACE_ROWS_NOTE,
   SESSION_SPACE_SAVE_FAILED,
   SESSION_SPACE_SORT_NOTES,
   SESSION_SPACE_TERMS_BROKEN,
@@ -41,6 +45,14 @@ function space(p: Partial<SessionSpaceVm> = {}): SessionSpaceVm {
     order: p.order ?? 2,
     warnings: p.warnings ?? [],
     error: p.error ?? null,
+    // The editor neither reads nor writes the kind a space can create — that
+    // is the section's control (Story 49.2). Present because the VM requires
+    // it, and `null` because nothing here is about a creatable space.
+    newFileKind: p.newFileKind ?? null,
+    // A space that says nothing about how it opens or how much it shows, which
+    // is every space that existed before Story 51.3.
+    folded: p.folded ?? null,
+    rows: p.rows ?? null,
   };
 }
 
@@ -338,6 +350,117 @@ describe("SessionSpaceEditor sort and position", () => {
 
     await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
     expect(savedRequest().order).toBe(2.5);
+  });
+});
+
+/**
+ * How a space opens and how much it shows (Story 51.3, rows 9–11).
+ *
+ * **Row 9 is the one that matters and it is asserted here as well as in Rust.**
+ * `render_edit` replaces the whole `keeper:` map, so the destroying bug lives in
+ * whichever hop drops the field — and a form that seeded the controls correctly
+ * and left them out of the request would pass every Rust test in the crate.
+ */
+describe("SessionSpaceEditor fold and row cap", () => {
+  it("row 9: sends both keys back untouched when something else was edited", async () => {
+    open(space({ folded: true, rows: 5 }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Work items" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest()).toMatchObject({ name: "Work items", folded: true, rows: 5 });
+  });
+
+  /** The controls show what the file says, so Save is the person agreeing with
+   *  what is on screen rather than a form guessing. */
+  it("seeds both controls from the space's own file", async () => {
+    open(space({ folded: false, rows: 5 }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    expect(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL)).toHaveValue("unfolded");
+    expect(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL)).toHaveValue(5);
+  });
+
+  /**
+   * Row 10, and the reason this is a three-option control rather than a
+   * checkbox: a space that says nothing must be able to keep saying nothing, or
+   * the first Save of any space would take it out from under
+   * `sessions.spaces_folded` forever.
+   */
+  it("row 10: writes neither key for a space that was given neither", async () => {
+    open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    expect(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL)).toHaveValue("unset");
+    expect(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL)).toHaveValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest()).toMatchObject({ folded: null, rows: null });
+  });
+
+  it("row 11: writes exactly what the two controls were set to", async () => {
+    open(space());
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL), {
+      target: { value: "folded" },
+    });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL), { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest()).toMatchObject({ folded: true, rows: 3 });
+  });
+
+  /** Going back to "however the setting says" has to be sayable, not just
+   *  reachable on the way in — otherwise the third state is a one-way door. */
+  it("clears a stored fold back to nothing said", async () => {
+    open(space({ folded: true }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_FOLDED_LABEL), {
+      target: { value: "unset" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().folded).toBeNull();
+  });
+
+  /**
+   * A cap has to be a whole number above zero. Everything else writes NO key,
+   * because a section capped at zero rows under a header that still counts them
+   * is not a thing anybody asked for — and refusing the whole save over a
+   * presentation field would be worse.
+   */
+  it.each([
+    ["", null],
+    ["0", null],
+    ["-2", null],
+    ["2.5", null],
+    ["many", null],
+    ["3", 3],
+  ])("reads a cap of %o as %o", async (typed, expected) => {
+    open(space({ rows: 5 }));
+
+    await screen.findByRole("button", { name: /Tag task/ });
+    fireEvent.change(screen.getByLabelText(SESSION_SPACE_ROWS_LABEL), { target: { value: typed } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().rows).toBe(expected);
+  });
+
+  /** Both lines are always on screen, because the two keys are the two things
+   *  about a space nobody can guess from a label. */
+  it("says what each of the two controls does", async () => {
+    open(space());
+
+    expect(await screen.findByText(SESSION_SPACE_FOLDED_NOTE)).toBeInTheDocument();
+    expect(screen.getByText(SESSION_SPACE_ROWS_NOTE)).toBeInTheDocument();
   });
 });
 

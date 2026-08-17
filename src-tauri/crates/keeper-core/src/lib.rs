@@ -24,6 +24,7 @@ pub mod drafts;
 pub mod egress;
 pub mod error;
 pub mod file_asset;
+pub mod file_properties;
 pub mod inbox;
 pub mod media;
 pub mod notes;

@@ -45,12 +45,12 @@ const RECORDED_DATE_KEY: &str = "date";
 /// The frontmatter key a recording stub writes the session's start clock into.
 const RECORDED_TIME_KEY: &str = "start";
 
-/// How much of an unreadable sort value the fallback sentence repeats back.
+/// How much of an unreadable frontmatter value a fallback sentence repeats back.
 ///
 /// The same judgement `space_icon`'s byte cap makes, for the same reason:
 /// frontmatter is agent-writable, so `sort:` can hold a megabyte, and a
 /// megabyte has no business inside a sidebar subtitle.
-const MAX_ECHOED_SORT: usize = 48;
+const MAX_ECHOED_VALUE: usize = 48;
 
 /// Where a space sits in the rail when its file does not say (FR-157).
 ///
@@ -323,15 +323,22 @@ fn unreadable_sentence(stored: &str) -> String {
 /// Quote a value back inside a sentence, safely.
 ///
 /// Two hazards, both real because this text came out of a file an agent may
-/// have written. Length is capped at [`MAX_ECHOED_SORT`] *characters*, counted
+/// have written. Length is capped at [`MAX_ECHOED_VALUE`] *characters*, counted
 /// on character boundaries so a multi-byte value cannot panic the sentence that
 /// quotes it. And every run of whitespace collapses to one space, because a
 /// frontmatter list flattens with newlines in it and a sentence carrying a
 /// newline arrives in the sidebar as two half-sentences.
-fn clip(value: &str) -> String {
+///
+/// Public because [`crate::sessions::spaces`] quotes `keeper.folded` and
+/// `keeper.rows` back into the same kind of sentence (Story 51.3), and the two
+/// hazards above are properties of frontmatter rather than of `sort:`. A second
+/// copy beside the second caller was the alternative, and it is how one of the
+/// two sentences ends up being the one that panics on a four-byte character.
+#[must_use]
+pub fn clip(value: &str) -> String {
     let flattened: Vec<&str> = value.split_whitespace().collect();
     let flattened = flattened.join(" ");
-    let mut out: String = flattened.chars().take(MAX_ECHOED_SORT).collect();
+    let mut out: String = flattened.chars().take(MAX_ECHOED_VALUE).collect();
     if out.chars().count() < flattened.chars().count() {
         out.push('…');
     }
