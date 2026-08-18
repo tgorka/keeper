@@ -353,14 +353,25 @@ pub struct AddArgs {
     pub removable: bool,
     #[arg(long, value_name = "BYTES")]
     pub lfs_threshold_bytes: Option<u64>,
-    /// Release local LFS objects once the remote holds them.
+    /// Release local LFS objects once the remote holds them. Now the default.
     ///
     /// Reclaims the second copy every LFS file has on the machine where it
     /// originated. The worktree keeps every file; only the redundant object in
     /// `.git/lfs/objects` goes, and only when the journal owes no transfer for
-    /// it. Trades a self-sufficient local copy for a smaller one.
+    /// it and the remote has confirmed it holds the content.
+    ///
+    /// Kept as a flag after the default flipped so existing scripts keep
+    /// working and keep saying what they mean; it now asks for what a profile
+    /// does anyway.
     #[arg(long)]
     pub lfs_prune_local: bool,
+    /// Keep the second local copy of every LFS object — the opt-out.
+    ///
+    /// For a folder that has to be restorable with no network: the object
+    /// store stays a complete local copy, so a file the worktree loses can be
+    /// recovered offline. It costs roughly twice the disk.
+    #[arg(long, conflicts_with = "lfs_prune_local")]
+    pub no_lfs_prune_local: bool,
     /// Glob that must never go through LFS, whatever its size. Repeatable.
     ///
     /// The recorded `.gitattributes` rule is per-extension, so one oversized
@@ -695,7 +706,12 @@ fn cmd_add(
     profile.subpaths = args.subpath.clone();
     profile.excludes = args.exclude.clone();
     profile.lfs_never = args.lfs_never.clone();
-    profile.lfs_prune_local = args.lfs_prune_local;
+    // Only the opt-out is applied. Assigning the flag itself would make every
+    // `add` that does not pass it an opt-out, which is how a changed default
+    // gets quietly undone by the tool that is supposed to honour it.
+    if args.no_lfs_prune_local {
+        profile.lfs_prune_local = false;
+    }
     profile.tags = args.tag.clone();
     profile.removable = args.removable;
     profile.author_override = args.author.clone();

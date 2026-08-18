@@ -77,7 +77,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `lfsMode` | `materialize`, `pointerOnly`, or `disabled` |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
-| `lfsPruneLocal` | Release local LFS objects once the remote holds them (default false) |
+| `lfsPruneLocal` | Release local LFS objects once the remote holds them (default **true**) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
 
@@ -334,8 +334,8 @@ at stage time — the bytes have to be read and hashed — but it is not needed
 forever. Measured on a 211 GB archive: 215 GB of worktree content plus 215 GB of
 store objects on one 920 GB drive.
 
-`lfsPruneLocal = true` releases it at the end of a successful sync. An object is
-released only when **all** of these hold:
+keeper releases it at the end of a successful sync — `lfsPruneLocal` is **on by
+default**. An object is released only when **all** of these hold:
 
 1. **The journal references no transfer for it.** Not an inference from ref
    positions — keeper's own durable record of what it still owes. This also
@@ -351,9 +351,21 @@ released only when **all** of these hold:
    quiescence and after the push, never between them.
 
 The honest trade: the drive stops being self-sufficient. Every file is still
-there, but restoring one the worktree later loses now needs the network. Off by
-default for that reason. A failure to release is logged and never fails the
-sync — reclaiming space is housekeeping.
+there, but restoring one the worktree later loses now needs the network. Set
+`lfsPruneLocal = false` on a machine that has to recover without one — the
+object store then stays a complete local copy, at roughly twice the disk.
+
+It was off by default until 0.8.12, and the reason for the change is what the
+three conditions above already prove: the copy is redundant, and rebuilding it
+costs one local read of a file that never left. As a default it was the wrong
+way round — the cost was paid silently and continuously by every originating
+machine, while the benefit only ever appears on a machine that is offline *and*
+has lost a worktree file. A store written before the change is carried over once
+by a marked migration in `db.rs`; a `false` set afterwards is an opt-out and is
+never rewritten.
+
+A failure to release is logged and never fails the sync — reclaiming space is
+housekeeping.
 
 ### The rule is recorded per extension — which is why `lfsNever` exists
 

@@ -371,10 +371,12 @@ impl NotesConfig {
 pub enum MediaPolicy {
     /// Keep the media bytes on this machine.
     ///
-    /// The default, and the honest one, for the same reason `lfs_prune_local`
-    /// is off by default: it prefers a self-sufficient local copy to a smaller
-    /// one. This is also the machine the recorder writes to, so the bytes are
-    /// here regardless — the choice is only whether git keeps them too.
+    /// The default, and the honest one: it prefers a self-sufficient local copy
+    /// to a smaller one. This is also the machine the recorder writes to, so
+    /// the bytes are here regardless — the choice is only whether git keeps
+    /// them too. `lfs_prune_local` once shared this rationale and no longer
+    /// does, because what that releases is a second copy of content the
+    /// worktree still holds, where this is the content itself.
     #[default]
     Materialize,
     /// Leave the recordings subtree as LFS pointer files on this clone.
@@ -779,13 +781,19 @@ pub struct SyncProfile {
     /// to compute the pointer. Measured on a 211 GB archive that is 215 GB of
     /// worktree plus 215 GB of store on one 920 GB drive.
     ///
-    /// Off by default, and the default is the honest one: turning this on trades
-    /// a self-sufficient local copy for a smaller one. The drive keeps every
-    /// file — only the redundant second copy goes — but restoring a file the
-    /// worktree later loses then needs the network.
+    /// **On by default.** The copy this releases is redundant by construction,
+    /// and the three conditions in [`crate::lfs::prune`] are what make that a
+    /// fact rather than a hope: nothing the journal still owes, nothing the
+    /// remote has not confirmed it holds, and nothing whose worktree file is
+    /// not standing there to rebuild it from at the cost of one local read.
     ///
-    /// See [`crate::lfs::prune`] for the three conditions an object must meet.
-    #[serde(default)]
+    /// What `false` buys is the offline restore of a file the worktree later
+    /// loses — the drive stays self-sufficient without the network. That is a
+    /// real want on a machine that is often off it, which is why the opt-out
+    /// stays; it is not the common case, and as the *default* it meant the
+    /// second copy grew unwatched until a disk filled. A store written before
+    /// the change is carried over by [`crate::db`]'s one-shot migration.
+    #[serde(default = "default_true")]
     pub lfs_prune_local: bool,
     /// Globs that must never be routed through LFS, whatever their size.
     ///
@@ -911,7 +919,7 @@ impl SyncProfile {
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
             lfs_never: Vec::new(),
-            lfs_prune_local: false,
+            lfs_prune_local: true,
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             tags: Vec::new(),
@@ -1338,6 +1346,25 @@ mod tests {
     /// the blob a 0.6.5 keeper wrote, every key it emitted and not one more:
     /// it must load as "not a vault" and validate clean, or upgrading would
     /// strand every existing folder.
+    /// Two defaults for one field is how they drift: `SyncProfile::new` answers
+    /// for a folder the app adds, the serde default answers for a `[[profile]]`
+    /// table that omits the key. They have to say the same thing.
+    #[test]
+    fn a_new_profile_and_an_unset_key_agree_about_the_redundant_copy() {
+        let fresh = SyncProfile::new("01N", "n", "/w/n", "https://git.example/r.git");
+        assert!(
+            fresh.lfs_prune_local,
+            "the second copy is redundant by construction; keeping it is the choice"
+        );
+        let sparse: SyncProfile = serde_json::from_str(
+            r#"{"id":"01N","name":"n","localPath":"/w/n",
+                "remoteUrl":"https://git.example/r.git","branch":"main",
+                "direction":"bidirectional","lane":"main","lfsMode":"materialize"}"#,
+        )
+        .expect("a table that omits the key still parses");
+        assert_eq!(sparse.lfs_prune_local, fresh.lfs_prune_local);
+    }
+
     #[test]
     fn a_profile_row_written_before_notes_existed_still_loads() {
         let v065 = r#"{
@@ -1552,7 +1579,7 @@ mod tests {
         let sparse: RecordingsConfig = serde_json::from_str("{}").expect("parse");
         assert_eq!(sparse, RecordingsConfig::default());
         assert_eq!(sparse.subfolder, DEFAULT_RECORDINGS_SUBFOLDER);
-        // The self-sufficient copy is the default, as it is for `lfs_prune_local`.
+        // The recorder's own bytes stay on the machine that recorded them.
         assert_eq!(sparse.media, MediaPolicy::Materialize);
         // Pushing a multi-gigabyte object during the meeting eats the uplink
         // the meeting runs on, so publication waits for the session to end.

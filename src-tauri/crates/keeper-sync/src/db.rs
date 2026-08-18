@@ -123,9 +123,75 @@ fn migrate(conn: &Connection) -> Result<()> {
             id          TEXT NOT NULL,
             label       TEXT NOT NULL
         );
+
+        -- Migrations that rewrite CONTENT rather than schema, and must
+        -- therefore run exactly once. Schema migrations need no marker: an
+        -- `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
+        -- idempotence. A row rewrite is not, because after it runs the old
+        -- value becomes a legitimate one again.
+        CREATE TABLE IF NOT EXISTS meta (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_activity_columns(conn)?;
+    ensure_prune_default(conn)?;
+    Ok(())
+}
+
+/// The marker naming the one-shot in [`ensure_prune_default`].
+const PRUNE_DEFAULT_MARKER: &str = "lfs_prune_local_default_on";
+
+/// Carry a store written before releasing the redundant LFS object copy became
+/// the default (`lfs_prune_local`).
+///
+/// A changed serde default cannot reach an install that already exists: a
+/// profile is stored as its serialization, and serialization writes every
+/// field, so every row written before the change holds a literal
+/// `"lfsPruneLocal": false`. Without this, the new default would apply to new
+/// folders only — and the folders with a second copy worth reclaiming are
+/// precisely the old ones.
+///
+/// **Exactly once**, marked in `meta`, because `false` has two meanings after
+/// the change: the old default, which this rewrites, and a deliberate opt-out,
+/// which must survive every later `open`. Running once is the only thing that
+/// keeps them apart. `keeper-syncd` applies its `config.toml` *after* `open`,
+/// so a profile that asks for `lfsPruneLocal = false` there is written back on
+/// the same boot and stays that way.
+///
+/// It does not touch `updated_ms`: the operator changed nothing, and a folder
+/// reporting an edit nobody made is a worse lie than a stale timestamp.
+fn ensure_prune_default(conn: &Connection) -> Result<()> {
+    let applied: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PRUNE_DEFAULT_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.is_some() {
+        return Ok(());
+    }
+    // `json_set` rather than a read-modify-write through serde: it preserves
+    // every other key byte for byte, including ones written by a keeper newer
+    // than this one, which a round trip through `SyncProfile` would drop.
+    let moved = conn.execute(
+        "UPDATE profiles
+            SET json = json_set(json, '$.lfsPruneLocal', json('true'))
+          WHERE json_extract(json, '$.lfsPruneLocal') = 0",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        (PRUNE_DEFAULT_MARKER, moved.to_string()),
+    )?;
+    if moved > 0 {
+        tracing::info!(
+            profiles = moved,
+            "releasing the redundant local LFS object copy is now the default",
+        );
+    }
     Ok(())
 }
 
@@ -1909,6 +1975,84 @@ mod tests {
         assert_eq!(
             back, held,
             "the previous state is intact: no delete without its inserts"
+        );
+    }
+
+    /// A row written before releasing the redundant copy became the default
+    /// holds a literal `"lfsPruneLocal": false` — serde writes every field — so
+    /// the new default cannot reach it on its own, and the folders with a
+    /// second copy worth reclaiming are exactly the old ones.
+    ///
+    /// A store that predates the change is simulated the only way an in-memory
+    /// one can be: by dropping the marker, which is precisely what such a store
+    /// does not have.
+    #[test]
+    fn a_store_written_before_the_flip_is_carried_onto_the_new_default() {
+        let c = conn();
+        c.execute("DELETE FROM meta WHERE key = ?1", [PRUNE_DEFAULT_MARKER])
+            .expect("unmark");
+        let legacy = r#"{
+            "id": "01OLD", "name": "tgdrive", "localPath": "/w/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": ["*.md"],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true
+        }"#;
+        c.execute(
+            "INSERT INTO profiles (id, json, updated_ms) VALUES (?1, ?2, ?3)",
+            ("01OLD", legacy, 7_i64),
+        )
+        .expect("insert a pre-flip row");
+
+        migrate(&c).expect("the next open");
+
+        let carried = stored_profile(&c, "01OLD")
+            .expect("read")
+            .expect("the row is still there");
+        assert!(
+            carried.lfs_prune_local,
+            "an install that already exists is what the migration is for"
+        );
+        assert_eq!(
+            carried.lfs_never,
+            vec!["*.md".to_owned()],
+            "json_set rewrites one key and leaves the rest byte for byte"
+        );
+        let updated: i64 = c
+            .query_row(
+                "SELECT updated_ms FROM profiles WHERE id = '01OLD'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("timestamp");
+        assert_eq!(
+            updated, 7,
+            "the operator edited nothing, and a folder reporting an edit \
+             nobody made is the worse lie"
+        );
+    }
+
+    /// After the one-shot, `false` means an opt-out — a folder that has to be
+    /// restorable with no network. Re-running the rewrite on every open would
+    /// undo that choice, which is the whole reason the marker exists.
+    #[test]
+    fn a_deliberate_opt_out_survives_every_later_open() {
+        let c = conn();
+        let mut p = profile("01KEEP");
+        p.lfs_prune_local = false;
+        upsert_profile(&c, &p, 1).expect("insert");
+
+        migrate(&c).expect("a later open");
+
+        assert!(
+            !stored_profile(&c, "01KEEP")
+                .expect("read")
+                .expect("row")
+                .lfs_prune_local,
+            "the one-shot already ran; it must not run again"
         );
     }
 }

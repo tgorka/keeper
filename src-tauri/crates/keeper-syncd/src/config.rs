@@ -303,15 +303,17 @@ logLevel = "info"
 # repository root. The trade-off is real: a matched file stays an ordinary git
 # blob however large it grows, and gitoxide has no streaming object read.
 # lfsNever = ["*.md", "*.txt"]
-# Release local LFS objects once the remote holds them. On the machine where
-# content originates every LFS file exists twice -- worktree and object store --
-# because the clean path must read the bytes to compute the pointer. This
-# reclaims the second copy. The worktree keeps every file; an object is released
-# only when its content is still in the worktree AND the journal owes no
-# transfer for it, so rebuilding costs one local read. The honest trade: the
-# drive stops being self-sufficient, because restoring a file the worktree later
-# loses then needs the network.
-# lfsPruneLocal = false
+# Release local LFS objects once the remote holds them. ON BY DEFAULT. On the
+# machine where content originates every LFS file exists twice -- worktree and
+# object store -- because the clean path must read the bytes to compute the
+# pointer. This reclaims the second copy. The worktree keeps every file; an
+# object is released only when its content is still in the worktree AND the
+# journal owes no transfer for it AND the remote has confirmed it holds the
+# content, so rebuilding costs one local read. Set it to false for a folder
+# that must be restorable with no network: the object store then stays a
+# complete local copy of everything the worktree holds, at roughly twice the
+# disk.
+# lfsPruneLocal = true
 # How long a file must stop changing before it is considered complete.
 # settleMs = 5000
 # pollIntervalMs = 15000

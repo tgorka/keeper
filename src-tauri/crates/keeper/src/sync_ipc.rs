@@ -3006,7 +3006,9 @@ mod tests {
     /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
     /// `keeper-syncd`'s profile file with no slot in the app's form — `parse_req`
     /// keeps them because it starts from `prior.clone()`, not because it copies
-    /// them by name.
+    /// them by name. `lfsPruneLocal` needs no slot on purpose: releasing the
+    /// redundant object copy is what a profile does by default, and the opt-out
+    /// is for a machine that is configured, not clicked.
     const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -3041,7 +3043,8 @@ mod tests {
         prior.enabled = false;
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
-        prior.lfs_prune_local = true;
+        // The opt-out, because a fresh profile now releases the redundant copy.
+        prior.lfs_prune_local = false;
         // Story 41.1's block, set to something a fresh profile never has. It was
         // a PRESERVED field until Story 41.7 gave the form a switch for it; the
         // distinctive value stays, because it is now what makes the EXPRESSED
