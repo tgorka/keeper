@@ -639,7 +639,19 @@ function PanelFrame({
       // Clicking anywhere in a panel focuses it, which is what makes the next
       // single click in the browser replace THIS panel rather than the one that
       // happened to be focused before.
+      //
+      // Both presses, and that is not belt-and-braces. A surface inside a panel
+      // may cancel its own `pointerdown` — the task board does, to stop WebKit
+      // anchoring a text selection under a drag (`task-board.tsx`) — and a
+      // cancelled `pointerdown` sets the platform's PREVENT MOUSE EVENT flag, so
+      // NO `mousedown` is dispatched at all and this ancestor never hears one. It
+      // suppresses the default focus action too, so `onFocusCapture` cannot cover
+      // either: no focus event fires. Left on `mousedown` alone, pressing a card
+      // in an unfocused panel opened its note into whichever panel `activeId`
+      // still pointed at. `focusPanel` is idempotent, so the pair costs a second
+      // store read on a press that does fire both.
       onFocusCapture={() => panelsStore.getState().focusPanel(panel.id)}
+      onPointerDown={() => panelsStore.getState().focusPanel(panel.id)}
       onMouseDown={() => panelsStore.getState().focusPanel(panel.id)}
       className={cn(
         "flex h-full flex-col overflow-hidden border-border border-r bg-background last:border-r-0",

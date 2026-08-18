@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 
@@ -14,6 +14,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 });
 
 import { PinsStrip } from "@/components/layout/pins-strip";
+import { DRAG_SELECTION_CLASS } from "@/hooks/use-pointer-drag";
 import { reorderPins, unpinRoom } from "@/lib/ipc/client";
 
 function room(id: string, overrides: Partial<InboxRoomVm> = {}): InboxRoomVm {
@@ -425,6 +426,88 @@ describe("PinsStrip", () => {
   });
 });
 
+// ── Selection, and why the pin does not translate (Story 54.1) ───────────────
+describe("PinsStrip drag selection", () => {
+  it("cancels the desktop press's own default, so a strip drag anchors no selection", () => {
+    // The desktop strip leaked exactly like the board: its only suppression was
+    // the phone's `select-none` on the avatar, and nothing stopped a `mousedown`
+    // anchoring a selection for the captured moves to drag across the app.
+    render(<PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} />);
+    mockPinSlots();
+    const alpha = screen.getAllByRole("button")[0];
+    const press = createEvent.pointerDown(alpha, {
+      pointerId: 1,
+      button: 0,
+      clientX: 30,
+      clientY: 30,
+    });
+    fireEvent(alpha, press);
+    expect(press.defaultPrevented).toBe(true);
+  });
+
+  it("leaves a secondary press to the platform, which is what opens the menu", () => {
+    render(<PinsStrip pins={[room("!a", { displayName: "Alpha" }), room("!b")]} />);
+    const alpha = screen.getAllByRole("button")[0];
+    const press = createEvent.pointerDown(alpha, {
+      pointerId: 1,
+      button: 2,
+      clientX: 30,
+      clientY: 30,
+    });
+    fireEvent(alpha, press);
+    expect(press.defaultPrevented).toBe(false);
+  });
+
+  it("holds the document unselectable from the slop crossing to the release", () => {
+    render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+      />,
+    );
+    mockPinSlots();
+    const alpha = screen.getAllByRole("button")[0];
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 30, clientY: 30 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    fireEvent.pointerUp(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+  });
+
+  it("moves the pressed pin by reordering the strip, and never by a transform", () => {
+    // The recorded half of Story 54.1 for this surface. The board's card
+    // translates because nothing else moves it; here the preview reorder already
+    // carries the pressed avatar into its target slot, so a translate by the
+    // delta from the press origin would be added on TOP of a displacement the
+    // DOM applied — the pin drawn a slot ahead of the finger and further ahead
+    // the further it travels. Following from here means re-measuring the moved
+    // element every step, which is a FLIP and is not what this epic bought.
+    render(
+      <PinsStrip
+        pins={[
+          room("!a", { displayName: "Alpha" }),
+          room("!b", { displayName: "Bravo" }),
+          room("!c", { displayName: "Charlie" }),
+        ]}
+      />,
+    );
+    mockPinSlots();
+    const alpha = screen.getAllByRole("button")[0];
+    fireEvent.pointerDown(alpha, { pointerId: 1, button: 0, clientX: 30, clientY: 30 });
+    fireEvent.pointerMove(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+    // The preview IS the movement: same node, third slot, no inline transform on
+    // it or on the `li` that holds it.
+    expect(screen.getAllByRole("button")[2]).toBe(alpha);
+    expect(alpha.style.transform).toBe("");
+    expect(alpha.closest("li")?.style.transform).toBe("");
+    fireEvent.pointerUp(alpha, { pointerId: 1, clientX: 150, clientY: 30 });
+  });
+});
+
 // ── Phone touch idioms (Story 13.6) ──────────────────────────────────────────
 describe("PinsStrip phone touch idioms", () => {
   const originalMatchMedia = window.matchMedia;
@@ -595,5 +678,27 @@ describe("PinsStrip phone touch idioms", () => {
     expect(screen.getByText("Move up").closest("[data-disabled]")).not.toBeNull();
     expect(screen.getByText("Move down").closest("[data-disabled]")).not.toBeNull();
     expect(reorderPins).not.toHaveBeenCalled();
+  });
+
+  it("leaves the phone's own press to the platform, and still suppresses its drag", () => {
+    // The phone gate returns before the desktop entry, so nothing cancels the
+    // press here: a finger's press must stay the platform's — the long-press,
+    // the strip's own scroll and the callout are all downstream of it, and the
+    // pin's `select-none` is what covers the lift. The suppression the lift drag
+    // does get is the shared one, armed when the gesture crosses the slop.
+    render(<PinsStrip pins={pins()} />);
+    mockPinSlots();
+    const pin = screen.getByRole("button", { name: "Pinned conversation with Alpha" });
+    const press = createEvent.pointerDown(pin, { pointerId: 1, clientX: 30, clientY: 30 });
+    fireEvent(pin, press);
+    expect(press.defaultPrevented).toBe(false);
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+    fireEvent.pointerMove(pin, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    fireEvent.pointerUp(pin, { pointerId: 1, clientX: 150, clientY: 30 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
   });
 });

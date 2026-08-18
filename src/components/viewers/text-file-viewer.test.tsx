@@ -84,11 +84,7 @@ import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
 import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
-import {
-  fileFrameFoldCookie,
-  hydrateFileFrameFold,
-  resetFileFrameFoldForTest,
-} from "@/lib/stores/file-frame-fold";
+import { FILE_FRAME_FOLD_COOKIE, resetFileFrameFoldForTest } from "@/lib/stores/file-frame-fold";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -1315,14 +1311,22 @@ describe("a session log opens in three modes (Story 51.5)", () => {
  * viewer this suite deliberately renders on its own (`openThroughTheRegistry`).
  */
 describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
-  // Story 53.3 put the form behind a fold that defaults closed, and a rename is
-  // committed from a field INSIDE that form. So these arrange the state a reader
-  // who has opened it once is in — the cookie's own encoding, through the real
-  // hydrate — rather than pressing the disclosure in five tests whose subject is
-  // where the pane points afterwards.
+  // The form is on screen by default again (Story 54.2), so nothing here has to
+  // arrange it OPEN: a rename is committed from a field INSIDE the form, and the
+  // reader has that field without pressing anything. This block used to hydrate
+  // `{ properties: false }` — the fold arranged open, because Story 53.3 had
+  // defaulted it closed — which is a state no fresh install was ever in.
+  //
+  // The store AND the jar, exactly as the 52.3 block below: `resetFileFrameFoldForTest`
+  // clears the module preference and re-arms the hydrate, and the hydrate then
+  // reads `document.cookie`. Resetting only the store leaves the default OPEN as
+  // a fact about what no earlier test in this file happens to have persisted,
+  // and a fold written anywhere before line 1313 would take the rename field off
+  // the screen and fail every test here for a reason none of them is about.
   beforeEach(() => {
     resetFileFrameFoldForTest();
-    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging the fold this block depends on
+    document.cookie = `${FILE_FRAME_FOLD_COOKIE}=; path=/; max-age=0`;
   });
 
   /** A block with a title, which is the field a rename is committed from. */
@@ -1556,13 +1560,19 @@ describe("a rename in the properties panel takes the open pane with it (Story 52
  * bytes. A frame test could only assert the prop it just passed.
  */
 describe("the properties block is drawn once, not twice (Story 52.3)", () => {
-  // The fold this claim needs open, arranged the way a reader who opened it once
-  // leaves it (Story 53.3). With it closed the pane draws the block, which is the
-  // correct behaviour for a surface with no form above it and is asserted in
-  // `text-file-frame.test.tsx`'s fold describe.
+  // No fold arrangement (Story 54.2). This block hydrated `{ properties: false }`
+  // — the fold arranged OPEN, because Story 53.3 defaulted it closed — so the
+  // guard written for the 52.3 request was testing a state no fresh install was
+  // ever in, in the same commit that broke the request. What every test here
+  // gets now is the state a fresh install is in.
+  //
+  // The store AND the jar, because the last test presses the disclosure and a
+  // fold is persisted: the frame hydrates from `document.cookie`, so one test's
+  // press would otherwise be the next one's arrangement.
   beforeEach(() => {
     resetFileFrameFoldForTest();
-    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+    // biome-ignore lint/suspicious/noDocumentCookie: clearing the fold a test in this block writes
+    document.cookie = `${FILE_FRAME_FOLD_COOKIE}=; path=/; max-age=0`;
   });
 
   /** A file with properties, as `file_properties` writes them, and its body. */
@@ -1617,5 +1627,43 @@ describe("the properties block is drawn once, not twice (Story 52.3)", () => {
     // AD-88's one buffer, visible in full in the one view that is always the
     // source. Hiding anything here would be a lie about what Save writes.
     expect(view.state.doc.toString()).toBe(BLOCK + BODY);
+  });
+
+  it("keeps the block out of the Note tab after the reader folds the form away", async () => {
+    // Story 54.2, end to end and through the registry: the fold is a display
+    // choice about the form. On the shipped build this press put
+    // `---\ntitle: Weekly\ntags:\n  - about\n---` back at the top of his
+    // document — which is the "prefix z properties" he reported.
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    syncReadText.mockResolvedValue(vm({ text: BLOCK + BODY }));
+    syncWriteEntry.mockResolvedValue(undefined);
+    openThroughTheRegistry(target({ name: "README.md", relativePath: SESSION_README }));
+    await settle();
+    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    await settle();
+
+    // The form is off the screen and his prose is unchanged.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Note" })).toHaveAttribute("aria-selected", "true");
+    const editor = await editorHost();
+    const view = liveView(editor);
+    expect(view.state.doc.toString()).toBe(BODY);
+
+    // And a save still writes the whole file, byte for byte, with the block the
+    // reader cannot see at the front of it. Typed first, because a clean buffer
+    // saves nothing — "keeper: not saving … nothing changed".
+    await act(async () => {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+    });
+    await typeAtCaret(view, "beta\n");
+    fireEvent.keyDown(editor, { key: "s", ...MOD });
+    await settle();
+    expect(syncWriteEntry).toHaveBeenCalledWith(
+      "profile-1",
+      SESSION_README,
+      `${BLOCK}# Weekly\n\nalpha\nbeta\n`,
+    );
   });
 });

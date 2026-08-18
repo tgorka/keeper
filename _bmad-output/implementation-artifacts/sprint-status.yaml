@@ -757,6 +757,41 @@ development_status:
   53-5-a-create-that-lands-where-the-space-says: review
   epic-53-retrospective: optional
 
+  # -- EPIC 54, 2026-08-17: two regressions from epic 53's own fixes ----------
+  #
+  # Three PRs #184..#186. Both items were caused by the PREVIOUS round:
+  #   54.1  the pointer gesture replaced HTML5 drag and gave back none of what
+  #         `draggable` was quietly doing besides starting a drag - the card did
+  #         not move at all (the whole visual inventory was opacity-50), and the
+  #         selection suppression covered only the element the pointer had
+  #         already left, because a native drag never selects text and that was
+  #         the second thing `draggable` bought.
+  #   54.2  the properties fold defaulted CLOSED and a closed fold UNMOUNTED the
+  #         form, so `formBlock` stayed null and the Note tab drew the `---`
+  #         block as the reader's first lines - undoing story 52.3's ask by
+  #         changing its antecedent without re-checking it.
+  #
+  # REVIEW THEN FOUND FOUR MORE, three of them in the new code:
+  #   * a translated card's rect is the TRANSFORMED box, so the slot tally
+  #     counted the dragged card and wrote the wrong index - a card dragged to
+  #     the bottom of its column landed at the top. Both boards' test fixtures
+  #     froze getBoundingClientRect, so the test named for that off-by-one
+  #     passed with and without the fix; the fixture was repaired first.
+  #   * cancelling the press killed `mousedown`, and panel focus rides on it -
+  #     a card in panel 2 opened its note over panel 1's document.
+  #   * the settle glided every successful drop BACKWARDS to the slot it left.
+  #   * and the two spec-53-3 overrides 54.2's commit claimed to have recorded
+  #     were never written into that file at all - the same antecedent-drift
+  #     that caused the epic, aimed at a fourth report.
+  #
+  # Owed: the on-screen click-through. jsdom has no layout, no compositor, no
+  # WebKit selection and stubs setPointerCapture, which is why every one of
+  # these shipped green.
+  epic-54: in-progress
+  54-1-a-card-that-follows-the-finger: review
+  54-2-properties-you-can-see-and-never-in-your-prose: review
+  epic-54-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5

@@ -66,9 +66,17 @@ frame group down into `PaneHeader`'s fourth slot (`pane-header.tsx:226-241`).
 - Never remove the standing fact that a file outside the vault has no history. Fold
   it to one Rust-composed line; never to nothing, and never to a webview
   paraphrase.
-- Never default the properties panel open on the file surface once the fold exists —
+- ~~Never default the properties panel open on the file surface once the fold exists —
   the notes surface defaults closed, and two surfaces disagreeing is the drift this
-  epic is already paying for elsewhere.
+  epic is already paying for elsewhere.~~
+  **SUPERSEDED by story 54.2 (FR-325). Do not implement this clause.** The symmetry
+  it leaned on does not exist: on a NOTE the frontmatter is a separate store field,
+  so a closed panel hides nothing, whereas on a FILE the buffer IS the whole file, so
+  a closed form put `---\ntitle: …\n---` at the top of the reader's own prose and
+  undid story 52.3 (`raw-rendered-view.tsx:199-201` already said so). The two
+  surfaces defaulting differently is the asymmetry of what they are showing, not
+  drift. The file surface defaults the properties fold **OPEN**; the caveat fold
+  still defaults closed.
 
 </intent-contract>
 
@@ -86,7 +94,7 @@ frame group down into `PaneHeader`'s fourth slot (`pane-header.tsx:226-241`).
 
 | # | acceptance |
 |---|---|
-| 1 | the properties panel folds and unfolds from the pane header, and defaults closed like the notes surface |
+| 1 | ~~the properties panel folds and unfolds from the pane header, and defaults closed like the notes surface~~ — **SUPERSEDED by story 54.2:** it folds and unfolds from the pane header and defaults **OPEN**, because the notes/file asymmetry this row assumed away is real (see the Never list above) |
 | 2 | the fold survives a remount and a panel fold/unfold |
 | 3 | the caveat shows one Rust-composed line by default and the full four on request; the short line still names what is missing |
 | 4 | the caveat's short form comes from Rust, not from truncation in the webview |
@@ -118,11 +126,21 @@ the hook is above the body.
 two keys belong to, unmounted for whole sessions, and the one place the call can
 be forgotten (DW-172).
 
-**The panes take the block back when the form folds away.**
-`frontmatterInForm` is `null` while the properties fold is closed: what the form
+**~~The panes take the block back when the form folds away.~~**
+**SUPERSEDED by story 54.2 (FR-325). Do not implement this paragraph.**
+~~`frontmatterInForm` is `null` while the properties fold is closed: what the form
 draws is what the panes hide (52.3), so with no form on screen the document has
-to draw the `---` block or a file's `tags:` would be on screen nowhere at all.
-The carried block is deliberately not forgotten, so unfolding costs no re-read.
+to draw the `---` block or a file's `tags:` would be on screen nowhere at all.~~
+The premise is that folded means absent, and it is false: **folded is not absent,
+because the control names it.** The disclosure carries the word *Properties*, an
+`aria-expanded` that says which state it is in and a chevron that points, so a
+reader with the form folded is not a reader who has been told nothing about the
+file's tags — and handing the `---` block to their prose to make the point undoes
+52.3's whole request. So the form stays MOUNTED and merely `hidden` when folded,
+`frontmatterInForm` is the block the form is holding in BOTH states, and the seam
+no longer depends on the fold at all.
+The carried block is deliberately not forgotten, so unfolding costs no re-read —
+that sentence stands, and is now true of the fold in both directions.
 
 ## Verification
 
@@ -192,6 +210,13 @@ line count is a function of the panel's width, and that is the one part of this
 arithmetic no measurement here can pin: this container has no Chromium (the
 browser tool's daemon fails to launch) and jsdom lays nothing out, so the wrap
 is given as the formula above plus its four cases rather than as one number.
+
+**Story 54.2 changes when the 81px is collected, not what it is.** The properties
+band is still zero pixels tall while folded — the region is `hidden`, so
+`display: none`, mounted or not — but folding it is now a press rather than the
+default, so the 153px and the 121px above are the gain a reader who has folded
+both bands sees, not the gain on a fresh install. On a fresh install the caveat's
+32px and the row's 40px are collected and the 81px is not.
 
 ### What could not be verified here
 

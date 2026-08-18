@@ -512,6 +512,45 @@ describe("the panel strip's close control", () => {
       relativePath: "c.md",
     });
   });
+
+  it("focuses a panel from the pointerdown, which a cancelled press is all there is", async () => {
+    // A surface inside a panel may cancel its own `pointerdown` — the task board
+    // does, to stop WebKit anchoring a text selection under a drag — and a
+    // cancelled `pointerdown` fires NO `mousedown` at all, on any platform. It
+    // suppresses the default focus action too, so no focus event arrives either.
+    // With the focus taken on `mousedown` alone, pressing a card in an unfocused
+    // panel left `activeId` on the panel it was before, and the card's own `open()`
+    // retargeted THAT panel: the note opened over whatever the other panel held.
+    //
+    // jsdom synthesises no compatibility mouse events, so a `pointerdown` alone is
+    // exactly the sequence a cancelled press produces in the app.
+    syncBrowse.mockResolvedValue(listed("", [entry("a.md"), entry("b.md")]));
+    const state = panelsStore.getState();
+    state.setActiveTarget({ kind: "file", profileId: "p1", relativePath: "a.md" });
+    state.openPanel({ kind: "file", profileId: "p1", relativePath: "b.md" });
+
+    await mount();
+    const first = panelsStore.getState().panels[0];
+    if (first === undefined) {
+      throw new Error("expected two panels");
+    }
+    expect(panelsStore.getState().activeId).not.toBe(first.id);
+
+    await act(async () => {
+      fireEvent.pointerDown(screen.getByTestId(`${PANEL_TESTID}-${first.id}`));
+      await Promise.resolve();
+    });
+
+    expect(panelsStore.getState().activeId).toBe(first.id);
+    // Which is the whole point of the focus: the next single click replaces THIS
+    // panel rather than the one that happened to be focused before.
+    panelsStore.getState().setActiveTarget({ kind: "file", profileId: "p1", relativePath: "c.md" });
+    expect(panelsStore.getState().panels[0]?.target).toEqual({
+      kind: "file",
+      profileId: "p1",
+      relativePath: "c.md",
+    });
+  });
 });
 
 describe("the panel strip's fold control", () => {
