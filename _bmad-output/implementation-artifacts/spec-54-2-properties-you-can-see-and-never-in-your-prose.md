@@ -1,7 +1,7 @@
 # Spec 54.2 — Properties you can see, and never in your prose
 
 story: 54.2
-status: in-progress
+status: review
 branch: `work/epic-54-properties-stay` (on top of `work/epic-54-card-follows`)
 baseline_revision: 9a95acf
 final_revision: ''
