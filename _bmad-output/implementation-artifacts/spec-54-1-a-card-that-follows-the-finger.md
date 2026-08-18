@@ -110,12 +110,19 @@ pressed card carries `transition-transform duration-200 ease-out` at all times
 drag ends, the inline transform is removed, and the transition is back in the
 after-change style — the browser therefore interpolates from the last
 `matrix(…)` to `none` rather than teleporting. No settling flag, no timeout, no
-second frame. Two landings, both correct: a release that lands **nowhere** (or is
-cancelled, or is refused by Rust) keeps the same DOM node, so the card travels
-back to where its file says; a release that lands in **another column** unmounts
-the node from one `<ul>` and mounts a new one in the other, which appears at zero
-with nothing to animate from. Animating that second case is a FLIP — measuring
-the new rect and inverting — and the epic put it out of scope.
+second frame. Two landings, and the second claim below was **WRONG** — see
+*Corrections after review*, defect 3. A release that lands **nowhere** (or is
+cancelled) keeps the same DOM node, so the card travels back to where its file
+says: correct, and still the behaviour. A release that lands in **another column**
+was claimed to unmount the node from one `<ul>` and mount a new one in the other,
+"which appears at zero with nothing to animate from". It does not: `onPointerUp`
+runs `forget()` and then `onRelease`, whose `move` is an `await` on a Tauri round
+trip, so the release commit paints the card still in its SOURCE column with the
+transform removed and the transition restored — and the browser interpolated it
+from the drop point BACK to its original slot, the opposite direction, until the
+re-read relocated it a round trip later. The transition is now withheld from a
+card whose write is in flight (`task-board.tsx:349-364`, `:493-496`). Animating
+the arrival itself is still a FLIP, and still out of scope.
 
 **The transform is on the lifted card only.** `style` is `undefined` for every
 other card (`task-board.tsx:377-382`), so a board of twenty cards does not grow
@@ -150,16 +157,25 @@ PREVENT MOUSE EVENT flag, so `mousedown`/`mousemove`/`mouseup` are not fired —
 and the spec's own worked sequence for a cancelled press still ends in `click`.
 So: the title button still opens the file (proved by the existing
 `is one handle` and `keeps a press that does not move a click` tests, both
-untouched and green); keyboard activation never went near a pointer; and the one
-real cost is focus-on-mousedown, which is why the `<select>` gate returns
+untouched and green); keyboard activation never went near a pointer; and the cost
+is focus-on-mousedown, which is why the `<select>` gate returns
 *before* the cancel (`task-board.tsx:328-335`, asserted) and why a secondary
 button does too. On macOS a click never focused a `button` anyway.
 
+*This inventory was INCOMPLETE, and the gap was the ancestor.* It accounted for
+the card's own controls and missed `panel-strip.tsx`'s `onMouseDown` — the panel
+`<section>` whose own comment states the contract that clicking anywhere in a
+panel focuses it. Suppressing `mousedown` suppressed that too, and it also
+suppresses the default focus action, so `onFocusCapture` could not cover: no focus
+event fires either. The panel now takes focus on `pointerdown` as well
+(`panel-strip.tsx:653-655`). See *Corrections after review*, defect 2.
+
 **The document-level suppression is a class, and it is Tailwind's own.**
-`DRAG_SELECTION_CLASS = "select-none"` (`use-pointer-drag.ts:91-104`) is added to
+`DRAG_SELECTION_CLASS = "select-none"` (`use-pointer-drag.ts:91-131`) is added to
 `document.body` at the slop crossing and removed by `forget`, which every exit
-path runs — release, cancel, the lost-capture-for-good branch — plus the unmount
-cleanup (`:307-317`) for the surface that dies mid-gesture. A class, not
+path runs — release, cancel, the lost-capture-for-good branch — plus `begin`, for
+a press whose release was never seen, plus the unmount cleanup (`:336-346`) for the
+surface that dies mid-gesture. A class, not
 `body.style.userSelect`: `classList.remove` of an absent class is a no-op, so
 every exit path can run unconditionally, where an inline write would have to
 remember and restore a previous value. Tailwind's `select-none` and not a new
@@ -170,7 +186,10 @@ second convention. Adding it imperatively from TS is
 `conversation-pane.tsx:1240-1247`'s idiom; naming the constant is
 `csv-table.ts:50`'s. An `armedRef` guard means the hook only ever releases a
 suppression it armed itself, so the other surface's unmount cannot strip it
-mid-gesture.
+mid-gesture — and, since review, it bounds each instance to at most ONE of a
+module-level reference count (`:112-131`), because `armedRef` alone did not stop an
+instance that DID arm from stripping the class from under a second surface still
+dragging. See *Corrections after review*, defect 5.
 
 **Why the pins strip gets the suppression and not the follow** (acceptance 7).
 Its drag preview is a real DOM reorder (`pins-strip.tsx:254-266`) — the pressed
@@ -259,7 +278,10 @@ board and on a note's board widget:
 1. Press a card and move slowly across two columns. The card must stay **under the
    cursor** the whole way with no lag, and the cursor must read as a closed hand.
    The dashed border must follow the column under the pointer.
-2. Release over a column: the card lands there. Release over dead space outside
+2. Release over a column: the card lands there — and it must **not** glide anywhere
+   on the way. Watch the moment of release: before review, a card that landed
+   successfully was animated from the drop point back to the slot it came from, and
+   only then relocated by the re-read. Release over dead space outside
    every column: the card must **glide back** to its slot (~200 ms), not snap.
 3. During a drag, sweep the pointer across the session tree and a pane of prose.
    **Nothing anywhere may turn blue.** Repeat with the press starting on the card's
@@ -277,3 +299,80 @@ board and on a note's board widget:
 9. Pins strip, desktop: drag an avatar across the strip. The strip previews the
    reorder, nothing anywhere is selected, and the click afterwards still opens the
    room.
+10. **The slot, not just the column** — the check this list did not have, and the
+    one that would have caught the review's first defect. Drag a card to the
+    **bottom of its OWN column** and confirm it lands **last**, then reopen the file
+    and confirm its `order:` agrees. Do it twice: once **grabbed near the card's top
+    edge**, once **grabbed near its bottom edge**. Then drag the bottom card of a
+    three-card column to the **top** of that same column, grabbed near its bottom
+    edge, and confirm it lands **first**. Where the press landed inside the card must
+    make no difference to any of it: it was the whole answer before the fix, because
+    the tally measured the dragged card's transformed box.
+11. **Panel focus from a card press.** Open two panels, both showing notes with a
+    task board. With panel 2 unfocused, press a card in panel 2 — press only, no
+    drag — and confirm the panel-2 ring appears. Then click the card's title and
+    confirm the note opens in **panel 2** and that panel 1 still shows what it
+    showed. Before the fix the press fired no `mousedown`, panel 1 kept `activeId`,
+    and the note replaced panel 1's document.
+12. **The card is not clipped by its pane.** In session detail, drag a card toward
+    the bottom and the right edges of the pane. The card must stay visible the whole
+    way — no part of it may disappear behind the pane edge — and **the scrollbar
+    thumb must not shrink** while the drag is live. Repeat inside a note panel,
+    whose box is `overflow-hidden`, dragging toward its right edge. jsdom implements
+    no overflow clipping at all, so this is measured nowhere in the suite: only the
+    capped number is (`caps the follow at the board's own box`).
+13. **The suppression cannot strand.** Press a card and move it past the slop, then
+    without releasing press a second card with a second finger (or press, drag off
+    the window, and release outside it). Then try to select a paragraph of prose:
+    it must select. Then start a drag on the board and, while it is live, drag a pin
+    in the pins strip; end the pin's drag first and confirm nothing turns blue for
+    the rest of the board's drag.
+
+## Corrections after review
+
+Story 54.1's own review found two P1s, two P2s and a P3. All six changes below are
+in this branch, each with a test that fails without it (mutation-proved, table
+below). Two of them were **caused by this story's own fix**, which is why the
+owed-checks list above grew items 10–13: the previous list checked which COLUMN a
+card landed in and never which SLOT, so no step on it could have caught defect 1.
+
+| # | defect | fix | test that fails without it |
+|---|---|---|---|
+| 1 | **P1.** `getBoundingClientRect` returns the TRANSFORMED box, so the midpoint tally measured the dragged card at the pointer. Its contribution reduced to `height / 2 < grabOffsetY` — constant for the gesture — and a card dragged to the bottom of its own column was written to the TOP; grabbed on its lower half and dragged up, it landed one slot too far. Only within-column reorders, which is exactly what `dropIndex`'s compensation existed for. | The tally skips the lifted card — `[data-card-key]:not([data-dragging="true"])` (`task-board.tsx:248-253`) — which makes `at` already an index into the column WITHOUT the card, so the `dropIndex` compensation is **retired** rather than kept beside it (`:406-418`) | `lands a card last when it is dragged to the bottom of its own column`, `lands a card first when it is dragged up to the top of its own column`, `lands it last however deep in the card the press began`, `sends a card dragged to the bottom of its own column to the end of it` (sessions) |
+| 2 | **P1.** The press's `preventDefault()` sets PREVENT MOUSE EVENT, so no `mousedown` is dispatched — including at `panel-strip.tsx`'s panel `<section>`, whose `onMouseDown` is what makes the next single click replace THIS panel. `onFocusCapture` cannot cover: the cancel suppresses the default focus action too. Pressing a card in an unfocused panel therefore opened its note into whichever panel `activeId` still pointed at, destroying that panel's document. | The panel takes focus on `pointerdown` as well as `mousedown` (`panel-strip.tsx:653-655`). The press cancel stays — dropping it reopens the selection this story exists to fix | `focuses a panel from the pointerdown, which a cancelled press is all there is` |
+| 3 | **P2.** The Design Note claiming a cross-column release "appears at zero with nothing to animate from" was false: `move` awaits a Tauri round trip, so the release commit paints the card still in its SOURCE column with the transform removed and the transition restored — the browser glided it BACKWARDS from the drop point to its original slot. Correct for the three returning cases, wrong for every successful drop, and it reads exactly like "the animation is broken" | A `landing` gate the release sets when `target !== null` and the settled write clears (`task-board.tsx:349-364`, `:406-418`, `:493-496`). A refusal is only known a round trip later, so a refused card teleports back rather than gliding — the sentence is what reports it | `holds a landed card still while keeper writes the drop, rather than gliding it back` |
+| 4 | **P2.** The follow was an inline transform on an in-flow `<li>` inside two clipping ancestors (`session-detail.tsx:457` `overflow-y-auto`, `panel-strip.tsx` `overflow-hidden`). A transformed descendant is clipped by an overflow ancestor and joins its scrollable overflow, so the card vanished behind the pane edge and every downward drag grew the scroll range. `opacity-50` makes the card a stacking context, so `z-index` could not help | The delta is capped to the board's own rect (`task-board.tsx:257-325`, `:461`, `:502`), measured at the press — the offsets are card-inside-board, so a mid-gesture scroll moves both equally and leaves them unchanged. Chosen over a `position: fixed` proxy, which needs either a second node carrying this card's `data-card-key` (which the tally counts) or the real card out of flow mid-drag, collapsing the hole and re-laying the column out under the pointer | `caps the follow at the board's own box, so the pane cannot clip the card` |
+| 5 | **P3.** Two strand paths for the body class. (a) `begin` recovers from a press whose release was never seen and called `detach()` without `restoreSelection()`; the replaced press's `pointerup` is dropped by the pointerId guard, so nothing else could ever release it. (b) Board and strip are two hook instances over one shared class with no reference count, so whichever gesture ended first stripped it from under the other; `armedRef` cannot see that | `restoreSelection()` beside the `detach()` at the top of `begin` (`use-pointer-drag.ts:400-401`), and a module-level count that removes the class only at zero (`use-pointer-drag.ts:112-131`) | `gives the document back when a second press replaces one whose release never came`, `keeps the document unselectable while a second surface's drag is still live` |
+| 6 | **P3 (this document).** The owed-checks list named no step that could see the slot, and the Design Notes stated two things that were not true (defects 3 and 5's premises) | Items 10–13 above; the two Design Notes corrected in place rather than only recorded here — a wrong *why* in the spec is what the next reader trusts | — |
+
+**The suite was blind by construction, and that is fixed first.** `layout()` in both
+board suites assigned each card a frozen `getBoundingClientRect` closure that no
+transform could move, so every slot assertion measured pre-54.1 geometry. Both
+fixtures now model the browser: a card's rect is its laid-out box **moved by the
+`translate()` its own inline style carries** (`task-board.test.tsx:107-114`,
+`session-board.test.tsx:99-106`), and the board's own `<section>` gets a rect so the
+cap is measured against the board rather than against `src/test/setup.ts`'s viewport
+shim. Defect 1's mutation is caught only because of this: with the frozen fixture,
+`loses the vacated slot…` passed both with and without the fix.
+
+**Mutation results.** Each mutation was applied to the source, run, and reverted
+from a byte-exact backup (`cmp` clean), with the full diff of all three touched
+files read line by line afterwards to confirm no mutant survived anywhere.
+
+| mutation | caught by |
+|---|---|
+| the full pre-fix slot arithmetic: tally without `:not([data-dragging])` **and** the `dropIndex` compensation restored | 3 tests (`lands a card last…`, `lands a card first…`, sessions `sends a card…`) |
+| the compensation kept **beside** the fix (retire missed) | 3 tests (`lands a card last…`, `lands it last however deep…`, sessions `sends a card…`) |
+| the tally measures the lifted card, compensation retired | 3 tests (`lands it last however deep…`, `lands a card first…`, sessions `sends a card…`) |
+| `onPointerDown` removed from the panel `<section>` | `focuses a panel from the pointerdown…` |
+| the `landing !== card.key` term dropped from the transition class | `holds a landed card still while keeper writes the drop…` |
+| `followTransform` returns the raw delta | `caps the follow at the board's own box…` |
+| `restoreSelection()` removed from `begin` | `gives the document back when a second press replaces one whose release never came` |
+| the reference count removes the class on every release | `keeps the document unselectable while a second surface's drag is still live` |
+
+One measured `equivalent`, reported rather than argued: `lands it last however deep
+in the card the press began` survives the full pre-fix mutation. For a DOWNWARD
+drag with a bottom grab the phantom self-count and the vacated-slot subtraction
+cancel exactly, so the old code returned the right answer for that grab offset. It
+is kept as the other half of the pair — it is the test that catches the retire being
+missed (mutation 2), and it pins the reviewer's owed check 10.

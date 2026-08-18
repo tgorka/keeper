@@ -70,8 +70,14 @@ function mount(over: Partial<React.ComponentProps<typeof SessionBoard>> = {}) {
  * last card. Local rather than shared, like `pins-strip.test.tsx`'s
  * `mockPinSlots`; the twin in `notes/task-board.test.tsx` measures the same board
  * from the widget side.
+ *
+ * A card's rect MOVES with the `translate()` its own inline style carries, and the
+ * board's `<section>` gets a rect of its own, because since Story 54.1 the board
+ * measures both: `getBoundingClientRect` returns the TRANSFORMED border box, and
+ * the follow is capped to the board's box so a pane cannot clip the card.
  */
 const COLUMN_W = 200;
+const BOARD_H = 300;
 const CARD_TOP = 40;
 const CARD_H = 30;
 
@@ -90,17 +96,32 @@ function rect(left: number, top: number, width: number, height: number): DOMRect
   } as DOMRect;
 }
 
+/** `base`, moved by the `translate()` in `element`'s own inline style. */
+function transformed(element: HTMLElement, base: DOMRect): DOMRect {
+  const shift = /translate\((-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(element.style.transform);
+  if (shift === null) {
+    return base;
+  }
+  return rect(base.left + Number(shift[1]), base.top + Number(shift[2]), base.width, base.height);
+}
+
 function layout() {
+  const columns = Array.from(document.querySelectorAll<HTMLElement>("[data-board-column]"));
+  const board = columns[0]?.closest<HTMLElement>("section");
+  if (board === null || board === undefined) {
+    throw new Error("no board around the columns");
+  }
+  board.getBoundingClientRect = () => rect(0, 0, COLUMN_W * columns.length, BOARD_H);
   let column = 0;
-  for (const box of document.querySelectorAll<HTMLElement>("[data-board-column]")) {
+  for (const box of columns) {
     const left = column * COLUMN_W;
     column += 1;
-    box.getBoundingClientRect = () => rect(left, 0, COLUMN_W, 300);
+    box.getBoundingClientRect = () => rect(left, 0, COLUMN_W, BOARD_H);
     let at = 0;
     for (const card of box.querySelectorAll<HTMLElement>("[data-card-key]")) {
       const top = CARD_TOP + at * CARD_H;
-      card.getBoundingClientRect = () => rect(left, top, COLUMN_W, CARD_H);
       at += 1;
+      card.getBoundingClientRect = () => transformed(card, rect(left, top, COLUMN_W, CARD_H));
     }
   }
 }
@@ -112,15 +133,20 @@ const X = { prep: 100, todo: 300, done: 500 };
 const Y = { afterFirst: 80, empty: 250 };
 
 /**
- * Press `from`'s card, move the pointer to (x, y) and release it there.
+ * Press `from`'s card at `pressY`, move the pointer to (x, y) and release it there.
  *
  * The gesture is pointer events, not HTML5 drag: under Tauri on macOS the page's
  * `drop` cannot fire at all (`use-pointer-drag.ts` carries the source lines), and
  * unlike a synthetic `dragstart`/`drop` pair this is the same sequence a real
  * pointer produces — which is why this suite can now claim a move happened.
+ *
+ * `pressY` says where inside the card the press landed — 45 is 5 px into the first
+ * slot, 68 is 28 px in. It used to make no difference to anything; since the card
+ * carries a transform, a tally that measured the dragged card turned it into the
+ * whole answer.
  */
-function drag(from: HTMLElement, x: number, y: number) {
-  fireEvent.pointerDown(from, { pointerId: 1, button: 0, clientX: 0, clientY: 45 });
+function drag(from: HTMLElement, x: number, y: number, pressY = 45) {
+  fireEvent.pointerDown(from, { pointerId: 1, button: 0, clientX: 0, clientY: pressY });
   fireEvent.pointerMove(from, { pointerId: 1, clientX: x, clientY: y });
   fireEvent.pointerUp(from, { pointerId: 1, clientX: x, clientY: y });
 }
@@ -199,19 +225,53 @@ describe("SessionBoard", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
-  it("loses the vacated slot when a card is dragged down inside its own column", async () => {
+  it("counts its own column without the card being dragged inside it", async () => {
     mount();
     layout();
     drag(cardOf("Write the board"), X.todo, Y.afterFirst);
     await waitFor(() => {
-      // Rendered slot 1, but the column Rust resolves against has this card
-      // removed — so the honest answer is 0, the classic off-by-one.
+      // Slot 0 of "to do", released just past the midpoint of the card below it —
+      // and the column Rust resolves against is this one WITHOUT this card, whose
+      // only member above the pointer is none: 0.
       expect(sessionsTaskMove).toHaveBeenCalledWith(
         "tgdrive",
         "active/2026-08-10-keeper",
         "write-the-board.md",
         "todo",
         0,
+      );
+    });
+  });
+
+  it("sends a card dragged to the bottom of its own column to the end of it", async () => {
+    // The gesture the owner reports, on the surface he reports it from, and the
+    // one the follow's transform broke: the dragged card measured itself at the
+    // pointer, so its own contribution became `height / 2 < grabOffsetY` — a
+    // constant for the whole gesture. Grabbed 5 px in and released at y=250 it
+    // counted as above nothing, the tally said slot 1, the vacated-slot
+    // subtraction took one off, and the bottom of the column was written as the
+    // top. Once from near the card's top edge, once from near its bottom.
+    mount();
+    layout();
+    drag(cardOf("Write the board"), X.todo, Y.empty, 45);
+    await waitFor(() => {
+      expect(sessionsTaskMove).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "write-the-board.md",
+        "todo",
+        1,
+      );
+    });
+    sessionsTaskMove.mockClear();
+    drag(cardOf("Write the board"), X.todo, Y.empty, 68);
+    await waitFor(() => {
+      expect(sessionsTaskMove).toHaveBeenCalledWith(
+        "tgdrive",
+        "active/2026-08-10-keeper",
+        "write-the-board.md",
+        "todo",
+        1,
       );
     });
   });

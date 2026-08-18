@@ -1312,13 +1312,22 @@ describe("a session log opens in three modes (Story 51.5)", () => {
  */
 describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
   // The form is on screen by default again (Story 54.2), so nothing here has to
-  // arrange it: a rename is committed from a field INSIDE the form, and the
+  // arrange it OPEN: a rename is committed from a field INSIDE the form, and the
   // reader has that field without pressing anything. This block used to hydrate
-  // `{ properties: false }` — the fold arranged OPEN, because Story 53.3 had
-  // defaulted it closed — which is a state no fresh install was ever in. The
-  // store still needs its reset, because a fold is a module-level preference
-  // that outlives a test.
-  beforeEach(resetFileFrameFoldForTest);
+  // `{ properties: false }` — the fold arranged open, because Story 53.3 had
+  // defaulted it closed — which is a state no fresh install was ever in.
+  //
+  // The store AND the jar, exactly as the 52.3 block below: `resetFileFrameFoldForTest`
+  // clears the module preference and re-arms the hydrate, and the hydrate then
+  // reads `document.cookie`. Resetting only the store leaves the default OPEN as
+  // a fact about what no earlier test in this file happens to have persisted,
+  // and a fold written anywhere before line 1313 would take the rename field off
+  // the screen and fail every test here for a reason none of them is about.
+  beforeEach(() => {
+    resetFileFrameFoldForTest();
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging the fold this block depends on
+    document.cookie = `${FILE_FRAME_FOLD_COOKIE}=; path=/; max-age=0`;
+  });
 
   /** A block with a title, which is the field a rename is committed from. */
   const TITLED = "---\ntitle: untitled\n---\n";

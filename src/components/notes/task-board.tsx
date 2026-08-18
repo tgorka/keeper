@@ -75,14 +75,25 @@
  * so the card tracks 1:1, and restored on release so it settles back rather than
  * teleporting. `useReducedMotion` cuts the landing transition and never the
  * follow — direct manipulation is not animation. The selection is stopped where
- * it is anchored: the press cancels its own default (`:345`), which is
+ * it is anchored: the press cancels its own default, which is
  * {@link "@/components/ui/resizable-columns"} (`:202-203`), and the hook holds a
- * `user-select: none` on the document for as long as the drag lasts.
+ * `user-select: none` on the document for as long as the drag lasts. The panel
+ * takes focus from the `pointerdown` for the same reason — a cancelled press
+ * fires no `mousedown` at all, so `panel-strip.tsx` cannot wait for one.
+ *
+ * **A transform has two consequences this file pays for by hand.** It moves the
+ * box `getBoundingClientRect` reports, so the drop tally SKIPS the lifted card
+ * rather than measuring it at the pointer ({@link dropAt}); and it is clipped by
+ * the pane the board sits in, so the follow is capped to the board's own box
+ * ({@link followTransform}). The settle is withheld from a card whose write is
+ * still in flight, because the release commit still paints it in its source
+ * column and a restored transition would glide it BACKWARDS from the drop point
+ * to the slot it came from, a round trip before the re-read moves it.
  */
 import { GripVertical, TriangleAlert } from "lucide-react";
 import { useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
-import { usePointerDrag } from "@/hooks/use-pointer-drag";
+import { type PointerDragDelta, usePointerDrag } from "@/hooks/use-pointer-drag";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
@@ -200,10 +211,23 @@ interface BoardDrop {
  * twice: jsdom implements no layout and so does not implement it at all, and it
  * answers with the topmost element, which during a gesture is the pressed card.
  *
- * The slot is the number of cards whose vertical midpoint is above the pointer.
- * One rule covers every case the old per-card `onDrop` needed three for: the
- * header (nothing above it, so the top of the column), the gap between two cards,
- * and the empty space below the last one (everything above, so the end).
+ * The slot is the number of cards whose vertical midpoint is above the pointer,
+ * counting every card in the column EXCEPT the one being dragged. One rule covers
+ * every case the old per-card `onDrop` needed three for: the header (nothing above
+ * it, so the top of the column), the gap between two cards, and the empty space
+ * below the last one (everything above, so the end).
+ *
+ * **The lifted card is excluded, and that is not an optimisation.** It carries the
+ * follow's `transform`, and `getBoundingClientRect` returns the TRANSFORMED border
+ * box — so a card dragged inside its own column measured itself at the pointer,
+ * where its contribution reduces to `height / 2 < grabOffsetY`: a constant for the
+ * whole gesture, decided by where inside the card the user grabbed it. A card
+ * dragged to the bottom of its own column was written to the TOP. Skipping it also
+ * makes the answer already an index into the column WITHOUT the moved card, which
+ * is the index Rust resolves against — so there is no off-by-one left to
+ * compensate for, in either direction, and no second rule for the within-column
+ * case to get wrong. The remaining cards are untransformed and stay in flow, so
+ * their midpoints are the slots the user can see.
  */
 function dropAt(root: HTMLElement | null, clientX: number, clientY: number): BoardDrop | null {
   if (root === null) {
@@ -221,11 +245,83 @@ function dropAt(root: HTMLElement | null, clientX: number, clientY: number): Boa
   if (box === undefined || status === undefined) {
     return null;
   }
-  const index = Array.from(box.querySelectorAll<HTMLElement>("[data-card-key]")).filter((card) => {
+  const index = Array.from(
+    box.querySelectorAll<HTMLElement>('[data-card-key]:not([data-dragging="true"])'),
+  ).filter((card) => {
     const rect = card.getBoundingClientRect();
     return rect.top + rect.height / 2 < clientY;
   }).length;
   return { status, index };
+}
+
+/**
+ * How far the followed card may be translated and still lie inside the board.
+ *
+ * Measured at the press rather than per move, and that is not a cached-geometry
+ * slip of the kind {@link dropAt}'s header warns about: these are the card's
+ * offsets from the board's own edges, and the card is INSIDE the board, so a
+ * mid-gesture scroll moves both by the same amount and leaves all four
+ * unchanged. What a per-move read would have to measure instead is a box that
+ * already carries the transform it is being asked to bound.
+ */
+interface FollowBounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+function followBounds(card: HTMLElement, root: HTMLElement | null): FollowBounds | null {
+  if (root === null) {
+    return null;
+  }
+  const box = card.getBoundingClientRect();
+  const within = root.getBoundingClientRect();
+  return {
+    minX: within.left - box.left,
+    maxX: within.right - box.right,
+    minY: within.top - box.top,
+    maxY: within.bottom - box.bottom,
+  };
+}
+
+/**
+ * The follow, capped to the board's own box.
+ *
+ * **Why capped at all.** The follow is an inline transform on an `<li>` that
+ * stays in flow, and both hosts put the board inside a clipping ancestor:
+ * `session-detail.tsx:457` wraps the sessions board in `overflow-y-auto`, and
+ * `panel-strip.tsx:645` gives every panel `overflow-hidden`. A transformed
+ * descendant is clipped by an overflow ancestor and its transformed box joins
+ * that ancestor's scrollable overflow — so an uncapped follow made the card
+ * vanish behind the pane edge exactly where aiming matters, and made every
+ * downward drag in session detail grow the scroll range and shrink the thumb for
+ * the duration of the gesture. `opacity-50` makes the card a stacking context,
+ * so no `z-index` could have rescued it.
+ *
+ * **Why capped rather than lifted into a fixed layer.** A `position: fixed`
+ * proxy escapes the clip only while no ancestor is a containing block for it,
+ * and it costs either a second node carrying this card's own `data-card-key` —
+ * which {@link dropAt} counts — or taking the real card out of flow mid-drag,
+ * which collapses the hole it left and re-lays the column out under the pointer.
+ * The cap keeps one node, one flow and one measurement. What it costs is the
+ * last few pixels of 1:1 travel at the board's edge, where there is nothing to
+ * drop onto: the pointer still moves freely, the hit-test still follows the
+ * pointer, and a release beyond the board is the same no-op it always was.
+ *
+ * The pointer is always inside the card's transformed box — the press began
+ * inside the card and both move by the same delta — so a card held inside the
+ * board is a card near a pointer that is itself on screen.
+ */
+function followTransform(delta: PointerDragDelta, limit: FollowBounds | null): string {
+  if (limit === null) {
+    return `translate(${delta.x}px, ${delta.y}px)`;
+  }
+  // A card larger than the board on an axis has no room on it at all, and stays
+  // put there rather than being pinned to whichever edge came first.
+  const x = limit.maxX < limit.minX ? 0 : Math.min(Math.max(delta.x, limit.minX), limit.maxX);
+  const y = limit.maxY < limit.minY ? 0 : Math.min(Math.max(delta.y, limit.minY), limit.maxY);
+  return `translate(${x}px, ${y}px)`;
 }
 
 export function TaskBoard({
@@ -251,8 +347,25 @@ export function TaskBoard({
   moveFailed?: string;
 }) {
   const [notice, setNotice] = useState<string | null>(null);
+  /**
+   * The card whose move keeper is still writing, if any.
+   *
+   * The settle transition is withheld from it, because the release commit paints
+   * it still in its SOURCE column: `forget()` has already zeroed the transform,
+   * and restoring `transition-transform` in that same commit interpolates the
+   * card from the drop point BACK to the slot it came from — the opposite
+   * direction — until the write and the re-read land it a round trip later. The
+   * three returning cases (released over nowhere, cancelled, refused) are the
+   * ones that want that travel; a successful landing wants the card to sit still.
+   * A refusal is only known a round trip later, so it teleports back rather than
+   * gliding: the sentence is what reports it, and a wrong animation on the common
+   * case is the worse trade.
+   */
+  const [landing, setLanding] = useState<string | null>(null);
   /** The board's own root, so the hit-test never crosses two mounted boards. */
   const board = useRef<HTMLElement>(null);
+  /** The pressed card's room inside the board, measured at the press. */
+  const bounds = useRef<FollowBounds | null>(null);
   // The landing transition's gate, and only the landing's: a live follow is the
   // card under the finger, which is the distinction `chat-row.tsx:459` draws.
   const reducedMotion = useReducedMotion();
@@ -272,19 +385,6 @@ export function TaskBoard({
   };
 
   /**
-   * Where a dropped card lands in a column it is dragged within.
-   *
-   * The index Rust wants counts the column **without** the moved card, so a card
-   * dragged downwards inside its own column has to lose the slot it vacated;
-   * one dragged from another column does not. Getting this wrong is the classic
-   * off-by-one that makes a downward drag land one place short.
-   */
-  const dropIndex = (column: BoardCard[], key: string, at: number) => {
-    const from = column.findIndex((card) => card.key === key);
-    return from !== -1 && from < at ? at - 1 : at;
-  };
-
-  /**
    * The gesture: press a card, move it, release it over a column.
    *
    * `onRelease` is handed a null target for a press that never passed the slop,
@@ -292,6 +392,12 @@ export function TaskBoard({
    * button's own `onClick` runs, untouched. The hook swallows exactly one click
    * after a drag, so the release of a card whose title happened to be under the
    * pointer does not also open the file.
+   *
+   * The slot is written as {@link dropAt} measured it: that tally already skips
+   * the lifted card, so it is already an index into the column WITHOUT it, for a
+   * card dragged within its own column and for one arriving from another alike.
+   * The off-by-one compensation this release used to apply is retired rather than
+   * kept beside it — two corrections for one index is how the wrong one survives.
    */
   const drag = usePointerDrag<string, BoardDrop>({
     resolve: (clientX, clientY) => dropAt(board.current, clientX, clientY),
@@ -301,7 +407,14 @@ export function TaskBoard({
       if (target === null) {
         return;
       }
-      void move(key, target.status, dropIndex(columnOf(cards, target.status), key, target.index));
+      // Before the commit that ends the drag, so that commit already knows this
+      // card's transform must not be animated back to where it came from.
+      setLanding(key);
+      void move(key, target.status, target.index).finally(() => {
+        // Only if this card's own write is the one still in flight: a second drop
+        // landing first must not clear the gate the second one is holding.
+        setLanding((current) => (current === key ? null : current));
+      });
     },
   });
 
@@ -343,6 +456,9 @@ export function TaskBoard({
         // is why the `<select>` above returns before reaching here, and why the
         // keyboard path — tab, then Enter — never goes near a pointer.
         event.preventDefault();
+        // The room this card has inside the board, before it carries a transform
+        // of its own: the follow is capped to it (see {@link followTransform}).
+        bounds.current = followBounds(event.currentTarget, board.current);
         drag.begin(card.key, {
           pointerId: event.pointerId,
           clientX: event.clientX,
@@ -368,18 +484,22 @@ export function TaskBoard({
       className={cn(
         "group cursor-grab select-none rounded-md border border-border bg-card px-2 py-1.5 data-[dragging=true]:cursor-grabbing data-[dragging=true]:opacity-50",
         // The settle, and only the settle. Withheld while the gesture is live so
-        // the card tracks the pointer exactly; restored by the render that ends
-        // the drag, where the transform returns to zero, so the card travels back
-        // to where its file says instead of jumping there; and cut altogether
-        // under reduced motion (`chat-row.tsx:459`).
-        !lifted(card) && !reducedMotion && "transition-transform duration-200 ease-out",
+        // the card tracks the pointer exactly; withheld again while keeper is
+        // writing the drop, so a landed card sits still instead of gliding back
+        // to the slot it came from; restored by the render that ends a gesture
+        // which returned the card, where the transform goes back to zero, so it
+        // travels rather than teleports; and cut altogether under reduced motion
+        // (`chat-row.tsx:459`).
+        !lifted(card) &&
+          landing !== card.key &&
+          !reducedMotion &&
+          "transition-transform duration-200 ease-out",
       )}
-      // The follow, 1:1, for the whole gesture. Only on the pressed card and only
-      // while it is a drag: a card at rest carries no transform at all, so the
-      // other nineteen never pay for a containing block none of them needed.
-      style={
-        lifted(card) ? { transform: `translate(${drag.delta.x}px, ${drag.delta.y}px)` } : undefined
-      }
+      // The follow, 1:1 until the board's own edge, for the whole gesture. Only
+      // on the pressed card and only while it is a drag: a card at rest carries
+      // no transform at all, so the other nineteen never pay for a containing
+      // block none of them needed.
+      style={lifted(card) ? { transform: followTransform(drag.delta, bounds.current) } : undefined}
     >
       <div className="flex items-start gap-1.5">
         <GripVertical

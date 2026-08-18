@@ -214,6 +214,75 @@ export const TEXT_FILE_CAVEAT_TESTID = "text-file-caveat";
 export const TEXT_FILE_CAVEAT_LABEL = "What keeper does not do for this file";
 
 /**
+ * Pixels group 3 needs before the properties disclosure may show its WORD, and
+ * why this is a reservation against the ROW rather than a breakpoint on the
+ * window (Story 54.2, corrected).
+ *
+ * The word widened the header's minimum content by roughly the width of
+ * `Properties`, and there is nothing in a `PaneHeader` row that can absorb
+ * that. Every `Button` is `shrink-0 whitespace-nowrap` from `buttonVariants`'
+ * base (`button.tsx:28`); group 2's width is a constant by construction, which
+ * is what group 2 IS; group 4 is `shrink-0` because the way to shut a panel may
+ * not depend on how wide the panel is. And group 1 cannot pay either — its
+ * basis is ZERO (`pane-header.tsx:328`), so it contributes nothing to a
+ * shortage's shrink and simply sits at 0px: the file name goes first, and then
+ * the row overflows past group 4's fold and close. That is the 46.5 defect
+ * `pane-header.tsx` exists to refuse, and it is what the comment on this
+ * frame's actions used to get backwards.
+ *
+ * So the word is spent out of the ACTIONS BUDGET, which is the one number in
+ * this row that already knows what group 1 is owed: `paneHeaderActionsBudget`
+ * is the row's content width less `PANE_HEADER_IDENTITY_MIN_PX` (160), less
+ * groups 2 and 4, less the gaps. Honouring it keeps both halves of the promise
+ * at once — the name keeps its 160px and the row never grows past its own
+ * width, so nothing is pushed off the right-hand edge.
+ *
+ * A `sm:` breakpoint would have been the wrong INSTRUMENT and not merely a
+ * coarser one, and this project has no `hidden sm:inline` idiom to reach for:
+ * `sm:` asks about the window, and a strip of four panels in a 1600px window
+ * satisfies every viewport breakpoint there is while giving each panel 400px.
+ * The panel is what this row is inside.
+ *
+ * The two figures are the shape's own arithmetic against Tailwind v4's default
+ * scale — `size="xs"` is `gap-1 px-2 text-xs` with `svg:size-3` — and not
+ * measurements: jsdom lays nothing out and this container has no Chromium.
+ *
+ *     the disclosure at its narrowest:
+ *       px-2 (8+8) + glyph 12 + gap-1 (4) + chevron 12        = 44
+ *     Save beside it: px-2 (8+8) + `Save` at 12px (~30)       = 46
+ *     the `gap-2` between them                               =  8
+ *     -----------------------------------------------------------
+ *     FILE_ACTIONS_NARROW_PX                                   98
+ *
+ *     the word: gap-1 (4) + `Properties` at 12px (~62)        = 66
+ *
+ * Both are deliberately generous. Overestimating delays the word by a few pixels
+ * of panel width; underestimating brings the overflow back. The disclosure
+ * exists only over a file a Save can follow — `propertiesPanel` is
+ * `writingTools ? … : null` and `writingTools` implies `savable` — so Save is
+ * always the control beside it and there is no second case to spell.
+ */
+export const FILE_ACTIONS_NARROW_PX = 98;
+
+/** What the visible word adds to {@link FILE_ACTIONS_NARROW_PX}. See there for
+ *  where 66 comes from and why it is rounded up. */
+export const PROPERTIES_WORD_PX = 66;
+
+/**
+ * The budget below which the disclosure hides its word, being the two figures
+ * above summed once so a test and the render cannot disagree about the sum.
+ *
+ * A budget of zero is what `PaneHeader` reports until a `ResizeObserver` has
+ * answered, and zero is below this — so an unobserved row renders the narrow
+ * shape, which is the same safe direction `PriorityActions` takes: the worst a
+ * machine that never delivers an observation can do is leave the row at its
+ * smallest. Narrow costs a reader nothing they depend on, because the word is
+ * `sr-only` rather than absent and the control keeps ONE accessible name — its
+ * own text — at every width.
+ */
+export const PROPERTIES_WORD_BUDGET_PX = FILE_ACTIONS_NARROW_PX + PROPERTIES_WORD_PX;
+
+/**
  * Where a file's own properties are addressed (Story 50.4, FR-283).
  *
  * The pair `(profile id, profile-relative subpath)` and nothing else — the same
@@ -716,7 +785,7 @@ export function TextFileFrame({
           // follow, has nothing to say here — and an empty reserved slot is 8px
           // of nothing (`pane-header.tsx`).
           status={savable ? { sizers: FILE_SAVE_SIZERS, caption: fileSaveWord(dirty) } : null}
-          actions={
+          actions={(budget) => (
             <>
               {/* The properties fold, and it says all three things a disclosure
                   has to say: WHAT it opens, THAT it opens, and which WAY.
@@ -730,17 +799,28 @@ export function TextFileFrame({
 
                   - the GLYPH is `SlidersHorizontal`, the app's spelling of
                     Properties everywhere else (`note-editor.tsx:794`);
-                  - the WORD is `PROPERTIES_LABEL` itself, visible now and the
-                    button's accessible name by its own text — so speech input
-                    and an eye ask for the same string (WCAG 2.5.3), with no
+                  - the WORD is `PROPERTIES_LABEL` itself, and it is the button's
+                    accessible name by its own text in BOTH states — so speech
+                    input and an eye ask for the same string (WCAG 2.5.3), with no
                     `aria-label` beside it to drift from it and no `title`
                     repeating a word that is already on screen;
                   - the CHEVRON pair is the caveat fold's, ten lines below.
 
                   It costs zero vertical pixels: `PaneHeader` is a fixed 40px row
-                  and `size="xs"` is 24px, the same height as Save beside it. The
-                  width comes out of group 1, which is the only member of the row
-                  allowed to give ground (`pane-header.tsx`).
+                  and `size="xs"` is 24px, the same height as Save beside it.
+
+                  HORIZONTALLY it costs the actions budget, which is why this is
+                  the render-prop form of `actions` and not a node. The comment
+                  that used to stand here said the width came out of group 1
+                  because group 1 is the only member allowed to give ground, and
+                  that is exactly backwards: group 1's basis is zero, so it gives
+                  its LAST pixel first and then the row overflows onto group 4's
+                  fold and close — 46.5's defect. `PROPERTIES_WORD_BUDGET_PX`
+                  says what the row has to be able to spare, and below it the
+                  word goes `sr-only`: out of flow, out of the row's content
+                  width, still the accessible name, still the string a reader
+                  speaks. The glyph and the chevron are the affordance that
+                  survives, and the fold is still named to a screen reader.
 
                   `aria-controls` is unconditional now, because the region it
                   names is mounted in both states — hidden while folded rather
@@ -758,7 +838,15 @@ export function TextFileFrame({
                   onClick={() => fileFrameFoldStore.getState().toggleBand("properties")}
                 >
                   <SlidersHorizontal aria-hidden="true" />
-                  {PROPERTIES_LABEL}
+                  {/* A span rather than a bare string, because the row has to be
+                      able to take it OUT of its content width, and `sr-only` is
+                      how this codebase does that: absolutely positioned, so it
+                      is not a flex item and costs neither width nor a `gap-1`,
+                      and still in the accessibility tree, so the accessible name
+                      is this same string at every width. */}
+                  <span className={budget >= PROPERTIES_WORD_BUDGET_PX ? undefined : "sr-only"}>
+                    {PROPERTIES_LABEL}
+                  </span>
                   {propertiesOpen ? (
                     <ChevronDown aria-hidden="true" />
                   ) : (
@@ -783,7 +871,7 @@ export function TextFileFrame({
                 </Button>
               ) : null}
             </>
-          }
+          )}
           // The host's own controls, last and never demoted into this surface's
           // overflow — `PaneHeader`'s fourth group, where Story 50.1 puts a note
           // panel's fold and close.

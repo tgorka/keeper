@@ -41,7 +41,10 @@ on a **file** the buffer IS the whole file, so a closed form dumps the block int
 the reader's prose. `raw-rendered-view.tsx:199-201` already states that asymmetry
 two files away from the code that assumed it away.
 
-So this epic overrides two clauses of spec 53.3, and says why in both places:
+So this epic overrides two clauses of spec 53.3, and says why AT THE CLAUSE in that
+file rather than in a footnote — `spec-53-3-one-title-bar-and-two-folds.md:69-79`
+(the Never list), `:97` (acceptance row 1) and `:129-143` (the Design Notes
+paragraph), each struck through with a `SUPERSEDED by story 54.2` line:
 - the file surface defaults properties **open** — he asked for an *option to fold*, and an option to fold presumes the thing is there;
 - a folded form **still hides the block**. Folded is not absent: the fold control names it, and the spec's objection is answered by the control, not by putting YAML in his document.
 

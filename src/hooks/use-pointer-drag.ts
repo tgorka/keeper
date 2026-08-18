@@ -100,8 +100,35 @@ export const POINTER_DRAG_SLOP_PX = 6;
  * `pointerup` and an unmount in the same tick) would restore it twice from a
  * value the first one already overwrote. `classList.remove` of a class that is
  * not there is a no-op, so every exit path can run unconditionally.
+ *
+ * It is one class over a document that mounts this hook more than once — the
+ * board and the pins strip at least — so the arming is REFERENCE COUNTED
+ * ({@link suppressDocumentSelection}). Without the count, whichever of two live
+ * gestures ended first stripped the suppression from under the other, and the
+ * one still running spent the rest of its travel painting a selection.
  */
 export const DRAG_SELECTION_CLASS = "select-none";
+
+/**
+ * How many live gestures are holding {@link DRAG_SELECTION_CLASS} on.
+ *
+ * Module-level, because the class is: two hook instances are two surfaces over
+ * one `document.body`, and neither can see the other's state. Each instance
+ * holds at most one count (`armedRef`), so the pair is always balanced.
+ */
+let suppressions = 0;
+
+function suppressDocumentSelection() {
+  suppressions += 1;
+  document.body.classList.add(DRAG_SELECTION_CLASS);
+}
+
+function restoreDocumentSelection() {
+  suppressions = Math.max(0, suppressions - 1);
+  if (suppressions === 0) {
+    document.body.classList.remove(DRAG_SELECTION_CLASS);
+  }
+}
 
 /** How far the pointer has travelled from the press origin, in CSS pixels. */
 export interface PointerDragDelta {
@@ -258,10 +285,12 @@ export function usePointerDrag<Item, Target>(
   // The element holding the capture, while it holds it. Null between gestures,
   // and before the slop crossing on the entries that capture there.
   const captureRef = React.useRef<CaptureHold | null>(null);
-  // Whether THIS hook armed the document's selection suppression. Two surfaces
-  // mount this hook, and one pointer can only be dragging on one of them; the
-  // flag is what stops the other one's unmount releasing a suppression it never
-  // armed.
+  // Whether THIS hook is holding one of {@link DRAG_SELECTION_CLASS}'s counts.
+  // Two surfaces mount this hook, and one pointer can only be dragging on one of
+  // them; the flag is what stops the other one's unmount releasing a suppression
+  // it never armed, and what keeps this instance's arm/release pairs balanced —
+  // it bounds the instance to at most one count, which is what makes the
+  // module-level total exact.
   const armedRef = React.useRef(false);
 
   const [item, setItem] = React.useState<Item | null>(null);
@@ -283,7 +312,7 @@ export function usePointerDrag<Item, Target>(
       return;
     }
     armedRef.current = true;
-    document.body.classList.add(DRAG_SELECTION_CLASS);
+    suppressDocumentSelection();
   }, []);
 
   const restoreSelection = React.useCallback(() => {
@@ -291,7 +320,7 @@ export function usePointerDrag<Item, Target>(
       return;
     }
     armedRef.current = false;
-    document.body.classList.remove(DRAG_SELECTION_CLASS);
+    restoreDocumentSelection();
   }, []);
 
   const forget = React.useCallback(() => {
@@ -363,8 +392,13 @@ export function usePointerDrag<Item, Target>(
       // A press whose release was never seen — a pointer that left a small target
       // without ever crossing the slop, so no capture and no `pointerup` here —
       // must not wedge the surface for good. The new press wins, and it cannot
-      // inherit the previous one's capture hold.
+      // inherit the previous one's capture hold, or its selection suppression:
+      // the replaced press's `pointerup` is dropped by the pointerId guard, so
+      // this is the LAST site that could ever give the document back. A pointer
+      // that crossed the slop and was then replaced left the whole app
+      // unselectable until the surface unmounted.
       detach();
+      restoreSelection();
       draggedRef.current = false;
       const press: Press<Item> = {
         pointerId: origin.pointerId,
@@ -383,7 +417,7 @@ export function usePointerDrag<Item, Target>(
         capture(press);
       }
     },
-    [capture, detach],
+    [capture, detach, restoreSelection],
   );
 
   const allowNextClick = React.useCallback(() => {

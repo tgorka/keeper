@@ -40,7 +40,7 @@ import { useRef, useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TextFileVm } from "@/lib/ipc/client";
 import type { ViewerEntry } from "@/lib/viewers";
-import { withRangeRects } from "@/test/layout";
+import { withActionWidths, withHandFiredResize, withRangeRects } from "@/test/layout";
 
 /** Story 52.3's seam needs both halves of the properties address in the test's
  *  hands: the block the form is holding is what the panes hide, and only a test
@@ -81,6 +81,8 @@ import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import {
   PANE_HEADER_ACTIONS_SLOT,
   PANE_HEADER_FRAME_SLOT,
+  PANE_HEADER_GAP_PX,
+  PANE_HEADER_IDENTITY_MIN_PX,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
 } from "@/components/layout/pane-header";
@@ -97,6 +99,7 @@ import {
   FILE_SAVE_SIZERS,
   type FilePropertiesCoordinates,
   fileSaveWord,
+  PROPERTIES_WORD_BUDGET_PX,
   TEXT_FILE_CAVEAT_LABEL,
   TEXT_FILE_CAVEAT_TESTID,
   TextFileFrame,
@@ -230,6 +233,23 @@ function shownWord(): string {
  *  formatter's business, the SET is the claim. */
 function box(element: Element): string {
   return Array.from(element.classList).sort().join(" ");
+}
+
+/**
+ * The lucide glyphs a control draws, in order, by the only handle a rendered icon
+ * has: `lucide-react` emits `class="lucide lucide-<kebab-name>"`, and these are
+ * `aria-hidden` on purpose so they have no accessible name to query by. The same
+ * idiom `files-pane.test.tsx:1481-1497` and `capture-window.test.tsx:154` use.
+ *
+ * Order and identity together, because "two svgs" is the assertion that let a
+ * swapped chevron pair through: a disclosure whose glyph points the wrong way
+ * contradicts its own `aria-expanded`, and only the NAME can see that.
+ */
+function glyphsOf(control: Element): string[] {
+  return Array.from(control.querySelectorAll("svg")).map(
+    (svg) =>
+      Array.from(svg.classList).find((name) => name.startsWith("lucide-")) ?? "no lucide glyph",
+  );
 }
 
 /**
@@ -589,16 +609,92 @@ describe("a file's own properties", () => {
     // The visible word IS the accessible name, rather than a second copy of it
     // that could drift (WCAG 2.5.3).
     expect(control.getAttribute("aria-label")).toBeNull();
-    // A disclosure's chevron, the pair the caveat fold beneath uses.
-    expect(control.querySelectorAll("svg").length).toBe(2);
+    // A disclosure's chevron, the pair the caveat fold beneath uses, and WHICH of
+    // the two by name: counting the svgs passed on a build with `ChevronDown` and
+    // `ChevronRight` swapped, which is a control whose glyph contradicts its own
+    // `aria-expanded`.
+    expect(glyphsOf(control)).toEqual(["lucide-sliders-horizontal", "lucide-chevron-down"]);
 
     // Zero vertical pixels: the row's height is `PaneHeader`'s `h-10` and the
-    // control is `h-6`, the same height as Save beside it. jsdom lays nothing
-    // out, so this is the class the height comes from and not a measurement —
-    // the pixels are a thing to look at on the real machine.
+    // control is `h-6`, the same height as Save beside it.
+    //
+    // THESE TWO ARE CLASS-STRING CHECKS AND NOT MEASUREMENTS. No Tailwind is
+    // loaded in this run and jsdom lays nothing out, so what they prove is that
+    // the classes the heights come from are still spelled on the right elements —
+    // a build where `h-10` resolved to something else, or where the row grew by a
+    // wrapper with padding of its own, would pass. The 40px and the 24px are owed
+    // as a real measurement on the machine; the spec's Verification says so.
     expect(bar()?.className).toContain("h-10");
     expect(control.className).toContain("h-6");
-    expect(within(group(PANE_HEADER_ACTIONS_SLOT)).getByText(PROPERTIES_LABEL)).toBeVisible();
+  });
+
+  it("hides its word rather than the file name when the row cannot afford both", async () => {
+    // The 46.5 defect the word reintroduced. Every `Button` is `shrink-0
+    // whitespace-nowrap` from `buttonVariants`' base, group 2's width is a
+    // constant and group 4 is `shrink-0`; group 1's basis is ZERO, so it does not
+    // shrink — it simply sits at 0px and the row then overflows past the fold and
+    // close controls. So the word is spent out of the actions BUDGET, which is
+    // `PaneHeader`'s render-prop form and already reserves 160px for the name.
+    //
+    // The geometry is DECLARED and not inherited, exactly as `note-editor.test.tsx`
+    // declares its own: `src/test/setup.ts` answers one whole 1024px viewport for
+    // every zero-sized element, so an unaided suite charges the budget 1024px for
+    // the status slot and 1024 again for the frame group and every width is
+    // meaningless. `status` is `Unsaved changes` at the header's 12px and `frame` is
+    // a panel's fold beside its close — two `icon-xs` controls and their seam.
+    const widths = withActionWidths({ status: 96, frame: 56 });
+    const owed =
+      PANE_HEADER_IDENTITY_MIN_PX +
+      PANE_HEADER_GAP_PX +
+      (96 + PANE_HEADER_GAP_PX) +
+      (56 + PANE_HEADER_GAP_PX);
+    const observer = withHandFiredResize();
+    try {
+      mount({ dirty: true }, MARKDOWN, ADDRESS, { frame: FRAME_CONTROLS });
+      await settle();
+      const word = () =>
+        within(group(PANE_HEADER_ACTIONS_SLOT)).getByText(PROPERTIES_LABEL).className;
+
+      // Zero until an observation arrives, which is the shape a machine with no
+      // `ResizeObserver` keeps: narrow, and `PriorityActions`' own safe direction.
+      expect(word()).toContain("sr-only");
+
+      // THE QUICK-CAPTURE WINDOW, 560px less the row's own `px-3` either side. The
+      // narrowest window this app has affords the word.
+      act(() => observer.resize(560 - 24));
+      expect(word()).not.toContain("sr-only");
+
+      // A FOUR-PANEL STRIP in a 1440px window: 360px a panel, 336 of row. It does
+      // not afford the word, and that is the case the shipped build overflowed.
+      act(() => observer.resize(360 - 24));
+      expect(word()).toContain("sr-only");
+      // What may not be given up to pay for it, and was: the file's name, and the
+      // host's own fold and close.
+      expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("readme.md");
+      expect(group(PANE_HEADER_FRAME_SLOT)).toBeInTheDocument();
+      // And in BOTH states the control keeps ONE accessible name — its own text.
+      // `sr-only` rather than absent, so nothing a screen reader or a speech-input
+      // user asks for changed with the width.
+      expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+
+      // The boundary itself, either side of one pixel, so the threshold is the
+      // product's constant rather than whichever width this test happened to pick.
+      act(() => observer.resize(owed + PROPERTIES_WORD_BUDGET_PX - 1));
+      expect(word()).toContain("sr-only");
+      act(() => observer.resize(owed + PROPERTIES_WORD_BUDGET_PX));
+      expect(word()).not.toContain("sr-only");
+
+      // WHAT THIS DOES NOT PROVE. `sr-only` is a class with no stylesheet behind it
+      // in this run and nothing here has a real width, so what is asserted is the
+      // DECISION and the reservation arithmetic. It does NOT prove that 164px is
+      // what `Properties` beside `Save` really measures in Inter at 12px, that 96
+      // and 56 are the real status and frame widths, or that the row stops
+      // overflowing on a screen. Those are measurements, owed on the machine — the
+      // spec's Verification lists them.
+    } finally {
+      observer.undo();
+      widths();
+    }
   });
 
   it("row 9: are not offered over a CSV, which has no frontmatter to show", () => {
@@ -971,6 +1067,9 @@ describe("the properties fold", () => {
     // pasted at the top.
     const control = screen.getByRole("button", { name: PROPERTIES_LABEL });
     expect(control).toHaveAttribute("aria-expanded", "true");
+    // The glyph and `aria-expanded` say the same thing, and by name rather than by
+    // count — a swapped pair would leave a control pointing down at nothing.
+    expect(glyphsOf(control)).toEqual(["lucide-sliders-horizontal", "lucide-chevron-down"]);
     expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
     expect(paneView().state.doc.toString()).toBe(BODY);
 
@@ -979,6 +1078,7 @@ describe("the properties fold", () => {
 
     // Folded: the form is off the screen, and the prose is still the prose.
     expect(control).toHaveAttribute("aria-expanded", "false");
+    expect(glyphsOf(control)).toEqual(["lucide-sliders-horizontal", "lucide-chevron-right"]);
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
     expect(paneView().state.doc.toString()).toBe(BODY);
 
@@ -987,6 +1087,7 @@ describe("the properties fold", () => {
 
     // And back, with no re-read behind it.
     expect(control).toHaveAttribute("aria-expanded", "true");
+    expect(glyphsOf(control)).toEqual(["lucide-sliders-horizontal", "lucide-chevron-down"]);
     expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
     expect(paneView().state.doc.toString()).toBe(BODY);
   });
