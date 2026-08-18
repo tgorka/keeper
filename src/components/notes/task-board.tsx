@@ -63,11 +63,27 @@
  * {@link "@/components/sessions/session-tree"} row idiom. It stays in the DOM
  * and in the tab order at all times: opacity is not visibility, and a keyboard
  * user tabbing to it brings it back.
+ *
+ * **The dragged card follows the pointer, and settles when it lands.** What
+ * `draggable="true"` was quietly buying, besides a drag session, was a drag image
+ * and a browser that never selected text while one was running; Story 53.1
+ * removed the attribute and replaced neither, so the card went half-transparent
+ * *in place* while the pointer walked away from it and every drag painted a
+ * selection across the app (Story 54.1, FR-323/FR-324). The follow is this repo's
+ * own idiom, from {@link "@/components/chat/chat-row"} (`:459-461`): a transform
+ * from the live delta, with the transition withheld **while** the gesture is live
+ * so the card tracks 1:1, and restored on release so it settles back rather than
+ * teleporting. `useReducedMotion` cuts the landing transition and never the
+ * follow — direct manipulation is not animation. The selection is stopped where
+ * it is anchored: the press cancels its own default (`:345`), which is
+ * {@link "@/components/ui/resizable-columns"} (`:202-203`), and the hook holds a
+ * `user-select: none` on the document for as long as the drag lasts.
  */
 import { GripVertical, TriangleAlert } from "lucide-react";
 import { useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { usePointerDrag } from "@/hooks/use-pointer-drag";
+import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -237,6 +253,9 @@ export function TaskBoard({
   const [notice, setNotice] = useState<string | null>(null);
   /** The board's own root, so the hit-test never crosses two mounted boards. */
   const board = useRef<HTMLElement>(null);
+  // The landing transition's gate, and only the landing's: a live follow is the
+  // card under the finger, which is the distinction `chat-row.tsx:459` draws.
+  const reducedMotion = useReducedMotion();
 
   const known = new Set(BOARD_COLUMNS.map((column) => column.status));
   const strays = cards.filter((card) => card.status === null || !known.has(card.status));
@@ -276,6 +295,8 @@ export function TaskBoard({
    */
   const drag = usePointerDrag<string, BoardDrop>({
     resolve: (clientX, clientY) => dropAt(board.current, clientX, clientY),
+    // The card translates by the live delta, so the hook has to publish it.
+    trackDelta: true,
     onRelease: (key, target) => {
       if (target === null) {
         return;
@@ -284,11 +305,20 @@ export function TaskBoard({
     },
   });
 
+  /**
+   * The pressed card, while the press is a drag.
+   *
+   * The one card that translates, the one card whose settle transition is
+   * withheld, and the one card the cursor changes on. A predicate rather than a
+   * value because `draw` is called once per card and only one of them is ever it.
+   */
+  const lifted = (card: BoardCard) => drag.dragging && drag.item === card.key;
+
   const draw = (card: BoardCard) => (
     <li
       key={card.key}
       data-card-key={card.key}
-      data-dragging={drag.dragging && drag.item === card.key ? "true" : undefined}
+      data-dragging={lifted(card) ? "true" : undefined}
       onPointerDown={(event) => {
         // Every press, ahead of the gates below: a press on a card's own menu
         // returns without reaching `begin`, which is the other site that clears
@@ -303,6 +333,16 @@ export function TaskBoard({
         ) {
           return;
         }
+        // The press's own default is the selection, and this is where it is
+        // stopped: a cancelled `pointerdown` sets the platform's PREVENT MOUSE
+        // EVENT flag, so no `mousedown` is fired and nothing anchors a selection
+        // for the following moves to extend — `resizable-columns.tsx:202-203`
+        // exactly, which is why a seam drag never leaked one. The spec's own
+        // worked sequence still ends in `click`, so the title button below still
+        // opens the file; what the cancel does cost is focus-on-mousedown, which
+        // is why the `<select>` above returns before reaching here, and why the
+        // keyboard path — tab, then Enter — never goes near a pointer.
+        event.preventDefault();
         drag.begin(card.key, {
           pointerId: event.pointerId,
           clientX: event.clientX,
@@ -311,18 +351,35 @@ export function TaskBoard({
         });
       }}
       // The move, the release and the cancel are listened for once, on the board
-      // (`:404`), and not again here: this card is inside it, so a card-level copy
+      // (`:461`), and not again here: this card is inside it, so a card-level copy
       // would only run the same hit-test a second time on every move of a live
       // drag. The press stays here, because it is the press that names the card,
       // and so does the click swallow, because that click lands on the card.
       onClickCapture={drag.handlers.onClickCapture}
-      // The whole card is the handle, so the whole card says so. `select-none` is
-      // what `draggable` used to buy: without it a mouse drag paints a text
+      // The whole card is the handle, so the whole card says so, and says it
+      // twice: `cursor-grab` at rest and `cursor-grabbing` for as long as the
+      // gesture is live, off the same `data-dragging` the opacity uses rather
+      // than off `:active`, which a plain click would also light. `select-none`
+      // is what `draggable` used to buy: without it a mouse drag paints a text
       // selection across the card instead of moving it. `touch-action` is left
       // alone deliberately — claiming it would stop a phone scrolling the board by
       // starting on a card, and a browser that takes a touch gesture over sends
       // `pointercancel`, which returns the card.
-      className="group cursor-grab select-none rounded-md border border-border bg-card px-2 py-1.5 data-[dragging=true]:opacity-50"
+      className={cn(
+        "group cursor-grab select-none rounded-md border border-border bg-card px-2 py-1.5 data-[dragging=true]:cursor-grabbing data-[dragging=true]:opacity-50",
+        // The settle, and only the settle. Withheld while the gesture is live so
+        // the card tracks the pointer exactly; restored by the render that ends
+        // the drag, where the transform returns to zero, so the card travels back
+        // to where its file says instead of jumping there; and cut altogether
+        // under reduced motion (`chat-row.tsx:459`).
+        !lifted(card) && !reducedMotion && "transition-transform duration-200 ease-out",
+      )}
+      // The follow, 1:1, for the whole gesture. Only on the pressed card and only
+      // while it is a drag: a card at rest carries no transform at all, so the
+      // other nineteen never pay for a containing block none of them needed.
+      style={
+        lifted(card) ? { transform: `translate(${drag.delta.x}px, ${drag.delta.y}px)` } : undefined
+      }
     >
       <div className="flex items-start gap-1.5">
         <GripVertical

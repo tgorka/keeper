@@ -238,6 +238,19 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
   // While a pin drags, preview the reordered strip; the authoritative order still
   // arrives over the stream after the release. With no HTML5 ghost to lean on,
   // this preview IS the desktop's drop cue.
+  //
+  // **And it is why the pressed pin does not also translate under the pointer**
+  // (Story 54.1). The board's card gets a `transform` from the drag's live delta
+  // because nothing else moves it: it stays in its column and the delta from the
+  // press origin is exactly where the pointer is. Here the DOM has already moved
+  // the pressed avatar into its target slot, so the same delta would be added on
+  // top of a displacement the reorder already applied — a pin drawn a slot ahead
+  // of the finger, further ahead the further it travelled. Following the finger
+  // from *here* means measuring the element's new rect every step, which is a FLIP
+  // and is not what this epic bought. The strip does take the other half of
+  // Story 54.1: the press cancels its own default (`:328`) and the shared hook
+  // holds the document unselectable for the gesture, which is what the desktop
+  // strip was missing.
   const pressed = drag.item;
   const preview =
     pressed !== null && drag.dragging && drag.over !== null && drag.over !== pressed.index
@@ -304,6 +317,15 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                       if (phone || !reorderable || e.button !== 0) {
                         return;
                       }
+                      // The press's own default is the selection: a cancelled
+                      // `pointerdown` fires no `mousedown`, so nothing anchors one
+                      // for the following moves to extend across the app
+                      // (Story 54.1; `resizable-columns.tsx:202-203`). `click` is
+                      // not cancelled by it, so the avatar still selects the room,
+                      // and the phone's long-press entry above is untouched — it
+                      // returns before this line and its own suppression is the
+                      // `select-none` below.
+                      e.preventDefault();
                       drag.begin(
                         {
                           index: pinIndex,
@@ -322,7 +344,7 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                     }}
                     // The long-press owns these on the avatar: it needs the
                     // element it is holding. The drag's own move/release/cancel
-                    // are listened for once, on the list (`:257`), because this
+                    // are listened for once, on the list (`:270`), because this
                     // avatar is inside it — a copy here would only re-run the same
                     // slot hit-test on every move of a live drag.
                     onPointerMove={longPress.onPointerMove}
@@ -339,8 +361,13 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                     className={cn(
                       "rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring data-[dragging=true]:opacity-50",
                       // Phone (Story 13.6): the pin is a long-press/drag target —
-                      // suppress the native callout/selection and let the pointer
-                      // (not native panning) own the gesture.
+                      // suppress the native callout and let the pointer (not
+                      // native panning) own the gesture. Still phone-only after
+                      // Story 54.1: `touch-none` and the callout are WebKit-touch
+                      // affordances, and the desktop's selection is now stopped
+                      // where it is anchored — at the press (`:328`) and on the
+                      // document for the gesture's duration — rather than on one
+                      // element.
                       phone && "touch-callout-none touch-none select-none",
                     )}
                   >

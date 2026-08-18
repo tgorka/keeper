@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionTaskVm } from "@/lib/ipc/client";
 
@@ -17,6 +17,7 @@ import {
   SESSION_BOARD_STRAY_HEADING,
   SessionBoard,
 } from "@/components/sessions/session-board";
+import { DRAG_SELECTION_CLASS } from "@/hooks/use-pointer-drag";
 
 function task(over: Partial<SessionTaskVm> & Pick<SessionTaskVm, "title">): SessionTaskVm {
   const relPath = over.relPath ?? `${over.title.toLowerCase().replace(/\W+/g, "-")}.md`;
@@ -349,5 +350,31 @@ describe("SessionBoard", () => {
     mount({ tasks: [] });
     expect(screen.getByText(SESSION_BOARD_EMPTY)).toBeInTheDocument();
     expect(screen.queryByRole("heading", { level: 4 })).not.toBeInTheDocument();
+  });
+
+  it("carries the follow and the selection suppression through to the sessions surface", () => {
+    // The board's own suite measures the arithmetic; this asserts the surface the
+    // owner actually drags on is wired to it, rather than a component nothing
+    // mounts having the behaviour. jsdom sees the computed transform string and
+    // the cancelled press — never a card moving, and never a WebKit selection.
+    mount();
+    layout();
+    const card = cardOf("Draft the plan");
+    const press = createEvent.pointerDown(card, {
+      pointerId: 1,
+      button: 0,
+      clientX: 40,
+      clientY: 45,
+    });
+    fireEvent(card, press);
+    expect(press.defaultPrevented).toBe(true);
+    fireEvent.pointerMove(card, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    expect(card.style.transform).toBe("translate(260px, 205px)");
+    expect(card.className).not.toContain("transition-transform");
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    fireEvent.pointerCancel(card, { pointerId: 1 });
+    expect(card.style.transform).toBe("");
+    expect(card.className).toContain("transition-transform");
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
   });
 });

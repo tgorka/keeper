@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BOARD_MOVE_LABEL, type BoardCard, TaskBoard } from "@/components/notes/task-board";
+import { DRAG_SELECTION_CLASS } from "@/hooks/use-pointer-drag";
 
 function card(over: Partial<BoardCard> & Pick<BoardCard, "title">): BoardCard {
   return {
@@ -136,7 +137,28 @@ function menuOf(title: string): HTMLSelectElement {
   return screen.getByLabelText(`${BOARD_MOVE_LABEL} — ${title}`) as HTMLSelectElement;
 }
 
+/**
+ * Report `(prefers-reduced-motion: reduce)` as matching, before the mount that
+ * reads it — {@link "@/hooks/use-reduced-motion"} initialises synchronously, so a
+ * preference installed after `render` would arrive a frame late here as well.
+ * Same shape as `use-reduced-motion.test.ts`'s own mock.
+ */
+const originalMatchMedia = window.matchMedia;
+function mockReducedMotion() {
+  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+    matches: query.includes("prefers-reduced-motion"),
+    media: query,
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+}
+
 afterEach(() => {
+  window.matchMedia = originalMatchMedia;
   vi.clearAllMocks();
 });
 
@@ -196,10 +218,14 @@ describe("TaskBoard pointer gesture", () => {
     fireEvent.pointerDown(title, { pointerId: 1, button: 0, clientX: 300, clientY: 75 });
     // Under the slop: a hand is not perfectly still, and this must stay a click.
     fireEvent.pointerMove(title, { pointerId: 1, clientX: 303, clientY: 77 });
+    // And a click moves nothing on screen either: the card is not lifted, so it
+    // carries no transform at all (Story 54.1).
+    expect(cardOf("Wire the IPC").style.transform).toBe("");
     fireEvent.pointerUp(title, { pointerId: 1, clientX: 303, clientY: 77 });
     fireEvent.click(title);
     expect(onMove).not.toHaveBeenCalled();
     expect(onOpen).toHaveBeenCalledWith("wire-the-ipc.md");
+    expect(cardOf("Wire the IPC").style.transform).toBe("");
   });
 
   it("draws the drop cue only on the column a release would be accepted by", () => {
@@ -404,6 +430,182 @@ describe("TaskBoard pointer gesture", () => {
       cards: [...cards(), card({ title: "Blocked on review", status: "blocked" })],
     });
     expect(container.querySelectorAll("[draggable]")).toHaveLength(0);
+  });
+});
+
+/**
+ * What jsdom can and cannot say about a card that follows the pointer.
+ *
+ * It has no layout and no compositor, so nothing here observes a card moving. It
+ * observes the arithmetic: the inline `transform` string the component computed
+ * from coordinates the test handed it, the class that decides whether that string
+ * is animated into, and whether the press was cancelled. Whether the transform
+ * reaches the screen is owed to a human on hesperia — see the story's spec.
+ */
+describe("TaskBoard drag follow", () => {
+  it("translates the pressed card by the pointer's delta from where it pressed", () => {
+    mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    const other = cardOf("Wire the IPC");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: 40, clientY: 45 });
+    // Under the slop: a card that jumped on the press would be worse than one
+    // that never moved.
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: 43, clientY: 47 });
+    expect(li.style.transform).toBe("");
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    // 300 − 40 across and 250 − 45 down: from where the press began, not from the
+    // last move, or the card would crawl one step behind the pointer.
+    expect(li.style.transform).toBe("translate(260px, 205px)");
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.done, clientY: Y.header });
+    expect(li.style.transform).toBe("translate(460px, -35px)");
+    // The pressed card and no other: twenty cards must not grow twenty containing
+    // blocks because one of them is moving.
+    expect(other.style.transform).toBe("");
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.done, clientY: Y.header });
+  });
+
+  it("withholds the settle transition while the card follows, and restores it at the release", () => {
+    const { onMove } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    expect(li.className).toContain("transition-transform");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: 40, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    // Live: no transition, or the card eases 200 ms behind the finger instead of
+    // tracking it (`chat-row.tsx:459`).
+    expect(li.className).not.toContain("transition-transform");
+    expect(li.dataset.dragging).toBe("true");
+    // The cursor rides the same attribute the opacity does. A class string is all
+    // jsdom has — it computes no cursor.
+    expect(li.className).toContain("data-[dragging=true]:cursor-grabbing");
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    // Released over no column, so nothing is written and this is the same node:
+    // the transform goes back to zero on the render that ends the drag, and the
+    // transition is back on in the same render, which is the settle.
+    expect(onMove).not.toHaveBeenCalled();
+    expect(li.style.transform).toBe("");
+    expect(li.className).toContain("transition-transform");
+    expect(li.dataset.dragging).toBeUndefined();
+  });
+
+  it("cuts the landing transition under reduced motion, and never the live follow", () => {
+    mockReducedMotion();
+    mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    expect(li.className).not.toContain("transition-transform");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: 40, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    // Direct manipulation is not animation: the card under the pointer still
+    // follows it, at 1:1, with the preference on.
+    expect(li.style.transform).toBe("translate(860px, 205px)");
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    expect(li.className).not.toContain("transition-transform");
+  });
+});
+
+describe("TaskBoard drag selection", () => {
+  it("cancels the press's own default, so no selection is anchored", () => {
+    mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    const press = createEvent.pointerDown(li, {
+      pointerId: 1,
+      button: 0,
+      clientX: 40,
+      clientY: 45,
+    });
+    fireEvent(li, press);
+    // A cancelled `pointerdown` fires no `mousedown`, and `mousedown` is what
+    // anchors the selection every later move extends. The `click` that follows is
+    // not cancelled by it, which is what the title tests above rely on.
+    expect(press.defaultPrevented).toBe(true);
+  });
+
+  it("leaves the column menu's press and a secondary press to the platform", () => {
+    mount();
+    layout();
+    // Cancelling the menu's press would cost the `<select>` its focus and its
+    // dropdown, and a secondary press belongs to whatever menu it opens.
+    const menu = menuOf("Draft the plan");
+    const onMenu = createEvent.pointerDown(menu, {
+      pointerId: 1,
+      button: 0,
+      clientX: 40,
+      clientY: 45,
+    });
+    fireEvent(menu, onMenu);
+    expect(onMenu.defaultPrevented).toBe(false);
+    const li = cardOf("Wire the IPC");
+    const secondary = createEvent.pointerDown(li, {
+      pointerId: 2,
+      button: 2,
+      clientX: 40,
+      clientY: 45,
+    });
+    fireEvent(li, secondary);
+    expect(secondary.defaultPrevented).toBe(false);
+  });
+
+  it("holds the document unselectable from the slop crossing to the release", () => {
+    mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: 40, clientY: 45 });
+    // A click must not make the whole app unselectable, so the arming waits for
+    // the crossing — the moment the press stops being a click.
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: 43, clientY: 47 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    fireEvent.pointerUp(li, { pointerId: 1, clientX: X.nowhere, clientY: Y.empty });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+  });
+
+  it("gives the document back when the gesture is cancelled", () => {
+    mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: 40, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    fireEvent.pointerCancel(li, { pointerId: 1 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+  });
+
+  it("gives the document back when the pressed card unmounts mid-drag", () => {
+    // The re-read that takes the node away for good: nothing will deliver a
+    // release to it, so the suppression has to come off the branch that hears the
+    // capture being lost.
+    const { reread } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.prep, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    reread([
+      card({ title: "Draft the plan", status: "done", order: 1 }),
+      card({ title: "Write the board", status: "todo", order: 1 }),
+      card({ title: "Wire the IPC", status: "todo", order: 2 }),
+    ]);
+    expect(li.isConnected).toBe(false);
+    fireEvent.lostPointerCapture(li, { pointerId: 1 });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+  });
+
+  it("gives the document back when the whole board unmounts mid-drag", () => {
+    // Nothing is left to hear a release, so the teardown is the last chance: an
+    // app that could never select text again would be the worse regression.
+    const { unmount } = mount();
+    layout();
+    const li = cardOf("Draft the plan");
+    fireEvent.pointerDown(li, { pointerId: 1, button: 0, clientX: X.prep, clientY: 45 });
+    fireEvent.pointerMove(li, { pointerId: 1, clientX: X.todo, clientY: Y.empty });
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(true);
+    unmount();
+    expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
   });
 });
 

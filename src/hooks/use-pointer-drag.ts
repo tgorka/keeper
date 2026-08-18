@@ -50,6 +50,29 @@
  * two causes apart, and they want opposite things: *moved* is recoverable (take
  * the capture back, the handlers are intact one step later), *unmounted* is not
  * (end the gesture, and clear the click it was going to swallow).
+ *
+ * **The press must prevent its own default, and the caller is what does it.**
+ * Selection is a default action of the compatibility `mousedown`, and cancelling
+ * `pointerdown` is what stops that `mousedown` being fired at all — Pointer
+ * Events, *mapping for devices that support hover*: a cancelled `pointerdown`
+ * sets the PREVENT MOUSE EVENT flag, so `mousedown`/`mousemove`/`mouseup` are
+ * suppressed for the rest of the gesture, and the spec's own worked sequence
+ * still ends in `click`. Without that cancel, a captured `pointermove` with the
+ * button held anchors a selection at the nearest selectable position and extends
+ * it across everything the pointer crosses — the board's regression (Story 54.1,
+ * FR-324). It is called at the callsite rather than here because the two entries
+ * do not share an event: a desktop press has the `pointerdown` in hand, which is
+ * {@link "@/components/ui/resizable-columns"} (`:202-203`) exactly, and the pins
+ * strip's phone lift reaches {@link PointerDrag.begin} from a long-press detail
+ * with no cancellable event left to it.
+ *
+ * **And the document stops being selectable for the drag's duration.** The cancel
+ * above covers the press; {@link DRAG_SELECTION_CLASS} covers the gesture, for
+ * the entries that never had a press to cancel and for a selection anchored
+ * before the press began. Armed at the slop crossing — a click must not make the
+ * app unselectable — and released on every exit: the release, the cancel, a
+ * mid-drag unmount, and the lost-capture-for-good branch above, all of which run
+ * through one `forget`.
  */
 import * as React from "react";
 
@@ -64,6 +87,30 @@ import * as React from "react";
  * trackpad adds to a tap is under three.
  */
 export const POINTER_DRAG_SLOP_PX = 6;
+
+/**
+ * What the body wears while a drag is live: Tailwind's own `user-select: none`,
+ * applied imperatively the way {@link "@/components/layout/conversation-pane"}
+ * (`:1240-1247`) applies its flash classes, and named the way
+ * {@link "@/components/notes/editor/csv-table"} (`:50`) names a class its tests
+ * assert on.
+ *
+ * A class and not `body.style.userSelect`, because an inline write has to
+ * remember and restore whatever was there before, and two disarms racing (a
+ * `pointerup` and an unmount in the same tick) would restore it twice from a
+ * value the first one already overwrote. `classList.remove` of a class that is
+ * not there is a no-op, so every exit path can run unconditionally.
+ */
+export const DRAG_SELECTION_CLASS = "select-none";
+
+/** How far the pointer has travelled from the press origin, in CSS pixels. */
+export interface PointerDragDelta {
+  x: number;
+  y: number;
+}
+
+/** The delta between gestures, shared so a still card never renders on identity. */
+const DRAG_DELTA_ZERO: PointerDragDelta = Object.freeze({ x: 0, y: 0 });
 
 /** Where a press began, and which element takes the capture. */
 export interface PointerPressOrigin {
@@ -91,6 +138,18 @@ export interface UsePointerDragOptions<Item, Target> {
   onRelease: (item: Item, target: Target | null, moved: boolean) => void;
   /** Override {@link POINTER_DRAG_SLOP_PX}. */
   slopPx?: number;
+  /**
+   * Publish the live pointer delta as state, for a caller that translates the
+   * pressed element by it ({@link PointerDrag.delta}).
+   *
+   * Off by default because it costs a render per `pointermove`. A caller that
+   * draws only from {@link PointerDrag.over} already renders exactly as often as
+   * its own target changes — the pins strip's slot index is a number, so React
+   * bails out of the moves that do not cross a slot — and a delta changes on
+   * every single move, which would turn that into 60 renders a second for a
+   * surface with nothing to do with them.
+   */
+  trackDelta?: boolean;
 }
 
 /**
@@ -127,6 +186,15 @@ export interface PointerDrag<Item, Target> {
   dragging: boolean;
   /** What the last move resolved to — the only thing a drop cue may be drawn from. */
   over: Target | null;
+  /**
+   * How far the pointer is from where it pressed. `{x: 0, y: 0}` until the slop
+   * is crossed, and again the moment the gesture ends — a released card is back
+   * at zero on the render that ends the drag, which is what makes the settle a
+   * transition rather than a teleport.
+   *
+   * Always zero unless {@link UsePointerDragOptions.trackDelta} is set.
+   */
+  delta: PointerDragDelta;
   /**
    * Start tracking a press. Called from an `onPointerDown`, or later by whatever
    * gates the gesture (the pins strip's phone long-press lifts first, and passes
@@ -190,10 +258,16 @@ export function usePointerDrag<Item, Target>(
   // The element holding the capture, while it holds it. Null between gestures,
   // and before the slop crossing on the entries that capture there.
   const captureRef = React.useRef<CaptureHold | null>(null);
+  // Whether THIS hook armed the document's selection suppression. Two surfaces
+  // mount this hook, and one pointer can only be dragging on one of them; the
+  // flag is what stops the other one's unmount releasing a suppression it never
+  // armed.
+  const armedRef = React.useRef(false);
 
   const [item, setItem] = React.useState<Item | null>(null);
   const [dragging, setDragging] = React.useState(false);
   const [over, setOver] = React.useState<Target | null>(null);
+  const [delta, setDelta] = React.useState<PointerDragDelta>(DRAG_DELTA_ZERO);
 
   const detach = React.useCallback(() => {
     const held = captureRef.current;
@@ -204,17 +278,43 @@ export function usePointerDrag<Item, Target>(
     held.element.removeEventListener("lostpointercapture", held.onLost);
   }, []);
 
+  const suppressSelection = React.useCallback(() => {
+    if (armedRef.current) {
+      return;
+    }
+    armedRef.current = true;
+    document.body.classList.add(DRAG_SELECTION_CLASS);
+  }, []);
+
+  const restoreSelection = React.useCallback(() => {
+    if (!armedRef.current) {
+      return;
+    }
+    armedRef.current = false;
+    document.body.classList.remove(DRAG_SELECTION_CLASS);
+  }, []);
+
   const forget = React.useCallback(() => {
     detach();
+    restoreSelection();
     pressRef.current = null;
     setItem(null);
     setDragging(false);
     setOver(null);
-  }, [detach]);
+    setDelta(DRAG_DELTA_ZERO);
+  }, [detach, restoreSelection]);
 
   // A press interrupted by the whole surface unmounting has no element left to
-  // hear the release on; the listener goes with it.
-  React.useEffect(() => detach, [detach]);
+  // hear the release on; the listener goes with it — and so does the document's
+  // selection suppression, which would otherwise outlive by forever the gesture
+  // that armed it, with nothing left alive able to release it.
+  React.useEffect(
+    () => () => {
+      detach();
+      restoreSelection();
+    },
+    [detach, restoreSelection],
+  );
 
   /**
    * Take the capture and listen for losing it.
@@ -278,6 +378,7 @@ export function usePointerDrag<Item, Target>(
       setItem(next);
       setDragging(false);
       setOver(null);
+      setDelta(DRAG_DELTA_ZERO);
       if (captureNow) {
         capture(press);
       }
@@ -304,10 +405,16 @@ export function usePointerDrag<Item, Target>(
           press.moved = true;
           draggedRef.current = true;
           setDragging(true);
+          // The crossing is the moment the press stops being a click, so it is
+          // the moment the document stops being selectable.
+          suppressSelection();
           // From here the pointer may leave the pressed element — and a drag that
           // stopped following the pointer exactly when the user moved fastest is
           // the defect capture exists to prevent.
           capture(press);
+        }
+        if (optionsRef.current.trackDelta === true) {
+          setDelta({ x: event.clientX - press.startX, y: event.clientY - press.startY });
         }
         setOver(optionsRef.current.resolve(event.clientX, event.clientY));
       },
@@ -337,8 +444,8 @@ export function usePointerDrag<Item, Target>(
         event.stopPropagation();
       },
     }),
-    [capture, forget],
+    [capture, forget, suppressSelection],
   );
 
-  return { item, dragging, over, begin, allowNextClick, handlers };
+  return { item, dragging, over, delta, begin, allowNextClick, handlers };
 }
