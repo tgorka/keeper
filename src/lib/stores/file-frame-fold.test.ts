@@ -57,14 +57,18 @@ afterEach(() => {
 
 describe("readFileFrameFold", () => {
   /**
-   * Both folded is the default, and neither half of that is arbitrary:
-   * `properties` matches the notes surface, whose `showProperties` has defaulted
-   * closed since Story 49, and `caveat` folded is AD-102's fact in one line
-   * rather than four — never in none.
+   * The form OPEN and the caveat folded, and neither half is arbitrary (Story
+   * 54.2). This asserted `{ properties: true, caveat: true }` while the file
+   * surface copied the notes surface's closed default, and the analogy it stood
+   * on is false: on a note the frontmatter is a separate store field
+   * (`notes-editor.ts:16-19`) so a closed panel hides nothing, while on a file
+   * the buffer IS the whole file, so a closed form put the `---` block into the
+   * reader's prose. `caveat` folded is AD-102's fact in one line rather than
+   * four — never in none.
    */
-  it("folds both bands for a keeper that has never folded anything", () => {
-    expect(readFileFrameFold("")).toEqual({ properties: true, caveat: true });
-    expect(fileFrameFolded()).toEqual({ properties: true, caveat: true });
+  it("opens the form and folds the caveat for a keeper that has never folded anything", () => {
+    expect(readFileFrameFold("")).toEqual({ properties: false, caveat: true });
+    expect(fileFrameFolded()).toEqual({ properties: false, caveat: true });
   });
 
   it("round-trips every combination, both directions", () => {
@@ -83,8 +87,13 @@ describe("readFileFrameFold", () => {
     // A key this build does not know, a value that is neither 0 nor 1, and an
     // entry with no colon in it. Written by an older build, or by a typo: the
     // answer is the default rather than a refusal to draw the pane.
+    //
+    // Both axes still discriminate after Story 54.2 flipped the properties
+    // default: `properties:yes` is junk and answers `false`, which a parser that
+    // read junk as folded would get wrong, and `caveat:0` is a real value that
+    // differs from that band's default.
     expect(readFileFrameFold(jar("properties:yes|caveat:0|nosuch:1|garbage"))).toEqual({
-      properties: true,
+      properties: false,
       caveat: false,
     });
   });
@@ -97,10 +106,11 @@ describe("readFileFrameFold", () => {
     // left behind did not fold a band wrong, it took the whole panel down.
     //
     // Both bands VISIBLY at their defaults: the values inside the truncated
-    // entry say `0` for both, so a parser that read half of it before failing
-    // would answer differently.
+    // entry are the OPPOSITE of both defaults — `properties:1` against a default
+    // of open, `caveat:0` against a default of folded — so a parser that read
+    // half of it before failing would answer differently on either band.
     expect(readFileFrameFold(rawJar("%"))).toEqual(fileFrameFolded());
-    expect(readFileFrameFold(rawJar("properties:0|caveat:0%7"))).toEqual(fileFrameFolded());
+    expect(readFileFrameFold(rawJar("properties:1|caveat:0%7"))).toEqual(fileFrameFolded());
 
     // And it costs its own surface only: one unreadable value in a shared jar
     // must not lose the rail the fold beside it remembers.
@@ -109,9 +119,11 @@ describe("readFileFrameFold", () => {
 
   it("reads its own cookie and never the notes rail's", () => {
     // The rail's own `files` key is in this jar and says something different.
-    // A shared namespace would make folding one surface fold the other.
-    const jarBoth = jar("properties:0|caveat:0");
-    expect(readFileFrameFold(jarBoth)).toEqual({ properties: false, caveat: false });
+    // A shared namespace would make folding one surface fold the other. Both
+    // values are the opposite of this store's defaults, so a read that answered
+    // from the defaults could not pass.
+    const jarBoth = jar("properties:1|caveat:0");
+    expect(readFileFrameFold(jarBoth)).toEqual({ properties: true, caveat: false });
     expect(readNotesRailFold(jarBoth)).toEqual({ spaces: true, tags: true, files: false });
   });
 });
@@ -134,24 +146,27 @@ describe("the store", () => {
   it("toggles one band and writes the whole set out", () => {
     fileFrameFoldStore.getState().toggleBand("properties");
 
-    expect(fileFrameFoldStore.getState().bands).toEqual({ properties: false, caveat: true });
+    // Folded, from the open default Story 54.2 ships.
+    expect(fileFrameFoldStore.getState().bands).toEqual({ properties: true, caveat: true });
     // Persisted, not just held: the frame is unmounted by a panel fold and by
     // every surface switch.
-    expect(readFileFrameFold(document.cookie)).toEqual({ properties: false, caveat: true });
+    expect(readFileFrameFold(document.cookie)).toEqual({ properties: true, caveat: true });
 
     fileFrameFoldStore.getState().toggleBand("caveat");
-    expect(readFileFrameFold(document.cookie)).toEqual({ properties: false, caveat: false });
+    expect(readFileFrameFold(document.cookie)).toEqual({ properties: true, caveat: false });
   });
 
   it("restores once, so a second frame cannot undo a fold the reader just changed", () => {
-    hydrateFileFrameFold(jar("properties:0|caveat:1"));
-    expect(fileFrameFoldStore.getState().bands.properties).toBe(false);
+    // A cookie that folds the form, which is the opposite of the default — so a
+    // build that never hydrated could not pass the first assertion.
+    hydrateFileFrameFold(jar("properties:1|caveat:1"));
+    expect(fileFrameFoldStore.getState().bands.properties).toBe(true);
 
     fileFrameFoldStore.getState().toggleBand("properties");
     // React's double-invoked development effect, or the second file pane in a
     // strip of four mounting a moment later.
-    hydrateFileFrameFold(jar("properties:0|caveat:1"));
+    hydrateFileFrameFold(jar("properties:1|caveat:1"));
 
-    expect(fileFrameFoldStore.getState().bands.properties).toBe(true);
+    expect(fileFrameFoldStore.getState().bands.properties).toBe(false);
   });
 });

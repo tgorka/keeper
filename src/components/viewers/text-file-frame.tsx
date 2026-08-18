@@ -60,15 +60,23 @@
  * guess about `savable` would leave five states with no title at all, which is
  * exactly the defect a naive port of 50.1 produces.
  *
- * # The two bands above the file fold (Story 53.3, FR-316, FR-318)
+ * # The two bands above the file fold (Story 53.3, FR-316, FR-318; Story 54.2,
+ * FR-325 and FR-326)
  *
  * The properties form (Story 50.4) and AD-102's caveat both sat above the
  * Preview|Source|Note tabs unconditionally, and both pushed the file down in all
- * three views. Each now folds from a control on this bar, defaulting folded, and
- * the answer is remembered per SURFACE rather than per file
- * (`@/lib/stores/file-frame-fold`) — this component outlives the file it shows
- * and a folded panel unmounts it entirely, so `useState` here would lose the
- * reader's answer twice over.
+ * three views. Each now folds from a control on this bar, and the answer is
+ * remembered per SURFACE rather than per file (`@/lib/stores/file-frame-fold`) —
+ * this component outlives the file it shows and a folded panel unmounts it
+ * entirely, so `useState` here would lose the reader's answer twice over.
+ *
+ * The two DEFAULTS differ, and Story 54.2 is why. The caveat opens folded, on
+ * Rust's one line. The properties form opens OPEN, because a file's frontmatter
+ * lives in the buffer this frame is showing: a closed form drew the `---` block
+ * as the first lines of the reader's prose, which is what 53.3's symmetry with
+ * the notes surface cost. And the form is MOUNTED whether or not it is on
+ * screen, so folding it by hand does not bring the block back either — see the
+ * region below.
  *
  * The caveat's fold is a narrowing of AD-102 and never a deletion: folded, it
  * shows Rust's ONE-LINE composition of the same fact
@@ -670,11 +678,20 @@ export function TextFileFrame({
   // what makes the claim true for a host that passes no refusal at all.
   const propertiesPanel = writingTools ? properties : null;
 
-  // Story 53.3: the form is behind a fold now, and the fold defaults CLOSED —
-  // the same default the notes surface has had since Story 49
-  // (`note-editor.tsx`'s `showProperties`). The CONTROL exists wherever the form
-  // would: a disclosure for a panel this file is never going to get would be a
-  // control that announces its own refusal.
+  // Story 53.3's fold, with Story 54.2's default: the form is behind a
+  // disclosure and that disclosure starts OPEN. 53.3 copied the notes surface's
+  // closed default and the analogy does not hold — on a note the frontmatter is
+  // a separate store field (`notes-editor.ts:16-19`), on a file the buffer is
+  // the whole file — so a closed form here put the `---` block into the reader's
+  // prose. See `file-frame-fold.ts`.
+  //
+  // This flag is now about VISIBILITY alone. The form is mounted either way (see
+  // the region below), so folding is a display choice about the form and never
+  // an instruction to put frontmatter into the document.
+  //
+  // The CONTROL exists wherever the form would: a disclosure for a panel this
+  // file is never going to get would be a control that announces its own
+  // refusal.
   const propertiesOpen = propertiesPanel !== null && !folds.properties;
 
   // Story 53.3's second fold. `writeCaveatShort` is Rust's one-line form, and
@@ -701,24 +718,52 @@ export function TextFileFrame({
           status={savable ? { sizers: FILE_SAVE_SIZERS, caption: fileSaveWord(dirty) } : null}
           actions={
             <>
-              {/* The properties fold, in the note editor's own disclosure shape:
-                  the same word, the same glyph, `aria-expanded` for the state and
-                  `aria-controls` naming the region while it is open (and omitted
-                  while it is closed, rather than pointing at an id nothing owns).
-                  Not `FoldSection`, which is the 48px rail-row shape. */}
+              {/* The properties fold, and it says all three things a disclosure
+                  has to say: WHAT it opens, THAT it opens, and which WAY.
+
+                  Story 54.2. It used to be a 32px `icon-sm` ghost carrying the
+                  glyph alone, sitting next to Save — identical whether the file
+                  had three properties or none, its only name an `aria-label` no
+                  eye reads. With the form folded and the region unmounted there
+                  was then nothing on screen that said properties existed, which
+                  is half of what the owner reported as missing.
+
+                  - the GLYPH is `SlidersHorizontal`, the app's spelling of
+                    Properties everywhere else (`note-editor.tsx:794`);
+                  - the WORD is `PROPERTIES_LABEL` itself, visible now and the
+                    button's accessible name by its own text — so speech input
+                    and an eye ask for the same string (WCAG 2.5.3), with no
+                    `aria-label` beside it to drift from it and no `title`
+                    repeating a word that is already on screen;
+                  - the CHEVRON pair is the caveat fold's, ten lines below.
+
+                  It costs zero vertical pixels: `PaneHeader` is a fixed 40px row
+                  and `size="xs"` is 24px, the same height as Save beside it. The
+                  width comes out of group 1, which is the only member of the row
+                  allowed to give ground (`pane-header.tsx`).
+
+                  `aria-controls` is unconditional now, because the region it
+                  names is mounted in both states — hidden while folded rather
+                  than gone, the way `tag-combobox.tsx:388` and
+                  `sidebar-group.tsx:215` do it. Not `FoldSection`, which is the
+                  48px rail-row shape. */}
               {propertiesPanel === null ? null : (
                 <Button
                   type="button"
                   variant="ghost"
-                  size="icon-sm"
-                  aria-label={PROPERTIES_LABEL}
-                  title={PROPERTIES_LABEL}
+                  size="xs"
                   aria-expanded={propertiesOpen}
-                  aria-controls={propertiesOpen ? propertiesRegionId : undefined}
+                  aria-controls={propertiesRegionId}
                   className="shrink-0"
                   onClick={() => fileFrameFoldStore.getState().toggleBand("properties")}
                 >
                   <SlidersHorizontal aria-hidden="true" />
+                  {PROPERTIES_LABEL}
+                  {propertiesOpen ? (
+                    <ChevronDown aria-hidden="true" />
+                  ) : (
+                    <ChevronRight aria-hidden="true" />
+                  )}
                 </Button>
               )}
               {savable ? (
@@ -821,14 +866,39 @@ export function TextFileFrame({
           re-read is what renders Rust's "is no longer in tgdrive", exactly as
           before.
 
-          UNMOUNTED rather than hidden while the fold is closed (Story 53.3), for
-          the reason `panel-strip.tsx` gives about a folded panel: a form kept
-          alive behind `hidden` keeps its read and its subscription over a file
-          nobody can see. The id rides on the box this form already had rather than
-          on a wrapper of its own — that box is what keeps the form out of the
-          editor's `flex-1`, and it is exactly the region the control names. */}
-      {propertiesOpen && propertiesPanel !== null ? (
-        <div id={propertiesRegionId} className="shrink-0">
+          MOUNTED IN BOTH STATES, and hidden rather than unmounted while the fold
+          is closed (Story 54.2, reversing Story 53.3's shape here). The form is
+          the only thing that knows this file's `---` block, and the panes hide
+          exactly the bytes it holds — so a form that unmounts when it folds hands
+          the panes nothing and the document draws the block as the first lines of
+          the reader's prose. That is the defect, and it is not fixed by the
+          default alone: it would come back the moment somebody folded the form by
+          hand, which is the gesture the fold exists for.
+
+          The `hidden` attribute, the way `sidebar-group.tsx:215` folds a section
+          body and `tag-combobox.tsx:388` folds its listbox: `display: none`, out
+          of the tab order and out of the accessibility tree, and no height in the
+          column. So `aria-controls` above can name this box unconditionally,
+          because it is always here to be named.
+
+          WHAT IT COSTS, against hoisting the read up here instead: one
+          `sync_read_frontmatter` per file while the form is folded — the panel's
+          own (`properties-panel.tsx:955-975`), which already runs for every file
+          whose form is open, and which is precisely the read that makes hiding
+          the block possible. There is no cheaper answer: this frame cannot hide
+          bytes it does not know. Hoisting would move that read here and leave the
+          panel doing its own — two reads per open file, or a second prop contract
+          on `FileProperties` — plus a second failure path to keep in step with
+          the one the panel already has for a refused read. What else a folded
+          mount pays is one `recording_note_targets` for a block that carries a
+          session id (`properties-panel.tsx:621-641`), and nothing beyond that:
+          the tag vocabulary is fetched only once somebody presses Add a tag, and
+          the column width is a store selector. The id rides on the box this form
+          already had rather than on a wrapper of its own — that box is what keeps
+          the form out of the editor's `flex-1`, and it is exactly the region the
+          control names. */}
+      {propertiesPanel === null ? null : (
+        <div id={propertiesRegionId} className="shrink-0" hidden={!propertiesOpen}>
           <FileProperties
             profileId={propertiesPanel.profileId}
             relativePath={propertiesPanel.relativePath}
@@ -842,7 +912,7 @@ export function TextFileFrame({
             onRenamed={onPropertiesRenamed}
           />
         </div>
-      ) : null}
+      )}
       <div className="min-h-0 flex-1">
         <RawRenderedView
           fileName={fileName}
@@ -881,12 +951,15 @@ export function TextFileFrame({
           // refuses, and for a file that gets no form — nothing is hidden then.
           // The Source tab still shows every byte, and a save still writes them.
           //
-          // And `null` while the fold is closed (Story 53.3): with no form on
-          // screen there is nothing drawing the block, so the document has to
-          // draw it — hiding bytes that are in neither place would put a file's
-          // `tags:` nowhere at all. The carried block is deliberately NOT
-          // forgotten on the way, so unfolding costs no re-read.
-          frontmatterInForm={propertiesOpen ? formBlock : null}
+          // Independent of the FOLD (Story 54.2, reversing Story 53.3). The form
+          // is mounted whether or not it is on screen, so it is holding the block
+          // in both states — and folding a form is a display choice about the
+          // form, never an instruction to paste YAML into somebody's document.
+          // 53.3's objection, that a folded form leaves a file's `tags:` on
+          // screen nowhere at all, is answered by the disclosure in the header:
+          // it is named Properties, it says it is closed, and folded is not
+          // absent.
+          frontmatterInForm={formBlock}
           onExternalWrite={() => void reload()}
           editor={TextEditorSurface}
           csvOptions={csvOptions}

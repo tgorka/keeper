@@ -1,5 +1,6 @@
 /**
- * Which of a file pane's two bands are folded away (Story 53.3, FR-316, FR-318).
+ * Which of a file pane's two bands are folded away (Story 53.3, FR-316, FR-318;
+ * the properties default is Story 54.2's, FR-325).
  *
  * **Two flags, and they are a standing preference rather than a per-file one.**
  * `TextFileFrame` can put two bands above the file itself: the properties form
@@ -53,15 +54,33 @@ export type FileFrameFold = Record<FileFrameBand, boolean>;
 /**
  * How a keeper that has never folded anything sees a file.
  *
- * BOTH folded, and neither default is arbitrary. `properties` matches the notes
- * surface, where `showProperties` has defaulted closed since Story 49
- * (`note-editor.tsx`) — two surfaces disagreeing about the same panel is drift
- * the reader pays for in both. `caveat` folded is the one line rather than the
- * four: AD-102 asks that the fact be on screen before the first keystroke, and it
- * is, in a sentence composed for the purpose.
+ * The form OPEN and the caveat folded, and the asymmetry between those two
+ * answers is the point (Story 54.2, FR-325).
+ *
+ * **The notes-surface analogy this used to give is what broke.** Story 53.3
+ * folded `properties` by default because `showProperties` has defaulted closed
+ * on the notes surface since Story 49 (`note-editor.tsx`), and two surfaces
+ * disagreeing about one panel is drift. But the two surfaces are not showing the
+ * same thing. On a NOTE the frontmatter is a separate store field
+ * (`notes-editor.ts:16-19`) and never part of the buffer, so a closed panel
+ * hides nothing. On a FILE the buffer IS the whole file, so a form that is not
+ * there leaves the `---` block to be drawn as the first lines of the reader's
+ * own prose — which is what the owner reported, in the same breath as the
+ * missing grid. `raw-rendered-view.tsx:199-201` states that asymmetry two files
+ * away from the code that assumed it away.
+ *
+ * So the file surface opens with the grid on screen: the ask was an option to
+ * fold the properties, and an option to fold presumes the thing is there. The
+ * fold itself is unchanged and still remembered — and it is a display choice
+ * about the FORM alone, because `TextFileFrame` keeps the form mounted and
+ * hidden while it is folded, so the block stays out of the prose in both states.
+ *
+ * `caveat` folded is untouched (AD-102, as Story 53.3 narrowed it): the one line
+ * rather than the four. AD-102 asks that the fact be on screen before the first
+ * keystroke, and it is, in a sentence composed for the purpose.
  */
 export function fileFrameFolded(): FileFrameFold {
-  return { properties: true, caveat: true };
+  return { properties: false, caveat: true };
 }
 
 /** The fold remembered in a `document.cookie` string. Pure, so the round trip is
@@ -116,7 +135,8 @@ export function useFileFrameFold<T>(selector: (state: FileFrameFoldState) => T):
   return useStore(fileFrameFoldStore, selector);
 }
 
-/** Test-only reset: back to both folded, unhydrated, no cookie written. */
+/** Test-only reset: back to the shipped defaults — the form open, the caveat on
+ *  its one line — unhydrated, and no cookie written. */
 export function resetFileFrameFoldForTest(): void {
   hydrated = false;
   fileFrameFoldStore.setState({ bands: fileFrameFolded() });

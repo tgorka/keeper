@@ -88,7 +88,6 @@ import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import {
   FILE_FRAME_FOLD_COOKIE,
   fileFrameFoldCookie,
-  hydrateFileFrameFold,
   readFileFrameFold,
   resetFileFrameFoldForTest,
 } from "@/lib/stores/file-frame-fold";
@@ -544,31 +543,62 @@ describe("the bar the Save control sits in", () => {
  * panel appears exactly where a save can land over prose, and nowhere else — the
  * same equality 50.3's writing tools stand on.
  *
- * Story 53.3 put the panel behind a fold, so "offered" now means the CONTROL is
- * on the bar and pressing it mounts the form. The predicate is unchanged and is
- * what these still assert: where no save can land there is neither.
+ * Story 53.3 put the panel behind a fold, and Story 54.2 opens that fold by
+ * default: "offered" means the CONTROL is on the bar and the form is on screen
+ * under it. The predicate is unchanged and is what these still assert: where no
+ * save can land there is neither.
  */
 describe("a file's own properties", () => {
   it("are offered for a writable markdown file the surface can address", async () => {
     mount({}, MARKDOWN, ADDRESS);
 
-    // Closed on arrival, like the notes surface (`note-editor.tsx`'s
-    // `showProperties`), and the control says so rather than leaving the state
-    // to be guessed at from the pane.
+    // OPEN on arrival, with no cookie and no press (Story 54.2, row 1). This
+    // asserted `aria-expanded="false"` and a null region while the file surface
+    // copied the notes surface's closed default — and on a file that default put
+    // the `---` block into the reader's prose, because the buffer here IS the
+    // whole file.
     const control = screen.getByRole("button", { name: PROPERTIES_LABEL });
-    expect(control).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
-
-    fireEvent.click(control);
-
+    expect(control).toHaveAttribute("aria-expanded", "true");
     const region = await screen.findByRole("region", { name: PROPERTIES_LABEL });
     expect(region).toBeInTheDocument();
     // The promise `aria-expanded` makes, kept: the id it names is the box the
     // form is in, so a screen reader's "go to the controlled region" lands on it.
-    expect(control).toHaveAttribute("aria-expanded", "true");
     const controls = control.getAttribute("aria-controls");
     expect(controls).not.toBeNull();
     expect(document.getElementById(controls as string)?.contains(region)).toBe(true);
+
+    fireEvent.click(control);
+
+    // And the fold still folds. The box stays in the document — hidden, so it is
+    // out of the accessibility tree and out of the column's height — which is
+    // what keeps the form holding the block while it is off screen.
+    expect(control).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(document.getElementById(controls as string)).not.toBeNull();
+  });
+
+  it("names itself on the bar, in a row whose height it does not change", () => {
+    mount({}, MARKDOWN, ADDRESS);
+
+    // The defect this control shipped with: a 32px ghost carrying
+    // `SlidersHorizontal` and an `aria-label`, next to Save, identical whether
+    // the file had three properties or none. Nothing an eye reads said
+    // properties existed at all.
+    const control = screen.getByRole("button", { name: PROPERTIES_LABEL });
+    expect(control.textContent).toContain(PROPERTIES_LABEL);
+    // The visible word IS the accessible name, rather than a second copy of it
+    // that could drift (WCAG 2.5.3).
+    expect(control.getAttribute("aria-label")).toBeNull();
+    // A disclosure's chevron, the pair the caveat fold beneath uses.
+    expect(control.querySelectorAll("svg").length).toBe(2);
+
+    // Zero vertical pixels: the row's height is `PaneHeader`'s `h-10` and the
+    // control is `h-6`, the same height as Save beside it. jsdom lays nothing
+    // out, so this is the class the height comes from and not a measurement —
+    // the pixels are a thing to look at on the real machine.
+    expect(bar()?.className).toContain("h-10");
+    expect(control.className).toContain("h-6");
+    expect(within(group(PANE_HEADER_ACTIONS_SLOT)).getByText(PROPERTIES_LABEL)).toBeVisible();
   });
 
   it("row 9: are not offered over a CSV, which has no frontmatter to show", () => {
@@ -712,19 +742,16 @@ describe("Note mode", () => {
  * commands, because the two states that got it wrong are a read still in flight
  * and a read that refused, and neither is a state a fixture can be.
  *
- * **The fold is arranged OPEN for all of them (Story 53.3).** The form is behind
- * a disclosure now and it defaults closed, and with it closed the pane must draw
- * the block as document text — which is the correct behaviour and is asserted in
- * the fold's own describe. What these tests are about is the seam BETWEEN a
- * mounted form and the pane, so they arrange the state that has one: the fold is
- * hydrated from a cookie that says open, exactly as a reader who opened it once
- * would leave it.
+ * **Nothing arranges the fold any more (Story 54.2).** All four of these ran
+ * under a `beforeEach` that hydrated `{ properties: false }` — which is the fold
+ * OPEN, arranged, because 53.3 had defaulted it closed. That is a state no fresh
+ * install was ever in: the guards written for the 52.3 request were disarmed by
+ * the same commit that broke it, and with the arrangement deleted on that build
+ * every one of them would have failed. The form is open by default again, so
+ * what they test is the default; the FOLDED case is asserted at the end of this
+ * block rather than arranged away.
  */
 describe("the panes hide the block the form is holding, and only that (Story 52.3)", () => {
-  beforeEach(() => {
-    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
-  });
-
   /** A block as `file_properties` writes one, and the body under it. `status`
    *  rather than `title`: a title write is a RENAME, which is a different path. */
   const BLOCK = "---\nstatus: draft\n---\n";
@@ -879,11 +906,38 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     expect(reads).toEqual([]);
     expect(sets).toEqual([]);
   });
+
+  it("keeps hiding the block from a form the reader folded away by hand", async () => {
+    // The load-bearing half of Story 54.2, and the half a new default does not
+    // buy. On the shipped build, folding the form put
+    // `---\nstatus: draft\n---` back at the top of the reader's document —
+    // `frontmatterInForm` was `null` while the fold was closed, because the form
+    // unmounted with it. Folding is a display choice about the FORM; it is never
+    // an instruction to paste YAML into somebody's prose, and the fold is the
+    // gesture the control exists for.
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
+    await settle();
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    await settle();
+
+    // Off the screen and out of the accessibility tree, still mounted, still
+    // holding the block — which is the whole of why the prose is unchanged.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+    // And it cost no second read: the form never went away, so folding and
+    // unfolding is free.
+    expect(syncReadFrontmatter).toHaveBeenCalledTimes(1);
+  });
 });
 
 /**
  * Story 53.3: the two bands above the file fold, and the fold is remembered
- * (FR-316, FR-318).
+ * (FR-316, FR-318). Story 54.2: the properties fold opens OPEN, and folding it
+ * never hands the block back to the prose (FR-325, FR-326).
  *
  * **The restore is asserted HERE because this component is the mount point.**
  * `hydrateFileFrameFold` is called by `TextFileFrame` and nowhere else, and a
@@ -893,43 +947,61 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
  * off the control.
  */
 describe("the properties fold", () => {
-  it("folds the form away and back, and the pane takes the block back with it", async () => {
-    // The seam 52.3 built, from the other side: what the form draws, the pane
-    // hides — so with no form on screen the pane has to draw the block, or a
-    // file's `tags:` would be in neither place.
+  /**
+   * Re-anchored by Story 54.2, and deliberately not deleted.
+   *
+   * This was called *"folds the form away and back, and the pane takes the block
+   * back with it"*, and while the form was folded it asserted `BLOCK + BODY` in
+   * the pane — the owner's own defect, written down as an assertion, from 53.3's
+   * reasoning that with no form on screen the document had to draw the block.
+   * The FOLD is still right and is still what this covers. The block coming back
+   * is not: the form is mounted either way now, so it holds the block either
+   * way, and 53.3's objection is answered by the control, which is named
+   * Properties and says it is closed.
+   */
+  it("folds the form away and back, and never hands the block to the prose", async () => {
     const BLOCK = "---\nstatus: draft\n---\n";
     const BODY = "# Weekly\n\nalpha\n";
     syncReadFrontmatter.mockResolvedValue(BLOCK);
     render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
     await settle();
 
-    // Folded on arrival: no form, and the whole file in the pane.
-    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
-    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
-
-    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
-    await settle();
-
+    // Open on arrival, with no cookie and no press: the grid is there and the
+    // pane holds his document rather than his document with its own metadata
+    // pasted at the top.
+    const control = screen.getByRole("button", { name: PROPERTIES_LABEL });
+    expect(control).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
     expect(paneView().state.doc.toString()).toBe(BODY);
 
-    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    fireEvent.click(control);
     await settle();
 
-    // And back. The form is UNMOUNTED rather than hidden, and the bytes it was
-    // drawing are in the document again — a build that kept hiding them would
-    // leave the block on screen nowhere at all.
+    // Folded: the form is off the screen, and the prose is still the prose.
+    expect(control).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
-    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
+    expect(paneView().state.doc.toString()).toBe(BODY);
+
+    fireEvent.click(control);
+    await settle();
+
+    // And back, with no re-read behind it.
+    expect(control).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(paneView().state.doc.toString()).toBe(BODY);
   });
 
   it("survives a remount, because the frame outlives the file it shows", async () => {
     const first = mount({}, MARKDOWN, ADDRESS);
+    await settle();
+    // FOLDING is the answer to remember now (Story 54.2): open is the default,
+    // so a test that pressed the control to open it and then asserted it was
+    // open would pass on a build that remembered nothing at all.
     fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
     await settle();
-    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
     // Written where a reload can find it, and the encoding is the shared one.
-    expect(readFileFrameFold(document.cookie).properties).toBe(false);
+    expect(readFileFrameFold(document.cookie).properties).toBe(true);
 
     // A folded panel unmounts its body and a panel replaces its target in place,
     // so this is the ordinary way a file pane goes away and comes back — and
@@ -938,24 +1010,32 @@ describe("the properties fold", () => {
     mount({}, MARKDOWN, ADDRESS);
     await settle();
 
-    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
     expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toHaveAttribute(
       "aria-expanded",
-      "true",
+      "false",
     );
   });
 
-  it("comes up open when the cookie the last run left says so", async () => {
+  it("comes up folded when the cookie the last run left says so", async () => {
     // The mount point's own claim, and the only thing that can fail here: the
     // store's suite calls the hydrate itself and would pass on a frame that
     // never did (DW-172). No store arrangement — a real cookie and a real mount.
+    //
+    // The cookie says FOLDED because open is the default now (Story 54.2): a
+    // frame that never hydrated would show the form, and a cookie saying "open"
+    // could no longer tell the two apart.
     // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
-    document.cookie = fileFrameFoldCookie({ properties: false, caveat: true });
+    document.cookie = fileFrameFoldCookie({ properties: true, caveat: true });
 
     mount({}, MARKDOWN, ADDRESS);
     await settle();
 
-    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 });
 
