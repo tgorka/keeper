@@ -5243,6 +5243,32 @@ export async function sessionsSpaceSave(rootId: string, space: SessionSpaceReq):
 }
 
 /**
+ * Narrow one over-specified space to the single term its default asks for
+ * (Story 53.4, FR-319). Resolves to the space's id, unchanged — the file never
+ * moves.
+ *
+ * **An id and nothing else.** The term is read in Rust off the default the space
+ * CLAIMS (`keeper.default`), so a two-term `log` space narrows to `tag:log` and
+ * this call composes no query (AD-65). What the press will write is already on
+ * the payload the control renders from — `SessionSpaceFilesVm.narrowTo` — so the
+ * person reads it before pressing, and the string they read and the string that
+ * is written come from one function.
+ *
+ * **It is an ordinary edit.** The write goes through `sessions_space_save`, so it
+ * is journaled like any save, preserves every other byte of the file including
+ * `keeper.default`, and is undone by editing the space again. Nothing narrows a
+ * space without this call: a scan, a restore and an app start all leave the file
+ * exactly as it is (AD-121, the directory is the ledger).
+ *
+ * Rejects with: `internal` (the space is gone, or it claims no default to narrow
+ * to and asks for something other than plain `tag:` terms — in which case
+ * nothing was written and the editor is the answer), `unsupported`.
+ */
+export async function sessionsSpaceNarrow(rootId: string, spaceId: string): Promise<string> {
+  return await invoke<string>("sessions_space_narrow", { rootId, spaceId });
+}
+
+/**
  * Remove one space (FR-261). The file is moved to the zone's own trash, not
  * unlinked — a space is a markdown file someone wrote, and `.keeper/trash/`
  * keeps its name so recovering it is a `mv` rather than an archaeology.
@@ -5679,9 +5705,15 @@ export async function sessionsDirNew(
  * ({@link SessionSpaceVm.createDir}), and Rust reads that definition and composes
  * the path (AD-65) — pass the space's own id and nothing else. The *Files*
  * heading's own creates belong to no space and send `""`, which produces the
- * write it always produced. Nothing here joins a directory to a filename, and a
- * directory keeper will not write into was already refused when the space was
- * saved.
+ * write it always produced. Nothing here joins a directory to a filename.
+ *
+ * **And a space that names none may still have one** (Story 53.5). An absent
+ * `keeper.create_dir` inherits the folder keeper's own default for that space
+ * names — `tasks/` for Tasks, `logs/` for Log — which is the state every space
+ * seeded before that story is in. So the destination is not always one somebody
+ * typed and therefore not always one that was refused at Save: Rust checks
+ * whatever it resolved, against the same guard, before it writes. A refusal can
+ * reach this call rather than only the space editor.
  *
  * Rejects with: `internal` (unknown root or session, a space that is no longer
  * there, or `about` — a session has one record and a second would give the shape

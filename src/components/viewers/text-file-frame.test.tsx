@@ -35,7 +35,7 @@ import "@/components/notes/editor/live-preview";
 // reason: a cold `import()` would not have resolved by the time it returns.
 import "@/components/notes/editor/writing-tools";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, type RenderResult, render, screen } from "@testing-library/react";
+import { act, fireEvent, type RenderResult, render, screen, within } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TextFileVm } from "@/lib/ipc/client";
@@ -77,19 +77,31 @@ vi.mock("@/lib/ipc/client", () => ({
   sessionsFileRename: vi.fn(async () => ""),
 }));
 
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import {
   PANE_HEADER_ACTIONS_SLOT,
+  PANE_HEADER_FRAME_SLOT,
   PANE_HEADER_IDENTITY_SLOT,
   PANE_HEADER_STATUS_SLOT,
 } from "@/components/layout/pane-header";
 import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
+import {
+  FILE_FRAME_FOLD_COOKIE,
+  fileFrameFoldCookie,
+  hydrateFileFrameFold,
+  readFileFrameFold,
+  resetFileFrameFoldForTest,
+} from "@/lib/stores/file-frame-fold";
 import {
   FILE_SAVE_CLEAN_TITLE,
   FILE_SAVE_LABEL,
   FILE_SAVE_SIZERS,
   type FilePropertiesCoordinates,
   fileSaveWord,
+  TEXT_FILE_CAVEAT_LABEL,
+  TEXT_FILE_CAVEAT_TESTID,
   TextFileFrame,
+  type TextFileFrameProps,
 } from "./text-file-frame";
 import type { UseTextFileResult } from "./use-text-file";
 
@@ -145,10 +157,37 @@ function state(over: Partial<UseTextFileResult> = {}): UseTextFileResult {
 /** The sync-profile address a Files panel would hand over (Story 50.4). */
 const ADDRESS = { profileId: "p1", relativePath: "60-sessions/active/s/README.md" };
 
+/**
+ * AD-102's caveat as Rust composes it, both forms (Story 46.14, Story 53.3).
+ *
+ * Verbatim from `WriteScope::unmanaged_caveat` and `unmanaged_caveat_short`, so
+ * what these tests assert is the sentence a reader actually gets — and so a
+ * webview that clipped the long one instead of rendering the short one is
+ * visible: the two are not prefixes of one another.
+ */
+const CAVEAT_FULL =
+  "AGENTS.md is not one of keeper's notes — it is outside Vault's notes vault (10-notes). " +
+  "keeper saves it straight to the file and sends a delete to this computer's trash: no note " +
+  "history, no search index and no conflict copy. Nothing about how Vault syncs this folder " +
+  "changes.";
+const CAVEAT_SHORT =
+  "AGENTS.md is not one of keeper's notes: no note history, no search index and no conflict copy.";
+
+/** The panel's own controls, as a host that gave up its row hands them down
+ *  (Story 53.3). One button, named the way `panel-strip.tsx` names its fold, so
+ *  a test can find it and press it after it has travelled. */
+const FRAME_CONTROL_LABEL = "Fold panel";
+const FRAME_CONTROLS = (
+  <button type="button" aria-label={FRAME_CONTROL_LABEL}>
+    x
+  </button>
+);
+
 function mount(
   over: Partial<UseTextFileResult> = {},
   entry: ViewerEntry = MARKDOWN,
   properties: FilePropertiesCoordinates | null = null,
+  extra: Partial<TextFileFrameProps> = {},
 ): RenderResult {
   return render(
     <TextFileFrame
@@ -158,6 +197,7 @@ function mount(
       csv={null}
       properties={properties}
       preview={{ vaultId: null }}
+      {...extra}
     />,
   );
 }
@@ -213,6 +253,12 @@ beforeEach(() => {
   syncReadFrontmatter.mockResolvedValue("");
   syncWriteFrontmatter.mockReset();
   syncWriteFrontmatter.mockResolvedValue("");
+  // Story 53.3's folds live in a store and a cookie, both of which outlive a
+  // test: one test's fold would otherwise be the next one's restore, and the
+  // hydrate runs once per document.
+  resetFileFrameFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this suite's subject
+  document.cookie = `${FILE_FRAME_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 /**
@@ -372,6 +418,9 @@ describe("the Save control", () => {
     // A Save over a file the frame is already refusing to make editable would be
     // a control that announces its own refusal.
     expect(screen.queryByRole("button", { name: FILE_SAVE_LABEL })).toBeNull();
+    // And with no host controls to carry, there is no row at all — the note
+    // embed's shape. A panel that gave up its own row gets one anyway, which is
+    // Story 53.3's promise and is asserted in its own describe below.
     expect(bar()).toBeNull();
   });
 
@@ -494,12 +543,32 @@ describe("the bar the Save control sits in", () => {
  * `properties-panel`'s and is asserted there. What this frame owes is that the
  * panel appears exactly where a save can land over prose, and nowhere else — the
  * same equality 50.3's writing tools stand on.
+ *
+ * Story 53.3 put the panel behind a fold, so "offered" now means the CONTROL is
+ * on the bar and pressing it mounts the form. The predicate is unchanged and is
+ * what these still assert: where no save can land there is neither.
  */
 describe("a file's own properties", () => {
   it("are offered for a writable markdown file the surface can address", async () => {
     mount({}, MARKDOWN, ADDRESS);
 
-    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    // Closed on arrival, like the notes surface (`note-editor.tsx`'s
+    // `showProperties`), and the control says so rather than leaving the state
+    // to be guessed at from the pane.
+    const control = screen.getByRole("button", { name: PROPERTIES_LABEL });
+    expect(control).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+
+    fireEvent.click(control);
+
+    const region = await screen.findByRole("region", { name: PROPERTIES_LABEL });
+    expect(region).toBeInTheDocument();
+    // The promise `aria-expanded` makes, kept: the id it names is the box the
+    // form is in, so a screen reader's "go to the controlled region" lands on it.
+    expect(control).toHaveAttribute("aria-expanded", "true");
+    const controls = control.getAttribute("aria-controls");
+    expect(controls).not.toBeNull();
+    expect(document.getElementById(controls as string)?.contains(region)).toBe(true);
   });
 
   it("row 9: are not offered over a CSV, which has no frontmatter to show", () => {
@@ -516,6 +585,7 @@ describe("a file's own properties", () => {
     };
     mount({}, csvRow, ADDRESS);
 
+    expect(screen.queryByRole("button", { name: PROPERTIES_LABEL })).toBeNull();
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
   });
 
@@ -523,8 +593,9 @@ describe("a file's own properties", () => {
     // The format keeper will not rewrite, and the file only the first megabyte
     // of which was read. Both already take the Save button away; a panel whose
     // every control announced its own refusal would be strictly worse than not
-    // being there.
+    // being there — and so would a fold over one.
     mount({}, LOCKED, ADDRESS);
+    expect(screen.queryByRole("button", { name: PROPERTIES_LABEL })).toBeNull();
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
 
     mount(
@@ -532,6 +603,7 @@ describe("a file's own properties", () => {
       MARKDOWN,
       ADDRESS,
     );
+    expect(screen.queryByRole("button", { name: PROPERTIES_LABEL })).toBeNull();
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
   });
 
@@ -541,6 +613,7 @@ describe("a file's own properties", () => {
     // other in the webview is what AD-65 forbids.
     mount({}, MARKDOWN, null);
 
+    expect(screen.queryByRole("button", { name: PROPERTIES_LABEL })).toBeNull();
     expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
   });
 });
@@ -638,8 +711,20 @@ describe("Note mode", () => {
  * These mount the real panel over the real pane and drive the frontmatter
  * commands, because the two states that got it wrong are a read still in flight
  * and a read that refused, and neither is a state a fixture can be.
+ *
+ * **The fold is arranged OPEN for all of them (Story 53.3).** The form is behind
+ * a disclosure now and it defaults closed, and with it closed the pane must draw
+ * the block as document text — which is the correct behaviour and is asserted in
+ * the fold's own describe. What these tests are about is the seam BETWEEN a
+ * mounted form and the pane, so they arrange the state that has one: the fold is
+ * hydrated from a cookie that says open, exactly as a reader who opened it once
+ * would leave it.
  */
 describe("the panes hide the block the form is holding, and only that (Story 52.3)", () => {
+  beforeEach(() => {
+    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+  });
+
   /** A block as `file_properties` writes one, and the body under it. `status`
    *  rather than `title`: a title write is a RENAME, which is a different path. */
   const BLOCK = "---\nstatus: draft\n---\n";
@@ -793,5 +878,310 @@ describe("the panes hide the block the form is holding, and only that (Story 52.
     expect(syncReadFrontmatter).toHaveBeenLastCalledWith("p1", "60-sessions/active/s/OTHER.md");
     expect(reads).toEqual([]);
     expect(sets).toEqual([]);
+  });
+});
+
+/**
+ * Story 53.3: the two bands above the file fold, and the fold is remembered
+ * (FR-316, FR-318).
+ *
+ * **The restore is asserted HERE because this component is the mount point.**
+ * `hydrateFileFrameFold` is called by `TextFileFrame` and nowhere else, and a
+ * store-level test passes unchanged on a build where that call was deleted
+ * (DW-172) — the defect epic 44 shipped with three tray listeners. So the fold
+ * tests below arrange a real cookie, mount the real frame, and read the state
+ * off the control.
+ */
+describe("the properties fold", () => {
+  it("folds the form away and back, and the pane takes the block back with it", async () => {
+    // The seam 52.3 built, from the other side: what the form draws, the pane
+    // hides — so with no form on screen the pane has to draw the block, or a
+    // file's `tags:` would be in neither place.
+    const BLOCK = "---\nstatus: draft\n---\n";
+    const BODY = "# Weekly\n\nalpha\n";
+    syncReadFrontmatter.mockResolvedValue(BLOCK);
+    render(<LiveFrame initial={BLOCK + BODY} disk={{ text: BLOCK + BODY }} sets={[]} reads={[]} />);
+    await settle();
+
+    // Folded on arrival: no form, and the whole file in the pane.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    await settle();
+
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(paneView().state.doc.toString()).toBe(BODY);
+
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    await settle();
+
+    // And back. The form is UNMOUNTED rather than hidden, and the bytes it was
+    // drawing are in the document again — a build that kept hiding them would
+    // leave the block on screen nowhere at all.
+    expect(screen.queryByRole("region", { name: PROPERTIES_LABEL })).toBeNull();
+    expect(paneView().state.doc.toString()).toBe(BLOCK + BODY);
+  });
+
+  it("survives a remount, because the frame outlives the file it shows", async () => {
+    const first = mount({}, MARKDOWN, ADDRESS);
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
+    await settle();
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    // Written where a reload can find it, and the encoding is the shared one.
+    expect(readFileFrameFold(document.cookie).properties).toBe(false);
+
+    // A folded panel unmounts its body and a panel replaces its target in place,
+    // so this is the ordinary way a file pane goes away and comes back — and
+    // `useState` in the frame lost the answer both times.
+    first.unmount();
+    mount({}, MARKDOWN, ADDRESS);
+    await settle();
+
+    expect(screen.getByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it("comes up open when the cookie the last run left says so", async () => {
+    // The mount point's own claim, and the only thing that can fail here: the
+    // store's suite calls the hydrate itself and would pass on a frame that
+    // never did (DW-172). No store arrangement — a real cookie and a real mount.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = fileFrameFoldCookie({ properties: false, caveat: true });
+
+    mount({}, MARKDOWN, ADDRESS);
+    await settle();
+
+    expect(await screen.findByRole("region", { name: PROPERTIES_LABEL })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Story 53.3: AD-102's caveat folds to ONE Rust-composed line, and never to
+ * nothing (FR-318).
+ *
+ * The decision being narrowed is `files_write.rs:675-679` — the standing fact has
+ * to be on screen BEFORE the first keystroke, because a person who finds out
+ * after saving that this file has no history has already lost what history would
+ * have given them. The fold keeps that: what is on screen by default names what
+ * is missing, and the full four sentences are one press away.
+ */
+describe("the caveat fold", () => {
+  /** The frame over a file keeper will write and does not manage. */
+  function mountUnmanaged(): RenderResult {
+    return mount({}, MARKDOWN, null, {
+      writeCaveat: CAVEAT_FULL,
+      writeCaveatShort: CAVEAT_SHORT,
+    });
+  }
+
+  it("stands on the short line before the first keystroke, and it names what is missing", () => {
+    mountUnmanaged();
+
+    const band = screen.getByTestId(TEXT_FILE_CAVEAT_TESTID);
+    // Rust's own short sentence, character for character — NOT a prefix of the
+    // long one, which is what a webview that clipped the text would produce.
+    expect(band).toHaveTextContent(CAVEAT_SHORT);
+    expect(CAVEAT_FULL.startsWith(CAVEAT_SHORT)).toBe(false);
+    // And what it still says, which is the whole of why AD-102 survives the fold.
+    for (const absent of ["no note history", "no search index", "no conflict copy"]) {
+      expect(band).toHaveTextContent(absent);
+    }
+    // The band is above the editor, where the standing fact belongs.
+    const editor = document.querySelector(".cm-content, [role='tablist']");
+    expect(editor).not.toBeNull();
+    expect(band.compareDocumentPosition(editor as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("shows the whole sentence on request, and folds back", () => {
+    mountUnmanaged();
+    const control = screen.getByRole("button", { name: TEXT_FILE_CAVEAT_LABEL });
+    expect(control).toHaveAttribute("aria-expanded", "false");
+    // The region the control names is on screen in both states, so the promise is
+    // one this surface can keep — a dangling `aria-controls` is a promise it
+    // cannot.
+    const region = control.getAttribute("aria-controls");
+    expect(document.getElementById(region as string)).not.toBeNull();
+
+    fireEvent.click(control);
+
+    const band = screen.getByTestId(TEXT_FILE_CAVEAT_TESTID);
+    expect(band).toHaveTextContent(CAVEAT_FULL);
+    expect(control).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(control);
+
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(CAVEAT_SHORT);
+  });
+
+  it("remembers the fold across a remount, and per surface rather than per file", () => {
+    const first = mountUnmanaged();
+    fireEvent.click(screen.getByRole("button", { name: TEXT_FILE_CAVEAT_LABEL }));
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(CAVEAT_FULL);
+    expect(readFileFrameFold(document.cookie).caveat).toBe(false);
+
+    first.unmount();
+    // A different file, with its own sentence: the preference is about how this
+    // reader reads files, not about `AGENTS.md`.
+    mount({}, MARKDOWN, null, {
+      writeCaveat: `other.md${CAVEAT_FULL.slice("AGENTS.md".length)}`,
+      writeCaveatShort: `other.md${CAVEAT_SHORT.slice("AGENTS.md".length)}`,
+    });
+
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent("other.md is not one of");
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(
+      "Nothing about how Vault syncs this folder changes.",
+    );
+  });
+
+  it("says nothing at all about a file keeper manages", () => {
+    mount({}, MARKDOWN, null);
+
+    expect(screen.queryByTestId(TEXT_FILE_CAVEAT_TESTID)).toBeNull();
+    expect(screen.queryByRole("button", { name: TEXT_FILE_CAVEAT_LABEL })).toBeNull();
+  });
+
+  it("keeps a caveat whole when its host carries no short form", () => {
+    // A host written before this story, or one Rust answered with only the long
+    // sentence. The fact stays on screen in full rather than folding to nothing:
+    // the fold is the preference and the sentence is the invariant.
+    mount({}, MARKDOWN, null, { writeCaveat: CAVEAT_FULL });
+
+    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(CAVEAT_FULL);
+    expect(screen.queryByRole("button", { name: TEXT_FILE_CAVEAT_LABEL })).toBeNull();
+  });
+});
+
+/**
+ * Story 53.3: one title bar, for a host that gave up its own (FR-317).
+ *
+ * The five states a naive port of Story 50.1 strands. `panel-strip.tsx` gives up
+ * its row on this component's promise, so what is asserted here is the promise
+ * itself: handed a `frame`, this frame draws a header in EVERY state it can
+ * render — including the four in which it used to draw none.
+ */
+describe("the merged title bar", () => {
+  /** The row's fourth group, which is where a host's controls land. */
+  function frameGroup(): HTMLElement | null {
+    return (
+      bar()?.querySelector<HTMLElement>(`:scope > [data-slot="${PANE_HEADER_FRAME_SLOT}"]`) ?? null
+    );
+  }
+
+  it("carries the name, the save word, Save and the host's controls in ONE row", () => {
+    mount({ dirty: true }, MARKDOWN, ADDRESS, { frame: FRAME_CONTROLS });
+
+    // One header, and everything the panel's row used to say is in it.
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("readme.md");
+    expect(shownWord()).toBe(fileSaveWord(true));
+    expect(screen.getByRole("button", { name: FILE_SAVE_LABEL })).toBeEnabled();
+    // The host's controls are in the fourth group, never in the surface's own —
+    // group 3 may demote a member into an overflow menu, and the way out of a
+    // panel must not be somewhere that depends on how wide the panel is.
+    const fourth = frameGroup();
+    expect(fourth).not.toBeNull();
+    expect(within(fourth as HTMLElement).getByRole("button", { name: FRAME_CONTROL_LABEL }));
+    expect(
+      within(group(PANE_HEADER_ACTIONS_SLOT)).queryByRole("button", { name: FRAME_CONTROL_LABEL }),
+    ).toBeNull();
+  });
+
+  it("draws the row while the file is still opening", () => {
+    mount({ loading: true }, MARKDOWN, ADDRESS, { frame: FRAME_CONTROLS });
+
+    // The state that would otherwise leave a panel with no title, no fold and no
+    // close for the whole of a pendrive's read.
+    expect(bar()).not.toBeNull();
+    expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("readme.md");
+    expect(screen.getByRole("button", { name: FRAME_CONTROL_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("opening readme.md");
+    // Nothing to save and nothing to say about a buffer that has not arrived.
+    expect(screen.queryByRole("button", { name: FILE_SAVE_LABEL })).toBeNull();
+  });
+
+  it("draws the row for a file it could not read at all", () => {
+    render(
+      <TextFileFrame
+        fileName="gone.md"
+        entry={MARKDOWN}
+        state={state({ vm: null, error: "keeper could not read gone.md." })}
+        csv={null}
+        properties={null}
+        preview={{ vaultId: null }}
+        frame={FRAME_CONTROLS}
+      />,
+    );
+
+    expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("gone.md");
+    expect(screen.getByRole("button", { name: FRAME_CONTROL_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("keeper could not read gone.md.");
+  });
+
+  it("draws the row over bytes that are not text", () => {
+    mount({ vm: vm({ binary: true, detail: "readme.md is not text." }) }, MARKDOWN, ADDRESS, {
+      frame: FRAME_CONTROLS,
+    });
+
+    expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("readme.md");
+    expect(screen.getByRole("button", { name: FRAME_CONTROL_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("readme.md is not text.");
+  });
+
+  it("draws the row for a file no save can follow, and reserves nothing there", () => {
+    mount({ dirty: true }, LOCKED, ADDRESS, { frame: FRAME_CONTROLS });
+
+    expect(group(PANE_HEADER_IDENTITY_SLOT)).toHaveTextContent("readme.md");
+    expect(screen.getByRole("button", { name: FRAME_CONTROL_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: FILE_SAVE_LABEL })).toBeNull();
+    // No status group at all, rather than an empty reserved one: this row exists
+    // because the host handed its controls over, and there is no buffer here that
+    // can be dirty (`pane-header.tsx` on why the two are different).
+    expect(bar()?.querySelector(`:scope > [data-slot="${PANE_HEADER_STATUS_SLOT}"]`)).toBeNull();
+  });
+
+  /** The name element itself, which is what carries the treatment. */
+  function nameElement(): Element {
+    const found = group(PANE_HEADER_IDENTITY_SLOT).firstElementChild;
+    if (found === null) {
+      throw new Error("the identity group drew no name");
+    }
+    return found;
+  }
+
+  it("names the file in the panel-title typography every other panel title wears", () => {
+    mount({ dirty: true }, MARKDOWN, ADDRESS, { frame: FRAME_CONTROLS });
+
+    // `FOLD_STRIP.titleClass` itself rather than a copy of its words: this row IS
+    // the panel's title row now, `panel-strip.tsx` gave up its own on that basis,
+    // and a strip holding `notes.md`, `report.pdf` and a note must not show three
+    // treatments for one thing. Folding the `.md` used to change the size of its
+    // own name, because the folded strip draws it in this class and the bar drew
+    // it in another.
+    const name = nameElement();
+    expect(name).toHaveTextContent("readme.md");
+    expect(name).toHaveClass(...FOLD_STRIP.titleClass.split(" "));
+    // And not the subordinate treatment it wore while it was a SECOND bar under
+    // the panel's own title row: 12px/500 beside every other panel's 15px/600.
+    expect(name).not.toHaveClass("text-xs");
+    expect(name).not.toHaveClass("font-medium");
+  });
+
+  it("leaves the name small for a host that draws its own row", () => {
+    // The note embed (`file-embed-host.tsx`), which passes no `frame`. This bar
+    // is not a panel title there — it is a label inside somebody's document, and
+    // a 15px heading would outshout the prose around it.
+    mount({ dirty: true }, MARKDOWN, ADDRESS);
+
+    const name = nameElement();
+    expect(name).toHaveTextContent("readme.md");
+    expect(name).toHaveClass("font-medium", "text-xs");
+    expect(name).not.toHaveClass("font-heading");
+    expect(name).not.toHaveClass("text-title");
   });
 });

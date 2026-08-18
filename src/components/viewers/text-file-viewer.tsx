@@ -35,7 +35,7 @@ import { useTextFile } from "./use-text-file";
  */
 export const TEXT_FILE_NOTICE_SLOT = "text-file-notice";
 
-export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement {
+export function TextFileViewer({ file, entry, frame = null }: ViewerProps): React.ReactElement {
   const state = useTextFile({ profileId: file.profileId, subpath: file.relativePath });
   const vaults = useNotesVaultsStore((each) => each.vaults);
   const [notice, setNotice] = useState<string | null>(null);
@@ -189,8 +189,21 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
     [inVault],
   );
 
-  return (
-    <div className="flex h-full min-h-0 flex-col">
+  /**
+   * What this surface has to say about the file, handed to the frame rather than
+   * stacked above it (Story 53.3's fix).
+   *
+   * These two used to be siblings above the mounted frame, which was right while
+   * the panel drew its own header on top of them. Since 53.3 the frame's row IS
+   * the panel's title row, so a band above it made a vault markdown file's first
+   * row a lone right-aligned button and pushed the name, Export, fold and close
+   * ~27px down — for the ordinary Files→vault case, and for the whole life of a
+   * notice a wikilink left behind. `TextFileFrame` draws them directly under the
+   * row now, in the same order, and keeps them on screen in the states where it
+   * renders one sentence instead of a file.
+   */
+  const notices = (
+    <>
       {/* Story 45.18: from a vault file, its note (FR-196, UX-DR79).
 
           Only for markdown, and only inside a vault. A PNG in the vault is an
@@ -217,35 +230,49 @@ export function TextFileViewer({ file, entry }: ViewerProps): React.ReactElement
           {notice}
         </p>
       )}
-      <div className="min-h-0 flex-1">
-        <TextFileFrame
-          fileName={file.name}
-          entry={entry}
-          state={state}
-          writeCaveat={file.writeCaveat}
-          // The location's verdict, straight off the listing row the panel
-          // opened this file from — Rust's own refusal sentence, which is what
-          // keeps a session's `workspace/` file (AD-113) read-only and toolless
-          // from the first frame instead of from the first refused save.
-          writeRefusal={file.writeRefusal}
-          csv={csv}
-          // Story 50.4: this host holds the sync-profile address, so it is the
-          // one that can offer a file's own properties. A file outside every
-          // profile has no `profileId` and therefore no properties surface —
-          // the same condition that already leaves it with no loader.
-          properties={
-            file.profileId === null
-              ? null
-              : { profileId: file.profileId, relativePath: file.relativePath }
-          }
-          // Story 52.2: a rename moves the file, so the pane showing it is
-          // re-ADDRESSED rather than left to re-read the address the rename just
-          // emptied — which is what put "is no longer in tgdrive" over a file the
-          // reader had merely retitled.
-          onPropertiesRenamed={repointAfterRename}
-          preview={preview}
-        />
-      </div>
-    </div>
+    </>
+  );
+
+  // No wrapper of this surface's own: with the bands inside the frame there is
+  // nothing left here to stack, and the frame's own root is already the full-height
+  // flex column this used to spell around it.
+  return (
+    <TextFileFrame
+      fileName={file.name}
+      entry={entry}
+      state={state}
+      writeCaveat={file.writeCaveat}
+      // Rust's one-line form of the same fact, which is what the frame shows
+      // until the reader asks for the whole of it (Story 53.3). Handed on
+      // rather than derived: clipping the sentence here would paraphrase the
+      // clause that names what is missing, which `viewers/types.ts` forbids.
+      writeCaveatShort={file.writeCaveatShort}
+      // The location's verdict, straight off the listing row the panel
+      // opened this file from — Rust's own refusal sentence, which is what
+      // keeps a session's `workspace/` file (AD-113) read-only and toolless
+      // from the first frame instead of from the first refused save.
+      writeRefusal={file.writeRefusal}
+      csv={csv}
+      // Story 50.4: this host holds the sync-profile address, so it is the
+      // one that can offer a file's own properties. A file outside every
+      // profile has no `profileId` and therefore no properties surface —
+      // the same condition that already leaves it with no loader.
+      properties={
+        file.profileId === null
+          ? null
+          : { profileId: file.profileId, relativePath: file.relativePath }
+      }
+      // Story 52.2: a rename moves the file, so the pane showing it is
+      // re-ADDRESSED rather than left to re-read the address the rename just
+      // emptied — which is what put "is no longer in tgdrive" over a file the
+      // reader had merely retitled.
+      onPropertiesRenamed={repointAfterRename}
+      preview={preview}
+      // The panel's own Export, fold and close, when the panel gave up its
+      // row because this frame draws one (Story 53.3). `null` from a host
+      // that draws its own — the frame then keeps the shape it had.
+      frame={frame}
+      notices={notices}
+    />
   );
 }

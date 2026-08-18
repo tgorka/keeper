@@ -253,13 +253,23 @@ pub enum KindHasNoHome {
 /// which is the whole point, because a create that writes where the pool does
 /// not read produces a file no space can ever list.
 ///
-/// **`create_dir` is the space's own answer, and `""` is no answer** (Story
-/// 52.5, FR-309). A space may name a directory its creates go into
-/// ([`super::spaces::SessionSpace::create_dir`]); empty means it named none, and
-/// then this returns exactly what it always returned. That is why the override
-/// is a parameter here rather than a second mapping beside this one: the
-/// question "where does a create of this kind go" has to have one answer, and a
-/// caller choosing between two functions is a caller that can choose wrong.
+/// **`create_dir` is the space's RESOLVED answer, and `""` is no directory**
+/// (Story 52.5, FR-309; Story 53.5, FR-320). A space may name a directory its
+/// creates go into ([`super::spaces::SessionSpace::create_dir`]); empty means
+/// there is none, and then this returns exactly what it always returned. That is
+/// why the override is a parameter here rather than a second mapping beside
+/// this one: the question "where does a create of this kind go" has to have one
+/// answer, and a caller choosing between two functions is a caller that can
+/// choose wrong.
+///
+/// **Resolved, not read off the file, since Story 53.5.** A space file carrying
+/// no `keeper.create_dir` key inherits the directory its claimed default names,
+/// and an explicitly empty one deliberately means the session root — a
+/// distinction [`super::spaces::destination`] collapses into the one string this
+/// parameter takes. This function is deliberately blind to which of the two
+/// produced it: whether a directory was typed or inherited changes nothing about
+/// where a create of a given kind may go under a given contract, and a second
+/// answer here would be a second place for the shape's rules to live.
 ///
 /// **The refusals are decided before the override is looked at.** A destination
 /// cannot make a homeless kind creatable: a folder-shaped session keeps no tasks

@@ -54,12 +54,14 @@ vi.mock("@/lib/ipc/client", () => ({
   tagsVocabulary: vi.fn(async () => ({ entries: [] })),
 }));
 
+import { EXPORT_FILE_LABEL } from "@/components/export/export-file-button";
 import {
   PANEL_CLOSE_LABEL,
   PANEL_EMPTY_SENTENCE,
   PANEL_FOLD_LABEL,
   PANEL_NO_VAULT_SENTENCE,
   PANEL_REASON_TESTID,
+  PANEL_RESOLVING_SENTENCE,
   PANEL_STRIP_LABEL,
   PANEL_TESTID,
   PANEL_UNFOLD_LABEL,
@@ -91,7 +93,12 @@ function entry(name: string, relativePath = name): FilesEntryVm {
     // Rust sends a write verdict on every row, so a fixture without one is a
     // fixture no listing could produce — and `FilePanelBody` reads it to tell the
     // viewer whether keeper manages this file (Story 46.14).
-    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
+    write: {
+      writable: false,
+      reason: "This folder is outside a notes vault.",
+      caveat: null,
+      caveatShort: null,
+    },
   } as FilesEntryVm;
 }
 
@@ -102,7 +109,12 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
     // 45.3's create-in-here verdict. These fixtures are panel-rendering
     // fixtures, so the location deliberately refuses: a panel must render a
     // listing identically whether or not the folder happens to be writable.
-    write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
+    write: {
+      writable: false,
+      reason: "This folder is outside a notes vault.",
+      caveat: null,
+      caveatShort: null,
+    },
     state: "listed",
     entries,
     detail: null,
@@ -200,7 +212,7 @@ describe("the panel strip", () => {
       listed("60-sessions/active/2026-08-10-keeper/workspace", [
         {
           ...entry("notes.md", "60-sessions/active/2026-08-10-keeper/workspace/notes.md"),
-          write: { writable: false, reason: fence, caveat: null },
+          write: { writable: false, reason: fence, caveat: null, caveatShort: null },
         },
       ]),
     );
@@ -232,7 +244,7 @@ describe("the panel strip", () => {
       listed("docs", [
         {
           ...entry("notes.md", "docs/notes.md"),
-          write: { writable: true, reason: null, caveat: null },
+          write: { writable: true, reason: null, caveat: null, caveatShort: null },
         },
       ]),
     );
@@ -335,7 +347,12 @@ describe("the panel strip", () => {
     syncBrowse.mockResolvedValue({
       profileId: "p1",
       subpath: "docs",
-      write: { writable: false, reason: "This folder is outside a notes vault.", caveat: null },
+      write: {
+        writable: false,
+        reason: "This folder is outside a notes vault.",
+        caveat: null,
+        caveatShort: null,
+      },
       state: "mediaAbsent",
       entries: null,
       detail: DRIVE_IS_OUT,
@@ -516,8 +533,13 @@ describe("the panel strip's fold control", () => {
     const [firstId] = await twoPanels();
     const frame = screen.getByTestId(`${PANEL_TESTID}-${firstId}`);
     // The body really was there first, so its absence below is the fold's doing
-    // and not a panel that never resolved.
-    expect(frame.children).toHaveLength(2);
+    // and not a panel that never resolved. ONE child, since Story 53.3: this is
+    // a `.md`, whose viewer draws the panel's row itself, so the panel's only
+    // child is the body — and the row inside it is the body's, which is why the
+    // count below going to two is the head and the spine rather than a header
+    // that survived.
+    expect(frame.children).toHaveLength(1);
+    expect(within(frame).getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(within(frame).getByRole("button", { name: PANEL_FOLD_LABEL }));
@@ -538,6 +560,7 @@ describe("the panel strip's fold control", () => {
     // rather than counted away.
     expect(folded.firstElementChild).toHaveAttribute("data-slot", FOLD_STRIP_HEAD_SLOT);
     expect(folded.lastElementChild).toHaveAttribute("data-slot", FOLD_STRIP_NAME_SLOT);
+    expect(folded.children).toHaveLength(2);
     expect(folded.lastElementChild?.textContent).toBe("a.md");
     // And it stops taking a share of the strip's width, which is the visible
     // point of folding: the neighbours get it.
@@ -707,5 +730,164 @@ describe("a note in a panel", () => {
     expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(PANEL_NO_VAULT_SENTENCE);
     expect(document.querySelectorAll("header")).toHaveLength(1);
     expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+});
+
+/**
+ * A file panel gives up its own header row too (Story 53.3, FR-317).
+ *
+ * The owner's report is the same one 50.1 answered for notes, one surface along:
+ * the file's name is on this frame's row AND on the save bar the viewer draws
+ * under it. So the panel hands its Export, its fold and its close down and draws
+ * nothing, exactly as it does for a note.
+ *
+ * **What is asserted here is the DECISION and the prop boundary**, not what the
+ * merged row contains — that is `text-file-frame.test.tsx`'s, over a frame handed
+ * a real `frame` node. What only this suite can see is that the panel consults
+ * the registry's `ownsHostRow` rather than guessing: the viewer is real here, so
+ * a `.pdf` and a listing that has not landed are cases a stub could not produce.
+ */
+describe("a file in a panel", () => {
+  /** One savable markdown file, resolved, with the loader answering. */
+  async function openSavableFile(): Promise<void> {
+    syncReadText.mockResolvedValue({
+      text: "# Notes\n",
+      sizeBytes: 9,
+      sizeLabel: "9 bytes",
+      oversize: false,
+      binary: false,
+      detail: null,
+    });
+    syncBrowse.mockResolvedValue(
+      listed("docs", [
+        {
+          ...entry("notes.md", "docs/notes.md"),
+          write: { writable: true, reason: null, caveat: null, caveatShort: null },
+        },
+      ]),
+    );
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "docs/notes.md" });
+    await mount();
+  }
+
+  it("draws no row of its own, and hands Export, fold and close to the viewer", async () => {
+    await openSavableFile();
+
+    // ONE header for this panel, and it is the frame's own: the band that
+    // carried the file's name a second time is gone.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument());
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    const only = panelsStore.getState().panels[0];
+    if (only === undefined) {
+      throw new Error("expected one panel");
+    }
+    const panel = screen.getByTestId(`${PANEL_TESTID}-${only.id}`);
+    // The panel's own children are the body and nothing else — the row is inside
+    // it now, drawn by the frame that draws the Save button.
+    expect(panel.children).toHaveLength(1);
+    // And all three controls went down. Export travels for a file where it does
+    // not for a note: it reads the bytes off the disk, and for a note the editor
+    // is the surface that can flush the buffer first.
+    const row = document.querySelector("header") as HTMLElement;
+    expect(within(row).getByRole("button", { name: EXPORT_FILE_LABEL })).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+    expect(within(row).getByText("notes.md")).toBeInTheDocument();
+  });
+
+  it("still folds from the control it handed down", async () => {
+    await openSavableFile();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument());
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: PANEL_FOLD_LABEL }));
+      await Promise.resolve();
+    });
+
+    // A control passed through three components is a control that can arrive
+    // rendered and dead. This is the press, and the fold is the effect.
+    expect(panelsStore.getState().panels[0]?.folded).toBe(true);
+  });
+
+  it("keeps its own row for a file whose viewer draws none", async () => {
+    // A `.pdf` resolves to the document viewer, which draws no chrome at all. If
+    // the panel gave its row up for every file, this one would have no title, no
+    // fold and no close — which is the naive port of 50.1, and the reason the
+    // decision reads the registry's promise rather than the target's kind.
+    syncBrowse.mockResolvedValue(listed("docs", [entry("report.pdf", "docs/report.pdf")]));
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "docs/report.pdf" });
+
+    await mount();
+
+    await waitFor(() => expect(screen.getByTestId(DOCUMENT_VIEWER_TESTID)).toBeInTheDocument());
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    const row = document.querySelector("header") as HTMLElement;
+    expect(within(row).getByText("report.pdf")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("keeps its own row for a file its folder does not have", async () => {
+    // The other headerless state a merge could strand: the listing landed and
+    // the file was not in it, so the body is a sentence. A sentence carries no
+    // fold and no close.
+    syncBrowse.mockResolvedValue(listed("docs", [entry("other.md", "docs/other.md")]));
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "docs/notes.md" });
+
+    await mount();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(
+        panelFileGoneSentence("notes.md"),
+      ),
+    );
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("keeps its own row while the folder is still answering", async () => {
+    // The first frame, before `sync_browse` resolves. Nothing has promised to
+    // draw a row yet, so the panel draws it — and a panel with no title for the
+    // whole of a pendrive's read is the state this guard exists for.
+    //
+    // Held open, never settled: a listing that answered would end the state
+    // under test. The executor form because this project's `lib` is below
+    // es2024, which is why `syncReadDocument`'s mock at the top of this file
+    // spells it the same way.
+    syncBrowse.mockReturnValue(new Promise<FilesListingVm>(() => undefined));
+    panelsStore
+      .getState()
+      .setActiveTarget({ kind: "file", profileId: "p1", relativePath: "docs/notes.md" });
+
+    await mount();
+
+    expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(PANEL_RESOLVING_SENTENCE);
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("reads no folder for a panel that is folded", async () => {
+    // The resolution moved up into the frame, which is above the body the fold
+    // unmounts — so the thing that used to stop this by construction no longer
+    // does, and the hook has to hold the rule itself. A folded panel that kept
+    // listing a directory would spend a pendrive read on a panel nobody can see.
+    await openSavableFile();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument());
+    syncBrowse.mockClear();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: PANEL_FOLD_LABEL }));
+      await Promise.resolve();
+    });
+
+    expect(syncBrowse).not.toHaveBeenCalled();
+    // And the way back is still there, on the folded strip's own band.
+    expect(
+      screen.getByRole("button", { name: `${PANEL_UNFOLD_LABEL}: notes.md` }),
+    ).toBeInTheDocument();
   });
 });

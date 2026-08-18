@@ -26,24 +26,37 @@
  * exception.
  *
  * **No drag-and-drop library.** The repo has none, and one board is not the
- * reason to take a dependency that owns pointer input across the whole app. This
- * follows the only precedent, the hand-rolled HTML5 DnD in
- * {@link "@/components/layout/pins-strip"} — with its lesson applied: indices go
- * stale, so every drop is guarded and the *authoritative* answer comes from the
- * re-read afterwards, never from this component's own idea of the order.
+ * reason to take a dependency that owns pointer input across the whole app. The
+ * gesture is {@link "@/hooks/use-pointer-drag"}, shared with
+ * {@link "@/components/layout/pins-strip"} — with that surface's lesson applied:
+ * indices go stale, so every release is guarded and the *authoritative* answer
+ * comes from the re-read afterwards, never from this component's own idea of the
+ * order.
  *
  * **Drag is not the only way to move a card.** Every card carries a column menu
  * that does the same write, because a drag needs a pointer, a working hand and a
  * screen tall enough to show two columns at once. The keyboard path is the
  * accessible one and the pointer path is the fast one; they are the same verb.
  *
- * **A drag has to say what it carries.** `dragstart` writes the card's key into
- * the drag data store and declares `effectAllowed = "move"`; both drop targets
- * answer with `dropEffect = "move"`. WebKit — the engine keeper ships on macOS —
- * fires no `drop` at all for a drag that set no data: it draws the ghost, paints
- * a no-drop badge and then does nothing, which is what "drag and drop does not
- * work" looked like underneath a suite of green jsdom tests that could not see a
- * data store jsdom does not implement. Never delete those two lines.
+ * **The gesture is pointer events, and HTML5 drag is gone from this file.** Two
+ * stories patched `dataTransfer` — correctly — and the board still moved nothing
+ * on macOS, because the defect is below the page: Tauri installs a wry drag-drop
+ * handler that always claims the event
+ * (`tauri-runtime-wry-2.11.4/src/lib.rs:4862-4896`) and wry's macOS WKWebView
+ * subclass forwards `performDragOperation:` to `super` only when it does not
+ * (`wry-0.55.1/src/wkwebview/drag_drop.rs:88-95`), so `dragstart` and `dragover`
+ * fire and the page's `drop` cannot. `draggable`, `onDragStart`, `onDrop` and
+ * `dataTransfer` are therefore REMOVED rather than left beside the pointer path:
+ * two mechanisms for one verb is how the dead one survived two epics under a
+ * suite of green jsdom tests. See {@link "@/hooks/use-pointer-drag"} for the
+ * source lines and for why `dragDropEnabled: false` is not the fix.
+ *
+ * **The whole column box is the target, and the cue is drawn on it.** The `<ul>`
+ * used to be what took a drop while the box drew the highlight, and the `<ul>`
+ * did not fill the box — so the padding, the header and everything below
+ * `min-h-16` were dead while looking live. There is no `dragover` in a pointer
+ * gesture, so the target is hit-tested from the pointer's position against the
+ * column boxes' own rects, measured on every move (see {@link BoardDrop}).
  *
  * **The menu is demoted, not removed.** Four permanent select boxes are four
  * columns of chrome, so it is revealed on hover and on `focus-within` — the
@@ -52,8 +65,9 @@
  * user tabbing to it brings it back.
  */
 import { GripVertical, TriangleAlert } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { usePointerDrag } from "@/hooks/use-pointer-drag";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -146,37 +160,56 @@ function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
 }
 
 /**
- * The format the card's identity is written in.
+ * Where a release would land: a column, and the slot in it.
  *
- * `text/plain` because a card *is* a file, so a card dropped into a text field
- * should type its path, and because it is the one type every engine lets a drop
- * handler read back. What is dropped inside the board is resolved from this
- * component's own state, not from the store — the store's job on WebKit is to
- * exist.
+ * Resolved by {@link dropAt} from two attributes this file writes and reads and
+ * nothing else does: `data-board-column` on each column box — the element a
+ * release lands on and the element the cue is drawn on — and `data-card-key` on
+ * each card.
  */
-const DRAG_FORMAT = "text/plain";
-
-/**
- * Say what the drag carries, and that it is a move.
- *
- * The store is guarded rather than assumed because jsdom builds its synthetic
- * drag events without one — the React types promise a `DataTransfer` the test
- * environment does not supply.
- */
-function carry(transfer: DataTransfer | null | undefined, key: string) {
-  if (transfer === null || transfer === undefined) {
-    return;
-  }
-  transfer.setData(DRAG_FORMAT, key);
-  transfer.effectAllowed = "move";
+interface BoardDrop {
+  status: string;
+  /** The insertion slot among the column's *rendered* cards. */
+  index: number;
 }
 
-/** Answer a drag over a target: a move, so WebKit paints a cursor and not a badge. */
-function accept(transfer: DataTransfer | null | undefined) {
-  if (transfer === null || transfer === undefined) {
-    return;
+/**
+ * Hit-test a viewport point against the board's columns.
+ *
+ * A pointer gesture has no `dragover`, so nothing tells this component what the
+ * pointer is over: it measures. Rects are read fresh on every call rather than
+ * cached at the press, which is what makes a column scrolled — or re-laid-out by
+ * the drag's own preview — resolve where it now is instead of where it was.
+ * `document.elementFromPoint` would be the shorter spelling and is the wrong one
+ * twice: jsdom implements no layout and so does not implement it at all, and it
+ * answers with the topmost element, which during a gesture is the pressed card.
+ *
+ * The slot is the number of cards whose vertical midpoint is above the pointer.
+ * One rule covers every case the old per-card `onDrop` needed three for: the
+ * header (nothing above it, so the top of the column), the gap between two cards,
+ * and the empty space below the last one (everything above, so the end).
+ */
+function dropAt(root: HTMLElement | null, clientX: number, clientY: number): BoardDrop | null {
+  if (root === null) {
+    return null;
   }
-  transfer.dropEffect = "move";
+  const box = Array.from(root.querySelectorAll<HTMLElement>("[data-board-column]")).find(
+    (column) => {
+      const rect = column.getBoundingClientRect();
+      return (
+        clientX >= rect.left && clientX < rect.right && clientY >= rect.top && clientY < rect.bottom
+      );
+    },
+  );
+  const status = box?.dataset.boardColumn;
+  if (box === undefined || status === undefined) {
+    return null;
+  }
+  const index = Array.from(box.querySelectorAll<HTMLElement>("[data-card-key]")).filter((card) => {
+    const rect = card.getBoundingClientRect();
+    return rect.top + rect.height / 2 < clientY;
+  }).length;
+  return { status, index };
 }
 
 export function TaskBoard({
@@ -201,17 +234,15 @@ export function TaskBoard({
   /** What to say when a refusal carries no sentence of its own. */
   moveFailed?: string;
 }) {
-  const [dragging, setDragging] = useState<string | null>(null);
-  const [over, setOver] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** The board's own root, so the hit-test never crosses two mounted boards. */
+  const board = useRef<HTMLElement>(null);
 
   const known = new Set(BOARD_COLUMNS.map((column) => column.status));
   const strays = cards.filter((card) => card.status === null || !known.has(card.status));
 
   const move = async (key: string, status: string, index: number) => {
     setNotice(null);
-    setDragging(null);
-    setOver(null);
     try {
       await onMove(key, status, index);
     } catch (error) {
@@ -234,54 +265,79 @@ export function TaskBoard({
     return from !== -1 && from < at ? at - 1 : at;
   };
 
-  const draw = (card: BoardCard, status: string, column: BoardCard[], at: number) => (
+  /**
+   * The gesture: press a card, move it, release it over a column.
+   *
+   * `onRelease` is handed a null target for a press that never passed the slop,
+   * which is the whole of "a press that does not move stays a click" — the title
+   * button's own `onClick` runs, untouched. The hook swallows exactly one click
+   * after a drag, so the release of a card whose title happened to be under the
+   * pointer does not also open the file.
+   */
+  const drag = usePointerDrag<string, BoardDrop>({
+    resolve: (clientX, clientY) => dropAt(board.current, clientX, clientY),
+    onRelease: (key, target) => {
+      if (target === null) {
+        return;
+      }
+      void move(key, target.status, dropIndex(columnOf(cards, target.status), key, target.index));
+    },
+  });
+
+  const draw = (card: BoardCard) => (
     <li
       key={card.key}
-      draggable
-      onDragStart={(event) => {
-        carry(event.dataTransfer, card.key);
-        setDragging(card.key);
-      }}
-      onDragEnd={() => {
-        setDragging(null);
-        setOver(null);
-      }}
-      onDragOver={(event) => {
-        event.preventDefault();
-        accept(event.dataTransfer);
-        setOver(`${status}:${at}`);
-      }}
-      onDrop={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (dragging === null) {
+      data-card-key={card.key}
+      data-dragging={drag.dragging && drag.item === card.key ? "true" : undefined}
+      onPointerDown={(event) => {
+        // Every press, ahead of the gates below: a press on a card's own menu
+        // returns without reaching `begin`, which is the other site that clears
+        // the swallowed-click flag, and a touch drag ends with no synthesised
+        // click to eat it.
+        drag.allowNextClick();
+        // Secondary buttons open menus and select text; and a press that begins
+        // on the column menu belongs to the menu, which owns its own pointer.
+        if (
+          event.button !== 0 ||
+          (event.target instanceof Element && event.target.closest("select") !== null)
+        ) {
           return;
         }
-        void move(dragging, status, dropIndex(column, dragging, at));
+        drag.begin(card.key, {
+          pointerId: event.pointerId,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          target: event.currentTarget,
+        });
       }}
-      className={cn(
-        "group rounded-md border border-border bg-card px-2 py-1.5",
-        dragging === card.key && "opacity-50",
-        over === `${status}:${at}` && dragging !== null && "border-primary border-dashed",
-      )}
+      // The move, the release and the cancel are listened for once, on the board
+      // (`:404`), and not again here: this card is inside it, so a card-level copy
+      // would only run the same hit-test a second time on every move of a live
+      // drag. The press stays here, because it is the press that names the card,
+      // and so does the click swallow, because that click lands on the card.
+      onClickCapture={drag.handlers.onClickCapture}
+      // The whole card is the handle, so the whole card says so. `select-none` is
+      // what `draggable` used to buy: without it a mouse drag paints a text
+      // selection across the card instead of moving it. `touch-action` is left
+      // alone deliberately — claiming it would stop a phone scrolling the board by
+      // starting on a card, and a browser that takes a touch gesture over sends
+      // `pointercancel`, which returns the card.
+      className="group cursor-grab select-none rounded-md border border-border bg-card px-2 py-1.5 data-[dragging=true]:opacity-50"
     >
       <div className="flex items-start gap-1.5">
         <GripVertical
           aria-hidden="true"
-          className="mt-0.5 size-3.5 shrink-0 cursor-grab text-muted-foreground"
+          className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
         />
         <div className="flex min-w-0 flex-col gap-1">
           <button
             type="button"
-            // The whole card is the handle, and a form control is a hole in it:
-            // WebKit starts no ancestor drag from a mousedown on a `button`, so
-            // a user who grabbed the title — the obvious place to grab — got
-            // nothing. Marking the button draggable makes it start the drag
-            // itself, and `dragstart` bubbles to the `li` that carries the
-            // handlers. Click and keyboard activation are untouched: what it
-            // costs is selecting the title's text, which a draggable card had
-            // already spent.
-            draggable
+            // The title is inside the handle, not a hole in it: the press lands
+            // on it, the `li` above tracks the pointer, and only a press that
+            // travelled far enough to become a drag suppresses this click. That
+            // is what a `button` inside a `draggable` card could never do — the
+            // old code had to mark the button draggable itself, and paid for it
+            // in text selection.
             onClick={() => onOpen(card.key)}
             className="text-left text-sm hover:underline"
           >
@@ -345,7 +401,22 @@ export function TaskBoard({
   );
 
   return (
-    <section aria-label={heading} className="flex flex-col gap-1">
+    <section
+      ref={board}
+      aria-label={heading}
+      // The move, the release and the cancel are listened for here and nowhere
+      // else. Before the slop crossing there is no capture, and a press 3 px from
+      // the edge of a 28 px card leaves the card before travelling 6: that move
+      // lands on the column box, which the card sits below rather than above, so
+      // on the card alone nothing would hear it and the drag would silently never
+      // start. From here the whole board hears it — including the release of a
+      // card whose own `li` an external re-read unmounted mid-drag. Every handler
+      // is `pointerId`-guarded and no-ops with no press in flight.
+      onPointerMove={drag.handlers.onPointerMove}
+      onPointerUp={drag.handlers.onPointerUp}
+      onPointerCancel={drag.handlers.onPointerCancel}
+      className="flex flex-col gap-1"
+    >
       <h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
         {heading}
       </h3>
@@ -363,47 +434,33 @@ export function TaskBoard({
             return (
               <div
                 key={column.status}
+                data-board-column={column.status}
                 className={cn(
                   "flex flex-col gap-1 rounded-md border border-border p-2",
-                  over === column.status && dragging !== null && "border-primary border-dashed",
+                  // Drawn on the element that accepts the release, and only while
+                  // one could be accepted: the cue and the target are now the
+                  // same box, so the cue cannot claim a region that is dead.
+                  drag.dragging &&
+                    drag.over?.status === column.status &&
+                    "border-primary border-dashed",
                 )}
               >
                 <h4 className="flex items-baseline justify-between gap-2 font-medium text-xs">
                   <span>{column.label}</span>
                   <span className="figures text-muted-foreground">{inColumn.length}</span>
                 </h4>
-                {/* The list, not the column box, is what takes a drop: a `ul`
-                    already announces itself as a list, where a bare `div` has
-                    no role for a screen reader to read out or for a drop to
-                    hang off. It keeps a minimum height so an empty column is
-                    still a target big enough to hit — the first card of a
-                    column has to be droppable somewhere. */}
-                <ul
-                  aria-label={column.label}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    accept(event.dataTransfer);
-                    setOver(column.status);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    if (dragging === null) {
-                      return;
-                    }
-                    // A drop on the list itself rather than on a card means the
-                    // empty space below the last one: the end.
-                    void move(
-                      dragging,
-                      column.status,
-                      dropIndex(inColumn, dragging, inColumn.length),
-                    );
-                  }}
-                  className="flex min-h-16 flex-col gap-1"
-                >
+                {/* The whole box above is the target; this is the list a screen
+                    reader reads out. `flex-1` so its own box fills the rest of
+                    the column: the list's bounds and the droppable region below
+                    the header are then the same rectangle, which is exactly what
+                    they were not when the `ul` took the drop and the box drew the
+                    highlight. `min-h-16` keeps an empty column tall enough to
+                    aim at. */}
+                <ul aria-label={column.label} className="flex min-h-16 flex-1 flex-col gap-1">
                   {inColumn.length === 0 ? (
                     <li className="text-muted-foreground text-xs">{BOARD_EMPTY_COLUMN}</li>
                   ) : (
-                    inColumn.map((card, at) => draw(card, column.status, inColumn, at))
+                    inColumn.map((card) => draw(card))
                   )}
                 </ul>
               </div>
@@ -417,9 +474,7 @@ export function TaskBoard({
             {BOARD_STRAY_HEADING}
           </h4>
           <p className="text-muted-foreground text-xs">{BOARD_STRAY_HINT}</p>
-          <ul className="flex flex-col gap-1">
-            {strays.map((card, at) => draw(card, card.status ?? "", strays, at))}
-          </ul>
+          <ul className="flex flex-col gap-1">{strays.map((card) => draw(card))}</ul>
         </div>
       )}
     </section>

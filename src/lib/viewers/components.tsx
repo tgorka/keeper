@@ -57,16 +57,53 @@ export const VIEWER_COMPONENTS: Partial<Record<ViewerId, ViewerComponent>> = Obj
   unknown: UnknownViewer,
 });
 
+/**
+ * Which viewers draw the row their HOST would otherwise draw (Story 53.3,
+ * FR-317).
+ *
+ * **Add your viewer here only if it draws a header in every state it can
+ * render.** A host that finds its viewer named here gives up its own title row
+ * and hands its fold, its close and its Export down through
+ * {@link ViewerProps.frame}. A viewer that then drew no row — while it was
+ * loading, for a file it could not read, for bytes that are not text — would
+ * leave the panel with no title and no way out of it, in exactly the states a
+ * reader most needs one.
+ *
+ * `text` is the only one today, and it earns it: {@link TextFileViewer}'s frame
+ * already draws a bar carrying the file's name, the save word and Save, so the
+ * panel's own row was that name a second time (the owner's report). Media and
+ * document viewers draw no chrome at all, so a host keeps its row for them.
+ *
+ * A table beside {@link VIEWER_COMPONENTS}, in the same shape and for the same
+ * reason, rather than a flag on a registry row: this is a property of the
+ * COMPONENT and not of the format — every `.md` in the world resolves to one
+ * row, and what draws it is what decides whether there is a header in it.
+ */
+export const VIEWERS_OWNING_HOST_ROW: Partial<Record<ViewerId, true>> = Object.freeze({
+  text: true,
+});
+
 /** Ids already reported, so a render loop logs once rather than once a frame. */
 const reportedUnbound = new Set<ViewerId>();
 
-/** A resolved viewer: the row that chose it, and the component to mount. */
+/** A resolved viewer: the row that chose it, the component to mount, and whether
+ *  that component draws its host's header row. */
 export interface ResolvedViewer {
   /** The row {@link resolveViewer} returned — the format keeper believes this
    *  file is, even when the component that draws it is not bound yet. */
   readonly entry: ViewerEntry;
   /** What to mount. Never `undefined`. */
   readonly Component: ViewerComponent;
+  /**
+   * Whether {@link ResolvedViewer.Component} draws the header row a frame around
+   * it would otherwise draw — {@link VIEWERS_OWNING_HOST_ROW}.
+   *
+   * Answered here so a surface never switches on a viewer id to find out
+   * (AD-87). It is `false` for a component that fell back to the unknown viewer,
+   * whatever the row said, because the promise belongs to what is actually
+   * mounted.
+   */
+  readonly ownsHostRow: boolean;
 }
 
 /**
@@ -103,5 +140,13 @@ export function resolveViewerComponent(
  */
 export function viewerComponentFor(file: ViewerFile): ResolvedViewer {
   const entry = resolveViewer(file);
-  return { entry, Component: resolveViewerComponent(entry) };
+  const Component = resolveViewerComponent(entry);
+  return {
+    entry,
+    Component,
+    // The mounted component's promise, not the row's: an unbound `viewer` falls
+    // back to the unknown viewer, which draws no header, and a host that had
+    // given up its row on the row's word alone would be left with none.
+    ownsHostRow: Component !== UnknownViewer && VIEWERS_OWNING_HOST_ROW[entry.viewer] === true,
+  };
 }

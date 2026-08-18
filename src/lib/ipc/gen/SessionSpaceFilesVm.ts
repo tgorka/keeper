@@ -24,6 +24,26 @@ files: Array<SessionSpaceFileVm>,
  */
 error: string | null, 
 /**
+ * Whether a budget stopped the session's markdown scan before it had seen
+ * the whole session, so what this space selected is a PREFIX of what it
+ * would have selected (Story 53.5).
+ *
+ * One fact about the pool, repeated onto every space evaluated over it,
+ * because a section is where a person is looking when the list they expect
+ * a file in is short. Story 53.5 is what makes it matter: per-kind
+ * destinations moved a create out of the session root — the first thing the
+ * walk enumerates — and into a directory reached only after every
+ * earlier-sorting subtree, so on a wide session the file a create just wrote
+ * is genuinely missing from the space that wrote it.
+ *
+ * **A flag, not a sentence**, unlike `error` and `no_home` below: the two
+ * sibling truncated scans on this surface ([`SessionTreeVm::truncated`],
+ * [`SessionReferencesVm::truncated`]) are flags whose notice is written
+ * where it is rendered, and a third wording of "keeper stopped looking" is
+ * the thing to avoid here, not a second one.
+ */
+poolTruncated: boolean, 
+/**
  * Why this space offers no create, already worded — or `None` when it has
  * one to offer, and when the refusal is nothing a person needs told.
  *
@@ -48,6 +68,28 @@ error: string | null,
  * and the sentence goes where the button would have been.
  */
 noHome: string | null, 
+/**
+ * The query a one-press repair would write into this space's definition, or
+ * `None` when there is no repair to offer (Story 53.4, FR-319).
+ *
+ * Set exactly where `no_home` above is
+ * [`crate::sessions::spaces::Refusal::ManyTerms`]' sentence AND the space
+ * claims a default that asks for a single `tag:` term —
+ * [`crate::sessions::spaces::CreateRefused::narrow_to`] is the one reader of
+ * that pairing, so the control and the sentence cannot come apart.
+ *
+ * **A whole query, composed in Rust.** The surface presses a verb with an id
+ * and never composes a query (AD-65), and it prints this string so the person
+ * can read what the press will write BEFORE pressing it. A flag here would
+ * mean TypeScript deciding that narrowing `tag:about tag:recordings` leaves
+ * `tag:about`, which is a second reading of `keeper.space`.
+ *
+ * `None` on every other refusal: a contract with nowhere to put the kind and
+ * a query made of negations are not things a narrowing fixes, and a space
+ * claiming no default has nothing that could say what its one term is. The
+ * editor is the answer in all three.
+ */
+narrowTo: string | null, 
 /**
  * Whether the verb that applies here instead of a create is opening the
  * session's record (FR-299).

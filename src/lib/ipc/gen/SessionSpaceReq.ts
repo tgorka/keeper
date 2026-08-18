@@ -43,10 +43,18 @@ folded: boolean | null,
  */
 rows: number | null, 
 /**
- * The directory this space's creates go into; empty writes no key.
+ * The directory this space's creates go into; `""` writes `create_dir: ""`
+ * and `null` writes no key at all (Story 52.5; Story 53.5, FR-320).
  *
  * Sent on every save for `folded`'s reason: `render_edit` replaces the
  * whole `keeper:` map, so a form that omitted this would delete the
  * operator's destination on the next unrelated Save.
+ *
+ * **Nullable, and the two empties are not the same request.** `null` is a
+ * field the operator never touched, which keeps the file inheriting its
+ * default's destination; `""` is a box they cleared, which is a deliberate
+ * *the session root* and writes the empty key that says so. One `String`
+ * here would make an unrelated Save silently reinstate inheritance under an
+ * operator who had chosen against it.
  */
-createDir: string, };
+createDir: string | null, };

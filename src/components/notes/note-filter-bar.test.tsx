@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // The bar reads the tag vocabulary when its chooser opens (Story 44.13); the
@@ -211,7 +211,15 @@ describe("the origin and pinned toggles", () => {
  * the pick lands on the filter that runs the list.
  */
 describe("adding a tag filter from the bar", () => {
-  /** Open the chooser and wait for the vocabulary it reads on opening. */
+  /**
+   * Open the chooser and wait for the vocabulary it reads on opening.
+   *
+   * The wait is on an option, and Story 53.2 is why that is worth saying: the
+   * bar's press mounts the chooser and the chooser's field takes the caret, and
+   * it is the caret arriving that unfolds the list. If focus ever stopped
+   * opening it, every test in this describe would fail here rather than
+   * somewhere subtle.
+   */
   async function openChooser(): Promise<HTMLElement> {
     render(bar());
     fireEvent.click(screen.getByRole("button", { name: ADD_TAG_FILTER }));
@@ -277,6 +285,33 @@ describe("adding a tag filter from the bar", () => {
       expect(document.activeElement).toBe(screen.getByRole("button", { name: ADD_TAG_FILTER })),
     );
     expect(screen.queryByRole("combobox", { name: ADD_TAG_FILTER })).toBeNull();
+  });
+
+  it("folds the list when the caret moves on, without taking the chooser away", async () => {
+    // Story 53.2. The bar's own toggle still owns whether the chooser is
+    // MOUNTED — Escape and a second press on the button both unmount it, above.
+    // What the caret leaving decides is only whether its list is on screen, so
+    // the field stays where it was and the bar stops carrying a list nobody is
+    // reading between the chips and the search box.
+    const field = await openChooser();
+
+    act(() => {
+      screen.getByRole("searchbox").focus();
+    });
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("combobox", { name: ADD_TAG_FILTER })).toBe(field);
+
+    act(() => {
+      field.focus();
+    });
+
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
+      "client",
+      "client/acme",
+      "draft",
+    ]);
   });
 
   it("does not read the vocabulary until the chooser is asked for", () => {

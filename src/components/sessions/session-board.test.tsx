@@ -59,11 +59,69 @@ function mount(over: Partial<React.ComponentProps<typeof SessionBoard>> = {}) {
   return { ...result, onOpen, onChanged };
 }
 
-/** Drag `from`'s card onto `onto`'s, the way a browser fires the pair. */
-function drag(from: HTMLElement, onto: HTMLElement) {
-  fireEvent.dragStart(from);
-  fireEvent.dragOver(onto);
-  fireEvent.drop(onto);
+/**
+ * Lay the board out, because jsdom does not — and because the shim in
+ * `src/test/setup.ts` answers a zero rect with one full viewport, which would
+ * make every point land in the first column.
+ *
+ * Four column boxes 200 px wide side by side, each column's cards 30 px tall
+ * stacked from y=40, so y<40 is the header and y≫40 is the empty space below the
+ * last card. Local rather than shared, like `pins-strip.test.tsx`'s
+ * `mockPinSlots`; the twin in `notes/task-board.test.tsx` measures the same board
+ * from the widget side.
+ */
+const COLUMN_W = 200;
+const CARD_TOP = 40;
+const CARD_H = 30;
+
+/** A DOMRect, spelled once rather than at nine fields a time. */
+function rect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    width,
+    height,
+    top,
+    left,
+    right: left + width,
+    bottom: top + height,
+    x: left,
+    y: top,
+    toJSON: () => ({}),
+  } as DOMRect;
+}
+
+function layout() {
+  let column = 0;
+  for (const box of document.querySelectorAll<HTMLElement>("[data-board-column]")) {
+    const left = column * COLUMN_W;
+    column += 1;
+    box.getBoundingClientRect = () => rect(left, 0, COLUMN_W, 300);
+    let at = 0;
+    for (const card of box.querySelectorAll<HTMLElement>("[data-card-key]")) {
+      const top = CARD_TOP + at * CARD_H;
+      card.getBoundingClientRect = () => rect(left, top, COLUMN_W, CARD_H);
+      at += 1;
+    }
+  }
+}
+
+/** The x that lands in each column, in the order `SESSION_BOARD_COLUMNS` renders. */
+const X = { prep: 100, todo: 300, done: 500 };
+
+/** Between the first two cards' midpoints, and far below the last card. */
+const Y = { afterFirst: 80, empty: 250 };
+
+/**
+ * Press `from`'s card, move the pointer to (x, y) and release it there.
+ *
+ * The gesture is pointer events, not HTML5 drag: under Tauri on macOS the page's
+ * `drop` cannot fire at all (`use-pointer-drag.ts` carries the source lines), and
+ * unlike a synthetic `dragstart`/`drop` pair this is the same sequence a real
+ * pointer produces — which is why this suite can now claim a move happened.
+ */
+function drag(from: HTMLElement, x: number, y: number) {
+  fireEvent.pointerDown(from, { pointerId: 1, button: 0, clientX: 0, clientY: 45 });
+  fireEvent.pointerMove(from, { pointerId: 1, clientX: x, clientY: y });
+  fireEvent.pointerUp(from, { pointerId: 1, clientX: x, clientY: y });
 }
 
 /** The card element for a title — the `li`, which is what carries the handlers. */
@@ -121,12 +179,13 @@ describe("SessionBoard", () => {
     expect(titles).toEqual(["First", "Second", "Third"]);
   });
 
-  it("moves a card to another column at the position it was dropped on", async () => {
+  it("moves a card to another column at the position the release landed on", async () => {
     const { onChanged } = mount();
-    drag(cardOf("Draft the plan"), cardOf("Wire the IPC"));
+    layout();
+    drag(cardOf("Draft the plan"), X.todo, Y.afterFirst);
     await waitFor(() => {
-      // Dropped onto the second card of "to do" — index 1, and the moved card
-      // was never in that column so nothing is subtracted.
+      // Released past the first card of "to do" and short of the second — slot
+      // 1, and the moved card was never in that column so nothing is subtracted.
       expect(sessionsTaskMove).toHaveBeenCalledWith(
         "tgdrive",
         "active/2026-08-10-keeper",
@@ -141,9 +200,10 @@ describe("SessionBoard", () => {
 
   it("loses the vacated slot when a card is dragged down inside its own column", async () => {
     mount();
-    drag(cardOf("Write the board"), cardOf("Wire the IPC"));
+    layout();
+    drag(cardOf("Write the board"), X.todo, Y.afterFirst);
     await waitFor(() => {
-      // Rendered index 1, but the column Rust resolves against has this card
+      // Rendered slot 1, but the column Rust resolves against has this card
       // removed — so the honest answer is 0, the classic off-by-one.
       expect(sessionsTaskMove).toHaveBeenCalledWith(
         "tgdrive",
@@ -155,12 +215,12 @@ describe("SessionBoard", () => {
     });
   });
 
-  it("drops onto a column's empty space at the end of it", async () => {
+  it("releases over a column's empty space at the end of it", async () => {
     mount();
-    const done = screen.getByRole("list", { name: "Done" });
-    fireEvent.dragStart(cardOf("Draft the plan"));
-    fireEvent.dragOver(done);
-    fireEvent.drop(done);
+    layout();
+    // Below every card's midpoint in "Done": the end of that column, and a
+    // region the old `<ul>` did not cover at all.
+    drag(cardOf("Draft the plan"), X.done, Y.empty);
     await waitFor(() => {
       expect(sessionsTaskMove).toHaveBeenCalledWith(
         "tgdrive",
@@ -172,31 +232,32 @@ describe("SessionBoard", () => {
     });
   });
 
-  it("does nothing on a drop that never started as a drag", () => {
+  it("does nothing on a release that never began as a press", () => {
     mount();
-    fireEvent.drop(cardOf("Wire the IPC"));
+    layout();
+    fireEvent.pointerUp(cardOf("Wire the IPC"), { pointerId: 1, clientX: X.todo, clientY: 250 });
     expect(sessionsTaskMove).not.toHaveBeenCalled();
   });
 
-  it("names the task in the drag data store by the path keeper moves it by", () => {
-    // WebKit fires no `drop` for a drag that wrote nothing to the store, so for
-    // two epics this board drew a ghost on macOS and moved nothing — under the
-    // drag tests above, which pass because jsdom implements no store to be empty.
-    // What only this suite can say is WHICH identity is carried: the session
-    // board addresses a card by its session-relative path, because that is the
-    // argument `sessions_task_move` takes.
-    mount();
-    const written = new Map<string, string>();
-    const data = {
-      dropEffect: "none",
-      effectAllowed: "uninitialized",
-      setData: (format: string, value: string) => {
-        written.set(format, value);
-      },
-    } as unknown as DataTransfer;
-    fireEvent.dragStart(cardOf("Draft the plan"), { dataTransfer: data });
-    expect(written.get("text/plain")).toBe("draft-the-plan.md");
-    expect(data.effectAllowed).toBe("move");
+  it("addresses the card by its session-relative path, not by its title", () => {
+    // What only this suite can say is WHICH identity the gesture carries: the
+    // session board moves a card by the path `sessions_task_move` takes, and a
+    // task's file need not be named after its heading.
+    mount({
+      tasks: [
+        task({ title: "Draft the plan", relPath: "plans/draft.md", status: "in-preparation" }),
+        task({ title: "Write the board", status: "todo", order: 1 }),
+      ],
+    });
+    layout();
+    drag(cardOf("Draft the plan"), X.todo, Y.empty);
+    expect(sessionsTaskMove).toHaveBeenCalledWith(
+      "tgdrive",
+      "active/2026-08-10-keeper",
+      "plans/draft.md",
+      "todo",
+      1,
+    );
   });
 
   it("keeps every card's column menu in the session's DOM, revealed rather than drawn", () => {
@@ -235,21 +296,27 @@ describe("SessionBoard", () => {
     expect(onOpen).toHaveBeenCalledWith("wire-the-ipc.md");
   });
 
-  it("says keeper's own refusal, and changes nothing", async () => {
+  it("says keeper's own refusal, and returns the card", async () => {
     const { onChanged } = mount();
+    layout();
     sessionsTaskMove.mockRejectedValue({ message: "That card is not in this session any more." });
-    drag(cardOf("Draft the plan"), cardOf("Wire the IPC"));
+    drag(cardOf("Draft the plan"), X.todo, Y.empty);
     expect(await screen.findByRole("status")).toHaveTextContent(
       "That card is not in this session any more.",
     );
     expect(screen.queryByText(SESSION_BOARD_MOVE_FAILED)).not.toBeInTheDocument();
     expect(onChanged).not.toHaveBeenCalled();
+    // The card is where its own `status:` puts it: the board never moved it, and
+    // nothing re-read, so the refusal costs the user nothing but the sentence.
+    const prep = screen.getByRole("list", { name: "In preparation" });
+    expect(within(prep).getByRole("button", { name: "Draft the plan" })).toBeInTheDocument();
   });
 
   it("falls back to keeper's sentence when the refusal carries none", async () => {
     mount();
+    layout();
     sessionsTaskMove.mockRejectedValue({});
-    drag(cardOf("Draft the plan"), cardOf("Wire the IPC"));
+    drag(cardOf("Draft the plan"), X.todo, Y.empty);
     expect(await screen.findByRole("status")).toHaveTextContent(SESSION_BOARD_MOVE_FAILED);
   });
 

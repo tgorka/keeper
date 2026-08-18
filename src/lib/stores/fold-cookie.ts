@@ -39,10 +39,11 @@ export const FOLD_MAX_AGE = 60 * 60 * 24 * 365;
 /**
  * The flags `name` remembers in `cookie`, defaulted per key.
  *
- * Total, and tolerant in one direction only: a malformed entry, an unknown key
- * or a value that is not `0`/`1` is dropped and leaves that flag at its default.
- * Refusing to render a menu because a jar holds a stale entry would be a worse
- * outcome than a menu that starts at its default.
+ * Total, and tolerant in one direction only: a malformed entry, an unknown key,
+ * a value that is not `0`/`1`, and a value that is not valid percent-encoding
+ * at all is dropped and leaves that flag at its default. Refusing to render a
+ * menu because a jar holds a stale entry would be a worse outcome than a menu
+ * that starts at its default.
  *
  * `defaults` rather than "everything starts open", because one section's honest
  * default is folded: the notes rail's Files tree loads a directory per expansion
@@ -61,7 +62,23 @@ export function readFoldFlags<K extends string>(
     if (separator === -1 || pair.slice(0, separator).trim() !== name) {
       continue;
     }
-    for (const entry of decodeURIComponent(pair.slice(separator + 1).trim()).split("|")) {
+    // `decodeURIComponent` THROWS a `URIError` on a lone `%` or a truncated
+    // escape, and a jar is other people's bytes: an extension, a proxy that
+    // rewrote a value, a build interrupted mid-write. Every reader of this runs
+    // inside a mount effect — two in `AppShell`, one in `NotesPane`, one in
+    // `TextFileFrame` — so an unguarded throw does not degrade a fold, it takes
+    // the surface down.
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(pair.slice(separator + 1).trim());
+    } catch {
+      // Not valid percent-encoding, and the value this module writes has its
+      // `|` and its `:` encoded — so these bytes carry no entry this parser
+      // could read. Every flag stays at its default, which is what the rest of
+      // this loop does with junk it can read.
+      continue;
+    }
+    for (const entry of decoded.split("|")) {
       const colon = entry.indexOf(":");
       if (colon === -1) {
         continue;

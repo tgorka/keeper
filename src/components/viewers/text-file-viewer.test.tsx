@@ -21,7 +21,7 @@ import {
   startCompletion,
 } from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   NoteCsvVm,
@@ -84,6 +84,11 @@ import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
 import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteVaultVm } from "@/lib/ipc/client";
+import {
+  fileFrameFoldCookie,
+  hydrateFileFrameFold,
+  resetFileFrameFoldForTest,
+} from "@/lib/stores/file-frame-fold";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -200,6 +205,7 @@ function target(overrides: Partial<ViewerFile> = {}): ViewerFile {
     sizeLabel: "412 bytes",
     openWith: null,
     writeCaveat: null,
+    writeCaveatShort: null,
     writeRefusal: null,
     ...overrides,
   };
@@ -221,6 +227,33 @@ function vm(overrides: Partial<TextFileVm> = {}): TextFileVm {
 function openThroughTheRegistry(file: ViewerFile) {
   const { entry, Component } = viewerComponentFor(file);
   return { entry, ...render(<Component file={file} entry={entry} />) };
+}
+
+/**
+ * The panel's own controls, as `panel-strip.tsx` hands them down when it gives up
+ * its row because this viewer's frame draws one (Story 53.3). One button, named
+ * the way the strip names its fold, so a test can find it after it has travelled.
+ */
+const FRAME_CONTROL_LABEL = "Fold panel";
+
+/** Mount the way a panel that gave up its row mounts it: the registry, plus the
+ *  controls the host handed down. */
+function openWithTheHostsRowHandedDown(file: ViewerFile) {
+  const { entry, Component } = viewerComponentFor(file);
+  return {
+    entry,
+    ...render(
+      <Component
+        file={file}
+        entry={entry}
+        frame={
+          <button type="button" aria-label={FRAME_CONTROL_LABEL}>
+            x
+          </button>
+        }
+      />,
+    ),
+  };
 }
 
 /** Drain microtasks without letting a frame run — see `raw-rendered-view.test.tsx`. */
@@ -470,20 +503,48 @@ describe("saving goes through Story 45.3's one write path", () => {
     // honest is that the reader is told what is missing BEFORE editing, not
     // after saving. Rust composes the sentence; this surface owes only that
     // it is on screen with the editor, not instead of it.
+    //
+    // **RE-ANCHORED BY STORY 53.3, which NARROWS this rule and does not drop
+    // it.** The reader can now fold the band, and what folding it shows is
+    // Rust's own one-line composition of the same fact — the four-line form is
+    // one press away, on the control beside it (`the caveat fold` in
+    // `text-file-frame.test.tsx` presses it). So what is asserted before the
+    // first keystroke is the SHORT sentence, and the teeth are unchanged in the
+    // direction that matters: if the band disappears, if the short line stops
+    // naming what is missing, or if the webview starts clipping the long
+    // sentence instead of rendering Rust's, this fails.
     const caveat =
       "AGENTS.md is not one of keeper's notes — it is outside tgdrive's notes vault " +
       "(10-notes). keeper saves it straight to the file and sends a delete to this " +
       "computer's trash: no note history, no search index and no conflict copy. Nothing " +
       "about how tgdrive syncs this folder changes.";
+    const short =
+      "AGENTS.md is not one of keeper's notes: no note history, no search index and no " +
+      "conflict copy.";
     syncReadText.mockResolvedValue(vm({ text: "hello\n" }));
 
     openThroughTheRegistry(
-      target({ name: "AGENTS.md", relativePath: "AGENTS.md", writeCaveat: caveat }),
+      target({
+        name: "AGENTS.md",
+        relativePath: "AGENTS.md",
+        writeCaveat: caveat,
+        writeCaveatShort: short,
+      }),
     );
     const editor = await editorHost();
 
-    // Verbatim, never paraphrased — the same rule `reason` and `detail` follow.
-    expect(screen.getByTestId(TEXT_FILE_CAVEAT_TESTID)).toHaveTextContent(caveat);
+    // On screen, standing, before anything has been typed — and verbatim, never
+    // paraphrased, the same rule `reason` and `detail` follow.
+    const band = screen.getByTestId(TEXT_FILE_CAVEAT_TESTID);
+    expect(band).toHaveTextContent(short);
+    // Still naming what is absent, which is the whole of what AD-102 asks a
+    // reader to know before the first keystroke.
+    for (const absent of ["no note history", "no search index", "no conflict copy"]) {
+      expect(band).toHaveTextContent(absent);
+    }
+    // Rust's short sentence and not a clipped long one: the two are not prefixes
+    // of each other, so a webview that truncated would fail here.
+    expect(caveat.startsWith(short)).toBe(false);
     // And the editor is there: this is a caveat, not a refusal.
     expect(editor).toBeInTheDocument();
   });
@@ -754,6 +815,92 @@ describe("a file knows its note (Story 45.18, FR-196)", () => {
     });
 
     expect(notesResolveLink).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The merged title bar is the panel's FIRST row, in every state this surface can
+ * put above a file (Story 53.3's fix).
+ *
+ * **Why this suite and not `panel-strip.test.tsx`.** The band under test only
+ * exists for a markdown file whose profile has a vault holding it, and the strip's
+ * file fixture is a `docs/notes.md` with no vault configured at all — so `inVault`
+ * is null there and the band never renders in the one suite that mounts the merged
+ * bar. This is the suite that can seed a vault, and the ordinary Files→vault
+ * markdown file is what the defect was: the panel's first row was a lone
+ * right-aligned button and the name, Export, fold and close sat ~27px lower than
+ * on the `.pdf` beside it.
+ */
+describe("the merged title bar is the panel's first row (Story 53.3)", () => {
+  /** The frame's root, which is the box the panel's body holds. */
+  function rowsOf(header: Element): Element[] {
+    const root = header.parentElement;
+    if (root === null) {
+      throw new Error("the header has no row box around it");
+    }
+    return Array.from(root.children);
+  }
+
+  it("draws the row above a vault file's Open in Notes band, not below it", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# Meeting\n" }));
+    openWithTheHostsRowHandedDown(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    // The band is on screen — this is the ordinary Files→vault markdown case,
+    // which is what makes the ordering claim worth anything.
+    const band = screen.getByRole("button", { name: "Open in Notes" });
+    const header = document.querySelector("header");
+    expect(header).not.toBeNull();
+    // The panel's controls are in that row, so "first row" is a claim about where
+    // the fold and the close are: at y=0, level with every panel beside it.
+    expect(
+      within(header as HTMLElement).getByRole("button", { name: FRAME_CONTROL_LABEL }),
+    ).toBeInTheDocument();
+    expect(within(header as HTMLElement).getByText("meeting.md")).toBeInTheDocument();
+
+    const rows = rowsOf(header as HTMLElement);
+    expect(rows.indexOf(header as HTMLElement)).toBe(0);
+    const bandRow = rows.find((row) => row.contains(band));
+    expect(bandRow).toBeDefined();
+    expect(rows.indexOf(bandRow as Element)).toBeGreaterThan(0);
+  });
+
+  it("draws the row above the notice a failed action leaves, for the whole life of it", async () => {
+    seedVaults();
+    syncReadText.mockResolvedValue(vm({ text: "# New\n" }));
+    // The index has not caught up, which is how a reader gets the notice without
+    // anything else about the surface changing.
+    notesTree.mockResolvedValue(folderWith({ id: "note-other", path: "somethingelse.md" }));
+    openWithTheHostsRowHandedDown(target({ name: "fresh.md", relativePath: "inbox/fresh.md" }));
+    await settle();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in Notes" }));
+    await settle();
+
+    expect(noticeText()).toContain("fresh.md");
+    const notice = document.querySelector(`[data-slot="${TEXT_FILE_NOTICE_SLOT}"]`) as Element;
+    const header = document.querySelector("header") as HTMLElement;
+    const rows = rowsOf(header);
+    expect(rows.indexOf(header)).toBe(0);
+    expect(rows.indexOf(notice)).toBeGreaterThan(0);
+  });
+
+  it("keeps the band on screen while the file is still opening", async () => {
+    // The band is about the FILE and not about the buffer, and the row it now
+    // lives under is drawn in this state too — so a vault file does not lose its
+    // note for the whole of a pendrive's read.
+    seedVaults();
+    syncReadText.mockReturnValue(new Promise<TextFileVm>(() => undefined));
+    openWithTheHostsRowHandedDown(target({ name: "meeting.md", relativePath: "inbox/meeting.md" }));
+    await settle();
+
+    const header = document.querySelector("header") as HTMLElement;
+    const band = screen.getByRole("button", { name: "Open in Notes" });
+    const rows = rowsOf(header);
+    expect(rows.indexOf(header)).toBe(0);
+    expect(rows.indexOf(rows.find((row) => row.contains(band)) as Element)).toBeGreaterThan(0);
+    expect(screen.getByRole("status")).toHaveTextContent("opening meeting.md");
   });
 });
 
@@ -1168,6 +1315,16 @@ describe("a session log opens in three modes (Story 51.5)", () => {
  * viewer this suite deliberately renders on its own (`openThroughTheRegistry`).
  */
 describe("a rename in the properties panel takes the open pane with it (Story 52.2)", () => {
+  // Story 53.3 put the form behind a fold that defaults closed, and a rename is
+  // committed from a field INSIDE that form. So these arrange the state a reader
+  // who has opened it once is in — the cookie's own encoding, through the real
+  // hydrate — rather than pressing the disclosure in five tests whose subject is
+  // where the pane points afterwards.
+  beforeEach(() => {
+    resetFileFrameFoldForTest();
+    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+  });
+
   /** A block with a title, which is the field a rename is committed from. */
   const TITLED = "---\ntitle: untitled\n---\n";
 
@@ -1399,6 +1556,15 @@ describe("a rename in the properties panel takes the open pane with it (Story 52
  * bytes. A frame test could only assert the prop it just passed.
  */
 describe("the properties block is drawn once, not twice (Story 52.3)", () => {
+  // The fold this claim needs open, arranged the way a reader who opened it once
+  // leaves it (Story 53.3). With it closed the pane draws the block, which is the
+  // correct behaviour for a surface with no form above it and is asserted in
+  // `text-file-frame.test.tsx`'s fold describe.
+  beforeEach(() => {
+    resetFileFrameFoldForTest();
+    hydrateFileFrameFold(fileFrameFoldCookie({ properties: false, caveat: true }));
+  });
+
   /** A file with properties, as `file_properties` writes them, and its body. */
   const BLOCK = "---\ntitle: Weekly\ntags:\n  - about\n---\n";
   const BODY = "# Weekly\n\nalpha\n";

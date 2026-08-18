@@ -1734,9 +1734,16 @@ fn files_listing_vm(
                     // just supplied.
                     let write = match scope.owner(&entry.relative_path, entry.is_dir) {
                         Ok(files_write::WriteOwner::Vault) => FilesWriteVm::allowed(),
-                        Ok(files_write::WriteOwner::Unmanaged) => {
-                            FilesWriteVm::unmanaged(scope.unmanaged_caveat(&entry.name))
-                        }
+                        Ok(files_write::WriteOwner::Unmanaged) => FilesWriteVm::unmanaged(
+                            scope.unmanaged_caveat(&entry.name),
+                            // Story 53.3: the same fact in one line, for the
+                            // surface that folds the caveat away. Composed here
+                            // beside the whole sentence, because a webview that
+                            // clipped one to make the other would be
+                            // paraphrasing the clause that names what is
+                            // missing.
+                            scope.unmanaged_caveat_short(&entry.name),
+                        ),
                         Err(refusal) => FilesWriteVm::refused(refusal.to_string()),
                     };
                     FilesEntryVm::new(FilesEntryFacts {

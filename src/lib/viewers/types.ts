@@ -18,7 +18,7 @@
  * icon.
  */
 
-import type { ComponentType } from "react";
+import type { ComponentType, ReactNode } from "react";
 import type { RecordingNoteTargetKind } from "@/lib/ipc/client";
 
 /**
@@ -286,6 +286,27 @@ export interface ViewerFile extends ViewerSubject {
    */
   readonly writeCaveat: string | null;
   /**
+   * The same standing sentence in ONE line, or `null` alongside
+   * {@link ViewerFile.writeCaveat}'s `null` (Story 53.3, FR-318).
+   *
+   * `FilesWriteVm.caveatShort`, and it exists because Story 53.3 lets a reader
+   * fold the caveat away: what folding it shows is this, and what it must never
+   * show is nothing. AD-102 is narrowed here rather than deleted — the fact that
+   * this file has no history stays on screen before the first keystroke, and the
+   * full four sentences are one press away.
+   *
+   * **Composed in Rust, exactly like the long form, and for a sharper reason.**
+   * A webview that clipped {@link ViewerFile.writeCaveat} to one line would be
+   * paraphrasing it — and a character count lands mid-clause, in the clause that
+   * names what is absent. So `WriteScope::unmanaged_caveat_short` writes this
+   * sentence and both forms are built from one list of absences, which is what
+   * keeps them from drifting apart.
+   *
+   * `Some` exactly when `caveat` is, on Rust's side: a surface therefore never
+   * has to decide what to show for a file that has one form and not the other.
+   */
+  readonly writeCaveatShort: string | null;
+  /**
    * Why keeper will not write this file's LOCATION, or `null` when it will
    * (Story 45.3's `FilesWriteVm.writable`/`reason`, threaded here by Story
    * 50.3's fix).
@@ -318,9 +339,9 @@ export interface ViewerFile extends ViewerSubject {
 }
 
 /**
- * What every viewer component is handed. Exactly two fields, and no bytes:
- * reading a file is Story 45.3's path and a viewer loads its own, so the
- * registry never becomes a place that reads the disk.
+ * What every viewer component is handed. No bytes: reading a file is Story
+ * 45.3's path and a viewer loads its own, so the registry never becomes a place
+ * that reads the disk.
  */
 export interface ViewerProps {
   /** The file to show. */
@@ -329,6 +350,26 @@ export interface ViewerProps {
    *  a viewer and the surface that mounted it cannot disagree about the format
    *  they are looking at. */
   readonly entry: ViewerEntry;
+  /**
+   * The controls of whatever FRAME is holding this viewer — a panel's fold and
+   * its close and its Export — or `null`/absent when that frame draws a row of
+   * its own and keeps them (Story 53.3, FR-317).
+   *
+   * **A viewer handed these MUST draw a header row in every state it can
+   * render**, including while it is loading and for a file it refuses to open:
+   * the host has given up its own row on the strength of that promise, and a
+   * viewer that drew none would leave the panel with no title, no fold and no
+   * way to close it. `ownsHostRow` on the row that resolved the component is
+   * which viewers make the promise (`components.tsx`), and a host must consult
+   * it rather than deciding for itself — that is the same rule AD-87 states for
+   * every other question about a format.
+   *
+   * Shaped as a node rather than a boolean plus a callback registry, exactly as
+   * `PaneHeader`'s fourth group is (`pane-header.tsx`): the controls are the
+   * host's own, so their labels, their handlers and their store are the host's
+   * too, and what travels is the rendered thing.
+   */
+  readonly frame?: ReactNode;
 }
 
 /** A viewer component: {@link ViewerProps} in, a rendered file out. */

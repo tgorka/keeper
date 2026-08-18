@@ -967,6 +967,9 @@ pub fn run() {
         sessions_ipc::sessions_spaces,
         sessions_ipc::sessions_space_files,
         sessions_ipc::sessions_space_save,
+        // The repair beside `save`, not beside the reads: it IS a save (Story
+        // 53.4), delegating to the one above it.
+        sessions_ipc::sessions_space_narrow,
         sessions_ipc::sessions_space_delete,
         sessions_ipc::sessions_spaces_restore,
         sessions_ipc::sessions_template_install,

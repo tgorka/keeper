@@ -73,9 +73,9 @@ folded: boolean | null,
  */
 rows: number | null, 
 /**
- * The directory this space's creates go into, session-relative — empty when
- * it names none, which is today's behaviour for every space (Story 52.5,
- * FR-309).
+ * The directory this space's creates go into, session-relative — `null`
+ * when the file carries no `keeper.create_dir` key at all (Story 52.5,
+ * FR-309; Story 53.5, FR-320).
  *
  * Carried so the editor can show what the file says and send it back
  * unchanged; the surface never composes a path out of it and never reads a
@@ -83,8 +83,31 @@ rows: number | null,
  * [`crate::sessions::shape::kind_dir`]'s answer in Rust (AD-65), which
  * takes this as its override and keeps the session's contract as the
  * fallback.
+ *
+ * **Nullable rather than a plain string, for
+ * [`crate::sessions::spaces::SessionSpace::create_dir`]'s reason**: `null`
+ * is a space that inherits [`Self::create_dir_default`], and `""` is an
+ * operator who chose the session root. The editor shows one empty box for
+ * both and has to say which it is, and a request that could not spell the
+ * difference would silently convert the second into the first on the next
+ * unrelated Save.
  */
-createDir: string, 
+createDir: string | null, 
+/**
+ * The destination [`Self::create_dir`] inherits when it is `null` — `""` for
+ * a space that claims no default, or claims one that names nowhere (Story
+ * 53.5, FR-320).
+ *
+ * **Resolved in Rust and sent as the editor's PLACEHOLDER, not as its
+ * value.** The placeholder is the only honest way to draw the inherited
+ * answer: put it in the box and the next Save persists a key nobody typed,
+ * which is the rewrite AD-121 forbids; leave the box saying nothing and an
+ * empty field reads as the session root it used to mean. Composed by
+ * [`crate::sessions::spaces::inherited`], so no surface reads
+ * `DEFAULT_SESSION_SPACES` — the same rule that keeps `new_file_kind` from
+ * being a query parsed in TypeScript.
+ */
+createDirDefault: string, 
 /**
  * Presentation keys keeper could not read, each a finished sentence. The
  * space still works — this is the "not obeying one line of its own file"

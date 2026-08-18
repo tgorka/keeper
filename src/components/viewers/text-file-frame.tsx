@@ -36,9 +36,45 @@
  * control for free, where a panel header would have given it nothing.
  *
  * The bar exists exactly when there is a Save to offer — a writable format that
- * was not truncated on the way in. A header whose only reason to exist is a
- * control that is not there is chrome for its own sake, and a reserved status
- * slot that can never say anything is 8px of nothing.
+ * was not truncated on the way in — OR when the host handed its own controls
+ * down, which is Story 53.3's merge and the next section.
+ *
+ * # One title bar, when the host gives up its own (Story 53.3, FR-317)
+ *
+ * The owner's report is that the name is on screen twice: this bar says it, and
+ * the panel's header above it said it again with the Export control and the
+ * fold and the close. The notes surface already fixed this shape — a note panel
+ * draws no row and hands its two controls into the editor's header
+ * (`panel-strip.tsx`, Story 50.1) — and {@link TextFileFrameProps.frame} is the
+ * same seam for a file.
+ *
+ * **What makes it harder here, and the trap it is guarded against.** A note
+ * panel can decide up front, because `noteVaultReason` is a pure store read.
+ * `savable` is decided in this function from the registry's row, Rust's refusal
+ * and `vm.oversize` — and the last of those only exists after the read lands.
+ * This frame also renders a bare sentence and NO header while it is loading, for
+ * a file it cannot read and for bytes that are not text. So the rule is a
+ * promise this component keeps rather than a condition the host evaluates: **a
+ * frame handed `frame` draws a header in every one of those states**, with
+ * whatever of the Save half is true at the time. A host that kept its row on a
+ * guess about `savable` would leave five states with no title at all, which is
+ * exactly the defect a naive port of 50.1 produces.
+ *
+ * # The two bands above the file fold (Story 53.3, FR-316, FR-318)
+ *
+ * The properties form (Story 50.4) and AD-102's caveat both sat above the
+ * Preview|Source|Note tabs unconditionally, and both pushed the file down in all
+ * three views. Each now folds from a control on this bar, defaulting folded, and
+ * the answer is remembered per SURFACE rather than per file
+ * (`@/lib/stores/file-frame-fold`) — this component outlives the file it shows
+ * and a folded panel unmounts it entirely, so `useState` here would lose the
+ * reader's answer twice over.
+ *
+ * The caveat's fold is a narrowing of AD-102 and never a deletion: folded, it
+ * shows Rust's ONE-LINE composition of the same fact
+ * ({@link TextFileFrameProps.writeCaveatShort}), which still names what a file
+ * outside the vault does not get. Never a truncation of the long one here — the
+ * short form is Rust's sentence too, for the reason `viewers/types.ts` gives.
  *
  * # The writing tools are decided here and mounted two levels down
  *
@@ -81,11 +117,18 @@
  * form above it" the ordinary way to use this pane — and it destroyed the
  * paragraph, silently, with no prompt.
  */
-import { useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, SlidersHorizontal } from "lucide-react";
+import { type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
-import { FileProperties } from "@/components/notes/properties-panel";
+import { FileProperties, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { Button } from "@/components/ui/button";
+import {
+  fileFrameFoldStore,
+  hydrateFileFrameFold,
+  useFileFrameFold,
+} from "@/lib/stores/file-frame-fold";
 import type { ViewerEntry } from "@/lib/viewers";
 import type { MarkdownPreviewOptions } from "./markdown-preview";
 import type { CsvCoordinates } from "./raw-rendered-view";
@@ -145,6 +188,22 @@ export const FILE_SAVE_CLEAN_TITLE = "Nothing has changed since this file was la
  * on screen before the editor.
  */
 export const TEXT_FILE_CAVEAT_TESTID = "text-file-caveat";
+
+/**
+ * The control that shows the whole of AD-102's caveat, and folds it back to one
+ * line (Story 53.3, FR-318).
+ *
+ * ONE label across both states, with `aria-expanded` saying which state it is
+ * in — the disclosure form the note editor's Properties control uses
+ * (`priority-actions.tsx`: "pressed says this control is on, expanded says the
+ * thing this control names is open"). The panel fold's two-label form is for a
+ * control that is the only thing left on screen; this one sits beside the
+ * sentence it belongs to.
+ *
+ * It names the FACT rather than the act, because the act is a chevron anybody
+ * recognises and the fact is what a reader is deciding whether to read.
+ */
+export const TEXT_FILE_CAVEAT_LABEL = "What keeper does not do for this file";
 
 /**
  * Where a file's own properties are addressed (Story 50.4, FR-283).
@@ -222,8 +281,69 @@ export interface TextFileFrameProps {
    * the standing fact has to be on screen before the first keystroke — an edit
    * that quietly does less than the vault path does is worse than the refusal
    * it replaced.
+   *
+   * Since Story 53.3 this is the form shown on REQUEST, and
+   * {@link TextFileFrameProps.writeCaveatShort} is what stands there by default.
+   * Both are on screen before the first keystroke in the only sense AD-102 asks
+   * for: the fact is, in whichever form the reader has chosen.
    */
   writeCaveat?: string | null;
+  /**
+   * The same fact in one line, or `null` (Story 53.3, FR-318).
+   *
+   * Composed in Rust too (`FilesWriteVm.caveatShort`) and rendered verbatim —
+   * this frame never derives it by clipping {@link TextFileFrameProps.writeCaveat},
+   * which would be a paraphrase of the clause that names what is missing.
+   *
+   * A host that carries a caveat carries both forms, because Rust sets them
+   * together. When only the long one arrives — a host written before this story,
+   * or a fixture — the fold has nothing to show, so the band stays whole rather
+   * than empty: the fact on screen is the invariant, and the fold is the
+   * preference.
+   */
+  writeCaveatShort?: string | null;
+  /**
+   * The controls of the frame holding this surface — a panel's Export, its fold
+   * and its close — or `null` when that frame draws its own row (Story 53.3,
+   * FR-317).
+   *
+   * **Handing these over is what makes this bar the panel's title bar**, and it
+   * comes with an obligation this component keeps in every branch: a frame with a
+   * `frame` draws a header while the file is opening, for a file it cannot read,
+   * for bytes that are not text, and for a file no save can follow — states in
+   * which it otherwise renders one bare sentence and nothing else. The host has
+   * given up its own row; a state with no row would be a panel a reader cannot
+   * name, fold or close.
+   *
+   * `null` for the note embed (`file-embed-host.tsx`), which is inside a
+   * document rather than inside a frame and has no controls to lend.
+   */
+  frame?: ReactNode;
+  /**
+   * The host's own bands — what it offers about this file and what it has to
+   * report about the last thing it tried — or omitted when it has none
+   * (Story 53.3's fix).
+   *
+   * **They belong here because this frame draws the title row.** They used to be
+   * siblings ABOVE the mounted frame in `text-file-viewer.tsx`, which was right
+   * while the panel drew its own header on top of them. Since this story the
+   * header below IS the panel's title row, so a band left above it made the
+   * panel's first row a lone right-aligned button — pushing the name, the fold
+   * and the close ~27px down for the ordinary Files→vault markdown file, and
+   * for the whole life of a notice a wikilink left behind. Across a strip the
+   * fold and close controls then stopped lining up with the panels beside them.
+   *
+   * Rendered directly under the header and above this frame's own bands, which
+   * is the order the host had: its band first, then the caveat, then the error.
+   * The only thing that moved is the row, and it moved to the top where a title
+   * row belongs.
+   *
+   * A `ReactNode` rather than coordinates, unlike {@link
+   * TextFileFrameProps.properties}: what the band SAYS is the host's own
+   * knowledge — which vault holds the file, which link went nowhere — and this
+   * frame has no opinion to add. It owns only where the nodes sit.
+   */
+  notices?: ReactNode;
   /**
    * Why keeper will not write this file's LOCATION, or `null` (Story 45.3's
    * `FilesWriteVm`, threaded by Story 50.3's fix).
@@ -252,7 +372,10 @@ export function TextFileFrame({
   entry,
   state,
   writeCaveat = null,
+  writeCaveatShort = null,
   writeRefusal = null,
+  frame = null,
+  notices = null,
   csv,
   properties,
   onPropertiesRenamed,
@@ -260,6 +383,25 @@ export function TextFileFrame({
   csvOptions,
 }: TextFileFrameProps): React.ReactElement {
   const { vm, content, setContent, dirty, save, reload, error, loading, loadedFrom } = state;
+
+  // Story 53.3's two folds, and the reader's standing answer to both.
+  //
+  // The restore is mounted HERE rather than at the shell: these two keys belong
+  // to no other surface, every surface that draws them mounts this component,
+  // and this is the one place the call can be forgotten (DW-172) — which is why
+  // the frame's own suite asserts it over a real cookie and the store's cannot.
+  const folds = useFileFrameFold((each) => each.bands);
+  useEffect(() => {
+    hydrateFileFrameFold(typeof document === "undefined" ? "" : document.cookie);
+  }, []);
+
+  // Both regions are named by the control that opens them, so the ids have to be
+  // unique per mounted frame: a panel strip can hold four of these at once, and
+  // two `aria-controls` pointing at one id is a promise to a screen reader that
+  // resolves to the wrong pane.
+  const frameId = useId();
+  const propertiesRegionId = `${frameId}-properties`;
+  const caveatRegionId = `${frameId}-caveat`;
 
   // The `---` block the properties form below is holding: `null` while its read
   // is in flight, `null` again if that read refused, and `null` when this file
@@ -370,11 +512,71 @@ export function TextFileFrame({
     );
   }, [formBlock]);
 
+  // The file's own name, which nothing else inside this frame renders — the note
+  // embed that mounts it has no header at all, and since Story 53.3 a panel that
+  // handed its controls down has no row of its own either, so this is the one
+  // identity every host can rely on.
+  //
+  // TWO treatments, because this row is two different things depending on who
+  // mounted it. With a `frame` it IS the panel's title row, and every other
+  // panel title in the strip is drawn in `FOLD_STRIP.titleClass` —
+  // `DESIGN.md`'s `pane-header` typography, which `panel-strip.tsx` gives up its
+  // own row to keep (`panel-strip.tsx:684-688`) and which the notes surface's
+  // merged row already wears (`note-editor.tsx`'s `deriveTitle` heading). Kept
+  // small, a strip holding `notes.md`, `report.pdf` and a note showed three
+  // typographies for one thing, and folding the `.md` changed the size of its
+  // own name.
+  //
+  // Without one — the note embed (`file-embed-host.tsx`) — this is not a panel
+  // title at all but a label inside somebody's document, where a 15px heading
+  // would outshout the prose around it. The heading semantics stay off both:
+  // `panel-strip.tsx` says why a second `h2` naming the same file is wrong.
+  const identity = (
+    <span
+      className={
+        frame === null ? "min-w-0 flex-1 truncate font-medium text-xs" : FOLD_STRIP.titleClass
+      }
+    >
+      {fileName}
+    </span>
+  );
+
+  // A state with no file in it: one sentence, and — when a host gave up its row
+  // for this frame — the row it is owed above it (Story 53.3, FR-317).
+  //
+  // Three call sites and they must stay in lockstep: these are exactly the states
+  // that used to render a bare `<p>` and no header, and the panel above is now
+  // relying on this component for its title, its fold and its close. One of them
+  // drawing nothing is a panel a reader cannot close.
+  //
+  // No status and no actions: there is no buffer to be dirty and no Save to
+  // offer. `PaneHeader` reserves nothing for a status it is not given, so this is
+  // the same 40px row with the name in it and the frame's controls at the end.
+  //
+  // The host's own bands come with it. They are about the FILE, not about the
+  // buffer — a vault markdown file has its note whether the bytes arrived or
+  // not — so dropping them here would make Open in Notes flicker out for the
+  // whole of a pendrive's read, which is what it did while these nodes were the
+  // host's own siblings.
+  const framed = (sentence: ReactNode): React.ReactElement =>
+    frame === null ? (
+      <>
+        {notices}
+        {sentence}
+      </>
+    ) : (
+      <div className="flex h-full min-h-0 flex-col">
+        <PaneHeader className="px-3" identity={identity} actions={null} frame={frame} />
+        {notices}
+        {sentence}
+      </div>
+    );
+
   if (loading) {
-    return (
+    return framed(
       <p className="px-3 py-2 text-muted-foreground text-xs" role="status">
         opening {fileName}
-      </p>
+      </p>,
     );
   }
 
@@ -384,10 +586,10 @@ export function TextFileFrame({
   // have the file an embed names, where Rust's sentence lists the paths it
   // looked for.
   if (vm === null) {
-    return (
+    return framed(
       <p className="px-3 py-2 text-destructive text-xs" role="alert">
         {error ?? `keeper could not open ${fileName}`}
-      </p>
+      </p>,
     );
   }
 
@@ -395,10 +597,10 @@ export function TextFileFrame({
   // editable pane over a binary file and offer to save it, which is how an
   // editor overwrites a `.png` with nothing.
   if (vm.binary) {
-    return (
+    return framed(
       <p className="px-3 py-2 text-destructive text-xs" role="alert">
         {vm.detail ?? `${fileName} is not text, so keeper will not open it in an editor`}
-      </p>
+      </p>,
     );
   }
 
@@ -468,45 +670,127 @@ export function TextFileFrame({
   // what makes the claim true for a host that passes no refusal at all.
   const propertiesPanel = writingTools ? properties : null;
 
+  // Story 53.3: the form is behind a fold now, and the fold defaults CLOSED —
+  // the same default the notes surface has had since Story 49
+  // (`note-editor.tsx`'s `showProperties`). The CONTROL exists wherever the form
+  // would: a disclosure for a panel this file is never going to get would be a
+  // control that announces its own refusal.
+  const propertiesOpen = propertiesPanel !== null && !folds.properties;
+
+  // Story 53.3's second fold. `writeCaveatShort` is Rust's one-line form, and
+  // the fold is only offered when there is one: a host that carries the long
+  // sentence alone keeps showing it whole rather than folding the fact off the
+  // screen.
+  const caveatFoldable = writeCaveat !== null && writeCaveatShort !== null;
+  const caveatOpen = !caveatFoldable || !folds.caveat;
+
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {savable ? (
+      {savable || frame !== null ? (
         <PaneHeader
           // Horizontal padding only. The bottom edge and the 40px height are
           // `PaneHeader`'s now; this used to spell `border-b` (a second edge
           // under the component's) and `py-1.5` (a 44px row where the other
           // two callers were 40).
           className="px-3"
-          // The file's own name, which nothing inside this frame renders — the
-          // panel's header names it too, and the note embed that mounts this has
-          // no header at all, so this is the one identity both hosts can rely on.
-          identity={<span className="min-w-0 flex-1 truncate font-medium text-xs">{fileName}</span>}
-          status={{ sizers: FILE_SAVE_SIZERS, caption: fileSaveWord(dirty) }}
+          identity={identity}
+          // Reserved only where there is a buffer to be dirty. A row that exists
+          // because the HOST handed its controls over, for a file no save can
+          // follow, has nothing to say here — and an empty reserved slot is 8px
+          // of nothing (`pane-header.tsx`).
+          status={savable ? { sizers: FILE_SAVE_SIZERS, caption: fileSaveWord(dirty) } : null}
           actions={
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              disabled={!dirty}
-              title={dirty ? undefined : FILE_SAVE_CLEAN_TITLE}
-              // The same call `Mod-s` makes, and the only one: the hook holds the
-              // buffer, so there is nothing for this to pass and nothing it could
-              // pass that would differ from what the editor last reported.
-              onClick={() => void save()}
-            >
-              {FILE_SAVE_LABEL}
-            </Button>
+            <>
+              {/* The properties fold, in the note editor's own disclosure shape:
+                  the same word, the same glyph, `aria-expanded` for the state and
+                  `aria-controls` naming the region while it is open (and omitted
+                  while it is closed, rather than pointing at an id nothing owns).
+                  Not `FoldSection`, which is the 48px rail-row shape. */}
+              {propertiesPanel === null ? null : (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={PROPERTIES_LABEL}
+                  title={PROPERTIES_LABEL}
+                  aria-expanded={propertiesOpen}
+                  aria-controls={propertiesOpen ? propertiesRegionId : undefined}
+                  className="shrink-0"
+                  onClick={() => fileFrameFoldStore.getState().toggleBand("properties")}
+                >
+                  <SlidersHorizontal aria-hidden="true" />
+                </Button>
+              )}
+              {savable ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={!dirty}
+                  title={dirty ? undefined : FILE_SAVE_CLEAN_TITLE}
+                  // The same call `Mod-s` makes, and the only one: the hook holds
+                  // the buffer, so there is nothing for this to pass and nothing
+                  // it could pass that would differ from what the editor last
+                  // reported.
+                  onClick={() => void save()}
+                >
+                  {FILE_SAVE_LABEL}
+                </Button>
+              ) : null}
+            </>
           }
+          // The host's own controls, last and never demoted into this surface's
+          // overflow — `PaneHeader`'s fourth group, where Story 50.1 puts a note
+          // panel's fold and close.
+          frame={frame}
         />
       ) : null}
+      {/* The host's bands, directly under the row and above this frame's own —
+          the order the host used to draw them in, minus the panel header that
+          used to sit between them and the file (see `notices`). Whatever they
+          are, the title row is the panel's FIRST row. */}
+      {notices}
       {writeCaveat === null ? null : (
-        <p
+        <div
           data-testid={TEXT_FILE_CAVEAT_TESTID}
-          className="shrink-0 border-b px-3 py-1.5 text-muted-foreground text-xs"
-          role="status"
+          className="flex shrink-0 items-start gap-2 border-b px-3 py-1.5"
         >
-          {writeCaveat}
-        </p>
+          {/* Rust's sentence, in whichever form the reader has asked for, and
+              never clipped here: the short one is composed in Rust too
+              (`WriteScope::unmanaged_caveat_short`), because a truncation is a
+              paraphrase of the clause that names what is missing.
+
+              One element for both forms, and therefore one `aria-controls`
+              target that always owns something: the region is the caveat itself,
+              expanded or not, so the promise `aria-expanded` makes is one this
+              surface can keep in both states. */}
+          <p
+            id={caveatRegionId}
+            className="min-w-0 flex-1 text-muted-foreground text-xs"
+            role="status"
+          >
+            {caveatOpen ? writeCaveat : writeCaveatShort}
+          </p>
+          {caveatFoldable ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={TEXT_FILE_CAVEAT_LABEL}
+              title={TEXT_FILE_CAVEAT_LABEL}
+              aria-expanded={caveatOpen}
+              aria-controls={caveatRegionId}
+              className="-my-0.5 shrink-0"
+              onClick={() => fileFrameFoldStore.getState().toggleBand("caveat")}
+            >
+              {caveatOpen ? (
+                <ChevronDown aria-hidden="true" />
+              ) : (
+                <ChevronRight aria-hidden="true" />
+              )}
+            </Button>
+          ) : null}
+        </div>
       )}
       {error === null ? null : (
         <p className="shrink-0 border-b px-3 py-1.5 text-destructive text-xs" role="alert">
@@ -535,9 +819,16 @@ export function TextFileFrame({
           (`FileProperties` calls it instead of `onRenamed` then), where the
           address here is the one Rust just emptied and no block changes — so the
           re-read is what renders Rust's "is no longer in tgdrive", exactly as
-          before. */}
-      {propertiesPanel === null ? null : (
-        <div className="shrink-0">
+          before.
+
+          UNMOUNTED rather than hidden while the fold is closed (Story 53.3), for
+          the reason `panel-strip.tsx` gives about a folded panel: a form kept
+          alive behind `hidden` keeps its read and its subscription over a file
+          nobody can see. The id rides on the box this form already had rather than
+          on a wrapper of its own — that box is what keeps the form out of the
+          editor's `flex-1`, and it is exactly the region the control names. */}
+      {propertiesOpen && propertiesPanel !== null ? (
+        <div id={propertiesRegionId} className="shrink-0">
           <FileProperties
             profileId={propertiesPanel.profileId}
             relativePath={propertiesPanel.relativePath}
@@ -551,7 +842,7 @@ export function TextFileFrame({
             onRenamed={onPropertiesRenamed}
           />
         </div>
-      )}
+      ) : null}
       <div className="min-h-0 flex-1">
         <RawRenderedView
           fileName={fileName}
@@ -589,7 +880,13 @@ export function TextFileFrame({
           // (Story 52.3, FR-304). `null` until the form's read lands, if it
           // refuses, and for a file that gets no form — nothing is hidden then.
           // The Source tab still shows every byte, and a save still writes them.
-          frontmatterInForm={propertiesPanel === null ? null : formBlock}
+          //
+          // And `null` while the fold is closed (Story 53.3): with no form on
+          // screen there is nothing drawing the block, so the document has to
+          // draw it — hiding bytes that are in neither place would put a file's
+          // `tags:` nowhere at all. The carried block is deliberately NOT
+          // forgotten on the way, so unfolding costs no re-read.
+          frontmatterInForm={propertiesOpen ? formBlock : null}
           onExternalWrite={() => void reload()}
           editor={TextEditorSurface}
           csvOptions={csvOptions}

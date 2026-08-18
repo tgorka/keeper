@@ -786,7 +786,21 @@ export function SpaceEditor({
                     filter bar — a space is a document being authored, and
                     naming the tag the work is about to carry before the first
                     note carries it is ordinary; a live filter naming a tag no
-                    note has is just an unexplained empty list. */}
+                    note has is just an unexplained empty list.
+
+                    Story 53.2 gave this mount the close it never had, and it is
+                    not a prop: the chooser owns whether its list is unfolded, so
+                    the caret leaving it or a press anywhere else on this form
+                    folds the list away with no toggle of the dialog's own, and it
+                    opens folded. There is no `onDismiss` because there is nothing
+                    of this form's to unmount — the field stays, and the Save
+                    button stops sitting under the height of a list nobody is
+                    reading. Escape is a fold here too, and one press of it does
+                    not cancel this dialog: the chooser claims that key on the
+                    window while its list is up (`tag-combobox.tsx:217`), which is
+                    ahead of where Radix's dismissable layer reads the claim, so
+                    the first press folds the list and the second closes the form
+                    with the draft still on screen in between. */}
                 <TagCombobox
                   label="Add a tag"
                   placeholder="Type or browse"

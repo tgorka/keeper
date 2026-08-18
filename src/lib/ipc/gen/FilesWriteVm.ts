@@ -26,6 +26,14 @@
  * shows standing, BEFORE the first keystroke — an edit that quietly does less
  * than the vault path does is strictly worse than the refusal it replaces.
  * `Some` only when `writable`; the two are never both set.
+ *
+ * `caveat_short` is the same fact in one sentence (Story 53.3, FR-318), and it
+ * is a SECOND field rather than a replacement because the surface shows one and
+ * then the other: the short form stands before the first keystroke and the full
+ * one is a press away. Composed in Rust for the same reason the full one is —
+ * the webview renders both verbatim, and a webview that clipped the long one to
+ * fit would be paraphrasing exactly the clause that names what is missing.
+ * `Some` exactly when `caveat` is.
  */
 export type FilesWriteVm = { 
 /**
@@ -41,4 +49,9 @@ reason: string | null,
  * a whole sentence. `None` when keeper manages the file, and always
  * `None` when `writable` is false.
  */
-caveat: string | null, };
+caveat: string | null, 
+/**
+ * The same fact in one sentence, for a surface that folds the caveat away
+ * (Story 53.3). `Some` exactly when `caveat` is.
+ */
+caveatShort: string | null, };

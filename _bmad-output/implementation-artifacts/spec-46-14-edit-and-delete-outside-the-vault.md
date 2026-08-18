@@ -56,6 +56,34 @@ So the surface says what is absent and refuses to overstate it:
 thing by name *and* asserts the sentence does not contain "will not sync" or
 "does not sync". A caveat that overstates is a caveat people learn to ignore.
 
+### Narrowed by Story 53.3, and this is the record of it
+
+The rule above — *the standing fact is on screen before the first keystroke* —
+**stands**. What Story 53.3 changed is how much of it stands there by default:
+the band now shows ONE sentence and the four above are a press away on the
+control beside them.
+
+> AGENTS.md is not one of keeper's notes: no note history, no search index and
+> no conflict copy.
+
+Three things make that a narrowing rather than a deletion, and each is enforced:
+
+- **The short form is composed in Rust**, beside the long one
+  (`WriteScope::unmanaged_caveat_short`), and both are built from one
+  `UNMANAGED_ABSENT` list so they cannot come to name different absences.
+  `the_short_caveat_still_names_what_is_missing` asserts the head, the three
+  absences, that it is one sentence, and that it drops only the qualifiers.
+  The webview never clips the long one: `viewers/types.ts` forbids paraphrase
+  and a character count would land inside the clause that names what is absent.
+- **It is never folded to nothing.** `FilesWriteVm.caveat_short` is `Some`
+  exactly when `caveat` is, and a frame handed a caveat with no short form keeps
+  showing it whole (`keeps a caveat whole when its host carries no short form`).
+- **M5's guard keeps its teeth.** `shows AD-102's caveat before the first
+  keystroke, and only when there is one` now asserts the SHORT sentence in the
+  band, still asserts each absence by name, and asserts that the short form is
+  not a prefix of the long one — so a build that dropped the band, stopped
+  naming what is missing, or truncated in TypeScript still fails.
+
 ## Where the line is drawn, since the brief asked
 
 Three concentric cases, and only the middle one changed:
@@ -281,6 +309,13 @@ reading the region back and re-running. `grep -rn MUT46-14 src src-tauri` exits 
 | M3 | `is_dir` refused only inside the vault (spec-45-3 widened to the OS trash) | `a_directory_is_refused_inside_and_outside_the_vault` | **caught** (30/1) |
 | M4 | the redundant `plain_segments` pre-check removed from `route` | *nothing* | **survived — deliberately.** The check was dead: `resolve_existing` already refuses every escape before the vault question. Removed for real and the doc comment corrected; the surviving mutant is the finding. |
 | M5 | `TextFileFrame` renders no caveat banner | `shows AD-102's caveat before the first keystroke` | **caught** (1 failed / 22 passed) |
+
+M5's guard was **re-anchored by Story 53.3** to the narrowed rule (see *Narrowed
+by Story 53.3* above): the band it looks for now carries Rust's one-line form and
+the four-sentence one is a press away. The mutation it dies on is unchanged —
+`TextFileFrame` rendering no caveat band — and two more now kill it as well:
+rendering the short form as a clip of the long one, and folding the band to
+nothing when a host carries no short form.
 
 M4 is why the mutation sweep was worth running rather than reporting: it removed
 nine lines of code and one paragraph of comment that stated a rationale the code
