@@ -693,6 +693,22 @@ Transfers now treat a running unit as cover, and recovery collapses the pairs
 that already exist — while one half is `running` the pair is invisible, and the
 moment startup returns it to `pending` there are two identical rows.
 
+### Sync marks never hold up a listing
+
+The Files view decorates each row with how far that path got toward the remote,
+which comes from the same `pending` answer §11 describes — a whole-worktree
+`git status` plus an untracked expansion that `lstat`s every candidate. The
+listing used to **wait** for it before naming a single entry, and the pane's
+refresh asked for it once per open directory: ten expanded folders, ten walks of
+the same tree at the same moment. On a folder of tens of thousands of files on a
+drive already saturated by its own transfers, that is minutes of an empty pane.
+
+The walk is now bounded (3 s) and shared: one at a time per folder, its answer
+reused for a few seconds, and — because the walk is spawned rather than awaited
+in place — an answer that outruns the budget still lands, ready for the next
+listing. A folder with no answer yet says so; it never reports its rows as
+clean, which is the one wrong thing a fast listing could have done.
+
 ### The Sync view's Activity list
 
 Each folder's card lists the files it recently carried, newest first. Every row
