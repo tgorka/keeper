@@ -662,8 +662,11 @@ built.
   warning.
 - **Tray status line**, e.g.
   `Transferring tgdrive — 42/310 files · 1.2 GB of 4.7 GB · 104 files left, 53.1 GB`.
-  The tail is the queue *behind* the file in flight, which the other numbers say
-  nothing about: `1.2 GB of 4.7 GB` describes one object, and a folder pulling
+  The tail is read from the journal every time a status is asked for, never
+  remembered — a stored copy went stale between claimed batches and left the
+  count unmoved for hours while completed files were dropping out of the
+  Pending list beside it. It is the queue *behind* the file in flight, which
+  the other numbers say nothing about: `1.2 GB of 4.7 GB` describes one object, and a folder pulling
   53 GB showed a line like it for two days without ever suggesting how much was
   left. Counted from the journal, never estimated — a remaining *time* on a link
   whose throughput varies by an order of magnitude is a guess dressed as a fact.

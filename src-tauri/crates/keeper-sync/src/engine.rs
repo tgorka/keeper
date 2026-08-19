@@ -712,11 +712,6 @@ impl Engine {
             let pending = self.pending_for(&profile.id).unwrap_or(0);
             let mut snapshot = SyncStatus::idle(&profile.id, &profile.name);
             snapshot.pending = pending;
-            if let Ok((files, bytes)) = self.with_db(|conn| db::queued_transfers(conn, &profile.id))
-            {
-                snapshot.queued_files = files;
-                snapshot.queued_bytes = bytes;
-            }
             // Seeded, not left at zero, because a one-shot `keeper-syncd
             // status` never ticks: without this it would read the journal,
             // find nothing, and print "up to date" over a folder whose files
@@ -861,16 +856,48 @@ impl Engine {
     }
 
     pub fn status(&self, id: &str) -> Result<SyncStatus> {
-        Self::lock(&self.status)
+        let mut snapshot = Self::lock(&self.status)
             .get(id)
             .cloned()
-            .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))
+            .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))?;
+        self.fill_queued(&mut snapshot);
+        Ok(snapshot)
     }
 
     pub fn statuses(&self) -> Result<Vec<SyncStatus>> {
         let mut all: Vec<SyncStatus> = Self::lock(&self.status).values().cloned().collect();
+        for snapshot in &mut all {
+            self.fill_queued(snapshot);
+        }
         all.sort_by(|a, b| a.profile_name.cmp(&b.profile_name));
         Ok(all)
+    }
+
+    /// Answer "how much is left" from the journal, at the moment of asking.
+    ///
+    /// These two are **derived**, and keeping them in the snapshot was the same
+    /// mistake [`Self::pending`] refuses to make: a remembered answer to a
+    /// question the journal already answers disagrees with it the moment
+    /// anything changes. It did, and visibly — a unit completed, the Pending
+    /// list dropped it (that list is computed), and the line above went on
+    /// saying "94 files left, 48.7 GB" because the snapshot was written only
+    /// after a whole claimed batch of up to [`CLAIM_LIMIT`] units had been
+    /// attempted. On a slow link that is hours of a number that never moves.
+    ///
+    /// One indexed aggregate over a table holding a queue, on a path polled
+    /// every couple of seconds. Cheaper than the bug it removes, and it cannot
+    /// go stale because there is nothing left to go stale.
+    ///
+    /// A failed read leaves the pair at zero rather than propagating: the
+    /// caller asked for a status, and a folder that cannot be counted is still
+    /// a folder whose state, phase and error are worth reporting.
+    fn fill_queued(&self, snapshot: &mut SyncStatus) {
+        if let Ok((files, bytes)) =
+            self.with_db(|conn| db::queued_transfers(conn, &snapshot.profile_id))
+        {
+            snapshot.queued_files = files;
+            snapshot.queued_bytes = bytes;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2717,16 +2744,9 @@ impl Engine {
         let settling = Self::lock(&self.gates)
             .get(profile_id)
             .map(|gate| gate.tracked(now) as u32);
-        let queued = self
-            .with_db(|conn| db::queued_transfers(conn, profile_id))
-            .ok();
         if let Ok(pending) = self.pending_for(profile_id) {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
                 snapshot.pending = pending;
-                if let Some((files, bytes)) = queued {
-                    snapshot.queued_files = files;
-                    snapshot.queued_bytes = bytes;
-                }
                 if let Some(settling) = settling {
                     snapshot.settling = settling;
                 }
@@ -7838,6 +7858,68 @@ mod tests {
             incoming.path.starts_with("LFS object eeee"),
             "it says what it is rather than pretending to be a path: {}",
             incoming.path
+        );
+    }
+
+    /// The figures follow the journal, with nothing in between to go stale.
+    ///
+    /// They used to be written into the snapshot by the drain loop — after a
+    /// whole claimed batch of up to `CLAIM_LIMIT` units had been attempted. So
+    /// a completed download vanished from the Pending list (that one is
+    /// computed) while the line above it kept saying "94 files left, 48.7 GB",
+    /// for as long as the rest of the batch took: hours, on the link this was
+    /// reported from. No drain runs in this test, and none should have to.
+    #[test]
+    fn the_queue_figures_follow_the_journal_without_waiting_for_a_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let first = engine
+            .with_db(|conn| {
+                db::enqueue(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "a".repeat(64),
+                        size: 4_000,
+                    },
+                    1,
+                    1,
+                )
+            })
+            .expect("enqueue");
+        engine
+            .with_db(|conn| {
+                db::enqueue(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "b".repeat(64),
+                        size: 1_000,
+                    },
+                    1,
+                    1,
+                )
+            })
+            .expect("enqueue");
+
+        let before = engine.status(&p.id).expect("status");
+        assert_eq!((before.queued_files, before.queued_bytes), (2, 5_000));
+
+        engine
+            .with_db(|conn| db::complete(conn, first))
+            .expect("complete");
+
+        let after = engine.status(&p.id).expect("status");
+        assert_eq!(
+            (after.queued_files, after.queued_bytes),
+            (1, 1_000),
+            "one unit finished, and nothing had to remember to say so"
         );
     }
 
