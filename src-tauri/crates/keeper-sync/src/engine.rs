@@ -5666,10 +5666,24 @@ impl Engine {
             // filesystem work on a tree that may hold a hundred thousand
             // files; running them on the async runtime would stall every other
             // profile while a UI poll finished.
-            let (status, untracked) = tokio::task::spawn_blocking(
-                move || -> Result<(git::repo::RepoStatus, Vec<PathBuf>)> {
+            let (status, untracked, deleted_sizes) = tokio::task::spawn_blocking(
+                move || -> Result<(
+                    git::repo::RepoStatus,
+                    Vec<PathBuf>,
+                    std::collections::HashMap<PathBuf, u64>,
+                )> {
                     let repo = git::repo::open(&repo_path, removable)?;
                     let status = git::repo::status_paths(&repo)?;
+                    // Asked here, where the repository is already open and on a
+                    // blocking thread: a deleted path cannot be stat'd, and the
+                    // index is the only thing that still knows how big it was.
+                    let deleted_sizes = status
+                        .deleted
+                        .iter()
+                        .filter_map(|rela| {
+                            lfs::stage::indexed_size(&repo, rela).map(|size| (rela.clone(), size))
+                        })
+                        .collect();
                     // Tier 0 before the expansion, not only after it: that walk
                     // `lstat`s every entry, and a `node_modules` the user has
                     // not put in `.gitignore` would otherwise cost fifty
@@ -5683,7 +5697,7 @@ impl Engine {
                     // The poll reports what is waiting; the commit walk owns
                     // saying why a nested repository never will be.
                     let (untracked, _collapsed) = Self::expand_untracked(&repo_path, &candidates)?;
-                    Ok((status, untracked))
+                    Ok((status, untracked, deleted_sizes))
                 },
             )
             .await
@@ -5709,7 +5723,11 @@ impl Engine {
                         // a stat that fails is a size nobody can report rather
                         // than a listing that fails.
                         let size_bytes = match reason {
-                            PendingReason::Deleted => None,
+                            // Off the index, because the file is gone. What it
+                            // reports is what was there — which is the whole
+                            // question about something that has been deleted
+                            // and not yet published.
+                            PendingReason::Deleted => deleted_sizes.get(rela).copied(),
                             _ => std::fs::metadata(profile.local_path.join(rela))
                                 .ok()
                                 .filter(|m| m.is_file())

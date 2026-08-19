@@ -726,7 +726,13 @@ a figure read as two lists.
 The row a transfer is on right now is marked, by name as well as by shade: a
 background colour is nothing to a screen reader. Only that row — a row that is
 merely next is not marked, because "in flight" is a fact and "about to be" is a
-guess about a queue that reorders.
+guess about a queue that reorders. It is also moved to the top, because a mark
+below the fold of an eighty-row list is not a mark; nothing else changes place.
+
+A deleted path carries a size like every other row. It cannot be stat'd — that
+is what deleted means — so the figure comes from the index: what the pointer
+names for an LFS entry, and the blob's own header length for an ordinary one.
+Neither reads content.
 
 ### One object, one unit — including while it runs
 

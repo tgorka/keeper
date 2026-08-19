@@ -1344,11 +1344,15 @@ describe("SyncPane pending", () => {
 
     const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
     const rows = within(list).getAllByRole("listitem");
-    expect(rows[0]).not.toHaveAttribute("aria-current");
-    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    // First, not second: it was second in the engine's order. A row marked and
+    // then left below the fold is not marked as far as anyone can see, and this
+    // list runs to eighty rows mid backlog.
+    expect(rows[0]).toHaveAttribute("aria-current", "true");
+    expect(rows[0]).toHaveTextContent("camera-0001.mov");
+    expect(rows[1]).not.toHaveAttribute("aria-current");
     // Named, not merely shaded: a background colour is nothing to a screen
     // reader and nothing to anyone who cannot separate these two greys.
-    expect(rows[1]).toHaveTextContent(SYNC_PENDING_CURRENT_WORD);
+    expect(rows[0]).toHaveTextContent(SYNC_PENDING_CURRENT_WORD);
   });
 
   it("explains a settling file as a wait so far, never as a finish time", async () => {

@@ -796,6 +796,26 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
     pointer_blob(repo, entry.id)
 }
 
+/// How big the content behind `rela` is, according to the index.
+///
+/// For a path that is **gone from the worktree** this is the only place left to
+/// ask: the file cannot be stat'd, and a row that says nothing about size beside
+/// rows that do reads as a column with holes in it.
+///
+/// Both kinds answered exactly, and neither by loading content. An LFS entry's
+/// blob is its ~130-byte pointer, so the answer is what the pointer *names*;
+/// an ordinary entry's blob length comes from the object header, which is a
+/// read of the header alone however large the object is.
+pub fn indexed_size(repo: &gix::Repository, rela: &Path) -> Option<u64> {
+    let index = repo.index_or_empty().ok()?;
+    let key = index_key(rela);
+    let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
+    if let Some(pointer) = pointer_blob(repo, entry.id) {
+        return Some(pointer.size);
+    }
+    repo.find_header(entry.id).ok().map(|header| header.size())
+}
+
 /// How many bytes a path just lost, if what is on disk cannot be its content.
 ///
 /// `Some(size)` means: the index holds a pointer naming `size` non-zero bytes,
