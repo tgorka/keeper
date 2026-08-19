@@ -136,6 +136,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         "#,
     )?;
     ensure_activity_columns(conn)?;
+    ensure_journal_columns(conn)?;
     ensure_prune_default(conn)?;
     Ok(())
 }
@@ -226,6 +227,68 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Add `label`, the journal's one late column, if it is not there yet.
+///
+/// A unit's payload says what work to do; the label says what to *call* it
+/// while it is being done. They are separate columns because they have
+/// different identities: [`enqueue_unique`] deduplicates on the payload string,
+/// so folding a display name into it would make two paths that share one object
+/// — the ordinary case for duplicated content — into two downloads of the same
+/// bytes.
+///
+/// Nullable, and read as "no better name than the work itself". A row written
+/// before this column existed, or by a code path that has no path to offer,
+/// reads back `NULL` and the UI falls back to the profile name.
+fn ensure_journal_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(journal)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "label") {
+        conn.execute("ALTER TABLE journal ADD COLUMN label TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Name a queued unit, if it does not have a name yet.
+///
+/// Separate from [`enqueue_unique`] rather than an argument to it, because the
+/// unit that comes back may be one queued earlier: the caller is naming
+/// *whatever will deliver this work*, which is exactly the covering unit that
+/// function returns. `label IS NULL` makes the first path win — with several
+/// paths sharing one object any of them is a truthful thing to display, and a
+/// last-one-wins race would make the line flicker between them.
+pub fn label_unit(conn: &Connection, id: i64, label: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET label = ?2 WHERE id = ?1 AND label IS NULL",
+        (id, label),
+    )?;
+    Ok(())
+}
+
+/// How much transferable work is left for one profile: units, and their bytes.
+///
+/// Counted together in one statement so the two numbers can never disagree,
+/// and restricted to rows that carry a size — a push or a commit is real work
+/// but it is not a file, and counting it under "files left" would be a lie
+/// told in the same breath as a byte total it contributes nothing to.
+///
+/// `parked` is excluded for the same reason it is excluded from `pending`: a
+/// parked unit is not waiting, it has stopped.
+pub fn queued_transfers(conn: &Connection, profile_id: &str) -> Result<(u32, u64)> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(json_extract(payload, '$.size')), 0)
+           FROM journal
+          WHERE profile_id = ?1
+            AND state != 'parked'
+            AND json_extract(payload, '$.size') IS NOT NULL",
+        [profile_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((count.max(0) as u32, bytes.max(0) as u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +564,12 @@ pub struct WorkItem {
     /// retry no delay at all.
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// What to call this unit while it runs — a repository-relative path, set
+    /// by whoever queued it and never an absolute one, because progress lines
+    /// end up in screenshots. `None` where the work has no single file to name
+    /// (a push carries many), and the line then says the profile's name alone,
+    /// exactly as it did before this column existed.
+    pub label: Option<String>,
 }
 
 /// Record a unit of work before attempting it.
@@ -564,7 +633,7 @@ pub fn claim_ready(
     limit: u32,
 ) -> Result<Vec<WorkItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, payload, attempts, last_error FROM journal
+        "SELECT id, payload, attempts, last_error, label FROM journal
          WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
          ORDER BY id LIMIT ?3",
     )?;
@@ -574,12 +643,13 @@ pub fn claim_ready(
             r.get::<_, String>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
 
     let mut claimed = Vec::new();
     for row in rows {
-        let (id, payload, attempts, last_error) = row?;
+        let (id, payload, attempts, last_error, label) = row?;
         match serde_json::from_str::<WorkKind>(&payload) {
             Ok(kind) => claimed.push(WorkItem {
                 id,
@@ -587,6 +657,7 @@ pub fn claim_ready(
                 kind,
                 attempts: attempts.max(0).saturating_add(1) as u32,
                 last_error,
+                label,
             }),
             Err(err) => {
                 // An unreadable payload can never succeed; parking it keeps the
@@ -2053,6 +2124,79 @@ mod tests {
                 .expect("row")
                 .lfs_prune_local,
             "the one-shot already ran; it must not run again"
+        );
+    }
+
+    /// Two paths whose content is identical share one object, and one object is
+    /// one download. The name is carried in a column rather than in the payload
+    /// precisely so that stays true — folding it into the payload would make
+    /// `enqueue_unique` see two different units and fetch the same bytes twice.
+    #[test]
+    fn two_paths_sharing_one_object_stay_one_download_under_the_first_name() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "a".repeat(64),
+            size: 4_096,
+        };
+        let first = enqueue_unique(&c, "p", &unit, 1, 1).expect("first");
+        label_unit(&c, first, "70-comms/keeper-rec/camera-0001.mov").expect("label");
+        let second = enqueue_unique(&c, "p", &unit, 2, 2).expect("second");
+        label_unit(&c, second, "40-media/a-copy-of-the-same-file.mov").expect("relabel");
+
+        assert_eq!(first, second, "one object, one unit");
+        let claimed = claim_ready(&c, "p", 10, 10).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].label.as_deref(),
+            Some("70-comms/keeper-rec/camera-0001.mov"),
+            "the first name wins; a last-one-wins race would make the line flicker"
+        );
+    }
+
+    /// The pair the status line reads. A push is real work and is not a file:
+    /// counting it would put a file count beside a byte total it contributes
+    /// nothing to, and the two numbers would disagree in the same sentence.
+    #[test]
+    fn queued_transfers_counts_sized_work_only_and_ignores_parked() {
+        let c = conn();
+        enqueue(&c, "p", &WorkKind::Push, 1, 1).expect("push");
+        enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: "b".repeat(64),
+                size: 1_000,
+            },
+            1,
+            1,
+        )
+        .expect("download");
+        let parked = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: "c".repeat(64),
+                size: 9_000_000,
+            },
+            1,
+            1,
+        )
+        .expect("second download");
+        c.execute(
+            "UPDATE journal SET state = 'parked' WHERE id = ?1",
+            [parked],
+        )
+        .expect("park it");
+
+        assert_eq!(
+            queued_transfers(&c, "p").expect("counted"),
+            (1, 1_000),
+            "the push has no size and the parked unit is not waiting"
+        );
+        assert_eq!(
+            queued_transfers(&c, "other").expect("counted"),
+            (0, 0),
+            "and it never reaches across profiles"
         );
     }
 }

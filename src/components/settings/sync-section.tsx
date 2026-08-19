@@ -37,6 +37,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { OverflowValue } from "@/components/ui/overflow-value";
 import { Progress } from "@/components/ui/progress";
 import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
 // Read and written straight through rather than through the mirror store: the
@@ -111,6 +112,9 @@ export const SYNC_ATTENTION_FALLBACK_SENTENCE =
 
 /** Accessible name for a row's progress meter. */
 export const SYNC_PROGRESS_LABEL = "Sync progress";
+
+/** Names the path a transfer is currently moving, for the overflow panel. */
+export const SYNC_CURRENT_FILE_LABEL = "Current file";
 
 /**
  * The remove confirmation, shared verbatim with the Sync view's folder card so
@@ -493,6 +497,18 @@ function SyncProfileRow({
               it from reflowing as they tick. */}
           {status !== undefined && (
             <span className="figures text-muted-foreground text-xs">{status.line}</span>
+          )}
+          {/* The file, under the sentence rather than inside it: `line` is the
+              tray's line too, and a path four folders deep does not belong in a
+              menu item. Shown with the same overflow affordance the rest of the
+              app uses, because the half of a path that matters — the filename —
+              is the half a plain truncation eats. */}
+          {status?.current != null && isSyncStatusActive(status) && (
+            <OverflowValue
+              name={SYNC_CURRENT_FILE_LABEL}
+              value={status.current}
+              className="text-muted-foreground text-xs"
+            />
           )}
           <SyncFolderPath
             profile={profile}

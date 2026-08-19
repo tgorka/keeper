@@ -606,9 +606,18 @@ The status line reports what is waiting, e.g. `tgdrive — offline, 12 waiting`.
   existing ~1 Hz tick; separate glyphs cover armed, paused/media-absent and
   warning.
 - **Tray status line**, e.g.
-  `Transferring tgdrive — 42/310 files · 1.2 GB of 4.7 GB`.
-- **In-app**: a progress meter and a sticky amber warning banner. Warnings that
-  need a decision get an inline action button.
+  `Transferring tgdrive — 42/310 files · 1.2 GB of 4.7 GB · 104 files left, 53.1 GB`.
+  The tail is the queue *behind* the file in flight, which the other numbers say
+  nothing about: `1.2 GB of 4.7 GB` describes one object, and a folder pulling
+  53 GB showed a line like it for two days without ever suggesting how much was
+  left. Counted from the journal, never estimated — a remaining *time* on a link
+  whose throughput varies by an order of magnitude is a guess dressed as a fact.
+- **In-app**: a progress meter, the same line, and — while a transfer is running
+  — the repository-relative path of the file being moved, on its own row. The
+  path is deliberately not in the line: that string is the tray's too, and a
+  path four folders deep does not belong in a menu item.
+- **In-app**: a sticky amber warning banner. Warnings that need a decision get
+  an inline action button.
 - **Notifications** fire exactly once per warning onset.
 - **Never a toast** for connectivity or any other persistent condition.
 

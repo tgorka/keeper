@@ -151,6 +151,9 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     state: "watching",
     phase: "idle",
     line: RUST_LINE,
+    current: null,
+    queuedFiles: 0,
+    queuedBytes: 0,
     filesDone: 0,
     filesTotal: null,
     bytesDone: 0,
@@ -230,6 +233,37 @@ describe("SyncSection profile rows", () => {
     const path = screen.getByText("/Users/alice/Documents/tgdrive");
     expect(path).toHaveAttribute("title", "/Users/alice/Documents/tgdrive");
     expect(screen.getByText("github.com")).toBeInTheDocument();
+  });
+
+  /**
+   * The question the composed line cannot answer without becoming a paragraph.
+   * `line` is the tray's sentence too, so the path goes on its own row here and
+   * nowhere near the menu item.
+   */
+  it("names the file a transfer is moving, under the line rather than inside it", async () => {
+    const transferring = statusVm({
+      state: "syncing",
+      phase: "downloadingLfs",
+      line: "Transferring tgdrive · 177.1 MB of 648.3 MB · 104 files left, 53.1 GB",
+      current: "70-comms/meetings/keeper/camera-0001.mov",
+      queuedFiles: 104,
+      queuedBytes: 57_015_809_064,
+    });
+    mockStatuses.mockResolvedValue([transferring]);
+
+    render(<SyncSection open />);
+
+    expect(await screen.findByText(transferring.line)).toBeInTheDocument();
+    expect(screen.getByText("70-comms/meetings/keeper/camera-0001.mov")).toBeInTheDocument();
+  });
+
+  /** An idle row has no file in flight, and inventing one would claim a
+   * transfer that is not happening. */
+  it("shows no current file when nothing is being transferred", async () => {
+    render(<SyncSection open />);
+
+    expect(await screen.findByText(RUST_LINE)).toBeInTheDocument();
+    expect(screen.queryByText(/camera-0001\.mov/)).not.toBeInTheDocument();
   });
 
   /** A `sync_folder_now` reply, with the fields a case does not care about. */
