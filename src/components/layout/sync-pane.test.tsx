@@ -599,6 +599,15 @@ describe("SyncPane profile header", () => {
     // and the polled sentence above read as one quantity.
     expect(await screen.findByText("3/12 files · 4.1 MB/s")).toBeInTheDocument();
     expect(screen.getByText("clips/holiday.mov")).toBeInTheDocument();
+
+    // And in that order. The figures are the fixed-width half and the half that
+    // changes every tick; a reader watching a rate should not have to find it
+    // at the end of a path whose length depends on how deep the file sits.
+    // Stated as the property rather than as literal text: `textContent` glues
+    // the spans together without the flex gap, so a string match here pins the
+    // layout's whitespace instead of the thing that matters.
+    const detail = screen.getByText("3/12 files · 4.1 MB/s").closest("p")?.textContent ?? "";
+    expect(detail.indexOf("4.1 MB/s")).toBeLessThan(detail.indexOf("clips/holiday.mov"));
   });
 
   it("claims nothing is in flight for a folder that has stopped", async () => {

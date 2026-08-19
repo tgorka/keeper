@@ -634,8 +634,9 @@ Both live in `keeper_sync::http`, which is the only place a client is built.
   left. Counted from the journal, never estimated — a remaining *time* on a link
   whose throughput varies by an order of magnitude is a guess dressed as a fact.
 - **In-app**: a progress meter, the same line, and — while a transfer is running
-  — the repository-relative path of the file being moved, under the bar beside
-  the rate. The path rides the streamed progress rather than the line: that
+  — the rate and then the repository-relative path of the file being moved, on
+  one row under the bar. The figures lead because they are the fixed-width half
+  and the half that changes every tick; the path truncates into what is left. The path rides the streamed progress rather than the line: that
   string is the tray's too, and a path four folders deep does not belong in a
   menu item. A queue that predates the name is filled in from the index on the
   next drain, once per folder per run, because naming otherwise happens only at

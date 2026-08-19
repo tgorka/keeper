@@ -1061,12 +1061,21 @@ function SyncProfileCard({
           />
         )}
         {(current !== null || flying.length > 0) && (
-          // The live detail under the bar: the path being carried, then how far
-          // through the set and how fast. Laid out like the folder's own
-          // path·host line in the header — one truncating span and a shrink-0
-          // tail, so a long path gives way to the figures rather than pushing
-          // them off the card.
+          // The live detail under the bar: how fast and how far through the
+          // set, then the path being carried.
+          //
+          // The figures lead because they are the fixed-width half and the one
+          // that changes every tick: a reader watching a rate should not have
+          // to find it at the end of a path whose length depends on how deep
+          // the file happens to sit. The path truncates into whatever room is
+          // left, which is the same bargain as before — a long path gives way
+          // to the figures rather than pushing them off the card — with the
+          // shrink-0 half now at the front where the eye lands.
           <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
+            {/* Monospaced so a rate climbing from 4.1 to 12.3 MB/s does not
+                reflow the line it sits on. */}
+            {flying.length > 0 && <span className="shrink-0 font-mono">{flying.join(" · ")}</span>}
+            {current !== null && flying.length > 0 && <span aria-hidden="true">·</span>}
             {current !== null && (
               <span className="truncate font-mono" title={current}>
                 {/* Under a moving bar the bare path is unambiguous on screen; to
@@ -1075,10 +1084,6 @@ function SyncProfileCard({
                 {current}
               </span>
             )}
-            {current !== null && flying.length > 0 && <span aria-hidden="true">·</span>}
-            {/* Monospaced so a rate climbing from 4.1 to 12.3 MB/s does not
-                reflow the line it sits on. */}
-            {flying.length > 0 && <span className="shrink-0 font-mono">{flying.join(" · ")}</span>}
           </p>
         )}
         {outcome !== null && (
