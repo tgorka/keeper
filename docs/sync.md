@@ -615,7 +615,23 @@ timeout would have to be longer than the longest legitimate transfer, and would
 therefore be useless for catching a stall. Connecting is bounded separately, at
 15 s.
 
-Both live in `keeper_sync::http`, which is the only place a client is built.
+A third knob lives beside them: an idle **pooled** connection is kept for at
+most 20 s rather than `reqwest`'s default 90 s. Keep-alive is worth having — an
+LFS batch and the download it authorises are two requests seconds apart — but a
+pooled connection is only an asset while the peer still has it, and reusing one
+the far side has forgotten costs a whole read timeout before anything is even
+attempted.
+
+That last one is a hypothesis rather than a diagnosis, and it is recorded as
+one: throughput on a folder was seen decaying over hours (300 kB/s after a
+restart, 25 kB/s an hour later) and restored by restarting the app every time. A
+fresh process has an empty pool, which fits. Accumulated backoff does not
+(nothing was waiting on a clock when measured), and neither does a resource leak
+(67 MB, 62 threads, four sockets after an hour). If the decay outlives this, the
+cause is elsewhere — and a 20 s window is still the better default.
+
+All three live in `keeper_sync::http`, which is the only place a client is
+built.
 
 ---
 
