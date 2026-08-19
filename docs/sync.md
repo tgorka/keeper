@@ -636,7 +636,11 @@ Both live in `keeper_sync::http`, which is the only place a client is built.
 - **In-app**: a progress meter, the same line, and — while a transfer is running
   — the rate and then the repository-relative path of the file being moved, on
   one row under the bar. The figures lead because they are the fixed-width half
-  and the half that changes every tick; the path truncates into what is left. The path rides the streamed progress rather than the line: that
+  and the half that changes every tick; the path truncates into what is left.
+  The rate sits in a box reserved for the widest figure the formatter can
+  produce (`999 bytes/s`) and is right-aligned inside it, so `2 kB/s` and
+  `294.8 kB/s` leave everything after them in the same place; the box is held
+  open, and stands empty, when there is no rate to show. The path rides the streamed progress rather than the line: that
   string is the tray's too, and a path four folders deep does not belong in a
   menu item. A queue that predates the name is filled in from the index on the
   next drain, once per folder per run, because naming otherwise happens only at

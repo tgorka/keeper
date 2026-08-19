@@ -916,21 +916,25 @@ function SyncProfileCard({
   // than two competing claims. Built as a list for the reason
   // `copyProgressSentence` builds one: a figure that is not known yet drops out
   // and leaves no orphaned separator behind.
-  const flying: string[] = [];
+  //
+  // Kept as two values rather than one joined string because they jitter at
+  // different speeds and only one of them can be given a fixed box: the rate
+  // changes every tick and has a bounded width, the file count changes once
+  // per file and has none.
+  let files: string | null = null;
   if (streamed !== undefined) {
     if (streamed.filesTotal !== null) {
-      flying.push(`${streamed.filesDone}/${streamed.filesTotal} files`);
+      files = `${streamed.filesDone}/${streamed.filesTotal} files`;
     } else if (streamed.filesDone > 0) {
-      flying.push(`${streamed.filesDone} files`);
+      files = `${streamed.filesDone} files`;
     }
   }
   // `null` covers both "too little measured to say" and "nothing is moving";
   // neither is a rate, and printing "0 B/s" for the second would be a claim
   // about an idle wire (AD-34-13).
   const rate = syncLiveRate(status, progress);
-  if (rate !== null) {
-    flying.push(`${formatCopyBytes(rate)}/s`);
-  }
+  const rateText = rate === null ? null : `${formatCopyBytes(rate)}/s`;
+  const flying = [files, rateText].filter((figure) => figure !== null);
 
   return (
     <Card size="sm">
@@ -1072,10 +1076,25 @@ function SyncProfileCard({
           // to the figures rather than pushing them off the card — with the
           // shrink-0 half now at the front where the eye lands.
           <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
-            {/* Monospaced so a rate climbing from 4.1 to 12.3 MB/s does not
-                reflow the line it sits on. */}
-            {flying.length > 0 && <span className="shrink-0 font-mono">{flying.join(" · ")}</span>}
-            {current !== null && flying.length > 0 && <span aria-hidden="true">·</span>}
+            {files !== null && <span className="figures shrink-0 font-mono">{files}</span>}
+            {files !== null && <span aria-hidden="true">·</span>}
+            {/* A RESERVED box, not merely a monospaced one. Mono fixes the
+                width of a digit and says nothing about how many there are:
+                `2 kB/s` against `294.8 kB/s` is four characters, and at one
+                update a second that would drag everything after it left and
+                right continuously.
+
+                `11ch` is the widest this formatter can produce — `999 bytes/s`,
+                verified across the whole range rather than estimated.
+                Right-aligned so the digits grow leftward into the reserved room
+                and the separator never moves, and held open even when there is
+                no rate: the row must not jump because a folder went quiet for a
+                tick. It stands empty then rather than reading `0 B/s`, which
+                would claim a measurement of an idle wire (AD-34-13). */}
+            <span className="figures min-w-[11ch] shrink-0 text-right font-mono">
+              {rateText ?? ""}
+            </span>
+            {current !== null && <span aria-hidden="true">·</span>}
             {current !== null && (
               <span className="truncate font-mono" title={current}>
                 {/* Under a moving bar the bare path is unambiguous on screen; to
