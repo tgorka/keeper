@@ -3542,6 +3542,21 @@ impl Engine {
     /// beside it, so the `-X theirs` merge that follows can never lose content:
     /// by the time it runs, every contested file already exists twice.
     ///
+    /// **Changing the same path is not the same as disagreeing about it.** Two
+    /// devices that ran the same formatter, or regenerated the same
+    /// deterministic listing, both show the path in their diff against the
+    /// merge base — and a copy made for that is pure litter: it is byte-identical
+    /// to the file it sits beside, and the user has to open both to find that
+    /// out. So the contested set is narrowed by one more question, one process
+    /// rather than one per path: does `HEAD` actually differ from the remote tip
+    /// *here*? A path that survives both filters is a real disagreement.
+    ///
+    /// [`SyncProfile::regenerable`] removes the remaining case, where the
+    /// content genuinely differs but the local revision is worth nothing —
+    /// a generated index listing two different new files. Only paths the user
+    /// declared get that treatment; keeper never guesses that an edit is
+    /// disposable.
+    ///
     /// Blocking.
     fn converge_with_conflict_copies(
         git: &GitCli,
@@ -3561,9 +3576,25 @@ impl Engine {
             .diff_names(repo_path, &base, tracking)?
             .into_iter()
             .collect();
+        // Tip against tip: what the two sides actually hold different bytes for.
+        let differing: std::collections::HashSet<PathBuf> = git
+            .diff_names(repo_path, "HEAD", tracking)?
+            .into_iter()
+            .collect();
+        // Compiled here rather than per profile: divergence is the rare path,
+        // and a set nobody configured costs one `is_empty` to skip.
+        let regenerable = crate::exclude::PatternSet::new(&profile.regenerable)?;
 
         let mut copied = Vec::new();
         for rela in ours.intersection(&theirs) {
+            // Both sides moved, and landed on the same content: there is
+            // nothing to preserve and nothing to tell the user about.
+            if !differing.contains(rela.as_path()) {
+                continue;
+            }
+            if !regenerable.is_empty() && regenerable.matches(rela) {
+                continue;
+            }
             let source = repo_path.join(rela);
             // A path deleted locally has nothing to preserve.
             if !source.is_file() {
@@ -10095,6 +10126,111 @@ mod tests {
             outcome.bytes > 0,
             "a run that received a pack must report the bytes it moved, got {}",
             outcome.bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_change_on_both_sides_makes_no_conflict_copy() {
+        // Two devices running the same formatter, or regenerating the same
+        // deterministic file, both list the path in their diff against the
+        // merge base — and the copy that used to produce was byte-identical to
+        // the file beside it. The user could only discover that by opening
+        // both. Changing a path is not the same as disagreeing about it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+
+        std::fs::write(p.local_path.join("index.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the shared root");
+
+        // Same path, same resulting bytes, arrived at independently.
+        advance_remote(remote_dir.path(), "index.md", "regenerated");
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("index.md"), b"regenerated").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("converge");
+        assert!(
+            outcome.conflicts.is_empty(),
+            "identical content is not a conflict, got {:?}",
+            outcome.conflicts
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("index.md")).expect("canonical path"),
+            b"regenerated",
+            "the content both sides agreed on must survive"
+        );
+        let strays: Vec<_> = std::fs::read_dir(&p.local_path)
+            .expect("read the worktree")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".sync-conflict-"))
+            .collect();
+        assert!(strays.is_empty(), "no copy may be left behind: {strays:?}");
+    }
+
+    #[tokio::test]
+    async fn a_regenerable_path_converges_without_a_copy() {
+        // A generated listing that two devices rewrote for two different
+        // reasons genuinely differs — and the local revision is still worth
+        // nothing, because the tool that wrote it rebuilds the right answer
+        // from inputs that are themselves synced. Only a path the user declared
+        // regenerable gets this; keeper never decides an edit is disposable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        p.regenerable = vec!["index.md".to_owned()];
+        engine.upsert_profile(&p).expect("upsert");
+
+        std::fs::write(p.local_path.join("index.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the shared root");
+
+        advance_remote(remote_dir.path(), "index.md", "theirs");
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("index.md"), b"ours").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("converge");
+        assert!(
+            outcome.conflicts.is_empty(),
+            "a declared-regenerable path must converge silently, got {:?}",
+            outcome.conflicts
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("index.md")).expect("canonical path"),
+            b"theirs",
+            "the remote still keeps the canonical path"
         );
     }
 

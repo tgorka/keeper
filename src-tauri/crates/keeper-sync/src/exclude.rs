@@ -379,6 +379,54 @@ impl ExcludeSet {
     }
 }
 
+/// A profile's own pattern list, compiled on its own.
+///
+/// [`ExcludeSet`] answers "should this path be synced at all?" and folds the
+/// built-in corpus into every answer. Some questions are narrower than that and
+/// must not inherit the corpus — "is this path regenerable?" is the first one
+/// (AD-43, see [`crate::git::conflict`]) — so they get their own set built from
+/// the same [`add_pattern`] anchoring rule. Sharing the rule is the point: a
+/// user who has written one exclude pattern already knows how these match.
+///
+/// An empty pattern list compiles to a set that matches nothing, which is the
+/// right reading of "the user configured no rules" and costs no allocation to
+/// ask.
+#[derive(Debug, Clone, Default)]
+pub struct PatternSet {
+    set: GlobSet,
+}
+
+impl PatternSet {
+    /// Compile `patterns`. A malformed pattern is [`SyncError::Config`] naming
+    /// the string the user typed, never a panic — these arrive from a
+    /// hand-edited `config.json` like every other profile field.
+    pub fn new(patterns: &[String]) -> Result<Self> {
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            add_pattern(&mut builder, pattern)?;
+        }
+        let set = builder
+            .build()
+            .map_err(|err| SyncError::Config(format!("could not compile pattern set: {err}")))?;
+        Ok(Self { set })
+    }
+
+    /// Whether `relative_path` — repository-relative, never absolute — matches.
+    pub fn matches(&self, relative_path: &Path) -> bool {
+        let candidate = match_string(relative_path);
+        if candidate.is_empty() {
+            return false;
+        }
+        self.set.is_match(candidate.as_str())
+    }
+
+    /// Whether any pattern was configured at all. Lets a caller skip work
+    /// entirely rather than matching every path against an empty set.
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
 /// Add one pattern, applying gitignore's anchoring rule.
 ///
 /// `literal_separator(true)` is what makes "basename vs anchored" a real
@@ -901,5 +949,42 @@ mod tests {
         // Story 41.3 depends on this one entry existing verbatim: it is the
         // only thing standing between a segment mid-write and the commit path.
         assert!(BUILTIN_EXCLUDES.contains(&"*.partial"));
+    }
+
+    #[test]
+    fn a_pattern_set_carries_none_of_the_builtin_corpus() {
+        // The whole reason it is a separate type: "is this regenerable?" must
+        // not inherit "is this keeper's noise?". A `.DS_Store` is excluded from
+        // syncing and is emphatically not a file whose edits may be dropped.
+        let set = PatternSet::new(&["index.md".to_owned()]).expect("compiles");
+        assert!(set.matches(Path::new("index.md")));
+        assert!(!set.matches(Path::new(".DS_Store")));
+    }
+
+    #[test]
+    fn a_pattern_set_uses_the_same_anchoring_rule_as_an_exclude() {
+        let bare = PatternSet::new(&["index.md".to_owned()]).expect("compiles");
+        assert!(
+            bare.matches(Path::new("10-notes/recordings/index.md")),
+            "a pattern without a slash matches a basename at any depth"
+        );
+        let anchored = PatternSet::new(&["10-notes/index.md".to_owned()]).expect("compiles");
+        assert!(anchored.matches(Path::new("10-notes/index.md")));
+        assert!(
+            !anchored.matches(Path::new("20-legal/index.md")),
+            "a pattern with a slash is anchored at the repository root"
+        );
+    }
+
+    #[test]
+    fn an_empty_pattern_set_matches_nothing_and_says_so() {
+        let set = PatternSet::new(&[]).expect("compiles");
+        assert!(set.is_empty());
+        assert!(!set.matches(Path::new("index.md")));
+    }
+
+    #[test]
+    fn a_malformed_pattern_is_a_config_error_not_a_panic() {
+        assert!(PatternSet::new(&["[".to_owned()]).is_err());
     }
 }

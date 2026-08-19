@@ -753,6 +753,21 @@ pub struct SyncProfile {
     /// Additional tier-0 exclusion globs, on top of the built-in set.
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Paths whose content is deterministically rebuildable from the rest of
+    /// the tree, matched with the same anchoring rule as [`Self::excludes`].
+    ///
+    /// These are still synced like anything else; the list only changes what
+    /// happens when they diverge. A generated listing that two devices both
+    /// rewrote does not need the local revision preserved beside it (AD-43) —
+    /// the tool that wrote it will produce the correct file again from inputs
+    /// that are themselves synced, so the conflict copy is litter rather than
+    /// recovery material. Divergence therefore resolves to the remote silently.
+    ///
+    /// Empty by default, and deliberately so: keeper cannot tell which of a
+    /// user's files are generated, and guessing wrong here **loses an edit**.
+    /// Only a path the user has declared regenerable is treated as one.
+    #[serde(default)]
+    pub regenerable: Vec<String>,
     /// The folder lives on removable media: absence is a pause, never a
     /// deletion (AD-48).
     #[serde(default)]
@@ -914,6 +929,7 @@ impl SyncProfile {
             lane: SyncLane::Main,
             subpaths: Vec::new(),
             excludes: Vec::new(),
+            regenerable: Vec::new(),
             removable: false,
             volume_id: None,
             lfs_mode: LfsMode::Materialize,
