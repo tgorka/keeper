@@ -54,6 +54,8 @@
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
   CircleAlert,
   CircleCheck,
   CircleDashed,
@@ -419,12 +421,28 @@ export const SYNC_DELIVERY_STATES: Record<
   abandoned: { icon: CircleSlash, word: SYNC_PARKED_TITLE, tone: "text-destructive" },
 };
 
+/**
+ * Which way a pending row is travelling, as a glyph and a word.
+ *
+ * The list carries both directions now, and a column of paths that does not say
+ * which way each one is going asks the reader to infer it from the sentence at
+ * the far end of the row. The glyph is the same size and tone as the Activity
+ * list's, because the two lists are read in one glance.
+ *
+ * Screen readers get the word, not the arrow: "up" is a shape, not a fact.
+ */
+export const SYNC_PENDING_INBOUND_WORD = "Coming in";
+export const SYNC_PENDING_OUTBOUND_WORD = "Going out";
+
 /** Why a file is waiting, for every reason except `settling` (which is timed). */
 const PENDING_REASONS: Record<string, string> = {
   untracked: "New file, not synced yet",
   added: "Added, not synced yet",
   modified: "Changed, not synced yet",
   deleted: "Deleted, not synced yet",
+  // The only inbound reason, and worded to say so: the four above are things
+  // this machine did, this one is content the remote still holds.
+  incoming: "Waiting to download",
 };
 
 /**
@@ -475,7 +493,11 @@ export function syncPendingReason(pending: SyncPendingVm, now: number = Date.now
       ? SYNC_SETTLING_SENTENCE
       : `${SYNC_SETTLING_SENTENCE} · ${formatSyncWaited(pending.sinceMs, now)} so far`;
   }
-  return PENDING_REASONS[pending.reason] ?? pending.reason;
+  const phrase = PENDING_REASONS[pending.reason] ?? pending.reason;
+  // The size belongs to `incoming` and to nothing else: it is what separates a
+  // queue of two minutes from one of four days, and for a file already on this
+  // disk it would answer a question nobody asked.
+  return pending.sizeBytes === null ? phrase : `${phrase} · ${formatCopyBytes(pending.sizeBytes)}`;
 }
 
 /** What a parked unit was doing and how hard keeper tried. */
@@ -1347,6 +1369,21 @@ function SyncPendingList({
           >
             {fold.visible.map((row) => (
               <li key={`${row.reason}-${row.path}`} className="flex items-center gap-3">
+                {(() => {
+                  const inbound = row.reason === "incoming";
+                  const Direction = inbound ? ArrowDownToLine : ArrowUpFromLine;
+                  return (
+                    <>
+                      <Direction
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0 text-muted-foreground"
+                      />
+                      <span className="sr-only">
+                        {inbound ? SYNC_PENDING_INBOUND_WORD : SYNC_PENDING_OUTBOUND_WORD}{" "}
+                      </span>
+                    </>
+                  );
+                })()}
                 <span className="min-w-0 flex-1 truncate font-mono text-xs" title={row.path}>
                   {row.path}
                 </span>

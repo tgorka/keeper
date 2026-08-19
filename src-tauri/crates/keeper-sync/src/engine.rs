@@ -212,6 +212,17 @@ pub enum PendingReason {
     Added,
     /// Tracked and no longer on disk.
     Deleted,
+    /// Queued to come IN: an LFS object this clone does not hold yet.
+    ///
+    /// The other reasons are computed from `git status` and the completeness
+    /// gate, which between them see only what this machine has changed. A
+    /// folder pulling 53 GB therefore listed nothing as pending while 106
+    /// objects sat in the journal — the list said "not synced yet" and meant
+    /// "not synced yet, outbound".
+    ///
+    /// Carries the size because that is the whole question about an inbound
+    /// object: a queue of 106 is two minutes or four days depending on it.
+    Incoming { size_bytes: u64 },
 }
 
 /// One path the folder is waiting on.
@@ -455,6 +466,12 @@ pub struct Engine {
     /// On one real profile that was 178,000 of the last 200,000 log lines and
     /// a 1.2 GB log. Keyed by `(profile id, path)` and said once.
     collapsed_reported: Mutex<HashSet<(String, PathBuf)>>,
+    /// Profiles whose queue has already been offered a name-filling walk in
+    /// this process. One walk is enough: what it cannot name — an object whose
+    /// path has since been deleted — it will not name on the next drain either,
+    /// and repeating an index walk per drain to learn that again is how a
+    /// display nicety becomes a cost.
+    labels_backfilled: Mutex<HashSet<String>>,
     /// Consecutive transient failures per profile.
     ///
     /// A transient error is retried and, on its own, is not worth alarming
@@ -619,6 +636,7 @@ impl Engine {
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             collapsed_reported: Mutex::new(HashSet::new()),
+            labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
@@ -882,7 +900,6 @@ impl Engine {
                 snapshot.files_total = event.files_total;
                 snapshot.bytes_done = event.bytes_done;
                 snapshot.bytes_total = event.bytes_total;
-                snapshot.current = event.current.clone();
                 if event.phase.is_active() {
                     snapshot.state = ProfileState::Syncing;
                 }
@@ -922,9 +939,6 @@ impl Engine {
             snapshot.files_total = None;
             snapshot.bytes_done = 0;
             snapshot.bytes_total = None;
-            // For the reason above: a path left behind an `Idle` phase reads as
-            // a file still being copied to any surface that shows it.
-            snapshot.current = None;
         }
     }
 
@@ -2470,6 +2484,9 @@ impl Engine {
         // re-read by whoever is about to do work. See
         // [`Self::release_satisfied_waits`] for the two failures that shape it.
         self.release_satisfied_waits(profile, now)?;
+        // Before claiming, because a unit claimed without a name reports the
+        // folder for the whole transfer — an hour, on a slow link.
+        self.backfill_labels(profile);
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
             if scan_when_idle {
@@ -3346,6 +3363,9 @@ impl Engine {
             .publish_while(
                 &profile,
                 SyncPhase::Fetching,
+                // A fetch moves many paths at once and can only honestly name
+                // the folder.
+                None,
                 report_rx,
                 |event, sample| {
                     let now = Instant::now();
@@ -4713,6 +4733,7 @@ impl Engine {
             .publish_while(
                 profile,
                 phase,
+                label,
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -5574,6 +5595,27 @@ impl Engine {
             }
         }
 
+        // The inbound half, from the journal. Added after the status buckets so
+        // `named` gives a local change precedence: if a path is somehow both
+        // edited here and queued from the remote, what the operator did is the
+        // more actionable of the two facts.
+        for (label, oid, size_bytes) in
+            self.with_db(|conn| db::queued_downloads(conn, profile_id))?
+        {
+            // An object whose path is not in the index cannot be named — it was
+            // queued for a path since deleted. It is still work, and dropping
+            // it would make this list disagree with the count in the status
+            // line, so it says plainly what it is.
+            let path =
+                label.unwrap_or_else(|| format!("LFS object {}…", &oid[..oid.len().min(12)]));
+            if named.insert(path.clone()) {
+                out.push(PendingFile {
+                    path,
+                    reason: PendingReason::Incoming { size_bytes },
+                });
+            }
+        }
+
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -5786,6 +5828,7 @@ impl Engine {
         &self,
         profile: &SyncProfile,
         phase: SyncPhase,
+        current: Option<&str>,
         mut events: tokio::sync::mpsc::UnboundedReceiver<E>,
         mut fold: impl FnMut(&mut SyncProgress, E),
         work: F,
@@ -5793,7 +5836,12 @@ impl Engine {
     where
         F: Future<Output = T>,
     {
+        // Stamped on the frame this function owns rather than on one published
+        // before the work starts. Every frame from here overwrites the
+        // snapshot, so a name set anywhere else survives exactly until the
+        // first byte moves — which is to say, it is never seen.
         let mut event = self.progress(profile, phase);
+        event.current = current.map(str::to_owned);
         tokio::pin!(work);
         loop {
             tokio::select! {
@@ -5823,6 +5871,55 @@ impl Engine {
                     self.publish(event.clone());
                 }
             }
+        }
+    }
+
+    /// Give queued transfers their names, for a queue that predates them.
+    ///
+    /// A unit is named when it is enqueued, which is the cheap moment: the path
+    /// is right there. Rows queued before that column existed have no such
+    /// moment left, and on an install that upgraded mid-backlog that is every
+    /// row — 106 objects and 54.7 GB of them on the folder that prompted this,
+    /// which would have shown the folder's name and nothing else for days.
+    ///
+    /// The index is the only reverse map from object to path, so this walks it
+    /// once and answers every waiting unit in that pass. Runs at most once per
+    /// profile per process (see `labels_backfilled`) and never fails a sync: a
+    /// missing name is a worse line, not a worse outcome.
+    fn backfill_labels(&self, profile: &SyncProfile) {
+        if Self::lock(&self.labels_backfilled).contains(&profile.id) {
+            return;
+        }
+        let Ok(wanted) = self.with_db(|conn| db::unlabelled_transfers(conn, &profile.id)) else {
+            return;
+        };
+        Self::lock(&self.labels_backfilled).insert(profile.id.clone());
+        if wanted.is_empty() {
+            return;
+        }
+        let named = (|| -> Result<usize> {
+            let repo = git::repo::open(&profile.local_path, false)?;
+            let tracked = git::repo::tracked_paths(&repo)?;
+            let mut named = 0usize;
+            for rela in tracked {
+                let Some(pointer) = lfs::stage::indexed_pointer(&repo, &rela) else {
+                    continue; // an ordinary file, not an LFS path
+                };
+                let Some(ids) = wanted.get(&pointer.oid) else {
+                    continue;
+                };
+                let label = rela.to_string_lossy().into_owned();
+                for id in ids {
+                    self.with_db(|conn| db::label_unit(conn, *id, &label))?;
+                    named += 1;
+                }
+            }
+            Ok(named)
+        })();
+        match named {
+            Ok(0) => {}
+            Ok(named) => tracing::info!(profile = profile.name, named, "named queued transfers"),
+            Err(err) => tracing::debug!(error = %err, "could not name queued transfers"),
         }
     }
 
@@ -7657,6 +7754,142 @@ mod tests {
     /// itself, so it can measure the decision with a working one and without.
     ///
     /// The state used here needs no worktree read at all. A pointer written to
+    /// "Not synced yet" used to mean "not synced yet, outbound".
+    ///
+    /// The Pending list is computed from `git status` and the completeness
+    /// gate, which between them see only what this machine changed — so a
+    /// folder pulling 53 GB listed NOTHING while 106 objects sat in the journal
+    /// waiting to arrive. The inbound half comes from the journal, and it is
+    /// the half that answers "what is this folder still missing".
+    #[tokio::test]
+    async fn pending_lists_what_is_still_coming_in_not_only_what_is_going_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        assert!(
+            engine
+                .pending(&p.id)
+                .await
+                .expect("pending")
+                .iter()
+                .all(|file| !matches!(file.reason, PendingReason::Incoming { .. })),
+            "nothing is queued yet, so nothing is coming in"
+        );
+
+        let unit = WorkKind::LfsDownload {
+            oid: "d".repeat(64),
+            size: 405_800_000,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::label_unit(conn, id, "70-comms/keeper-rec/camera-0001.mov"))
+            .expect("label");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("the queued download is listed");
+        assert_eq!(incoming.path, "70-comms/keeper-rec/camera-0001.mov");
+        assert_eq!(
+            incoming.reason,
+            PendingReason::Incoming {
+                size_bytes: 405_800_000
+            },
+            "the size is the whole question about an object that has not arrived"
+        );
+    }
+
+    /// An object queued for a path since deleted cannot be named, and dropping
+    /// it would make this list disagree with the count the status line prints.
+    #[tokio::test]
+    async fn an_unnameable_incoming_object_is_still_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let unit = WorkKind::LfsDownload {
+            oid: "e".repeat(64),
+            size: 10,
+        };
+        engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("an unnamed object is still work");
+        assert!(
+            incoming.path.starts_with("LFS object eeee"),
+            "it says what it is rather than pretending to be a path: {}",
+            incoming.path
+        );
+    }
+
+    /// The queue that already exists is exactly the one that needs names.
+    ///
+    /// Naming happens at enqueue, so an install that upgrades mid-backlog has a
+    /// queue of rows that will never pass through that moment again: on the
+    /// folder that prompted this, 106 objects and 54.7 GB of them, every one
+    /// reporting the folder's name instead of a file for as long as it took to
+    /// deliver. The index is the only reverse map from object to path.
+    #[test]
+    fn a_queue_older_than_its_names_gets_them_filled_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let repo = engine.open_repo(&p).expect("open");
+        let pointer = lfs::stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+            .expect("the committed blob is a pointer");
+
+        // A row shaped exactly like one queued before the column existed.
+        let unit = WorkKind::LfsDownload {
+            oid: pointer.oid.clone(),
+            size: pointer.size,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+
+        engine.backfill_labels(&p);
+
+        let claimed = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, 10, 10))
+            .expect("claim");
+        let named = claimed
+            .iter()
+            .find(|item| item.id == id)
+            .expect("the queued download is still there");
+        assert_eq!(
+            named.label.as_deref(),
+            Some("clip.mp4"),
+            "an unnamed queue is what the walk exists to answer"
+        );
+    }
+
     /// the index and not yet committed is a `HEAD`-to-index difference, which
     /// git reports from objects alone.
     #[test]
@@ -9548,6 +9781,7 @@ mod tests {
             .publish_while(
                 &p,
                 SyncPhase::UploadingLfs,
+                Some("40-media/clip.mov"),
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -9569,6 +9803,15 @@ mod tests {
         let mut previous_total = 0;
         for event in &published {
             assert_eq!(event.phase, SyncPhase::UploadingLfs);
+            // EVERY frame, not just the first. The name used to be stamped on a
+            // frame published before the transfer began, and the first byte
+            // that moved replaced it with `None` — so the surface that shows
+            // the file being carried showed it for no observable time at all.
+            assert_eq!(
+                event.current.as_deref(),
+                Some("40-media/clip.mov"),
+                "the file being carried must survive its own progress"
+            );
             let total = event
                 .bytes_total
                 .expect("a started object gives the bar a denominator");

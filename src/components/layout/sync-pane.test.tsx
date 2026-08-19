@@ -70,6 +70,8 @@ import {
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
   SYNC_PENDING_EMPTY_SENTENCE,
+  SYNC_PENDING_INBOUND_WORD,
+  SYNC_PENDING_OUTBOUND_WORD,
   SYNC_PENDING_TITLE,
   SYNC_PROBLEMS_TITLE,
   SYNC_RESCAN_LABEL,
@@ -232,7 +234,6 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     state: "watching",
     phase: "idle",
     line: RUST_LINE,
-    current: null,
     queuedFiles: 0,
     queuedBytes: 0,
     filesDone: 0,
@@ -1230,8 +1231,8 @@ describe("SyncPane activity delivery", () => {
 
 describe("SyncPane pending", () => {
   const pending: SyncPendingVm[] = [
-    { path: "notes/draft.md", reason: "settling", sinceMs: NOW - 300_000 },
-    { path: "notes/scratch.md", reason: "untracked", sinceMs: null },
+    { path: "notes/draft.md", reason: "settling", sinceMs: NOW - 300_000, sizeBytes: null },
+    { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
   ];
 
   it("lists what is waiting and why", async () => {
@@ -1244,6 +1245,28 @@ describe("SyncPane pending", () => {
     expect(rows[0]).toHaveTextContent("notes/draft.md");
     expect(rows[1]).toHaveTextContent("notes/scratch.md");
     expect(rows[1]).toHaveTextContent("New file, not synced yet");
+  });
+
+  /** The list carries both directions now, so each row has to say which one it
+   * is without the reader parsing the sentence at the far end. */
+  it("marks which way each pending row is travelling", async () => {
+    mockPending.mockResolvedValue([
+      { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
+      {
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      },
+    ]);
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_INBOUND_WORD);
+    // and the direction is a word for a screen reader, not only an arrow
+    expect(rows[1]).toHaveTextContent("Waiting to download · 405.8 MB");
   });
 
   it("explains a settling file as a wait so far, never as a finish time", async () => {
@@ -1833,17 +1856,31 @@ describe("sync pane projections", () => {
   });
 
   it("words each pending reason, and shows an unknown one as itself", () => {
-    expect(syncPendingReason({ path: "a", reason: "modified", sinceMs: null })).toBe(
-      "Changed, not synced yet",
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "modified", sinceMs: null, sizeBytes: null }),
+    ).toBe("Changed, not synced yet");
     // A settling row with no recorded start still says what it is waiting for.
-    expect(syncPendingReason({ path: "a", reason: "settling", sinceMs: null })).toBe(
-      SYNC_SETTLING_SENTENCE,
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "settling", sinceMs: null, sizeBytes: null }),
+    ).toBe(SYNC_SETTLING_SENTENCE);
     // A reason Rust grows later is shown, not swallowed.
-    expect(syncPendingReason({ path: "a", reason: "quarantined", sinceMs: null })).toBe(
-      "quarantined",
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "quarantined", sinceMs: null, sizeBytes: null }),
+    ).toBe("quarantined");
+    // The one inbound reason, and the only one that carries a size: a queue of
+    // 106 objects is two minutes or four days depending on it.
+    expect(
+      syncPendingReason({
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      }),
+    ).toBe("Waiting to download · 405.8 MB");
+    // And an outbound row does not grow a size it was never about.
+    expect(
+      syncPendingReason({ path: "a.md", reason: "modified", sinceMs: null, sizeBytes: null }),
+    ).toBe("Changed, not synced yet");
   });
 
   it("counts a single attempt in the singular and an unknown kind as itself", () => {

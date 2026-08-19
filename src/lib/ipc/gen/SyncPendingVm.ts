@@ -5,9 +5,19 @@
  */
 export type SyncPendingVm = { path: string, 
 /**
- * `settling` | `untracked` | `modified` | `added` | `deleted`.
+ * `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`.
+ *
+ * The first five are what this machine changed; `incoming` is an LFS
+ * object queued to arrive, which `git status` cannot see and which used to
+ * leave a folder pulling 53 GB reporting nothing as pending at all.
  */
 reason: string, 
+/**
+ * Announced size, for `incoming` only — the one thing worth knowing about
+ * an object that has not arrived. `null` for every other reason, where the
+ * file is already on this disk and its size is not what the row is about.
+ */
+sizeBytes: number | null, 
 /**
  * When the quiescence episode began, for `settling` only. The UI renders
  * it as "waiting for writes to stop", not as a countdown: the window

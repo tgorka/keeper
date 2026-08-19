@@ -28,15 +28,6 @@ line: string, filesDone: number, filesTotal: number | null, bytesDone: number, b
  */
 settling: number, 
 /**
- * Repository-relative path of the file being transferred, when one file
- * owns the work. `null` for a leg that moves many paths at once.
- *
- * Absent from `line` on purpose — that string is the tray's too, and a
- * path four folders deep does not belong in a menu item. A window with
- * room shows it on its own line.
- */
-current: string | null, 
-/**
  * Transfers still to be delivered, and their bytes. `line` says both in
  * words; the numbers are here so a surface can show them without parsing
  * prose, the same reason `settling` is.
