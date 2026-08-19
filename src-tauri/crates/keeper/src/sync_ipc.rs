@@ -367,8 +367,17 @@ pub struct SyncActivityVm {
 #[serde(rename_all = "camelCase")]
 pub struct SyncPendingVm {
     pub path: String,
-    /// `settling` | `untracked` | `modified` | `added` | `deleted`.
+    /// `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`.
+    ///
+    /// The first five are what this machine changed; `incoming` is an LFS
+    /// object queued to arrive, which `git status` cannot see and which used to
+    /// leave a folder pulling 53 GB reporting nothing as pending at all.
     pub reason: String,
+    /// Announced size, for `incoming` only — the one thing worth knowing about
+    /// an object that has not arrived. `null` for every other reason, where the
+    /// file is already on this disk and its size is not what the row is about.
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
     /// When the quiescence episode began, for `settling` only. The UI renders
     /// it as "waiting for writes to stop", not as a countdown: the window
     /// restarts on every write, so a promised finish time would be a guess.
@@ -1156,17 +1165,19 @@ pub async fn sync_pending(
     Ok(files
         .into_iter()
         .map(|file| {
-            let (reason, since_ms) = match file.reason {
-                PendingReason::Settling { since_ms } => ("settling", Some(since_ms)),
-                PendingReason::Untracked => ("untracked", None),
-                PendingReason::Modified => ("modified", None),
-                PendingReason::Added => ("added", None),
-                PendingReason::Deleted => ("deleted", None),
+            let (reason, since_ms, size_bytes) = match file.reason {
+                PendingReason::Settling { since_ms } => ("settling", Some(since_ms), None),
+                PendingReason::Incoming { size_bytes } => ("incoming", None, Some(size_bytes)),
+                PendingReason::Untracked => ("untracked", None, None),
+                PendingReason::Modified => ("modified", None, None),
+                PendingReason::Added => ("added", None, None),
+                PendingReason::Deleted => ("deleted", None, None),
             };
             SyncPendingVm {
                 path: file.path,
                 reason: reason.to_owned(),
                 since_ms,
+                size_bytes,
             }
         })
         .collect())
@@ -1860,6 +1871,9 @@ fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> 
                 Some(PendingReason::Added) => "This file is staged and has not been committed yet.",
                 Some(PendingReason::Deleted) => {
                     "This file has been deleted and the deletion has not been committed yet."
+                }
+                Some(PendingReason::Incoming { .. }) => {
+                    "This file's content is still on the remote and has not been downloaded yet."
                 }
                 None => "Something in this folder is waiting to sync.",
             },

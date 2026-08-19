@@ -425,6 +425,9 @@ const PENDING_REASONS: Record<string, string> = {
   added: "Added, not synced yet",
   modified: "Changed, not synced yet",
   deleted: "Deleted, not synced yet",
+  // The only inbound reason, and worded to say so: the four above are things
+  // this machine did, this one is content the remote still holds.
+  incoming: "Waiting to download",
 };
 
 /**
@@ -475,7 +478,11 @@ export function syncPendingReason(pending: SyncPendingVm, now: number = Date.now
       ? SYNC_SETTLING_SENTENCE
       : `${SYNC_SETTLING_SENTENCE} · ${formatSyncWaited(pending.sinceMs, now)} so far`;
   }
-  return PENDING_REASONS[pending.reason] ?? pending.reason;
+  const phrase = PENDING_REASONS[pending.reason] ?? pending.reason;
+  // The size belongs to `incoming` and to nothing else: it is what separates a
+  // queue of two minutes from one of four days, and for a file already on this
+  // disk it would answer a question nobody asked.
+  return pending.sizeBytes === null ? phrase : `${phrase} · ${formatCopyBytes(pending.sizeBytes)}`;
 }
 
 /** What a parked unit was doing and how hard keeper tried. */

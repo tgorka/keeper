@@ -212,6 +212,17 @@ pub enum PendingReason {
     Added,
     /// Tracked and no longer on disk.
     Deleted,
+    /// Queued to come IN: an LFS object this clone does not hold yet.
+    ///
+    /// The other reasons are computed from `git status` and the completeness
+    /// gate, which between them see only what this machine has changed. A
+    /// folder pulling 53 GB therefore listed nothing as pending while 106
+    /// objects sat in the journal — the list said "not synced yet" and meant
+    /// "not synced yet, outbound".
+    ///
+    /// Carries the size because that is the whole question about an inbound
+    /// object: a queue of 106 is two minutes or four days depending on it.
+    Incoming { size_bytes: u64 },
 }
 
 /// One path the folder is waiting on.
@@ -5584,6 +5595,27 @@ impl Engine {
             }
         }
 
+        // The inbound half, from the journal. Added after the status buckets so
+        // `named` gives a local change precedence: if a path is somehow both
+        // edited here and queued from the remote, what the operator did is the
+        // more actionable of the two facts.
+        for (label, oid, size_bytes) in
+            self.with_db(|conn| db::queued_downloads(conn, profile_id))?
+        {
+            // An object whose path is not in the index cannot be named — it was
+            // queued for a path since deleted. It is still work, and dropping
+            // it would make this list disagree with the count in the status
+            // line, so it says plainly what it is.
+            let path =
+                label.unwrap_or_else(|| format!("LFS object {}…", &oid[..oid.len().min(12)]));
+            if named.insert(path.clone()) {
+                out.push(PendingFile {
+                    path,
+                    reason: PendingReason::Incoming { size_bytes },
+                });
+            }
+        }
+
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -7722,6 +7754,93 @@ mod tests {
     /// itself, so it can measure the decision with a working one and without.
     ///
     /// The state used here needs no worktree read at all. A pointer written to
+    /// "Not synced yet" used to mean "not synced yet, outbound".
+    ///
+    /// The Pending list is computed from `git status` and the completeness
+    /// gate, which between them see only what this machine changed — so a
+    /// folder pulling 53 GB listed NOTHING while 106 objects sat in the journal
+    /// waiting to arrive. The inbound half comes from the journal, and it is
+    /// the half that answers "what is this folder still missing".
+    #[tokio::test]
+    async fn pending_lists_what_is_still_coming_in_not_only_what_is_going_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        assert!(
+            engine
+                .pending(&p.id)
+                .await
+                .expect("pending")
+                .iter()
+                .all(|file| !matches!(file.reason, PendingReason::Incoming { .. })),
+            "nothing is queued yet, so nothing is coming in"
+        );
+
+        let unit = WorkKind::LfsDownload {
+            oid: "d".repeat(64),
+            size: 405_800_000,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::label_unit(conn, id, "70-comms/keeper-rec/camera-0001.mov"))
+            .expect("label");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("the queued download is listed");
+        assert_eq!(incoming.path, "70-comms/keeper-rec/camera-0001.mov");
+        assert_eq!(
+            incoming.reason,
+            PendingReason::Incoming {
+                size_bytes: 405_800_000
+            },
+            "the size is the whole question about an object that has not arrived"
+        );
+    }
+
+    /// An object queued for a path since deleted cannot be named, and dropping
+    /// it would make this list disagree with the count the status line prints.
+    #[tokio::test]
+    async fn an_unnameable_incoming_object_is_still_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let unit = WorkKind::LfsDownload {
+            oid: "e".repeat(64),
+            size: 10,
+        };
+        engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("an unnamed object is still work");
+        assert!(
+            incoming.path.starts_with("LFS object eeee"),
+            "it says what it is rather than pretending to be a path: {}",
+            incoming.path
+        );
+    }
+
     /// The queue that already exists is exactly the one that needs names.
     ///
     /// Naming happens at enqueue, so an install that upgrades mid-backlog has a

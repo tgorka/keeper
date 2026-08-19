@@ -648,6 +648,25 @@ Both live in `keeper_sync::http`, which is the only place a client is built.
 Progress is reported in bytes where a total is known, because a file-counted bar
 sits at 50% for ten minutes when one of the two files is a 4 GB video.
 
+### The Pending list runs in both directions
+
+`git status` and the completeness gate see only what this machine changed, so
+until 0.8.14 the Pending list meant "not synced yet, **outbound**" while saying
+"not synced yet". A folder pulling 53 GB listed nothing at all: its 106 queued
+objects lived in the journal, which that list never read.
+
+Queued LFS downloads now appear with the reason `incoming`, carrying the size —
+the one fact worth knowing about an object that has not arrived, since a queue
+of 106 is two minutes or four days depending on it. Names come from the same
+`label` the transfer line uses, so a queue that predates them is filled in from
+the index on the next drain; an object queued for a path since deleted cannot be
+named and says so rather than being dropped, because a list that disagrees with
+the count in the status line is worse than an ugly row.
+
+Uploads are deliberately not listed: the path an upload carries is already
+reported by `git status` as a local change, and one fact wearing two hats reads
+as two.
+
 ### The Sync view's Activity list
 
 Each folder's card lists the files it recently carried, newest first. Every row

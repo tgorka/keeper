@@ -269,6 +269,40 @@ pub fn label_unit(conn: &Connection, id: i64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every download this profile is still waiting for: its name, object and size.
+///
+/// Downloads only. An upload is also unfinished work, but the path it carries
+/// is already reported by `git status` as a local change, and listing it twice
+/// under two different sentences would be one fact wearing two hats.
+pub fn queued_downloads(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<Vec<(Option<String>, String, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT label,
+                json_extract(payload, '$.oid'),
+                json_extract(payload, '$.size')
+           FROM journal
+          WHERE profile_id = ?1
+            AND kind = 'lfsDownload'
+            AND state != 'parked'
+          ORDER BY id",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (label, oid, size) = row?;
+        out.push((label, oid, size.max(0) as u64));
+    }
+    Ok(out)
+}
+
 /// Queued transfers that have no name yet, as oid → the units wanting it.
 ///
 /// Every row queued before the `label` column existed is in here, which on an
