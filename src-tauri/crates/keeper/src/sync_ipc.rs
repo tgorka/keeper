@@ -3169,7 +3169,19 @@ mod tests {
     /// them by name. `lfsPruneLocal` needs no slot on purpose: releasing the
     /// redundant object copy is what a profile does by default, and the opt-out
     /// is for a machine that is configured, not clicked.
-    const PRESERVED: [&str; 5] = ["id", "volumeId", "enabled", "lfsNever", "lfsPruneLocal"];
+    /// `regenerable` joins them for the same reason and one of its own: which
+    /// paths a repository generates is a fact about that repository, so it is
+    /// configured where the repository can say it — `.keeper/keeper.toml`, which
+    /// travels with the folder — rather than clicked per machine. A save from a
+    /// form that has never shown the list must not be able to empty it.
+    const PRESERVED: [&str; 6] = [
+        "id",
+        "volumeId",
+        "enabled",
+        "lfsNever",
+        "lfsPruneLocal",
+        "regenerable",
+    ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
         match serde_json::to_value(profile).expect("a profile serializes") {
@@ -3253,6 +3265,7 @@ mod tests {
         prior.enabled = false;
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
+        prior.regenerable = vec!["index.md".into()];
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
         // Story 41.1's block, set to something a fresh profile never has. It was
