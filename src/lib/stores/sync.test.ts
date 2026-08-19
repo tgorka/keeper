@@ -282,6 +282,7 @@ describe("actions", () => {
       pulled: false,
       filesChanged: 3,
       conflicts: [],
+      stale: [],
       bytes: 2_048,
       line: "Committed and pushed 3 files, moved 2 KB.",
     };

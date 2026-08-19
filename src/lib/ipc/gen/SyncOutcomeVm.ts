@@ -11,6 +11,12 @@
  */
 export type SyncOutcomeVm = { committed: boolean, pushed: boolean, pulled: boolean, filesChanged: number, conflicts: Array<string>, 
 /**
+ * Paths that took the remote's version with no copy kept, because the
+ * profile declares them regenerable. Nothing is on disk to clean up —
+ * these want the tool that writes them to run again.
+ */
+stale: Array<string>, 
+/**
  * Bytes this run moved over the network — the received pack plus every
  * LFS object transferred. Zero for a pass that found nothing to do, which
  * is the common and correct answer, never an error.

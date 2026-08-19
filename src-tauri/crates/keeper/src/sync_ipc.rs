@@ -303,6 +303,10 @@ pub struct SyncOutcomeVm {
     #[ts(type = "number")]
     pub files_changed: u64,
     pub conflicts: Vec<String>,
+    /// Paths that took the remote's version with no copy kept, because the
+    /// profile declares them regenerable. Nothing is on disk to clean up —
+    /// these want the tool that writes them to run again.
+    pub stale: Vec<String>,
     /// Bytes this run moved over the network — the received pack plus every
     /// LFS object transferred. Zero for a pass that found nothing to do, which
     /// is the common and correct answer, never an error.
@@ -1084,6 +1088,16 @@ fn outcome_line(outcome: &SyncOutcome) -> String {
             plural(count)
         ));
     }
+    if !outcome.stale.is_empty() {
+        // Deliberately not phrased as a conflict: nothing was kept, nothing has
+        // to be deleted, and the only action is to run whatever writes the file.
+        let count = outcome.stale.len() as u64;
+        clauses.push(format!(
+            "took the remote's version of {count} generated file{} — regenerate {}",
+            plural(count),
+            if count == 1 { "it" } else { "them" }
+        ));
+    }
     if clauses.is_empty() {
         return NOTHING_TO_SYNC.to_owned();
     }
@@ -1120,6 +1134,7 @@ pub async fn sync_folder_now(
         files_changed: outcome.files_changed,
         bytes: outcome.bytes,
         line: outcome_line(&outcome),
+        stale: outcome.stale.clone(),
         conflicts: outcome.conflicts,
     })
 }
@@ -3972,6 +3987,45 @@ mod tests {
             line,
             "Kept your version of 1 file that changed in both places, alongside the remote's."
         );
+    }
+
+    /// A regenerable path that took the remote's version is neither a conflict
+    /// nor silence. Nothing was kept and nothing has to be deleted, so the
+    /// sentence must not send anybody looking for a `.sync-conflict-` file that
+    /// does not exist — the only action is to run whatever writes the file.
+    #[test]
+    fn a_regenerable_path_reads_as_regenerate_not_as_conflict() {
+        let one = outcome_line(&SyncOutcome {
+            pulled: true,
+            stale: vec!["10-notes/index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert_eq!(
+            one,
+            "Took the remote's version of 1 generated file — regenerate it."
+        );
+        assert!(!one.contains("Kept your version"));
+
+        let many = outcome_line(&SyncOutcome {
+            pulled: true,
+            stale: vec!["a/index.md".to_owned(), "b/index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert_eq!(
+            many,
+            "Took the remote's version of 2 generated files — regenerate them."
+        );
+
+        // Both can happen in one convergence, and the sentence has to carry
+        // both without conflating them.
+        let both = outcome_line(&SyncOutcome {
+            pulled: true,
+            conflicts: vec!["notes.sync-conflict-20250725-120000-host.md".to_owned()],
+            stale: vec!["index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert!(both.contains("Kept your version of 1 file"), "{both}");
+        assert!(both.contains("1 generated file"), "{both}");
     }
 
     /// A pass whose legs all ran and moved nothing is the single most common

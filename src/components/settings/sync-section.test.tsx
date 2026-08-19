@@ -242,6 +242,7 @@ describe("SyncSection profile rows", () => {
       pulled: true,
       filesChanged: 0,
       conflicts: [],
+      stale: [],
       bytes: 0,
       line: "Nothing to sync — this folder already matches the remote.",
       ...over,
