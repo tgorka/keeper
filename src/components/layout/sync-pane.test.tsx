@@ -1255,6 +1255,25 @@ describe("SyncPane pending", () => {
     { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
   ];
 
+  /**
+   * The lists are paths — repository-relative, four folders deep, beside a size
+   * and a date. Capped at 720px they truncate into ellipses while the window
+   * sits half empty, and the tail of a path is the half that identifies it.
+   *
+   * The forms are the opposite case and keep their measure, which is why this
+   * asserts both halves rather than "no max-width anywhere".
+   */
+  it("gives the lists the whole window and the forms a measure", async () => {
+    await renderPane();
+    // Any rendered row will do; this one is the folder card's own line.
+    await screen.findByText(RUST_LINE);
+
+    const body = document.querySelector('[data-slot="sync-body"]');
+    expect(body).not.toBeNull();
+    expect(body?.className).not.toMatch(/max-w-/);
+    expect(body?.className).not.toMatch(/mx-auto/);
+  });
+
   it("lists what is waiting and why", async () => {
     mockPending.mockResolvedValue(pending);
     await renderPane();

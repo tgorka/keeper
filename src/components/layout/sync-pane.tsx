@@ -47,8 +47,10 @@
  *     waiting and stops there.
  *
  * It reuses the {@link RecordingPane} outer chrome (`<section>`/`<header>`/
- * `<ScrollArea>`) and its centered content column (UX-DR29) so the non-chat
- * primary views read as one family. The whole surface is capability-gated at
+ * `<ScrollArea>`) so the non-chat primary views read as one family, but not
+ * its centered content column: the body is full-bleed like the Bridges one,
+ * because this surface is lists of repository paths rather than a stack of
+ * setup forms. The forms it does hold keep a measured width of their own. The whole surface is capability-gated at
  * the app-shell / sidebar level: a machine with no usable `git` gets no sync UI
  * at all, never a disabled one.
  */
@@ -808,9 +810,16 @@ export function SyncPane() {
       </header>
 
       <ScrollArea className="min-h-0 flex-1">
-        {/* Centered single column at content-max-width (UX-DR29), matching the
-            Recording pane rather than the full-bleed Bridges body. */}
-        <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 p-6">
+        {/* Full-bleed, like the Bridges body and unlike the Recording pane.
+            Those two are the app's precedents and this surface belongs to the
+            second one: UX-DR29's centered column is a decision about
+            *Recording*, a stack of setup forms where a measured line length is
+            the point. Sync is lists — Activity, Pending, Problems — whose rows
+            are repository paths four folders deep beside a size and a date. At
+            720px those paths truncate into ellipses while the window sits half
+            empty, which is the one thing a list of paths must not do: the tail
+            of a path is the half that identifies it. */}
+        <div data-slot="sync-body" className="flex flex-col gap-6 p-6">
           {readError !== null && (
             <p role="alert" className="text-destructive text-sm">
               {readError}
@@ -834,7 +843,12 @@ export function SyncPane() {
               reopen it is hidden, so a discard there would leave a user with
               nothing to do and no way to undo it. */}
           {showAddForm && (
-            <Card size="sm">
+            // Capped where the lists are not. A form is read line by line and a
+            // label-and-field pair stretched across a wide window is worse than
+            // one that sits still; the rows below are paths that want every
+            // pixel. Same reasoning as the Recording pane's column, applied to
+            // the part of this surface that is actually a form.
+            <Card size="sm" className="w-full max-w-[720px]">
               <CardContent>
                 <AddFolderForm
                   onSaved={(_profile, settled) => setAdding(!settled)}
@@ -1176,7 +1190,9 @@ function SyncProfileCard({
             nothing else on screen would report. */}
         {editing && (
           <AddFolderForm
-            className="border-border border-b pb-5"
+            // Measured for the same reason the add form is: this is a form
+            // inside a card that is now as wide as the window.
+            className="w-full max-w-[720px] border-border border-b pb-5"
             profile={profile}
             onSaved={(_saved, settled) => setEditing(!settled)}
             onCancel={() => setEditing(false)}
