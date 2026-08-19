@@ -367,6 +367,24 @@ never rewritten.
 A failure to release is logged and never fails the sync — reclaiming space is
 housekeeping.
 
+### The filter's output is buffered, and why that shows up as energy
+
+Content reaches git through the filter's stdout, and `std::io::Stdout` is a
+`LineWriter`: it flushes to the last newline in every write it is handed.
+Binary content has newlines all through it, so nothing coalesces — a large
+object crossed the pipe in `io::copy`-sized mouthfuls, each one a syscall and a
+wake for git on the other end.
+
+That is invisible in a CPU column and plain in an energy one. A folder syncing
+all day was measured at **8 200 context switches a second against 3% CPU**, with
+about two idle wakeups a second — not a timer problem, an I/O-shape problem. The
+filter now gathers its output in 256 KiB buffers, which is safe only because
+every response already ends in an explicit flush; the protocol has to flush,
+because git waits on it.
+
+This is a reduction, not a cure. A folder moving tens of gigabytes over a slow
+link is expensive because of the bytes, and no amount of buffering changes that.
+
 ### The rule is recorded per extension — which is why `lfsNever` exists
 
 The decision is per file and by size, but the rule keeper writes into
