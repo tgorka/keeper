@@ -47,6 +47,7 @@ pub mod export;
 pub mod file_serve;
 pub mod files_write;
 pub mod git;
+pub mod http;
 pub mod lfs;
 pub mod names;
 pub mod platform;

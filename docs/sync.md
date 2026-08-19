@@ -596,6 +596,27 @@ Offline is a normal state, not an error.
 
 The status line reports what is waiting, e.g. `tgdrive — offline, 12 waiting`.
 
+### The half-offline case: a connection that neither works nor fails
+
+Being offline is easy to handle because it announces itself. The expensive case
+is a socket whose peer has gone — a laptop that changed networks mid-object, a
+NAT mapping that expired, a link that stopped passing packets — because nothing
+is delivered and no error arrives either. Without a timeout that transfer waits
+forever, and since the engine runs one operation per profile and returns
+in-flight units to the queue only at startup, everything queued behind it waits
+with it. Observed on a folder pulling 53 GB: nine downloads sat in `running` for
+sixteen hours, backoff long expired, 95 units behind them, not one byte written.
+
+Transfers therefore bound **silence**, not duration: an established connection
+that delivers nothing for 60 s fails as a network error and is retried with the
+usual backoff, while a transfer that keeps delivering bytes may run for hours —
+which multi-gigabyte objects on a slow link genuinely do. A total request
+timeout would have to be longer than the longest legitimate transfer, and would
+therefore be useless for catching a stall. Connecting is bounded separately, at
+15 s.
+
+Both live in `keeper_sync::http`, which is the only place a client is built.
+
 ---
 
 ## 11. Progress and warnings

@@ -682,10 +682,15 @@ enum BatchStep {
 
 /// A credential-safe description of a transport failure.
 pub(crate) fn transport_reason(err: &reqwest::Error) -> &'static str {
-    if err.is_timeout() {
-        "the request timed out"
-    } else if err.is_connect() {
+    // `is_connect` is asked first because a connect timeout answers true to
+    // both, and of the two answers "could not connect" is the one an operator
+    // can act on. What remains under `is_timeout` is then the case worth naming
+    // precisely: an established connection that stopped delivering bytes, which
+    // `crate::http::READ_TIMEOUT` is what turns into an error at all.
+    if err.is_connect() {
         "could not connect"
+    } else if err.is_timeout() {
+        "the connection went silent"
     } else if err.is_redirect() {
         "too many redirects"
     } else if err.is_decode() || err.is_body() {

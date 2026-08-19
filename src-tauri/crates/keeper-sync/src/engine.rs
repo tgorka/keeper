@@ -603,10 +603,11 @@ impl Engine {
             });
         }
 
-        let http = reqwest::Client::builder()
-            .user_agent(crate::AGENT)
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not build an HTTP client: {err}")))?;
+        // Timeouts live in `crate::http`, and the reason they are not inline
+        // here is that their absence was invisible: a client built without them
+        // never fails, it waits — and a wait on a dead socket parks the whole
+        // profile until the process restarts.
+        let http = crate::http::client(crate::AGENT)?;
 
         let engine = Self {
             platform,
