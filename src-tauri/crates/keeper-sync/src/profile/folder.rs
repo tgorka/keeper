@@ -122,6 +122,12 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // --- Repository policy: the same on every clone, or the clones disagree --
     ("branch", FolderFieldRule::Allowed),
     ("excludes", FolderFieldRule::Allowed),
+    // Which paths are generated is a fact about the repository's layout, not
+    // about the machine holding it: the tool that rebuilds them is committed
+    // beside them. Letting the folder itself declare them is the point — a
+    // repository whose index files are generated says so once, and every clone
+    // converges the same way without anybody configuring a device (AD-43).
+    ("regenerable", FolderFieldRule::Allowed),
     ("lfsNever", FolderFieldRule::Allowed),
     ("lfsThresholdBytes", FolderFieldRule::Allowed),
     ("commitSubjectTemplate", FolderFieldRule::Allowed),
