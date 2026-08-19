@@ -61,9 +61,33 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// into a failure would trade a rare hang for frequent spurious retries.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long an idle connection may be kept for reuse.
+///
+/// Keep-alive is worth having — an LFS batch and the download it authorises are
+/// two requests seconds apart — but a pooled connection is only an asset while
+/// the peer still has it. Over a link that drops connections without saying so
+/// (a NAT mapping that expired, a tunnel that stopped passing packets), reusing
+/// one costs a full [`READ_TIMEOUT`] before anything is even attempted: the
+/// request goes out, nothing comes back, and the transfer starts a minute in
+/// the hole.
+///
+/// `reqwest`'s own default is 90 s, which on such a link is long enough for the
+/// pool to fill with connections the far side has forgotten. Twenty seconds
+/// keeps the reuse that matters and discards the rest.
+///
+/// **This is a hypothesis, and it is worth saying so.** The symptom is that
+/// throughput on one folder decays over hours — 300 kB/s after a restart, 25
+/// kB/s an hour later — and that restarting the app restores it every time. A
+/// fresh process has an empty pool, which fits; a backoff that accumulates does
+/// not (measured: nothing was waiting on a clock), and neither does a resource
+/// leak (67 MB and 62 threads after an hour). This narrows the window in which
+/// the pool can hold a dead connection. If the decay survives it, the cause is
+/// elsewhere and this is still the right default.
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The client this crate runs on.
 pub fn client(user_agent: &'static str) -> Result<reqwest::Client> {
-    client_with(user_agent, CONNECT_TIMEOUT, READ_TIMEOUT)
+    client_with(user_agent, CONNECT_TIMEOUT, READ_TIMEOUT, POOL_IDLE_TIMEOUT)
 }
 
 /// [`client`], with the timeouts named — the seam tests use to make a stall
@@ -72,11 +96,13 @@ pub fn client_with(
     user_agent: &'static str,
     connect_timeout: Duration,
     read_timeout: Duration,
+    pool_idle_timeout: Duration,
 ) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
+        .pool_idle_timeout(pool_idle_timeout)
         .build()
         .map_err(|err| SyncError::Config(format!("could not build an HTTP client: {err}")))
 }
@@ -119,8 +145,13 @@ mod tests {
     #[tokio::test]
     async fn a_body_that_goes_silent_fails_instead_of_hanging_forever() {
         let url = silent_server();
-        let http = client_with("test", Duration::from_secs(5), Duration::from_millis(200))
-            .expect("client");
+        let http = client_with(
+            "test",
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+            POOL_IDLE_TIMEOUT,
+        )
+        .expect("client");
 
         let started = std::time::Instant::now();
         let mut response = http.get(&url).send().await.expect("headers arrive");
@@ -143,6 +174,104 @@ mod tests {
         );
     }
 
+    /// A connection the pool has held past its idle window is not reused.
+    ///
+    /// Asserted against a real socket by counting accepts, because the claim is
+    /// about `reqwest`'s behaviour rather than ours: with a long window the
+    /// second request must reuse the first connection, and with a short one it
+    /// must open a new one. A test that only read the constant back would pass
+    /// just as happily if the builder call were deleted.
+    #[tokio::test]
+    async fn an_idle_connection_is_dropped_rather_than_reused_when_it_is_stale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    // Keep-alive: answer every request on this connection until
+                    // the client goes away.
+                    let mut scratch = [0u8; 1024];
+                    while matches!(sock.read(&mut scratch), Ok(n) if n > 0) {
+                        if sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let _ = sock.flush();
+                    }
+                });
+            }
+        });
+        let url = format!("http://{addr}/object");
+
+        let reusing = client_with(
+            "test",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .expect("client");
+        reusing
+            .get(&url)
+            .send()
+            .await
+            .expect("first")
+            .bytes()
+            .await
+            .expect("body");
+        reusing
+            .get(&url)
+            .send()
+            .await
+            .expect("second")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "back-to-back requests must keep the connection — the pool earns its place"
+        );
+
+        let stale = client_with(
+            "test",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .expect("client");
+        stale
+            .get(&url)
+            .send()
+            .await
+            .expect("third")
+            .bytes()
+            .await
+            .expect("body");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        stale
+            .get(&url)
+            .send()
+            .await
+            .expect("fourth")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            3,
+            "an idle connection past its window is opened afresh, not handed back"
+        );
+    }
+
     /// The property the whole module exists for, stated where a future edit
     /// will trip over it: a *total* request timeout would cap how long a
     /// legitimate transfer may run, and multi-gigabyte objects over a slow link
@@ -155,5 +284,9 @@ mod tests {
             "a stall must be noticed while the queue behind it still matters"
         );
         assert!(CONNECT_TIMEOUT < READ_TIMEOUT);
+        // The cost of reusing a connection the far side has forgotten is a
+        // whole read timeout, so the window in which one can be held has to be
+        // the smaller of the two.
+        assert!(POOL_IDLE_TIMEOUT < READ_TIMEOUT);
     }
 }

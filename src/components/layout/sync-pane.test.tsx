@@ -596,9 +596,27 @@ describe("SyncPane profile header", () => {
     });
 
     // Worded the way the Rust status line words its counter, so the fast copy
-    // and the polled sentence above read as one quantity.
-    expect(await screen.findByText("3/12 files · 4.1 MB/s")).toBeInTheDocument();
+    // and the polled sentence above read as one quantity. Two elements, not
+    // one string: the rate needs a box of its own to stop it dragging the row
+    // about, and the file count cannot have one.
+    expect(await screen.findByText("3/12 files")).toBeInTheDocument();
+    const rate = screen.getByText("4.1 MB/s");
     expect(screen.getByText("clips/holiday.mov")).toBeInTheDocument();
+
+    // The reservation itself, asserted as the class because jsdom has no
+    // layout to measure: `2 kB/s` and `294.8 kB/s` differ by four characters,
+    // and without a fixed box everything after the rate would move every tick.
+    expect(rate.className).toContain("min-w-[11ch]");
+    expect(rate.className).toContain("text-right");
+
+    // And in that order. The figures are the fixed-width half and the half that
+    // changes every tick; a reader watching a rate should not have to find it
+    // at the end of a path whose length depends on how deep the file sits.
+    // Stated as the property rather than as literal text: `textContent` glues
+    // the spans together without the flex gap, so a string match here pins the
+    // layout's whitespace instead of the thing that matters.
+    const detail = rate.closest("p")?.textContent ?? "";
+    expect(detail.indexOf("4.1 MB/s")).toBeLessThan(detail.indexOf("clips/holiday.mov"));
   });
 
   it("claims nothing is in flight for a folder that has stopped", async () => {

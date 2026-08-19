@@ -78,7 +78,7 @@
 //! job it was chosen for — a worktree whose keeper binary moved still checks
 //! out, as pointers.
 
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SyncError};
@@ -120,6 +120,25 @@ pub enum Direction {
 /// Blocking and streaming. Nothing here sizes a buffer from the file — a clean
 /// hashes straight into the store as the bytes arrive (NFR-23), which is the
 /// whole reason LFS exists in this engine.
+/// How much output is gathered before it reaches the pipe.
+///
+/// The smudge path streams a whole object through `std::io::copy`, whose
+/// internal buffer is 8 KiB — and the writer git hands us is
+/// `std::io::Stdout`, a `LineWriter`, which flushes to the last newline in
+/// every write it is given. Binary content has newlines all over it, so
+/// nothing coalesces: a 400 MB video crosses the pipe in ~50 000 writes, each
+/// one waking git to read it. That is where a folder syncing all day spends
+/// its context switches — 8 200 a second, measured, against 3% CPU.
+///
+/// 256 KiB turns those 8 KiB writes into one syscall per buffer. The pipe
+/// itself holds 64 KiB, so the kernel still moves it in pieces; what changes
+/// is how many times *this* process has to ask.
+///
+/// Correctness rests on every response already ending in an explicit `flush`,
+/// which it does — the protocol has to, because git waits on it. Buffering
+/// without that would deadlock rather than merely be slow.
+const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
+
 pub fn run(
     repo: &Path,
     direction: Direction,
@@ -128,9 +147,10 @@ pub fn run(
 ) -> Result<()> {
     let store = LfsStore::in_git_dir(repo.join(".git"));
     store.ensure_layout()?;
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
     match direction {
-        Direction::Smudge => smudge(&store, repo, input, output),
-        Direction::Clean => clean(&store, repo, input, output),
+        Direction::Smudge => smudge(&store, repo, input, &mut output),
+        Direction::Clean => clean(&store, repo, input, &mut output),
     }
 }
 
@@ -290,6 +310,10 @@ fn clean(
 pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) -> Result<()> {
     let store = LfsStore::in_git_dir(repo.join(".git"));
     store.ensure_layout()?;
+    // The long-running form carries the same content through the same pipe, so
+    // it wants the same buffer. See [`OUTPUT_BUFFER_BYTES`].
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
+    let output = &mut output;
 
     if !handshake(input, output)? {
         return Ok(());
@@ -1036,6 +1060,70 @@ mod tests {
         assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
         assert_eq!(answers[0].body, payload);
         assert!(answers[0].trailer.is_empty(), "no mid-stream failure");
+    }
+
+    /// A writer that answers "how many times did this process have to ask the
+    /// kernel", which is the question behind the energy figure.
+    struct CountingWriter {
+        inner: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.inner.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The object crosses the pipe in buffers, not in `io::copy`'s 8 KiB
+    /// mouthfuls.
+    ///
+    /// Every one of those is a syscall and a wake for git on the other end, and
+    /// the writer it hands us — `Stdout`, a `LineWriter` — coalesces none of
+    /// them, because binary content has newlines all through it and a
+    /// `LineWriter` flushes to the last one in every write it is given. A
+    /// folder syncing all day was measured at 8 200 context switches a second
+    /// against 3% CPU; this is where they were going.
+    #[test]
+    fn a_served_object_reaches_the_pipe_in_buffers_not_in_mouthfuls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        // Comfortably larger than the output buffer, so the ratio is the thing
+        // being measured rather than a rounding artefact.
+        let payload = vec![9u8; OUTPUT_BUFFER_BYTES * 4];
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("insert the object");
+        let pointer = Pointer::new(oid, size).render();
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/big.mov", pointer.as_bytes()));
+        let mut out = CountingWriter {
+            inner: Vec::new(),
+            writes: 0,
+        };
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        // What the payload alone would cost unbuffered, at `io::copy`'s buffer.
+        let unbuffered = payload.len() / 8_192;
+        assert!(
+            out.writes < unbuffered / 4,
+            "expected buffering to cut the writes well below {unbuffered}, got {}",
+            out.writes
+        );
+
+        // And the bytes are still all there, in order — a buffer that lost or
+        // reordered content would be a far worse bargain than the syscalls.
+        let answers = replies(&out.inner);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[0].body, payload);
     }
 
     #[test]

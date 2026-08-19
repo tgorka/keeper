@@ -10,7 +10,9 @@
 //! in the engine; this layer only translates types and maps errors into the one
 //! `IpcError` envelope the frontend already understands.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -1665,6 +1667,143 @@ pub async fn sync_unsubscribe_progress(
 /// Rejects with: `unsupported`, `internal` (no such profile, a malformed
 /// profile exclude pattern, a subpath that escapes the root, an unreadable
 /// directory).
+/// How long a listing waits for the sync marks before showing the folder without
+/// them.
+///
+/// [`Engine::pending`] is a `git status` over the whole worktree plus an
+/// untracked expansion that `lstat`s every candidate. On a folder of tens of
+/// thousands of files, on a drive already saturated by its own transfers, that
+/// is minutes — and every one of them was spent with the Files pane showing
+/// nothing at all, because the listing waited for marks it does not need in
+/// order to name a directory's entries.
+const BROWSE_MARKS_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long one answer is reused by later listings.
+///
+/// Short, because it decorates rows a person is looking at. Long enough to
+/// cover the burst that matters: the Files pane's refresh re-reads EVERY open
+/// directory, so ten expanded folders used to mean ten whole-repository walks
+/// of the same tree at the same moment.
+const BROWSE_MARKS_TTL: Duration = Duration::from_secs(3);
+
+/// What the row's `unavailable` reason says when the walk outran its budget.
+const BROWSE_MARKS_SLOW_SENTENCE: &str =
+    "This folder is busy, so the sync marks are not ready yet. They appear on the next listing.";
+
+/// The last pending view per profile, and whether one is being computed.
+///
+/// A process-wide memo rather than a field on `AppState`: it is a cache of an
+/// answer the engine already owns, it must be shared by every window, and
+/// nothing outside this one command reads it. `Instant` is stamped when the
+/// answer arrives, not when it was asked for, so a walk that took two minutes
+/// does not hand back a view that is two minutes stale the moment it lands.
+static BROWSE_MARKS: OnceLock<Mutex<HashMap<String, MarkSlot>>> = OnceLock::new();
+
+#[derive(Default)]
+struct MarkSlot {
+    answered: Option<(Instant, browse::PendingView)>,
+    walking: bool,
+}
+
+/// What a listing should do about one profile's marks.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkPlan {
+    /// Use this answer as it stands.
+    Serve(browse::PendingView),
+    /// A walk is already running and this is the best answer there is. `None`
+    /// means there has never been one, and the row says so rather than
+    /// claiming every entry is clean.
+    ServeWhileWalking(Option<browse::PendingView>),
+    /// Nothing usable and nobody walking: start one.
+    Walk,
+}
+
+impl MarkSlot {
+    /// The policy, separated from the plumbing so it can be read and tested
+    /// without an engine, a disk or a clock.
+    fn plan(&self, ttl: Duration) -> MarkPlan {
+        if let Some((at, view)) = self.answered.as_ref() {
+            if at.elapsed() < ttl {
+                return MarkPlan::Serve(view.clone());
+            }
+        }
+        if self.walking {
+            return MarkPlan::ServeWhileWalking(self.answered.as_ref().map(|(_, v)| v.clone()));
+        }
+        MarkPlan::Walk
+    }
+}
+
+fn browse_marks() -> &'static Mutex<HashMap<String, MarkSlot>> {
+    BROWSE_MARKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The sync marks for one profile: cached, or computed within a budget.
+///
+/// The walk is spawned rather than awaited in place, and the task stores its
+/// own result — so a walk that outruns [`BROWSE_MARKS_BUDGET`] is not wasted.
+/// Dropping the `JoinHandle` (which is what the timeout does) does not cancel a
+/// tokio task, so it runs to completion and the NEXT listing finds the answer
+/// waiting. Without that, a folder slow enough to time out once would never
+/// show a mark at all.
+async fn browse_marks_for(
+    engine: &Arc<keeper_sync::engine::Engine>,
+    id: &str,
+) -> (browse::PendingView, Option<String>) {
+    {
+        let mut marks = browse_marks().lock().expect("browse marks lock");
+        let slot = marks.entry(id.to_owned()).or_default();
+        match slot.plan(BROWSE_MARKS_TTL) {
+            MarkPlan::Serve(view) => return (view, None),
+            // One walk at a time per folder. A second would read the same tree
+            // off the same disk for the same answer, and on this hardware that
+            // is the difference the transfers feel.
+            MarkPlan::ServeWhileWalking(Some(view)) => return (view, None),
+            MarkPlan::ServeWhileWalking(None) => {
+                return (
+                    browse::PendingView::Unavailable,
+                    Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+                )
+            }
+            MarkPlan::Walk => slot.walking = true,
+        }
+    }
+
+    let walker = {
+        let engine = Arc::clone(engine);
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let answered = engine.pending(&id).await;
+            let mut marks = browse_marks().lock().expect("browse marks lock");
+            let slot = marks.entry(id).or_default();
+            slot.walking = false;
+            match &answered {
+                Ok(files) => {
+                    slot.answered = Some((
+                        Instant::now(),
+                        browse::PendingView::from_pending(files.clone()),
+                    ));
+                }
+                Err(_) => slot.answered = None,
+            }
+            answered.map(browse::PendingView::from_pending)
+        })
+    };
+
+    match tokio::time::timeout(BROWSE_MARKS_BUDGET, walker).await {
+        Ok(Ok(Ok(view))) => (view, None),
+        Ok(Ok(Err(error))) => (browse::PendingView::Unavailable, Some(error.to_string())),
+        // The task panicked. The slot stays flagged as walking, which is the
+        // safe way round: it stops a panicking walk being re-entered on every
+        // keystroke, and a restart clears it.
+        Ok(Err(join)) => (browse::PendingView::Unavailable, Some(join.to_string())),
+        Err(_) => (
+            browse::PendingView::Unavailable,
+            Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn sync_browse(
     state: tauri::State<'_, AppState>,
@@ -1677,11 +1816,9 @@ pub async fn sync_browse(
     let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
 
     // Before the walk, so one answer covers every entry in the directory and a
-    // thousand-row folder asks the engine once.
-    let (pending, unavailable) = match engine.pending(&id).await {
-        Ok(files) => (browse::PendingView::from_pending(files), None),
-        Err(error) => (browse::PendingView::Unavailable, Some(error.to_string())),
-    };
+    // thousand-row folder asks the engine once — and bounded, so a folder whose
+    // walk takes minutes still lists its entries now. See `browse_marks_for`.
+    let (pending, unavailable) = browse_marks_for(&engine, &id).await;
 
     let listing = {
         let profile = profile.clone();
@@ -3039,6 +3176,56 @@ mod tests {
             serde_json::Value::Object(map) => map,
             other => panic!("a profile is a JSON object, got {other}"),
         }
+    }
+
+    /// The Files pane used to wait for `Engine::pending` before it would name a
+    /// single entry — a whole-worktree `git status` plus an untracked
+    /// expansion. On a folder of tens of thousands of files on a busy drive
+    /// that is minutes of an empty pane, and the pane's own refresh asked for
+    /// it once per open directory.
+    #[test]
+    fn a_fresh_answer_is_served_and_a_stale_one_starts_a_walk() {
+        let view = browse::PendingView::Unavailable;
+        let fresh = MarkSlot {
+            answered: Some((Instant::now(), view.clone())),
+            walking: false,
+        };
+        assert_eq!(fresh.plan(Duration::from_secs(3)), MarkPlan::Serve(view));
+
+        // The same answer, now older than the window it is good for.
+        assert_eq!(fresh.plan(Duration::from_nanos(1)), MarkPlan::Walk);
+
+        assert_eq!(
+            MarkSlot::default().plan(Duration::from_secs(3)),
+            MarkPlan::Walk
+        );
+    }
+
+    /// One walk at a time per folder: a second reads the same tree off the same
+    /// disk for the same answer, which is exactly what made ten open
+    /// directories ten whole-repository walks at once.
+    #[test]
+    fn a_walk_in_progress_serves_what_there_is_rather_than_starting_another() {
+        let stale = browse::PendingView::Known(Default::default());
+        let walking_with_answer = MarkSlot {
+            answered: Some((Instant::now(), stale.clone())),
+            walking: true,
+        };
+        // Stale but usable: a mark a few seconds old beats no mark at all.
+        assert_eq!(
+            walking_with_answer.plan(Duration::from_nanos(1)),
+            MarkPlan::ServeWhileWalking(Some(stale))
+        );
+
+        let walking_first_time = MarkSlot {
+            answered: None,
+            walking: true,
+        };
+        assert_eq!(
+            walking_first_time.plan(Duration::from_secs(3)),
+            MarkPlan::ServeWhileWalking(None),
+            "and with nothing to serve it says so, rather than calling every entry clean"
+        );
     }
 
     /// AD-34-9, mechanized. The old `parse_req` rebuilt the profile from

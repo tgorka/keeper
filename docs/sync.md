@@ -367,6 +367,24 @@ never rewritten.
 A failure to release is logged and never fails the sync — reclaiming space is
 housekeeping.
 
+### The filter's output is buffered, and why that shows up as energy
+
+Content reaches git through the filter's stdout, and `std::io::Stdout` is a
+`LineWriter`: it flushes to the last newline in every write it is handed.
+Binary content has newlines all through it, so nothing coalesces — a large
+object crossed the pipe in `io::copy`-sized mouthfuls, each one a syscall and a
+wake for git on the other end.
+
+That is invisible in a CPU column and plain in an energy one. A folder syncing
+all day was measured at **8 200 context switches a second against 3% CPU**, with
+about two idle wakeups a second — not a timer problem, an I/O-shape problem. The
+filter now gathers its output in 256 KiB buffers, which is safe only because
+every response already ends in an explicit flush; the protocol has to flush,
+because git waits on it.
+
+This is a reduction, not a cure. A folder moving tens of gigabytes over a slow
+link is expensive because of the bytes, and no amount of buffering changes that.
+
 ### The rule is recorded per extension — which is why `lfsNever` exists
 
 The decision is per file and by size, but the rule keeper writes into
@@ -615,7 +633,23 @@ timeout would have to be longer than the longest legitimate transfer, and would
 therefore be useless for catching a stall. Connecting is bounded separately, at
 15 s.
 
-Both live in `keeper_sync::http`, which is the only place a client is built.
+A third knob lives beside them: an idle **pooled** connection is kept for at
+most 20 s rather than `reqwest`'s default 90 s. Keep-alive is worth having — an
+LFS batch and the download it authorises are two requests seconds apart — but a
+pooled connection is only an asset while the peer still has it, and reusing one
+the far side has forgotten costs a whole read timeout before anything is even
+attempted.
+
+That last one is a hypothesis rather than a diagnosis, and it is recorded as
+one: throughput on a folder was seen decaying over hours (300 kB/s after a
+restart, 25 kB/s an hour later) and restored by restarting the app every time. A
+fresh process has an empty pool, which fits. Accumulated backoff does not
+(nothing was waiting on a clock when measured), and neither does a resource leak
+(67 MB, 62 threads, four sockets after an hour). If the decay outlives this, the
+cause is elsewhere — and a 20 s window is still the better default.
+
+All three live in `keeper_sync::http`, which is the only place a client is
+built.
 
 ---
 
@@ -634,8 +668,13 @@ Both live in `keeper_sync::http`, which is the only place a client is built.
   left. Counted from the journal, never estimated — a remaining *time* on a link
   whose throughput varies by an order of magnitude is a guess dressed as a fact.
 - **In-app**: a progress meter, the same line, and — while a transfer is running
-  — the repository-relative path of the file being moved, under the bar beside
-  the rate. The path rides the streamed progress rather than the line: that
+  — the rate and then the repository-relative path of the file being moved, on
+  one row under the bar. The figures lead because they are the fixed-width half
+  and the half that changes every tick; the path truncates into what is left.
+  The rate sits in a box reserved for the widest figure the formatter can
+  produce (`999 bytes/s`) and is right-aligned inside it, so `2 kB/s` and
+  `294.8 kB/s` leave everything after them in the same place; the box is held
+  open, and stands empty, when there is no rate to show. The path rides the streamed progress rather than the line: that
   string is the tray's too, and a path four folders deep does not belong in a
   menu item. A queue that predates the name is filled in from the index on the
   next drain, once per folder per run, because naming otherwise happens only at
@@ -687,6 +726,22 @@ never shrinks; the expensive one is the same bytes fetched twice.
 Transfers now treat a running unit as cover, and recovery collapses the pairs
 that already exist — while one half is `running` the pair is invisible, and the
 moment startup returns it to `pending` there are two identical rows.
+
+### Sync marks never hold up a listing
+
+The Files view decorates each row with how far that path got toward the remote,
+which comes from the same `pending` answer §11 describes — a whole-worktree
+`git status` plus an untracked expansion that `lstat`s every candidate. The
+listing used to **wait** for it before naming a single entry, and the pane's
+refresh asked for it once per open directory: ten expanded folders, ten walks of
+the same tree at the same moment. On a folder of tens of thousands of files on a
+drive already saturated by its own transfers, that is minutes of an empty pane.
+
+The walk is now bounded (3 s) and shared: one at a time per folder, its answer
+reused for a few seconds, and — because the walk is spawned rather than awaited
+in place — an answer that outruns the budget still lands, ready for the next
+listing. A folder with no answer yet says so; it never reports its rows as
+clean, which is the one wrong thing a fast listing could have done.
 
 ### The Sync view's Activity list
 
