@@ -255,6 +255,15 @@ pub struct PendingFile {
     /// Repository-relative.
     pub path: String,
     pub reason: PendingReason,
+    /// How big the thing waiting is, when that is knowable.
+    ///
+    /// Inbound rows have always carried it — the announced size of an object
+    /// that has not arrived. Outbound rows are measured off the worktree, so a
+    /// list holding both reads as one list rather than two half-populated
+    /// columns. `None` where there is nothing to measure: a deletion has no
+    /// file left, and a path that vanished between the walk and the stat is not
+    /// worth failing a listing over.
+    pub size_bytes: Option<u64>,
 }
 
 /// A unit of work the engine has given up on, as a human needs to see it.
@@ -5630,11 +5639,18 @@ impl Engine {
             }
             let relative = relative.to_string_lossy().into_owned();
             if named.insert(relative.clone()) {
+                // `path` here is absolute — the gate stores it that way, which
+                // is the whole reason `relative` is derived above.
+                let size_bytes = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len());
                 out.push(PendingFile {
                     path: relative,
                     reason: PendingReason::Settling {
                         since_ms: entry.pending_since_ms,
                     },
+                    size_bytes,
                 });
             }
         }
@@ -5688,9 +5704,21 @@ impl Engine {
                     // Already named as settling, or reported by two status
                     // buckets at once (staged as added, then edited again).
                     if named.insert(relative.clone()) {
+                        // Measured off the worktree, and only where there is
+                        // something to measure: a deleted path has no file, and
+                        // a stat that fails is a size nobody can report rather
+                        // than a listing that fails.
+                        let size_bytes = match reason {
+                            PendingReason::Deleted => None,
+                            _ => std::fs::metadata(profile.local_path.join(rela))
+                                .ok()
+                                .filter(|m| m.is_file())
+                                .map(|m| m.len()),
+                        };
                         out.push(PendingFile {
                             path: relative,
                             reason: reason.clone(),
+                            size_bytes,
                         });
                     }
                 }
@@ -5714,6 +5742,7 @@ impl Engine {
                 out.push(PendingFile {
                     path,
                     reason: PendingReason::Incoming { size_bytes },
+                    size_bytes: Some(size_bytes),
                 });
             }
         }
@@ -9227,6 +9256,8 @@ mod tests {
                 reason: PendingReason::Settling {
                     since_ms: opened_at
                 },
+                // The bytes the gate is holding, measured off the worktree.
+                size_bytes: Some(13),
             }],
             "a held file reports why it is held and since when — not `untracked`, \
              which would read as sync being broken"
@@ -9390,6 +9421,8 @@ mod tests {
             vec![PendingFile {
                 path: "sub/deeper/x.txt".to_owned(),
                 reason: PendingReason::Untracked,
+                // `b"x"`, measured off the worktree like every outbound row.
+                size_bytes: Some(1),
             }]
         );
     }
@@ -9602,6 +9635,7 @@ mod tests {
             vec![PendingFile {
                 path: closed.to_owned(),
                 reason: PendingReason::Untracked,
+                size_bytes: Some(b"a segment that closed".len() as u64),
             }],
             "only the finished segment is waiting; the one being written is not a file sync has an opinion about"
         );
@@ -9818,10 +9852,11 @@ mod tests {
         let pending = PendingFile {
             path: "notes/a.md".to_owned(),
             reason: PendingReason::Settling { since_ms: 42 },
+            size_bytes: Some(4_096),
         };
         assert_eq!(
             serde_json::to_string(&pending).expect("serialize"),
-            r#"{"path":"notes/a.md","reason":{"kind":"settling","sinceMs":42}}"#
+            r#"{"path":"notes/a.md","reason":{"kind":"settling","sinceMs":42},"sizeBytes":4096}"#
         );
 
         let report = ProblemReport {
