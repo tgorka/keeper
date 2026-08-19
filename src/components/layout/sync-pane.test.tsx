@@ -70,6 +70,8 @@ import {
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
   SYNC_PENDING_EMPTY_SENTENCE,
+  SYNC_PENDING_INBOUND_WORD,
+  SYNC_PENDING_OUTBOUND_WORD,
   SYNC_PENDING_TITLE,
   SYNC_PROBLEMS_TITLE,
   SYNC_RESCAN_LABEL,
@@ -1243,6 +1245,28 @@ describe("SyncPane pending", () => {
     expect(rows[0]).toHaveTextContent("notes/draft.md");
     expect(rows[1]).toHaveTextContent("notes/scratch.md");
     expect(rows[1]).toHaveTextContent("New file, not synced yet");
+  });
+
+  /** The list carries both directions now, so each row has to say which one it
+   * is without the reader parsing the sentence at the far end. */
+  it("marks which way each pending row is travelling", async () => {
+    mockPending.mockResolvedValue([
+      { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
+      {
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      },
+    ]);
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_INBOUND_WORD);
+    // and the direction is a word for a screen reader, not only an arrow
+    expect(rows[1]).toHaveTextContent("Waiting to download · 405.8 MB");
   });
 
   it("explains a settling file as a wait so far, never as a finish time", async () => {

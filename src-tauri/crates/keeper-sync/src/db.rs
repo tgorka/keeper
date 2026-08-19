@@ -579,6 +579,25 @@ impl WorkKind {
     /// queues one and has to be able to assert it did (DW-207).
     pub const PULL: &'static str = "pull";
 
+    /// Whether an identical unit ALREADY RUNNING covers this work.
+    ///
+    /// A transfer is content-addressed: `LfsDownload { oid, size }` names
+    /// immutable bytes, so a second unit for an object already in flight can
+    /// only fetch what the first one is fetching. A push is the opposite — it
+    /// publishes whatever the worktree holds *when it runs*, so a change made
+    /// after it started genuinely needs its own unit, and treating the running
+    /// one as cover would drop that change until something else queued a push.
+    ///
+    /// That asymmetry is why [`enqueue_unique`] ignored `running` for
+    /// everything: correct for pushes, and quietly wrong for transfers.
+    /// Measured on a folder pulling 53 GB — 106 queued units for 95 distinct
+    /// objects, every duplicate a `running` object re-queued by the next scan.
+    /// The visible symptom is a queue that never shrinks; the invisible one is
+    /// the same bytes fetched twice.
+    pub fn covered_while_running(&self) -> bool {
+        matches!(self, Self::LfsUpload { .. } | Self::LfsDownload { .. })
+    }
+
     /// Discriminant used as the journal's `kind` column, so a row can be
     /// filtered without deserializing its payload.
     pub fn tag(&self) -> &'static str {
@@ -675,14 +694,21 @@ pub fn enqueue_unique(
 ) -> Result<i64> {
     let payload = serde_json::to_string(kind)
         .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    // `running` counts as cover only for work whose identity is its content —
+    // see [`WorkKind::covered_while_running`] for the asymmetry and what
+    // ignoring it cost.
+    let sql = if kind.covered_while_running() {
+        "SELECT id FROM journal
+          WHERE profile_id = ?1 AND payload = ?2
+            AND state IN ('pending','deferred','running')
+          LIMIT 1"
+    } else {
+        "SELECT id FROM journal
+          WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
+          LIMIT 1"
+    };
     let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM journal
-             WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
-             LIMIT 1",
-            (profile_id, &payload),
-            |r| r.get(0),
-        )
+        .query_row(sql, (profile_id, &payload), |r| r.get(0))
         .optional()?;
     if let Some(id) = existing {
         return Ok(id);
@@ -778,6 +804,28 @@ pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     )?;
     if n > 0 {
         tracing::info!(count = n, "re-queued sync work interrupted by a restart");
+    }
+    // Collapse what the return can reveal. Until `enqueue_unique` learned to
+    // treat a running transfer as cover, an object being downloaded could be
+    // queued a second time by the next scan; the pair is invisible while one
+    // half is `running` and becomes two identical pending rows the moment this
+    // statement runs. Identical payload is identical work, so the older row
+    // keeps the queue's place and the copy goes.
+    //
+    // Both halves of the fix are needed: this one clears the queues that
+    // already exist, and the enqueue rule stops new ones forming.
+    let collapsed = conn.execute(
+        "DELETE FROM journal
+          WHERE state = 'pending'
+            AND id NOT IN (
+                SELECT MIN(id) FROM journal
+                 WHERE state = 'pending'
+                 GROUP BY profile_id, payload
+            )",
+        [],
+    )?;
+    if collapsed > 0 {
+        tracing::info!(count = collapsed, "collapsed duplicate queued work");
     }
     Ok(n)
 }
@@ -2264,5 +2312,76 @@ mod tests {
             (0, 0),
             "and it never reaches across profiles"
         );
+    }
+
+    /// The bug the queue tail made visible: 106 units for 95 objects on a
+    /// folder pulling 53 GB, every duplicate a `running` object re-queued by
+    /// the next scan. A transfer is content-addressed — the same oid names the
+    /// same immutable bytes — so a second unit can only fetch what the first
+    /// one is already fetching.
+    #[test]
+    fn a_running_transfer_covers_an_identical_enqueue() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "f".repeat(64),
+            size: 4_096,
+        };
+        let first = enqueue_unique(&c, "p", &unit, 1, 1).expect("first");
+        let claimed = claim_ready(&c, "p", 10, 10).expect("claim");
+        assert_eq!(claimed.len(), 1, "it is running now");
+
+        let second = enqueue_unique(&c, "p", &unit, 2, 2).expect("second");
+        assert_eq!(second, first, "the running unit is the one that covers it");
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(total, 1, "a queue that never shrinks is how this looked");
+    }
+
+    /// A push is NOT covered by one in flight: it publishes what the worktree
+    /// holds when it runs, so a change made after it started needs its own
+    /// unit. Dropping it would strand that change until something else queued
+    /// a push — which is why the running state was ignored in the first place.
+    #[test]
+    fn a_running_push_does_not_cover_a_later_one() {
+        let c = conn();
+        let first = enqueue_unique(&c, "p", &WorkKind::Push, 1, 1).expect("first");
+        claim_ready(&c, "p", 10, 10).expect("claim");
+
+        let second = enqueue_unique(&c, "p", &WorkKind::Push, 2, 2).expect("second");
+        assert_ne!(
+            second, first,
+            "the running push cannot publish a change made after it started"
+        );
+    }
+
+    /// The queues that already exist. While one half is `running` the pair is
+    /// invisible; the moment recovery returns it to `pending` there are two
+    /// identical rows, and identical payload is identical work.
+    #[test]
+    fn recovery_collapses_a_duplicate_the_return_reveals() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "a".repeat(64),
+            size: 8,
+        };
+        let kept = enqueue(&c, "p", &unit, 1, 1).expect("first");
+        // Exactly the shape the old enqueue rule produced: a second row for an
+        // object already in flight.
+        c.execute("UPDATE journal SET state = 'running' WHERE id = ?1", [kept])
+            .expect("run it");
+        let copy = enqueue(&c, "p", &unit, 2, 2).expect("duplicate");
+
+        recover_running(&c, 5).expect("recover");
+
+        let rows: Vec<i64> = c
+            .prepare("SELECT id FROM journal ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        assert_eq!(rows, vec![kept], "the copy goes, the queue's place stays");
+        assert!(!rows.contains(&copy));
     }
 }

@@ -667,6 +667,27 @@ Uploads are deliberately not listed: the path an upload carries is already
 reported by `git status` as a local change, and one fact wearing two hats reads
 as two.
 
+Each row carries a direction glyph, because a list holding both is otherwise a
+column of paths whose direction has to be inferred from the sentence at the far
+end of the row.
+
+### One object, one unit — including while it runs
+
+`enqueue_unique` deduplicates against work that is queued. It used to ignore
+work that is **running**, which is right for a push — that publishes whatever
+the worktree holds when it runs, so a change made after it started needs its own
+unit — and wrong for a transfer, which is content-addressed: the same oid names
+the same immutable bytes.
+
+The cost was invisible until the queue tail printed a total: a folder pulling
+53 GB held **106 queued units for 95 distinct objects**, every duplicate a
+running object re-queued by the next scan. The visible symptom is a queue that
+never shrinks; the expensive one is the same bytes fetched twice.
+
+Transfers now treat a running unit as cover, and recovery collapses the pairs
+that already exist — while one half is `running` the pair is invisible, and the
+moment startup returns it to `pending` there are two identical rows.
+
 ### The Sync view's Activity list
 
 Each folder's card lists the files it recently carried, newest first. Every row
