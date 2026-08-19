@@ -709,9 +709,24 @@ Uploads are deliberately not listed: the path an upload carries is already
 reported by `git status` as a local change, and one fact wearing two hats reads
 as two.
 
-Each row carries a direction glyph, because a list holding both is otherwise a
-column of paths whose direction has to be inferred from the sentence at the far
-end of the row.
+Each row leads with one glyph answering two questions, because a row has space
+for one: the arrow's **direction** says which way the file is travelling, and
+whether it is **circled** says whether the far end already holds something. A
+bare arrow is content nobody has yet; a circled one is a second version of
+something that does. There is no circled *down* arrow in use — a download is
+queued only for a path whose worktree still holds pointer text, so "an update
+arriving" is not a state this queue can be in.
+
+The reason is no longer written out beside each path. It is the row's accessible
+description, which is where it was useful; the right-hand column carries the
+size instead, on **every** row — outbound sizes are measured off the worktree,
+inbound ones are what the object announced. A list where only half the rows had
+a figure read as two lists.
+
+The row a transfer is on right now is marked, by name as well as by shade: a
+background colour is nothing to a screen reader. Only that row — a row that is
+merely next is not marked, because "in flight" is a fact and "about to be" is a
+guess about a queue that reorders.
 
 ### One object, one unit — including while it runs
 

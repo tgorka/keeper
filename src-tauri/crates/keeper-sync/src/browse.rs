@@ -1535,6 +1535,7 @@ mod tests {
         let pending = PendingView::from_pending(vec![PendingFile {
             path: "notes-archive/late.md".to_owned(),
             reason: PendingReason::Untracked,
+            size_bytes: None,
         }]);
 
         assert_eq!(

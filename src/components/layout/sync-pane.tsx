@@ -57,11 +57,14 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   CircleAlert,
+  CircleArrowDown,
+  CircleArrowUp,
   CircleCheck,
   CircleDashed,
   CircleMinus,
   CirclePlus,
   CircleSlash,
+  Clock,
   FileIcon,
   SquarePen,
   TriangleAlert,
@@ -434,6 +437,39 @@ export const SYNC_DELIVERY_STATES: Record<
 export const SYNC_PENDING_INBOUND_WORD = "Coming in";
 export const SYNC_PENDING_OUTBOUND_WORD = "Going out";
 
+/**
+ * The glyph a pending row leads with, and the words behind it.
+ *
+ * Two questions in one mark, because a row has space for one: an arrow's
+ * **direction** says which way the file is travelling, and whether it is
+ * **circled** says whether the thing at the other end already exists. A bare
+ * arrow is content nobody has yet; a circled one is a second version of
+ * something that does.
+ *
+ * `PENDING_INBOUND_UPDATE_MARK` below is deliberately unused. An inbound row is
+ * always new content — a download is queued only for a path whose worktree
+ * still holds pointer text (`lfs::stage::pending_smudges`), so "an update
+ * arriving" is not a state this queue can be in. When it becomes one, that is
+ * the mark it takes and the scheme above stays true.
+ *
+ * The word is what a screen reader gets. An arrow is a shape, and "up" is not a
+ * fact about a file.
+ */
+export const PENDING_MARKS: Record<string, { icon: typeof FileIcon; word: string }> = {
+  untracked: { icon: ArrowUpFromLine, word: `New file · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  added: { icon: ArrowUpFromLine, word: `New file · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  modified: { icon: CircleArrowUp, word: `Changed · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  deleted: { icon: CircleMinus, word: `Deleted · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  settling: { icon: Clock, word: SYNC_SETTLING_SENTENCE },
+  incoming: { icon: ArrowDownToLine, word: `New file · ${SYNC_PENDING_INBOUND_WORD}` },
+};
+
+/** Reserved for an inbound row that replaces content this clone already has. */
+export const PENDING_INBOUND_UPDATE_MARK = CircleArrowDown;
+
+/** Names the row a transfer is moving right now. */
+export const SYNC_PENDING_CURRENT_WORD = "Syncing now";
+
 /** Why a file is waiting, for every reason except `settling` (which is timed). */
 const PENDING_REASONS: Record<string, string> = {
   untracked: "New file, not synced yet",
@@ -493,11 +529,11 @@ export function syncPendingReason(pending: SyncPendingVm, now: number = Date.now
       ? SYNC_SETTLING_SENTENCE
       : `${SYNC_SETTLING_SENTENCE} · ${formatSyncWaited(pending.sinceMs, now)} so far`;
   }
-  const phrase = PENDING_REASONS[pending.reason] ?? pending.reason;
-  // The size belongs to `incoming` and to nothing else: it is what separates a
-  // queue of two minutes from one of four days, and for a file already on this
-  // disk it would answer a question nobody asked.
-  return pending.sizeBytes === null ? phrase : `${phrase} · ${formatCopyBytes(pending.sizeBytes)}`;
+  // No size here any more: every row carries one, and it is rendered in a column
+  // of its own rather than glued onto a sentence which is itself no longer
+  // shown. What this composes now is the row's ACCESSIBLE description; the
+  // glyph is what a sighted reader gets.
+  return PENDING_REASONS[pending.reason] ?? pending.reason;
 }
 
 /** What a parked unit was doing and how hard keeper tried. */
@@ -1152,7 +1188,7 @@ function SyncProfileCard({
           busy={busy}
           onRetry={retryUnit}
         />
-        <SyncPendingList profile={profile} rows={detail?.pending ?? null} />
+        <SyncPendingList profile={profile} rows={detail?.pending ?? null} current={current} />
         <SyncProblemsSection
           profile={profile}
           problems={detail?.problems ?? null}
@@ -1372,9 +1408,12 @@ function SyncDeliveryMark({
 function SyncPendingList({
   profile,
   rows,
+  current,
 }: {
   profile: SyncProfileVm;
   rows: SyncPendingVm[] | null;
+  /** The path a transfer is moving right now, from the streamed progress. */
+  current: string | null;
 }) {
   const settling = rows?.some((row) => row.reason === "settling");
   const fold = useFold(rows);
@@ -1391,31 +1430,54 @@ function SyncPendingList({
             aria-label={`${SYNC_PENDING_TITLE}: ${profile.name}`}
             className="flex flex-col gap-1.5"
           >
-            {fold.visible.map((row) => (
-              <li key={`${row.reason}-${row.path}`} className="flex items-center gap-3">
-                {(() => {
-                  const inbound = row.reason === "incoming";
-                  const Direction = inbound ? ArrowDownToLine : ArrowUpFromLine;
-                  return (
-                    <>
-                      <Direction
-                        aria-hidden="true"
-                        className="size-3.5 shrink-0 text-muted-foreground"
-                      />
-                      <span className="sr-only">
-                        {inbound ? SYNC_PENDING_INBOUND_WORD : SYNC_PENDING_OUTBOUND_WORD}{" "}
-                      </span>
-                    </>
-                  );
-                })()}
-                <span className="min-w-0 flex-1 truncate font-mono text-xs" title={row.path}>
-                  {row.path}
-                </span>
-                <span className="shrink-0 text-muted-foreground text-xs">
-                  {syncPendingReason(row)}
-                </span>
-              </li>
-            ))}
+            {fold.visible.map((row) => {
+              const mark = PENDING_MARKS[row.reason];
+              const Mark = mark?.icon ?? FileIcon;
+              // The row the transfer is on right now. Compared by path because
+              // that is what both sides are keyed by; a row that is merely
+              // *next* is not marked, because "in flight" is a fact and "about
+              // to be" is a guess about a queue that reorders.
+              const syncing = current !== null && row.path === current;
+              return (
+                <li
+                  key={`${row.reason}-${row.path}`}
+                  aria-current={syncing ? "true" : undefined}
+                  className={`-mx-1.5 flex items-center gap-3 rounded-sm px-1.5 ${
+                    syncing ? "bg-muted" : ""
+                  }`}
+                >
+                  <Mark aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+                  {/* The sentence the row no longer shows. A glyph is the whole
+                      answer for a reader who can see it and none of it for one
+                      who cannot. */}
+                  <span className="sr-only">
+                    {/* A settling row is described rather than named: its whole
+                        point is HOW LONG it has been held, which a fixed word
+                        cannot carry and the glyph certainly cannot. */}
+                    {row.reason === "settling" || mark === undefined
+                      ? syncPendingReason(row)
+                      : mark.word}
+                    {syncing ? ` · ${SYNC_PENDING_CURRENT_WORD}` : ""}{" "}
+                  </span>
+                  <span
+                    className={`min-w-0 flex-1 truncate font-mono text-xs ${
+                      syncing ? "text-foreground" : ""
+                    }`}
+                    title={`${row.path} — ${syncPendingReason(row)}`}
+                  >
+                    {row.path}
+                  </span>
+                  {/* A size nobody could measure shows nothing, the same rule
+                      the Activity list follows: "0 B" would claim the file is
+                      empty. */}
+                  {row.sizeBytes !== null && (
+                    <span className="shrink-0 font-mono text-muted-foreground text-xs">
+                      {formatCopyBytes(row.sizeBytes)}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
           <FoldToggle rows={rows} fold={fold} label={`${SYNC_PENDING_TITLE}: ${profile.name}`} />
           {settling && <p className="text-muted-foreground text-xs">{SYNC_SETTLING_NOTE}</p>}

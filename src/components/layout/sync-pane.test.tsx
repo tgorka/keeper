@@ -69,6 +69,7 @@ import {
   SYNC_PANE_EMPTY_SENTENCE,
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
+  SYNC_PENDING_CURRENT_WORD,
   SYNC_PENDING_EMPTY_SENTENCE,
   SYNC_PENDING_INBOUND_WORD,
   SYNC_PENDING_OUTBOUND_WORD,
@@ -1263,7 +1264,10 @@ describe("SyncPane pending", () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("notes/draft.md");
     expect(rows[1]).toHaveTextContent("notes/scratch.md");
-    expect(rows[1]).toHaveTextContent("New file, not synced yet");
+    // The reason is the row's accessible description now, not visible prose:
+    // the glyph carries it for a reader who can see it.
+    expect(rows[1]).toHaveTextContent("New file");
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
   });
 
   /** The list carries both directions now, so each row has to say which one it
@@ -1284,8 +1288,48 @@ describe("SyncPane pending", () => {
     const rows = within(list).getAllByRole("listitem");
     expect(rows[0]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
     expect(rows[1]).toHaveTextContent(SYNC_PENDING_INBOUND_WORD);
-    // and the direction is a word for a screen reader, not only an arrow
-    expect(rows[1]).toHaveTextContent("Waiting to download · 405.8 MB");
+    // Both halves of the mark: which way, and whether the far end already has
+    // something. A bare arrow is new content; a circled one is a second version.
+    expect(rows[0]).toHaveTextContent("New file");
+    expect(rows[1]).toHaveTextContent("New file");
+    // The size is a column of its own, and both directions have one — the
+    // uploads used to show none, which is what made the list read as two.
+    expect(rows[1]).toHaveTextContent("405.8 MB");
+    // And no prose: the sentence lives in the accessible name, not the row.
+    expect(rows[1]).not.toHaveTextContent("Waiting to download ·");
+  });
+
+  /** Which of the queued rows is the one actually moving right now. */
+  it("marks the row the transfer is on, and only that one", async () => {
+    mockPending.mockResolvedValue([
+      { path: "70-comms/camera-0000.mov", reason: "incoming", sinceMs: null, sizeBytes: 9_500_000 },
+      {
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      },
+    ]);
+    await renderPane();
+
+    act(() => {
+      emitProgress?.(
+        progressVm({
+          phase: "downloadingLfs",
+          fraction: 0.2,
+          current: "70-comms/camera-0001.mov",
+          bytesPerSecond: 294_800,
+        }),
+      );
+    });
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows[0]).not.toHaveAttribute("aria-current");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    // Named, not merely shaded: a background colour is nothing to a screen
+    // reader and nothing to anyone who cannot separate these two greys.
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_CURRENT_WORD);
   });
 
   it("explains a settling file as a wait so far, never as a finish time", async () => {
@@ -1886,8 +1930,8 @@ describe("sync pane projections", () => {
     expect(
       syncPendingReason({ path: "a", reason: "quarantined", sinceMs: null, sizeBytes: null }),
     ).toBe("quarantined");
-    // The one inbound reason, and the only one that carries a size: a queue of
-    // 106 objects is two minutes or four days depending on it.
+    // The size is NOT in here any more: it is a column of its own, on every
+    // row, so this composes the accessible description alone.
     expect(
       syncPendingReason({
         path: "70-comms/camera-0001.mov",
@@ -1895,11 +1939,7 @@ describe("sync pane projections", () => {
         sinceMs: null,
         sizeBytes: 405_800_000,
       }),
-    ).toBe("Waiting to download · 405.8 MB");
-    // And an outbound row does not grow a size it was never about.
-    expect(
-      syncPendingReason({ path: "a.md", reason: "modified", sinceMs: null, sizeBytes: null }),
-    ).toBe("Changed, not synced yet");
+    ).toBe("Waiting to download");
   });
 
   it("counts a single attempt in the singular and an unknown kind as itself", () => {

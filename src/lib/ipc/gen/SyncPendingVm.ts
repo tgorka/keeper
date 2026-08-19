@@ -13,9 +13,10 @@ export type SyncPendingVm = { path: string,
  */
 reason: string, 
 /**
- * Announced size, for `incoming` only — the one thing worth knowing about
- * an object that has not arrived. `null` for every other reason, where the
- * file is already on this disk and its size is not what the row is about.
+ * How big the thing waiting is: announced, for an object that has not
+ * arrived; measured off the worktree for one that has not left. `null`
+ * only where there is nothing to measure — a deletion has no file, and a
+ * path that vanished between the walk and the stat has no size to report.
  */
 sizeBytes: number | null, 
 /**
