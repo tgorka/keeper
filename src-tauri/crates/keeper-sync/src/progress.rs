@@ -429,13 +429,6 @@ pub struct SyncStatus {
     /// how "up to date" came to be printed over it. Maintained by the scan,
     /// which is the only thing that knows.
     pub settling: u32,
-    /// The path in flight, mirrored from the streamed progress so a surface
-    /// that polls sees the same file as one that subscribes.
-    ///
-    /// Deliberately NOT in [`status_line`]: that string is also the tray's, and
-    /// a menu item is no place for a path four folders deep. The window has
-    /// room for a second line; the tray does not.
-    pub current: Option<String>,
     /// Transfers still to be delivered, and their bytes — the queue *behind*
     /// the file in flight, which `bytes_total` says nothing about.
     ///
@@ -472,7 +465,6 @@ impl SyncStatus {
             bytes_total: None,
             pending: 0,
             settling: 0,
-            current: None,
             queued_files: 0,
             queued_bytes: 0,
             warning: None,

@@ -634,9 +634,12 @@ Both live in `keeper_sync::http`, which is the only place a client is built.
   left. Counted from the journal, never estimated — a remaining *time* on a link
   whose throughput varies by an order of magnitude is a guess dressed as a fact.
 - **In-app**: a progress meter, the same line, and — while a transfer is running
-  — the repository-relative path of the file being moved, on its own row. The
-  path is deliberately not in the line: that string is the tray's too, and a
-  path four folders deep does not belong in a menu item.
+  — the repository-relative path of the file being moved, under the bar beside
+  the rate. The path rides the streamed progress rather than the line: that
+  string is the tray's too, and a path four folders deep does not belong in a
+  menu item. A queue that predates the name is filled in from the index on the
+  next drain, once per folder per run, because naming otherwise happens only at
+  enqueue and an upgrade mid-backlog would never reach that moment again.
 - **In-app**: a sticky amber warning banner. Warnings that need a decision get
   an inline action button.
 - **Notifications** fire exactly once per warning onset.

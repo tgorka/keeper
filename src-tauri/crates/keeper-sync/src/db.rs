@@ -269,6 +269,38 @@ pub fn label_unit(conn: &Connection, id: i64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Queued transfers that have no name yet, as oid → the units wanting it.
+///
+/// Every row queued before the `label` column existed is in here, which on an
+/// install that upgraded mid-backlog is the entire queue: naming happens when
+/// work is enqueued, and that already happened. Without a way to fill them in
+/// afterwards the feature would arrive for a folder that has nothing left to do.
+///
+/// Keyed by oid rather than by unit because the answer is found by walking the
+/// index once and asking "does anything want this object", which is O(index)
+/// instead of O(index × units).
+pub fn unlabelled_transfers(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<i64>>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, json_extract(payload, '$.oid') FROM journal
+          WHERE profile_id = ?1
+            AND state != 'parked'
+            AND label IS NULL
+            AND json_extract(payload, '$.oid') IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, oid) = row?;
+        out.entry(oid).or_default().push(id);
+    }
+    Ok(out)
+}
+
 /// How much transferable work is left for one profile: units, and their bytes.
 ///
 /// Counted together in one statement so the two numbers can never disagree,

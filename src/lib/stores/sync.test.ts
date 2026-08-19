@@ -84,7 +84,6 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     profileName: "tgdrive",
     state: "idle",
     phase: "idle",
-    current: null,
     queuedFiles: 0,
     queuedBytes: 0,
     line: "tgdrive — up to date",

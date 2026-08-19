@@ -232,7 +232,6 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     state: "watching",
     phase: "idle",
     line: RUST_LINE,
-    current: null,
     queuedFiles: 0,
     queuedBytes: 0,
     filesDone: 0,

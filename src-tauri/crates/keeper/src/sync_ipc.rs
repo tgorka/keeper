@@ -242,13 +242,6 @@ pub struct SyncStatusVm {
     /// words; the number is here so a surface can show it without parsing prose.
     #[ts(type = "number")]
     pub settling: u32,
-    /// Repository-relative path of the file being transferred, when one file
-    /// owns the work. `null` for a leg that moves many paths at once.
-    ///
-    /// Absent from `line` on purpose — that string is the tray's too, and a
-    /// path four folders deep does not belong in a menu item. A window with
-    /// room shows it on its own line.
-    pub current: Option<String>,
     /// Transfers still to be delivered, and their bytes. `line` says both in
     /// words; the numbers are here so a surface can show them without parsing
     /// prose, the same reason `settling` is.
@@ -281,7 +274,6 @@ impl From<&SyncStatus> for SyncStatusVm {
             bytes_total: s.bytes_total,
             pending: s.pending,
             settling: s.settling,
-            current: s.current.clone(),
             queued_files: s.queued_files,
             queued_bytes: s.queued_bytes,
             warning: s.warning.clone(),
