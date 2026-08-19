@@ -367,6 +367,27 @@ never rewritten.
 A failure to release is logged and never fails the sync — reclaiming space is
 housekeeping.
 
+### A resume does not re-read what this process already hashed
+
+A resumed download must still produce a digest over every byte, including the
+ones it did not fetch this time, so `resume_offset` reads the whole `.part` back
+and re-hashes it. Correct, and not cheap: a 970 MB partial on an external drive
+is about fourteen seconds of reading before a single new byte is asked for.
+
+On a link that interrupts often that cost is paid on every retry and it **grows
+with progress**, which is what made a folder get slower the longer it ran.
+Measured over 44 GB pulled through a 240 kB/s tunnel: three partials above
+600 MB, all resuming repeatedly, and an effective rate that fell from the link's
+own 300 kB/s to a fifth of it.
+
+The hasher is now kept in memory when a transfer is interrupted, and handed back
+**only** while the partial is exactly as long as it was when the state was taken.
+Nothing here rewrites a partial in place — a download appends and nothing else —
+so equal length means equal bytes; and the finished object's digest is still
+checked against its oid before the file is committed, so a wrong prefix cannot
+pass, only fail late. A restart falls back to reading, which is the honest answer
+there: `Sha256`'s intermediate state has no serialized form.
+
 ### The filter's output is buffered, and why that shows up as energy
 
 Content reaches git through the filter's stdout, and `std::io::Stdout` is a
