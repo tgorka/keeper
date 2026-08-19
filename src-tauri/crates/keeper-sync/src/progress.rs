@@ -429,6 +429,27 @@ pub struct SyncStatus {
     /// how "up to date" came to be printed over it. Maintained by the scan,
     /// which is the only thing that knows.
     pub settling: u32,
+    /// The path in flight, mirrored from the streamed progress so a surface
+    /// that polls sees the same file as one that subscribes.
+    ///
+    /// Deliberately NOT in [`status_line`]: that string is also the tray's, and
+    /// a menu item is no place for a path four folders deep. The window has
+    /// room for a second line; the tray does not.
+    pub current: Option<String>,
+    /// Transfers still to be delivered, and their bytes — the queue *behind*
+    /// the file in flight, which `bytes_total` says nothing about.
+    ///
+    /// `bytes_done of bytes_total` describes one object. A folder pulling 53 GB
+    /// showed "177.1 MB of 648.3 MB" and finished that object twenty times over
+    /// without the number ever suggesting how much was left, because the other
+    /// hundred objects were not in it. These two are, and they are read in one
+    /// statement so they can never disagree.
+    ///
+    /// Counted only over units that carry a size: a push is real work but it is
+    /// not a file, and counting it here would put a file count beside a byte
+    /// total it contributes nothing to.
+    pub queued_files: u32,
+    pub queued_bytes: u64,
     /// Sticky warning, last-write-wins, cleared only by a clean run. Mirrors
     /// `RecordingStatusVm::warning` so the banner behaves identically.
     pub warning: Option<String>,
@@ -451,6 +472,9 @@ impl SyncStatus {
             bytes_total: None,
             pending: 0,
             settling: 0,
+            current: None,
+            queued_files: 0,
+            queued_bytes: 0,
             warning: None,
             error: None,
             last_sync_ms: None,
@@ -590,6 +614,25 @@ pub fn status_line(status: &SyncStatus) -> String {
                 ));
             } else if status.bytes_done > 0 {
                 line.push_str(&format!(" · {}", format_bytes(status.bytes_done)));
+            }
+            // What is left, which is the question the other numbers do not
+            // answer: they describe the object in flight, and the queue behind
+            // it is where the hours are. Counted, not estimated — no rate is
+            // involved, because a remaining *time* on a link that varies by an
+            // order of magnitude is a guess dressed as a fact.
+            if status.queued_files > 0 {
+                line.push_str(&format!(
+                    " · {} {} left",
+                    status.queued_files,
+                    if status.queued_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                ));
+                if status.queued_bytes > 0 {
+                    line.push_str(&format!(", {}", format_bytes(status.queued_bytes)));
+                }
             }
             line
         }
@@ -1085,6 +1128,54 @@ mod tests {
         assert_eq!(
             status_line(&s),
             "Transferring tgdrive — 42/310 files · 1.2 GB of 4.7 GB"
+        );
+    }
+
+    /// The question the old line could not answer. `bytes_done of bytes_total`
+    /// describes the object in flight; on a folder pulling 53 GB it read
+    /// "177.1 MB of 648.3 MB" and said nothing about the hundred objects behind
+    /// it, so the line looked identical on hour one and hour forty.
+    #[test]
+    fn an_active_line_says_how_much_is_still_to_come() {
+        let mut s = status("neuradrive");
+        s.state = ProfileState::Syncing;
+        s.phase = SyncPhase::DownloadingLfs;
+        s.bytes_done = 185_694_618;
+        s.bytes_total = Some(679_780_352);
+        s.queued_files = 104;
+        s.queued_bytes = 57_015_809_064;
+        assert_eq!(
+            status_line(&s),
+            "Transferring neuradrive · 177.1 MB of 648.3 MB · 104 files left, 53.1 GB"
+        );
+    }
+
+    #[test]
+    fn one_file_left_is_not_one_files_left() {
+        let mut s = status("neuradrive");
+        s.state = ProfileState::Syncing;
+        s.phase = SyncPhase::DownloadingLfs;
+        s.queued_files = 1;
+        s.queued_bytes = 4_294_967_296;
+        assert_eq!(
+            status_line(&s),
+            "Transferring neuradrive · 1 file left, 4.0 GB"
+        );
+    }
+
+    /// An empty queue adds nothing rather than "0 files left": the tail exists
+    /// to answer "how much longer", and the answer "none" is what the absence
+    /// of the tail already says.
+    #[test]
+    fn the_last_object_carries_no_tail() {
+        let mut s = status("neuradrive");
+        s.state = ProfileState::Syncing;
+        s.phase = SyncPhase::DownloadingLfs;
+        s.bytes_done = 1_048_576;
+        s.bytes_total = Some(2_097_152);
+        assert_eq!(
+            status_line(&s),
+            "Transferring neuradrive · 1.0 MB of 2.0 MB"
         );
     }
 

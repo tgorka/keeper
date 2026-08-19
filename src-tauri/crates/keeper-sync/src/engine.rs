@@ -693,6 +693,11 @@ impl Engine {
             let pending = self.pending_for(&profile.id).unwrap_or(0);
             let mut snapshot = SyncStatus::idle(&profile.id, &profile.name);
             snapshot.pending = pending;
+            if let Ok((files, bytes)) = self.with_db(|conn| db::queued_transfers(conn, &profile.id))
+            {
+                snapshot.queued_files = files;
+                snapshot.queued_bytes = bytes;
+            }
             // Seeded, not left at zero, because a one-shot `keeper-syncd
             // status` never ticks: without this it would read the journal,
             // find nothing, and print "up to date" over a folder whose files
@@ -876,6 +881,7 @@ impl Engine {
                 snapshot.files_total = event.files_total;
                 snapshot.bytes_done = event.bytes_done;
                 snapshot.bytes_total = event.bytes_total;
+                snapshot.current = event.current.clone();
                 if event.phase.is_active() {
                     snapshot.state = ProfileState::Syncing;
                 }
@@ -915,6 +921,9 @@ impl Engine {
             snapshot.files_total = None;
             snapshot.bytes_done = 0;
             snapshot.bytes_total = None;
+            // For the reason above: a path left behind an `Idle` phase reads as
+            // a file still being copied to any surface that shows it.
+            snapshot.current = None;
         }
     }
 
@@ -2469,7 +2478,10 @@ impl Engine {
         }
 
         for item in claimed {
-            match self.execute(profile, &item.kind, item.id, source).await {
+            match self
+                .execute(profile, &item.kind, item.id, item.label.as_deref(), source)
+                .await
+            {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     self.clear_warning(&profile.id);
@@ -2687,9 +2699,16 @@ impl Engine {
         let settling = Self::lock(&self.gates)
             .get(profile_id)
             .map(|gate| gate.tracked(now) as u32);
+        let queued = self
+            .with_db(|conn| db::queued_transfers(conn, profile_id))
+            .ok();
         if let Ok(pending) = self.pending_for(profile_id) {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
                 snapshot.pending = pending;
+                if let Some((files, bytes)) = queued {
+                    snapshot.queued_files = files;
+                    snapshot.queued_bytes = bytes;
+                }
                 if let Some(settling) = settling {
                     snapshot.settling = settling;
                 }
@@ -2862,6 +2881,7 @@ impl Engine {
         profile: &SyncProfile,
         kind: &WorkKind,
         unit_id: i64,
+        label: Option<&str>,
         source: SyncSource,
     ) -> Result<()> {
         match kind {
@@ -2877,8 +2897,12 @@ impl Engine {
                 self.mark_synced(profile);
                 Ok(())
             }
-            WorkKind::LfsDownload { oid, size } => self.do_lfs(profile, oid, *size, false).await,
-            WorkKind::LfsUpload { oid, size } => self.do_lfs(profile, oid, *size, true).await,
+            WorkKind::LfsDownload { oid, size } => {
+                self.do_lfs(profile, oid, *size, label, false).await
+            }
+            WorkKind::LfsUpload { oid, size } => {
+                self.do_lfs(profile, oid, *size, label, true).await
+            }
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
         }
@@ -4568,6 +4592,7 @@ impl Engine {
         profile: &SyncProfile,
         oid: &str,
         size: u64,
+        label: Option<&str>,
         upload: bool,
     ) -> Result<()> {
         if profile.lfs_mode == LfsMode::Disabled {
@@ -4581,7 +4606,14 @@ impl Engine {
         } else {
             SyncPhase::DownloadingLfs
         };
-        self.publish(self.progress(profile, phase));
+        // The file, not the folder. Every other leg of a sync moves many paths
+        // at once and can only honestly name the profile; a transfer moves
+        // exactly one object, and the path it lands at is the most useful thing
+        // a progress line can say — especially on a slow link, where one object
+        // owns the line for an hour.
+        let mut event = self.progress(profile, phase);
+        event.current = label.map(str::to_owned);
+        self.publish(event);
 
         // `.lfsconfig` at the repository root overrides the derived endpoint —
         // the documented precedence, and the shape a self-hosted LFS server
@@ -4833,7 +4865,16 @@ impl Engine {
                 oid: smudge.pointer.oid.clone(),
                 size: smudge.pointer.size,
             };
-            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
+            // The path is carried beside the unit rather than inside it: the
+            // payload is what `enqueue_unique` deduplicates on, and two paths
+            // sharing one object — ordinary for duplicated content — must stay
+            // one download. `label_unit` names the covering unit, so the second
+            // path finds the first one's name already there and leaves it.
+            let label = smudge.path.to_string_lossy().into_owned();
+            self.with_db(|conn| {
+                let id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
+                db::label_unit(conn, id, &label)
+            })?;
         }
         if materialized > 0 {
             tracing::info!(
