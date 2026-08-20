@@ -25,7 +25,7 @@
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -1110,6 +1110,172 @@ fn still_unreadable(repo: &gix::Repository, known: Vec<UnreadablePath>) -> Vec<U
 /// synced folder is full of names that are also glob syntax — `[2026]`, `*`,
 /// `?` all occur in real user content — and a pattern that quietly matched more
 /// than the one path it names would hide unrelated files from every pass.
+/// Abandons a status walk that has stopped producing items.
+///
+/// # Why a watchdog and not a total timeout
+///
+/// A status pass has no honest upper bound. It converts every filtered file it
+/// suspects of having changed, and one of those can be a gigabyte of video that
+/// takes minutes on an external disk. A pass that is *slow* is doing its job; a
+/// pass that has stopped emitting anything is not, and only the second is worth
+/// killing. So the clock is reset by every item, and it fires on silence.
+///
+/// # Why it interrupts rather than just reporting
+///
+/// gix polls the flag from inside the walk, so setting it unwinds the threads
+/// that are stuck and returns control here. A watchdog that only logged would
+/// leave the folder exactly as stuck as before while claiming to have noticed —
+/// which is the failure mode this whole change exists to remove.
+struct StatusWatchdog {
+    heartbeat: std::sync::Arc<AtomicU64>,
+    started: Instant,
+}
+
+impl StatusWatchdog {
+    fn arm(interrupt: std::sync::Arc<AtomicBool>, heartbeat: std::sync::Arc<AtomicU64>) -> Self {
+        Self::arm_with(interrupt, heartbeat, WATCHDOG_POLL, STATUS_SILENCE_LIMIT)
+    }
+
+    /// The intervals as parameters, so the behaviour that matters — firing on
+    /// silence, staying quiet under load — is testable in milliseconds instead
+    /// of in the ten minutes production waits.
+    fn arm_with(
+        interrupt: std::sync::Arc<AtomicBool>,
+        heartbeat: std::sync::Arc<AtomicU64>,
+        poll: Duration,
+        limit: Duration,
+    ) -> Self {
+        let watcher_interrupt = std::sync::Arc::clone(&interrupt);
+        let watcher_heartbeat = std::sync::Arc::clone(&heartbeat);
+        // Detached: it observes two atomics and owns nothing the walk needs, so
+        // there is no join to get wrong and no lock it can hold. It ends when
+        // the walk does, because the walk stops beating and the flag it sets is
+        // read once more before anyone looks at it.
+        std::thread::Builder::new()
+            .name("keeper-status-watchdog".into())
+            .spawn(move || {
+                let mut last_beat = 0u64;
+                let mut quiet = Duration::ZERO;
+                loop {
+                    std::thread::sleep(poll);
+                    if watcher_interrupt.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let beat = watcher_heartbeat.load(Ordering::Relaxed);
+                    if beat == u64::MAX {
+                        // The walk finished and said so; nothing left to watch.
+                        return;
+                    }
+                    if beat != last_beat {
+                        last_beat = beat;
+                        quiet = Duration::ZERO;
+                        continue;
+                    }
+                    quiet += poll;
+                    if quiet >= limit {
+                        tracing::error!(
+                            items = beat,
+                            silent_for_s = quiet.as_secs(),
+                            "the status walk stopped producing items; abandoning it"
+                        );
+                        watcher_interrupt.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    // Said once per minute rather than once per poll: a long
+                    // honest conversion should leave a trail, not a flood.
+                    if quiet.as_secs().is_multiple_of(60) {
+                        tracing::info!(
+                            items = beat,
+                            silent_for_s = quiet.as_secs(),
+                            "the status walk is still working on one file"
+                        );
+                    }
+                }
+            })
+            .ok();
+        // `interrupt` is not kept: the watcher owns the clone that sets it and
+        // the caller owns the clone that reads it, so a third handle here would
+        // be a field nobody touches.
+        drop(interrupt);
+        Self {
+            heartbeat,
+            started: Instant::now(),
+        }
+    }
+
+    /// One item came out of the walk. Answers how many have, so the caller
+    /// needs no counter of its own.
+    fn beat(&self) -> u64 {
+        self.heartbeat.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// How many items the walk has produced.
+    fn beats(&self) -> u64 {
+        self.heartbeat.load(Ordering::Relaxed)
+    }
+
+    /// How long the walk has been running.
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    /// The sentence a caller shows when the walk was abandoned.
+    ///
+    /// It names what was reached, because "status failed" without a count
+    /// cannot tell "stuck on the first file" from "stuck on the last one", and
+    /// that difference is the whole of the next person's investigation.
+    fn silence_error(&self, seen: u64) -> SyncError {
+        SyncError::Git(format!(
+            "the folder's status scan stopped responding after {seen} entries and \
+             {}s, so keeper abandoned it rather than waiting. This is usually a \
+             stalled content filter; the next pass will try again.",
+            self.started.elapsed().as_secs()
+        ))
+    }
+}
+
+impl Drop for StatusWatchdog {
+    fn drop(&mut self) {
+        // Tell the watcher the walk is over, whichever way it ended.
+        self.heartbeat.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+/// How often the watchdog looks. Short enough to be responsive, long enough to
+/// cost nothing over a pass that runs for minutes.
+const WATCHDOG_POLL: Duration = Duration::from_secs(5);
+
+/// How long the walk may go without producing an item before it is abandoned.
+///
+/// Not a performance budget — a liveness one. A status pass over a large
+/// worktree can legitimately spend minutes on one file: converting a gigabyte
+/// of video through the LFS filter is real work, and killing it because it is
+/// slow would be a bug of its own. What it may never do is stop producing items
+/// *entirely*, which is what a deadlocked filter looks like from here.
+///
+/// Ten minutes is far longer than the slowest honest file and far shorter than
+/// the four days a stalled folder went unnoticed in the field.
+const STATUS_SILENCE_LIMIT: Duration = Duration::from_secs(600);
+
+/// The most files this walk converts at once.
+///
+/// **The number that took a vault down for four days.** `thread_limit: None`
+/// means "one thread per core", and each thread that meets a filtered file
+/// holds an LFS filter conversion open while it streams the file through. On a
+/// worktree of `*.mov` recordings that produced 55 conversions in flight at
+/// once against a much smaller pool of filter processes — every one of them
+/// blocked, none able to finish, no error, no progress, forever.
+///
+/// Four is enough to keep a disk busy and small enough that the conversions in
+/// flight cannot outnumber the workers that serve them. A status pass is not
+/// the hot path; it runs before a pull and once per scan.
+const STATUS_THREAD_LIMIT: usize = 4;
+
+/// The ceiling is the fix, so it is enforced where it cannot be argued with
+/// rather than in a test somebody can delete: raising this back to "one per
+/// core" is what deadlocked 55 conversions against a smaller filter pool.
+const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
+
 fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
@@ -1118,13 +1284,29 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
     // changing filetype" in its top frame, and the errno that says *why* —
     // permission denied, EOF from a file rewritten mid-read — is two `source()`
     // hops down. gix never names the path, so the cause is all there is.
+    // The walk is told when to give up before it is told what to look for: a
+    // pass that cannot be abandoned is a pass that can hang a folder forever,
+    // which is what this function did in the field (DW: a vault went four days
+    // without a fetch, `running` in the journal, no error, no progress).
+    let interrupt = std::sync::Arc::new(AtomicBool::new(false));
+    let heartbeat = std::sync::Arc::new(AtomicU64::new(0));
+    let watchdog = StatusWatchdog::arm(
+        std::sync::Arc::clone(&interrupt),
+        std::sync::Arc::clone(&heartbeat),
+    );
+
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?
+        .should_interrupt_owned(std::sync::Arc::clone(&interrupt))
         .index_worktree_options_mut(|options| {
             if let Some(dirwalk) = options.dirwalk_options.as_mut() {
                 dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
             }
+            // See `STATUS_THREAD_LIMIT`: unbounded parallelism here is what
+            // produced 55 simultaneous LFS conversions against a smaller pool
+            // of filter processes and deadlocked every one of them.
+            options.thread_limit = Some(STATUS_THREAD_LIMIT);
         });
     let patterns: Vec<gix::bstr::BString> = skip
         .iter()
@@ -1140,7 +1322,14 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
 
     let mut out = RepoStatus::default();
     for item in iter {
+        // Before the item is inspected: a walk that is producing anything at
+        // all is alive, whatever the item turns out to be. The heartbeat is the
+        // count, so there is no second counter to keep in step with it.
+        let seen = watchdog.beat();
         let item = item.map_err(|err| {
+            if interrupt.load(Ordering::Relaxed) {
+                return watchdog.silence_error(seen);
+            }
             SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
         })?;
         match item {
@@ -1205,6 +1394,17 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
         bucket.sort();
         bucket.dedup();
     }
+    // The shape of the pass, once, at INFO. A folder that later stalls is
+    // diagnosed by comparing this line between runs — how many entries, how
+    // long — and its absence is what made the field failure unreadable.
+    tracing::info!(
+        entries = watchdog.beats(),
+        elapsed_ms = watchdog.elapsed_ms(),
+        added = out.added.len(),
+        modified = out.modified.len(),
+        deleted = out.deleted.len(),
+        "status walk finished"
+    );
     Ok(out)
 }
 
@@ -1698,6 +1898,125 @@ pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    /// The watchdog fires on SILENCE, not on duration.
+    ///
+    /// This is the whole distinction the field failure turned on: a status pass
+    /// converting a gigabyte of video is slow and healthy, and one that has
+    /// stopped emitting is stuck. A guard that could not tell them apart would
+    /// either kill honest work or keep waiting on a deadlock — both worse than
+    /// no guard at all, because both look like a decision.
+    const FAST_POLL: Duration = Duration::from_millis(20);
+    const FAST_LIMIT: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn a_walk_that_keeps_producing_is_never_interrupted() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::clone(&heartbeat),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+
+        // Several times the silence limit, spent beating slowly enough that a
+        // duration-based guard would have fired long ago.
+        let until = Instant::now() + FAST_LIMIT * 4;
+        while Instant::now() < until {
+            watchdog.beat();
+            std::thread::sleep(FAST_POLL / 2);
+        }
+
+        assert!(
+            !interrupt.load(Ordering::Relaxed),
+            "a walk that is producing items is alive, however long it takes"
+        );
+        assert!(watchdog.beats() > 0, "the beats are the item count");
+    }
+
+    /// The behaviour the whole change exists for: a walk that stops emitting is
+    /// abandoned rather than waited on. Without this the guard is decoration.
+    #[test]
+    fn a_walk_that_goes_silent_is_interrupted() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::clone(&heartbeat),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+        // One item, then nothing — the shape of a deadlocked conversion.
+        watchdog.beat();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !interrupt.load(Ordering::Relaxed) {
+            std::thread::sleep(FAST_POLL);
+        }
+
+        assert!(
+            interrupt.load(Ordering::Relaxed),
+            "silence past the limit has to set the flag gix polls, or the walk \
+             hangs exactly as it did in the field"
+        );
+    }
+
+    /// The counter is the item count, and the caller needs no second one.
+    #[test]
+    fn a_beat_answers_how_many_have_been_seen() {
+        let watchdog = StatusWatchdog::arm(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert_eq!(watchdog.beat(), 1);
+        assert_eq!(watchdog.beat(), 2);
+        assert_eq!(watchdog.beats(), 2);
+    }
+
+    /// Dropping the guard tells the watcher to stop, so a finished walk leaves
+    /// no thread behind polling atomics for ten minutes.
+    #[test]
+    fn a_finished_walk_releases_its_watcher() {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        {
+            let _watchdog =
+                StatusWatchdog::arm(Arc::new(AtomicBool::new(false)), Arc::clone(&heartbeat));
+        }
+        assert_eq!(
+            heartbeat.load(Ordering::Relaxed),
+            u64::MAX,
+            "the sentinel is how the watcher learns the walk is over"
+        );
+    }
+
+    /// The sentence a stalled scan produces has to name what was reached.
+    ///
+    /// "status failed" cannot tell "stuck on the first file" from "stuck on the
+    /// last one", and that difference is the whole of the next investigation.
+    #[test]
+    fn the_refusal_names_what_it_got_through() {
+        let watchdog = StatusWatchdog::arm(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let message = watchdog.silence_error(4_217).to_string();
+
+        assert!(
+            message.contains("4217"),
+            "the count is the diagnosis: {message}"
+        );
+        assert!(
+            message.contains("stopped responding"),
+            "it has to say the scan stopped, not that it failed: {message}"
+        );
+        assert!(
+            message.contains("try again"),
+            "and that the folder is not lost: {message}"
+        );
+    }
+
     #[test]
     fn a_stale_index_lock_is_released_but_a_fresh_one_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");

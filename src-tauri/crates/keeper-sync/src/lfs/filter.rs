@@ -80,6 +80,8 @@
 
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::error::{Result, SyncError};
 use crate::lfs::pktline::{self, Packet};
@@ -341,9 +343,94 @@ pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) 
             flush(output)?;
             continue;
         };
+        // The guard is armed around the request and disarmed when it answers.
+        // *Between* requests this process is meant to sit idle for as long as
+        // git keeps it alive, so a timer that ran the whole time would kill a
+        // healthy filter waiting for the next file.
+        let serving = RequestGuard::arm(&keys);
         serve_one(&store, repo, direction, input, output)?;
+        drop(serving);
     }
     Ok(())
+}
+
+/// How long one clean or smudge may take before the filter gives up on it.
+///
+/// A generous ceiling on honest work: converting a gigabyte of video on an
+/// external disk is minutes, not seconds, and killing that would be a bug. What
+/// this catches is the request that never ends — the parent stops sending, the
+/// filter blocks in `read` on its stdin, and both sides wait forever. That is
+/// not hypothetical: it stalled a vault for four days with no error anywhere.
+const REQUEST_LIMIT: Duration = Duration::from_secs(900);
+
+/// Ends the process if one request never finishes.
+///
+/// # Why exiting is the right answer here
+///
+/// This is a child process with one job. It cannot repair a half-consumed
+/// request — the pipe's position is part of the protocol state, and there is no
+/// packet meaning "let us start over". Exiting closes the pipe, which is a
+/// thing the parent already knows how to interpret: `invoke` fails, the caller
+/// gets an error naming the path, and the pass is retried. A filter that hangs
+/// on instead offers the parent nothing to react to at all.
+struct RequestGuard {
+    done: std::sync::Arc<AtomicBool>,
+}
+
+impl RequestGuard {
+    fn arm(keys: &[String]) -> Self {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = std::sync::Arc::clone(&done);
+        // The path, captured now: once this process exits there is nobody left
+        // to ask what it was working on, and "a filter timed out" without a
+        // path is a sentence that starts an investigation instead of ending one.
+        let pathname = value_of(keys, "pathname").unwrap_or_else(|| "<unnamed>".into());
+        std::thread::Builder::new()
+            .name("keeper-filter-watchdog".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let deadline = started + REQUEST_LIMIT;
+                let mut announced = Duration::ZERO;
+                while Instant::now() < deadline {
+                    if watcher.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    // A file that takes minutes says so, by name, once a
+                    // minute. This is the line whose absence turned a stalled
+                    // filter into four days of silence: the parent's log knew
+                    // only that a status pass was running, never on what.
+                    let elapsed = started.elapsed();
+                    if elapsed - announced >= Duration::from_secs(60) {
+                        announced = elapsed;
+                        eprintln!(
+                            "keeper lfs filter: still converting {pathname} after {}s",
+                            elapsed.as_secs()
+                        );
+                    }
+                }
+                if watcher.load(Ordering::Relaxed) {
+                    return;
+                }
+                // `eprintln!`, not `tracing`: this process's stdout is the
+                // protocol and its tracing subscriber belongs to a different
+                // binary's configuration. stderr is what the parent captures.
+                eprintln!(
+                    "keeper lfs filter: no progress on {pathname} for {}s; exiting so the \
+                     caller sees a closed pipe instead of waiting forever",
+                    REQUEST_LIMIT.as_secs()
+                );
+                std::process::exit(75);
+            })
+            .ok();
+        Self { done }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Agree on version 2 and on the capabilities we will actually honour.
