@@ -1,0 +1,48 @@
+_bmad-output/implementation-artifacts/spec-note-panel-never-clipped.md
+  s_9bfe0bf28c8205::t_3d16657e7075d2 1-92
+  s_9bfe0bf28c8205::t_2224173583d99e 93-115
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9bfe0bf28c8205::t_2d663569c59c59 3371-3397
+src-tauri/crates/keeper/tauri.conf.json
+  s_9bfe0bf28c8205::t_d7ba1c2d3be556 25
+src/components/layout/chat-list-pane.test.tsx
+  s_9bfe0bf28c8205::t_78c1f7db29974f 1725
+src/components/layout/chat-list-pane.tsx
+  s_9bfe0bf28c8205::t_2357475ce360fe 64-65
+src/components/layout/files-pane.test.tsx
+  s_9bfe0bf28c8205::t_c1b9b2c6f5392b 2799
+src/components/layout/files-pane.tsx
+  s_9bfe0bf28c8205::t_cd6218601cb457 197-202
+src/components/layout/fold-strip.test.tsx
+  s_9bfe0bf28c8205::t_bc2a21faaa4afc 289
+src/components/layout/panel-strip.tsx
+  s_9bfe0bf28c8205::t_722963142ea47f 663-665,736-748,753-773
+src/components/layout/surface-column.test.tsx
+  s_9bfe0bf28c8205::t_54a635c9286f6c 109,123,246,251,263,276,301,309,321,324
+src/components/layout/surface-column.tsx
+  s_9bfe0bf28c8205::t_dbc43ca92f25d5 79,366-370
+src/components/notes/notes-pane.tsx
+  s_9bfe0bf28c8205::t_ee60e7a640f695 516,563
+src/lib/column-widths.test.ts
+  s_9bfe0bf28c8205::t_d4c0c449f11b96 2,7,142-215
+src/lib/column-widths.ts
+  s_9bfe0bf28c8205::t_db175a09b2b4df 142-190
+src/lib/window-minimum.test.ts
+  s_9bfe0bf28c8205::t_2cc3f735d11a81 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "7e3c6585e004f6911a3505ef8b1a3b2379f49173",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
