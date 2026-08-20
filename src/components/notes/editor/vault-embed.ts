@@ -120,9 +120,16 @@ export async function renderVaultEmbedInto(
   target: string,
   options: VaultEmbedOptions,
 ): Promise<void> {
-  const resolve = options.resolve ?? notesEmbedPaths;
   let resolved: NoteEmbedPathVm | null;
   try {
+    // Inside the `try`, including reaching for the command itself. Reading
+    // `notesEmbedPaths` is not obviously a throwing operation and in production
+    // it is not one — but a module reference can fail to resolve, and when it
+    // does it fails *at the property access*, before any promise exists to
+    // reject. Outside the `try` that becomes an unhandled rejection thrown out
+    // of `toDOM`, which is the one thing this module promises cannot happen:
+    // every failure is supposed to leave the reader the link.
+    const resolve = options.resolve ?? notesEmbedPaths;
     [resolved = null] = await resolve(vaultId, [target]);
   } catch {
     // An unreachable volume, a vault that has gone away, a command that is not

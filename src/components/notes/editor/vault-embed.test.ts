@@ -115,6 +115,25 @@ describe("rendering into a note", () => {
     expect(node.querySelector(".cm-lp-wikilink")?.textContent).toBe("holiday.png");
   });
 
+  it("leaves the link alone when the command itself cannot be reached", async () => {
+    const node = host("holiday.png");
+    // Not the same failure as a rejected call: this one throws at the property
+    // access, before a promise exists — and a throw out of `toDOM` is an
+    // unhandled rejection that no `.catch()` on the caller can see. Found by
+    // the pre-push hook, which reports vitest's error count and not only its
+    // pass count.
+    const options = {
+      assetUrl,
+      get resolve(): never {
+        throw new Error("no such export");
+      },
+    };
+
+    await expect(renderVaultEmbedInto(node, "v1", "holiday.png", options)).resolves.toBeUndefined();
+
+    expect(node.querySelector(".cm-lp-wikilink")?.textContent).toBe("holiday.png");
+  });
+
   it("leaves the link alone for a file it has no element for", async () => {
     const node = host("archive.zip");
 
