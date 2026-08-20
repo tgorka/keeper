@@ -1,0 +1,45 @@
+src/components/notes/editor/format-commands.test.ts
+  s_9bfe0bf28c8205::t_f5dfac0e9b4adb 25,73-75,100-128,142-147,685-687
+src/components/notes/editor/format-commands.ts
+  s_9bfe0bf28c8205::t_8390ffe6cd9252 47,59-60,76-78,738-760,770-771,818-819
+src/components/notes/editor/live-preview-marks.test.ts
+  s_9bfe0bf28c8205::t_9648ac1d0b4981 24,61-62,77-102
+src/components/notes/format-toolbar.tsx
+  s_9bfe0bf28c8205::t_ff69256f28ad52 29,36,44,47,51-125,139,161,179-204,230,243,248-309
+src/components/viewers/markdown-preview.ts
+  s_9bfe0bf28c8205::t_0dfe051ade8d4c 256-258,288,352-356
+src/components/viewers/raw-rendered-view.test.tsx
+  s_9bfe0bf28c8205::t_b73abaee9d0929 24-26
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9bfe0bf28c8205::t_c70c672390529e 3408-3417
+_bmad-output/implementation-artifacts/spec-toolbar-mark-and-emoji.md
+  s_9bfe0bf28c8205::t_c489ea1a253628 1-87
+src/components/notes/editor/live-preview.ts
+  s_9bfe0bf28c8205::t_fad1c6632d50c0 63,74,606-615
+src/components/notes/editor/markdown-marks.test.ts
+  s_9bfe0bf28c8205::t_b19f7e4e9c55bc 1-72
+src/components/notes/editor/markdown-marks.ts
+  s_9bfe0bf28c8205::t_02c31c6e043705 1-93
+src/components/notes/format-toolbar.test.tsx
+  s_9bfe0bf28c8205::t_7828ee3ec34ea3 19,128-131,226-291,297-299
+src/components/notes/note-editor.tsx
+  s_9bfe0bf28c8205::t_cac9159525261a 458,478,563-569
+src/index.css
+  s_9bfe0bf28c8205::t_edf116b63d32b1 61-62,158-164,246-250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "45e49eac09f89fd76d81179d17aa8064597c1537",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
