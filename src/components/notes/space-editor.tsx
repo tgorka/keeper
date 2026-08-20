@@ -230,6 +230,7 @@ export function SpaceEditor({
   const sortDirId = useId();
   const orderId = useId();
   const templateId = useId();
+  const folderId = useId();
   const [name, setName] = useState(space.name);
   const [icon, setIcon] = useState<string | null>(space.icon);
   // The icon search, held here rather than inside the chooser: clearing it on
@@ -259,6 +260,9 @@ export function SpaceEditor({
   // against the list, so a template that is missing right now stays selected
   // and stays visible instead of being cleared by a render.
   const [template, setTemplate] = useState(space.template ?? SPACE_NO_TEMPLATE);
+  // Kept as typed rather than resolved: the folder may not exist yet, and a
+  // space that names one keeper has to create is not a mistake to refuse.
+  const [folder, setFolder] = useState(space.folder ?? "");
   const [templateChoices, setTemplateChoices] = useState<readonly NoteTemplateVm[]>([]);
   // Whether the list above is an ANSWER or merely the absence of one. A vault
   // with genuinely no templates and a read that failed both leave `choices`
@@ -428,6 +432,9 @@ export function SpaceEditor({
         // Trimmed to the sentinel, so "no template" reaches Rust as the empty
         // string it already treats as absent rather than as a path of spaces.
         template: template.trim() === "" ? null : template.trim(),
+        // Same rule as the template: an empty box clears the key instead of
+        // storing a folder that names nothing.
+        folder: folder.trim() === "" ? null : folder.trim(),
       });
       onSaved();
     } catch {
@@ -641,6 +648,28 @@ export function SpaceEditor({
               {SPACE_SORT_NOTES[`${sortKey} ${sortDir}`]}
             </p>
           )}
+
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor={folderId}>New notes go in</Label>
+            <Input
+              id={folderId}
+              value={folder}
+              onChange={(event) => setFolder(event.target.value)}
+              placeholder="Vault root"
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+            />
+            <p className="text-muted-foreground text-sm">
+              {/* The whole reason this field exists: a `path:` query already
+                  says where its notes live, and a `tag:` query never could —
+                  so creating in a tag space used to drop the note at the vault
+                  root and leave the user to find it. */}
+              A folder in this vault, like <code>journal</code> or <code>projects/optimizer</code>.
+              Leave it empty to let the query decide, which only works for a space that names a
+              folder itself.
+            </p>
+          </div>
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor={templateId}>New notes start from</Label>

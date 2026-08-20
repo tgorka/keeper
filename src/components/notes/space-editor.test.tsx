@@ -58,6 +58,7 @@ function space(p: Partial<NoteSpaceVm> = {}): NoteSpaceVm {
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
     template: p.template ?? null,
+    folder: p.folder ?? null,
     warnings: p.warnings ?? [],
     order: p.order ?? 0,
     error: p.error ?? null,
@@ -1087,5 +1088,31 @@ describe("the space editor is a form you can reach both ends of", () => {
     expect(terms.querySelector<HTMLElement>("[role='listbox']")?.className).toContain(
       "overflow-y-auto",
     );
+  });
+  it("writes the folder new notes go in, and clears the key when the box is emptied (Story 44.13)", async () => {
+    // The gap: a `path:` query already implies a folder, a `tag:` query never
+    // can, so creating in a tag space dropped the note at the vault root.
+    open(space({ query: "tag:gsd", folder: null }));
+
+    const field = await screen.findByLabelText("New notes go in");
+    fireEvent.change(field, { target: { value: "  fundraising  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().folder).toBe("fundraising");
+  });
+
+  it("sends no folder rather than an empty one when the box is cleared (Story 44.13)", async () => {
+    // `folder: ""` would be a key in the file that names nothing, and a reader
+    // would then have to decide what it meant. Absent is the only honest state.
+    open(space({ query: "tag:gsd", folder: "fundraising" }));
+
+    const field = await screen.findByLabelText("New notes go in");
+    expect((field as HTMLInputElement).value).toBe("fundraising");
+    fireEvent.change(field, { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(savedRequest().folder).toBeNull();
   });
 });

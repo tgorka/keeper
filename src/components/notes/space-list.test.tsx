@@ -61,6 +61,7 @@ function space(p: Partial<NoteSpaceVm> & Pick<NoteSpaceVm, "id" | "name">): Note
     icon: p.icon ?? null,
     defaultKey: p.defaultKey ?? null,
     template: p.template ?? null,
+    folder: p.folder ?? null,
     warnings: p.warnings ?? [],
     order: p.order ?? 0,
     error: p.error ?? null,

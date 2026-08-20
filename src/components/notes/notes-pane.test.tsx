@@ -144,6 +144,7 @@ function space(
     // on something that is not a tag, so a template that added one could file a
     // new note straight out of the space that offered it.
     template: null,
+    folder: null,
     warnings: [],
     order: 0,
     error: null,

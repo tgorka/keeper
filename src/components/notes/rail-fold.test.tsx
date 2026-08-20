@@ -52,6 +52,7 @@ const SPACES: NoteSpaceVm[] = [
     order: 0,
     defaultKey: "inbox",
     template: null,
+    folder: null,
     error: null,
     warnings: [],
   },

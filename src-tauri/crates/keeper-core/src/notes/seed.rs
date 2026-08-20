@@ -117,6 +117,51 @@ pub fn inherit(query: &str) -> Seed {
     seed
 }
 
+/// Read a space's query, then let the space's own folder override where the
+/// note lands.
+///
+/// `path:journal/**` already says "write it here", and that is where a folder
+/// came from until now. A `tag:` space says nothing about a place — `tag:gsd`
+/// gathers notes from everywhere, which is the point of a tag — so creating in
+/// one dropped the note at the vault root and left the user to find out. A
+/// space can now name a folder outright, and when it does, that is the answer:
+/// somebody typed it into the editor, which beats a directory inferred from a
+/// pattern.
+///
+/// The folder is validated exactly as a query-derived one is. A space file is
+/// ordinary vault content that syncs between machines, so `../../etc` in one
+/// must not become a write outside the vault on the other (AD-65, FR-145).
+pub fn inherit_into(query: &str, folder: Option<&str>) -> Seed {
+    let mut seed = inherit(query);
+    if let Some(dir) = folder.and_then(folder_dest) {
+        seed.dest = Some(dir);
+    }
+    seed
+}
+
+/// A folder a space names for itself, or `None` when it does not name a usable
+/// one.
+///
+/// Takes a plain directory rather than a glob — `journal`, `journal/2026` — and
+/// holds it to the same rule [`literal_dir`] holds a pattern to: no empty
+/// segment, no `.`, no `..`, no glob character, nothing that could climb out of
+/// the vault. An unusable value yields `None` rather than an error, because a
+/// space whose folder is nonsense should still create notes.
+pub fn folder_dest(folder: &str) -> Option<String> {
+    let trimmed = folder.trim().trim_start_matches('/').trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut dir: Vec<&str> = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains(GLOB_META) {
+            return None;
+        }
+        dir.push(segment);
+    }
+    Some(dir.join("/"))
+}
+
 /// Apply one term to the seed. Anything not named here is left to [`verdict`].
 fn seed_term(seed: &mut Seed, term: &Term) {
     match term.key.as_deref() {
@@ -1127,5 +1172,68 @@ mod tests {
                 space.key
             );
         }
+    }
+    #[test]
+    fn a_space_folder_beats_a_folder_read_out_of_the_query() {
+        // Somebody typed the folder into the editor; the other one was inferred
+        // from a pattern. The typed one wins.
+        let seed = inherit_into("path:journal/** tag:review", Some("operations"));
+        assert_eq!(seed.dest.as_deref(), Some("operations"));
+        assert_eq!(
+            seed.tags,
+            vec!["review".to_owned()],
+            "the query still seeds its tags"
+        );
+    }
+
+    #[test]
+    fn a_tag_space_with_a_folder_finally_has_somewhere_to_write() {
+        // The gap this exists to close: `tag:gsd` gathers notes from everywhere
+        // and names no place, so a create used to land at the vault root.
+        let seed = inherit_into("tag:gsd", Some("fundraising"));
+        assert_eq!(seed.dest.as_deref(), Some("fundraising"));
+        assert_eq!(seed.tags, vec!["gsd".to_owned()]);
+    }
+
+    #[test]
+    fn no_folder_leaves_the_query_to_answer() {
+        assert_eq!(
+            inherit_into("path:journal/**", None).dest.as_deref(),
+            Some("journal")
+        );
+        assert_eq!(inherit_into("tag:gsd", None).dest, None);
+    }
+
+    #[test]
+    fn a_folder_that_could_climb_out_of_the_vault_is_refused() {
+        // A space file syncs between machines, so this is untrusted input on
+        // every device except the one it was typed on.
+        for hostile in ["../secrets", "a/../../b", "a/./b", "note*", "", "   ", "/"] {
+            assert_eq!(
+                folder_dest(hostile),
+                None,
+                "{hostile:?} must not become a destination"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_slash_means_the_vault_root_and_not_the_filesystem() {
+        // The case that looks dangerous and is not, pinned so nobody "fixes" it
+        // into a refusal: in a vault a leading `/` is the vault's own root, the
+        // same reading OKF gives a bundle-relative path. `/etc` is the folder
+        // `etc` beside `journal`, and there is no way from here to `/etc`.
+        assert_eq!(folder_dest("/etc").as_deref(), Some("etc"));
+        assert_eq!(folder_dest("/company").as_deref(), Some("company"));
+    }
+
+    #[test]
+    fn an_ordinary_folder_survives_its_decorations() {
+        assert_eq!(folder_dest("company").as_deref(), Some("company"));
+        assert_eq!(
+            folder_dest("/journal/2026/").as_deref(),
+            Some("journal/2026")
+        );
+        assert_eq!(folder_dest("  operations  ").as_deref(), Some("operations"));
     }
 }

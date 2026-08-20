@@ -298,6 +298,15 @@ pub struct NoteSpaceVm {
     /// the editor shows what the file says and the create path is what reports a
     /// template that has gone missing.
     pub template: Option<String>,
+    /// The folder a note created in this space is written to — vault-relative,
+    /// or `None` to let the query answer (Story 44.13).
+    ///
+    /// A `path:` query already implies a folder and still does; this is what a
+    /// `tag:` space has instead, because a tag names a set and never a place.
+    /// Stored as typed, unresolved: whether the folder exists is a question for
+    /// create time, and a space that names one keeper has to make is not an
+    /// error the editor should refuse.
+    pub folder: Option<String>,
     /// The presentation keys of this space's frontmatter that keeper could not
     /// read, each already worded as a finished sentence (Story 44.4).
     ///
@@ -1112,6 +1121,11 @@ pub struct NoteSpaceReq {
     /// An empty string clears the key rather than storing a template whose path
     /// is nothing.
     pub template: Option<String>,
+    /// Where notes created in this space are written — vault-relative, or
+    /// `None`/empty to leave the destination to the query (Story 44.13). An
+    /// empty string clears the key rather than storing a folder that names
+    /// nothing.
+    pub folder: Option<String>,
 }
 
 /// Change a vault's settings (FR-120).
