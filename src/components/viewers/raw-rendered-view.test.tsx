@@ -21,6 +21,9 @@ import "@codemirror/lang-markdown";
 import "@codemirror/language";
 import "@codemirror/state";
 import "@/components/notes/editor/live-preview";
+// Story 55.3's `==` delimiter table, awaited unconditionally by the mount —
+// warmed for the same reason as the four above.
+import "@/components/notes/editor/markdown-marks";
 // Note mode's mount awaits three more chunks — the editing keymap, Story 43.1's
 // Tab bindings and (story 52.3) the writing tools — so they are warmed here for
 // the same reason as the four above: `settle()` drains microtasks and never a

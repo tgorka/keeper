@@ -3405,3 +3405,13 @@ status: open
   summary: The file viewers mount CodeMirror without `search()`, so there is no find at all in a `.md`, `.csv` or `.json` opened from Files.
   evidence: `⌘F` is wired in `note-editor.tsx` only. `findBar()` is now one extension and would drop into `text-viewer.tsx` unchanged, but adding find where there was none is a feature, not a restyle, and the viewers have their own `⌘F` question (the Files pane filter) to settle first.
   status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: The emoji picker has no recents and no skin-tone variants.
+  evidence: Both are state, and this was a picker. Recents in particular would change what "opens on" means and needs a decision about where that state lives (per vault? per device? synced?) before it is worth building. The opening set in `format-toolbar.tsx` is the hand-maintained stand-in.
+  status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: `==highlight==` renders in keeper and is invisible to anything else reading the vault.
+  evidence: It is not in CommonMark or GFM; the extension in `markdown-marks.ts` is keeper's own, matching the spelling Obsidian and most wikis use. A note exported or read by a plain CommonMark renderer shows the equals signs. Worth stating in the vault docs rather than fixing — there is nothing to fix short of not supporting it.
+  status: open

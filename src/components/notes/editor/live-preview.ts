@@ -60,6 +60,7 @@ const HIDDEN_MARKS: Record<string, true> = {
   StrikethroughMark: true,
   SubscriptMark: true,
   SuperscriptMark: true,
+  HighlightMark: true,
 };
 
 /** Inline nodes that keep their text and gain a class. */
@@ -70,6 +71,7 @@ const INLINE_CLASSES: Record<string, string> = {
   Strikethrough: "cm-lp-strike",
   Subscript: "cm-lp-sub",
   Superscript: "cm-lp-sup",
+  Highlight: "cm-lp-mark",
   // The language a fence declares. Visible, unlike the backticks around it:
   // hiding it left every code block opening with a blank grey line and threw
   // away the one piece of information the block carried about itself.
@@ -601,6 +603,16 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-strong": { fontWeight: "600" },
   ".cm-lp-em": { fontStyle: "italic" },
   ".cm-lp-strike": { textDecoration: "line-through" },
+  // The one inline mark that paints a background rather than changing the
+  // glyphs, so it is the one that has to answer for contrast in both themes.
+  // `--mark` is defined beside the other palette tokens in `index.css`, and is
+  // not `--search-highlight`: see the comment there.
+  ".cm-lp-mark": {
+    backgroundColor: "var(--mark)",
+    color: "var(--mark-foreground)",
+    borderRadius: "2px",
+    padding: "0 1px",
+  },
   ".cm-lp-underline": { textDecoration: "underline" },
   // `vertical-align` alone would push the line's height around; the smaller
   // font is what keeps a paragraph containing `H~2~O` the same height as one

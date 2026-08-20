@@ -58,6 +58,8 @@
     --color-bridge-disconnected: var(--bridge-disconnected);
     --color-search-highlight: var(--search-highlight);
     --color-search-highlight-foreground: var(--search-highlight-foreground);
+    --color-mark: var(--mark);
+    --color-mark-foreground: var(--mark-foreground);
     --color-swipe-archive: var(--swipe-archive);
     --color-swipe-archive-foreground: var(--swipe-archive-foreground);
     --color-swipe-read: var(--swipe-read);
@@ -153,6 +155,13 @@
   --bridge-disconnected: #a8322b;
   --search-highlight: #ded08f;
   --search-highlight-foreground: #231303;
+  /* `==highlight==` in a note (Story 55.3). Deliberately NOT
+     --search-highlight: a word the reader marked and a word the search just
+     found mean different things, and one colour for both makes a note look
+     like it is full of hits. Warmer and lighter than the search pair, so the
+     two are told apart at a glance rather than by memory. */
+  --mark: #f4dd93;
+  --mark-foreground: #2a1f05;
   /* Row-swipe action surfaces (Story 13.6): mapped onto existing theme colors —
      no new palette. Archive is the neutral triage verb, read/unread the primary
      one, discard the destructive one. */
@@ -234,6 +243,11 @@
   --bridge-disconnected: #e0625a;
   --search-highlight: #4a4415;
   --search-highlight-foreground: #e4e9e4;
+  /* Story 55.3, dark: the same distinction, kept by hue rather than by
+     lightness — a mark has to read as a mark on a dark note without becoming
+     the brightest thing on the line. */
+  --mark: #5e4d14;
+  --mark-foreground: #f0e7d2;
   /* Row-swipe action surfaces (Story 13.6), dark theme: the same theme-color
      mapping; the dark background/primary/destructive values carry the contrast. */
   --swipe-archive: var(--muted-foreground);

@@ -16,7 +16,7 @@
  */
 import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
@@ -125,6 +125,10 @@ function selected(view: EditorView): string {
   return view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
 }
 
+/** The opening set's size, as a fact this suite is allowed to know: the
+ *  assertion is that none of them is blank, and that needs a total. */
+const EMOJI_OPENING_COUNT = 48;
+
 describe("the formatting toolbar, in the editor the user actually types into", () => {
   it("bolds the selection that was there when the button was pressed", async () => {
     const view = await mounted();
@@ -219,11 +223,80 @@ describe("the formatting toolbar, in the editor the user actually types into", (
    * new button is also pressed here, on the real `NoteEditor`, and read back
    * through the notes store — the buffer that would be written to the file.
    */
+  describe("the emoji picker (Story 55.3)", () => {
+    it("puts the character in the note and closes", async () => {
+      const view = await mounted();
+      select(view, "beta");
+
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      const search = await screen.findByLabelText("Search emoji");
+      fireEvent.change(search, { target: { value: "tada" } });
+
+      // Named by its shortcode, because the character alone is nothing a
+      // screen reader can announce usefully.
+      fireEvent.click(await screen.findByRole("button", { name: "tada" }));
+
+      await waitFor(() => {
+        // The character, not `:tada:` — one buffer spelling whichever door the
+        // emoji came through.
+        expect(readNoteDocument("v1", "n1").text).toBe("alpha\n🎉\n");
+      });
+      expect(screen.queryByLabelText("Search emoji")).toBeNull();
+    });
+
+    it("opens on a set somebody would actually reach for, all of it real", async () => {
+      await mounted();
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      await screen.findByLabelText("Search emoji");
+
+      // Not the emoji table's head, which is ordered by shortcode and opens on
+      // `+1`, `100`, `1234`, `8ball`, `a`, `ab` and a run of flags.
+      expect(screen.getByRole("button", { name: "tada" })).not.toBeNull();
+      expect(screen.getByRole("button", { name: "white_check_mark" })).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "8ball" })).toBeNull();
+
+      // Every opening shortcode resolves: the list names shortcodes and the
+      // table owns the characters, so one that fell out of the table would
+      // otherwise render as a blank button.
+      const choices = within(screen.getByRole("group", { name: "Emoji picker" })).getAllByRole(
+        "button",
+      );
+      expect(choices.filter((button) => button.textContent?.trim() === "")).toHaveLength(0);
+      expect(choices).toHaveLength(EMOJI_OPENING_COUNT);
+    });
+
+    it("says so when nothing matches, rather than showing an empty grid", async () => {
+      await mounted();
+
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      fireEvent.change(await screen.findByLabelText("Search emoji"), {
+        target: { value: "zzzznotanemoji" },
+      });
+
+      expect(await screen.findByText(/No emoji matches/)).not.toBeNull();
+    });
+
+    it("opens with a clean query the second time", async () => {
+      await mounted();
+
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      fireEvent.change(await screen.findByLabelText("Search emoji"), { target: { value: "tada" } });
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+
+      // A stale query is a picker that lies about what it is showing.
+      expect(await screen.findByLabelText("Search emoji")).toHaveValue("");
+    });
+  });
+
   describe("the marks Story 45.10 added", () => {
     const buttons: readonly { name: string; wrapped: string }[] = [
       { name: "Underline", wrapped: "<u>beta</u>" },
       { name: "Subscript", wrapped: "~beta~" },
       { name: "Superscript", wrapped: "^beta^" },
+      // Story 55.3's, in the same table: the toolbar makes one promise and it
+      // should be one test for all of them.
+      { name: "Highlight", wrapped: "==beta==" },
     ];
 
     for (const button of buttons) {

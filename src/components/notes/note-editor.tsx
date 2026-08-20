@@ -455,6 +455,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         indent,
         writing,
         find,
+        marks,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -474,6 +475,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         // The find bar. In the closure with everything else so the search
         // panel's React tree is in the editor chunk, not the main bundle.
         import("./editor/find-panel"),
+        import("./editor/markdown-marks"),
       ]);
       if (disposed) {
         return;
@@ -558,7 +560,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
                 },
               },
             ]),
-            markdown.markdown({ base: markdown.markdownLanguage }),
+            markdown.markdown({
+              base: markdown.markdownLanguage,
+              // `==highlight==`, which no base grammar defines. The same list
+              // is passed by `markdown-preview.ts`, because a note and the
+              // same bytes opened from Files must not render differently.
+              extensions: [...marks.MARKDOWN_MARKS],
+            }),
             writing.markdownWritingTools([
               wikilink.wikilinkSource(vaultId),
               tags.tagCompleteSource(async () => {
