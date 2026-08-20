@@ -71,7 +71,7 @@ import {
   SquarePen,
   TriangleAlert,
 } from "lucide-react";
-import { type ReactNode, useEffect, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useMemo, useState } from "react";
 import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
@@ -1432,7 +1432,24 @@ function SyncPendingList({
   current: string | null;
 }) {
   const settling = rows?.some((row) => row.reason === "settling");
-  const fold = useFold(rows);
+  // The row being transferred comes first. Marking it and then leaving it below
+  // the fold is not a mark: this list runs to eighty-odd rows on a folder mid
+  // backlog, and the one thing happening right now was on none of the screens
+  // that reported it missing. Only that row moves; everything else keeps the
+  // order the engine gave it.
+  const ordered = useMemo(() => {
+    if (rows === null || current === null) {
+      return rows;
+    }
+    const at = rows.findIndex((row) => row.path === current);
+    if (at <= 0) {
+      return rows;
+    }
+    const moved = [...rows];
+    const [row] = moved.splice(at, 1);
+    return [row, ...moved];
+  }, [rows, current]);
+  const fold = useFold(ordered);
   return (
     <div className="flex flex-col gap-2">
       <h2 className="label-caps text-faint">{SYNC_PENDING_TITLE}</h2>
