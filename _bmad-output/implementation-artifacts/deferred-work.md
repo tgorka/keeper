@@ -3451,3 +3451,23 @@ status: open
   summary: `files-pane.test.tsx` "re-reads a remembered folder once when Refresh rescues a failed first list" times out under parallel load.
   evidence: Observed twice while hunting an unrelated unhandled rejection — once during a `lefthook` pre-push run (tests sharing the machine with clippy and typecheck) and once in a bare full run. `TestingLibraryElementError: Unable to find role="treeitem" and name "Notes"` after the 5s `waitFor` budget; the pane is rendered and the tree is empty, so the second list has not landed. Passes 15/15 in isolation. Not investigated: it is a different subsystem from the work in flight, and guessing at a timing fix without reproducing it deliberately would be a change nobody can evaluate.
   status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: The filter-protocol deadlock itself is guarded against but not root-caused.
+  evidence: Observed precisely — content fully delivered (every open file at EOF), `keeper lfs filter-process` blocked in `pktline::read` on stdin, parent blocked in `Client::invoke`. `Request::fill` handles the flush packet correctly, so the missing packet is on the client side or in how a conversion is handed between gix's pool and ours. This change makes the deadlock survivable (bounded concurrency, abandonable walk, self-terminating filter) without explaining it. Reproducing it on a synthetic repo of large filtered files is its own story.
+  status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: `.git/lfs/tmp` accumulates leaked scratch — 100 GB in 863 files over four days on one machine.
+  evidence: The files are `tempfile`-style `.tmpXXXXXX` names, which delete on drop; a process killed mid-transfer leaks one. Nothing in keeper sweeps them, so every crash costs disk permanently. A sweep at startup on the same terms as `recover_running` — remove scratch older than any live run — would return the space. Measured alongside `.git/lfs/incomplete` at 4 GB, itself untouched since 17 August.
+  status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: A profile can sit in `offline` indefinitely with no path back.
+  evidence: `Offline` is set on a transient network error with the comment "the queue drains when connectivity returns (AD-49)", but the state is only refreshed by a sync that completes. When the only queued unit cannot complete, the profile reports `offline` forever while the server is reachable — observed for three days with `curl` answering the remote in 30 ms. The state needs a way to be re-evaluated that does not depend on the thing it is blocking.
+  status: open
+
+- source_spec: spec-repair-the-lfs-stat-invariant
+  summary: Nothing detects a broken pointer-stat invariant on its own; the repair runs only when a person presses "Recheck all files".
+  evidence: `repair_index_stat` restores it, and `rescan` calls it, but a folder whose invariant broke while nobody was looking still converts its whole worktree on every status pass until somebody notices and presses the button. The card now says the folder needs attention after three consecutive failures, which is what makes the button findable — but a cheap periodic check (does a materialized entry's stat still describe its file?) would make the repair automatic. Left out here because a self-repairing index is a write nobody asked for, and this story's job was to make the failure visible and fixable.
+  status: open
