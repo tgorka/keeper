@@ -1263,6 +1263,22 @@ describe("SyncPane pending", () => {
    * The forms are the opposite case and keep their measure, which is why this
    * asserts both halves rather than "no max-width anywhere".
    */
+  /**
+   * The other half of going full-bleed, and the half that bit: Radix renders a
+   * scroll viewport's child as `display: table`, so its width is `max-content`.
+   * The longest path in the longest list then decides how wide the card is, and
+   * the row of actions ends up past the window's edge with `Remove` unclickable.
+   */
+  it("keeps the scrolling body inside the window rather than sizing to its content", async () => {
+    await renderPane();
+    await screen.findByText(RUST_LINE);
+
+    const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+    expect(viewport).not.toBeNull();
+    expect(viewport?.className).toContain("[&>div]:!block");
+    expect(viewport?.className).toContain("[&>div]:!w-full");
+  });
+
   it("gives the lists the whole window and the forms a measure", async () => {
     await renderPane();
     // Any rendered row will do; this one is the folder card's own line.

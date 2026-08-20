@@ -809,7 +809,11 @@ export function SyncPane() {
         )}
       </header>
 
-      <ScrollArea className="min-h-0 flex-1">
+      {/* `fitWidth`, because this body is full-bleed: without it Radix's
+          `display: table` viewport sizes to the longest path in the longest
+          list and pushes the row of actions past the window's edge, where the
+          last of them cannot be clicked. */}
+      <ScrollArea fitWidth className="min-h-0 flex-1">
         {/* Full-bleed, like the Bridges body and unlike the Recording pane.
             Those two are the app's precedents and this surface belongs to the
             second one: UX-DR29's centered column is a decision about
@@ -1032,7 +1036,11 @@ function SyncProfileCard({
               <span className="shrink-0">{syncRemoteHost(profile.remoteUrl)}</span>
             </p>
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-1">
+          {/* `ml-auto` and not merely `justify-end`: the row wraps, and a
+              wrapped line is laid out on its own, so the actions would land at
+              the left edge of the second line — under the folder's name rather
+              than in the corner where they started. */}
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
             <Button
               type="button"
               variant="outline"
