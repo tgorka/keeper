@@ -129,6 +129,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
         -- idempotence. A row rewrite is not, because after it runs the old
         -- value becomes a legitimate one again.
+        -- Paths this clone has ever held real content for.
+        --
+        -- The only way to tell an arriving object that REPLACES something from
+        -- one that is simply new here, and it cannot be derived: a queued
+        -- download always finds pointer text in the worktree, and git history
+        -- answers a different question — a file added a week ago and never
+        -- fetched here is new to this machine however old it is upstream.
+        --
+        -- One row per path, written when content lands. Cheap to keep and the
+        -- only fact that makes the distinction true.
+        CREATE TABLE IF NOT EXISTS materialized (
+            profile_id  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            at_ms       INTEGER NOT NULL,
+            PRIMARY KEY (profile_id, path)
+        );
+
         CREATE TABLE IF NOT EXISTS meta (
             key         TEXT PRIMARY KEY,
             value       TEXT NOT NULL
@@ -299,6 +316,41 @@ pub fn queued_downloads(
     for row in rows {
         let (label, oid, size) = row?;
         out.push((label, oid, size.max(0) as u64));
+    }
+    Ok(out)
+}
+
+/// Record that content for `path` now exists on this machine.
+///
+/// Called when an object is materialized, which is the one moment the fact is
+/// known. `INSERT OR REPLACE` because materializing again is the ordinary case
+/// — a second version arriving — and the newest timestamp is the useful one.
+pub fn remember_materialized(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Every path this clone has held content for.
+///
+/// Read whole rather than asked per row: the caller is deciding a mark for a
+/// list, and one statement beats a query per line.
+pub fn materialized_paths(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM materialized WHERE profile_id = ?1")?;
+    let rows = stmt.query_map([profile_id], |r| r.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
     }
     Ok(out)
 }

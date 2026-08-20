@@ -734,9 +734,12 @@ Each row leads with one glyph answering two questions, because a row has space
 for one: the arrow's **direction** says which way the file is travelling, and
 whether it is **circled** says whether the far end already holds something. A
 bare arrow is content nobody has yet; a circled one is a second version of
-something that does. There is no circled *down* arrow in use — a download is
-queued only for a path whose worktree still holds pointer text, so "an update
-arriving" is not a state this queue can be in.
+something that does. All four combinations exist. An inbound update is invisible in the repository —
+a download is queued only for a path whose worktree holds pointer text, and that
+is true of a new file and a new version alike — so it is read from keeper's own
+record of what it has materialized here, written when content lands. A file
+added upstream a week ago and never fetched is **new** to this machine however
+old it is there, which is the question the mark answers.
 
 The reason is no longer written out beside each path. It is the row's accessible
 description, which is where it was useful; the right-hand column carries the

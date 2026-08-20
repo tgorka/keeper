@@ -237,6 +237,14 @@ pub enum PendingReason {
     Deleted,
     /// Queued to come IN: an LFS object this clone does not hold yet.
     ///
+    /// `replacing` says whether this machine has ever held content for that
+    /// path — the difference between a file arriving and a new version of one
+    /// arriving. It cannot be inferred from the repository: a queued download
+    /// always finds pointer text in the worktree, and history answers a
+    /// different question, since a file added upstream a week ago and never
+    /// fetched here is new to this clone however old it is there. It is read
+    /// from what keeper itself recorded when content last landed.
+    ///
     /// The other reasons are computed from `git status` and the completeness
     /// gate, which between them see only what this machine has changed. A
     /// folder pulling 53 GB therefore listed nothing as pending while 106
@@ -245,7 +253,7 @@ pub enum PendingReason {
     ///
     /// Carries the size because that is the whole question about an inbound
     /// object: a queue of 106 is two minutes or four days depending on it.
-    Incoming { size_bytes: u64 },
+    Incoming { size_bytes: u64, replacing: bool },
 }
 
 /// One path the folder is waiting on.
@@ -4986,6 +4994,11 @@ impl Engine {
                     continue;
                 }
                 lfs::stage::materialize(store, &profile.local_path, smudge)?;
+                // The one moment this is knowable: content for this path now
+                // exists here, so the next object for it is a replacement
+                // rather than an arrival.
+                let landed = smudge.path.to_string_lossy().into_owned();
+                self.with_db(|conn| db::remember_materialized(conn, &profile.id, &landed, now))?;
                 materialized += 1;
                 continue;
             }
@@ -5747,6 +5760,9 @@ impl Engine {
         // `named` gives a local change precedence: if a path is somehow both
         // edited here and queued from the remote, what the operator did is the
         // more actionable of the two facts.
+        let held = self
+            .with_db(|conn| db::materialized_paths(conn, profile_id))
+            .unwrap_or_default();
         for (label, oid, size_bytes) in
             self.with_db(|conn| db::queued_downloads(conn, profile_id))?
         {
@@ -5757,9 +5773,13 @@ impl Engine {
             let path =
                 label.unwrap_or_else(|| format!("LFS object {}…", &oid[..oid.len().min(12)]));
             if named.insert(path.clone()) {
+                let replacing = held.contains(&path);
                 out.push(PendingFile {
                     path,
-                    reason: PendingReason::Incoming { size_bytes },
+                    reason: PendingReason::Incoming {
+                        size_bytes,
+                        replacing,
+                    },
                     size_bytes: Some(size_bytes),
                 });
             }
@@ -7953,9 +7973,73 @@ mod tests {
         assert_eq!(
             incoming.reason,
             PendingReason::Incoming {
-                size_bytes: 405_800_000
+                size_bytes: 405_800_000,
+                // Nothing was ever materialized for this path in this test, and
+                // that is what `replacing` reports — not what the repository's
+                // history says about the file.
+                replacing: false,
             },
             "the size is the whole question about an object that has not arrived"
+        );
+    }
+
+    /// A second version arriving is not the same thing as a file arriving, and
+    /// the repository cannot tell them apart: a queued download finds pointer
+    /// text in the worktree either way. What separates them is whether THIS
+    /// machine has ever held content for that path, which is why keeper records
+    /// it when content lands.
+    #[tokio::test]
+    async fn an_object_for_a_path_this_clone_has_held_is_marked_as_replacing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let queue = |oid: &str, label: &str| {
+            let unit = WorkKind::LfsDownload {
+                oid: oid.to_owned(),
+                size: 4_096,
+            };
+            let id = engine
+                .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+                .expect("enqueue");
+            engine
+                .with_db(|conn| db::label_unit(conn, id, label))
+                .expect("label");
+        };
+        queue(&"a".repeat(64), "media/held-before.mov");
+        queue(&"b".repeat(64), "media/never-seen.mov");
+
+        // Only the first path has ever had content on this machine.
+        engine
+            .with_db(|conn| db::remember_materialized(conn, &p.id, "media/held-before.mov", 1))
+            .expect("remember");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let reason = |path: &str| {
+            pending
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.reason.clone())
+                .expect("listed")
+        };
+        assert_eq!(
+            reason("media/held-before.mov"),
+            PendingReason::Incoming {
+                size_bytes: 4_096,
+                replacing: true
+            }
+        );
+        assert_eq!(
+            reason("media/never-seen.mov"),
+            PendingReason::Incoming {
+                size_bytes: 4_096,
+                replacing: false
+            },
+            "new here, whatever the repository's history says about its age"
         );
     }
 

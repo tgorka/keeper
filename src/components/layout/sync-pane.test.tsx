@@ -59,6 +59,7 @@ import {
   copySummarySentence,
   formatCopyBytes,
   formatSyncWaited,
+  PENDING_MARKS,
   SYNC_ACTIVITY_EMPTY_SENTENCE,
   SYNC_ACTIVITY_TITLE,
   SYNC_CONFLICT_SENTENCE,
@@ -1336,6 +1337,19 @@ describe("SyncPane pending", () => {
     // something. A bare arrow is new content; a circled one is a second version.
     expect(rows[0]).toHaveTextContent("New file");
     expect(rows[1]).toHaveTextContent("New file");
+    // And the fourth combination, which needed a fact the repository does not
+    // hold: an object replacing content this machine has had before.
+    expect(
+      syncPendingReason({
+        path: "media/held-before.mov",
+        reason: "incomingUpdate",
+        sinceMs: null,
+        sizeBytes: 4_096,
+      }),
+    ).toBe("incomingUpdate");
+    expect(PENDING_MARKS.incomingUpdate.word).toBe(`Changed · ${SYNC_PENDING_INBOUND_WORD}`);
+    expect(PENDING_MARKS.incomingUpdate.icon).not.toBe(PENDING_MARKS.incoming.icon);
+    expect(PENDING_MARKS.modified.icon).not.toBe(PENDING_MARKS.untracked.icon);
     // The size is a column of its own, and both directions have one — the
     // uploads used to show none, which is what made the list read as two.
     expect(rows[1]).toHaveTextContent("405.8 MB");
