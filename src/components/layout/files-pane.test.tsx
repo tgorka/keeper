@@ -2796,7 +2796,7 @@ describe("FilesPane — the tree is a column", () => {
     render(<FilesPane />);
 
     expect(await screen.findByRole("region", { name: FILES_PANE_TITLE })).toHaveStyle({
-      width: `${wider}px`,
+      flexBasis: `${wider}px`,
     });
   });
 

@@ -286,7 +286,7 @@ describe("every folded strip is the same strip", () => {
     );
     // A number rather than a class, because a column's width is an inline style
     // the rest of the time. Same number.
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${FOLD_STRIP.widthPx}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${FOLD_STRIP.widthPx}px` });
   });
 
   it("gives a folded panel the shared width instead of fitting its one button", () => {

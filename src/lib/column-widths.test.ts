@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import {
   COLUMN_WIDTH_COOKIE,
   clampColumnWidth,
   columnMinWidth,
+  columnStyle,
   columnTemplate,
   columnWidthCookie,
   MAX_COLUMN_WIDTH,
@@ -135,5 +137,79 @@ describe("surface column floors", () => {
     expect(readColumnWidths(columnWidthCookie(jar, "chat-list", 100))["chat-list"]).toBe(
       SURFACE_COLUMNS["chat-list"].minWidth,
     );
+  });
+});
+
+/**
+ * The rule that stopped the note panel being clipped (Story 55.1).
+ *
+ * Every row here is a row of the spec's edge-case matrix. The distribution
+ * itself is flexbox's — what is testable, and what was wrong before, is the
+ * pair of numbers each column hands it.
+ */
+describe("columnStyle", () => {
+  // The constant, not a copy of its value: change `FOLD_STRIP.widthPx` and these
+  // assertions have to move with it rather than passing against the old number.
+  const FOLD = FOLD_STRIP.widthPx;
+
+  it("gives a column its chosen width as a basis, and its floor as a floor", () => {
+    // Room for everything: the basis is what the user dragged to, and the floor
+    // is only a floor.
+    expect(columnStyle("notes-rail", 240, false, FOLD)).toEqual({
+      flexBasis: 240,
+      minWidth: 180,
+    });
+    expect(columnStyle("notes-list", 320, false, FOLD)).toEqual({
+      flexBasis: 320,
+      minWidth: 240,
+    });
+  });
+
+  it("never lets a column be asked to go below the floor its spec states", () => {
+    // The squeeze is flexbox's, and `min-width` is the only thing that stops
+    // it. A column that reported no floor would be squeezed to nothing, which
+    // is the shape of the bug one level up: something has to refuse first.
+    for (const id of SURFACE_COLUMN_IDS) {
+      const style = columnStyle(id, SURFACE_COLUMNS[id].defaultWidth, false, FOLD);
+      expect(style.minWidth).toBe(SURFACE_COLUMNS[id].minWidth);
+      expect(style.flexBasis).toBeGreaterThanOrEqual(style.minWidth);
+    }
+  });
+
+  it("lifts a stored width that is below today's floor", () => {
+    // Defence in depth, not a reachable app state: `readColumnWidths` and the
+    // resizer both clamp before a width gets here, and every `defaultWidth` is
+    // already above its floor. What this pins is that the render site does not
+    // assume that — it is the last place a number becomes a pixel.
+    expect(columnStyle("notes-rail", 100, false, FOLD)).toEqual({
+      flexBasis: 180,
+      minWidth: 180,
+    });
+  });
+
+  it("makes a folded column rigid, whatever its surface's class says", () => {
+    // A 48px strip that squeezes is a strip whose icons collide. Basis and
+    // floor are both the strip width, so it cannot give even inside a row that
+    // is short of space.
+    expect(columnStyle("notes-rail", 240, true, FOLD)).toEqual({
+      flexBasis: FOLD,
+      minWidth: FOLD,
+    });
+  });
+
+  it("returns the same numbers for the same column every time", () => {
+    // Squeezing is a rendering response, never a write: widening the window
+    // has to restore exactly what the user chose, which it can only do if this
+    // function never remembers a narrowed value.
+    const first = columnStyle("notes-list", 400, false, FOLD);
+    const second = columnStyle("notes-list", 400, false, FOLD);
+    expect(second).toEqual(first);
+    expect(first.flexBasis).toBe(400);
+  });
+
+  it("carries no flex-shrink, so the surface's own class keeps deciding", () => {
+    // An inline `flexShrink` outranks a class. Emitting one here would hand
+    // Files and Chat a behaviour only the Notes surface was changed to want.
+    expect(columnStyle("files-tree", 360, false, FOLD)).not.toHaveProperty("flexShrink");
   });
 });

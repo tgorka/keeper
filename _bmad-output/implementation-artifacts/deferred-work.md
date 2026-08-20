@@ -3368,3 +3368,30 @@ reason: `drop_foreign_lfs_driver` removes a non-repository `filter "lfs"` sectio
   as absent (git's `apply_filter` tests `*ca->drv->process`, gix's `maybe_launch_process` tests
   only `Some`). (c) is the honest fix and is not ours to schedule.
 status: open
+
+- source_spec: none
+  summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
+  evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.
+
+- source_spec: none
+  summary: Add a mark (`==highlight==`) command and an emoji picker button to the markdown format toolbar.
+  evidence: Split from the same four-goal intent. Independently shippable: two additions to `format-toolbar.tsx` plus format commands; `emoji-complete.ts` already provides `:shortcode:` autocomplete, so the picker is a second entry point rather than new emoji infrastructure.
+
+- source_spec: none
+  summary: Audit inline embedding of image/video/audio/html/json/csv/pdf across all notes including session notes, and add editing of the rendered text for html, csv and json.
+  evidence: Split from the same four-goal intent, and the largest of the four. Much of it already exists — `FILE_FORMATS` in `src/lib/viewers/registry.ts` covers all seven types, `FileEmbedWidget`, `CsvTableWidget`, `ImageWidget` and `RecordingEmbedWidget` render them — so the real work is an audit of the gaps plus editable rendered text, not new embedding infrastructure.
+
+- source_spec: spec-note-panel-never-clipped
+  summary: The Files and Chat surfaces still carry `shrink-0` on their columns, so a wide tree or inbox can still starve the document beside it.
+  evidence: The panel strip fix is shared — those two surfaces render the same `PanelStrip` and now claim the same 280px basis — but their columns still refuse to shrink, so the deficit lands on the panel again. Story 55.1 was scoped to Notes and told not to touch them ("Never: do not touch the Files or Chat surfaces' columns"). The fix is one line each: drop `shrink-0` from `FILES_COLUMN_CLASS` and `CHAT_LIST_COLUMN_CLASS`. Deferred rather than done because neither surface's floor has been thought about the way `notes-list`'s 240 was, and changing three surfaces on one surface's evidence is how a fix becomes a regression somewhere nobody was looking.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: While a column is squeezed, the drag handle's `aria-valuenow` and the resizer report the remembered width, not the rendered one.
+  evidence: Deliberate — the remembered width is what a widened window restores, and it is the number the user set, so persisting or announcing the squeezed value would be the write this spec forbids. But a screen reader is told 320 while the column is 263, and dragging from a squeezed state jumps to the remembered width before it moves. Neither is wrong enough to trade for a stored-width bug; both deserve a considered answer about what a resizer should say when the layout is overriding it.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: No test lane exercises real flexbox — layout regressions of this kind can only be caught by arithmetic or by hand.
+  evidence: jsdom computes no layout, so every assertion in this story checks the *inputs* to the distribution (`flexBasis`, `minWidth`) and none checks the result. The bug being fixed was invisible to all 4600 tests precisely because it lived in the distribution. Verified for this story by rebuilding the box tree against the compiled stylesheet in a real engine and reading widths back, which is repeatable but manual. A headless-browser lane for a handful of layout invariants would make it automatic.
+  status: open

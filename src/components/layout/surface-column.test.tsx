@@ -106,7 +106,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
   it("starts at its own width, showing its body and offering the fold", () => {
     render(<Host id={id} />);
 
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${spec.defaultWidth}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${spec.defaultWidth}px` });
     expect(screen.getByText(BODY)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: collapse })).toHaveAttribute("aria-expanded", "true");
   });
@@ -120,7 +120,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     // mounted keeps its subscriptions, which is the cost folding reclaims.
     expect(screen.queryByText(BODY)).not.toBeInTheDocument();
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${FOLD_STRIP.widthPx}px`,
+      flexBasis: `${FOLD_STRIP.widthPx}px`,
     });
     // A fold with no handle is a column the user deleted by accident. The
     // control is a real button in the tab order, named for where it goes.
@@ -243,12 +243,12 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
 
     fireEvent.keyDown(handle, { key: "ArrowRight" });
     const wider = spec.defaultWidth + COLUMN_KEY_STEP;
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${wider}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${wider}px` });
     expect(readColumnWidths(document.cookie)[id]).toBe(wider);
 
     unmount();
     render(<Host id={id} />);
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${wider}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${wider}px` });
   });
 
   it("resizes from a drag", () => {
@@ -260,7 +260,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     fireEvent.pointerUp(handle, { pointerId: 1 });
 
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${spec.defaultWidth + 40}px`,
+      flexBasis: `${spec.defaultWidth + 40}px`,
     });
     expect(readColumnWidths(document.cookie)[id]).toBe(spec.defaultWidth + 40);
   });
@@ -273,7 +273,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     fireEvent.pointerMove(handle, { pointerId: 1, clientX: 0 });
     fireEvent.pointerUp(handle, { pointerId: 1 });
 
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${spec.minWidth}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${spec.minWidth}px` });
     expect(readColumnWidths(document.cookie)[id]).toBe(spec.minWidth);
   });
 
@@ -298,7 +298,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
 
     // The strip is 48px wide and the remembered width is untouched by it.
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${FOLD_STRIP.widthPx}px`,
+      flexBasis: `${FOLD_STRIP.widthPx}px`,
     });
     expect(readColumnWidths(document.cookie)[id]).toBe(chosen);
     // No seam while folded: there is nothing to size, and a drag on a strip
@@ -306,7 +306,7 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     expect(screen.queryByRole("separator", { name: seam })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: expand }));
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${chosen}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${chosen}px` });
   });
 
   it("survives a reload folded AND resized, then unfolds to the chosen width", () => {
@@ -318,10 +318,10 @@ describe.each(SURFACE_COLUMN_IDS)("the %s column", (id) => {
     reload(id, unmount);
 
     expect(screen.getByTestId("column")).toHaveStyle({
-      width: `${FOLD_STRIP.widthPx}px`,
+      flexBasis: `${FOLD_STRIP.widthPx}px`,
     });
     fireEvent.click(screen.getByRole("button", { name: expand }));
-    expect(screen.getByTestId("column")).toHaveStyle({ width: `${chosen}px` });
+    expect(screen.getByTestId("column")).toHaveStyle({ flexBasis: `${chosen}px` });
   });
 
   it("offers neither control where the arrangement is not a row of columns", () => {

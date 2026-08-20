@@ -22,7 +22,7 @@
         "title": "keeper",
         "width": 1280,
         "height": 800,
-        "minWidth": 940,
+        "minWidth": 960,
         "minHeight": 600,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
