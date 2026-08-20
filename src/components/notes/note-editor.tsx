@@ -1112,7 +1112,15 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo
           stack all have to survive a trip through history or conflict mode. */}
-      <div ref={hostRef} className={mode === "edit" ? "min-h-0 flex-1 overflow-auto" : "hidden"} />
+      <div
+        ref={hostRef}
+        // Named so a test can tell that an editor is booting here: its boot
+        // awaits thirteen dynamic imports, and a file that walks away mid-flight
+        // loses a race against the environment teardown. See
+        // `src/test/note-editor-boot.ts`.
+        data-slot="note-editor-host"
+        className={mode === "edit" ? "min-h-0 flex-1 overflow-auto" : "hidden"}
+      />
 
       {mode === "history" ? (
         <div className="min-h-0 flex-1">

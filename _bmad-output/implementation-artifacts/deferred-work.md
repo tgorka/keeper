@@ -3446,3 +3446,8 @@ status: open
   summary: A `<style>` block is dropped, so a page renders in keeper's typography rather than its own.
   evidence: Deliberate and stated in `html-view.ts`: applying a file's CSS would be styling this application's own DOM from a document somebody was handed. A scoped or sanitised subset is possible and is a separate question with its own answer.
   status: open
+
+- source_spec: none
+  summary: `files-pane.test.tsx` "re-reads a remembered folder once when Refresh rescues a failed first list" times out under parallel load.
+  evidence: Observed twice while hunting an unrelated unhandled rejection — once during a `lefthook` pre-push run (tests sharing the machine with clippy and typecheck) and once in a bare full run. `TestingLibraryElementError: Unable to find role="treeitem" and name "Notes"` after the 5s `waitFor` budget; the pane is rendered and the tree is empty, so the second list has not landed. Passes 15/15 in isolation. Not investigated: it is a different subsystem from the work in flight, and guessing at a timing fix without reproducing it deliberately would be a change nobody can evaluate.
+  status: open

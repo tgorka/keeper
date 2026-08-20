@@ -12,8 +12,9 @@
  * child from the header, or the menu stops rendering children, this fails.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const openFolder = vi.fn();
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -110,6 +111,10 @@ beforeEach(() => {
   toastSuccess.mockReset();
   toastError.mockReset();
 });
+
+// The editor's boot outlives a test that only needed the header; see the helper
+// for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("the header a person actually sees", () => {
   it("offers Export in the note's Actions menu and exports the note it is showing", async () => {
