@@ -45,7 +45,7 @@ use crate::lfs::batch::{
     auth_challenge, bounded_body, header_string, json_headers, sensitive_auth, transport_reason,
     Action, AuthRefresh, Disposition, ObjectId, ObjectSpec, Operation, MAX_ERROR_BODY_BYTES,
 };
-use crate::lfs::store::LfsStore;
+use crate::lfs::store::{self, LfsStore};
 
 /// `lfs.concurrenttransfers` default (research §5.10).
 ///
@@ -573,20 +573,25 @@ impl BasicTransfer {
         // `chunk()` rather than `bytes_stream()`: consuming a `Stream` needs
         // `futures_util::StreamExt`, which this crate deliberately does not
         // depend on. Both poll one body frame at a time; neither buffers.
-        loop {
-            let chunk = response
-                .chunk()
-                .await
-                .map_err(|err| network(host, transport_reason(&err)))?;
+        // The loop BREAKS with its outcome rather than returning through `?`,
+        // because an interrupted transfer has something worth keeping: the
+        // hasher, primed with every byte that did reach the disk. Returning
+        // early drops it, and the next attempt then re-reads the whole partial
+        // to rebuild what this process already had — fourteen seconds, on a
+        // 970 MB partial, before it asks for a single new byte.
+        let interrupted: Option<SyncError> = loop {
+            let chunk = match response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(err) => break Some(network(host, transport_reason(&err))),
+            };
             let Some(chunk) = chunk else {
-                break;
+                break None;
             };
             let bytes: &[u8] = &chunk;
             hasher.update(bytes);
-            writer
-                .write_all(bytes)
-                .await
-                .map_err(|err| SyncError::io("write lfs partial", &part, err))?;
+            if let Err(err) = writer.write_all(bytes).await {
+                break Some(SyncError::io("write lfs partial", &part, err));
+            }
             written += bytes.len() as u64;
             if coalescer.should_emit(Instant::now()) {
                 self.reporter.emit(TransferEvent::Progress {
@@ -594,12 +599,21 @@ impl BasicTransfer {
                     bytes_done: written,
                 });
             }
-        }
+        };
+
         writer
             .flush()
             .await
             .map_err(|err| SyncError::io("flush lfs partial", &part, err))?;
         drop(writer);
+
+        if let Some(err) = interrupted {
+            // Flushed first, deliberately: the remembered offset is only usable
+            // while it equals the file's length, so state saved ahead of the
+            // flush would be discarded by the very check that makes it safe.
+            store::remember_prefix(&spec.oid, written, &hasher);
+            return Err(err);
+        }
 
         let digest = hex::encode(hasher.finalize());
         if digest != spec.oid || written != spec.size {
@@ -607,6 +621,7 @@ impl BasicTransfer {
             // prefix we already know is poisoned would reproduce the same
             // mismatch on every subsequent attempt, forever.
             self.store.remove_partial(&spec.oid)?;
+            store::forget_prefix(&spec.oid);
             return Err(SyncError::Integrity {
                 subject: format!("lfs object {}", spec.oid),
                 expected: format!("{}/{}B", spec.oid, spec.size),
@@ -615,6 +630,7 @@ impl BasicTransfer {
         }
 
         // A rename; microseconds, so it stays on the reactor.
+        store::forget_prefix(&spec.oid);
         self.store.commit_partial(&spec.oid)
     }
 
