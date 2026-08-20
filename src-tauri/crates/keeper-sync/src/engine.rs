@@ -639,6 +639,27 @@ impl Engine {
     /// declared prerequisite, and discovering it mid-push would leave a profile
     /// half-applied.
     pub fn open(platform: Arc<dyn SyncPlatform>) -> Result<Self> {
+        // Before anything opens a repository. A Finder-launched macOS app
+        // inherits launchd's 256 descriptors, and gitoxide's object store maps
+        // one file per object it reads — a checkout of a few hundred exhausts
+        // them mid-tree and the folder silently stops catching up. Once per
+        // process; a second engine finds the limit already raised.
+        static RAISED: std::sync::Once = std::sync::Once::new();
+        RAISED.call_once(|| match crate::openfiles::raise() {
+            crate::openfiles::Raised::Raised { from, to } => {
+                tracing::info!(from, to, "raised the open-file limit");
+            }
+            crate::openfiles::Raised::AlreadyEnough(soft) => {
+                tracing::debug!(soft, "open-file limit already sufficient");
+            }
+            crate::openfiles::Raised::Unchanged => {
+                tracing::warn!(
+                    "could not raise the open-file limit; a large checkout may fail with \
+                     `Too many open files`"
+                );
+            }
+        });
+
         let data_dir = platform.data_dir()?;
         let conn = db::open(&data_dir)?;
         let device = db::device_identity(&conn, &platform.host_label())?;
@@ -5155,7 +5176,7 @@ impl Engine {
         }
         let _reservation = self
             .reserve(&profile.id)
-            .ok_or_else(|| SyncError::Config(format!("{} is already syncing", profile.name)))?;
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
 
         tracing::info!(
             profile = profile.name,

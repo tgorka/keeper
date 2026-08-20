@@ -692,6 +692,13 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // which is the truth for the moment it lasts — and `internal` would
         // dress a routine race as a defect in front of the user.
         SyncError::RemoteMoved { .. } => IpcErrorCode::SyncUnavailable,
+        // The third of the same shape, and the one the user is most likely to
+        // cause themselves: a scheduled run and a "Sync now" click overlapping.
+        // The folder is being synced — by the run that got there first — so this
+        // is a wait, not a fault. It used to arrive as `Config`, which the app
+        // renders as "invalid sync configuration", sending somebody to look for
+        // a broken setting that does not exist.
+        SyncError::Busy(_) => IpcErrorCode::SyncUnavailable,
         // Everything else keeps the `internal` this funnel has always given it.
         // Spelled out rather than defaulted so that growing the taxonomy asks
         // the question here instead of answering it.

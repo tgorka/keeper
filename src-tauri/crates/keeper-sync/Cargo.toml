@@ -76,3 +76,10 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+# `openfiles` raises RLIMIT_NOFILE at startup, because a Finder-launched app
+# inherits launchd's 256 and gitoxide's object store needs more than that.
+# A wrapper rather than `libc` directly: this crate denies `unsafe_code`, and
+# one syscall is not worth an exception to that.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
