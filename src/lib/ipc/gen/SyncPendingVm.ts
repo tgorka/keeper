@@ -5,7 +5,8 @@
  */
 export type SyncPendingVm = { path: string, 
 /**
- * `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`.
+ * `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`
+ * | `incomingUpdate`.
  *
  * The first five are what this machine changed; `incoming` is an LFS
  * object queued to arrive, which `git status` cannot see and which used to

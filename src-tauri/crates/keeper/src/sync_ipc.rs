@@ -373,7 +373,8 @@ pub struct SyncActivityVm {
 #[serde(rename_all = "camelCase")]
 pub struct SyncPendingVm {
     pub path: String,
-    /// `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`.
+    /// `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`
+    /// | `incomingUpdate`.
     ///
     /// The first five are what this machine changed; `incoming` is an LFS
     /// object queued to arrive, which `git status` cannot see and which used to
@@ -1185,7 +1186,18 @@ pub async fn sync_pending(
         .map(|file| {
             let (reason, since_ms) = match file.reason {
                 PendingReason::Settling { since_ms } => ("settling", Some(since_ms)),
-                PendingReason::Incoming { .. } => ("incoming", None),
+                // Two words for one direction: an object that replaces content
+                // this machine holds is a different thing to look at from one
+                // that is simply arriving, and only keeper's own record of what
+                // it has materialized can tell them apart.
+                PendingReason::Incoming { replacing, .. } => (
+                    if replacing {
+                        "incomingUpdate"
+                    } else {
+                        "incoming"
+                    },
+                    None,
+                ),
                 PendingReason::Untracked => ("untracked", None),
                 PendingReason::Modified => ("modified", None),
                 PendingReason::Added => ("added", None),

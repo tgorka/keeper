@@ -448,11 +448,12 @@ export const SYNC_PENDING_OUTBOUND_WORD = "Going out";
  * arrow is content nobody has yet; a circled one is a second version of
  * something that does.
  *
- * `PENDING_INBOUND_UPDATE_MARK` below is deliberately unused. An inbound row is
- * always new content — a download is queued only for a path whose worktree
- * still holds pointer text (`lfs::stage::pending_smudges`), so "an update
- * arriving" is not a state this queue can be in. When it becomes one, that is
- * the mark it takes and the scheme above stays true.
+ * All four combinations exist. An inbound update is not visible in the
+ * repository — a download is queued only for a path whose worktree holds
+ * pointer text, and that is true of a new file and a new version alike — so it
+ * is read from keeper's own record of what it has materialized here. A file
+ * added upstream a week ago and never fetched is NEW to this machine however
+ * old it is there, which is the question this answers.
  *
  * The word is what a screen reader gets. An arrow is a shape, and "up" is not a
  * fact about a file.
@@ -464,10 +465,8 @@ export const PENDING_MARKS: Record<string, { icon: typeof FileIcon; word: string
   deleted: { icon: CircleMinus, word: `Deleted · ${SYNC_PENDING_OUTBOUND_WORD}` },
   settling: { icon: Clock, word: SYNC_SETTLING_SENTENCE },
   incoming: { icon: ArrowDownToLine, word: `New file · ${SYNC_PENDING_INBOUND_WORD}` },
+  incomingUpdate: { icon: CircleArrowDown, word: `Changed · ${SYNC_PENDING_INBOUND_WORD}` },
 };
-
-/** Reserved for an inbound row that replaces content this clone already has. */
-export const PENDING_INBOUND_UPDATE_MARK = CircleArrowDown;
 
 /** Names the row a transfer is moving right now. */
 export const SYNC_PENDING_CURRENT_WORD = "Syncing now";
