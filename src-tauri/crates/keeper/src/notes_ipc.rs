@@ -651,6 +651,10 @@ struct SpaceDef {
     /// template directory. `None` when the space hands out no template, which
     /// is the ordinary case.
     template: Option<String>,
+    /// `keeper.folder` — where a note created in this space is written
+    /// (Story 44.13). `None` leaves the destination to the query, which is what
+    /// a `path:` space has always done and what a `tag:` space never could.
+    folder: Option<String>,
     /// What keeper could not read in the two presentation keys, already worded
     /// (Story 44.4). Empty for a file keeper understood entirely.
     warnings: Vec<String>,
@@ -682,6 +686,7 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
         order: sort::DEFAULT_SPACE_ORDER,
         default_key: None,
         template: None,
+        folder: None,
         warnings: Vec::new(),
     };
     let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
@@ -698,6 +703,12 @@ fn space_def(entry: &IndexEntry, source: &str) -> SpaceDef {
             ("sort", FieldValue::Str(stored)) => def.sort = stored.clone(),
             ("limit", FieldValue::Num(limit)) => def.limit = counts::read_limit(*limit),
             ("icon", FieldValue::Str(icon)) => def.icon = space_icon(icon),
+            // Kept as the stored text rather than the validated directory: the
+            // editor must show what the file says, and `seed::folder_dest` is
+            // the one place that decides whether it can be written to.
+            ("folder", FieldValue::Str(dir)) => {
+                def.folder = Some(dir.clone()).filter(|d| !d.trim().is_empty());
+            }
             // Matched on the key alone and flattened to text, so `order: 2`,
             // `order: "2"` and `order: [a, b]` all reach one reader instead of
             // the first two working and the third being silently absent.
@@ -1300,6 +1311,7 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
                 icon: def.icon,
                 default_key: def.default_key,
                 template: def.template,
+                folder: def.folder,
                 warnings: def.warnings,
                 order: def.order,
                 error,
@@ -1558,6 +1570,17 @@ pub async fn notes_space_save(
                 templates::SPACE_TEMPLATE_KEY.to_owned(),
                 FieldValue::Str(template.to_owned()),
             ));
+        }
+        // Same rule again: written only when there is one, so clearing the
+        // field in the editor removes the key instead of leaving `folder: ""`
+        // for a reader to interpret.
+        if let Some(folder) = space
+            .folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+        {
+            pairs.push(("folder".to_owned(), FieldValue::Str(folder.to_owned())));
         }
         pairs
     };
@@ -1999,7 +2022,9 @@ fn create_for_space(vault: &Vault, req: &NoteCreateReq) -> Result<NoteCreateVm, 
         let note = create_note(vault, req, &seed::Seed::default(), None, &mut notices)?;
         return Ok(NoteCreateVm { note, notices });
     };
-    let seeded = seed::inherit(&space.query);
+    // The space's folder overrides whatever the query implied, because it was
+    // typed rather than inferred (Story 44.13).
+    let seeded = seed::inherit_into(&space.query, space.folder.as_deref());
     // The space's own default template, the middle rung of `template_source`'s
     // three (Story 44.7). Read from the same one read of the space note that
     // produced the query, so a note cannot be seeded from one version of the
@@ -2047,6 +2072,7 @@ struct SpaceForCreate {
     query: String,
     /// `keeper.template`, the template this space hands out (Story 44.7).
     template: Option<String>,
+    folder: Option<String>,
 }
 
 /// One space's name, stored query text and default template, or `None` when no
@@ -2070,6 +2096,7 @@ fn space_source(vault: &Vault, space_id: &str) -> Option<SpaceForCreate> {
         name: def.name,
         query: def.query,
         template: def.template,
+        folder: def.folder,
     })
 }
 

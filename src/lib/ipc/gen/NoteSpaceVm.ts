@@ -83,6 +83,17 @@ defaultKey: string | null,
  */
 template: string | null, 
 /**
+ * The folder a note created in this space is written to — vault-relative,
+ * or `None` to let the query answer (Story 44.13).
+ *
+ * A `path:` query already implies a folder and still does; this is what a
+ * `tag:` space has instead, because a tag names a set and never a place.
+ * Stored as typed, unresolved: whether the folder exists is a question for
+ * create time, and a space that names one keeper has to make is not an
+ * error the editor should refuse.
+ */
+folder: string | null, 
+/**
  * The presentation keys of this space's frontmatter that keeper could not
  * read, each already worded as a finished sentence (Story 44.4).
  *

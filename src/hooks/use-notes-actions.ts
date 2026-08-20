@@ -228,6 +228,10 @@ export async function saveFilterAsSpace(name: string): Promise<NoteRefVm | null>
     // that is on screen, and a template is not part of a filter. The space
     // editor is where one is chosen (Story 44.7).
     template: null,
+    // And no folder, on the same rule: a filter says which notes, never where
+    // the next one goes. Inventing a destination nobody chose is how a space
+    // starts writing somewhere its owner never looked (Story 44.13).
+    folder: null,
   });
 }
 

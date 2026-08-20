@@ -52,4 +52,11 @@ order: number,
  * An empty string clears the key rather than storing a template whose path
  * is nothing.
  */
-template: string | null, };
+template: string | null, 
+/**
+ * Where notes created in this space are written — vault-relative, or
+ * `None`/empty to leave the destination to the query (Story 44.13). An
+ * empty string clears the key rather than storing a folder that names
+ * nothing.
+ */
+folder: string | null, };
