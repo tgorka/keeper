@@ -250,7 +250,17 @@ const FILE_FORMAT_ROWS: readonly FileFormatRow[] = [
   sourceRow(["go"], "go", "Go source"),
   sourceRow(["sh", "bash", "zsh", "fish"], "shell", "Shell script"),
   sourceRow(["sql"], "sql", "SQL"),
-  sourceRow(["html", "htm"], "html", "HTML"),
+  // Not a `sourceRow` since Story 55.5: HTML is the one source format with a
+  // reading of its own — the page it describes — and until then keeper could
+  // show a `.html` only as angle brackets. The raw half is unchanged and is
+  // still the only half that can change anything (AD-88).
+  textRow(["html", "htm"], {
+    format: "html",
+    label: "HTML",
+    icon: "file-code",
+    rendered: "html",
+    language: "html",
+  }),
   sourceRow(["css", "scss", "less"], "css", "Stylesheet"),
   sourceRow(["xml", "plist"], "xml", "XML"),
   sourceRow(["java"], "java", "Java source"),

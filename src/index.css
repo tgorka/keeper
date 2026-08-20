@@ -313,3 +313,111 @@
     @apply font-sans;
   }
 }
+
+/* The rendered half of an HTML file (Story 55.5).
+ *
+ * Tailwind's preflight removes every element default, which is right for an app
+ * whose every box is deliberate and wrong for the one view whose whole job is
+ * to show a document as its author wrote it: without these, a `<h1>` is body
+ * text, a list has no markers and a table's cells run together — which is a
+ * viewer that renders and shows nothing.
+ *
+ * Scoped to the pane, so nothing here reaches the application's own DOM, and
+ * built from the theme's tokens rather than from a browser's defaults, so the
+ * page reads as part of keeper in both themes.
+ *
+ * These are the elements `html-view.ts` can produce and no others: it builds
+ * through an allowlist, so this list and that one are the same list. */
+@layer components {
+  .keeper-html-page :is(h1, h2, h3, h4, h5, h6) {
+    font-weight: 600;
+    line-height: 1.25;
+    margin-block: 0.8em 0.4em;
+  }
+  .keeper-html-page h1 {
+    font-size: 1.6em;
+  }
+  .keeper-html-page h2 {
+    font-size: 1.35em;
+  }
+  .keeper-html-page h3 {
+    font-size: 1.15em;
+  }
+  .keeper-html-page :is(p, blockquote, pre, table, ul, ol, dl, figure) {
+    margin-block: 0.6em;
+  }
+  .keeper-html-page :is(ul, ol) {
+    padding-inline-start: 1.5em;
+  }
+  .keeper-html-page ul {
+    list-style: disc;
+  }
+  .keeper-html-page ol {
+    list-style: decimal;
+  }
+  .keeper-html-page li {
+    margin-block: 0.15em;
+  }
+  .keeper-html-page a {
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .keeper-html-page blockquote {
+    border-inline-start: 2px solid var(--border);
+    padding-inline-start: 0.8em;
+    color: var(--muted-foreground);
+  }
+  .keeper-html-page :is(code, pre) {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+  }
+  .keeper-html-page pre {
+    background-color: var(--muted);
+    border-radius: 4px;
+    padding: 0.6em 0.8em;
+    overflow-x: auto;
+  }
+  .keeper-html-page table {
+    border-collapse: collapse;
+    /* The one wide thing a page can hold: it scrolls inside its own box rather
+       than pushing the pane's width out from under the reader. */
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+  }
+  .keeper-html-page :is(td, th) {
+    border: 1px solid var(--border);
+    padding: 0.25em 0.5em;
+    text-align: start;
+  }
+  .keeper-html-page th {
+    font-weight: 600;
+    background-color: var(--muted);
+  }
+  .keeper-html-page hr {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin-block: 1em;
+  }
+  .keeper-html-page mark {
+    background-color: var(--mark);
+    color: var(--mark-foreground);
+  }
+  /* An address keeper deliberately did not fetch. Quieter than the prose it
+     sits in, because it is a fact about the file rather than part of it. */
+  .keeper-html-page .keeper-html-address {
+    display: block;
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+  }
+  /* A text run the reader may retype. No border until it is focused: a page
+     covered in boxes is not a page. */
+  .keeper-html-page .keeper-html-text:focus {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
+}

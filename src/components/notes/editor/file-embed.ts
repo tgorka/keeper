@@ -112,8 +112,8 @@ export interface FileEmbedOptions {
  * the kind Rust actually returned, and draws that.
  *
  * The set is derived and not listed: a text-shaped format with a rendered half
- * that is a table or a structure. That is CSV, JSON and JSONL today, and it
- * will be whatever else earns a row.
+ * that is a table, a structure or a page. That is CSV, JSON, JSONL and — since
+ * Story 55.5 — HTML, and it will be whatever else earns a row.
  *
  * **Markdown is deliberately excluded even though it has a rendered half.**
  * `![[note.md]]` is a transclusion — showing one note inside another — which is
@@ -128,7 +128,9 @@ export function embedEntryFor(target: string): ViewerEntry | null {
   if (entry.viewer !== "text") {
     return null;
   }
-  return entry.rendered === "table" || entry.rendered === "structure" ? entry : null;
+  return entry.rendered === "table" || entry.rendered === "structure" || entry.rendered === "html"
+    ? entry
+    : null;
 }
 
 /** The ordinary wikilink: what the embed shows before the panel arrives, and

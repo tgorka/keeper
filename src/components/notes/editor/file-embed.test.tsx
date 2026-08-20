@@ -191,6 +191,11 @@ describe("which embeds get a panel", () => {
     // Same format under its other spelling, because the registry says so and
     // this module never learned that `.ndjson` exists.
     expect(embedEntryFor("rows.ndjson")?.format).toBe("jsonl");
+    // Story 55.5 gave HTML a rendered half, and this module learned nothing:
+    // the predicate is "a text-shaped format with a rendered half", and a row
+    // that gained one is in the set from the moment it did.
+    expect(embedEntryFor("attachments/page.html")?.format).toBe("html");
+    expect(embedEntryFor("index.htm")?.format).toBe("html");
   });
 
   it("leaves alone everything a panel would be the wrong answer for", () => {
@@ -201,6 +206,10 @@ describe("which embeds get a panel", () => {
     // No rendered half — a toggle showing the same bytes twice.
     expect(embedEntryFor("notes/readme.txt")).toBeNull();
     expect(embedEntryFor("src/main.rs")).toBeNull();
+    // Still true of the other source rows: HTML is the one with a reading of
+    // its own, and `.css` and `.xml` are not it.
+    expect(embedEntryFor("site/style.css")).toBeNull();
+    expect(embedEntryFor("data/feed.xml")).toBeNull();
     // Media and documents belong to their own viewers.
     expect(embedEntryFor("attachments/clip.mov")).toBeNull();
     expect(embedEntryFor("attachments/report.pdf")).toBeNull();

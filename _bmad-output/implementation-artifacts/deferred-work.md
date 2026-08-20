@@ -3431,3 +3431,18 @@ status: open
   summary: A PDF embed cannot report a failed load.
   evidence: `<embed>` fires no `error` event, so the degrade-to-a-link path every other kind has does not exist for PDF. Safe today because the path came back from a resolver that stats the file, so "the vault holds it" is established before the element is built — but a file deleted between the resolve and the paint shows an empty box rather than the link. Fixing it means probing the bytes or watching for a zero-size box, neither of which is obviously worth it.
   status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: The JSON structure view is still read-only, so "editable rendered text" is true of HTML and CSV and not of JSON.
+  evidence: `json-structure.ts` says so in its header and gives its reason. Making a value editable there is the same shape this story built for HTML — a parse that records source offsets, a splice verified before it is applied — but the JSON parser is deliberately not `JSON.parse` (it preserves number text, key order and repeats), so the offsets have to come out of that parser rather than a second scan. Its own story.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: Pressing Enter inside an editable HTML text run drops the line break.
+  evidence: `contenteditable="plaintext-only"` inserts a break element, and the splice reads `textContent`, which does not include it — so the text is written without the newline. Lossy in one direction only and never corrupting (the verified splice still applies), but a reader who expects a paragraph break gets a space. Fixing it means deciding what a line break inside a run should become in the markup, which is a markup decision and therefore the Source tab's.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: A `<style>` block is dropped, so a page renders in keeper's typography rather than its own.
+  evidence: Deliberate and stated in `html-view.ts`: applying a file's CSS would be styling this application's own DOM from a document somebody was handed. A scoped or sanitised subset is possible and is a separate question with its own answer.
+  status: open

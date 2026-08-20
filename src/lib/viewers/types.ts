@@ -51,6 +51,12 @@ export type ViewerId = "video" | "image" | "audio" | "text" | "document" | "fold
  * {@link ViewerEntry.language} and in nothing else a surface acts on, so a
  * per-language format id would be twenty entries in a union whose only reader
  * would immediately collapse them back to one branch.
+ *
+ * **HTML is out of `source` for exactly that reason turned around** (Story
+ * 55.5): it gained a rendered half, which is something a surface acts on, and
+ * the remembered-view cookie is keyed by format — so leaving it in `source`
+ * would file "I prefer the Page tab" under a key every `.rs` and `.py` also
+ * reads.
  */
 export type ViewerFormat =
   | "video"
@@ -64,6 +70,7 @@ export type ViewerFormat =
   | "jsonl"
   | "plain"
   | "source"
+  | "html"
   | "pdf"
   | "docx"
   | "pptx"
@@ -78,7 +85,7 @@ export type ViewerFormat =
  * present and showing the same bytes twice. A `.rs` file has no rendered form;
  * offering a toggle that changes nothing is how a control loses its meaning.
  */
-export type RenderedView = "markdown" | "table" | "structure";
+export type RenderedView = "markdown" | "table" | "structure" | "html";
 
 /**
  * The syntax a file deserves in the raw editor (Story 45.6).
