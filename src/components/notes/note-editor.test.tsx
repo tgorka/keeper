@@ -31,6 +31,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteVaultVm, NoteWriteVm } from "@/lib/ipc/client";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
@@ -233,6 +234,10 @@ afterEach(() => {
   restoreRects = null;
   resetNotesEditorStoreForTest();
 });
+
+// The editor's boot outlives a test that only needed the header; see the helper
+// for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("the header row is three groups, not nine siblings", () => {
   it("puts no control in the same shrink context as the caption", async () => {

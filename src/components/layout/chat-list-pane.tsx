@@ -61,6 +61,8 @@ import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
  * `w-[320px]` here — it is a remembered number on the element, which is what
  * lets it be dragged.
  */
+// `shrink-0` on purpose — see the note on `FILES_COLUMN_CLASS`. Story 55.1
+// changed the Notes columns only.
 const CHAT_LIST_COLUMN_CLASS =
   "flex h-full shrink-0 flex-col border-border border-r bg-background outline-none last:border-r-0";
 

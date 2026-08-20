@@ -1722,7 +1722,7 @@ describe("ChatListPane — the inbox is a column", () => {
     render(<ChatListPane />);
     expect(
       screen.getByLabelText("Loading conversations").closest("[id='column-chat-list']"),
-    ).toHaveStyle({ width: `${wider}px` });
+    ).toHaveStyle({ flexBasis: `${wider}px` });
   });
 
   it("offers neither control on the phone, and ignores a fold made on the desktop", () => {

@@ -58,12 +58,8 @@
 import { WidgetType } from "@codemirror/view";
 import { type RecordingNoteTargetVm, recordingNoteTargets, revealPath } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
-import {
-  primeFirstFrame,
-  type RecordingTransport,
-  releaseHost,
-  releaseMediaElement,
-} from "./recording-transport";
+import { mediaElementFor } from "./media-element";
+import { type RecordingTransport, releaseHost, releaseMediaElement } from "./recording-transport";
 import { WIKILINK_ATTR } from "./wikilink";
 
 /**
@@ -249,44 +245,29 @@ function elementFor(
 ): HTMLElement {
   // Before the URL: the chip requests no bytes, so composing one for it would
   // be a string built to be thrown away.
-  if (target.kind === "file") {
+  //
+  // `folder` joins it, which is a change of behaviour: the branch below used to
+  // be "video or else audio", so a target that was a directory became an
+  // `<audio controls>` named after it. `kind_for_file_name` never returns
+  // `folder`, so this was almost certainly unreachable for a recording target —
+  // but "almost certainly unreachable" and "silently draws an audio player" are
+  // a poor pair, and lifting the drawable kinds into their own type in Story
+  // 55.4 is what asked the question.
+  if (target.kind === "file" || target.kind === "folder") {
     return chip(target);
   }
-  const name = fileName(target.relativePath);
-  const url = recordingAssetUrl(sessionId, target.relativePath);
-  if (target.kind === "image") {
-    const image = document.createElement("img");
-    image.className = "cm-lp-recording-image";
-    // The file name, because a recording's image has no caption anywhere else
-    // and an empty `alt` would tell a screen reader it is decorative.
-    image.alt = name;
-    // Off-screen embeds in a long note cost nothing until they are scrolled to.
-    image.loading = "lazy";
-    image.decoding = "async";
-    image.addEventListener("error", onFailedLoad);
-    image.src = url;
-    return image;
-  }
-  const player = document.createElement(target.kind === "video" ? "video" : "audio");
-  // The video class is the one Story 42.4 shipped and its rule — block, capped
-  // height — is right for an audio bar too.
-  player.className = target.kind === "video" ? "cm-lp-recording-player" : "cm-lp-recording-audio";
-  player.controls = true;
-  // Metadata only: a duration and a first frame, not half a gigabyte. The
-  // "and a first frame" half is not free and is not the platform's default —
-  // see {@link primeFirstFrame}, registered below.
-  player.preload = "metadata";
-  // The file name, so a screen reader hears which of a session's tracks this is.
-  player.setAttribute("aria-label", name);
-  player.addEventListener("error", onFailedLoad);
-  if (player instanceof HTMLVideoElement) {
-    // Audio has no frame to show, so it is asked for nothing it cannot use.
-    primeFirstFrame(player);
-  }
-  // Assigned last, because assigning `src` is what starts the load and every
-  // handler above must already be registered when it does.
-  player.src = url;
-  return player;
+  // The three drawable kinds are `media-element.ts`'s, so that an ordinary
+  // note's photograph and a recording's photograph are the same `<img>` rather
+  // than two that resemble each other (Story 55.4). What stays here is the URL,
+  // which is the one thing the two address spaces do not share.
+  return mediaElementFor(
+    {
+      kind: target.kind,
+      name: fileName(target.relativePath),
+      url: recordingAssetUrl(sessionId, target.relativePath),
+    },
+    onFailedLoad,
+  );
 }
 
 /**

@@ -454,6 +454,8 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         tags,
         indent,
         writing,
+        find,
+        marks,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -470,6 +472,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         // imports too, so a session log gets the same three tools rather than a
         // second copy of them.
         import("./editor/writing-tools"),
+        // The find bar. In the closure with everything else so the search
+        // panel's React tree is in the editor chunk, not the main bundle.
+        import("./editor/find-panel"),
+        import("./editor/markdown-marks"),
       ]);
       if (disposed) {
         return;
@@ -518,7 +524,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             // everywhere else. CodeMirror's own keymap is what receives it,
             // rather than a synthesised event, because the panel it opens is
             // CodeMirror's and only its own commands can drive it.
-            cmSearch.search({ top: true }),
+            find.findBar(),
             cmSearch.highlightSelectionMatches(),
             view.keymap.of([
               ...commands.defaultKeymap,
@@ -554,7 +560,13 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
                 },
               },
             ]),
-            markdown.markdown({ base: markdown.markdownLanguage }),
+            markdown.markdown({
+              base: markdown.markdownLanguage,
+              // `==highlight==`, which no base grammar defines. The same list
+              // is passed by `markdown-preview.ts`, because a note and the
+              // same bytes opened from Files must not render differently.
+              extensions: [...marks.MARKDOWN_MARKS],
+            }),
             writing.markdownWritingTools([
               wikilink.wikilinkSource(vaultId),
               tags.tagCompleteSource(async () => {
@@ -1100,7 +1112,15 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
 
       {/* Hidden rather than unmounted: the caret, the selection and the undo
           stack all have to survive a trip through history or conflict mode. */}
-      <div ref={hostRef} className={mode === "edit" ? "min-h-0 flex-1 overflow-auto" : "hidden"} />
+      <div
+        ref={hostRef}
+        // Named so a test can tell that an editor is booting here: its boot
+        // awaits thirteen dynamic imports, and a file that walks away mid-flight
+        // loses a race against the environment teardown. See
+        // `src/test/note-editor-boot.ts`.
+        data-slot="note-editor-host"
+        className={mode === "edit" ? "min-h-0 flex-1 overflow-auto" : "hidden"}
+      />
 
       {mode === "history" ? (
         <div className="min-h-0 flex-1">

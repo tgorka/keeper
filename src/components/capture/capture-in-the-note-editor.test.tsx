@@ -34,8 +34,9 @@
  * instead would pass just as happily while both presses named one note.
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaptureTargetVm, NoteBodyBatch, NoteVaultVm } from "@/lib/ipc/client";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const notesCaptureOpen = vi.fn<(target: CaptureTargetVm) => Promise<void>>();
 const notesCaptureWindows = vi.fn<() => Promise<unknown[]>>();
@@ -183,6 +184,10 @@ beforeEach(() => {
   });
   seedVault();
 });
+
+// The editor's boot outlives a test that only needed the header; see the helper
+// for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("the Actions menu a person actually opens", () => {
   it("offers Open in a capture window, and opens the note the header is showing", async () => {

@@ -140,6 +140,55 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
 };
 
 /**
+ * The CSS a surface column occupies, given what the user chose and whether it
+ * is folded (Story 55.1).
+ *
+ * **The distribution is flexbox's job, not ours.** A column used to render as
+ * `width: <chosen>px` with `shrink-0`, which is a promise the surface cannot
+ * always keep: three panes whose widths are fixed do not fit a window narrower
+ * than their sum, so the row overflowed and the last pane — the one holding the
+ * open note and its header controls — was the part that went off screen. The
+ * only remedy was folding columns by hand.
+ *
+ * A basis plus a floor says the same thing without the lie. `flex-basis` is the
+ * width the column takes when there is room; `min-width` is the floor it will
+ * not go below; and because the panel strip beside it has `flex-basis: 0`, a
+ * shortfall is absorbed entirely by the columns and never by the note. Widening
+ * restores the basis exactly, so nothing has to be remembered, recomputed or
+ * written back — which is what keeps a narrow window from quietly rewriting the
+ * width somebody dragged.
+ *
+ * A folded column is rigid on purpose — basis and floor are both the strip
+ * width, so it cannot squeeze whatever its class says, and a strip that
+ * squeezes is a strip whose icons collide.
+ *
+ * **No `flex-shrink` here, deliberately.** Whether a column may give is the
+ * surface's decision, carried by its own class: an inline `flexShrink` would
+ * outrank that class and hand every surface a behaviour only one of them was
+ * changed to want.
+ */
+export function columnStyle(
+  id: SurfaceColumnId,
+  chosen: number,
+  folded: boolean,
+  foldedWidth: number,
+): { flexBasis: number; minWidth: number } {
+  if (folded) {
+    return { flexBasis: foldedWidth, minWidth: foldedWidth };
+  }
+  const floor = columnMinWidth(id);
+  // The same clamp `clampColumnWidth` applies on the way in, applied again on
+  // the way out — both ends, because a value that never went through the codec
+  // reaches here too. A non-finite `chosen` is the one that matters: React drops
+  // `flex-basis: NaNpx`, the property falls back to `auto`, and a column with no
+  // basis in a row that is short of space collapses toward its content.
+  const basis = Number.isFinite(chosen)
+    ? Math.min(Math.max(chosen, floor), MAX_COLUMN_WIDTH)
+    : floor;
+  return { flexBasis: basis, minWidth: floor };
+}
+
+/**
  * The floor `id` is held to.
  *
  * Consulted on read as well as on write, so a width recorded by a build with a

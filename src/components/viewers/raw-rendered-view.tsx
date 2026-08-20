@@ -62,6 +62,7 @@ import { writeCookie } from "@/components/ui/cookie-writer";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { notesCsvSetCell } from "@/lib/ipc/client";
 import type { LanguageId, RenderedView, ViewerFormat } from "@/lib/viewers";
+import { buildHtmlView, spliceText, TEXT_RUN_ATTR } from "./html-view";
 import type { JsonParseError, JsonRow, JsonStructure } from "./json-structure";
 import { parseJsonlStructure, parseJsonStructure } from "./json-structure";
 import type { MarkdownEditing, MarkdownPreview, MarkdownPreviewOptions } from "./markdown-preview";
@@ -219,6 +220,7 @@ const RENDERED_LABEL: Record<RenderedView, string> = {
   markdown: "Preview",
   table: "Table",
   structure: "Structure",
+  html: "Page",
 };
 
 /** The raw tab. "Source", not "Raw": every editor a person has used calls the
@@ -285,6 +287,111 @@ function Notice({ children }: { children: React.ReactNode }): React.ReactElement
  * thousand and five thousand DOM rows is a pane that stops responding — the
  * kind of thing that passes every test and fails on the first real export.
  */
+/**
+ * The rendered half of an HTML file (Story 55.5).
+ *
+ * Editable text and nothing else: a reader may retype a paragraph, and an
+ * attribute, an element or the shape of the document are the Source tab's — the
+ * one tab that can change anything (AD-88).
+ *
+ * **Rebuilt on the file, not on the buffer.** Every keystroke changes
+ * `content`, and rebuilding the view under a caret would move it to the start
+ * of the document on every character. So the built view is the one made when
+ * this file was opened, and `content` is read imperatively at the moment an
+ * edit is spliced — which is also the moment {@link spliceText} verifies that
+ * the bytes it is about to replace are still the ones it was built from.
+ */
+function HtmlPane({
+  content,
+  readOnly,
+  onChange,
+  onRefusal,
+}: {
+  content: string;
+  readOnly: boolean;
+  onChange: ((next: string) => void) | undefined;
+  onRefusal: (reason: string) => void;
+}): React.ReactElement {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  // Read imperatively: see the doc above. A dependency on `content` would
+  // remount the view on every keystroke.
+  const latest = useRef({ content, onChange, onRefusal });
+  latest.current = { content, onChange, onRefusal };
+  // The source the view was built from, which is what a splice is checked
+  // against — not the buffer, which the reader's own typing has already moved.
+  const builtFrom = useRef(content);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (host === null) {
+      return;
+    }
+    builtFrom.current = latest.current.content;
+    const view = buildHtmlView(latest.current.content);
+    host.replaceChildren(view.node);
+    if (readOnly) {
+      return () => host.replaceChildren();
+    }
+    for (const span of Array.from(host.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`))) {
+      // A run of pure whitespace is a text node between two blocks — the
+      // newline after a `</p>`. It is a real run and keeps its index, because
+      // the mapping is by order, but it is not something a reader can see, and
+      // an invisible edit target is a place to lose a keystroke.
+      if ((span.textContent ?? "").trim() === "") {
+        continue;
+      }
+      // `setAttribute`, not the property: the property setter is not
+      // implemented everywhere (jsdom does nothing with it, silently), and the
+      // attribute is what the engine reads either way.
+      //
+      // `plaintext-only` rather than `true`: a reader retypes words, and a
+      // paste of rich text would be a second way to write markup into a file
+      // whose markup only the Source tab may change. An engine that does not
+      // know the value treats it as `inherit` and the text is simply not
+      // editable — a lost capability, never a wrong edit.
+      span.setAttribute("contenteditable", "plaintext-only");
+      span.spellcheck = false;
+    }
+    const onInput = (event: Event): void => {
+      const span = (event.target as HTMLElement | null)?.closest<HTMLElement>(`[${TEXT_RUN_ATTR}]`);
+      const run = view.runs[Number(span?.getAttribute(TEXT_RUN_ATTR))];
+      if (span === null || span === undefined || run === undefined) {
+        return;
+      }
+      const spliced = spliceText(builtFrom.current, run, span.textContent ?? "");
+      if (!spliced.ok) {
+        latest.current.onRefusal(spliced.reason);
+        return;
+      }
+      // The new file becomes what the next edit is checked against, so a second
+      // edit in another paragraph splices into the document as it now is.
+      builtFrom.current = spliced.text;
+      latest.current.onChange?.(spliced.text);
+    };
+    host.addEventListener("input", onInput);
+    return () => {
+      host.removeEventListener("input", onInput);
+      host.replaceChildren();
+    };
+    // `content` is deliberately absent from the dependencies: rebuilding on
+    // every keystroke would move the caret to the top of the document on every
+    // character, so the buffer is read imperatively through `latest` instead.
+    // (No suppression needed — the rule is not on here, and a suppression that
+    // suppresses nothing is a comment pretending to be a guarantee.)
+  }, [readOnly]);
+
+  return (
+    <div
+      ref={hostRef}
+      data-testid={HTML_PANE_TESTID}
+      className="keeper-html-page h-full min-h-0 overflow-auto px-3 py-2 text-sm"
+    />
+  );
+}
+
+/** Test id for the page view, on the same terms as the PDF's. */
+export const HTML_PANE_TESTID = "html-page";
+
 function StructurePane({ structure }: { structure: JsonStructure }): React.ReactElement {
   const items = useMemo<StructureItem[]>(() => {
     const merged: StructureItem[] = structure.rows.map((row, at) => ({ at, row }));
@@ -902,6 +1009,17 @@ export function RawRenderedView({
           />
         ) : rendered === "table" && csv != null ? (
           <CsvPane coordinates={csv} options={csvOptions} onExternalWrite={onExternalWrite} />
+        ) : rendered === "html" ? (
+          <HtmlPane
+            content={content}
+            readOnly={readOnly === true}
+            onChange={onChange}
+            // The banner Story 45.4 already built for a preview that refused:
+            // a refused splice is the same kind of fact — keeper declining to
+            // act on bytes, with a sentence — and it clears when the buffer
+            // changes, which is exactly when the refusal stops being true.
+            onRefusal={onOutcome}
+          />
         ) : structure !== null ? (
           <StructurePane structure={structure} />
         ) : null}

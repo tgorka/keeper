@@ -21,6 +21,7 @@ import { fireEvent } from "@testing-library/dom";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { withRangeRects } from "@/test/layout";
 import { livePreview } from "./live-preview";
+import { MARKDOWN_MARKS } from "./markdown-marks";
 
 // jsdom has no `Range.getClientRects`, and CodeMirror's measure pass calls it
 // on any animation frame that elapses mid-test — taking the run's exit code
@@ -57,7 +58,8 @@ function render(doc: string): EditorView {
     state: EditorState.create({
       doc,
       extensions: [
-        markdown({ base: markdownLanguage }),
+        // The parser the app loads; see the note in `format-commands.test.ts`.
+        markdown({ base: markdownLanguage, extensions: [...MARKDOWN_MARKS] }),
         livePreview({ vaultId: "v1", assetUrl: (rel) => rel, onOpenLink: () => {} }),
       ],
     }),
@@ -71,6 +73,32 @@ function render(doc: string): EditorView {
 function shown(view: EditorView): string {
   return view.contentDOM.firstElementChild?.textContent ?? "";
 }
+
+describe("== renders as a highlight (Story 55.3)", () => {
+  it("hides its delimiters and paints the text", () => {
+    const view = render("say ==this== please\n\n");
+
+    expect(shown(view)).toBe("say this please");
+    const marked = view.contentDOM.querySelector(".cm-lp-mark");
+    expect(marked?.textContent).toBe("this");
+  });
+
+  it("gives the source back when the caret lands on the line", () => {
+    const view = render("say ==this== please\n\n");
+    view.dispatch({ selection: { anchor: 2 } });
+
+    // The same reveal rule every other mark obeys: the line you are editing is
+    // the line you can see the syntax of.
+    expect(shown(view)).toBe("say ==this== please");
+  });
+
+  it("leaves arithmetic unpainted", () => {
+    const view = render("if a == b then\n\n");
+
+    expect(shown(view)).toBe("if a == b then");
+    expect(view.contentDOM.querySelector(".cm-lp-mark")).toBeNull();
+  });
+});
 
 describe("links render (the defect 45.10 was sent to fix)", () => {
   /**

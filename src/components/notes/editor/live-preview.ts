@@ -37,6 +37,7 @@ import { mermaidLayer } from "./mermaid-widget";
 import { type NoteWidgetOptions, noteWidgetLayer } from "./note-widget";
 import { RecordingEmbedWidget } from "./recording-embed";
 import { transportFor } from "./recording-transport";
+import { VaultEmbedWidget } from "./vault-embed";
 import { LINK_ATTR, WIKILINK, WIKILINK_ATTR } from "./wikilink";
 
 /** How long an externally applied change stays highlighted. */
@@ -60,6 +61,7 @@ const HIDDEN_MARKS: Record<string, true> = {
   StrikethroughMark: true,
   SubscriptMark: true,
   SuperscriptMark: true,
+  HighlightMark: true,
 };
 
 /** Inline nodes that keep their text and gain a class. */
@@ -70,6 +72,7 @@ const INLINE_CLASSES: Record<string, string> = {
   Strikethrough: "cm-lp-strike",
   Subscript: "cm-lp-sub",
   Superscript: "cm-lp-sup",
+  Highlight: "cm-lp-mark",
   // The language a fence declares. Visible, unlike the backticks around it:
   // hiding it left every code block opening with a blank grey line and threw
   // away the one piece of information the block carried about itself.
@@ -526,6 +529,26 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
               );
               continue;
             }
+
+            // Not a data file, and not a recording note: the vault is what is
+            // left (Story 55.4). Until this branch a photograph embedded in an
+            // ordinary note was a link to a photograph — the widget existed and
+            // only a recording note could reach it, because only a recording
+            // note had an address space to resolve in.
+            //
+            // A recording note never reaches here, and deliberately: in one,
+            // `manifest.json` under the session folder and `attachments/x.png`
+            // beside the note are different files, and `RecordingEmbedWidget`
+            // is the only thing that can tell them apart. It already looks in
+            // the vault when the session declines.
+            decorations.push(
+              Decoration.replace({
+                widget: new VaultEmbedWidget(options.vaultId, target, {
+                  assetUrl: options.assetUrl,
+                }),
+              }).range(start, end),
+            );
+            continue;
           }
 
           const labelStart = start + match[0].indexOf(label, match[0].indexOf("[[") + 2);
@@ -601,6 +624,16 @@ const livePreviewTheme = EditorView.baseTheme({
   ".cm-lp-strong": { fontWeight: "600" },
   ".cm-lp-em": { fontStyle: "italic" },
   ".cm-lp-strike": { textDecoration: "line-through" },
+  // The one inline mark that paints a background rather than changing the
+  // glyphs, so it is the one that has to answer for contrast in both themes.
+  // `--mark` is defined beside the other palette tokens in `index.css`, and is
+  // not `--search-highlight`: see the comment there.
+  ".cm-lp-mark": {
+    backgroundColor: "var(--mark)",
+    color: "var(--mark-foreground)",
+    borderRadius: "2px",
+    padding: "0 1px",
+  },
   ".cm-lp-underline": { textDecoration: "underline" },
   // `vertical-align` alone would push the line's height around; the smaller
   // font is what keeps a paragraph containing `H~2~O` the same height as one
@@ -653,6 +686,9 @@ const livePreviewTheme = EditorView.baseTheme({
   // wedged into a line of prose is neither readable nor watchable. Audio does
   // too: a native transport bar is a couple of hundred pixels wide and its own
   // paragraph either way (Story 42.4, widened by Story 43.5).
+  // Named for the recording embed that first needed them and now shared with an
+  // ordinary note's (Story 55.4): they say what the element IS, and an `<img>`
+  // is the same `<img>` whichever address space resolved it.
   ".cm-lp-recording-player, .cm-lp-recording-image": {
     display: "block",
     maxWidth: "100%",
@@ -661,6 +697,15 @@ const livePreviewTheme = EditorView.baseTheme({
     backgroundColor: "var(--muted)",
   },
   ".cm-lp-recording-audio": { display: "block", width: "100%", maxWidth: "24rem" },
+  // A PDF gets a page's worth of height rather than `maxHeight`: an `<embed>`
+  // has no intrinsic size to cap, so without one it collapses to nothing.
+  ".cm-lp-embed-pdf": {
+    display: "block",
+    width: "100%",
+    height: "60vh",
+    borderRadius: "4px",
+    backgroundColor: "var(--muted)",
+  },
   // The chip stays INLINE, unlike the three that render: it is a reference to a
   // file, closer to the link it replaced than to a player, and a block-level
   // box for `manifest.json` would shout louder than the recording above it.

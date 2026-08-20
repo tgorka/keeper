@@ -513,7 +513,7 @@ export function NotesPane() {
         // and `rootProps` points this region's `aria-labelledby` at it, so the
         // region and the heading a reader hears are one string (Story 48.3).
         {...rail.rootProps}
-        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-sidebar last:border-r-0"
+        className="flex h-full min-h-0 flex-col overflow-hidden border-border border-r bg-sidebar last:border-r-0"
       >
         {rail.chrome}
         {!rail.folded && (
@@ -560,7 +560,7 @@ export function NotesPane() {
       <div
         onKeyDown={onColumnKeyDown}
         {...list.rootProps}
-        className="flex h-full min-h-0 shrink-0 flex-col border-border border-r bg-background last:border-r-0"
+        className="flex h-full min-h-0 flex-col overflow-hidden border-border border-r bg-background last:border-r-0"
       >
         {list.chrome}
         {!list.folded && (

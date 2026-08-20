@@ -13,8 +13,9 @@
  *   window's close button close somebody else's window.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaptureWindowVm } from "@/lib/ipc/client";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const notesCaptureWindows = vi.fn<() => Promise<CaptureWindowVm[]>>();
 const notesCaptureOpen = vi.fn<(target: unknown) => Promise<void>>();
@@ -101,6 +102,10 @@ beforeEach(() => {
   saveNote.mockResolvedValue(true);
   listenNotesCaptureWindows.mockResolvedValue(() => {});
 });
+
+// The capture panel mounts the real note editor, whose boot outlives a test
+// that only needed the chrome; see the helper for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("CaptureWindowChrome", () => {
   it("dismisses through the act it was handed, not through one of its own", async () => {

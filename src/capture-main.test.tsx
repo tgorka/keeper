@@ -15,7 +15,8 @@
  */
 import { fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const draftProps = vi.fn<(props: { captureKey: string }) => void>();
 const documentProps = vi.fn<(props: { vaultId: string; noteId: string }) => void>();
@@ -65,6 +66,10 @@ beforeEach(() => {
   resetCaptureWindowsStoreForTest();
   notesCaptureWindows.mockResolvedValue([]);
 });
+
+// The capture panel mounts the real note editor, whose boot outlives a test
+// that only needed the chrome; see the helper for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("CapturePanel", () => {
   it("renders the prewarmed page when the window names no note", () => {

@@ -194,6 +194,12 @@ export const FILES_PANE_SUBTITLE =
  * document that list opens. The strip beside it is the flexible one now, which
  * is the arrangement Notes has had since Story 46.12.
  */
+// `shrink-0` on purpose, for now: Story 55.1 made the Notes columns yield so
+// the note panel stops being clipped, and deliberately did not touch this
+// surface or Chat. They share the same `PanelStrip` and therefore the same
+// symptom — a tree dragged wide starves the document beside it — but changing
+// three surfaces on one bug's evidence is how a fix becomes a regression
+// somewhere nobody was looking. Tracked in deferred work.
 const FILES_COLUMN_CLASS =
   "flex min-w-0 shrink-0 flex-col border-border border-r bg-background last:border-r-0";
 

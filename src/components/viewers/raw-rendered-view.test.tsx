@@ -21,6 +21,9 @@ import "@codemirror/lang-markdown";
 import "@codemirror/language";
 import "@codemirror/state";
 import "@/components/notes/editor/live-preview";
+// Story 55.3's `==` delimiter table, awaited unconditionally by the mount —
+// warmed for the same reason as the four above.
+import "@/components/notes/editor/markdown-marks";
 // Note mode's mount awaits three more chunks — the editing keymap, Story 43.1's
 // Tab bindings and (story 52.3) the writing tools — so they are warmed here for
 // the same reason as the four above: `settle()` drains microtasks and never a
@@ -40,9 +43,10 @@ import { SLASH_COMMANDS } from "@/components/notes/editor/slash-menu";
 import { matchEmoji } from "@/lib/emoji/match";
 import type { NoteCsvVm } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
+import { TEXT_RUN_ATTR } from "./html-view";
 import type { MarkdownPreview } from "./markdown-preview";
 import type { RawEditorProps } from "./raw-rendered-view";
-import { RawRenderedView } from "./raw-rendered-view";
+import { HTML_PANE_TESTID, RawRenderedView } from "./raw-rendered-view";
 import type { FileOrigin } from "./use-text-file";
 import { VIEW_MODE_COOKIE } from "./view-mode";
 
@@ -1522,5 +1526,113 @@ describe("the default view is Note when Note is possible (Story 52.3)", () => {
     // And no toolbar anywhere on the surface: there is no editable pane to have
     // one, in either of this file's two views.
     expect(screen.queryByRole("button", { name: "Bold" })).toBeNull();
+  });
+});
+
+describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
+  const PAGE = "<h1>Title</h1>\n<p>Body text</p>\n";
+
+  /** The rendered tab, mounted the way a Files panel mounts it. */
+  function page(initial = PAGE, extra: Partial<HostProps> = {}) {
+    const onSaved = vi.fn();
+    const result = render(
+      <Host
+        format="html"
+        rendered="html"
+        language="html"
+        cookie={jar()}
+        fileName="page.html"
+        initial={initial}
+        onSaved={onSaved}
+        {...extra}
+      />,
+    );
+    return { ...result, onSaved };
+  }
+
+  it("names the tab for what it shows, beside the Source that always exists", async () => {
+    page();
+    await settle();
+
+    // "Page", not "Rendered": the reader should not have to guess, and the
+    // guess differs per format.
+    expect(screen.getByRole("tab", { name: "Page" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Source" })).toBeInTheDocument();
+  });
+
+  it("shows what the page says rather than its angle brackets", async () => {
+    const { container } = page();
+    await settle();
+
+    const pane = container.querySelector(`[data-testid="${HTML_PANE_TESTID}"]`);
+    expect(pane?.textContent).toBe("Title\nBody text\n");
+    expect(pane?.querySelector("h1")?.textContent).toBe("Title");
+    // The markup is still exactly one tab away and is still the file's bytes.
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    expect(screen.getByLabelText("Source of page.html")).toHaveValue(PAGE);
+  });
+
+  it("splices a retyped paragraph into the file and leaves every other byte", async () => {
+    const { container } = page();
+    await settle();
+
+    const spans = container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`);
+    const body = Array.from(spans).find((span) => span.textContent === "Body text");
+    if (body === undefined) {
+      throw new Error("the paragraph's text was not editable");
+    }
+    body.textContent = "Rewritten";
+    fireEvent.input(body);
+
+    // The whole file, differing by that paragraph and nothing else — no
+    // reserialisation, so the newlines and the heading are untouched.
+    fireEvent.click(screen.getByRole("tab", { name: "Source" }));
+    expect(screen.getByLabelText("Source of page.html")).toHaveValue(
+      "<h1>Title</h1>\n<p>Rewritten</p>\n",
+    );
+  });
+
+  it("offers nothing to type into when the file is read-only", async () => {
+    const { container } = page(PAGE, { readOnly: true, readOnlyReason: "this file is too big" });
+    await settle();
+
+    // The attribute, not `isContentEditable`: jsdom does not implement the
+    // property, and the attribute is what this code actually sets.
+    const spans = Array.from(container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
+    expect(spans.length).toBeGreaterThan(0);
+    for (const span of spans) {
+      expect(span.getAttribute("contenteditable")).toBeNull();
+    }
+  });
+
+  it("marks the text editable when the file is writable", async () => {
+    const { container } = page();
+    await settle();
+
+    const spans = Array.from(container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
+    const words = spans.filter((span) => (span.textContent ?? "").trim() !== "");
+    expect(words.length).toBeGreaterThan(0);
+    for (const span of words) {
+      // `plaintext-only`: a reader retypes words, and pasting rich text into a
+      // file whose markup only Source may change would be a second way to
+      // write markup.
+      expect(span.getAttribute("contenteditable")).toBe("plaintext-only");
+    }
+    // A run of pure whitespace — the newline after a `</p>` — keeps its index
+    // and is not an edit target: it is nothing a reader can see.
+    for (const span of spans.filter((span) => (span.textContent ?? "").trim() === "")) {
+      expect(span.getAttribute("contenteditable")).toBeNull();
+    }
+  });
+
+  it("keeps a script out of the page and out of the reader's way", async () => {
+    const { container } = page('<p>safe</p><script>alert(1)</script><img src="https://t/p.png">');
+    await settle();
+
+    const pane = container.querySelector(`[data-testid="${HTML_PANE_TESTID}"]`);
+    expect(pane?.querySelector("script")).toBeNull();
+    // Nothing is fetched, and the address is visible rather than hidden.
+    expect(pane?.querySelector("img")).toBeNull();
+    expect(pane?.textContent).toContain("https://t/p.png");
   });
 });

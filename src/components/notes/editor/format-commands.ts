@@ -44,6 +44,7 @@ export type FormatAction =
   | { kind: "bold" }
   | { kind: "italic" }
   | { kind: "strikethrough" }
+  | { kind: "mark" }
   | { kind: "code" }
   | { kind: "subscript" }
   | { kind: "superscript" }
@@ -55,7 +56,8 @@ export type FormatAction =
   | { kind: "link" }
   | { kind: "codeblock" }
   | { kind: "heading"; level: number }
-  | ({ kind: "table" } & TableShape);
+  | ({ kind: "table" } & TableShape)
+  | { kind: "emoji"; text: string };
 
 /** One inline mark, named the way the markdown parser names it. */
 interface InlineMark {
@@ -71,6 +73,9 @@ const BOLD: InlineMark = { token: "**", node: "StrongEmphasis", mark: "EmphasisM
 const ITALIC: InlineMark = { token: "*", node: "Emphasis", mark: "EmphasisMark" };
 const STRIKE: InlineMark = { token: "~~", node: "Strikethrough", mark: "StrikethroughMark" };
 const CODE: InlineMark = { token: "`", node: "InlineCode", mark: "CodeMark" };
+// `markdown-marks.ts` defines these two nodes; without that extension loaded
+// this toggle would write `==` that nothing ever parses back off again.
+const MARK: InlineMark = { token: "==", node: "Highlight", mark: "HighlightMark" };
 
 /**
  * Subscript and superscript, in the spelling the parser already in this editor
@@ -730,6 +735,29 @@ function insertTable(shape: TableShape): Command {
   };
 }
 
+/**
+ * Put literal text where the caret is, replacing a selection if there is one.
+ *
+ * The emoji picker's insertion, and deliberately the *character* rather than
+ * the `:shortcode:` — `emoji-complete.ts` resolves a typed shortcode to the
+ * character on commit, so a picker that wrote the shortcode back would leave
+ * the buffer holding two spellings of one emoji depending on which door it came
+ * through.
+ */
+function insertAtCaret(text: string): Command {
+  return (view) => {
+    const range = view.state.selection.main;
+    view.dispatch({
+      changes: { from: range.from, to: range.to, insert: text },
+      selection: { anchor: range.from + text.length },
+      scrollIntoView: true,
+      userEvent: "input.type",
+    });
+    view.focus();
+    return true;
+  };
+}
+
 /** The one place an action description becomes an editor command. */
 export function formatCommand(action: FormatAction): Command {
   switch (action.kind) {
@@ -739,6 +767,8 @@ export function formatCommand(action: FormatAction): Command {
       return toggleInline(ITALIC);
     case "strikethrough":
       return toggleInline(STRIKE);
+    case "mark":
+      return toggleInline(MARK);
     case "code":
       return toggleInline(CODE);
     case "subscript":
@@ -785,5 +815,7 @@ export function formatCommand(action: FormatAction): Command {
     }
     case "table":
       return insertTable(action);
+    case "emoji":
+      return insertAtCaret(action.text);
   }
 }

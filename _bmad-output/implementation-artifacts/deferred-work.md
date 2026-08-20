@@ -3368,3 +3368,86 @@ reason: `drop_foreign_lfs_driver` removes a non-repository `filter "lfs"` sectio
   as absent (git's `apply_filter` tests `*ca->drv->process`, gix's `maybe_launch_process` tests
   only `Some`). (c) is the honest fix and is not ours to schedule.
 status: open
+
+- source_spec: none
+  summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
+  evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.
+
+- source_spec: none
+  summary: Add a mark (`==highlight==`) command and an emoji picker button to the markdown format toolbar.
+  evidence: Split from the same four-goal intent. Independently shippable: two additions to `format-toolbar.tsx` plus format commands; `emoji-complete.ts` already provides `:shortcode:` autocomplete, so the picker is a second entry point rather than new emoji infrastructure.
+
+- source_spec: none
+  summary: Audit inline embedding of image/video/audio/html/json/csv/pdf across all notes including session notes, and add editing of the rendered text for html, csv and json.
+  evidence: Split from the same four-goal intent, and the largest of the four. Much of it already exists — `FILE_FORMATS` in `src/lib/viewers/registry.ts` covers all seven types, `FileEmbedWidget`, `CsvTableWidget`, `ImageWidget` and `RecordingEmbedWidget` render them — so the real work is an audit of the gaps plus editable rendered text, not new embedding infrastructure.
+
+- source_spec: spec-note-panel-never-clipped
+  summary: The Files and Chat surfaces still carry `shrink-0` on their columns, so a wide tree or inbox can still starve the document beside it.
+  evidence: The panel strip fix is shared — those two surfaces render the same `PanelStrip` and now claim the same 280px basis — but their columns still refuse to shrink, so the deficit lands on the panel again. Story 55.1 was scoped to Notes and told not to touch them ("Never: do not touch the Files or Chat surfaces' columns"). The fix is one line each: drop `shrink-0` from `FILES_COLUMN_CLASS` and `CHAT_LIST_COLUMN_CLASS`. Deferred rather than done because neither surface's floor has been thought about the way `notes-list`'s 240 was, and changing three surfaces on one surface's evidence is how a fix becomes a regression somewhere nobody was looking.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: While a column is squeezed, the drag handle's `aria-valuenow` and the resizer report the remembered width, not the rendered one.
+  evidence: Deliberate — the remembered width is what a widened window restores, and it is the number the user set, so persisting or announcing the squeezed value would be the write this spec forbids. But a screen reader is told 320 while the column is 263, and dragging from a squeezed state jumps to the remembered width before it moves. Neither is wrong enough to trade for a stored-width bug; both deserve a considered answer about what a resizer should say when the layout is overriding it.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: No test lane exercises real flexbox — layout regressions of this kind can only be caught by arithmetic or by hand.
+  evidence: jsdom computes no layout, so every assertion in this story checks the *inputs* to the distribution (`flexBasis`, `minWidth`) and none checks the result. The bug being fixed was invisible to all 4600 tests precisely because it lived in the distribution. Verified for this story by rebuilding the box tree against the compiled stylesheet in a real engine and reading widths back, which is repeatable but manual. A headless-browser lane for a handful of layout invariants would make it automatic.
+  status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The find bar shows no match count, so "how many" and "which one" are still unanswerable.
+  evidence: The stock panel had none either, so this is not a regression — but it is the affordance people expect from a find bar, and rebuilding the panel was the cheap moment to add it. Held back deliberately: counting every match on each keystroke is a performance question about large notes (`SearchQuery.getCursor` walks the document), and a restyle is the wrong story to answer it in. Wants a cap and a "500+" form.
+  status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The file viewers mount CodeMirror without `search()`, so there is no find at all in a `.md`, `.csv` or `.json` opened from Files.
+  evidence: `⌘F` is wired in `note-editor.tsx` only. `findBar()` is now one extension and would drop into `text-viewer.tsx` unchanged, but adding find where there was none is a feature, not a restyle, and the viewers have their own `⌘F` question (the Files pane filter) to settle first.
+  status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: The emoji picker has no recents and no skin-tone variants.
+  evidence: Both are state, and this was a picker. Recents in particular would change what "opens on" means and needs a decision about where that state lives (per vault? per device? synced?) before it is worth building. The opening set in `format-toolbar.tsx` is the hand-maintained stand-in.
+  status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: `==highlight==` renders in keeper and is invisible to anything else reading the vault.
+  evidence: It is not in CommonMark or GFM; the extension in `markdown-marks.ts` is keeper's own, matching the spelling Obsidian and most wikis use. A note exported or read by a plain CommonMark renderer shows the equals signs. Worth stating in the vault docs rather than fixing — there is nothing to fix short of not supporting it.
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `.docx`, `.pptx` and `.xlsx` embedded in a note are still links.
+  evidence: They are `documentRow`s with no inline renderer — `document-viewer.tsx` shows a PDF through the webview's own renderer and offers the other three as a download. What a spreadsheet should look like inside a paragraph is a design question, not a wiring one, so `drawableFor` returns null for them and the link stays.
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `![[note.md]]` is still a link rather than a transclusion.
+  evidence: Deliberate and stated in `file-embed.ts`: showing one note inside another is a different feature with a different meaning, and mounting a raw editor over a note would be a second way to write one without `notes_save`'s base revision or its conflict copy. Rust refuses that write too, so both halves agree. Listed here because "every file type renders inline except this one" is the kind of gap a reader will otherwise report as a bug.
+
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: A PDF embed cannot report a failed load.
+  evidence: `<embed>` fires no `error` event, so the degrade-to-a-link path every other kind has does not exist for PDF. Safe today because the path came back from a resolver that stats the file, so "the vault holds it" is established before the element is built — but a file deleted between the resolve and the paint shows an empty box rather than the link. Fixing it means probing the bytes or watching for a zero-size box, neither of which is obviously worth it.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: The JSON structure view is still read-only, so "editable rendered text" is true of HTML and CSV and not of JSON.
+  evidence: `json-structure.ts` says so in its header and gives its reason. Making a value editable there is the same shape this story built for HTML — a parse that records source offsets, a splice verified before it is applied — but the JSON parser is deliberately not `JSON.parse` (it preserves number text, key order and repeats), so the offsets have to come out of that parser rather than a second scan. Its own story.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: Pressing Enter inside an editable HTML text run drops the line break.
+  evidence: `contenteditable="plaintext-only"` inserts a break element, and the splice reads `textContent`, which does not include it — so the text is written without the newline. Lossy in one direction only and never corrupting (the verified splice still applies), but a reader who expects a paragraph break gets a space. Fixing it means deciding what a line break inside a run should become in the markup, which is a markup decision and therefore the Source tab's.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: A `<style>` block is dropped, so a page renders in keeper's typography rather than its own.
+  evidence: Deliberate and stated in `html-view.ts`: applying a file's CSS would be styling this application's own DOM from a document somebody was handed. A scoped or sanitised subset is possible and is a separate question with its own answer.
+  status: open
+
+- source_spec: none
+  summary: `files-pane.test.tsx` "re-reads a remembered folder once when Refresh rescues a failed first list" times out under parallel load.
+  evidence: Observed twice while hunting an unrelated unhandled rejection — once during a `lefthook` pre-push run (tests sharing the machine with clippy and typecheck) and once in a bare full run. `TestingLibraryElementError: Unable to find role="treeitem" and name "Notes"` after the 5s `waitFor` budget; the pane is rendered and the tree is empty, so the second list has not landed. Passes 15/15 in isolation. Not investigated: it is a different subsystem from the work in flight, and guessing at a timing fix without reproducing it deliberately would be a change nobody can evaluate.
+  status: open

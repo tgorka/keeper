@@ -22,6 +22,7 @@ import { EditorView } from "@codemirror/view";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { withRangeRects } from "@/test/layout";
 import { type FormatAction, formatCommand, gfmTable } from "./format-commands";
+import { MARKDOWN_MARKS } from "./markdown-marks";
 
 // jsdom has no `Range.getClientRects`, so CodeMirror's measure pass throws on
 // any animation frame that elapses during a test. The hand-rolled shim this
@@ -69,7 +70,9 @@ function open(doc: string, select?: string): Opened {
     state: EditorState.create({
       doc,
       selection: EditorSelection.single(at, at + (select?.length ?? 0)),
-      extensions: [markdown({ base: markdownLanguage })],
+      // The parser the app loads, marks and all — a helper that configures
+      // less than production is a helper that can pass for a build that fails.
+      extensions: [markdown({ base: markdownLanguage, extensions: [...MARKDOWN_MARKS] })],
     }),
   });
   return {
@@ -94,6 +97,35 @@ function roundTrip(doc: string, select: string, action: FormatAction) {
   return { once, twice };
 }
 
+describe("inserting a literal", () => {
+  it("puts an emoji at the caret", () => {
+    const editor = open("say ");
+    editor.apply({ kind: "emoji", text: "🎉" });
+
+    expect(editor.text()).toBe("say 🎉");
+    editor.view.destroy();
+  });
+
+  it("replaces a selection rather than pushing it aside", () => {
+    const editor = open("say boo now", "boo");
+    editor.apply({ kind: "emoji", text: "🎉" });
+
+    expect(editor.text()).toBe("say 🎉 now");
+    editor.view.destroy();
+  });
+
+  it("leaves the caret after the character, ready for the next word", () => {
+    const editor = open("say ");
+    editor.apply({ kind: "emoji", text: "🎉" });
+
+    // Not selected, and not before it: an emoji is punctuation in a sentence
+    // somebody is in the middle of typing.
+    expect(editor.view.state.selection.main.empty).toBe(true);
+    expect(editor.view.state.selection.main.head).toBe(editor.text().length);
+    editor.view.destroy();
+  });
+});
+
 describe("the inline marks", () => {
   const marks: readonly { action: FormatAction; on: string; name: string }[] = [
     { name: "bold", action: { kind: "bold" }, on: "**word**" },
@@ -107,6 +139,12 @@ describe("the inline marks", () => {
     { name: "subscript", action: { kind: "subscript" }, on: "~word~" },
     { name: "superscript", action: { kind: "superscript" }, on: "^word^" },
     { name: "underline", action: { kind: "underline" }, on: "<u>word</u>" },
+    // Story 55.3's, on the same terms. It joins this table rather than getting
+    // its own suite for the reason stated above — and because `==` is the one
+    // mark whose *node* this repo had to define, so proving it toggles like the
+    // six that came with the parser is proving the extension, not just the
+    // command.
+    { name: "highlight", action: { kind: "mark" }, on: "==word==" },
   ];
 
   for (const mark of marks) {
@@ -644,7 +682,9 @@ describe("the table builder", () => {
     editor.apply({ kind: "table", rows: 3, columns: 2, header: true });
     const state = EditorState.create({
       doc: editor.text(),
-      extensions: [markdown({ base: markdownLanguage })],
+      // The parser the app loads, marks and all — a helper that configures
+      // less than production is a helper that can pass for a build that fails.
+      extensions: [markdown({ base: markdownLanguage, extensions: [...MARKDOWN_MARKS] })],
     });
     const nodes: string[] = [];
     syntaxTree(state).iterate({ enter: (node) => void nodes.push(node.name) });

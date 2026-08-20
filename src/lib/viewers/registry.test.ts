@@ -264,7 +264,7 @@ describe("the table itself", () => {
   it("offers a rendered half only where the format has a structure", () => {
     for (const entry of FILE_FORMAT_ENTRIES) {
       if (entry.rendered !== null) {
-        expect(["markdown", "csv", "json", "jsonl"]).toContain(entry.format);
+        expect(["markdown", "csv", "json", "jsonl", "html"]).toContain(entry.format);
       }
     }
   });

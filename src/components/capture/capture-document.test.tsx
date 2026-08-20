@@ -35,6 +35,7 @@ import type {
   NoteWriteVm,
 } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const notesCaptureDraft = vi.fn<(key: string) => Promise<NoteCreateVm>>();
 const notesCaptureHide = vi.fn<() => Promise<void>>();
@@ -215,6 +216,10 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 // Door 1 — the hotkey window
 // ---------------------------------------------------------------------------
+
+// The capture panel mounts the real note editor, whose boot outlives a test
+// that only needed the chrome; see the helper for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("the quick-capture draft window", () => {
   it("mounts the real note editor on the note Rust resolved", async () => {

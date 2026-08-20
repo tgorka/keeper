@@ -253,6 +253,9 @@ export async function mountMarkdownPreview(
     import("@codemirror/view"),
     import("@codemirror/lang-markdown"),
     import("@/components/notes/editor/live-preview"),
+    // Unconditional, unlike the three below: a reader who never edits still has
+    // to see a `==highlight==` as one. It is a delimiter table, not a feature.
+    import("@/components/notes/editor/markdown-marks"),
     // In the same wave rather than after it, so Note mode costs one chunk fetch
     // and never a second round trip — and `null` when it was not asked for, so
     // a reader who only ever previews does not download an editing keymap to
@@ -282,7 +285,7 @@ export async function mountMarkdownPreview(
       destroy: () => {},
     };
   }
-  const [state, view, markdown, preview, commands, indent, writing] = loaded;
+  const [state, view, markdown, preview, marks, commands, indent, writing] = loaded;
 
   // One flag rather than reading the document back: the update listener runs
   // for programmatic dispatches too, and an adoption of the host's own buffer
@@ -346,7 +349,11 @@ export async function mountMarkdownPreview(
             // reader was told they cannot change.
             writing.markdownWritingTools(),
           ]),
-      markdown.markdown({ base: markdown.markdownLanguage }),
+      markdown.markdown({
+        base: markdown.markdownLanguage,
+        // The same mark list the note editor loads; see `markdown-marks.ts`.
+        extensions: [...marks.MARKDOWN_MARKS],
+      }),
       preview.livePreview({
         // The decoration layer takes a value because the note editor is built
         // per vault. Outside a vault there is nothing to resolve against, and

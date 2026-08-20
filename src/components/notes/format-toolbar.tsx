@@ -26,12 +26,14 @@ import {
   Bold,
   Code,
   Heading,
+  Highlighter,
   Italic,
   Link,
   List,
   ListOrdered,
   ListTodo,
   Quote,
+  Smile,
   SquareCode,
   Strikethrough,
   Subscript,
@@ -39,13 +41,88 @@ import {
   Table,
   Underline,
 } from "lucide-react";
-import { type MouseEvent, useCallback, useId, useState } from "react";
+import { type MouseEvent, useCallback, useId, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { type EmojiMatch, emojiFor, matchEmoji } from "@/lib/emoji/match";
 import type { FormatAction } from "./editor/format-commands";
 
 /** Which extra panel, if any, is open. Only ever one. */
-type Panel = "heading" | "table" | null;
+type Panel = "heading" | "table" | "emoji" | null;
+
+/** How many emoji the picker shows at once.
+ *
+ * Six rows of eight. `EMOJI_MATCH_LIMIT` (50) is tuned for a completion menu
+ * you arrow through; a grid you look at can hold more without becoming harder
+ * to read, and the panel scrolls past the third row anyway. */
+const EMOJI_PICKER_LIMIT = 48;
+
+/**
+ * What the picker shows before anything is typed.
+ *
+ * Not the table's head, which is what an unfiltered `matchEmoji("")` gives:
+ * `EMOJI_TABLE` is ordered by shortcode, so opening the panel used to show
+ * `+1`, `100`, `1234`, `8ball`, `a`, `ab`, `abacus` and a run of flags —
+ * accurate, and a wall of letter-symbols nobody came here for.
+ *
+ * Shortcodes rather than characters, resolved through `emojiFor`, so this list
+ * names things the emoji table already defines instead of becoming a second
+ * place a character is written down. Anything the table stops recognising drops
+ * out silently rather than rendering as a blank button; the test pins that the
+ * list resolves in full today.
+ *
+ * A starting point, not a taxonomy — search reaches the other ~1800.
+ */
+const EMOJI_OPENING: readonly string[] = [
+  "smile",
+  "smiley",
+  "grin",
+  "joy",
+  "wink",
+  "blush",
+  "thinking",
+  "neutral_face",
+  "slightly_frowning_face",
+  "cry",
+  "sob",
+  "scream",
+  "sunglasses",
+  "heart_eyes",
+  "hugs",
+  "raised_eyebrow",
+  "+1",
+  "-1",
+  "ok_hand",
+  "clap",
+  "raised_hands",
+  "pray",
+  "muscle",
+  "wave",
+  "heart",
+  "fire",
+  "star",
+  "sparkles",
+  "tada",
+  "rocket",
+  "zap",
+  "boom",
+  "white_check_mark",
+  "x",
+  "warning",
+  "question",
+  "exclamation",
+  "bulb",
+  "pushpin",
+  "paperclip",
+  "memo",
+  "book",
+  "calendar",
+  "hourglass",
+  "coffee",
+  "eyes",
+  "brain",
+  "chart_with_upwards_trend",
+];
 
 const HEADING_LEVELS = [1, 2, 3, 4, 5, 6] as const;
 
@@ -59,6 +136,7 @@ const DIRECT: readonly { action: FormatAction; label: string; Icon: typeof Bold 
   { action: { kind: "italic" }, label: "Italic", Icon: Italic },
   { action: { kind: "underline" }, label: "Underline", Icon: Underline },
   { action: { kind: "strikethrough" }, label: "Strikethrough", Icon: Strikethrough },
+  { action: { kind: "mark" }, label: "Highlight", Icon: Highlighter },
   { action: { kind: "subscript" }, label: "Subscript", Icon: Subscript },
   { action: { kind: "superscript" }, label: "Superscript", Icon: Superscript },
   { action: { kind: "code" }, label: "Inline code", Icon: Code },
@@ -80,6 +158,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
   // The labels have to name their fields by id, and an editor pane is not
   // guaranteed to be the only one on the page.
   const ids = useId();
+  const [emojiQuery, setEmojiQuery] = useState("");
   const [rows, setRows] = useState(3);
   const [columns, setColumns] = useState(2);
   const [header, setHeader] = useState(true);
@@ -96,6 +175,32 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
     },
     [onAction],
   );
+
+  // `matchEmoji` over the same vocabulary `:shortcode:` completion searches —
+  // the picker is a second door into it, not a second copy. An empty query is
+  // the whole table's head rather than nothing, so the panel opens showing
+  // emoji instead of an instruction to type.
+  const emoji: EmojiMatch[] = useMemo(() => {
+    if (emojiQuery.trim() === "") {
+      return EMOJI_OPENING.flatMap((shortcode) => {
+        const character = emojiFor(shortcode);
+        return character === undefined ? [] : [{ shortcode, emoji: character }];
+      });
+    }
+    return matchEmoji(emojiQuery, EMOJI_PICKER_LIMIT);
+  }, [emojiQuery]);
+
+  const openPanel = useCallback((which: Exclude<Panel, null>) => {
+    setPanel((open) => {
+      const next = open === which ? null : which;
+      // Reopening starts clean: a stale query is a picker that lies about what
+      // it is showing.
+      if (next === "emoji") {
+        setEmojiQuery("");
+      }
+      return next;
+    });
+  }, []);
 
   return (
     <div className="relative flex flex-wrap items-center gap-0.5 border-b px-2 py-1">
@@ -122,7 +227,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
         title="Heading"
         aria-expanded={panel === "heading"}
         onMouseDown={keepCaret}
-        onClick={() => setPanel((open) => (open === "heading" ? null : "heading"))}
+        onClick={() => openPanel("heading")}
       >
         <Heading aria-hidden="true" />
       </Button>
@@ -135,10 +240,72 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
         title="Table"
         aria-expanded={panel === "table"}
         onMouseDown={keepCaret}
-        onClick={() => setPanel((open) => (open === "table" ? null : "table"))}
+        onClick={() => openPanel("table")}
       >
         <Table aria-hidden="true" />
       </Button>
+
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="ghost"
+        aria-label="Emoji"
+        title="Emoji"
+        aria-expanded={panel === "emoji"}
+        onMouseDown={keepCaret}
+        onClick={() => openPanel("emoji")}
+      >
+        <Smile aria-hidden="true" />
+      </Button>
+
+      {panel === "emoji" ? (
+        <fieldset
+          // Named apart from the button that opens it, as "Heading level" and
+          // "Insert table" are: two things answering to "Emoji" is ambiguous to
+          // anything navigating by name, a test included.
+          aria-label="Emoji picker"
+          className="absolute top-full left-2 z-20 mt-1 flex w-72 flex-col gap-2 rounded-md border bg-popover p-2 shadow-md"
+        >
+          <label className="sr-only" htmlFor={`${ids}-emoji`}>
+            Search emoji
+          </label>
+          <Input
+            id={`${ids}-emoji`}
+            className="h-8"
+            placeholder="Search emoji"
+            value={emojiQuery}
+            onChange={(event) => setEmojiQuery(event.target.value)}
+          />
+          {emoji.length === 0 ? (
+            // A sentence, not an empty grid: the vocabulary is large enough
+            // that a blank panel reads as broken rather than as no match.
+            <p className="px-1 py-2 text-muted-foreground text-xs">
+              No emoji matches “{emojiQuery}”.
+            </p>
+          ) : (
+            <div className="grid max-h-48 grid-cols-8 gap-0.5 overflow-y-auto">
+              {emoji.map(({ shortcode, emoji: character }) => (
+                <Button
+                  key={shortcode}
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  // The shortcode is the name, because the character alone is
+                  // what a screen reader would otherwise have to describe.
+                  aria-label={shortcode}
+                  title={`:${shortcode}:`}
+                  onMouseDown={keepCaret}
+                  onClick={() => run({ kind: "emoji", text: character })}
+                >
+                  <span aria-hidden="true" className="text-title leading-none">
+                    {character}
+                  </span>
+                </Button>
+              ))}
+            </div>
+          )}
+        </fieldset>
+      ) : null}
 
       {panel === "heading" ? (
         // A fieldset rather than a dialog: it takes no focus and traps none, so

@@ -101,6 +101,35 @@ pub fn write_refusal(rel: &str, extension: Option<&str>) -> Option<String> {
     None
 }
 
+/// Where an embed target resolved to, and what keeper says it is
+/// (Story 46.11; `kind` added by Story 55.4).
+///
+/// The answer [`notes_embed_paths`] gives per target, and the whole of what a
+/// decoration needs in order to draw a photograph, a video, an audio file or a
+/// PDF inside a note: a path to compose a `keeper-note://` URL from, and the
+/// one classification this repo has.
+///
+/// **Why the kind is here and not computed in the webview.** It is the same
+/// rule [`NoteEmbedVm::kind`] states — one classifier, in Rust (AD-87) — with
+/// one addition this story made unavoidable: an image and a video share no
+/// extension with anything in the frontend's viewer registry, deliberately, so
+/// the frontend *cannot* tell them apart even if it were allowed to. The
+/// alternative was reading a bounded prefix of every embedded file through
+/// [`notes_embed_read`] purely to learn what it was, which is a file read per
+/// photograph to answer a question the resolver already knows the answer to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteEmbedPathVm {
+    /// The vault-relative path that actually resolved, on the same terms as
+    /// [`NoteEmbedVm::rel_path`]: a bare `photo.png` comes back as
+    /// `attachments/photo.png` when that is where it is.
+    pub rel_path: String,
+    /// What keeper says this file is (`kind_for_file_name`), from the resolved
+    /// file's own name.
+    pub kind: RecordingNoteTargetKind,
+}
+
 /// A file embedded in a note, as the note's own viewer needs it
 /// (Story 45.12, FR-186, FR-187).
 ///

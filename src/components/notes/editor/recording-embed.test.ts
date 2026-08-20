@@ -623,18 +623,26 @@ describe("livePreview, over a recording note", () => {
     view.destroy();
   });
 
-  it("leaves an embed alone in a note that is not about a recording", async () => {
+  it("never asks the recordings index about a note that is not about a recording", async () => {
     const view = open(`intro\n\n![[${WRITTEN}/screen-0000.mov]]\n\nafter\n`, null);
 
     await settle();
+
+    // The half of this test that is about THIS module, and the half that has
+    // not changed: a note with no `session:` costs no index round trip.
+    expect(indexed).not.toHaveBeenCalled();
     expect(view.contentDOM.querySelector(".cm-lp-recording")).toBeNull();
-    expect(view.contentDOM.querySelector("video")).toBeNull();
-    // Still the wikilink it always was — that path is untouched, and no note
-    // without a `session:` costs an IPC round trip.
+
+    // The other half moved. Until Story 55.4 this embed stayed a plain
+    // wikilink, which is what this test used to assert; an ordinary note now
+    // asks the VAULT about it (`vault-embed.ts`), and the link is what it shows
+    // until and unless the vault answers with a file it can draw. Here nothing
+    // answers, so the link is what remains — the same pixels, a different
+    // reason, and the reason is worth stating rather than asserting past.
     expect(view.contentDOM.querySelector(`[${WIKILINK_ATTR}]`)?.textContent).toBe(
       `${WRITTEN}/screen-0000.mov`,
     );
-    expect(indexed).not.toHaveBeenCalled();
+    expect(view.contentDOM.querySelector("video")).toBeNull();
 
     view.destroy();
   });

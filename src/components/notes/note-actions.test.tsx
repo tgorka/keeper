@@ -16,6 +16,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch, NoteDeletePlanVm } from "@/lib/ipc/client";
+import { settleNoteEditorBoot } from "@/test/note-editor-boot";
 
 const notesOpen =
   vi.fn<(v: string, n: string, on: (b: NoteBodyBatch) => void) => Promise<string>>();
@@ -131,6 +132,10 @@ afterEach(() => {
   resetNotesEditorStoreForTest();
   resetPanelsStoreForTest();
 });
+
+// The editor's boot outlives a test that only needed the header; see the helper
+// for the teardown race that costs.
+afterEach(settleNoteEditorBoot);
 
 describe("deleting the open note, from the editor's own header", () => {
   /**

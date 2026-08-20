@@ -76,7 +76,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { ColumnResizer, useResizableColumn } from "@/components/ui/resizable-columns";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { SURFACE_COLUMNS, type SurfaceColumnId } from "@/lib/column-widths";
+import { columnStyle, SURFACE_COLUMNS, type SurfaceColumnId } from "@/lib/column-widths";
 import { columnFoldStore, useColumnFold } from "@/lib/stores/column-fold";
 import { cn } from "@/lib/utils";
 
@@ -363,7 +363,11 @@ export function useSurfaceColumn(
     folded,
     rootProps: {
       id: `column-${id}`,
-      style: { width: folded ? FOLD_STRIP.widthPx : width },
+      // A basis and a floor, not a fixed width (Story 55.1). The distribution
+      // is flexbox's: the panel strip beside these columns has `flex-basis: 0`,
+      // so a window too narrow for everything takes it out of the columns down
+      // to their floor and never out of the open note.
+      style: columnStyle(id, width, folded, FOLD_STRIP.widthPx),
       "data-folded": folded ? "true" : undefined,
       "data-fold-strip": enabled && folded ? FOLD_STRIP_SLOT : undefined,
       "aria-labelledby": enabled && !folded ? titleId : undefined,

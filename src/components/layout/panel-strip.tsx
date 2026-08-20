@@ -660,7 +660,9 @@ function PanelFrame({
         // consequence of whatever its one button happened to measure — the
         // only one of the four that nothing measured, and the reason four
         // strips side by side were not the same width.
-        panel.folded ? cn(FOLD_STRIP.widthClass, "shrink-0 grow-0") : "min-w-[280px] flex-1",
+        panel.folded
+          ? cn(FOLD_STRIP.widthClass, "shrink-0 grow-0")
+          : cn(PANEL_MIN_WIDTH_CLASS, "flex-1"),
         // The active mark is the ring. An inset ring draws on all four sides,
         // so on top of this panel's own trailing edge the right side would be
         // 2px while the other three are 1px — the panel cancels its border
@@ -731,11 +733,44 @@ function PanelFrame({
  * sentence depends on which surface is rendering and not on which one mounted
  * last.
  */
+/**
+ * The narrowest an open panel is allowed to be, as a class so the panel and the
+ * strip that must hold one of them cannot disagree about the number.
+ *
+ * 280 is where a document panel stops being readable: the header's identity
+ * group and its first action, or a line of prose at the body's font size.
+ */
+export const PANEL_MIN_WIDTH_CLASS = "min-w-[280px]";
+
+/** The same number as a flex basis, so the strip claims it rather than
+ * receiving whatever is left. */
+export const PANEL_BASIS_CLASS = "basis-[280px]";
+
 export function PanelStrip({ emptySentence = PANEL_EMPTY_SENTENCE }: { emptySentence?: string }) {
   const panels = usePanelsStore((s) => s.panels);
   const activeId = usePanelsStore((s) => s.activeId);
   return (
-    <section aria-label={PANEL_STRIP_LABEL} className="flex min-w-0 flex-1 overflow-x-auto">
+    <section
+      aria-label={PANEL_STRIP_LABEL}
+      // `flex-1 min-w-0` was `flex: 1 1 0%` with no floor, and that is two
+      // things at once: a scaled shrink factor of `1 x 0 = 0`, so the strip
+      // never takes a share of a deficit, and a basis of zero, so it only ever
+      // receives what the columns beside it did not want. The surface columns
+      // therefore never had to give, and the panel got `surface - 560` however
+      // little that was — 120px at the smallest window this app allows, with a
+      // 280px panel inside it overflowing into the scroller below.
+      //
+      // A basis and a floor of one panel make the strip a claimant instead: the
+      // columns give first, down to their own floors, and the note keeps a
+      // width worth reading. Several panels still scroll inside here, which is
+      // this element's other job and is unchanged.
+      // `grow shrink basis-…` rather than `flex-1` and a basis beside it: those
+      // two are one property and one shorthand at equal specificity, so which
+      // wins is decided by the order Tailwind happens to emit them in, not by
+      // the order they are written here. Three explicit properties cannot
+      // disagree.
+      className={cn("flex shrink grow overflow-x-auto", PANEL_BASIS_CLASS, PANEL_MIN_WIDTH_CLASS)}
+    >
       {panels.map((panel) => (
         <PanelFrame
           key={panel.id}
