@@ -3395,3 +3395,13 @@ status: open
   summary: No test lane exercises real flexbox — layout regressions of this kind can only be caught by arithmetic or by hand.
   evidence: jsdom computes no layout, so every assertion in this story checks the *inputs* to the distribution (`flexBasis`, `minWidth`) and none checks the result. The bug being fixed was invisible to all 4600 tests precisely because it lived in the distribution. Verified for this story by rebuilding the box tree against the compiled stylesheet in a real engine and reading widths back, which is repeatable but manual. A headless-browser lane for a handful of layout invariants would make it automatic.
   status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The find bar shows no match count, so "how many" and "which one" are still unanswerable.
+  evidence: The stock panel had none either, so this is not a regression — but it is the affordance people expect from a find bar, and rebuilding the panel was the cheap moment to add it. Held back deliberately: counting every match on each keystroke is a performance question about large notes (`SearchQuery.getCursor` walks the document), and a restyle is the wrong story to answer it in. Wants a cap and a "500+" form.
+  status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The file viewers mount CodeMirror without `search()`, so there is no find at all in a `.md`, `.csv` or `.json` opened from Files.
+  evidence: `⌘F` is wired in `note-editor.tsx` only. `findBar()` is now one extension and would drop into `text-viewer.tsx` unchanged, but adding find where there was none is a feature, not a restyle, and the viewers have their own `⌘F` question (the Files pane filter) to settle first.
+  status: open

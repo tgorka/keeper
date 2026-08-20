@@ -454,6 +454,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         tags,
         indent,
         writing,
+        find,
       ] = await Promise.all([
         import("@codemirror/state"),
         import("@codemirror/view"),
@@ -470,6 +471,9 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         // imports too, so a session log gets the same three tools rather than a
         // second copy of them.
         import("./editor/writing-tools"),
+        // The find bar. In the closure with everything else so the search
+        // panel's React tree is in the editor chunk, not the main bundle.
+        import("./editor/find-panel"),
       ]);
       if (disposed) {
         return;
@@ -518,7 +522,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             // everywhere else. CodeMirror's own keymap is what receives it,
             // rather than a synthesised event, because the panel it opens is
             // CodeMirror's and only its own commands can drive it.
-            cmSearch.search({ top: true }),
+            find.findBar(),
             cmSearch.highlightSelectionMatches(),
             view.keymap.of([
               ...commands.defaultKeymap,
