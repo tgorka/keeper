@@ -3415,3 +3415,19 @@ status: open
   summary: `==highlight==` renders in keeper and is invisible to anything else reading the vault.
   evidence: It is not in CommonMark or GFM; the extension in `markdown-marks.ts` is keeper's own, matching the spelling Obsidian and most wikis use. A note exported or read by a plain CommonMark renderer shows the equals signs. Worth stating in the vault docs rather than fixing — there is nothing to fix short of not supporting it.
   status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `.docx`, `.pptx` and `.xlsx` embedded in a note are still links.
+  evidence: They are `documentRow`s with no inline renderer — `document-viewer.tsx` shows a PDF through the webview's own renderer and offers the other three as a download. What a spreadsheet should look like inside a paragraph is a design question, not a wiring one, so `drawableFor` returns null for them and the link stays.
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `![[note.md]]` is still a link rather than a transclusion.
+  evidence: Deliberate and stated in `file-embed.ts`: showing one note inside another is a different feature with a different meaning, and mounting a raw editor over a note would be a second way to write one without `notes_save`'s base revision or its conflict copy. Rust refuses that write too, so both halves agree. Listed here because "every file type renders inline except this one" is the kind of gap a reader will otherwise report as a bug.
+
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: A PDF embed cannot report a failed load.
+  evidence: `<embed>` fires no `error` event, so the degrade-to-a-link path every other kind has does not exist for PDF. Safe today because the path came back from a resolver that stats the file, so "the vault holds it" is established before the element is built — but a file deleted between the resolve and the paint shows an empty box rather than the link. Fixing it means probing the bytes or watching for a zero-size box, neither of which is obviously worth it.
+  status: open

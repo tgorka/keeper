@@ -119,6 +119,7 @@ export type { NoteCsvRowVm } from "./gen/NoteCsvRowVm";
 export type { NoteCsvVm } from "./gen/NoteCsvVm";
 export type { NoteDeletePlanVm } from "./gen/NoteDeletePlanVm";
 export type { NoteDiffVm } from "./gen/NoteDiffVm";
+export type { NoteEmbedPathVm } from "./gen/NoteEmbedPathVm";
 export type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 export type { NoteFlag } from "./gen/NoteFlag";
 export type { NoteFolderVm } from "./gen/NoteFolderVm";
@@ -319,6 +320,7 @@ import type { NoteCreateVm } from "./gen/NoteCreateVm";
 import type { NoteCsvVm } from "./gen/NoteCsvVm";
 import type { NoteDeletePlanVm } from "./gen/NoteDeletePlanVm";
 import type { NoteDiffVm } from "./gen/NoteDiffVm";
+import type { NoteEmbedPathVm } from "./gen/NoteEmbedPathVm";
 import type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 import type { NoteFlag } from "./gen/NoteFlag";
 import type { NoteFolderVm } from "./gen/NoteFolderVm";
@@ -4598,6 +4600,11 @@ export async function notesCsvSetCell(
  * which is the whole reason the resolved path is what comes back rather than a
  * boolean.
  *
+ * Each answer carries the file's `kind` beside its path (Story 55.4), so a
+ * decoration can draw a photograph inside a note without the webview
+ * classifying anything (AD-87) and without reading the file to find out what
+ * it is.
+ *
  * A missing file is a `null`, never a rejection: "this note embeds something
  * that is not here" is a fact a panel has to render, and one moved photograph
  * must not blank the rest of the list.
@@ -4607,8 +4614,8 @@ export async function notesCsvSetCell(
 export async function notesEmbedPaths(
   vaultId: string,
   targets: string[],
-): Promise<(string | null)[]> {
-  return await invoke<(string | null)[]>("notes_embed_paths", { vaultId, targets });
+): Promise<(NoteEmbedPathVm | null)[]> {
+  return await invoke<(NoteEmbedPathVm | null)[]>("notes_embed_paths", { vaultId, targets });
 }
 
 /**

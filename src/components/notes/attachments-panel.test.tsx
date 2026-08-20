@@ -16,6 +16,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type {
   NoteAttachSourceVm,
   NoteBodyBatch,
+  NoteEmbedPathVm,
   NoteWriteVm,
   RecordingNoteTargetVm,
 } from "@/lib/ipc/client";
@@ -38,7 +39,13 @@ const notesAttachSources = vi.fn<(v: string, s: string[]) => Promise<NoteAttachS
  *  Defaulted in `beforeEach` to "every target resolves where it is written",
  *  because that is the ordinary vault and every 46.2 case is about a file that
  *  is there. */
-const notesEmbedPaths = vi.fn<(v: string, targets: string[]) => Promise<(string | null)[]>>();
+const notesEmbedPaths =
+  vi.fn<(v: string, targets: string[]) => Promise<(NoteEmbedPathVm | null)[]>>();
+
+/** The command answers with a path and the file's kind (Story 55.4). This panel
+ *  reads only the path, so the kind is filled in plausibly and never asserted
+ *  on — it is the note decoration that cares which it is. */
+const resolvedTo = (relPath: string): NoteEmbedPathVm => ({ relPath, kind: "file" });
 const pickFiles = vi.fn<() => Promise<string[] | null>>();
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -154,7 +161,7 @@ beforeEach(() => {
   // The ordinary vault: every target resolves at the path it is written at.
   // Rust's own resolution can answer a different path for a bare name — the
   // cases that care set their own answer.
-  notesEmbedPaths.mockImplementation(async (_vault, targets) => targets);
+  notesEmbedPaths.mockImplementation(async (_vault, targets) => targets.map(resolvedTo));
   notesSave.mockResolvedValue({
     rev: "r1",
     path: "n.md",
@@ -356,7 +363,7 @@ describe("the attachment panel", () => {
     // attachments folder second, so which file `![[photo.png]]` means is a
     // question only Rust can answer — which is exactly why 46.2 declined to list
     // it and why this story can.
-    notesEmbedPaths.mockResolvedValue(["attachments/photo.png"]);
+    notesEmbedPaths.mockResolvedValue([resolvedTo("attachments/photo.png")]);
     await panel("---\ntitle: Trip\n---\n", "![[photo.png]]\n");
 
     const row = screen.getByRole("listitem");
@@ -364,7 +371,7 @@ describe("the attachment panel", () => {
   });
 
   it("names an embed whose file is not in the vault instead of dropping the row in silence", async () => {
-    notesEmbedPaths.mockResolvedValue([null, "attachments/here.png"]);
+    notesEmbedPaths.mockResolvedValue([null, resolvedTo("attachments/here.png")]);
     await panel("---\ntitle: Trip\n---\n", "![[photos/deleted.png]]\n![[attachments/here.png]]\n");
 
     // The one that is there is a row; the one that is not is a sentence naming
@@ -385,9 +392,9 @@ describe("the attachment panel", () => {
   it("makes no claim about the vault while the probe is in flight", async () => {
     // The executor form, not `Promise.withResolvers`: the project compiles
     // against `lib: ES2020`, where that constructor method does not exist.
-    let answer!: (paths: (string | null)[]) => void;
+    let answer!: (paths: (NoteEmbedPathVm | null)[]) => void;
     notesEmbedPaths.mockReturnValue(
-      new Promise<(string | null)[]>((resolve) => {
+      new Promise<(NoteEmbedPathVm | null)[]>((resolve) => {
         answer = resolve;
       }),
     );
@@ -408,7 +415,7 @@ describe("the attachment panel", () => {
     expect(screen.queryByText(/not in this vault/)).toBeNull();
     expect(screen.getByText("Looking…")).toBeInTheDocument();
 
-    answer(["photos/holiday.png"]);
+    answer([resolvedTo("photos/holiday.png")]);
     expect(await screen.findByTitle("photos/holiday.png")).toBeInTheDocument();
     expect(screen.queryByText("Looking…")).toBeNull();
   });

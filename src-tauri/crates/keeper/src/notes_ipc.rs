@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use keeper_core::archive::recordings_fts::kind_for_file_name;
 use keeper_core::notes::default_spaces::{self, SPACES_DIR};
-use keeper_core::notes::embed::{self, NoteEmbedVm};
+use keeper_core::notes::embed::{self, NoteEmbedPathVm, NoteEmbedVm};
 use keeper_core::notes::frontmatter::{FieldValue, Frontmatter};
 use keeper_core::notes::index::{IndexEntry, IndexSnapshot, TagTerms};
 use keeper_core::notes::template_update::{
@@ -3997,7 +3997,10 @@ pub async fn notes_embed_read(vault_id: String, target: String) -> Result<NoteEm
 /// AD-103 and this story both exist to remove.
 ///
 /// One answer per target, in the order asked, `None` for a target the vault does
-/// not hold. Never a rejection for a missing file: "this note embeds something
+/// not hold. Each answer carries the resolved path **and** the file's kind —
+/// Story 55.4, so a decoration can draw a photograph inside a note without the
+/// webview classifying anything (AD-87) and without reading the file to find
+/// out what it is. Never a rejection for a missing file: "this note embeds something
 /// that is not here" is a fact the surface must render, and a rejected promise
 /// gives it nothing to render — and one moved photograph must not blank the rest
 /// of the list.
@@ -4010,7 +4013,7 @@ pub async fn notes_embed_read(vault_id: String, target: String) -> Result<NoteEm
 pub async fn notes_embed_paths(
     vault_id: String,
     targets: Vec<String>,
-) -> Result<Vec<Option<String>>, IpcError> {
+) -> Result<Vec<Option<NoteEmbedPathVm>>, IpcError> {
     let vault = vault_of(&vault_id)?;
     // Blocking: `contained_read` canonicalises, which stats every component, and
     // a note may embed a dozen files. On the async runtime that would stall
@@ -4018,7 +4021,21 @@ pub async fn notes_embed_paths(
     tokio::task::spawn_blocking(move || {
         targets
             .iter()
-            .map(|target| embed_path_opt(&vault, target).map(|(rel, _)| rel))
+            .map(|target| {
+                embed_path_opt(&vault, target).map(|(rel, path)| NoteEmbedPathVm {
+                    // From the resolved file's own name, not from the target the
+                    // note spells: `![[photo]]` with no extension resolves to
+                    // `attachments/photo.png`, and it is the file that decides
+                    // what the file is.
+                    kind: kind_for_file_name(
+                        &path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| rel.clone()),
+                    ),
+                    rel_path: rel,
+                })
+            })
             .collect()
     })
     .await

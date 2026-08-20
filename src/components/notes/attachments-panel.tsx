@@ -307,7 +307,10 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
           // target, in the order asked. A short reply leaves the tail
           // unanswered rather than silently pairing the wrong path with the
           // wrong embed.
-          setResolved(new Map(asked.map((target, at) => [target, paths[at] ?? null])));
+          // The path only: this panel lists what the vault holds, and the
+          // `kind` the answer now also carries (Story 55.4) is the note
+          // decoration's business, not a row's.
+          setResolved(new Map(asked.map((target, at) => [target, paths[at]?.relPath ?? null])));
         }
       })
       .catch(() => {
