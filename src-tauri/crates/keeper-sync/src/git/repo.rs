@@ -1241,6 +1241,26 @@ impl Drop for StatusWatchdog {
     }
 }
 
+/// Hand back the walk's result, or refuse it because the walk was abandoned.
+///
+/// **The refusal is the point.** An interrupt does not make gix yield an error
+/// — it makes the iterator END, which from the loop is indistinguishable from a
+/// walk that finished. Without this check the caller receives a status computed
+/// from whatever was reached before the stall and treats it as a description of
+/// the whole worktree; `commit_local` would then commit that reading. Observed
+/// on the first run of this guard against a real stalled folder: 19 entries of
+/// a 567-file tree, offered as `added=0 modified=1 deleted=2`.
+fn finish_walk(
+    interrupt: &AtomicBool,
+    watchdog: &StatusWatchdog,
+    out: RepoStatus,
+) -> Result<RepoStatus> {
+    if interrupt.load(Ordering::Relaxed) {
+        return Err(watchdog.silence_error(watchdog.beats()));
+    }
+    Ok(out)
+}
+
 /// How often the watchdog looks. Short enough to be responsive, long enough to
 /// cost nothing over a pass that runs for minutes.
 const WATCHDOG_POLL: Duration = Duration::from_secs(5);
@@ -1327,6 +1347,10 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
         // count, so there is no second counter to keep in step with it.
         let seen = watchdog.beat();
         let item = item.map_err(|err| {
+            // An interrupt usually ends the iterator rather than surfacing
+            // here, which is why the real guard is after the loop — but if it
+            // ever does surface, the reason the walk stopped is the useful
+            // sentence, not gix's inner error.
             if interrupt.load(Ordering::Relaxed) {
                 return watchdog.silence_error(seen);
             }
@@ -1394,6 +1418,15 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
         bucket.sort();
         bucket.dedup();
     }
+    // **After the loop, not inside it.** An interrupt does not make gix yield an
+    // error — it makes the iterator END, which is indistinguishable from a walk
+    // that finished. Returning here would hand the caller a status computed
+    // from the entries reached before the stall and let `commit_local` act on
+    // it as though it described the whole worktree. Observed on the very first
+    // run of this guard: 19 entries of a 567-file tree, reported as
+    // `added=0 modified=1 deleted=2`.
+    let out = finish_walk(&interrupt, &watchdog, out)?;
+
     // The shape of the pass, once, at INFO. A folder that later stalls is
     // diagnosed by comparing this line between runs — how many entries, how
     // long — and its absence is what made the field failure unreadable.
@@ -1973,6 +2006,37 @@ mod tests {
         assert_eq!(watchdog.beat(), 1);
         assert_eq!(watchdog.beat(), 2);
         assert_eq!(watchdog.beats(), 2);
+    }
+
+    /// A walk that was abandoned must not be mistaken for one that finished.
+    ///
+    /// The regression this pins cost nothing only because it was caught on the
+    /// guard's first real run: gix ends the iterator on interrupt instead of
+    /// erroring, so the partial result reached the caller looking complete.
+    #[test]
+    fn an_abandoned_walk_is_refused_rather_than_returned_short() {
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(19)),
+            FAST_POLL,
+            Duration::from_secs(3600),
+        );
+        let partial = RepoStatus {
+            deleted: vec![PathBuf::from("a"), PathBuf::from("b")],
+            ..RepoStatus::default()
+        };
+
+        let interrupted = AtomicBool::new(true);
+        let refused = finish_walk(&interrupted, &watchdog, partial.clone());
+        assert!(
+            refused.is_err(),
+            "a truncated status offered as a whole one is how a stall becomes a \
+             commit of deletions nobody made"
+        );
+
+        let ran = AtomicBool::new(false);
+        let kept = finish_walk(&ran, &watchdog, partial).expect("a completed walk is returned");
+        assert_eq!(kept.deleted.len(), 2, "an honest walk keeps its findings");
     }
 
     /// Dropping the guard tells the watcher to stop, so a finished walk leaves
