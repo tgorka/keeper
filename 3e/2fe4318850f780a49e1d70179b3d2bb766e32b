@@ -1,0 +1,25 @@
+src/components/notes/space-icons.test.ts
+  s_9bfe0bf28c8205::t_e666ef805693b2 99-130
+src/components/notes/space-icons.ts
+  s_9bfe0bf28c8205::t_e18d4fdece0f16 50,56,58,78,88-89,115,127-128,147,173,183,215,220-221,223,297-303,337-340,407-409,490-492
+src/lib/stores/notes-filters.test.ts
+  s_9bfe0bf28c8205::t_f76e87c05daab3 218-245
+src/lib/stores/notes-filters.ts
+  s_9bfe0bf28c8205::t_0a40ccd36a4960 397-415
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "3e2fe4318850f780a49e1d70179b3d2bb766e32b",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
