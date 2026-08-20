@@ -50,6 +50,7 @@ pub mod git;
 pub mod http;
 pub mod lfs;
 pub mod names;
+pub mod openfiles;
 pub mod platform;
 pub mod profile;
 pub mod progress;

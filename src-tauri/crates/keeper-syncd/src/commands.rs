@@ -130,6 +130,10 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // A cancelled operation is not a failure — the type's own contract says
         // so, and a graceful SIGTERM must not make systemd log a failed unit.
         SyncError::Cancelled => EXIT_OK,
+        // Neither is an overlapping run. The work is being done by whoever got
+        // the folder first, so a one-shot that lands here did nothing wrong and
+        // must not earn a `Restart=on-failure` for losing a race.
+        SyncError::Busy(_) => EXIT_OK,
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }

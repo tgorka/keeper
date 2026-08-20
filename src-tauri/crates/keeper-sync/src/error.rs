@@ -183,6 +183,17 @@ pub enum SyncError {
     #[error("invalid sync configuration: {0}")]
     Config(String),
 
+    /// A sync for this folder is already running.
+    ///
+    /// Not a misconfiguration and not a failure: a scheduled run and a "Sync
+    /// now" click overlapping is the ordinary case, and the work is already
+    /// being done by the run that got there first. It had been reported as
+    /// `Config`, which rendered as "invalid sync configuration: … is already
+    /// syncing" — a sentence that sends somebody to look for a broken setting
+    /// that does not exist.
+    #[error("{0} is already syncing; the run already in progress will finish it")]
+    Busy(String),
+
     /// The operation was cancelled — by the user, by shutdown, or by a volume
     /// disappearing mid-flight. Never surfaced as a failure.
     #[error("operation cancelled")]
@@ -231,7 +242,8 @@ impl SyncError {
             // first is the ordinary weather of a shared branch, and the retry
             // lands after the reconcile that `do_push` queues alongside it.
             Self::Git(_) | Self::Io { .. } | Self::RemoteMoved { .. } => Retriability::Transient,
-            Self::Cancelled => Retriability::Permanent,
+            // Nothing to retry: the run that holds the folder is doing this work.
+            Self::Busy(_) | Self::Cancelled => Retriability::Permanent,
         }
     }
 
@@ -274,6 +286,7 @@ impl SyncError {
             Self::Git(_) => "git",
             Self::Io { .. } => "io",
             Self::Config(_) => "config",
+            Self::Busy(_) => "busy",
             Self::Cancelled => "cancelled",
         }
     }
