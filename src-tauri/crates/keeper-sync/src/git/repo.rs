@@ -31,6 +31,7 @@ use std::{
 
 use crate::error::{Result, SyncError};
 use crate::git::fetch::Credential;
+use crate::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
 
 /// How long an `index.lock` must sit untouched before it is debris.
 ///
@@ -1870,6 +1871,70 @@ pub fn unspellable_tracked_paths(
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// Restore the pointer-blob / worktree-stat invariant across the whole index.
+///
+/// # The failure this repairs
+///
+/// [`refresh_index_stat`] is called in exactly one place: immediately after a
+/// materialization, on the paths that materialization touched. That is correct
+/// and it is not enough. A run that dies between writing the real files and
+/// refreshing their stat — the `Too many open files` exhaustion that a
+/// Finder-launched app hit for days is one way — leaves the index describing
+/// pointers and the worktree holding gigabytes. Nothing ever calls it again for
+/// those paths, so the invariant stays broken for the life of the folder.
+///
+/// What that costs is not cosmetic. Every entry whose stat disagrees is a file
+/// `status` must convert through the LFS filter to compare, so a routine status
+/// pass turns into streaming the entire worktree through a filter pipeline —
+/// which is how one vault reached 93 GB of conversions and stopped syncing
+/// entirely.
+///
+/// # Why it re-stats rather than re-checks out
+///
+/// The bytes on disk are right; only the index's memory of them is stale. A
+/// checkout would re-materialize files that are already correct, cost the
+/// transfer again, and touch mtimes the user may be relying on. Re-stat is the
+/// smaller and truer repair: it changes what git *remembers*, not what the user
+/// *has*.
+///
+/// Answers how many entries it corrected, so a caller can say whether there was
+/// anything to repair — "nothing was wrong" and "I fixed 500 files" are
+/// different sentences and a button that cannot tell them apart teaches nothing.
+pub fn repair_index_stat(repo: &gix::Repository) -> Result<usize> {
+    let paths = tracked_paths(repo)?;
+    let workdir = workdir(repo)?;
+    // Only the entries whose worktree file is NOT a pointer: those are the
+    // materialized ones, and they are the only ones whose stat can have been
+    // left describing something else. An entry that still holds a pointer on
+    // disk is already consistent and re-stating it would be a write for
+    // nothing.
+    let stale: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|rel| {
+            let full = workdir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&full) else {
+                return false;
+            };
+            if !meta.is_file() {
+                return false;
+            }
+            // A pointer is tiny by construction. Anything larger cannot be one,
+            // and reading the head of every small file is cheap next to the
+            // conversion this exists to avoid.
+            if meta.len() >= MAX_POINTER_BYTES as u64 {
+                return true;
+            }
+            let Ok(head) = std::fs::read(&full) else {
+                return false;
+            };
+            Pointer::parse(&head).is_none()
+        })
+        .collect();
+    let corrected = stale.len();
+    refresh_index_stat(repo, &stale)?;
+    Ok(corrected)
 }
 
 /// Re-stat `paths` and write the refreshed index.

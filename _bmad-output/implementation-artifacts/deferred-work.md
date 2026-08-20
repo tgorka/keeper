@@ -3466,3 +3466,8 @@ status: open
   summary: A profile can sit in `offline` indefinitely with no path back.
   evidence: `Offline` is set on a transient network error with the comment "the queue drains when connectivity returns (AD-49)", but the state is only refreshed by a sync that completes. When the only queued unit cannot complete, the profile reports `offline` forever while the server is reachable — observed for three days with `curl` answering the remote in 30 ms. The state needs a way to be re-evaluated that does not depend on the thing it is blocking.
   status: open
+
+- source_spec: spec-repair-the-lfs-stat-invariant
+  summary: Nothing detects a broken pointer-stat invariant on its own; the repair runs only when a person presses "Recheck all files".
+  evidence: `repair_index_stat` restores it, and `rescan` calls it, but a folder whose invariant broke while nobody was looking still converts its whole worktree on every status pass until somebody notices and presses the button. The card now says the folder needs attention after three consecutive failures, which is what makes the button findable — but a cheap periodic check (does a materialized entry's stat still describe its file?) would make the repair automatic. Left out here because a self-repairing index is a write nobody asked for, and this story's job was to make the failure visible and fixable.
+  status: open

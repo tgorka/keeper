@@ -2776,6 +2776,17 @@ impl Engine {
                         &profile.name,
                         format!("sync has failed {consecutive} times in a row: {err}"),
                     );
+                    // And say it where the folder is looked at, not only where
+                    // notifications go. A run of transient failures used to
+                    // leave the card reading whatever it read before —
+                    // `Idle`, or a stale `Offline` from the failure that
+                    // started it — while the queue retried in a loop nobody
+                    // could see. A folder that has failed this many times in a
+                    // row is not idle, and the sentence belongs beside it.
+                    self.set_state(&profile.id, ProfileState::NeedsAttention);
+                    if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+                        snapshot.error = Some(err.to_string());
+                    }
                 }
             }
             Retriability::Permanent => {
@@ -5336,9 +5347,49 @@ impl Engine {
         }
         self.with_db(|conn| db::clear_file_state(conn, id))?;
         Self::lock(&self.gates).remove(id);
+
+        // "Recheck all files" now means git's memory too, not only keeper's.
+        //
+        // Forgetting `file_state` makes keeper look at everything again; it
+        // does nothing for the index entries whose cached stat stopped
+        // describing the worktree, and those are what turn a status pass into
+        // a filter conversion of the entire folder. A person whose folder has
+        // stopped syncing presses this button — it should be able to repair
+        // the thing that stopped it. See `repair_index_stat`.
+        //
+        // Best effort, deliberately: a repository this cannot open is one the
+        // walk below will report on properly, and failing the button here would
+        // take away the "forget and look again" half that always works.
+        match self.repair_stat_invariant(id) {
+            Ok(0) => {}
+            Ok(corrected) => tracing::info!(
+                profile = id,
+                corrected,
+                "recheck: restored the index stat for materialized content"
+            ),
+            Err(err) => tracing::warn!(
+                profile = id,
+                error = %err,
+                "recheck: could not restore the index stat; looking again anyway"
+            ),
+        }
+
         self.wake_now(id);
         tracing::info!(profile = id, "forgot the remembered tree state on request");
         Ok(())
+    }
+
+    /// Re-stat every materialized LFS entry whose index stat has gone stale.
+    ///
+    /// Split out so `rescan` reads as the two things it now does, and so the
+    /// repair can be reached from anywhere else that finds the invariant
+    /// broken.
+    fn repair_stat_invariant(&self, id: &str) -> Result<usize> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Ok(0);
+        };
+        let repo = git::repo::open(&profile.local_path, profile.removable)?;
+        git::repo::repair_index_stat(&repo)
     }
 
     /// Ask for a walk **now**, remembering everything already known.
