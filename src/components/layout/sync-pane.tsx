@@ -823,18 +823,27 @@ export function SyncPane() {
             720px those paths truncate into ellipses while the window sits half
             empty, which is the one thing a list of paths must not do: the tail
             of a path is the half that identifies it. */}
-        <div data-slot="sync-body" className="flex flex-col gap-6 p-6">
+        {/* No gutter and no gap. A card here is not an object floating on a
+            surface — it is a section of the surface, and the folders are the
+            whole content of this pane. Separated by a rule rather than by
+            emptiness, since with the cards meeting edge to edge there is no
+            background left between them to do the separating. Prose and the
+            add form keep their own padding, because a sentence flush against
+            the window frame reads as a mistake. */}
+        <div data-slot="sync-body" className="flex flex-col">
           {readError !== null && (
-            <p role="alert" className="text-destructive text-sm">
+            <p role="alert" className="px-6 pt-4 text-destructive text-sm">
               {readError}
             </p>
           )}
           {/* Only claim "nothing configured" once a read has actually landed —
               before that the list is unknown, not empty. */}
           {profiles === null && (
-            <p className="text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
+            <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
           )}
-          {empty && <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>}
+          {empty && (
+            <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>
+          )}
           {/* Whether it arrived as the empty state or from the header action,
               this is the one add form; see `showAddForm` above for why.
 
@@ -852,7 +861,7 @@ export function SyncPane() {
             // one that sits still; the rows below are paths that want every
             // pixel. Same reasoning as the Recording pane's column, applied to
             // the part of this surface that is actually a form.
-            <Card size="sm" className="w-full max-w-[720px]">
+            <Card size="sm" className="m-6 w-full max-w-[720px]">
               <CardContent>
                 <AddFolderForm
                   onSaved={(_profile, settled) => setAdding(!settled)}
@@ -868,6 +877,9 @@ export function SyncPane() {
               this surface it keeps nothing about. */}
           <Separator />
           <CopyCard />
+          {/* The last card ends where the pane does; without this the surface
+              stops mid-scroll and the background shows through under it. */}
+          <div className="min-h-6 flex-1 bg-card" />
         </div>
       </ScrollArea>
     </section>
@@ -991,7 +1003,10 @@ function SyncProfileCard({
   const flying = [files, rateText].filter((figure) => figure !== null);
 
   return (
-    <Card size="sm">
+    // Square and edge to edge: this card is a section of the pane, not an
+    // object on it. The rule at the bottom is what separates one folder from
+    // the next now that no background shows between them.
+    <Card size="sm" className="rounded-none border-border border-b">
       <CardHeader>
         {/* Wraps rather than overflowing. The actions used to be `shrink-0` beside
             a `min-w-0` title, which works until there are five of them: the row

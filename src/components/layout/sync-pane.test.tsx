@@ -1288,6 +1288,15 @@ describe("SyncPane pending", () => {
     expect(body).not.toBeNull();
     expect(body?.className).not.toMatch(/max-w-/);
     expect(body?.className).not.toMatch(/mx-auto/);
+    // And no gutter: a folder's card is a section of this pane rather than an
+    // object floating on it, so the card colour reaches every edge.
+    expect(body?.className).not.toMatch(/\bp-6\b/);
+    expect(body?.className).not.toMatch(/\bgap-6\b/);
+    const card = document.querySelector('[data-slot="card"]');
+    expect(card?.className).toContain("rounded-none");
+    // Separated by a rule, because with the cards meeting there is no
+    // background between them left to do it.
+    expect(card?.className).toContain("border-b");
   });
 
   it("lists what is waiting and why", async () => {
