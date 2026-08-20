@@ -1,0 +1,21 @@
+src/components/notes/editor/vault-embed.test.ts
+  s_9bfe0bf28c8205::t_3076578ea3d440 118-136
+src/components/notes/editor/vault-embed.ts
+  s_9bfe0bf28c8205::t_c4b501e1a3129a 125-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f0378b65f526ef3a319a3249a2d4db9d133aa91b",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
