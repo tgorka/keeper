@@ -16,7 +16,6 @@
  * Renders only the Add Account button when there are no accounts.
  */
 import {
-  Check,
   CloudOff,
   Loader2,
   LogOut,
@@ -103,9 +102,15 @@ function homeserverLabel(homeserverUrl: string): string {
 }
 
 /**
- * The 3-state sync glyph, a passive projection of the account's connection
- * status: no batch yet (`undefined`) → a syncing spinner; `online` → a synced
- * check; `offline` → a gray offline cloud. Never a toast.
+ * The sync glyph, a passive projection of the account's connection status: no
+ * batch yet (`undefined`) → a syncing spinner; `offline` → a gray offline
+ * cloud; `online` → nothing at all. Never a toast.
+ *
+ * `online` used to draw a check. It was on screen essentially always, which is
+ * what made it useless: a mark that is present whenever nothing is wrong tells
+ * a reader nothing when they look at it, and it cost a row that is now 130px
+ * wide the space to say which account it is. The two states worth a glyph are
+ * the two that are not fine, and those still have one.
  */
 function SyncGlyph({ status }: { status: ConnectionStatus | undefined }) {
   if (status === undefined) {
@@ -119,7 +124,7 @@ function SyncGlyph({ status }: { status: ConnectionStatus | undefined }) {
   if (status === "offline") {
     return <CloudOff aria-label="Offline" className="size-3.5 shrink-0 text-muted-foreground" />;
   }
-  return <Check aria-label="Synced" className="size-3.5 shrink-0 text-muted-foreground" />;
+  return null;
 }
 
 /** The hue-tinted initials avatar for an account. */
@@ -580,7 +585,11 @@ function AccountRowMenu({
         type="button"
         aria-label={menuLabel}
         className={cn(
-          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left",
+          // The row is the control now (Story 49), and it had nothing to say
+          // so on hover: no tint, no cursor change, nothing but a pointer
+          // passing over text. `hover:bg-accent` is what every other clickable
+          // row in the drawer does, so this one stops being the exception.
+          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left hover:bg-accent",
           FOCUS_RING,
         )}
       >

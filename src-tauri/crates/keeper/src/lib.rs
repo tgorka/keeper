@@ -5,10 +5,12 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
-#[cfg(desktop)]
 mod build_identity;
 mod copy_ipc;
 mod debug_log;
+#[cfg(desktop)]
+#[cfg(target_os = "macos")]
+mod pdf_export;
 // The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
 // reason `note_protocol` is: it serves files out of a synced folder, and the
 // folder sync it is rooted in is desktop-only.
@@ -917,6 +919,7 @@ pub fn run() {
         sync_ipc::sync_browse,
         sync_ipc::sync_open_entry,
         sync_ipc::sync_read_text,
+        sync_ipc::sync_export_pdf,
         // The document reader (Story 45.8). Returns a bounded projection of a
         // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
         sync_ipc::sync_read_document,
@@ -1030,6 +1033,7 @@ pub fn run() {
         notes_ipc::notes_link_targets,
         notes_ipc::notes_resolve_link,
         notes_ipc::notes_backlinks,
+        notes_ipc::notes_forwardlinks,
         notes_ipc::notes_history,
         notes_ipc::notes_diff,
         notes_ipc::notes_mark_read,

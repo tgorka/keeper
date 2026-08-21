@@ -124,11 +124,16 @@ describe("AccountFooter", () => {
     expect(screen.getByLabelText("Syncing")).toBeInTheDocument();
   });
 
-  it("shows the synced glyph when the account is online", () => {
+  // Online is the state the account is in almost all the time, and a glyph that
+  // is present whenever nothing is wrong says nothing to the person reading it.
+  // The two states that are not fine still draw one; this one draws nothing.
+  it("draws no glyph when the account is online, because that is the boring case", () => {
     accountsStore.getState().hydrateAll([alice]);
     accountStatusStore.getState().setStatus(alice.accountId, "online");
     renderFooter();
-    expect(screen.getByLabelText("Synced")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Synced")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Syncing")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Offline")).not.toBeInTheDocument();
   });
 
   it("shows the offline glyph when the account is offline", () => {

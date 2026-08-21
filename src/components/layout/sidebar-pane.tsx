@@ -154,9 +154,23 @@ export const SIDEBAR_TITLE = "Menu";
  * Collapsed is {@link FOLD_STRIP.widthClass} and not a literal of its own: this
  * used to be `w-12` here and `48` in `surface-column.tsx`, each with a comment
  * pointing at the other. */
+/**
+ * The drawer's two widths.
+ *
+ * `expanded` was 260px, which was roughly twice what the drawer holds: the
+ * widest row in it is "Recordings", and measured against the built stylesheet
+ * that row wants 117px including its icon, its gap and the padding on both
+ * sides. 130px leaves 13px of slack and clips nothing — the labels were never
+ * what the other 130px was for.
+ *
+ * The account handle in the footer truncates harder at this width, which is a
+ * truncation and not a clip: it already had an ellipsis at 260px, and the
+ * synced glyph that used to sit beside it is gone (`SyncGlyph`), so the row
+ * gives up less than the number suggests.
+ */
 export const SIDEBAR_WIDTH_CLASS = {
   collapsed: FOLD_STRIP.widthClass,
-  expanded: "w-[260px]",
+  expanded: "w-[130px]",
 } as const;
 
 /** The id the fold control's `aria-controls` points at.

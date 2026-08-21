@@ -37,6 +37,7 @@ import {
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesRename, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
@@ -45,10 +46,10 @@ import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/not
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { AttachFileButton } from "./attach-file-button";
 import { ATTACHMENTS_LABEL, AttachmentsPanel } from "./attachments-panel";
-import { BacklinksPanel } from "./backlinks-panel";
 import { ConflictResolver } from "./conflict-resolver";
 import type { FormatAction } from "./editor/format-commands";
 import { FormatToolbar } from "./format-toolbar";
+import { LinksPanel } from "./links-panel";
 import { NoteActions } from "./note-actions";
 import { NoteDiffBar } from "./note-diff-bar";
 import { NOTE_HISTORY_LABEL, NoteHistoryPanel } from "./note-history-panel";
@@ -332,6 +333,23 @@ export interface NoteEditorProps {
   frame?: ReactNode;
 }
 
+/**
+ * The open note's column.
+ *
+ * `min-w-0` is defensive, and this comment exists to say so honestly: it is not
+ * what stopped the note escaping its pane. It was shipped believing it was, on
+ * a measurement of a container chain the app does not actually have — the
+ * column's parent is a block box (`overflow-auto`), not a flex container, so
+ * `min-width: auto` never applied to this element and setting it to zero
+ * changed nothing. Measured again against the real chain, with and without the
+ * class: 604px either way.
+ *
+ * It stays because the day this column becomes a flex item the floor is already
+ * written, and it costs nothing. What actually fits the note to its pane is the
+ * `ResizeObserver` below — see the comment beside it.
+ */
+export const NOTE_COLUMN_CLASS = "flex h-full min-h-0 min-w-0 flex-col";
+
 export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
@@ -612,6 +630,28 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         }),
       });
 
+      // This pane changes width without the window changing size — a column
+      // folds, the strip re-divides between panels — and CodeMirror measures
+      // its own width when it is created and when the window resizes, not when
+      // the box it lives in is re-divided around it.
+      //
+      // Measured in the running app: the window was dragged 158px narrower and
+      // the three columns beside this pane did not move a pixel, so the whole
+      // change landed here. The text did not re-wrap, and there was no
+      // horizontal scrollbar to reach the rest with. Every line kept the width
+      // the pane used to have, and the pane clipped it — which is what "the
+      // note does not fit the window" turned out to be.
+      //
+      // Guarded because jsdom does not always define it, in the shape the other
+      // panes in this app already use.
+      const resizes =
+        typeof ResizeObserver === "undefined"
+          ? null
+          : new ResizeObserver(() => {
+              editorView.requestMeasure();
+            });
+      resizes?.observe(host);
+
       runtimeRef.current = {
         applyExternal: (text: string) => {
           const splice = preview.spliceBetween(editorView.state.doc.toString(), text);
@@ -656,7 +696,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
           writing.runFormatAction(editorView, action);
         },
         focus: () => editorView.focus(),
-        destroy: () => editorView.destroy(),
+        destroy: () => {
+          resizes?.disconnect();
+          editorView.destroy();
+        },
       };
       editorView.focus();
       // The document almost never exists yet when this chunk lands — the channel
@@ -800,14 +843,6 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         expanded: showAttachments,
         controls: showAttachments ? attachmentsRegionId : undefined,
       },
-      {
-        id: "properties",
-        label: PROPERTIES_LABEL,
-        icon: SlidersHorizontal,
-        onSelect: toggleProperties,
-        expanded: showProperties,
-        controls: showProperties ? propertiesRegionId : undefined,
-      },
       { id: "history", label: NOTE_HISTORY_LABEL, icon: History, onSelect: openHistory },
     ];
     if (vault !== null && path !== null && filePathForNote(vault, path) !== null) {
@@ -819,17 +854,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
       });
     }
     return acts;
-  }, [
-    vault,
-    path,
-    toggleAttachments,
-    toggleProperties,
-    openHistory,
-    showAttachments,
-    showProperties,
-    attachmentsRegionId,
-    propertiesRegionId,
-  ]);
+  }, [vault, path, toggleAttachments, openHistory, showAttachments, attachmentsRegionId]);
 
   // Story 46.4: read once, because the header both shows this word and hangs it
   // on a `title` — an error is the one caption that can outgrow its slot.
@@ -844,7 +869,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className={NOTE_COLUMN_CLASS}>
       {/* Story 46.4's three groups, Story 46.13's component (AD-104).
 
           The row is `flex` and does not wrap, so every sibling in it competes
@@ -912,12 +937,35 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             // one verb here that starts outside keeper, which is why 46.5 kept
             // it out when it put everything else away.
             leading={
-              <AttachFileButton
-                vaultId={vaultId}
-                body={body.text}
-                onInsert={insertAtCursor}
-                onOutcome={setAttachOutcome}
-              />
+              <>
+                <AttachFileButton
+                  vaultId={vaultId}
+                  body={body.text}
+                  onInsert={insertAtCursor}
+                  onOutcome={setAttachOutcome}
+                />
+                {/* Leading rather than a candidate, which is the difference
+                    between "shown when there is room" and "shown". It discloses
+                    the region holding three of the four questions anybody asks
+                    of an open note — its properties, what links here, what it
+                    links to — and a disclosure control that disappears into a
+                    menu at narrow widths takes the region with it: there is
+                    nothing on screen left to say the region exists. The verbs
+                    below still demote, because a verb in a menu is still a verb
+                    you can reach by name. */}
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label={PROPERTIES_LABEL}
+                  title={PROPERTIES_LABEL}
+                  aria-expanded={showProperties}
+                  aria-controls={showProperties ? propertiesRegionId : undefined}
+                  onClick={toggleProperties}
+                >
+                  <SlidersHorizontal aria-hidden="true" className="size-4" />
+                </Button>
+              </>
             }
             // The menu is the row's overflow in the row's own order, and then
             // the verbs that never leave it. One rule, so nothing has to reason
@@ -1069,16 +1117,47 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
           points `aria-controls` at, and a wrapper that generated a box would put
           a flex item between this column and the panel it holds. */}
       {showProperties ? (
-        <div id={propertiesRegionId} className="contents">
+        <div id={propertiesRegionId} className="min-h-0 shrink-0 border-t">
           {mode === "edit" ? (
-            <PropertiesPanel
-              frontmatter={frontmatter}
-              body={body.text}
-              subscriptionId={subscriptionId}
-              baseRev={rev}
-              onSaved={adoptPanelWrite}
-              rename={noteId === null ? null : renameNoteFile}
-            />
+            // Three questions about the open note that all want the same corner
+            // of the screen, so they share one. "Linked from" used to live below
+            // this region as a section of its own, appearing and disappearing
+            // with the note's inbound links; as a tab it is always askable, and
+            // its answer — including "nothing yet" — is a sentence rather than
+            // an absence.
+            <Tabs defaultValue="properties">
+              <TabsList className="mx-3 mt-2">
+                <TabsTrigger value="properties">{PROPERTIES_LABEL}</TabsTrigger>
+                <TabsTrigger value="linked-from">Linked from</TabsTrigger>
+                <TabsTrigger value="linked-to">Linked to</TabsTrigger>
+              </TabsList>
+              <TabsContent value="properties">
+                <PropertiesPanel
+                  frontmatter={frontmatter}
+                  body={body.text}
+                  subscriptionId={subscriptionId}
+                  baseRev={rev}
+                  onSaved={adoptPanelWrite}
+                  rename={noteId === null ? null : renameNoteFile}
+                />
+              </TabsContent>
+              <TabsContent value="linked-from">
+                <LinksPanel
+                  vaultId={vaultId}
+                  noteId={noteId}
+                  direction="from"
+                  onOpen={(linked) => onOpenNote?.(linked)}
+                />
+              </TabsContent>
+              <TabsContent value="linked-to">
+                <LinksPanel
+                  vaultId={vaultId}
+                  noteId={noteId}
+                  direction="to"
+                  onOpen={(linked) => onOpenNote?.(linked)}
+                />
+              </TabsContent>
+            </Tabs>
           ) : (
             <PanelUnavailable panel={PROPERTIES_LABEL} mode={mode} onBack={leaveMode} />
           )}
@@ -1139,14 +1218,6 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
             onAbandon={leaveMode}
           />
         </div>
-      ) : null}
-
-      {mode === "edit" ? (
-        <BacklinksPanel
-          vaultId={vaultId}
-          noteId={noteId}
-          onOpen={(linked) => onOpenNote?.(linked)}
-        />
       ) : null}
     </div>
   );

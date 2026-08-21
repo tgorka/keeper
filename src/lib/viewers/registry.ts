@@ -174,6 +174,10 @@ function documentRow(
   extensions: readonly string[],
   format: ViewerFormat,
   label: string,
+  /** The glyph, when the format has one of its own. Defaults to the generic
+   *  typed-document page, which is what a format keeps until somebody decides
+   *  it is worth telling apart in a list. */
+  icon: IconName = "file-document",
 ): FileFormatRow {
   return {
     extensions,
@@ -181,7 +185,7 @@ function documentRow(
       viewer: "document",
       format,
       label,
-      icon: "file-document",
+      icon,
       writable: false,
     }),
   };
@@ -271,10 +275,16 @@ const FILE_FORMAT_ROWS: readonly FileFormatRow[] = [
   sourceRow(["lua"], "lua", "Lua source"),
   sourceRow(["swift"], "swift", "Swift source"),
   sourceRow(["kt", "kts"], "kotlin", "Kotlin source"),
-  documentRow(["pdf"], "pdf", "PDF"),
+  // Four formats that all drew the same page until now, which is how a folder
+  // of LOIs, decks and CVs came to look like one repeated file. `documentRow`
+  // still names the default; these three say what they are instead.
+  documentRow(["pdf"], "pdf", "PDF", "file-pdf"),
   documentRow(["docx"], "docx", "Word document"),
-  documentRow(["pptx"], "pptx", "Presentation"),
-  documentRow(["xlsx"], "xlsx", "Spreadsheet"),
+  documentRow(["pptx"], "pptx", "Presentation", "file-slides"),
+  // The same glyph as CSV, deliberately. A spreadsheet and a comma-separated
+  // file are both a table, and giving this one a chart would say something
+  // about the contents that opening it might not bear out.
+  documentRow(["xlsx"], "xlsx", "Spreadsheet", "file-table"),
 ];
 
 /**

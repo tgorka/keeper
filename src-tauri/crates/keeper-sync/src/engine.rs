@@ -337,6 +337,20 @@ const CLAIM_LIMIT: u32 = 16;
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
+/// How often a folder's transfer scratch is swept.
+///
+/// Scratch is what an interrupted transfer leaves behind, and nothing else ever
+/// reclaims it: it is not in the working tree, so no status walk sees it; it is
+/// not an LFS object, so no prune considers it. Until this, the only thing that
+/// swept it was the "Recheck all files" button — which meant the space came back
+/// only for a person who already suspected something was wrong and went looking
+/// for a button to press. On the folder that prompted this, that was 915 files
+/// and 123 GB sitting behind a button nobody had a reason to press.
+///
+/// An hour, matching `SCRATCH_DEBRIS_AGE`: the sweep runs as often as a file can
+/// become eligible for it, and no oftener.
+const SWEEP_EVERY_MS: i64 = 3_600_000;
+
 /// How many consecutive transient failures before a profile stops calling
 /// itself healthy.
 ///
@@ -531,6 +545,13 @@ pub struct Engine {
     /// scanning is paced by the profile's own `poll_interval_ms`, which until
     /// now was parsed, validated, documented and read by nothing (DW-116).
     next_scan_ms: Mutex<HashMap<String, i64>>,
+    /// When each profile's transfer scratch may next be swept.
+    ///
+    /// Absent means "now", so a folder is swept on the first tick after keeper
+    /// starts. That is deliberate and it is the case that matters: the run that
+    /// leaves scratch behind is the one that was killed, and the next start is
+    /// the first moment anything can clean up after it.
+    next_sweep_ms: Mutex<HashMap<String, i64>>,
     /// Absolute path to the binary git should invoke as the `lfs` filter.
     ///
     /// `None` when the running executable cannot be resolved — the filter is an
@@ -700,6 +721,7 @@ impl Engine {
             labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
+            next_sweep_ms: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
             // desktop run; both understand `lfs clean|smudge`.
             filter_program: std::env::current_exe().ok(),
@@ -893,6 +915,7 @@ impl Engine {
         Self::lock(&self.status).remove(id);
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
+        Self::lock(&self.next_sweep_ms).remove(id);
         self.drop_watcher(id);
         Ok(())
     }
@@ -912,6 +935,7 @@ impl Engine {
             // ...and neither is making them wait out a scan window: resuming is
             // a request to look now.
             Self::lock(&self.next_scan_ms).remove(id);
+            Self::lock(&self.next_sweep_ms).remove(id);
         }
         Ok(())
     }
@@ -1196,6 +1220,7 @@ impl Engine {
             if !profile.enabled {
                 continue;
             }
+            self.sweep_scratch_if_due(&profile).await;
             match self.tick_profile(&profile).await {
                 Ok(()) => {
                     Self::lock(&self.transient_failures).remove(&profile.id);
@@ -1263,6 +1288,50 @@ impl Engine {
         }
         let interval = profile.effective_poll_interval_ms() as i64;
         due.insert(profile.id.clone(), now.saturating_add(interval));
+        true
+    }
+
+    /// Whether this profile's transfer scratch may be swept on this tick.
+    ///
+    /// Same shape as [`Self::scan_is_due`] and for the same reason: a schedule
+    /// on the platform clock is a schedule a test can advance, and housekeeping
+    /// that could only be observed by waiting an hour would not be tested.
+    /// Delete transfer scratch this folder will never use again.
+    ///
+    /// Fenced in `spawn_blocking`: this is `read_dir` plus up to a few thousand
+    /// `unlink`s on a volume that may be an external disk, and the supervisor
+    /// ticks at 1 Hz. Awaited rather than detached, so two sweeps of the same
+    /// folder can never overlap.
+    ///
+    /// `incomplete/` is swept alongside `tmp/` even though it exists to let a
+    /// download resume, because the hasher state that would resume it lives in
+    /// the process: once keeper restarts, a partial file there is bytes nothing
+    /// can continue from. Keeping it would cost disk to preserve a resume that
+    /// cannot happen.
+    ///
+    /// Never fails the tick. Housekeeping that could stop a folder syncing would
+    /// have traded a disk-space problem for a sync problem.
+    async fn sweep_scratch_if_due(&self, profile: &SyncProfile) {
+        if !self.sweep_is_due(profile) {
+            return;
+        }
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let name = profile.name.clone();
+        // The sweep reports its own anomaly when it removes anything, so there
+        // is nothing to log here: a sweep that found nothing is the normal case
+        // and has nothing to say.
+        let _ = tokio::task::spawn_blocking(move || store.sweep_scratch(&name)).await;
+    }
+
+    fn sweep_is_due(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        let mut due = Self::lock(&self.next_sweep_ms);
+        match due.get(&profile.id) {
+            None => {}
+            Some(at) if now >= *at => {}
+            Some(_) => return false,
+        }
+        due.insert(profile.id.clone(), now.saturating_add(SWEEP_EVERY_MS));
         true
     }
 
@@ -5423,6 +5492,7 @@ impl Engine {
         // walk at all, and the cleared deadline is what stops it waiting out the
         // rest of the poll interval first.
         Self::lock(&self.next_scan_ms).remove(id);
+        Self::lock(&self.next_sweep_ms).remove(id);
         self.note_watch_wake(id);
     }
 
@@ -6520,6 +6590,69 @@ mod tests {
         assert!(!engine.scan_is_due(&p), "still inside the window");
         platform.advance_ms(1);
         assert!(engine.scan_is_due(&p), "the window has opened");
+    }
+
+    /// The bug this fixes was not in the sweep. It was that nothing called it.
+    ///
+    /// `sweep_scratch` shipped with exactly one caller — the "Recheck all files"
+    /// button — so a folder accumulated scratch until somebody suspected a
+    /// problem and went hunting for a button. The folder that prompted this had
+    /// 915 files and 123 GB waiting behind that button.
+    #[test]
+    fn scratch_is_swept_on_the_first_tick_and_then_hourly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        // First sight sweeps: the run that leaves scratch behind is the one that
+        // was killed, and the next start is the first chance to clean up.
+        assert!(engine.sweep_is_due(&p), "a folder is swept when first seen");
+        assert!(!engine.sweep_is_due(&p), "and not again on the next tick");
+
+        platform.advance_ms(SWEEP_EVERY_MS - 1);
+        assert!(!engine.sweep_is_due(&p), "still inside the hour");
+        platform.advance_ms(1);
+        assert!(engine.sweep_is_due(&p), "the hour has passed");
+    }
+
+    /// End to end through the call the tick actually makes, because the schedule
+    /// being right is worth nothing if the wiring is not.
+    #[tokio::test]
+    async fn a_due_sweep_removes_debris_and_leaves_a_live_transfer_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        let tmp = p.local_path.join(".git").join("lfs").join("tmp");
+        std::fs::create_dir_all(&tmp).expect("scratch dir");
+        let debris = tmp.join(".tmpAbandoned");
+        let live = tmp.join(".tmpInFlight");
+        std::fs::write(&debris, b"left by a killed run").expect("write");
+        std::fs::write(&live, b"being written right now").expect("write");
+        // Backdated past the age gate. The gate is what tells the two apart —
+        // the names are random by construction and carry nothing.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7_200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&debris)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("backdate");
+
+        // Through `tick`, not through `sweep_scratch_if_due`. Calling the sweep
+        // directly would pass just as well with the call removed from the tick,
+        // and the call being absent from the tick *was* the bug.
+        engine.upsert_profile(&p).expect("upsert");
+        let _ = engine.tick().await;
+
+        assert!(!debris.exists(), "an hour-old temp file is debris");
+        assert!(live.exists(), "a temp file being written is not");
     }
 
     /// `poll_interval_ms` is user-supplied and older rows predate it meaning

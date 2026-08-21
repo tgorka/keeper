@@ -63,6 +63,9 @@ export interface TextRun {
 const KEPT_ELEMENTS: Record<string, string> = {
   a: "a",
   abbr: "abbr",
+  address: "address",
+  article: "article",
+  aside: "aside",
   b: "b",
   blockquote: "blockquote",
   br: "br",
@@ -81,20 +84,29 @@ const KEPT_ELEMENTS: Record<string, string> = {
   h4: "h4",
   h5: "h5",
   h6: "h6",
+  header: "header",
+  hgroup: "hgroup",
   hr: "hr",
   i: "i",
   img: "img",
   li: "li",
+  main: "main",
   mark: "mark",
+  nav: "nav",
   ol: "ol",
   p: "p",
   pre: "pre",
   s: "s",
+  section: "section",
   small: "small",
   span: "span",
   strong: "strong",
   sub: "sub",
   sup: "sup",
+  caption: "caption",
+  col: "col",
+  colgroup: "colgroup",
+  footer: "footer",
   table: "table",
   tbody: "tbody",
   td: "td",
@@ -124,6 +136,37 @@ const KEPT_ATTRIBUTES: Record<string, readonly string[]> = {
   td: ["colspan", "rowspan"],
   th: ["colspan", "rowspan", "scope"],
 };
+
+/**
+ * A stylesheet with every request taken out of it.
+ *
+ * The document's own CSS is what makes it look like itself, and dropping it was
+ * why a deck rendered as a column of grey prose. Keeping it costs one thing:
+ * CSS can fetch. `url(...)` in a `background`, a `src` in an `@font-face`, an
+ * `@import` — each is a request the moment the rule applies, and NFR-11 says a
+ * document a person opens must not be able to report that they opened it.
+ *
+ * So: every `@import` goes, and every `url(...)` that is not already a `data:`
+ * URI is replaced by an empty one. A `data:` URI is bytes that were in the file
+ * already and asks nothing of the network, which is exactly the test.
+ *
+ * A regular expression over CSS is not a parser and this does not pretend to be
+ * one. It is deliberately over-eager: the failure it can produce is a rule that
+ * does not apply, and the failure it must not produce is a request. Everything
+ * matching `url(` up to its `)` is rewritten whatever it looked like.
+ */
+export function safeCss(text: string): string {
+  return (
+    text
+      // `@import "x";` and `@import url(x);` alike — the whole statement, to the
+      // semicolon or the block that follows it.
+      .replace(/@import[^;{]*(;|(?=\{))/gi, "")
+      // Anything that would be fetched. `data:` survives; nothing else does.
+      .replace(/url\(\s*(['"]?)([^)]*?)\1\s*\)/gi, (whole, _quote, target: string) =>
+        /^data:/i.test(target.trim()) ? whole : 'url("data:,")',
+      )
+  );
+}
 
 /** A URL this app is willing to put in front of a reader as a link. Never a
  *  request: an anchor is not followed until somebody clicks it, and the app's
@@ -194,6 +237,10 @@ export interface BuiltHtml {
   readonly node: DocumentFragment;
   /** One entry per editable text node, in the order they were created. */
   readonly runs: TextRun[];
+  /** The document's own stylesheets, with every request filtered out of them.
+   *  Mounted by the caller into the same shadow root as {@link node}, which is
+   *  what keeps them off the application around it. */
+  readonly styles: readonly string[];
 }
 
 /**
@@ -207,6 +254,7 @@ export function buildHtmlView(source: string): BuiltHtml {
   const scanned = scanTextRuns(source);
   const fragment = document.createDocumentFragment();
   const runs: TextRun[] = [];
+  const styles: string[] = [];
   let nextRun = 0;
 
   const walk = (from: Node, into: Node): void => {
@@ -231,6 +279,14 @@ export function buildHtmlView(source: string): BuiltHtml {
         continue;
       }
       const tag = child.tagName.toLowerCase();
+      if (tag === "style") {
+        // Kept, filtered, and carried out separately rather than appended here:
+        // it belongs to the whole view, and a `<style>` sitting between two
+        // paragraphs in the built tree would be a text node in the run order
+        // that the source scanner knows nothing about.
+        styles.push(safeCss(child.textContent ?? ""));
+        continue;
+      }
       if (DROPPED_WHOLE.has(tag)) {
         continue;
       }
@@ -242,6 +298,21 @@ export function buildHtmlView(source: string): BuiltHtml {
         continue;
       }
       const element = document.createElement(kept);
+      // `class` and `style` on every element, not per tag. They carry no
+      // behaviour and they are most of what a document looks like — dropping
+      // them is what turned a laid-out deck into a column of grey prose. They
+      // are safe here for the reason the stylesheet is: this subtree lives in a
+      // shadow root, so a rule in it cannot reach the application around it.
+      // The inline one still goes through the request filter, because a `style`
+      // attribute can fetch exactly like a rule can.
+      const classes = child.getAttribute("class");
+      if (classes !== null) {
+        element.setAttribute("class", classes);
+      }
+      const inline = child.getAttribute("style");
+      if (inline !== null) {
+        element.setAttribute("style", safeCss(inline));
+      }
       for (const name of KEPT_ATTRIBUTES[tag] ?? []) {
         const value = child.getAttribute(name);
         if (value === null) {
@@ -274,8 +345,13 @@ export function buildHtmlView(source: string): BuiltHtml {
     }
   };
 
+  // The head first, and only for its stylesheets: a document keeps its rules
+  // there and the walk below has always started at the body.
+  for (const sheet of Array.from(parsed.head.querySelectorAll("style"))) {
+    styles.push(safeCss(sheet.textContent ?? ""));
+  }
   walk(parsed.body, fragment);
-  return { node: fragment, runs };
+  return { node: fragment, runs, styles };
 }
 
 /** Marks a span the reader may type into, and indexes it into `runs`. */

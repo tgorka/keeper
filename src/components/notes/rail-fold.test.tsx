@@ -80,6 +80,29 @@ function section(name: string): HTMLElement {
   return screen.getByRole("region", { name });
 }
 
+/**
+ * A drift guard, and the measurement it stands in for.
+ *
+ * jsdom lays out no flexbox, so nothing here can see two captions on top of
+ * each other. Measured in a browser against the built stylesheet, in a rail
+ * 150px tall: with `min-h-0` the Tags section was laid out **4px** high while
+ * the header inside it stayed 20px, so the header hung 20px past the section
+ * and painted over the Files caption below. Without it the section's floor is
+ * its own min-content height — 100px — and the captions are 76px apart.
+ *
+ * A section may shrink to its caption. It may not shrink past it.
+ */
+describe("a rail section never shrinks below its own caption", () => {
+  it("gives Tags and Files a height floor of their contents, not of zero", async () => {
+    renderRail();
+    await waitFor(() => expect(section("Tags")).toBeInTheDocument());
+
+    for (const name of ["Tags", "Files"]) {
+      expect(section(name).className).not.toContain("min-h-0");
+    }
+  });
+});
+
 beforeEach(() => {
   mockSpaces.mockReset().mockResolvedValue(SPACES);
   mockRestore.mockReset().mockResolvedValue(0);

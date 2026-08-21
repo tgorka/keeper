@@ -55,7 +55,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesVaultSetActive: vi.fn(async () => {}),
 }));
 
-import { PROPERTIES_LABEL } from "@/components/notes/properties-panel";
+import { ATTACHMENTS_LABEL } from "@/components/notes/attachments-panel";
 import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { activePanel, panelsStore, resetPanelsStoreForTest } from "@/lib/stores/panels";
@@ -230,10 +230,11 @@ async function pressShowInFiles(): Promise<void> {
  */
 async function showInFilesIsNotOffered(): Promise<void> {
   const menu = await openNoteActions();
-  // `Properties` is a `menuitemcheckbox` since Story 49 — it opens a panel and
-  // says so — but it is still the unconditional sibling this proves the menu by.
+  // Attachments is the unconditional sibling this proves the menu by. It used to
+  // be Properties, until Properties became a leading control that never enters
+  // this menu — a witness that is sometimes absent proves nothing.
   expect(
-    within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }),
+    within(menu).getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }),
   ).toBeInTheDocument();
   expect(within(menu).queryByRole("menuitem", { name: SHOW_IN_FILES_LABEL })).toBeNull();
 }

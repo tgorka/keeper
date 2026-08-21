@@ -321,6 +321,17 @@ function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactE
   // Only the parts that are not zero: "0 B of scratch" is a fact nobody needs,
   // and a row of zeroes teaches a reader to stop reading the line.
   const parts = [
+    // What the folder tracks, at full size, whether or not the bytes are here.
+    // Worked out from the LFS pointers rather than asked of the server, because
+    // the git protocol has no question that means "how big are you" — and a
+    // number that only appeared for one host would be worse than none.
+    //
+    // Suppressed when it matches what is on disk, which is the ordinary case for
+    // a folder with no large files: saying the same figure twice in one sentence
+    // reads as a bug in the sentence.
+    footprint.content > 0 && footprint.content !== footprint.onDisk
+      ? `${footprint.contentLabel} of content`
+      : null,
     footprint.reclaimable > 0 ? `${footprint.reclaimableLabel} the server already has` : null,
     footprint.scratch > 0 ? `${footprint.scratchLabel} scratch` : null,
   ].filter((part): part is string => part !== null);

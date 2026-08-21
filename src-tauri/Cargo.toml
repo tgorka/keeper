@@ -112,6 +112,11 @@ security-framework = "3"
 # NSError result, NSString path, NSNumber value, NSFileManager). MIT — passes the cargo-deny
 # license firewall.
 objc2 = "0.6"
+# The webview behind a Tauri window, for turning a rendered page into a PDF
+# without a print dialog. Already in the tree — wry depends on it — so this is a
+# direct name for a crate that was going to be compiled either way.
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKPDFConfiguration"] }
+block2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSURL",
     "NSError",

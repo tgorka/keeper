@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- The document being turned into a PDF, and nothing else (Story 56).
+         Deliberately barer than capture.html: no chrome, no theme bootstrap, no
+         application shell. Whatever is on this page is what the PDF is, so
+         anything keeper would draw around a document would be printed as part
+         of it. -->
+    <title>keeper — printing</title>
+    <style>
+      /* Paper, not the app's surface. The window is off-screen and its only
+         reader is a renderer, so the colours here are the ones that belong in a
+         file somebody opens later — never the viewer's theme. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #fff;
+        color: #000;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/print-main.tsx"></script>
+  </body>
+</html>
