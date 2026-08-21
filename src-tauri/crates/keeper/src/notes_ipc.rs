@@ -771,12 +771,90 @@ struct SpaceLens {
     name: String,
 }
 
+/// The reserved id of the one space that has no note behind it.
+///
+/// Every other space in the rail is a markdown file somebody wrote. This one is
+/// composed on demand from all the others, so it has no path, no frontmatter and
+/// nothing to edit or delete — the rail hides those controls for exactly this id.
+/// The colon keeps it out of the id space a note can occupy.
+pub const UNCATEGORIZED_SPACE_ID: &str = "keeper:uncategorized";
+
+/// The query that selects the notes no space claims.
+///
+/// It is the negation of every space's query, joined by the implicit AND:
+/// `-(tag:inbox) -(path:journal/**) …`. The point of composing it in the query
+/// language rather than evaluating membership separately is that there is then
+/// only one engine: whatever a space means today, "in no space" means exactly
+/// its complement, including the parts of the DSL this function has never heard
+/// of.
+///
+/// Two kinds of space are skipped, and skipping them is what makes the answer
+/// right rather than merely defensible:
+///
+/// * one whose query does not parse — it selects nothing, so it claims nothing,
+///   so subtracting it would subtract nothing while risking a composed query
+///   that does not parse either;
+/// * one whose query nests so deeply that wrapping it in one more bracket would
+///   pass [`query::MAX_DEPTH`]. Dropping it makes this space show a few notes it
+///   might not have; keeping it would make the whole row fail to parse and show
+///   none. A row that is slightly too generous still answers the question.
+///
+/// An empty vault, or one with no spaces at all, composes to the empty string —
+/// which the parser reads as "everything", and everything is the correct answer
+/// when nothing has been claimed.
+fn uncategorized_query(vault: &Vault, snapshot: &IndexSnapshot) -> String {
+    compose_uncategorized(
+        snapshot
+            .entries()
+            .iter()
+            .filter(|e| has_flag(e, "space"))
+            .map(|entry| {
+                let source = notes_vault::read_note(vault, &entry.path).unwrap_or_default();
+                space_def(entry, &source).query
+            }),
+    )
+}
+
+/// The composition on its own, away from the vault it usually reads from.
+///
+/// Split out because this is where every decision lives — which spaces count,
+/// how they are joined, what an empty list means — and because a function that
+/// needs an index snapshot to be asked one question is a function nobody tests.
+fn compose_uncategorized(queries: impl Iterator<Item = String>) -> String {
+    queries
+        .filter_map(|q| {
+            let wrapped = format!("-({q})");
+            (query::parse(&q).is_ok() && query::parse(&wrapped).is_ok()).then_some(wrapped)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Read one space's whole lens off its note.
 fn space_lens(
     vault: &Vault,
     snapshot: &IndexSnapshot,
     space_id: &str,
 ) -> Result<SpaceLens, IpcError> {
+    if space_id == UNCATEGORIZED_SPACE_ID {
+        let composed = uncategorized_query(vault, snapshot);
+        // Composed from queries that were each parsed a moment ago, so a failure
+        // here is a bug in the composition and not in anybody's file. Reported
+        // as a query error rather than unwrapped, because a panic in the note
+        // list is a worse answer than a sentence.
+        let parsed = query::parse(&composed).map_err(|error| {
+            notes_error(NotesError::Query {
+                message: error.message,
+                token_index: error.token_index,
+            })
+        })?;
+        return Ok(SpaceLens {
+            query: parsed,
+            ordering: sort::read("").sort,
+            limit: None,
+            name: "Uncategorized".to_owned(),
+        });
+    }
     let entry = snapshot
         .by_id(space_id)
         .ok_or_else(|| notes_error(NotesError::NotFound(space_id.to_owned())))?;
@@ -1322,6 +1400,29 @@ pub async fn notes_spaces(vault_id: String) -> Result<Vec<NoteSpaceVm>, IpcError
     // it sorted by before Story 44.4, so a vault nobody has positioned does not
     // move (FR-157).
     spaces.sort_by(|a, b| sort::rail_order((a.order, a.name.as_str()), (b.order, b.name.as_str())));
+    // Composed, not read: the one row in this list with no file behind it.
+    //
+    // It goes last rather than into the sort, and that is deliberate. Its order
+    // is not a position somebody chose and it must not compete with the ones
+    // that are — a person who floats a space to the top of the rail has said
+    // something, and a synthetic row outranking them would be keeper arguing.
+    // The foot of the list is also where it reads best: everything above is a
+    // place notes were put, and this is what is left.
+    spaces.push(NoteSpaceVm {
+        id: UNCATEGORIZED_SPACE_ID.to_owned(),
+        name: "Uncategorized".to_owned(),
+        query: uncategorized_query(&vault, &snapshot),
+        sort_effective: sort::read("").sort.canonical(),
+        sort: String::new(),
+        limit: 0,
+        icon: Some("shapes".to_owned()),
+        default_key: None,
+        template: None,
+        folder: None,
+        warnings: Vec::new(),
+        order: 0.0,
+        error: None,
+    });
     Ok(spaces)
 }
 
@@ -5633,5 +5734,52 @@ mod tests {
         assert!(state.is_dirty());
         state.mine = Some("hello world".to_owned());
         assert!(state.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod uncategorized_tests {
+    use super::compose_uncategorized;
+
+    fn compose(queries: &[&str]) -> String {
+        compose_uncategorized(queries.iter().map(|q| (*q).to_owned()))
+    }
+
+    /// A vault where nothing has been claimed: everything is unclaimed. The
+    /// parser reads the empty string as "everything", which is the answer.
+    #[test]
+    fn no_spaces_means_every_note_is_uncategorized() {
+        assert_eq!(compose(&[]), "");
+    }
+
+    /// The whole idea in one line: the complement of the rows above it, spelled
+    /// in the same language those rows are spelled in.
+    #[test]
+    fn every_space_becomes_one_negated_group() {
+        assert_eq!(
+            compose(&["tag:inbox", "path:journal/**"]),
+            "-(tag:inbox) -(path:journal/**)"
+        );
+    }
+
+    /// A space whose query does not parse selects nothing, so it claims nothing,
+    /// so subtracting it would subtract nothing — and would risk composing a
+    /// query that does not parse either, which would take the whole row down
+    /// with it.
+    #[test]
+    fn a_space_that_does_not_parse_claims_nothing_and_is_skipped() {
+        assert_eq!(
+            compose(&["tag:inbox", "tag:(", "is:pinned"]),
+            "-(tag:inbox) -(is:pinned)"
+        );
+    }
+
+    /// Wrapping costs one level of nesting, so a query already at the limit
+    /// cannot be wrapped. Dropping it makes this row a little too generous;
+    /// keeping it would make the row fail to parse and show nothing at all.
+    #[test]
+    fn a_query_too_deep_to_wrap_is_dropped_rather_than_breaking_the_row() {
+        let deep = format!("{}is:pinned{}", "(".repeat(64), ")".repeat(64));
+        assert_eq!(compose(&["tag:inbox", &deep]), "-(tag:inbox)");
     }
 }
