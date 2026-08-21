@@ -530,7 +530,19 @@ const VERIFY_NEEDED_WORD = "Verification needed";
 const ROW_MENU_QUIET =
   "pointer-events-none opacity-0 transition-opacity group-hover/account-row:pointer-events-auto group-hover/account-row:opacity-100 group-focus-within/account-row:pointer-events-auto group-focus-within/account-row:opacity-100 aria-expanded:pointer-events-auto aria-expanded:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100";
 
-function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
+function AccountRowMenu({
+  account,
+  collapsed,
+  children,
+}: {
+  account: AccountVm;
+  collapsed: boolean;
+  /** The row's own contents, when the ROW is the trigger.
+   *
+   * Absent on the folded rail, where the avatar is already a button for the
+   * filter and the menu keeps its own small trigger in the free corner. */
+  children?: React.ReactNode;
+}) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
   // single dialog instance is mounted once in {@link AccountFooter}.
@@ -549,6 +561,33 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
   const menuLabel = showVerifyBadge
     ? `Account menu for ${userId}, ${VERIFY_NEEDED_WORD}`
     : `Account menu for ${userId}`;
+
+  const filterAccountId = useAccountsStore((state) => state.filterAccountId);
+  const toggleFilter = useAccountsStore((state) => state.toggleFilter);
+  const filtered = filterAccountId === account.accountId;
+  const filterLabel = filtered ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
+
+  // The ROW is the trigger when it hands us its contents.
+  //
+  // It used to be a three-dot button in a reserved gutter beside a row that did
+  // something else entirely — toggled the inbox filter. Two controls, one of
+  // them 24px wide, for one account. The row now opens everything the account
+  // can do, and the filter is the first of those things rather than a hidden
+  // second meaning of clicking the name.
+  const rowTrigger = children !== undefined && (
+    <DropdownMenuTrigger asChild>
+      <button
+        type="button"
+        aria-label={menuLabel}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left",
+          FOCUS_RING,
+        )}
+      >
+        {children}
+      </button>
+    </DropdownMenuTrigger>
+  );
 
   const trigger = (
     <DropdownMenuTrigger asChild>
@@ -595,9 +634,21 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
             <TooltipContent side="right">{menuLabel}</TooltipContent>
           </Tooltip>
         ) : (
-          trigger
+          // The row when it gave us one, and the old small trigger only when it
+          // did not — so an expanded footer has exactly one control per account.
+          (rowTrigger ?? trigger)
         )}
         <DropdownMenuContent align="end" side="right">
+          {/* First, because it is the thing the row itself used to do and the
+              one action here that is about the inbox rather than the account.
+              Its checked state is what the row's `aria-pressed` used to carry. */}
+          <DropdownMenuCheckboxItem
+            checked={filtered}
+            onCheckedChange={() => toggleFilter(account.accountId)}
+          >
+            {filterLabel}
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem
             // Named outright rather than left to the contents: a menu item's
             // name is concatenated from its children with each text node
@@ -675,24 +726,17 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
     );
   }
 
-  const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
   return (
     <div
       className={cn(
-        "group/account-row flex shrink-0 items-center gap-2 rounded-md pr-1",
+        // No `pr-1`: it reserved the gutter the three-dot trigger sat in, and
+        // with the row itself opening the menu that gutter is width the
+        // account's own name can have back.
+        "group/account-row flex shrink-0 items-center gap-2 rounded-md",
         active && "bg-accent",
       )}
     >
-      <button
-        type="button"
-        aria-label={filterLabel}
-        aria-pressed={active}
-        onClick={() => toggleFilter(account.accountId)}
-        className={cn(
-          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left",
-          FOCUS_RING,
-        )}
-      >
+      <AccountRowMenu account={account} collapsed={collapsed}>
         <AccountAvatar account={account} />
         <span
           aria-hidden="true"
@@ -708,8 +752,7 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
           </span>
         </span>
         <SyncGlyph status={status} />
-      </button>
-      <AccountRowMenu account={account} collapsed={collapsed} />
+      </AccountRowMenu>
     </div>
   );
 }
