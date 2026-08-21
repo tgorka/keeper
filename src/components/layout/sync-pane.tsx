@@ -118,6 +118,7 @@ import type {
   CopyJobState,
   CopyJobVm,
   SyncActivityVm,
+  SyncFootprintVm,
   SyncOutcomeVm,
   SyncParkedVm,
   SyncPendingVm,
@@ -125,6 +126,7 @@ import type {
   SyncProfileVm,
   SyncStatusVm,
 } from "@/lib/ipc/client";
+import { syncFootprint } from "@/lib/ipc/client";
 import {
   type CopyGroup,
   cancelCopyJob,
@@ -258,6 +260,79 @@ export const SYNC_FOLD_LESS_LABEL = "Show fewer";
  * two-row Problems list have nothing to say to each other about how much of
  * themselves the user wants to see.
  */
+/** Test id for the footprint line. */
+export const SYNC_FOOTPRINT_TESTID = "sync-folder-footprint";
+
+/**
+ * What this folder costs on disk, and how much of that is a second copy.
+ *
+ * # The question it answers
+ *
+ * "It is 220 GB here and less on the server." Both true: a synced folder holds
+ * the working tree *and* a local LFS cache of the same content, so a folder of
+ * large files is close to twice its own size by design. Without this line the
+ * difference reads as a leak, and somebody goes looking for one.
+ *
+ * # Why no server figure sits beside it
+ *
+ * No generic git request asks a remote how large it is. A host's own API can,
+ * and keeper syncs to plain git — a number that appeared for one host and not
+ * another would be worse than none. What is here instead is the half that
+ * explains the gap without asking anyone: the bytes held locally that the
+ * remote already has.
+ *
+ * # Why it is asked for rather than polled
+ *
+ * It walks a tree that may live on a slow external volume: cheap enough to ask
+ * for while a card is on screen, far too expensive to repeat on the status
+ * poll, which runs when nobody is looking at Sync at all.
+ */
+function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactElement | null {
+  const [footprint, setFootprint] = useState<SyncFootprintVm | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    // The call is INSIDE the try, not merely awaited in it. Reaching for the
+    // command can throw before any promise exists — a module that failed to
+    // resolve fails at the property access — and a `.catch()` chained onto a
+    // call that never returned has nothing to attach to. That is not
+    // hypothetical: the same shape threw out of a note decoration earlier in
+    // this epic and took the render with it.
+    void (async () => {
+      try {
+        const measured = await syncFootprint(profileId);
+        if (live) {
+          setFootprint(measured);
+        }
+      } catch {
+        // A folder on an unmounted volume cannot be measured, and saying so
+        // here would be a second error message about a fact the card's status
+        // line already carries.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [profileId]);
+
+  if (footprint === null) {
+    return null;
+  }
+  // Only the parts that are not zero: "0 B of scratch" is a fact nobody needs,
+  // and a row of zeroes teaches a reader to stop reading the line.
+  const parts = [
+    footprint.reclaimable > 0 ? `${footprint.reclaimableLabel} the server already has` : null,
+    footprint.scratch > 0 ? `${footprint.scratchLabel} scratch` : null,
+  ].filter((part): part is string => part !== null);
+
+  return (
+    <p data-testid={SYNC_FOOTPRINT_TESTID} className="text-muted-foreground text-xs">
+      {footprint.onDiskLabel} on disk
+      {parts.length > 0 ? ` — ${parts.join(", ")}` : null}
+    </p>
+  );
+}
+
 function useFold<T>(rows: readonly T[] | null): {
   visible: readonly T[];
   hidden: number;
@@ -1049,6 +1124,7 @@ function SyncProfileCard({
               <span aria-hidden="true">·</span>
               <span className="shrink-0">{syncRemoteHost(profile.remoteUrl)}</span>
             </p>
+            <SyncFolderFootprint profileId={profile.id} />
           </div>
           {/* `ml-auto` and not merely `justify-end`: the row wraps, and a
               wrapped line is laid out on its own, so the actions would land at

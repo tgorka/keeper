@@ -242,6 +242,7 @@ export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
 export type { SyncGitState } from "./gen/SyncGitState";
 export type { SyncGitVm } from "./gen/SyncGitVm";
 export type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
@@ -386,6 +387,7 @@ import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+import type { SyncFootprintVm } from "./gen/SyncFootprintVm";
 import type { SyncGitVm } from "./gen/SyncGitVm";
 import type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
@@ -3125,6 +3127,26 @@ export async function syncVerify(id: string): Promise<string[]> {
  */
 export async function syncRescan(id: string): Promise<void> {
   await invoke<void>("sync_rescan", { id });
+}
+
+/**
+ * What one synced folder costs on this disk, decomposed (Story 55.9).
+ *
+ * **There is no server total in the answer**, and the absence is deliberate: no
+ * generic git request asks a remote how large it is, and a figure that appeared
+ * only for hosts with their own API would be worse than none. What comes back
+ * is the half that explains the gap a person actually notices — the bytes held
+ * here that the remote already has, and the scratch an interrupted run left.
+ *
+ * Walks a tree that may live on a slow external volume, so it is asked for when
+ * a card is on screen rather than folded into the status poll.
+ *
+ * Rejects with: `syncUnavailable`, `internal` — including for a folder whose
+ * volume is not mounted, which cannot be measured and whose absence the card's
+ * status line already reports.
+ */
+export async function syncFootprint(id: string): Promise<SyncFootprintVm> {
+  return await invoke<SyncFootprintVm>("sync_footprint", { id });
 }
 
 /**

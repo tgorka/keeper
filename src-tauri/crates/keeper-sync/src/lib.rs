@@ -47,6 +47,7 @@ pub mod exclude;
 pub mod export;
 pub mod file_serve;
 pub mod files_write;
+pub mod footprint;
 pub mod git;
 pub mod http;
 pub mod lfs;

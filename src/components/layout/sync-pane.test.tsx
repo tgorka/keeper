@@ -2,6 +2,19 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  // The footprint the card asks for. A mock that does not know a command the
+  // component calls is a mock that lies about the surface under test — and this
+  // one threw at the property access, which is how it was noticed.
+  syncFootprint: vi.fn(async () => ({
+    onDisk: 1024,
+    lfsCache: 512,
+    reclaimable: 256,
+    scratch: 0,
+    onDiskLabel: "1 KB",
+    lfsCacheLabel: "512 B",
+    reclaimableLabel: "256 B",
+    scratchLabel: "0 B",
+  })),
   // The shared profile/status mirror.
   syncProfiles: vi.fn(),
   syncStatuses: vi.fn(),
@@ -67,6 +80,7 @@ import {
   SYNC_DELIVERY_DETAIL_LABEL,
   SYNC_DELIVERY_RETRYING_SENTENCE,
   SYNC_DELIVERY_STATES,
+  SYNC_FOOTPRINT_TESTID,
   SYNC_PANE_EMPTY_SENTENCE,
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
@@ -384,6 +398,32 @@ afterEach(() => {
 });
 
 describe("SyncPane profile header", () => {
+  /**
+   * The line that answers "why is it 220 GB here and less on the server".
+   *
+   * A synced folder holds the working tree AND a local LFS cache of the same
+   * content, so a folder of large files is close to twice its own size by
+   * design — and without this line that difference reads as a leak.
+   */
+  it("says what the folder costs, and how much of it the server already has", async () => {
+    render(<SyncPane />);
+
+    const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
+    expect(line).toHaveTextContent("1 KB on disk");
+    expect(line).toHaveTextContent("256 B the server already has");
+  });
+
+  /**
+   * A zero is not a fact anybody needs. A row of "0 B scratch" teaches a reader
+   * to stop reading the line, which costs more than the line gives.
+   */
+  it("leaves out the parts that are zero", async () => {
+    render(<SyncPane />);
+
+    const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
+    expect(line.textContent ?? "").not.toContain("scratch");
+  });
+
   it("renders the Rust-composed line verbatim beside a state word, path and host", async () => {
     await renderPane();
 

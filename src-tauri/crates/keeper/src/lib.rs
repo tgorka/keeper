@@ -909,6 +909,7 @@ pub fn run() {
         sync_ipc::sync_folder_now,
         sync_ipc::sync_verify,
         sync_ipc::sync_rescan,
+        sync_ipc::sync_footprint,
         sync_ipc::sync_open_path,
         // The Files tab's listing command and its actions (Story 43.8; the text
         // read added by Story 45.6). Desktop-only with the rest of sync: a build

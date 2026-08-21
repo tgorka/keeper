@@ -211,6 +211,86 @@ impl From<&SyncProfile> for SyncProfileVm {
     }
 }
 
+/// What a synced folder costs on this disk, decomposed (Story 55.9).
+///
+/// **There is no server total here, and its absence is deliberate.** No generic
+/// git request asks a remote how large it is; a host's own API can answer, and
+/// keeper syncs to plain git, so a figure that appeared for one host and not
+/// another would be worse than none. What is knowable without asking anyone is
+/// the half that explains the gap a person actually notices — the bytes held
+/// here that the remote already has.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFootprintVm {
+    /// Everything under the folder, working tree and `.git` together.
+    ///
+    /// `number` rather than ts-rs's `bigint` for `u64`, the same reading every
+    /// other byte count in this file takes: JSON loses precision above 2^53, and
+    /// 2^53 bytes is nine petabytes.
+    pub on_disk: u64,
+    /// The local LFS object cache — the second copy of large content. Inside
+    /// `on_disk`, never beside it.
+    pub lfs_cache: u64,
+    /// Cache the remote already holds, which keeper may release at any time.
+    /// This is the number that explains "why is it bigger here than there".
+    pub reclaimable: u64,
+    /// Transfer scratch left by interrupted runs. Swept by "Recheck all files".
+    pub scratch: u64,
+    /// The same four numbers as people read them.
+    ///
+    /// Formatted here, by the one formatter, because a second one in TypeScript
+    /// is how this row and the Files pane's size column end up disagreeing about
+    /// the same folder.
+    pub on_disk_label: String,
+    pub lfs_cache_label: String,
+    pub reclaimable_label: String,
+    pub scratch_label: String,
+}
+
+/// Measure one folder's footprint.
+///
+/// Blocking: it walks and stats a tree that may be on a slow external volume,
+/// and doing that on the async runtime would stall every other command sharing
+/// the thread — the same reason `notes_embed_paths` spawns.
+#[tauri::command]
+pub async fn sync_footprint(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SyncFootprintVm, IpcError> {
+    let engine = engine_of(&state)?;
+    // `list_profiles` because that is the accessor the engine offers; a folder
+    // that has been removed between the click and this call is a missing id,
+    // not an error worth a dialog.
+    let profile = engine
+        .list_profiles()
+        .map_err(|e| sync_ipc_error(&e))?
+        .into_iter()
+        .find(|candidate| candidate.id == id)
+        .ok_or_else(|| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!(
+                "no such sync profile: {id}"
+            )))
+        })?;
+    let root = profile.local_path.clone();
+    let measured = tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root))
+        .await
+        .map_err(|err| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
+        })?
+        .map_err(|e| sync_ipc_error(&e))?;
+    Ok(SyncFootprintVm {
+        on_disk: measured.on_disk,
+        lfs_cache: measured.lfs_cache,
+        reclaimable: measured.reclaimable,
+        scratch: measured.scratch,
+        on_disk_label: keeper_core::size::format_file_size(measured.on_disk),
+        lfs_cache_label: keeper_core::size::format_file_size(measured.lfs_cache),
+        reclaimable_label: keeper_core::size::format_file_size(measured.reclaimable),
+        scratch_label: keeper_core::size::format_file_size(measured.scratch),
+    })
+}
+
 /// What a profile is doing right now — the polled snapshot the tray reads.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
