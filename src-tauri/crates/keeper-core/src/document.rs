@@ -1756,22 +1756,27 @@ mod furniture_tests {
         }
     }
 
-    /// The deck that prompted this: a confidentiality mark and the company's
-    /// name on every slide, and about six lines of content under them. Read as
-    /// an outline, two thirds of what a reader saw was the same three words.
+    /// The shape that prompted this: a confidentiality mark and a company name
+    /// on every slide, and about six lines of content under them. Read as an
+    /// outline, two thirds of what a reader saw was the same three words.
+    ///
+    /// The lines here are stand-ins on purpose. The rule keys on repetition
+    /// across slides, not on what the repeated words say, so a real deck's
+    /// wording would add nothing to the test and would put a private document's
+    /// outline in a public repository.
     #[test]
     fn a_line_on_nearly_every_slide_is_the_masters_and_goes() {
         let mut deck = vec![
-            slide(1, &["CONFIDENTIAL", "Neuraffica", "The problem"]),
-            slide(2, &["CONFIDENTIAL", "Neuraffica", "Costs outrun gains"]),
-            slide(3, &["CONFIDENTIAL", "Neuraffica", "Power is the ceiling"]),
-            slide(4, &["CONFIDENTIAL", "Neuraffica", "The solution"]),
+            slide(1, &["CONFIDENTIAL", "Example Ltd", "First point"]),
+            slide(2, &["CONFIDENTIAL", "Example Ltd", "Second point"]),
+            slide(3, &["CONFIDENTIAL", "Example Ltd", "Third point"]),
+            slide(4, &["CONFIDENTIAL", "Example Ltd", "Fourth point"]),
             slide(5, &["Thanks"]),
         ];
         drop_furniture(&mut deck);
 
-        assert_eq!(deck[0].lines, vec!["The problem".to_owned()]);
-        assert_eq!(deck[3].lines, vec!["The solution".to_owned()]);
+        assert_eq!(deck[0].lines, vec!["First point".to_owned()]);
+        assert_eq!(deck[3].lines, vec!["Fourth point".to_owned()]);
         assert_eq!(deck[4].lines, vec!["Thanks".to_owned()]);
     }
 
