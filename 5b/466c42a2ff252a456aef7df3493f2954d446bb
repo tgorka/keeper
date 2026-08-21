@@ -1,0 +1,19 @@
+src-tauri/crates/keeper-sync/tests/lfs_roundtrip.rs
+  s_9bfe0bf28c8205::t_f251ddf208c5d2 281-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "5b466c42a2ff252a456aef7df3493f2954d446bb",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
