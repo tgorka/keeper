@@ -4370,6 +4370,21 @@ export async function notesForwardlinks(vaultId: string, noteId: string): Promis
 }
 
 /**
+ * Every value this vault already uses for one frontmatter key.
+ *
+ * For a field whose values are a convention rather than a closed set — `stage`,
+ * `status`, `location` — the vault is the vocabulary. Offering what is already
+ * in use is what stops the fourth note inventing `outreach ready` beside three
+ * that say `outreach-ready`, without keeper pretending it knows which words are
+ * allowed: the control suggests, and still accepts anything typed.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesFieldVocabulary(vaultId: string, key: string): Promise<string[]> {
+  return await invoke<string[]>("notes_field_vocabulary", { vaultId, key });
+}
+
+/**
  * A note's revision history (FR-114, AD-63), projected from the commit trailers
  * `keeper-sync` already writes. keeper keeps no parallel history store, so a
  * vault whose profile has never committed answers with an honest empty list

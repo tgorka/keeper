@@ -2065,6 +2065,37 @@ pub async fn notes_backlinks(
     Ok(rows_of(state.platform.as_ref(), &vault_id, &inbound))
 }
 
+/// Every value this vault already uses for one frontmatter key.
+///
+/// For a field whose values are a convention rather than a closed set —
+/// `stage`, `status`, `location` — the vault itself is the vocabulary. Offering
+/// what is already in use is what stops the fourth note inventing
+/// `outreach ready` beside three that say `outreach-ready`, without keeper
+/// pretending it knows which words are allowed.
+///
+/// Sorted and deduplicated, empties dropped. Capped, because this feeds a
+/// suggestion list and a list nobody can read to the end is a list that has
+/// stopped suggesting.
+#[tauri::command]
+pub async fn notes_field_vocabulary(
+    vault_id: String,
+    key: String,
+) -> Result<Vec<String>, IpcError> {
+    const LIMIT: usize = 200;
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in snapshot.entries() {
+        if let Some(value) = entry.fields.get(&key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                seen.insert(trimmed.to_owned());
+            }
+        }
+    }
+    Ok(seen.into_iter().take(LIMIT).collect())
+}
+
 /// Every note this one links to (the other direction of [`notes_backlinks`]).
 #[tauri::command]
 pub async fn notes_forwardlinks(
