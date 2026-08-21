@@ -387,17 +387,32 @@ describe("AccountFooter", () => {
     });
   });
 
-  it("renders avatar-only rows with a menu when collapsed", () => {
+  it("renders avatar-only rows, and the avatar is the menu", () => {
     accountsStore.getState().hydrateAll([alice]);
     renderFooter(true);
     expect(screen.queryByText(alice.userId)).not.toBeInTheDocument();
+
+    // One control per account, folded as well as unfolded. The avatar used to
+    // toggle the inbox filter while a separate dot in the corner opened the
+    // menu, so the same press meant different things in the two shapes and the
+    // menu sat behind a target a few pixels wide.
     expect(
-      screen.getByRole("button", { name: `Filter inbox to ${alice.userId}` }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: `Filter inbox to ${alice.userId}` }),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: `Account menu for ${alice.userId}` }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  it("still offers the filter, from the menu the avatar opens", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter(true);
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: `Account menu for ${alice.userId}` }));
+    expect(
+      await screen.findByRole("menuitemcheckbox", { name: `Filter inbox to ${alice.userId}` }),
+    ).toBeInTheDocument();
   });
 
   // ── Global Do-Not-Disturb toggle (Story 10.2) ──────────────────────────────

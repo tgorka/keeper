@@ -544,8 +544,9 @@ function AccountRowMenu({
   collapsed: boolean;
   /** The row's own contents, when the ROW is the trigger.
    *
-   * Absent on the folded rail, where the avatar is already a button for the
-   * filter and the menu keeps its own small trigger in the free corner. */
+   * Given in both shapes since the folded rail's avatar became the trigger
+   * too; the small corner dot is what remains for a caller that hands nothing
+   * down. */
   children?: React.ReactNode;
 }) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
@@ -638,8 +639,11 @@ function AccountRowMenu({
     <>
       <DropdownMenu>
         {collapsed ? (
+          // Folded, the tooltip is the only thing that says whose account this
+          // is, so it wraps whichever trigger there is — the avatar when the row
+          // handed one down, the old dot when it did not.
           <Tooltip>
-            <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+            <TooltipTrigger asChild>{rowTrigger ?? trigger}</TooltipTrigger>
             <TooltipContent side="right">{menuLabel}</TooltipContent>
           </Tooltip>
         ) : (
@@ -700,37 +704,31 @@ function AccountRowMenu({
 function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   const status = useAccountStatus(account.accountId);
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
-  const toggleFilter = useAccountsStore((s) => s.toggleFilter);
   const active = filterAccountId === account.accountId;
   const userId = account.userId;
   const homeserver = homeserverLabel(account.homeserverUrl);
 
   if (collapsed) {
-    const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
+    // The avatar IS the control, exactly as the expanded row became one in
+    // Story 49. It used to toggle the inbox filter while a separate dot in the
+    // corner opened the menu — so the folded rail and the unfolded one answered
+    // the same press differently, and the menu was behind a target a few pixels
+    // wide. The filter is the menu's first item in both shapes now.
     return (
       <div className="group/account-row relative flex shrink-0 justify-center">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label={filterLabel}
-              aria-pressed={active}
-              onClick={() => toggleFilter(account.accountId)}
-              className={cn(
-                "relative flex items-center justify-center rounded-md p-1",
-                FOCUS_RING,
-                active && "bg-accent",
-              )}
-            >
-              <AccountAvatar account={account} />
-              <span className="absolute right-0 bottom-0">
-                <SyncGlyph status={status} />
-              </span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="right">{`${userId} — ${homeserver}`}</TooltipContent>
-        </Tooltip>
-        <AccountRowMenu account={account} collapsed={collapsed} />
+        <AccountRowMenu account={account} collapsed={collapsed}>
+          <span
+            className={cn(
+              "relative flex items-center justify-center rounded-md p-1",
+              active && "bg-accent",
+            )}
+          >
+            <AccountAvatar account={account} />
+            <span className="absolute right-0 bottom-0">
+              <SyncGlyph status={status} />
+            </span>
+          </span>
+        </AccountRowMenu>
       </div>
     );
   }
