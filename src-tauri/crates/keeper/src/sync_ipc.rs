@@ -2279,43 +2279,6 @@ pub async fn sync_read_text(
         .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))
 }
 
-/// Read one file inside a synced folder as a document (Story 45.8, FR-181,
-/// FR-182, AD-65).
-///
-/// **The third reader beside `sync_read_text` and `sync_browse`, and separate
-/// for the same reason they are separate from each other.** A document is not
-/// text: it cannot be edited, its bytes never cross this boundary, and what the
-/// webview receives is a bounded projection rather than a file. Folding it into
-/// `sync_read_text` would have meant a `TextFileVm` with four document-shaped
-/// fields that are `None` for every text file, and a viewer deciding which half
-/// of one command's answer it was looking at.
-///
-/// **Containment is not restated here.** The subpath is one the listing already
-/// produced, and [`browse::resolve`] is the same function `sync_browse`,
-/// `sync_open_entry` and `sync_read_text` use. This command composes no path of
-/// its own (AD-65).
-///
-/// **Every decision is in `keeper-core`.** Which format the bytes are, every
-/// cap, every refusal sentence and the whole of the parsing is
-/// [`keeper_core::document::open_document`], which compiles and is tested on
-/// any machine. This crate does not build on Linux, so a cap written here would
-/// be one nobody could exercise until macOS (AD-55, AD-56).
-///
-/// **This does not serve the PDF's pages.** Those come from Story 45.7's
-/// `keeper-file://` protocol, Range-served straight into the webview's own PDF
-/// renderer, so a 400-page document costs one element and no marshalling. What
-/// this command adds for a PDF is the header facts — version, page count,
-/// whether it is encrypted — that the chrome around the embed shows.
-///
-/// Runs on the blocking pool: inflating a container can take hundreds of
-/// milliseconds, and stalling the async runtime would freeze every other
-/// profile's poll behind one click.
-///
-/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
-/// escapes the root, a file that is no longer on disk, an unreadable file). A
-/// file that is readable but is not a document keeper knows is NOT a rejection
-/// — it is a `DocumentVm` carrying a sentence, because the viewer draws that.
-
 /// Write `subpath`'s rendered page beside it as a PDF (Story 56, macOS).
 ///
 /// The renderer is the webview, because there is no Rust crate that lays out
@@ -2457,6 +2420,42 @@ fn uuid_like(subpath: &str) -> String {
         .collect()
 }
 
+/// Read one file inside a synced folder as a document (Story 45.8, FR-181,
+/// FR-182, AD-65).
+///
+/// **The third reader beside `sync_read_text` and `sync_browse`, and separate
+/// for the same reason they are separate from each other.** A document is not
+/// text: it cannot be edited, its bytes never cross this boundary, and what the
+/// webview receives is a bounded projection rather than a file. Folding it into
+/// `sync_read_text` would have meant a `TextFileVm` with four document-shaped
+/// fields that are `None` for every text file, and a viewer deciding which half
+/// of one command's answer it was looking at.
+///
+/// **Containment is not restated here.** The subpath is one the listing already
+/// produced, and [`browse::resolve`] is the same function `sync_browse`,
+/// `sync_open_entry` and `sync_read_text` use. This command composes no path of
+/// its own (AD-65).
+///
+/// **Every decision is in `keeper-core`.** Which format the bytes are, every
+/// cap, every refusal sentence and the whole of the parsing is
+/// [`keeper_core::document::open_document`], which compiles and is tested on
+/// any machine. This crate does not build on Linux, so a cap written here would
+/// be one nobody could exercise until macOS (AD-55, AD-56).
+///
+/// **This does not serve the PDF's pages.** Those come from Story 45.7's
+/// `keeper-file://` protocol, Range-served straight into the webview's own PDF
+/// renderer, so a 400-page document costs one element and no marshalling. What
+/// this command adds for a PDF is the header facts — version, page count,
+/// whether it is encrypted — that the chrome around the embed shows.
+///
+/// Runs on the blocking pool: inflating a container can take hundreds of
+/// milliseconds, and stalling the async runtime would freeze every other
+/// profile's poll behind one click.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an unreadable file). A
+/// file that is readable but is not a document keeper knows is NOT a rejection
+/// — it is a `DocumentVm` carrying a sentence, because the viewer draws that.
 #[tauri::command]
 pub async fn sync_read_document(
     state: tauri::State<'_, AppState>,
