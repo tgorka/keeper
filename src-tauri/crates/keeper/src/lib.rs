@@ -6,6 +6,11 @@
 #![recursion_limit = "256"]
 
 mod build_identity;
+// Desktop only: the copy engine drives `keeper_sync`, which is not a
+// dependency on iOS or Android (see this crate's Cargo.toml), and
+// `AppState.copies` is gated the same way. Its three commands already sit
+// inside the `#[cfg(desktop)]` half of the handler list.
+#[cfg(desktop)]
 mod copy_ipc;
 mod debug_log;
 #[cfg(desktop)]

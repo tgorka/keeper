@@ -278,8 +278,10 @@ fn resolved_filters(
     let resolved = text
         .split('\0')
         .collect::<Vec<_>>()
-        .chunks_exact(3)
-        .map(|triple| (triple[0].to_owned(), triple[2].to_owned()))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[path, _, attr]| (path.to_owned(), attr.to_owned()))
         .collect();
     (resolved, String::from_utf8_lossy(&out.stderr).into_owned())
 }

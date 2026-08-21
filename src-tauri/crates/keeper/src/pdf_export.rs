@@ -18,6 +18,16 @@
 //! `createPDF` captures what has been laid out. Fonts arrive late, and a sleep
 //! long enough to be safe on a slow machine is a sleep everybody else pays. The
 //! page itself says when it is done, once, and this waits for that.
+//!
+//! # What this does not do yet
+//!
+//! `createPDF` captures the document as ONE page sized to its content. A
+//! fifteen-slide deck comes out as a single very tall page rather than fifteen.
+//! It is faithful — every slide is there, in its own design — and it is not
+//! paginated. Pagination needs `WKPDFConfiguration::rect` driven once per page,
+//! or the `NSPrintOperation` path, and both need a decision about where the
+//! breaks go that the document itself does not carry. Measured on a
+//! fifteen-slide visual deck: 304 kB, PDF 1.3, one page.
 
 #![cfg(target_os = "macos")]
 
@@ -30,16 +40,6 @@ use objc2::MainThreadMarker;
 use objc2_foundation::{NSData, NSError};
 use objc2_web_kit::{WKPDFConfiguration, WKWebView};
 use tauri::WebviewWindow;
-
-/// # What this does not do yet
-///
-/// `createPDF` captures the document as ONE page sized to its content. A
-/// fifteen-slide deck comes out as a single very tall page rather than fifteen.
-/// It is faithful — every slide is there, in its own design — and it is not
-/// paginated. Pagination needs `WKPDFConfiguration::rect` driven once per page,
-/// or the `NSPrintOperation` path, and both need a decision about where the
-/// breaks go that the document itself does not carry. Measured on
-/// `2026-08-10-deck-v8-visual.html`: 304 kB, PDF 1.3, one page.
 
 /// How long the render may take before the attempt is abandoned.
 ///
