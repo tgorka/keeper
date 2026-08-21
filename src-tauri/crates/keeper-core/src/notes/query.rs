@@ -54,7 +54,7 @@ pub const MAX_TOKENS: usize = 256;
 /// The closed `is:` flag set. Closed on purpose: an unknown flag is a located
 /// parse error rather than a predicate that is silently false forever, because a
 /// space whose filter quietly stopped filtering is worse than one that refuses.
-const IS_FLAGS: [&str; 11] = [
+const IS_FLAGS: [&str; 12] = [
     "pinned",
     "archived",
     "unread",
@@ -66,6 +66,13 @@ const IS_FLAGS: [&str; 11] = [
     "recording",
     "orphan",
     "untagged",
+    // An Open Knowledge Format bundle's reserved files: `index.md`, generated
+    // from the documents around it, and `log.md`, a hand-kept ledger. Neither
+    // is a document and both are `.md` in the vault, so they list as notes and
+    // crowd out the notes somebody wrote. A flag rather than a hiding rule:
+    // `-is:generated` in a space is the vault saying so, and keeper deciding
+    // for it would be keeper hiding files it did not create.
+    "generated",
 ];
 
 /// The one `is:` flag derived from the entry rather than read out of `flags`.
@@ -1471,6 +1478,7 @@ mod tests {
 
     fn entry(path: &str) -> IndexEntry {
         IndexEntry {
+            link_attrs: Default::default(),
             id: format!("id-{path}"),
             path: path.to_owned(),
             title: path.to_owned(),

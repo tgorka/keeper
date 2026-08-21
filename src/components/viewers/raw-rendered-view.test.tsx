@@ -1609,6 +1609,59 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     expect(css).toContain("data:image/gif;base64,AAA");
   });
 
+  /**
+   * A deck's artwork travels inside the file. The one that prompted this had
+   * eight `data:` images and twenty-two inline SVGs and not a single remote
+   * reference — so the page could have been drawn exactly, and instead it was
+   * drawn with the design taken out.
+   */
+  it("draws a picture that travels inside the document", async () => {
+    const pixel = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    const { container } = page(`<p>before</p><img src="${pixel}" alt="a dot"><p>after</p>`);
+    await settle();
+
+    const image = shadow(container).querySelector("img");
+    expect(image?.getAttribute("src")).toBe(pixel);
+    expect(image?.getAttribute("alt")).toBe("a dot");
+  });
+
+  /**
+   * NFR-11 is unchanged and this is where it is tested from: a remote source is
+   * still shown as its address rather than fetched, because a document must not
+   * be able to report that somebody opened it.
+   */
+  it("still refuses to fetch a picture that lives somewhere else", async () => {
+    const { container } = page('<img src="https://elsewhere.example/pic.png" alt="">');
+    await settle();
+
+    const root = shadow(container);
+    expect(root.querySelector("img[src^='https']")).toBeNull();
+    expect(root.textContent ?? "").toContain("elsewhere.example");
+  });
+
+  it("draws inline SVG, and takes the dangerous parts out of it", async () => {
+    const { container } = page(
+      "<svg viewBox='0 0 10 10'>" +
+        "<circle cx='5' cy='5' r='4' fill='red'></circle>" +
+        "<script>window.x = 1</script>" +
+        "<image href='https://elsewhere.example/pic.png'></image>" +
+        "<foreignObject><b>html again</b></foreignObject>" +
+        "</svg>",
+    );
+    await settle();
+
+    const root = shadow(container);
+    const svg = root.querySelector("svg");
+    expect(svg?.getAttribute("viewBox")).toBe("0 0 10 10");
+    expect(svg?.querySelector("circle")?.getAttribute("fill")).toBe("red");
+    // Each of these is a different way out of a filtered subtree: a program, a
+    // request, and arbitrary HTML smuggled back in past the HTML filter.
+    expect(root.querySelector("script")).toBeNull();
+    expect(root.querySelector("image")).toBeNull();
+    expect(root.querySelector("foreignObject")).toBeNull();
+    expect(root.innerHTML).not.toContain("elsewhere.example");
+  });
+
   it("names the tab for what it shows, beside the Source that always exists", async () => {
     page();
     await settle();

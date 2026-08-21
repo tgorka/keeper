@@ -171,6 +171,7 @@ pub fn as_index_entry(entry: &PoolEntry, mtime_ns: i128) -> IndexEntry {
         tags: entry.tags.clone(),
         fields: entry.fields.clone(),
         links: Vec::new(),
+        link_attrs: std::collections::BTreeMap::new(),
         flags,
         // Empty rather than a body excerpt, and this is the one place the two
         // projections differ on purpose: `notes_vault` builds a snippet because

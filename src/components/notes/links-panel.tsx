@@ -80,6 +80,17 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
             onClick={() => onOpen(row.id)}
           >
             <span>{row.title}</span>
+            {/* The author's own word for the relationship, when they wrote one:
+                `[Belief](belief.md){reference="supports"}` makes this row say
+                `supports`. Before the title's snippet and in a chip, because it
+                is the thing this list is FOR — "what links here" is a weaker
+                question than "what supports this", and the answer should not be
+                buried in a line of body text. */}
+            {row.predicate === null ? null : (
+              <span className="ml-2 rounded bg-muted px-1 py-0.5 text-meta text-muted-foreground">
+                {row.predicate}
+              </span>
+            )}
             <span className="ml-2 text-muted-foreground">{row.snippet}</span>
           </button>
         </li>

@@ -68,6 +68,7 @@ import {
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
   filesRowActionsBudget,
+  filesRowIndent,
   filesSelectionSentence,
 } from "@/components/layout/files-pane";
 import {
@@ -746,10 +747,15 @@ describe("FilesPane keyboard navigation", () => {
     mountVault();
     (await screen.findByRole("treeitem", { name: "Vault" })).focus();
 
+    // `waitFor`, not a bare read. Moving focus goes through a React commit and
+    // a `focus()` call, and under a full-suite load those land a tick after the
+    // key does — this test passed alone and failed in the run, which is the
+    // signature of reading a value before it arrives rather than of a wrong
+    // value. The claim is unchanged: focus must end on this row.
     await press("End");
-    expect(focusedName()).toBe("Field");
+    await waitFor(() => expect(focusedName()).toBe("Field"));
     await press("Home");
-    expect(focusedName()).toBe("Vault");
+    await waitFor(() => expect(focusedName()).toBe("Vault"));
   });
 
   it("expands a closed folder with Right, then descends into it with Right again", async () => {
@@ -1004,11 +1010,18 @@ describe("FilesPane — a row's verbs against the column's width", () => {
     // Each promoted control costs 32px and the 4px gap after it, so the budget
     // buys one at 66px, two at 106 and three at 226. Boundaries either side, so
     // the arithmetic is pinned rather than sampled.
-    expect(filesRowActionsBudget({ column: 320, level: FILE_LEVEL })).toBe(66);
-    expect(filesRowActionsBudget({ column: 360, level: FILE_LEVEL })).toBe(106);
-    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL })).toBe(226);
+    expect(filesRowActionsBudget({ column: 320, level: FILE_LEVEL })).toBe(82);
+    expect(filesRowActionsBudget({ column: 360, level: FILE_LEVEL })).toBe(122);
+    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL })).toBe(242);
     // And one level deeper is 16px narrower, all the way down.
-    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL + 1 })).toBe(210);
+    expect(filesRowActionsBudget({ column: 480, level: FILE_LEVEL + 1 })).toBe(226);
+
+    // 16px more than before at every depth, because the first nesting level is
+    // free now: a synced folder and the folders directly inside it share an
+    // inset. That level said "these are inside the thing above" about the only
+    // place they could be, and charged every name in the tree to say it.
+    expect(filesRowIndent(1)).toBe(filesRowIndent(2));
+    expect(filesRowIndent(3) - filesRowIndent(2)).toBe(16);
   });
 
   it("never returns less than nothing, however narrow or nonsense the column", () => {
@@ -1033,8 +1046,12 @@ describe("FilesPane — a row's verbs against the column's width", () => {
     expect(verbs(await rowAt(220))).toEqual([]);
   });
 
-  it("shows a 320px row its first verb and no more", async () => {
-    expect(verbs(await rowAt(320))).toEqual([FILES_OPEN_LABEL]);
+  // Two at 320px, not one. The 16px the first nesting level used to spend on
+  // saying "inside the folder above" is name width now, and a row that is 16px
+  // wider buys one more verb at exactly this size. The pane got better at the
+  // width where it was worst, which is where it matters.
+  it("shows a 320px row two verbs, one more than it could afford before", async () => {
+    expect(verbs(await rowAt(320))).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL]);
   });
 
   it("shows a 480px row all three, in the order the pane declared them", async () => {

@@ -702,7 +702,12 @@ const realignTables = EditorState.transactionFilter.of((transaction) => {
 
 const tableTheme = EditorView.baseTheme({
   [`.${TABLE_BLOCK_CLASS}`]: {
-    margin: "0.4em 0",
+    // `1em` above and below, not `0.4em`. A table is a block somebody stops at,
+    // and at 0.4em it sat as close to the paragraph above it as two lines of
+    // that paragraph sat to each other — so the eye read it as part of the
+    // sentence rather than as a thing of its own. The cell padding inside is
+    // 0.15em, which is why the outside has to do the separating.
+    margin: "1em 0",
     // The block never exceeds the pane, whatever is inside it. Belt to the
     // scroll box's braces: a block widget's parent is the wrapped content box,
     // so this is already its width — and it stops being so the day this widget
@@ -756,7 +761,11 @@ const tableTheme = EditorView.baseTheme({
   [`.${TABLE_CELL_CLASS}`]: {
     border: "1px solid currentColor",
     borderColor: "color-mix(in srgb, currentColor 25%, transparent)",
-    padding: "0.15em 0.5em",
+    // Room to read a value in. 0.15em vertical was one hairline of space above
+    // the text and one below it, which is legible and cramped — a table is
+    // scanned down a column, and a row that touches its neighbours is a row the
+    // eye has to separate for itself.
+    padding: "0.35em 0.6em",
     verticalAlign: "top",
   },
   [`.${TABLE_BLOCK_CLASS} th.${TABLE_CELL_CLASS}`]: {

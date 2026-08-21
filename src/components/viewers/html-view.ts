@@ -127,6 +127,134 @@ const KEPT_ELEMENTS: Record<string, string> = {
  */
 const DROPPED_WHOLE = new Set(["script", "style", "template", "iframe", "object", "embed"]);
 
+/**
+ * The SVG elements this view will draw, and the reason SVG gets its own list.
+ *
+ * A deck's artwork is usually inline SVG — the file that prompted this had
+ * twenty-two of them — and dropping the lot turned a designed page into a page
+ * with the design taken out. But SVG is not decoration with a different
+ * spelling: it can carry `<script>`, it can pull a document into itself with
+ * `<use href>` or `<image href>`, and `<foreignObject>` puts arbitrary HTML back
+ * inside a subtree that has already been filtered.
+ *
+ * So the shapes are kept and nothing that can fetch or execute is. An element
+ * nobody has thought about is dropped whole rather than unwrapped, which is the
+ * opposite of the HTML rule above and deliberate: unwrapping an unknown HTML
+ * element leaves the text somebody wrote, while unwrapping an unknown SVG
+ * element leaves geometry with no meaning.
+ */
+const KEPT_SVG: ReadonlySet<string> = new Set([
+  "svg",
+  "g",
+  "path",
+  "circle",
+  "ellipse",
+  "line",
+  "polyline",
+  "polygon",
+  "rect",
+  "text",
+  "tspan",
+  "title",
+  "desc",
+  "defs",
+  "linearGradient",
+  "radialGradient",
+  "stop",
+  "clipPath",
+  "mask",
+]);
+
+/**
+ * SVG attributes kept: geometry, painting and the two that name a shape for a
+ * reader. Nothing that takes a URL, so `href`, `xlink:href`, `filter` and
+ * `mask`'s external forms cannot reach out of the document.
+ *
+ * `style` goes through the same request filter the HTML side uses, because an
+ * SVG `style` attribute can hold `url(...)` exactly like any other.
+ */
+const KEPT_SVG_ATTRS: ReadonlySet<string> = new Set([
+  "viewBox",
+  "width",
+  "height",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "d",
+  "points",
+  "transform",
+  "fill",
+  "fill-opacity",
+  "fill-rule",
+  "stroke",
+  "stroke-width",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-dasharray",
+  "stroke-opacity",
+  "opacity",
+  "offset",
+  "stop-color",
+  "stop-opacity",
+  "gradientUnits",
+  "gradientTransform",
+  "clipPathUnits",
+  "maskUnits",
+  "preserveAspectRatio",
+  "class",
+  "id",
+  "text-anchor",
+  "font-size",
+  "font-family",
+  "font-weight",
+  "aria-label",
+  "role",
+]);
+
+/** Build one SVG subtree, node by node, keeping only what is in the lists. */
+function buildSvg(from: Element): SVGElement | null {
+  const tag = from.tagName;
+  if (!KEPT_SVG.has(tag)) {
+    return null;
+  }
+  const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const attribute of Array.from(from.attributes)) {
+    const name = attribute.name;
+    if (name === "style") {
+      element.setAttribute("style", safeCss(attribute.value));
+      continue;
+    }
+    if (KEPT_SVG_ATTRS.has(name)) {
+      element.setAttribute(name, attribute.value);
+    }
+  }
+  for (const child of Array.from(from.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      // Text inside `<text>`/`<tspan>`/`<title>` is part of the picture. It is
+      // NOT a run the editor offers to retype: the source scanner does not know
+      // about it, and a span here would put the run order out by one for the
+      // whole rest of the document.
+      element.appendChild(document.createTextNode(child.textContent ?? ""));
+      continue;
+    }
+    if (child instanceof Element) {
+      const built = buildSvg(child);
+      if (built !== null) {
+        element.appendChild(built);
+      }
+    }
+  }
+  return element;
+}
+
 /** Attributes kept, per element. Nothing global: `href` on a `<span>` means
  *  nothing, and a list per element is a list somebody has thought about. */
 const KEPT_ATTRIBUTES: Record<string, readonly string[]> = {
@@ -290,6 +418,13 @@ export function buildHtmlView(source: string): BuiltHtml {
       if (DROPPED_WHOLE.has(tag)) {
         continue;
       }
+      if (tag === "svg") {
+        const drawn = buildSvg(child);
+        if (drawn !== null) {
+          into.appendChild(drawn);
+        }
+        continue;
+      }
       const kept = KEPT_ELEMENTS[tag];
       if (kept === undefined) {
         // Unwrapped, not dropped: an element nobody has thought about still
@@ -328,6 +463,20 @@ export function buildHtmlView(source: string): BuiltHtml {
         element.setAttribute(name, value);
       }
       if (tag === "img") {
+        // A `data:` source is bytes that were already in this file. Showing it
+        // asks the network for nothing, which is the whole of NFR-11's test —
+        // the rule is that a document must not be able to report that somebody
+        // opened it, and a picture that travels inside the document reports
+        // nothing. A deck's artwork is usually exactly this, and dropping it
+        // turned a designed page into a page with the design taken out.
+        const src = child.getAttribute("src") ?? "";
+        if (/^data:image\//i.test(src.trim())) {
+          element.setAttribute("src", src.trim());
+          const described = child.getAttribute("alt");
+          element.setAttribute("alt", described ?? "");
+          into.appendChild(element);
+          continue;
+        }
         // The address as text, never a request (NFR-11). An `<img>` with no
         // `src` is an empty box that tells the reader nothing, so what goes in
         // is what the file says the picture is.

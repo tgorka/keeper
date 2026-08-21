@@ -58,6 +58,7 @@ import {
   PropertiesPanel,
   readFrontmatter,
   recordingSessionId,
+  unquote,
 } from "./properties-panel";
 import { TemplateUpdateOffer } from "./template-update-offer";
 
@@ -386,6 +387,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
   // the regions are several strips further down: nothing about where they sit
   // says which control opened them, so `aria-controls` has to.
   const propertiesRegionId = useId();
+
   const attachmentsRegionId = useId();
   const [conflictTheirs, setConflictTheirs] = useState<string | null>(null);
   // Story 45.13's sentence about what attaching just did — what was copied in,
@@ -780,6 +782,60 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
     },
     [vaultId, noteId],
   );
+
+  /**
+   * How long the title has to hold still before the file is renamed.
+   *
+   * The title follows the heading on every save, and saves are already
+   * debounced — but a rename is a file MOVE, and a move per debounced save
+   * while somebody types a heading is a dozen moves, a dozen commits and a
+   * dozen chances for the other machine to see a name that existed for two
+   * seconds. Three seconds of quiet is the difference between "they finished
+   * the heading" and "they are still typing it".
+   */
+  const RENAME_QUIET_MS = 3_000;
+
+  // The title as the file currently records it. `null` for a note with no
+  // `title:` — those have nothing to follow and keeper does not add the key.
+  const storedTitle = useMemo(() => {
+    const entry = readFrontmatter(frontmatter).entries.find(
+      (candidate) => candidate.key === "title" && !candidate.nested,
+    );
+    return entry === undefined || entry.nested ? null : unquote(entry.text.trim()).text;
+  }, [frontmatter]);
+
+  // What the filename was last made to say. Seeded on the first sight of a note
+  // so opening one renames nothing: the file is already called what it is
+  // called, and a rename on open would be keeper rewriting somebody's tree for
+  // having looked at it.
+  const renamedFor = useRef<string | null>(null);
+  const renameKey = `${vaultId}/${noteId ?? ""}`;
+  const renameFor = useRef(renameKey);
+  if (renameFor.current !== renameKey) {
+    renameFor.current = renameKey;
+    renamedFor.current = null;
+  }
+
+  useEffect(() => {
+    if (noteId === null || storedTitle === null || storedTitle === "") {
+      return;
+    }
+    if (renamedFor.current === null) {
+      renamedFor.current = storedTitle;
+      return;
+    }
+    if (renamedFor.current === storedTitle) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      renamedFor.current = storedTitle;
+      // Best effort, like every other rename path here: a name the vault will
+      // not take is reported by the panel that offers renaming, and a failure
+      // in the background must not interrupt typing.
+      void notesRename(vaultId, noteId, storedTitle).catch(() => {});
+    }, RENAME_QUIET_MS);
+    return () => clearTimeout(timer);
+  }, [storedTitle, vaultId, noteId]);
 
   const leaveMode = useCallback(() => {
     setConflictTheirs(null);

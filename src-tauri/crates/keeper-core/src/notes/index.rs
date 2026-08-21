@@ -132,6 +132,19 @@ pub struct IndexEntry {
     /// not at extraction time, because a link may point at a note that does not
     /// exist yet.
     pub links: Vec<String>,
+    /// The predicate written on a link, by target: `[x](y){reference="cites"}`
+    /// puts `y → cites` here.
+    ///
+    /// Beside `links` rather than inside it, because `links` is read by the
+    /// query engine and by every consumer of the graph, and none of them has an
+    /// opinion about predicates — widening the type would have made every one
+    /// of them carry a value it ignores.
+    ///
+    /// Keyed by target, so a note linking one target twice with two different
+    /// predicates keeps the first. That is a real limitation and a small one:
+    /// the second edge still exists, it is the same edge, and the panel names
+    /// the relationship rather than enumerating every time it was written.
+    pub link_attrs: std::collections::BTreeMap<String, String>,
     /// Index-computed booleans, as strings so the set can grow without a schema
     /// bump: `pinned`, `archived`, `unread`, `conflict`, `journal`, `template`,
     /// `space`, `capture`, `recording`, `orphan`, `unstable_identity`,
@@ -932,6 +945,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
+            link_attrs: std::collections::BTreeMap::new(),
             flags: Vec::new(),
             snippet: String::new(),
             order: NoteOrder::default(),
