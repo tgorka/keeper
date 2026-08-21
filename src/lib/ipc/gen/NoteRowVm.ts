@@ -48,6 +48,16 @@ conflict: boolean,
  */
 origin: string, 
 /**
+ * What kind of link connects this row to the note being looked at, when the
+ * author said so: the `reference` attribute on the link.
+ *
+ * `None` for every link written without one, which is nearly all of them,
+ * and for every row that is not the far end of a link — the field is only
+ * filled by the two link projections. A predicate is the author's word for
+ * the relationship; keeper neither invents one nor infers one.
+ */
+predicate: string | null, 
+/**
  * The head revision that last touched this note's path: the revision
  * `unread` was computed against (`head_rev != acknowledged_rev`).
  *

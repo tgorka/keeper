@@ -131,6 +131,14 @@ pub struct NoteRowVm {
     /// or `changed on hesperia`. Empty when the note has no commit yet — the row
     /// branches on emptiness, never on null.
     pub origin: String,
+    /// What kind of link connects this row to the note being looked at, when the
+    /// author said so: the `reference` attribute on the link.
+    ///
+    /// `None` for every link written without one, which is nearly all of them,
+    /// and for every row that is not the far end of a link — the field is only
+    /// filled by the two link projections. A predicate is the author's word for
+    /// the relationship; keeper neither invents one nor infers one.
+    pub predicate: Option<String>,
     /// The head revision that last touched this note's path: the revision
     /// `unread` was computed against (`head_rev != acknowledged_rev`).
     ///
@@ -651,7 +659,10 @@ pub enum NoteListOp {
     /// second copy that goes stale between them.
     Reset { rows: Vec<NoteRowVm> },
     /// Insert or replace the row at `index`.
-    Upsert { index: u32, row: NoteRowVm },
+    /// Boxed since the row learned to carry a link's predicate: the row is the
+    /// only large variant here, and an enum sized by its largest member costs
+    /// that size on every `Reset` and every `Remove` too.
+    Upsert { index: u32, row: Box<NoteRowVm> },
     /// Drop the row with this note id, wherever it currently sits.
     Remove { id: String },
 }
@@ -1182,6 +1193,7 @@ mod tests {
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
         let row = NoteRowVm {
+            predicate: None,
             id: "n1".to_owned(),
             path: "notes/a.md".to_owned(),
             title: "A".to_owned(),

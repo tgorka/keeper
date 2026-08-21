@@ -746,10 +746,15 @@ describe("FilesPane keyboard navigation", () => {
     mountVault();
     (await screen.findByRole("treeitem", { name: "Vault" })).focus();
 
+    // `waitFor`, not a bare read. Moving focus goes through a React commit and
+    // a `focus()` call, and under a full-suite load those land a tick after the
+    // key does — this test passed alone and failed in the run, which is the
+    // signature of reading a value before it arrives rather than of a wrong
+    // value. The claim is unchanged: focus must end on this row.
     await press("End");
-    expect(focusedName()).toBe("Field");
+    await waitFor(() => expect(focusedName()).toBe("Field"));
     await press("Home");
-    expect(focusedName()).toBe("Vault");
+    await waitFor(() => expect(focusedName()).toBe("Vault"));
   });
 
   it("expands a closed folder with Right, then descends into it with Right again", async () => {

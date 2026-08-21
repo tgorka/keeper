@@ -1471,6 +1471,7 @@ mod tests {
 
     fn entry(path: &str) -> IndexEntry {
         IndexEntry {
+            link_attrs: Default::default(),
             id: format!("id-{path}"),
             path: path.to_owned(),
             title: path.to_owned(),

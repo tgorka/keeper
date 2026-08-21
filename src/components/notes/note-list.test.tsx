@@ -41,6 +41,7 @@ function row(overrides: Partial<NoteRowVm> & { id: string; title: string }): Not
   return {
     path: `${overrides.id}.md`,
     snippet: "the body excerpt",
+    predicate: null,
     tags: [],
     updatedMs: Date.now() - 3_600_000,
     pinned: false,

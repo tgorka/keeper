@@ -1487,6 +1487,25 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
             .into_iter()
             .map(|link| link.target)
             .collect(),
+        // The first predicate wins per target — see `IndexEntry::link_attrs`.
+        // `reference` is the key the convention uses for "what kind of link is
+        // this"; another key on the same link is kept out of the graph rather
+        // than guessed at, because only `reference` has an agreed meaning.
+        link_attrs: links::extract(body)
+            .into_iter()
+            .filter_map(|link| {
+                link.attrs
+                    .iter()
+                    .find(|(key, _)| key == "reference")
+                    .map(|(_, value)| (link.target.clone(), value.clone()))
+            })
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut acc, (target, value)| {
+                    acc.entry(target).or_insert(value);
+                    acc
+                },
+            ),
         flags,
         snippet: snippet(body),
         // Read once, here, so the list's comparator never re-parses a string
@@ -2805,6 +2824,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
+            link_attrs: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),

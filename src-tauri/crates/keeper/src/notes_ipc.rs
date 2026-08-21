@@ -369,6 +369,9 @@ fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> Note
         // A note with no commit yet is this device's, which is what the
         // `origin:` predicate table says absent means.
         origin: head.map_or("local", |head| head.origin.as_str()).to_owned(),
+        // Filled by the two link projections, which know which edge a row is
+        // the far end of. Every other listing produces rows that are not edges.
+        predicate: None,
         // The revision the unread mark is cleared against. Filled from the same
         // commit lookup that produced `origin` and `unread`, so accepting from the
         // list cannot acknowledge a revision that moved in between; empty when the
@@ -2062,7 +2065,21 @@ pub async fn notes_backlinks(
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
     let mut inbound = snapshot.backlinks(&note_id);
     inbound.sort_by(|a, b| list_order(a, b));
-    Ok(rows_of(state.platform.as_ref(), &vault_id, &inbound))
+    let mut rows = rows_of(state.platform.as_ref(), &vault_id, &inbound);
+    // The predicate is written on the SOURCE's link, so for inbound edges it
+    // comes off the linking note and not off this one. Matched by any of this
+    // note's keys, because a link reaches a note through its title, its alias
+    // or its path and the author picked one of them.
+    let keys: std::collections::BTreeSet<String> = snapshot
+        .by_id(&note_id)
+        .map(|entry| entry.link_keys())
+        .unwrap_or_default();
+    for (row, source) in rows.iter_mut().zip(inbound.iter()) {
+        row.predicate = keys
+            .iter()
+            .find_map(|key| source.link_attrs.get(key).cloned());
+    }
+    Ok(rows)
 }
 
 /// Every value this vault already uses for one frontmatter key.
@@ -2107,7 +2124,18 @@ pub async fn notes_forwardlinks(
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
     let mut outbound = snapshot.forwardlinks(&note_id);
     outbound.sort_by(|a, b| list_order(a, b));
-    Ok(rows_of(state.platform.as_ref(), &vault_id, &outbound))
+    let mut rows = rows_of(state.platform.as_ref(), &vault_id, &outbound);
+    // Outbound is the easy direction: the predicate is on this note's own link,
+    // and the target it was written against is one of the far note's keys.
+    if let Some(here) = snapshot.by_id(&note_id) {
+        for (row, target) in rows.iter_mut().zip(outbound.iter()) {
+            row.predicate = target
+                .link_keys()
+                .iter()
+                .find_map(|key| here.link_attrs.get(key).cloned());
+        }
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -4554,7 +4582,7 @@ fn diff_ops(
         if !unchanged {
             ops.push(NoteListOp::Upsert {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
-                row: row.clone(),
+                row: Box::new(row.clone()),
             });
         }
     }
@@ -5182,6 +5210,7 @@ mod tests {
             tags: Vec::new(),
             fields: std::collections::BTreeMap::new(),
             links: Vec::new(),
+            link_attrs: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
@@ -5288,6 +5317,7 @@ mod tests {
             unread: false,
             conflict: false,
             origin: "local".to_owned(),
+            predicate: None,
             head_rev: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
         }
