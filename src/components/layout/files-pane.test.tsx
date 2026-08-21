@@ -1604,15 +1604,34 @@ describe("FilesPane — what it is and how big", () => {
       entry("main.rs", "file"),
       entry("contract.pdf", "file"),
       entry("mystery.qqq", "file"),
+      entry("signed.pdf", "file"),
+      entry("bio.docx", "file"),
+      entry("deck.pptx", "file"),
+      entry("model.xlsx", "file"),
     ]);
 
     expect(glyphOf("clip.mov")).toBe("lucide-file-play");
     expect(glyphOf("budget.csv")).toBe("lucide-file-spreadsheet");
     expect(glyphOf("main.rs")).toBe("lucide-file-code");
-    expect(glyphOf("contract.pdf")).toBe("lucide-file-type");
+    expect(glyphOf("contract.pdf")).toBe("lucide-file-badge");
     // A format with no row is the registry's `unknown`, which is a first-class
     // answer (AD-91) and has its own glyph rather than a blank cell.
     expect(glyphOf("mystery.qqq")).toBe("lucide-file-question-mark");
+
+    // The four office-ish formats used to share one page, which is how a
+    // data room of LOIs, decks and CVs came to look like one file repeated
+    // down the column. Three of them say what they are now; the spreadsheet
+    // deliberately borrows CSV's glyph, because both of them are a table.
+    expect(
+      new Set([
+        glyphOf("signed.pdf"),
+        glyphOf("bio.docx"),
+        glyphOf("deck.pptx"),
+        glyphOf("model.xlsx"),
+      ]).size,
+    ).toBe(4);
+    expect(glyphOf("deck.pptx")).toBe("lucide-presentation");
+    expect(glyphOf("model.xlsx")).toBe("lucide-file-spreadsheet");
 
     // The property behind those five, stated once so a future mapping that is
     // wrong-but-plausible still fails: five files that Rust classifies as only
