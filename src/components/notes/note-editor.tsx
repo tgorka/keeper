@@ -333,18 +333,19 @@ export interface NoteEditorProps {
 }
 
 /**
- * The open note's column, and the reason it carries a width floor of zero.
+ * The open note's column.
  *
- * This column is a flex item of the panel strip, so its `min-width` defaults to
- * `auto` — the width its own content demands. Most of what it holds wraps, but
- * not all: a backlink row is `truncate`, which is `white-space: nowrap`, and a
- * nowrap line's demand is its full length. `auto` hands that demand up, and the
- * column grows to fit text that was supposed to be clipped: measured at 1077px
- * inside a 600px strip, with the ellipsis never drawn because there was nothing
- * left to clip.
+ * `min-w-0` is defensive, and this comment exists to say so honestly: it is not
+ * what stopped the note escaping its pane. It was shipped believing it was, on
+ * a measurement of a container chain the app does not actually have — the
+ * column's parent is a block box (`overflow-auto`), not a flex container, so
+ * `min-width: auto` never applied to this element and setting it to zero
+ * changed nothing. Measured again against the real chain, with and without the
+ * class: 604px either way.
  *
- * `min-w-0` refuses the demand. The column takes its share, and `truncate` does
- * the job it was asked to do.
+ * It stays because the day this column becomes a flex item the floor is already
+ * written, and it costs nothing. What actually fits the note to its pane is the
+ * `ResizeObserver` below — see the comment beside it.
  */
 export const NOTE_COLUMN_CLASS = "flex h-full min-h-0 min-w-0 flex-col";
 
@@ -628,6 +629,28 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
         }),
       });
 
+      // This pane changes width without the window changing size — a column
+      // folds, the strip re-divides between panels — and CodeMirror measures
+      // its own width when it is created and when the window resizes, not when
+      // the box it lives in is re-divided around it.
+      //
+      // Measured in the running app: the window was dragged 158px narrower and
+      // the three columns beside this pane did not move a pixel, so the whole
+      // change landed here. The text did not re-wrap, and there was no
+      // horizontal scrollbar to reach the rest with. Every line kept the width
+      // the pane used to have, and the pane clipped it — which is what "the
+      // note does not fit the window" turned out to be.
+      //
+      // Guarded because jsdom does not always define it, in the shape the other
+      // panes in this app already use.
+      const resizes =
+        typeof ResizeObserver === "undefined"
+          ? null
+          : new ResizeObserver(() => {
+              editorView.requestMeasure();
+            });
+      resizes?.observe(host);
+
       runtimeRef.current = {
         applyExternal: (text: string) => {
           const splice = preview.spliceBetween(editorView.state.doc.toString(), text);
@@ -672,7 +695,10 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
           writing.runFormatAction(editorView, action);
         },
         focus: () => editorView.focus(),
-        destroy: () => editorView.destroy(),
+        destroy: () => {
+          resizes?.disconnect();
+          editorView.destroy();
+        },
       };
       editorView.focus();
       // The document almost never exists yet when this chunk lands — the channel
