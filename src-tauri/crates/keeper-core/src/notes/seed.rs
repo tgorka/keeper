@@ -496,7 +496,7 @@ pub fn projected(seed: &Seed, title: &str, body: &str, stamp: &str, now_ms: i64)
     // seed a destination for exactly that reason, but `path:spaces/**` does
     // not — so a seed really can land here, and a projection that missed it
     // would tell a spaces space its new note will not appear when it will.
-    if path.starts_with(SPACES_DIR) {
+    if path.starts_with(SPACES_DIR) && !crate::notes::is_okf_reserved(&path) {
         flags.push("space".to_owned());
     }
     // 44.7's rule, mirrored whole: a template is a note TAGGED `template`

@@ -1424,8 +1424,17 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     if templates::is_template(&fm) || rel.starts_with(&format!("{}/", templates::TEMPLATES_DIR)) {
         flags.push("template".to_owned());
     }
-    if rel.starts_with("spaces/") {
+    // The folder decides, EXCEPT for the two files OKF reserves. `index.md` is
+    // generated from the documents around it and `log.md` is a hand-kept
+    // ledger; neither carries frontmatter, so neither can carry a query. Left
+    // in, a generated listing under `spaces/` becomes a space that selects
+    // nothing and says its query cannot be read — which is what the vault that
+    // prompted this was showing. That is not a broken space; it is not a space.
+    if rel.starts_with("spaces/") && !keeper_core::notes::is_okf_reserved(rel) {
         flags.push("space".to_owned());
+    }
+    if keeper_core::notes::is_okf_reserved(rel) {
+        flags.push("generated".to_owned());
     }
     if rel.starts_with("journal/") {
         flags.push("journal".to_owned());
