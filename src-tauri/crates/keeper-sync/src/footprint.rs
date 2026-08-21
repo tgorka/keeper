@@ -102,6 +102,43 @@ fn tracked_content(repo: &gix::Repository, root: &Path, tracked: &[std::path::Pa
         .sum()
 }
 
+/// Tracked files that are plain blobs in git and would be LFS objects today.
+///
+/// The threshold is a per-machine setting and it moves. A file committed when
+/// it was 4 MiB stays a blob for the life of the history, whatever the setting
+/// says afterwards — git has no way to change its mind about a commit that
+/// already happened. So the drive quietly carries a set of files the current
+/// rule would have sent to LFS, and nothing anywhere says so.
+///
+/// This is the check somebody would otherwise run by hand and only after they
+/// already suspected something. Returns `(count, bytes)`.
+///
+/// It reads the index rather than the worktree: a materialised LFS file IS the
+/// real bytes on disk, so a size check out there answers a different question
+/// and answers it wrongly.
+pub fn blobs_over_threshold(
+    repo: &gix::Repository,
+    root: &Path,
+    tracked: &[std::path::PathBuf],
+    threshold: u64,
+) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for rela in tracked {
+        if lfs::stage::indexed_pointer(repo, rela).is_some() {
+            continue; // already an LFS object
+        }
+        let Ok(meta) = std::fs::symlink_metadata(root.join(rela)) else {
+            continue;
+        };
+        if meta.is_file() && meta.len() >= threshold {
+            count += 1;
+            bytes += meta.len();
+        }
+    }
+    (count, bytes)
+}
+
 /// Bytes under a directory, following nothing and failing on nothing.
 ///
 /// A folder being measured is a folder somebody is also using: files appear and

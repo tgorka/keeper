@@ -1321,6 +1321,45 @@ impl Engine {
         // is nothing to log here: a sweep that found nothing is the normal case
         // and has nothing to say.
         let _ = tokio::task::spawn_blocking(move || store.sweep_scratch(&name)).await;
+        self.report_blobs_over_threshold(profile).await;
+    }
+
+    /// Say, once an hour, how much of this folder git is carrying as plain
+    /// blobs that today's threshold would have sent to LFS.
+    ///
+    /// The threshold moves — this folder went from 4 MiB to 0.25 MB — and a
+    /// commit cannot change its mind afterwards. So a drive quietly accumulates
+    /// files the current rule disagrees with, and nothing says so until
+    /// somebody runs the check by hand, which they only do once they already
+    /// suspect something. Reported and not fixed: converting them means
+    /// rewriting history, which is not a thing keeper does to a folder two
+    /// people are syncing.
+    async fn report_blobs_over_threshold(&self, profile: &SyncProfile) {
+        let root = profile.local_path.clone();
+        let threshold = profile.lfs_threshold_bytes;
+        let name = profile.name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(repo) = git::repo::open(&root, false) else {
+                return;
+            };
+            let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                return;
+            };
+            let (count, bytes) =
+                crate::footprint::blobs_over_threshold(&repo, &root, &tracked, threshold);
+            if count == 0 {
+                return;
+            }
+            crate::anomaly::Anomaly {
+                what: "files git carries as plain blobs that today's threshold would send to LFS",
+                measured: format!("files={count} bytes={bytes} threshold={threshold}"),
+                expected: "none, on a folder whose threshold has never moved",
+                consequence: "history keeps them as blobs for good; the cost is permanent and \
+                              known, and nothing new is being added to it",
+            }
+            .report(&name);
+        })
+        .await;
     }
 
     fn sweep_is_due(&self, profile: &SyncProfile) -> bool {
