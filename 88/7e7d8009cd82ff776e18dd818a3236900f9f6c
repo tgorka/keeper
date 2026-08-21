@@ -1,0 +1,19 @@
+src/components/notes/format-toolbar.tsx
+  s_9bfe0bf28c8205::t_3292d105d695f5 45,49,52-58,336,339-342,353
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "887e7d8009cd82ff776e18dd818a3236900f9f6c",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
