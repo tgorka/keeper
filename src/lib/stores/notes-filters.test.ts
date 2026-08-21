@@ -215,6 +215,34 @@ describe("the three-state tag chip", () => {
 });
 
 describe("emptyFilterReason", () => {
+  /**
+   * The tag that is honest and empty at the same time.
+   *
+   * The rail's counts include tags carried by RECORDINGS; this list shows notes.
+   * A vault with a recording tagged `epic22` and no note carrying it shows
+   * `epic22 1` in the rail and nothing in the list — which reads as a broken
+   * filter until somebody says where the tag lives. Diagnosed on a real vault.
+   */
+  it("says where else a tag can live, when a tag is the only thing narrowing", () => {
+    notesFiltersStore.getState().setTagTerm("epic22", "include");
+    const reason = emptyFilterReason(notesFiltersStore.getState()) ?? "";
+
+    expect(reason).toContain("Narrowed by epic22.");
+    expect(reason).toContain("carried by a recording");
+  });
+
+  /**
+   * And not otherwise: with a search term in the sentence there are other
+   * explanations, and offering this one would be guessing at which term emptied
+   * the list — which this function's own doc refuses to do.
+   */
+  it("keeps quiet about recordings when something else is narrowing too", () => {
+    notesFiltersStore.getState().setTagTerm("epic22", "include");
+    notesFiltersStore.getState().setText("quarterly");
+
+    expect(emptyFilterReason(notesFiltersStore.getState()) ?? "").not.toContain("recording");
+  });
+
   it("names the excluded term that emptied the list, in words rather than a sign", () => {
     const state = notesFiltersStore.getState();
     state.setTagTerm("client/acme", "include");

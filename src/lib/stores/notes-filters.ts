@@ -394,7 +394,25 @@ export function emptyFilterReason(state: NotesFiltersState): string | null {
   }
   const last = terms[terms.length - 1];
   const phrase = terms.length === 1 ? last : `${terms.slice(0, -1).join(", ")} and ${last}`;
-  return `Narrowed by ${phrase}.`;
+  // A tag that is narrowing by itself gets one more sentence, because there is a
+  // way for it to be honest AND empty: the rail's tag counts include the tags on
+  // recordings, and this list shows notes. A vault with a recording tagged
+  // `epic22` and no note carrying it shows `epic22 1` in the rail and nothing
+  // here — which reads as a bug in the filter rather than as a fact about where
+  // the tag lives.
+  //
+  // Said only for a tag-only narrowing: with a search term or a scope in the
+  // sentence there are other explanations, and offering this one would be
+  // guessing at which term emptied the list — the thing the doc above says this
+  // function will not do.
+  const tagOnly =
+    state.tagTerms.length > 0 &&
+    terms.length === state.tagTerms.length &&
+    state.tagTerms.every((chip) => chip.term !== "exclude");
+  const aside = tagOnly
+    ? " A tag can also be carried by a recording, which this list does not show."
+    : "";
+  return `Narrowed by ${phrase}.${aside}`;
 }
 
 /**

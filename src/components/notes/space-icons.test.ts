@@ -97,6 +97,38 @@ describe("the catalogue", () => {
     }
   });
 
+  /**
+   * The glyphs a *hand-built* vault asks for, which is a different set from the
+   * seeded defaults and is the one that went wrong.
+   *
+   * A vault whose spaces were written by hand — or by an agent following
+   * lucide's own names, which is what this file's header invites — asked for
+   * `building-2`, `user`, `folder-kanban`, `settings` and `list-todo`. The
+   * picker had `building` but not `building-2`, and none of the other four, so
+   * five spaces on a real rail drew the unknown-icon fallback while their
+   * frontmatter named a perfectly good glyph.
+   *
+   * Nothing detects that: the fallback is silent by design, because a name the
+   * picker has not got must never be rewritten on disk. So the names are pinned
+   * here instead.
+   */
+  it("offers the glyphs a hand-written vault names, lucide's spelling included", () => {
+    for (const key of ["building-2", "user", "folder-kanban", "settings", "list-todo"]) {
+      expect(SPACE_ICONS[key], key).toBeDefined();
+    }
+  });
+
+  /**
+   * Both spellings, because the map had one and the vault used the other.
+   * Keeping `building` is not optional — this file's header says nothing is ever
+   * removed, since a stored name whose entry disappeared draws the fallback on a
+   * space somebody deliberately gave a glyph.
+   */
+  it("keeps the older spelling beside the lucide one", () => {
+    expect(SPACE_ICONS.building).toBeDefined();
+    expect(SPACE_ICONS["building-2"]).toBeDefined();
+  });
+
   it("falls back for an unknown name and for none, without touching the name", () => {
     expect(spaceIcon(null)).toBe(SpaceIconFallback);
     expect(spaceIcon("no-such-glyph")).toBe(SpaceIconFallback);
