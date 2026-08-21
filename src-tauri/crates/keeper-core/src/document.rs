@@ -925,6 +925,56 @@ fn truncate_chars(text: &mut String, limit: usize) {
 // PPTX
 // ---------------------------------------------------------------------------
 
+/// Take the master's furniture out of the outline.
+///
+/// A deck repeats a few strings on every slide — a confidentiality mark, the
+/// company's name, a page number — and they come out of the XML like any other
+/// text. Read as an outline they are most of it: the deck that prompted this had
+/// four such lines per slide and about six lines of content, so two thirds of
+/// what a reader saw was the same three words over and over.
+///
+/// A line is furniture when it appears on nearly every slide. Not *every*: a
+/// deck almost always has a title slide or a closing slide laid out differently,
+/// and a rule that demanded all of them would find nothing on exactly the decks
+/// this matters for.
+///
+/// Deliberately not a list of known words. "CONFIDENTIAL" is this deck's
+/// furniture and somebody else's heading, and keeper has no business knowing
+/// which words a company puts on its slides. Repetition is the evidence.
+///
+/// A deck of two or three slides is left alone: "on nearly every slide" means
+/// nothing when there are two, and the first line of a two-slide deck would go.
+fn drop_furniture(slides: &mut [SlideVm]) {
+    const FEWEST_SLIDES: usize = 4;
+    if slides.len() < FEWEST_SLIDES {
+        return;
+    }
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for slide in slides.iter() {
+        // Once per slide, however many times the slide says it: a line repeated
+        // twice on one slide is that slide's business.
+        let unique: std::collections::BTreeSet<&str> =
+            slide.lines.iter().map(String::as_str).collect();
+        for line in unique {
+            *seen.entry(line).or_insert(0) += 1;
+        }
+    }
+    // Four fifths, so one differently laid-out slide at either end does not save
+    // a line that is furniture everywhere else.
+    let threshold = (slides.len() * 4).div_ceil(5);
+    let furniture: std::collections::BTreeSet<String> = seen
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold)
+        .map(|(line, _)| line.to_owned())
+        .collect();
+    if furniture.is_empty() {
+        return;
+    }
+    for slide in slides.iter_mut() {
+        slide.lines.retain(|line| !furniture.contains(line));
+    }
+}
+
 fn read_pptx<R: io::Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     budget: &mut Budget,
@@ -943,6 +993,7 @@ fn read_pptx<R: io::Read + io::Seek>(
         slide.number = u32::try_from(index + 1).unwrap_or(u32::MAX);
         slides.push(slide);
     }
+    drop_furniture(&mut slides);
 
     Ok(OoxmlBody {
         note: format!(
@@ -1692,3 +1743,77 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod furniture_tests {
+    use super::{drop_furniture, SlideVm};
+
+    fn slide(number: u32, lines: &[&str]) -> SlideVm {
+        SlideVm {
+            number,
+            title: None,
+            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+        }
+    }
+
+    /// The deck that prompted this: a confidentiality mark and the company's
+    /// name on every slide, and about six lines of content under them. Read as
+    /// an outline, two thirds of what a reader saw was the same three words.
+    #[test]
+    fn a_line_on_nearly_every_slide_is_the_masters_and_goes() {
+        let mut deck = vec![
+            slide(1, &["CONFIDENTIAL", "Neuraffica", "The problem"]),
+            slide(2, &["CONFIDENTIAL", "Neuraffica", "Costs outrun gains"]),
+            slide(3, &["CONFIDENTIAL", "Neuraffica", "Power is the ceiling"]),
+            slide(4, &["CONFIDENTIAL", "Neuraffica", "The solution"]),
+            slide(5, &["Thanks"]),
+        ];
+        drop_furniture(&mut deck);
+
+        assert_eq!(deck[0].lines, vec!["The problem".to_owned()]);
+        assert_eq!(deck[3].lines, vec!["The solution".to_owned()]);
+        assert_eq!(deck[4].lines, vec!["Thanks".to_owned()]);
+    }
+
+    /// Not *every* slide: a deck almost always has a title or closing slide laid
+    /// out differently, and a rule that demanded all of them would find nothing
+    /// on exactly the decks this matters for.
+    #[test]
+    fn one_differently_laid_out_slide_does_not_save_the_furniture() {
+        let mut deck = vec![
+            slide(1, &["Title slide"]),
+            slide(2, &["CONFIDENTIAL", "one"]),
+            slide(3, &["CONFIDENTIAL", "two"]),
+            slide(4, &["CONFIDENTIAL", "three"]),
+            slide(5, &["CONFIDENTIAL", "four"]),
+        ];
+        drop_furniture(&mut deck);
+        assert_eq!(deck[1].lines, vec!["one".to_owned()]);
+    }
+
+    /// "On nearly every slide" means nothing when there are two, and the first
+    /// line of a two-slide deck would go.
+    #[test]
+    fn a_very_short_deck_is_left_alone() {
+        let mut deck = vec![slide(1, &["shared", "a"]), slide(2, &["shared", "b"])];
+        drop_furniture(&mut deck);
+        assert_eq!(deck[0].lines, vec!["shared".to_owned(), "a".to_owned()]);
+    }
+
+    /// Content that happens to be said twice on one slide is that slide's
+    /// business, not evidence of a master.
+    #[test]
+    fn a_line_repeated_inside_one_slide_is_counted_once() {
+        let mut deck = vec![
+            slide(1, &["echo", "echo", "a"]),
+            slide(2, &["b"]),
+            slide(3, &["c"]),
+            slide(4, &["d"]),
+        ];
+        drop_furniture(&mut deck);
+        assert_eq!(
+            deck[0].lines,
+            vec!["echo".to_owned(), "echo".to_owned(), "a".to_owned()]
+        );
+    }
+}
