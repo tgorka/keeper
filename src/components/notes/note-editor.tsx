@@ -332,6 +332,22 @@ export interface NoteEditorProps {
   frame?: ReactNode;
 }
 
+/**
+ * The open note's column, and the reason it carries a width floor of zero.
+ *
+ * This column is a flex item of the panel strip, so its `min-width` defaults to
+ * `auto` — the width its own content demands. Most of what it holds wraps, but
+ * not all: a backlink row is `truncate`, which is `white-space: nowrap`, and a
+ * nowrap line's demand is its full length. `auto` hands that demand up, and the
+ * column grows to fit text that was supposed to be clipped: measured at 1077px
+ * inside a 600px strip, with the ellipsis never drawn because there was nothing
+ * left to clip.
+ *
+ * `min-w-0` refuses the demand. The column takes its share, and `truncate` does
+ * the job it was asked to do.
+ */
+export const NOTE_COLUMN_CLASS = "flex h-full min-h-0 min-w-0 flex-col";
+
 export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorProps) {
   const body = useNotesBody(vaultId, noteId);
   // Story 46.12: every one of these names the note THIS editor is showing.
@@ -844,7 +860,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className={NOTE_COLUMN_CLASS}>
       {/* Story 46.4's three groups, Story 46.13's component (AD-104).
 
           The row is `flex` and does not wrap, so every sibling in it competes
