@@ -246,7 +246,7 @@ pub fn capture_search(target: &CaptureTargetVm) -> String {
 /// called `a+b` would otherwise open a window holding a note in a vault called
 /// `a b`, which resolves to nothing and renders "not found" on a note the
 /// person just watched keeper accept.
-fn query_encode(value: &str) -> String {
+pub fn query_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         let ch = *byte as char;

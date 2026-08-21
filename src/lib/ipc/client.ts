@@ -3255,6 +3255,26 @@ export async function syncReadText(id: string, subpath: string): Promise<TextFil
 }
 
 /**
+ * Write an HTML file's rendered page beside it as a PDF (Story 56, macOS).
+ *
+ * Same stem, same folder: `deck-v8.html` produces `deck-v8.pdf`, and pressing
+ * it again overwrites that rather than piling up a second copy. The point of
+ * the button is that the two files stay the same document, so the PDF is
+ * rendered by the webview — the same renderer the Page tab draws with, in an
+ * off-screen window that mounts nothing else.
+ *
+ * Resolves with the name of the file written, so the caller can say what it
+ * made instead of guessing at it.
+ *
+ * Rejects with: `unsupported`, `internal`. On a platform that is not macOS it
+ * rejects saying so — the renderer is WebKit's and there is no substitute
+ * pretending otherwise.
+ */
+export async function syncExportPdf(id: string, subpath: string): Promise<string> {
+  return await invoke<string>("sync_export_pdf", { id, subpath });
+}
+
+/**
  * Read one file inside a synced folder as a document (FR-181, FR-182, AD-65,
  * Story 45.8).
  *

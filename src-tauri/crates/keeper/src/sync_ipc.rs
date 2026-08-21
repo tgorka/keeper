@@ -2315,6 +2315,148 @@ pub async fn sync_read_text(
 /// escapes the root, a file that is no longer on disk, an unreadable file). A
 /// file that is readable but is not a document keeper knows is NOT a rejection
 /// — it is a `DocumentVm` carrying a sentence, because the viewer draws that.
+
+/// Write `subpath`'s rendered page beside it as a PDF (Story 56, macOS).
+///
+/// The renderer is the webview, because there is no Rust crate that lays out
+/// HTML and CSS to a standard somebody comparing the two files would accept —
+/// and a PDF that does not look like the page defeats the button, whose whole
+/// point is that the two stay the same document. See `pdf_export`.
+///
+/// Returns the subpath of the file written, so the caller can say what it made
+/// rather than guessing at the name.
+#[tauri::command]
+pub async fn sync_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Stated rather than silently absent: the renderer is the webview, and
+        // asking one for a PDF is `createPDF`, which is a WebKit method. A
+        // platform where that does not exist needs a different renderer, not a
+        // different call — so the honest answer here is that this is not built
+        // yet, named as such.
+        let _ = (&app, &state, &id, &subpath);
+        return Err(open_failure(
+            "exporting a PDF is macOS-only for now: it renders through the webview".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder};
+
+        let engine = engine_of(&state)?;
+        let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+        let profile = find_profile(&profiles, &id)?;
+        let source = browse::resolve(&profile.local_path, &subpath)
+            .map_err(|refusal| open_failure(refusal.to_string()))?
+            .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+        let out = crate::pdf_export::pdf_beside(&source);
+
+        // A label per export, so two of them cannot collide and a leaked window from
+        // a previous failure cannot be mistaken for this one's.
+        let label = format!("print-{}", uuid_like(&subpath));
+        if let Some(stale) = app.get_webview_window(&label) {
+            let _ = stale.destroy();
+        }
+        let url = format!(
+            "print.html?profile={}&subpath={}",
+            keeper_core::capture::query_encode(&id),
+            keeper_core::capture::query_encode(&subpath)
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let ready = tx.clone();
+        let failed = tx;
+        let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+            .title("keeper — printing")
+            .inner_size(
+                crate::pdf_export::PAGE_SIZE.0,
+                crate::pdf_export::PAGE_SIZE.1,
+            )
+            .position(
+                crate::pdf_export::OFFSCREEN.0,
+                crate::pdf_export::OFFSCREEN.1,
+            )
+            .visible(true)
+            .decorations(false)
+            .skip_taskbar(true)
+            .build()
+            .map_err(|err| open_failure(format!("could not open a window to render in: {err}")))?;
+
+        tracing::info!(
+            profile = %id,
+            subpath = %subpath,
+            label = %label,
+            out = %out.display(),
+            "pdf export: window opened"
+        );
+        window.listen(crate::pdf_export::READY_EVENT, move |_| {
+            tracing::info!("pdf export: the page reported it is laid out");
+            let _ = ready.try_send(Ok(()));
+        });
+        window.listen(crate::pdf_export::FAILED_EVENT, move |event| {
+            let said = event.payload().trim_matches('"').to_owned();
+            tracing::warn!(said = %said, "pdf export: the page refused");
+            let _ = failed.try_send(Err(said));
+        });
+
+        let rendered = tokio::task::spawn_blocking(move || {
+            match rx.recv_timeout(crate::pdf_export::RENDER_LIMIT) {
+                Ok(answer) => answer,
+                Err(_) => Err("the page never reported that it was ready".to_owned()),
+            }
+        })
+        .await
+        .map_err(|err| open_failure(format!("waiting for the page failed: {err}")))?;
+
+        let captured = match rendered {
+            Ok(()) => {
+                let window = window.clone();
+                tokio::task::spawn_blocking(move || crate::pdf_export::capture(&window))
+                    .await
+                    .map_err(|err| open_failure(format!("rendering failed: {err}")))?
+            }
+            Err(said) => Err(said),
+        };
+
+        // Always, and before the answer is read: a window left off-screen is a
+        // window nobody can find to close.
+        let _ = window.destroy();
+
+        let bytes = match captured {
+            Ok(bytes) => {
+                tracing::info!(bytes = bytes.len(), "pdf export: rendered");
+                bytes
+            }
+            Err(said) => {
+                tracing::error!(said = %said, "pdf export: failed");
+                return Err(open_failure(said));
+            }
+        };
+        std::fs::write(&out, &bytes)
+            .map_err(|err| open_failure(format!("could not write {}: {err}", out.display())))?;
+        Ok(out
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| subpath.clone()))
+    }
+}
+
+/// A label-safe token for one subpath. Not an identifier anybody stores — it
+/// only has to be stable within a run and free of characters a window label
+/// refuses.
+#[cfg(target_os = "macos")]
+fn uuid_like(subpath: &str) -> String {
+    subpath
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn sync_read_document(
     state: tauri::State<'_, AppState>,
