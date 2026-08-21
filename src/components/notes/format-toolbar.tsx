@@ -42,11 +42,19 @@ import {
   Underline,
 } from "lucide-react";
 import { type MouseEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type EmojiMatch, emojiFor, matchEmoji } from "@/lib/emoji/match";
 import { EMOJI_TABLE } from "@/lib/emoji/table";
+import { cn } from "@/lib/utils";
 import type { FormatAction } from "./editor/format-commands";
+
+// Every emoji choice wears the same classes, so they are computed once here
+// rather than 1855 times inside the grid. `<Button>` runs `cn(buttonVariants())`
+// per instance — tailwind-merge, not string concatenation — and at this count
+// that dominates opening the picker. The markup below reproduces what `Button`
+// emits, `data-` attributes included, so the DOM is unchanged.
+const EMOJI_CHOICE_CLASS = cn(buttonVariants({ variant: "ghost", size: "icon-sm" }));
 
 /** Which extra panel, if any, is open. Only ever one. */
 type Panel = "heading" | "table" | "emoji" | null;
@@ -325,11 +333,13 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
           ) : (
             <div className="grid max-h-48 grid-cols-8 gap-0.5 overflow-y-auto">
               {emoji.map(({ shortcode, emoji: character }) => (
-                <Button
+                <button
                   key={shortcode}
                   type="button"
-                  size="icon-sm"
-                  variant="ghost"
+                  data-slot="button"
+                  data-variant="ghost"
+                  data-size="icon-sm"
+                  className={EMOJI_CHOICE_CLASS}
                   // The shortcode is the name, because the character alone is
                   // what a screen reader would otherwise have to describe.
                   aria-label={shortcode}
@@ -340,7 +350,7 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
                   <span aria-hidden="true" className="text-title leading-none">
                     {character}
                   </span>
-                </Button>
+                </button>
               ))}
             </div>
           )}
