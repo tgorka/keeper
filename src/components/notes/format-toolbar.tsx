@@ -41,10 +41,11 @@ import {
   Table,
   Underline,
 } from "lucide-react";
-import { type MouseEvent, useCallback, useId, useMemo, useState } from "react";
+import { type MouseEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { type EmojiMatch, emojiFor, matchEmoji } from "@/lib/emoji/match";
+import { EMOJI_TABLE } from "@/lib/emoji/table";
 import type { FormatAction } from "./editor/format-commands";
 
 /** Which extra panel, if any, is open. Only ever one. */
@@ -155,6 +156,7 @@ export interface FormatToolbarProps {
 
 export function FormatToolbar({ onAction }: FormatToolbarProps) {
   const [panel, setPanel] = useState<Panel>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   // The labels have to name their fields by id, and an editor pane is not
   // guaranteed to be the only one on the page.
   const ids = useId();
@@ -182,10 +184,22 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
   // emoji instead of an instruction to type.
   const emoji: EmojiMatch[] = useMemo(() => {
     if (emojiQuery.trim() === "") {
-      return EMOJI_OPENING.flatMap((shortcode) => {
+      // The whole table, not a curated forty-eight. The forty-eight were a good
+      // first row and a bad only row: a person who does not know the shortcode
+      // for the emoji they want cannot type their way to it, and browsing was
+      // the reason to open a picker rather than type `:`. The grid scrolls, so
+      // the cost of the rest is scrolling past it, and the familiar ones are
+      // still first — `EMOJI_OPENING` leads, and the table follows without
+      // repeating them.
+      const lead = EMOJI_OPENING.flatMap((shortcode) => {
         const character = emojiFor(shortcode);
         return character === undefined ? [] : [{ shortcode, emoji: character }];
       });
+      const led = new Set(lead.map((entry) => entry.shortcode));
+      const rest = EMOJI_TABLE.flatMap(([shortcode, character]) =>
+        led.has(shortcode) ? [] : [{ shortcode, emoji: character }],
+      );
+      return [...lead, ...rest];
     }
     return matchEmoji(emojiQuery, EMOJI_PICKER_LIMIT);
   }, [emojiQuery]);
@@ -202,8 +216,34 @@ export function FormatToolbar({ onAction }: FormatToolbarProps) {
     });
   }, []);
 
+  // A press anywhere else shuts whichever panel is open.
+  //
+  // `pointerdown`, not `click`: a press that starts outside and finishes inside
+  // some other control still means "leave this", and waiting for `click` lets
+  // that other control fire first with the panel still over it. Capture, so a
+  // handler that stops propagation on the way up cannot leave the panel open.
+  //
+  // The toolbar's own subtree is excluded rather than the panel's, because the
+  // toggle that opened it lives out here: without that, pressing the emoji
+  // button while its panel is open would close it here and reopen it in the
+  // toggle, and the panel would never shut.
+  useEffect(() => {
+    if (panel === null) {
+      return;
+    }
+    const onPress = (event: Event) => {
+      const root = rootRef.current;
+      if (root !== null && event.target instanceof Node && root.contains(event.target)) {
+        return;
+      }
+      setPanel(null);
+    };
+    document.addEventListener("pointerdown", onPress, true);
+    return () => document.removeEventListener("pointerdown", onPress, true);
+  }, [panel]);
+
   return (
-    <div className="relative flex flex-wrap items-center gap-0.5 border-b px-2 py-1">
+    <div ref={rootRef} className="relative flex flex-wrap items-center gap-0.5 border-b px-2 py-1">
       {DIRECT.map(({ action, label, Icon }) => (
         <Button
           key={label}
