@@ -386,6 +386,7 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
   // the regions are several strips further down: nothing about where they sit
   // says which control opened them, so `aria-controls` has to.
   const propertiesRegionId = useId();
+
   const attachmentsRegionId = useId();
   const [conflictTheirs, setConflictTheirs] = useState<string | null>(null);
   // Story 45.13's sentence about what attaching just did — what was copied in,

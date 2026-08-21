@@ -621,6 +621,26 @@ export function flashExternal(view: EditorView, from: number, to: number): void 
 }
 
 const livePreviewTheme = EditorView.baseTheme({
+  // The floor under every widget this editor draws, and the reason it is one
+  // line rather than a rule per widget.
+  //
+  // `.cm-content` is a flex item of `.cm-scroller`, so its `min-width` is `auto`
+  // — the widest thing inside it. `EditorView.lineWrapping` makes prose wrap to
+  // that width, which means ONE wide, unbreakable child re-lays the whole
+  // document at its width and the pane clips the rest. Every wide block here is
+  // supposed to be contained and most of them are; a note in the vault proves
+  // they are not all contained, and hunting the last one is a game with no end
+  // — the next widget somebody adds starts it again.
+  //
+  // Measured against a real CodeMirror with `lineWrapping` and one uncontained
+  // block, in a 600px pane: `.cm-content` came out **1796px**, which is exactly
+  // what the pane was showing. With this line, 600px, and the block keeps its
+  // own `overflow-x` so nothing becomes unreachable — it scrolls inside itself
+  // instead of dragging the prose out of the pane with it.
+  ".cm-content": {
+    minWidth: "0",
+  },
+
   ".cm-lp-strong": { fontWeight: "600" },
   ".cm-lp-em": { fontStyle: "italic" },
   ".cm-lp-strike": { textDecoration: "line-through" },
