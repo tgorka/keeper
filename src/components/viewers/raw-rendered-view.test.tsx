@@ -1550,6 +1550,65 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     return { ...result, onSaved };
   }
 
+  /**
+   * The rendered page, which lives in a shadow root.
+   *
+   * It has to: the document's own stylesheet is mounted beside it, and a rule
+   * saying `div { position: fixed }` would otherwise be styling this
+   * application. Testing Library queries the light DOM, so every assertion
+   * about what the page says goes through here.
+   */
+  function shadow(container: HTMLElement): ShadowRoot {
+    const host = container.querySelector(`[data-testid="${HTML_PANE_TESTID}"]`);
+    const root = host?.shadowRoot;
+    if (!root) {
+      throw new Error("the html pane has no shadow root");
+    }
+    return root;
+  }
+
+  /**
+   * A document that arrives with its own stylesheet is a document that was
+   * written to look like something. Dropping the rules is what turned a deck
+   * into a column of grey prose — the text was all there and none of the design
+   * was.
+   */
+  it("keeps the document's own stylesheet, and its classes with it", async () => {
+    const { container } = page(
+      '<style>.lead{color:red}</style><p class="lead" style="margin:2rem">Hi</p>',
+    );
+    await settle();
+
+    const root = shadow(container);
+    expect(root.querySelector("style")?.textContent).toContain(".lead{color:red}");
+    const paragraph = root.querySelector("p");
+    expect(paragraph?.getAttribute("class")).toBe("lead");
+    expect(paragraph?.getAttribute("style")).toBe("margin:2rem");
+  });
+
+  /**
+   * NFR-11: a document a person opens must not be able to report that they
+   * opened it. CSS is a way to fetch — `url()` in a background, `@import` at the
+   * top — so keeping the stylesheet means filtering it, and this is the half of
+   * the change that had to be right.
+   */
+  it("keeps the rules and takes every request out of them", async () => {
+    const { container } = page(
+      "<style>@import url(https://elsewhere.example/x.css);" +
+        ".a{background:url(https://elsewhere.example/pic.png)}" +
+        '.b{background:url("data:image/gif;base64,AAA")}</style><p>Hi</p>',
+    );
+    await settle();
+
+    const css = shadow(container).querySelector("style")?.textContent ?? "";
+    expect(css).not.toContain("@import");
+    expect(css).not.toContain("elsewhere.example");
+    // The rule survives, pointing at nothing. A `data:` URI is bytes that were
+    // already in the file and asks the network for nothing, so it stays.
+    expect(css).toContain('url("data:,")');
+    expect(css).toContain("data:image/gif;base64,AAA");
+  });
+
   it("names the tab for what it shows, beside the Source that always exists", async () => {
     page();
     await settle();
@@ -1564,7 +1623,7 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     const { container } = page();
     await settle();
 
-    const pane = container.querySelector(`[data-testid="${HTML_PANE_TESTID}"]`);
+    const pane = shadow(container);
     expect(pane?.textContent).toBe("Title\nBody text\n");
     expect(pane?.querySelector("h1")?.textContent).toBe("Title");
     // The markup is still exactly one tab away and is still the file's bytes.
@@ -1576,7 +1635,7 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     const { container } = page();
     await settle();
 
-    const spans = container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`);
+    const spans = shadow(container).querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`);
     const body = Array.from(spans).find((span) => span.textContent === "Body text");
     if (body === undefined) {
       throw new Error("the paragraph's text was not editable");
@@ -1598,7 +1657,7 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
 
     // The attribute, not `isContentEditable`: jsdom does not implement the
     // property, and the attribute is what this code actually sets.
-    const spans = Array.from(container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
+    const spans = Array.from(shadow(container).querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
     expect(spans.length).toBeGreaterThan(0);
     for (const span of spans) {
       expect(span.getAttribute("contenteditable")).toBeNull();
@@ -1609,7 +1668,7 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     const { container } = page();
     await settle();
 
-    const spans = Array.from(container.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
+    const spans = Array.from(shadow(container).querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`));
     const words = spans.filter((span) => (span.textContent ?? "").trim() !== "");
     expect(words.length).toBeGreaterThan(0);
     for (const span of words) {
@@ -1629,7 +1688,7 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
     const { container } = page('<p>safe</p><script>alert(1)</script><img src="https://t/p.png">');
     await settle();
 
-    const pane = container.querySelector(`[data-testid="${HTML_PANE_TESTID}"]`);
+    const pane = shadow(container);
     expect(pane?.querySelector("script")).toBeNull();
     // Nothing is fetched, and the address is visible rather than hidden.
     expect(pane?.querySelector("img")).toBeNull();
