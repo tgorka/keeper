@@ -1030,6 +1030,7 @@ pub fn run() {
         notes_ipc::notes_link_targets,
         notes_ipc::notes_resolve_link,
         notes_ipc::notes_backlinks,
+        notes_ipc::notes_forwardlinks,
         notes_ipc::notes_history,
         notes_ipc::notes_diff,
         notes_ipc::notes_mark_read,

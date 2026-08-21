@@ -2065,6 +2065,20 @@ pub async fn notes_backlinks(
     Ok(rows_of(state.platform.as_ref(), &vault_id, &inbound))
 }
 
+/// Every note this one links to (the other direction of [`notes_backlinks`]).
+#[tauri::command]
+pub async fn notes_forwardlinks(
+    state: State<'_, AppState>,
+    vault_id: String,
+    note_id: String,
+) -> Result<Vec<NoteRowVm>, IpcError> {
+    let snapshot = notes_vault::snapshot(&vault_id)
+        .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
+    let mut outbound = snapshot.forwardlinks(&note_id);
+    outbound.sort_by(|a, b| list_order(a, b));
+    Ok(rows_of(state.platform.as_ref(), &vault_id, &outbound))
+}
+
 // ---------------------------------------------------------------------------
 // Writing notes
 // ---------------------------------------------------------------------------

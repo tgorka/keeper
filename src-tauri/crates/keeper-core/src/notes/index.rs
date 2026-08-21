@@ -468,6 +468,34 @@ impl IndexSnapshot {
         rows
     }
 
+    /// Every note this one links to, sorted by path — the other direction of
+    /// [`Self::backlinks`].
+    ///
+    /// Deduplicated by note rather than by target, so a body that names the same
+    /// note twice — once by title and once by path — lists it once. A target
+    /// nothing answers to is dropped rather than listed as a broken row: this
+    /// answers "what does this note point at that exists", and the editor is
+    /// where an unresolved `[[link]]` is already visible as one.
+    ///
+    /// Self-links are excluded on the same grounds backlinks excludes them: a
+    /// note is not its own neighbour.
+    pub fn forwardlinks(&self, id: &str) -> Vec<&IndexEntry> {
+        let Some(entry) = self.by_id(id) else {
+            return Vec::new();
+        };
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for target in &entry.links {
+            if let Some(found) = self.resolve_link(target) {
+                if found.id != id {
+                    seen.insert(found.id.as_str());
+                }
+            }
+        }
+        let mut rows: Vec<&IndexEntry> = seen.into_iter().filter_map(|s| self.by_id(s)).collect();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows
+    }
+
     /// Resolve a raw link target — a title, an alias or a vault-relative path —
     /// to the note it names, or `None` when nothing answers to it (FR-108/FR-109).
     ///

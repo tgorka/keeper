@@ -247,7 +247,7 @@ describe("finding the destructive verb", () => {
     expect(spoken).toContain("Standup");
   });
 
-  it("leaves two controls in the header, so its last one is not the one off the screen", async () => {
+  it("leaves three controls in the header, so its last one is not the one off the screen", async () => {
     openOn("# Standup\n");
     render(<NoteEditor vaultId="v1" noteId="note-7" />);
     await screen.findByRole("button", { name: new RegExp(`^${NOTE_ACTIONS_LABEL}`) });
@@ -269,7 +269,11 @@ describe("finding the destructive verb", () => {
     const labels = Array.from((actions as HTMLElement).querySelectorAll("button"), (button) =>
       button.getAttribute("aria-label"),
     );
-    expect(labels).toEqual([ATTACH_FILE_LABEL, `${NOTE_ACTIONS_LABEL} Standup`]);
+    // Three now, not two: Properties joined the leading group, because a
+    // disclosure control that falls into the menu takes the region it discloses
+    // out of reach — there is nothing left on screen saying the region exists.
+    // The menu is still the group's last child, which is the claim here.
+    expect(labels).toEqual([ATTACH_FILE_LABEL, PROPERTIES_LABEL, `${NOTE_ACTIONS_LABEL} Standup`]);
   });
 
   it("still offers every verb the header used to carry, by name, from that one menu", async () => {
@@ -291,9 +295,12 @@ describe("finding the destructive verb", () => {
     const items = Array.from(
       menu.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]'),
     ) as HTMLElement[];
+    // Properties is not in this list and must not be: it is a leading control
+    // now, in the header at every width, so a copy down here would be the same
+    // verb offered twice — and `note-editor.test.tsx` asserts no verb appears
+    // twice at any width.
     expect(items.map((item) => item.textContent)).toEqual([
       ATTACHMENTS_LABEL,
-      PROPERTIES_LABEL,
       NOTE_HISTORY_LABEL,
       EXPORT_NOTE_LABEL,
       NOTE_DELETE_LABEL,

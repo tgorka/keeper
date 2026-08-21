@@ -4335,6 +4335,21 @@ export async function notesBacklinks(vaultId: string, noteId: string): Promise<N
 }
 
 /**
+ * The notes this one links TO — the other direction of {@link notesBacklinks},
+ * projected from the same graph and stored no more than that one is.
+ *
+ * Deduplicated by note rather than by target, so a body naming the same note
+ * twice lists it once, and a target nothing answers to is left out entirely:
+ * this is what the note points at that exists, and an unresolved `[[link]]` is
+ * already visible where it was written.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesForwardlinks(vaultId: string, noteId: string): Promise<NoteRowVm[]> {
+  return await invoke<NoteRowVm[]>("notes_forwardlinks", { vaultId, noteId });
+}
+
+/**
  * A note's revision history (FR-114, AD-63), projected from the commit trailers
  * `keeper-sync` already writes. keeper keeps no parallel history store, so a
  * vault whose profile has never committed answers with an honest empty list

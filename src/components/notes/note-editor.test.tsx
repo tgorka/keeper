@@ -496,18 +496,13 @@ describe("the header shows the verbs it has room for", () => {
     const resize = await openAtWidths();
 
     resize(1400);
-    expect(names()).toEqual([
-      ATTACHMENTS_LABEL,
-      PROPERTIES_LABEL,
-      NOTE_HISTORY_LABEL,
-      SHOW_IN_FILES_LABEL,
-    ]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL, SHOW_IN_FILES_LABEL]);
 
     resize(800);
-    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL, NOTE_HISTORY_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL, SHOW_IN_FILES_LABEL]);
 
     resize(700);
-    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL]);
 
     // What the 560px capture window is near: the two panels the owner reported
     // as missing are the last things to go, and Attachments is the last of all.
@@ -546,7 +541,6 @@ describe("the header shows the verbs it has room for", () => {
       menuItems();
       for (const label of [
         ATTACHMENTS_LABEL,
-        PROPERTIES_LABEL,
         NOTE_HISTORY_LABEL,
         SHOW_IN_FILES_LABEL,
         NOTE_DELETE_LABEL,
@@ -574,15 +568,15 @@ describe("the header shows the verbs it has room for", () => {
     const resize = await openAtWidths();
 
     resize(700);
-    // Attachments and Properties are words in the row; History and Show in
-    // Files came back to the menu, in the order the row would have shown them,
-    // and above Export, which never leaves.
-    expect(menuItems()).toEqual([
-      NOTE_HISTORY_LABEL,
-      SHOW_IN_FILES_LABEL,
-      "Export…",
-      NOTE_DELETE_LABEL,
-    ]);
+    // Attachments is a word in the row; Show in Files came back to the menu, in
+    // the order the row would have shown it, and above Export, which never
+    // leaves. Properties is in neither list — it is a leading control, so it is
+    // in the row at every width and can never come back to the menu.
+    // Asserted before the menu is opened: an open Radix menu hides the rest of
+    // the header from the accessibility tree, so a control checked afterwards
+    // would look absent whether it was there or not.
+    expect(screen.getByRole("button", { name: PROPERTIES_LABEL })).toBeVisible();
+    expect(menuItems()).toEqual([SHOW_IN_FILES_LABEL, "Export…", NOTE_DELETE_LABEL]);
   });
 
   it("stays at 46.5's shape on a machine that never delivers an observation", async () => {
@@ -598,7 +592,6 @@ describe("the header shows the verbs it has room for", () => {
     expect(names()).toEqual([]);
     expect(menuItems()).toEqual([
       ATTACHMENTS_LABEL,
-      PROPERTIES_LABEL,
       NOTE_HISTORY_LABEL,
       SHOW_IN_FILES_LABEL,
       "Export…",
@@ -622,7 +615,10 @@ describe("the header shows the verbs it has room for", () => {
     resize(1400);
 
     const before = names();
-    expect(before).toContain(PROPERTIES_LABEL);
+    // Not among the candidates, and that is the claim: a leading control is in
+    // the row whatever the budget says, so it is never in `names()` and never
+    // in the menu either.
+    expect(before).not.toContain(PROPERTIES_LABEL);
     // Closed, and saying so.
     expect(screen.getByRole("button", { name: PROPERTIES_LABEL, expanded: false })).toBeVisible();
 
@@ -774,17 +770,12 @@ describe("a note in a panel: one row, carrying the panel's own controls", () => 
     // 454, and 454 less the 198 the leading control and the trigger reserve
     // buys the 108 and the 100 but not the 74 behind them.
     resize(800);
-    expect(names()).toEqual([ATTACHMENTS_LABEL, PROPERTIES_LABEL]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL]);
 
     // And the row is still a row that grows: the frame group is a constant
     // subtraction, not a cap.
     resize(1400);
-    expect(names()).toEqual([
-      ATTACHMENTS_LABEL,
-      PROPERTIES_LABEL,
-      NOTE_HISTORY_LABEL,
-      SHOW_IN_FILES_LABEL,
-    ]);
+    expect(names()).toEqual([ATTACHMENTS_LABEL, NOTE_HISTORY_LABEL, SHOW_IN_FILES_LABEL]);
   });
 });
 
@@ -804,8 +795,14 @@ describe("a panel that will not open in this mode", () => {
     return document.querySelector<HTMLElement>(`[data-slot="${PANEL_UNAVAILABLE_SLOT}"]`);
   }
 
-  /** Press an item in the note's actions menu, whichever kind of item it is. */
+  /** Press a verb, wherever it lives: Properties is a leading control that never
+   *  enters the menu, and everything else is a menu item of one kind or another. */
   function pick(label: string): void {
+    const control = screen.queryByRole("button", { name: label });
+    if (control !== null) {
+      fireEvent.click(control);
+      return;
+    }
     openNoteActions();
     const item =
       screen.queryByRole("menuitem", { name: label }) ??
@@ -868,13 +865,10 @@ describe("a panel that will not open in this mode", () => {
  * that the path is not the identity.
  */
 describe("a note's title, changed in the properties panel", () => {
-  /** Press an item in the note's actions menu, whichever kind of item it is. */
+  /** Press the disclosure control, which is in the header at every width and
+   *  never in the menu — that is the point of it being a leading control. */
   function openProperties(): void {
-    openNoteActions();
-    const item =
-      screen.queryByRole("menuitem", { name: PROPERTIES_LABEL }) ??
-      screen.getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL });
-    fireEvent.click(item);
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
   }
 
   it("renames the file, through the command FR-97 shipped and nobody called", async () => {
