@@ -16,7 +16,7 @@
  */
 import { undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteBodyBatch } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
@@ -256,26 +256,33 @@ describe("the formatting toolbar, in the editor the user actually types into", (
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
       await screen.findByLabelText("Search emoji");
 
-      const choices = within(screen.getByRole("group", { name: "Emoji picker" })).getAllByRole(
-        "button",
-      );
+      // `querySelectorAll` rather than `getAllByRole`, and it is not a
+      // shortcut: the picker holds 1855 buttons, and a role query computes an
+      // accessible name for every one of them — 1097ms against 5ms, measured,
+      // for the identical 1855 elements. Each `getByRole(name:)` below costs
+      // the same scan again. That is what put this test over its 15s budget
+      // under a loaded suite while it passed in 2.4s alone.
+      //
+      // Nothing is weakened by the swap. Every choice is a real `<button>`
+      // carrying an `aria-label`, so the label IS the accessible name, and
+      // the two queries return the same set.
+      const picker = screen.getByRole("group", { name: "Emoji picker" });
+      const choices = Array.from(picker.querySelectorAll("button"));
+      const labels = choices.map((button) => button.getAttribute("aria-label"));
 
       // The familiar ones LEAD, in their own order. That was the whole point of
       // the curated list and it survives: the picker must not open on `+1`,
       // `100`, `1234`, `8ball`, `a`, `ab` and a run of flags, which is what the
       // table's own order starts with.
-      expect(choices.slice(0, 2).map((button) => button.getAttribute("aria-label"))).toEqual([
-        "smile",
-        "smiley",
-      ]);
-      expect(screen.getByRole("button", { name: "tada" })).not.toBeNull();
-      expect(screen.getByRole("button", { name: "white_check_mark" })).not.toBeNull();
+      expect(labels.slice(0, 2)).toEqual(["smile", "smiley"]);
+      expect(labels).toContain("tada");
+      expect(labels).toContain("white_check_mark");
 
       // ...and the rest FOLLOWS, which it did not before. A person who does not
       // know the shortcode cannot type their way to an emoji, and browsing is
       // the reason to open a picker rather than type `:` — so `8ball` has to be
       // reachable by scrolling even though nobody would put it in a top row.
-      expect(screen.getByRole("button", { name: "8ball" })).not.toBeNull();
+      expect(labels).toContain("8ball");
       expect(choices.length).toBeGreaterThan(EMOJI_OPENING_COUNT * 10);
 
       // Every button resolves to a character: the curated list names shortcodes
@@ -284,7 +291,6 @@ describe("the formatting toolbar, in the editor the user actually types into", (
       expect(choices.filter((button) => button.textContent?.trim() === "")).toHaveLength(0);
 
       // And nothing is offered twice — the lead is subtracted from the tail.
-      const labels = choices.map((button) => button.getAttribute("aria-label"));
       expect(new Set(labels).size).toBe(labels.length);
     });
 
