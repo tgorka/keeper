@@ -165,7 +165,7 @@ const NUMBER = /^-?\d+(?:\.\d+)?$/;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Strip one layer of matching quotes, if the value has them. */
-function unquote(raw: string): { text: string; quoted: boolean } {
+export function unquote(raw: string): { text: string; quoted: boolean } {
   if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
     return { text: raw.slice(1, -1), quoted: true };
   }

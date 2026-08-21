@@ -3001,12 +3001,70 @@ pub async fn notes_buffer_report(
 /// without a live subscription, and this is the part of it that decides what lands
 /// on disk. `updated` is rewritten on every keeper-authored save; `created` never
 /// is, because `set_in` touches one key's span and nothing else (FR-121).
-fn save_document(frontmatter: &str, body: &str) -> String {
-    Frontmatter::set_in(
+fn save_document(frontmatter: &str, body: &str, was: &str) -> String {
+    let stamped = Frontmatter::set_in(
         &join_note(frontmatter, body),
         "updated",
         FieldValue::Str(now_local()),
-    )
+    );
+    follow_heading(&stamped, was, body)
+}
+
+/// Keep `title:` on the note's first heading, when the two were already saying
+/// the same thing.
+///
+/// The heading is what the app shows and what a person edits; `title:` is what
+/// every listing, query and export reads. Letting them drift means the note is
+/// called one thing on screen and another everywhere else, which is how a search
+/// stops finding a note somebody just renamed.
+///
+/// **Only when they agreed.** A note whose `title:` deliberately differs from
+/// its heading — a long heading and a short catalogue name — has said something,
+/// and following the heading there would overwrite a decision. So the rule is
+/// narrow: if the stored title equals what the OLD body's heading derived to,
+/// the author had not decided anything, and the new heading is the better
+/// answer. If it does not, nothing is touched.
+///
+/// A note with no `title:` at all is left without one. Adding a key on save is a
+/// bigger claim than following one that is already there, and the listings fall
+/// back to the heading anyway.
+fn follow_heading(document: &str, was: &str, body: &str) -> String {
+    let (block, _) = Frontmatter::parse(document);
+    let Some(stored) = block.as_string("title").map(str::to_owned) else {
+        // No `title:` to follow. Adding a key on save is a bigger claim than
+        // following one that is already there, and every listing falls back to
+        // the heading anyway.
+        return document.to_owned();
+    };
+    let derived = heading_title(body);
+    if stored == derived {
+        return document.to_owned();
+    }
+    // Whether the two were in step BEFORE this save, which is the whole rule:
+    // the previous document is what the note said a moment ago, and its heading
+    // is what the stored title would have been following.
+    let (before, _) = Frontmatter::parse(was);
+    let agreed = before
+        .as_string("title")
+        .is_some_and(|title| title == heading_title(split_note(was).1));
+    if agreed {
+        Frontmatter::set_in(document, "title", FieldValue::Str(derived))
+    } else {
+        document.to_owned()
+    }
+}
+
+/// A body's first non-empty line with its `#` markers stripped — the same rule
+/// the editor's own header uses, so the two cannot disagree about what a note is
+/// called.
+fn heading_title(body: &str) -> String {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return trimmed.trim_start_matches('#').trim().to_owned();
+        }
+    }
+    "Untitled".to_owned()
 }
 
 /// Save a note (FR-112, NFR-30).
@@ -3047,6 +3105,7 @@ pub async fn notes_save(
         save_document(
             frontmatter.as_deref().unwrap_or_else(|| state.split().0),
             &text,
+            &disk,
         )
     };
     notes_vault::write_note(&vault, &rel, &stamped).map_err(notes_error)?;
@@ -3936,7 +3995,7 @@ pub async fn notes_body_write(
         notes_vault::write_conflict_copy(&vault, &rel, &disk)
     };
 
-    let stamped = save_document(split_note(&disk).0, &text);
+    let stamped = save_document(split_note(&disk).0, &text, &disk);
     notes_vault::write_note(&vault, &rel, &stamped).map_err(notes_error)?;
     Ok(NoteWriteVm {
         rev: notes_vault::content_rev(&stamped),
@@ -5277,7 +5336,9 @@ mod tests {
 
         // The keystroke that used to break the note, at the only offset that could.
         let typed = format!("The folder is the database.{body}");
-        let saved = save_document(block, &typed);
+        // No previous document to compare against here: this test is about a
+        // keystroke at one offset, not about the title rule.
+        let saved = save_document(block, &typed, "");
         notes_vault::write_note(&vault, &created.path, &saved).expect("save the note");
 
         let on_disk = notes_vault::read_note(&vault, &created.path).expect("re-read the note");
@@ -5856,5 +5917,55 @@ mod uncategorized_tests {
     fn a_query_too_deep_to_wrap_is_dropped_rather_than_breaking_the_row() {
         let deep = format!("{}is:pinned{}", "(".repeat(64), ")".repeat(64));
         assert_eq!(compose(&["tag:inbox", &deep]), "-(tag:inbox)");
+    }
+}
+
+#[cfg(test)]
+mod heading_title_tests {
+    use super::{follow_heading, heading_title};
+
+    fn doc(title: &str, heading: &str) -> String {
+        format!("---\ntitle: {title}\n---\n\n# {heading}\n\nbody\n")
+    }
+
+    /// The case the request is about: the heading is what a person edits, and
+    /// `title:` is what every listing, query and export reads. Letting them
+    /// drift means a note is called one thing on screen and another everywhere
+    /// else, which is how a search stops finding a note somebody just renamed.
+    #[test]
+    fn a_title_that_agreed_follows_the_new_heading() {
+        let was = doc("Belief", "Belief");
+        let now = doc("Belief", "Belief and Vision");
+        let out = follow_heading(&now, &was, "# Belief and Vision\n\nbody\n");
+        assert!(out.contains("title: Belief and Vision"), "{out}");
+    }
+
+    /// A note whose `title:` deliberately differs — a long heading and a short
+    /// catalogue name — has said something, and following the heading there
+    /// would overwrite a decision nobody asked to revisit.
+    #[test]
+    fn a_title_that_never_agreed_is_left_alone() {
+        let was = doc("Q3 plan", "The plan for the third quarter");
+        let now = doc("Q3 plan", "The plan for the third quarter, revised");
+        let out = follow_heading(&now, &was, "# The plan for the third quarter, revised\n");
+        assert!(out.contains("title: Q3 plan"), "{out}");
+    }
+
+    /// Adding a key on save is a bigger claim than following one that is
+    /// already there, and every listing falls back to the heading anyway.
+    #[test]
+    fn a_note_without_a_title_key_does_not_get_one() {
+        let now = "---\ntags: [a]\n---\n\n# Heading\n";
+        let out = follow_heading(now, "---\ntags: [a]\n---\n\n# Heading\n", "# Heading\n");
+        assert!(!out.contains("title:"), "{out}");
+    }
+
+    /// The same rule the editor's own header uses, so the two cannot disagree
+    /// about what a note is called.
+    #[test]
+    fn the_heading_is_the_first_non_empty_line_without_its_markers() {
+        assert_eq!(heading_title("\n\n### Deep heading\nbody"), "Deep heading");
+        assert_eq!(heading_title("no markers here\n# later"), "no markers here");
+        assert_eq!(heading_title("   \n\n"), "Untitled");
     }
 }
