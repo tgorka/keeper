@@ -490,6 +490,8 @@ pub struct Engine {
     device: Mutex<DeviceIdentity>,
     git: GitCli,
     http: reqwest::Client,
+    /// The client LFS objects move through — see `http::transfer_client`.
+    transfer_http: reqwest::Client,
     /// Live status per profile id, the polled snapshot the tray reads.
     status: Mutex<HashMap<String, SyncStatus>>,
     /// Per-profile completeness gates, retained across ticks so a settling file
@@ -686,6 +688,10 @@ impl Engine {
         // never fails, it waits — and a wait on a dead socket parks the whole
         // profile until the process restarts.
         let http = crate::http::client(crate::AGENT)?;
+        // A second client, and the only difference is its read ceiling: an
+        // upload's guard is progress, not silence. See
+        // `http::TRANSFER_READ_TIMEOUT`.
+        let transfer_http = crate::http::transfer_client(crate::AGENT)?;
 
         let engine = Self {
             platform,
@@ -693,6 +699,7 @@ impl Engine {
             device: Mutex::new(device),
             git,
             http,
+            transfer_http,
             status: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
@@ -904,6 +911,24 @@ impl Engine {
         };
         profile.enabled = enabled;
         self.upsert_profile(&profile)?;
+        // Said out loud, because until now it was not.
+        //
+        // Pausing wrote a row and nothing else: no line in the log, and a
+        // transfer already in flight kept its window before anything noticed.
+        // So a person who pressed Pause on a folder that was retrying saw it go
+        // on retrying, and had no way to tell whether the press had landed —
+        // and neither did anybody reading the log afterwards, which is how a
+        // report of "pause does not work" arrives with no evidence either way.
+        tracing::info!(
+            profile = profile.name,
+            enabled,
+            "sync profile paused or resumed on request"
+        );
+        if !enabled {
+            // The state says so at once rather than at the next tick, which is
+            // the tick this profile is about to stop having.
+            self.set_state(&profile.id, ProfileState::Paused);
+        }
         if enabled {
             // Work deferred while paused becomes eligible again immediately;
             // making the user wait out a backoff they did not cause is rude.
@@ -4858,7 +4883,7 @@ impl Engine {
         // a channel rather than touching the engine directly.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let transfer = Arc::new(
-            lfs::basic::BasicTransfer::new(self.http.clone(), store.clone())
+            lfs::basic::BasicTransfer::new(self.transfer_http.clone(), store.clone())
                 .with_sink(Box::new(move |event| {
                     // `false` detaches the reporter for good, so this says
                     // "stop" only once the receiver is genuinely gone.

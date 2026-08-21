@@ -61,6 +61,27 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// into a failure would trade a rare hang for frequent spurious retries.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The same ceiling, for the client that moves LFS objects — and it is much
+/// larger on purpose.
+///
+/// [`READ_TIMEOUT`] is a ceiling on SILENCE, which is the right question for a
+/// request whose answer should arrive promptly. It is the wrong question for an
+/// upload: while the client is sending a body, the server is silent **because
+/// that is correct**, and there is nothing for the client to read until the
+/// last byte is in. So a 60-second ceiling on silence is, for an upload, a
+/// 60-second ceiling on DURATION — and an object that needs longer than that to
+/// send can never finish, however good the connection is.
+///
+/// Observed on a real folder: eight objects, 3.8 GB, retried every 61 seconds
+/// for eighteen hours. Sixty of read timeout, one of setup, forever — the size
+/// of the object never mattered and neither did the network.
+///
+/// What actually guards an upload is `lfs::basic`'s stall watchdog, which asks
+/// whether BYTES ARE MOVING rather than whether the socket is quiet. This value
+/// is only a backstop for a connection that dies in a way the watchdog cannot
+/// see, so it is generous.
+pub const TRANSFER_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// How long an idle connection may be kept for reuse.
 ///
 /// Keep-alive is worth having — an LFS batch and the download it authorises are
@@ -88,6 +109,19 @@ pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The client this crate runs on.
 pub fn client(user_agent: &'static str) -> Result<reqwest::Client> {
     client_with(user_agent, CONNECT_TIMEOUT, READ_TIMEOUT, POOL_IDLE_TIMEOUT)
+}
+/// The client that moves LFS objects.
+///
+/// Everything [`client`] does, with [`TRANSFER_READ_TIMEOUT`] in place of
+/// [`READ_TIMEOUT`]: an upload's guard is progress, not silence, and the reason
+/// is written on that constant.
+pub fn transfer_client(user_agent: &'static str) -> Result<reqwest::Client> {
+    client_with(
+        user_agent,
+        CONNECT_TIMEOUT,
+        TRANSFER_READ_TIMEOUT,
+        POOL_IDLE_TIMEOUT,
+    )
 }
 
 /// [`client`], with the timeouts named — the seam tests use to make a stall
