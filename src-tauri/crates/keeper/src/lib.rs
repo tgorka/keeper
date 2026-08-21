@@ -5,9 +5,12 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
-#[cfg(desktop)]
+mod build_identity;
 mod copy_ipc;
 mod debug_log;
+#[cfg(desktop)]
+#[cfg(target_os = "macos")]
+mod pdf_export;
 // The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
 // reason `note_protocol` is: it serves files out of a synced folder, and the
 // folder sync it is rooted in is desktop-only.
@@ -319,6 +322,8 @@ pub fn run() {
                 keeper_core::config::install(layers);
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                // First, so every line under it can be read as "this build said".
+                build_identity::announce();
                 for fault in keeper_core::config::faults() {
                     // `Display`, not `summary()`: the log form keeps `toml`'s
                     // own caret diagram over the offending line, which is the
@@ -906,6 +911,7 @@ pub fn run() {
         sync_ipc::sync_folder_now,
         sync_ipc::sync_verify,
         sync_ipc::sync_rescan,
+        sync_ipc::sync_footprint,
         sync_ipc::sync_open_path,
         // The Files tab's listing command and its actions (Story 43.8; the text
         // read added by Story 45.6). Desktop-only with the rest of sync: a build
@@ -913,6 +919,7 @@ pub fn run() {
         sync_ipc::sync_browse,
         sync_ipc::sync_open_entry,
         sync_ipc::sync_read_text,
+        sync_ipc::sync_export_pdf,
         // The document reader (Story 45.8). Returns a bounded projection of a
         // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
         sync_ipc::sync_read_document,
@@ -1026,6 +1033,8 @@ pub fn run() {
         notes_ipc::notes_link_targets,
         notes_ipc::notes_resolve_link,
         notes_ipc::notes_backlinks,
+        notes_ipc::notes_forwardlinks,
+        notes_ipc::notes_field_vocabulary,
         notes_ipc::notes_history,
         notes_ipc::notes_diff,
         notes_ipc::notes_mark_read,

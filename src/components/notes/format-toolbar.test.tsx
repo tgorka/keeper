@@ -31,6 +31,13 @@ vi.mock("@/lib/ipc/client", () => ({
   notesBufferReport: vi.fn(async () => {}),
   notesTagTree: vi.fn(async () => ({ nodes: [] })),
   notesBacklinks: vi.fn(async () => []),
+  // Both arrive with the tabs under the note: the panel asks for links in each
+  // direction, and the template offer asks whether this note has drifted from
+  // the template it was made with. Absent from the mock they reject after the
+  // test has torn its environment down, which vitest reports as an unhandled
+  // error beside a green run.
+  notesForwardlinks: vi.fn(async () => []),
+  notesTemplateUpdatePreview: vi.fn(async () => null),
   notesResolveConflict: vi.fn(async () => {}),
   notesMarkRead: vi.fn(async () => {}),
   notesDiff: vi.fn(async () => null),
@@ -249,20 +256,63 @@ describe("the formatting toolbar, in the editor the user actually types into", (
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
       await screen.findByLabelText("Search emoji");
 
-      // Not the emoji table's head, which is ordered by shortcode and opens on
-      // `+1`, `100`, `1234`, `8ball`, `a`, `ab` and a run of flags.
-      expect(screen.getByRole("button", { name: "tada" })).not.toBeNull();
-      expect(screen.getByRole("button", { name: "white_check_mark" })).not.toBeNull();
-      expect(screen.queryByRole("button", { name: "8ball" })).toBeNull();
-
-      // Every opening shortcode resolves: the list names shortcodes and the
-      // table owns the characters, so one that fell out of the table would
-      // otherwise render as a blank button.
       const choices = within(screen.getByRole("group", { name: "Emoji picker" })).getAllByRole(
         "button",
       );
+
+      // The familiar ones LEAD, in their own order. That was the whole point of
+      // the curated list and it survives: the picker must not open on `+1`,
+      // `100`, `1234`, `8ball`, `a`, `ab` and a run of flags, which is what the
+      // table's own order starts with.
+      expect(choices.slice(0, 2).map((button) => button.getAttribute("aria-label"))).toEqual([
+        "smile",
+        "smiley",
+      ]);
+      expect(screen.getByRole("button", { name: "tada" })).not.toBeNull();
+      expect(screen.getByRole("button", { name: "white_check_mark" })).not.toBeNull();
+
+      // ...and the rest FOLLOWS, which it did not before. A person who does not
+      // know the shortcode cannot type their way to an emoji, and browsing is
+      // the reason to open a picker rather than type `:` — so `8ball` has to be
+      // reachable by scrolling even though nobody would put it in a top row.
+      expect(screen.getByRole("button", { name: "8ball" })).not.toBeNull();
+      expect(choices.length).toBeGreaterThan(EMOJI_OPENING_COUNT * 10);
+
+      // Every button resolves to a character: the curated list names shortcodes
+      // and the table owns the characters, so one that fell out of the table
+      // would otherwise render as a blank button.
       expect(choices.filter((button) => button.textContent?.trim() === "")).toHaveLength(0);
-      expect(choices).toHaveLength(EMOJI_OPENING_COUNT);
+
+      // And nothing is offered twice — the lead is subtracted from the tail.
+      const labels = choices.map((button) => button.getAttribute("aria-label"));
+      expect(new Set(labels).size).toBe(labels.length);
+    });
+
+    it("shuts when the next press lands somewhere else", async () => {
+      await mounted();
+      fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      await screen.findByLabelText("Search emoji");
+
+      // `pointerdown`, which is what the panel listens for: a press that starts
+      // outside means "leave this" whatever it finishes on, and waiting for a
+      // click lets whatever is under the pointer act with the panel still over
+      // it.
+      fireEvent.pointerDown(document.body);
+
+      expect(screen.queryByLabelText("Search emoji")).toBeNull();
+    });
+
+    it("stays open when the press is inside the toolbar it belongs to", async () => {
+      await mounted();
+      const toggle = screen.getByRole("button", { name: "Emoji" });
+      fireEvent.click(toggle);
+      const search = await screen.findByLabelText("Search emoji");
+
+      // The toolbar's own subtree is excluded, and the toggle is the reason:
+      // closing here and reopening in the toggle would leave the button unable
+      // to shut its own panel.
+      fireEvent.pointerDown(search);
+      expect(screen.queryByLabelText("Search emoji")).not.toBeNull();
     });
 
     it("says so when nothing matches, rather than showing an empty grid", async () => {

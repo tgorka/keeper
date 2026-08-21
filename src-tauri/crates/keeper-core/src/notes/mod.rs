@@ -29,6 +29,27 @@ pub mod tags;
 pub mod template_update;
 pub mod templates;
 pub mod vm;
+/// The two files an Open Knowledge Format bundle reserves, which are never
+/// documents.
+///
+/// OKF's rule is that every `.md` in a bundle carries a non-empty `type:`
+/// EXCEPT these two: `index.md` is generated from the documents around it and
+/// `log.md` is a hand-kept ledger. Neither has frontmatter, by the format's own
+/// definition.
+///
+/// keeper has to know them because it reads a folder's PATH in one place — a
+/// note under `spaces/` is a space — and a generated listing that lands in such
+/// a folder then becomes a space with no query, which shows up in the rail as a
+/// row that selects nothing and says its query cannot be read. That is not a
+/// broken space; it is not a space.
+pub const OKF_RESERVED: [&str; 2] = ["index.md", "log.md"];
+
+/// Whether this vault-relative path is one of OKF's reserved files.
+pub fn is_okf_reserved(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    OKF_RESERVED.contains(&name)
+}
+
 pub mod widget;
 
 /// Everything the notes domain can refuse to do.
@@ -117,5 +138,29 @@ mod tests {
         assert_eq!(line_number(s, 4), 2);
         assert_eq!(line_number(s, 8), 3);
         assert_eq!(line_number(s, 9_999), 3);
+    }
+}
+
+#[cfg(test)]
+mod okf_reserved_tests {
+    use super::is_okf_reserved;
+
+    /// The two files OKF reserves, wherever they sit. A vault that adopts the
+    /// format grows one per bundle directory, and every one of them lands in
+    /// some folder whose name keeper reads.
+    #[test]
+    fn the_two_reserved_names_are_recognised_at_any_depth() {
+        assert!(is_okf_reserved("index.md"));
+        assert!(is_okf_reserved("spaces/index.md"));
+        assert!(is_okf_reserved("10-notes/operations/log.md"));
+    }
+
+    /// A note is not reserved because its name contains one of them: `index.md`
+    /// is a listing, `my-index.md` is somebody's note about indices.
+    #[test]
+    fn a_name_that_merely_ends_in_one_is_not_reserved() {
+        assert!(!is_okf_reserved("spaces/my-index.md"));
+        assert!(!is_okf_reserved("spaces/changelog.md"));
+        assert!(!is_okf_reserved("spaces/2026-08-09-inbox.md"));
     }
 }

@@ -328,11 +328,27 @@ function HtmlPane({
     }
     builtFrom.current = latest.current.content;
     const view = buildHtmlView(latest.current.content);
-    host.replaceChildren(view.node);
+    // A shadow root, and it is what makes keeping the document's own CSS safe.
+    // Rules inside one do not reach the tree around it and rules outside do not
+    // reach in, so a file that says `div { position: fixed }` styles itself and
+    // not this application. Without it the choice was between a document that
+    // looks like itself and an application that survives opening one.
+    //
+    // Attached once and reused: `attachShadow` throws on a second call, and this
+    // effect re-runs on every edit.
+    const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
+    const sheets = view.styles.map((css) => {
+      const element = document.createElement("style");
+      // `textContent`, like everything else here. The rules were filtered for
+      // requests when they were read; this is not a parser and never was.
+      element.textContent = css;
+      return element;
+    });
+    root.replaceChildren(...sheets, view.node);
     if (readOnly) {
-      return () => host.replaceChildren();
+      return () => root.replaceChildren();
     }
-    for (const span of Array.from(host.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`))) {
+    for (const span of Array.from(root.querySelectorAll<HTMLElement>(`[${TEXT_RUN_ATTR}]`))) {
       // A run of pure whitespace is a text node between two blocks — the
       // newline after a `</p>`. It is a real run and keeps its index, because
       // the mapping is by order, but it is not something a reader can see, and
@@ -368,10 +384,15 @@ function HtmlPane({
       builtFrom.current = spliced.text;
       latest.current.onChange?.(spliced.text);
     };
-    host.addEventListener("input", onInput);
+    // On the shadow root, not on the host. An `input` event crosses the shadow
+    // boundary, but crossing it RETARGETS `event.target` to the host — so a
+    // listener out there would look for the edited span, find an element with
+    // no run attribute on it, and drop every keystroke without a word. Inside
+    // the root the target is the span that was typed into.
+    root.addEventListener("input", onInput);
     return () => {
-      host.removeEventListener("input", onInput);
-      host.replaceChildren();
+      root.removeEventListener("input", onInput);
+      root.replaceChildren();
     };
     // `content` is deliberately absent from the dependencies: rebuilding on
     // every keystroke would move the caret to the top of the document on every

@@ -132,6 +132,19 @@ pub struct IndexEntry {
     /// not at extraction time, because a link may point at a note that does not
     /// exist yet.
     pub links: Vec<String>,
+    /// The predicate written on a link, by target: `[x](y){reference="cites"}`
+    /// puts `y → cites` here.
+    ///
+    /// Beside `links` rather than inside it, because `links` is read by the
+    /// query engine and by every consumer of the graph, and none of them has an
+    /// opinion about predicates — widening the type would have made every one
+    /// of them carry a value it ignores.
+    ///
+    /// Keyed by target, so a note linking one target twice with two different
+    /// predicates keeps the first. That is a real limitation and a small one:
+    /// the second edge still exists, it is the same edge, and the panel names
+    /// the relationship rather than enumerating every time it was written.
+    pub link_attrs: std::collections::BTreeMap<String, String>,
     /// Index-computed booleans, as strings so the set can grow without a schema
     /// bump: `pinned`, `archived`, `unread`, `conflict`, `journal`, `template`,
     /// `space`, `capture`, `recording`, `orphan`, `unstable_identity`,
@@ -464,6 +477,34 @@ impl IndexSnapshot {
         }
         let mut rows: Vec<&IndexEntry> =
             sources.into_iter().filter_map(|s| self.by_id(s)).collect();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows
+    }
+
+    /// Every note this one links to, sorted by path — the other direction of
+    /// [`Self::backlinks`].
+    ///
+    /// Deduplicated by note rather than by target, so a body that names the same
+    /// note twice — once by title and once by path — lists it once. A target
+    /// nothing answers to is dropped rather than listed as a broken row: this
+    /// answers "what does this note point at that exists", and the editor is
+    /// where an unresolved `[[link]]` is already visible as one.
+    ///
+    /// Self-links are excluded on the same grounds backlinks excludes them: a
+    /// note is not its own neighbour.
+    pub fn forwardlinks(&self, id: &str) -> Vec<&IndexEntry> {
+        let Some(entry) = self.by_id(id) else {
+            return Vec::new();
+        };
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for target in &entry.links {
+            if let Some(found) = self.resolve_link(target) {
+                if found.id != id {
+                    seen.insert(found.id.as_str());
+                }
+            }
+        }
+        let mut rows: Vec<&IndexEntry> = seen.into_iter().filter_map(|s| self.by_id(s)).collect();
         rows.sort_by(|a, b| a.path.cmp(&b.path));
         rows
     }
@@ -904,6 +945,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
+            link_attrs: std::collections::BTreeMap::new(),
             flags: Vec::new(),
             snippet: String::new(),
             order: NoteOrder::default(),

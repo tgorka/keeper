@@ -242,6 +242,7 @@ export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
 export type { SyncGitState } from "./gen/SyncGitState";
 export type { SyncGitVm } from "./gen/SyncGitVm";
 export type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
@@ -386,6 +387,7 @@ import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
+import type { SyncFootprintVm } from "./gen/SyncFootprintVm";
 import type { SyncGitVm } from "./gen/SyncGitVm";
 import type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
 import type { SyncOutcomeVm } from "./gen/SyncOutcomeVm";
@@ -3128,6 +3130,26 @@ export async function syncRescan(id: string): Promise<void> {
 }
 
 /**
+ * What one synced folder costs on this disk, decomposed (Story 55.9).
+ *
+ * **There is no server total in the answer**, and the absence is deliberate: no
+ * generic git request asks a remote how large it is, and a figure that appeared
+ * only for hosts with their own API would be worse than none. What comes back
+ * is the half that explains the gap a person actually notices — the bytes held
+ * here that the remote already has, and the scratch an interrupted run left.
+ *
+ * Walks a tree that may live on a slow external volume, so it is asked for when
+ * a card is on screen rather than folded into the status poll.
+ *
+ * Rejects with: `syncUnavailable`, `internal` — including for a folder whose
+ * volume is not mounted, which cannot be measured and whose absence the card's
+ * status line already reports.
+ */
+export async function syncFootprint(id: string): Promise<SyncFootprintVm> {
+  return await invoke<SyncFootprintVm>("sync_footprint", { id });
+}
+
+/**
  * Open a synced folder in the OS file manager (Finder on macOS).
  *
  * Takes the profile id, never a path: Rust reads the folder off the stored
@@ -3230,6 +3252,26 @@ export async function syncOpenEntry(id: string, subpath: string): Promise<void> 
  */
 export async function syncReadText(id: string, subpath: string): Promise<TextFileVm> {
   return await invoke<TextFileVm>("sync_read_text", { id, subpath });
+}
+
+/**
+ * Write an HTML file's rendered page beside it as a PDF (Story 56, macOS).
+ *
+ * Same stem, same folder: `deck-v8.html` produces `deck-v8.pdf`, and pressing
+ * it again overwrites that rather than piling up a second copy. The point of
+ * the button is that the two files stay the same document, so the PDF is
+ * rendered by the webview — the same renderer the Page tab draws with, in an
+ * off-screen window that mounts nothing else.
+ *
+ * Resolves with the name of the file written, so the caller can say what it
+ * made instead of guessing at it.
+ *
+ * Rejects with: `unsupported`, `internal`. On a platform that is not macOS it
+ * rejects saying so — the renderer is WebKit's and there is no substitute
+ * pretending otherwise.
+ */
+export async function syncExportPdf(id: string, subpath: string): Promise<string> {
+  return await invoke<string>("sync_export_pdf", { id, subpath });
 }
 
 /**
@@ -4310,6 +4352,36 @@ export async function notesResolveLink(vaultId: string, target: string): Promise
  */
 export async function notesBacklinks(vaultId: string, noteId: string): Promise<NoteRowVm[]> {
   return await invoke<NoteRowVm[]>("notes_backlinks", { vaultId, noteId });
+}
+
+/**
+ * The notes this one links TO — the other direction of {@link notesBacklinks},
+ * projected from the same graph and stored no more than that one is.
+ *
+ * Deduplicated by note rather than by target, so a body naming the same note
+ * twice lists it once, and a target nothing answers to is left out entirely:
+ * this is what the note points at that exists, and an unresolved `[[link]]` is
+ * already visible where it was written.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesForwardlinks(vaultId: string, noteId: string): Promise<NoteRowVm[]> {
+  return await invoke<NoteRowVm[]>("notes_forwardlinks", { vaultId, noteId });
+}
+
+/**
+ * Every value this vault already uses for one frontmatter key.
+ *
+ * For a field whose values are a convention rather than a closed set — `stage`,
+ * `status`, `location` — the vault is the vocabulary. Offering what is already
+ * in use is what stops the fourth note inventing `outreach ready` beside three
+ * that say `outreach-ready`, without keeper pretending it knows which words are
+ * allowed: the control suggests, and still accepts anything typed.
+ *
+ * Rejects with: `invalidInput`, `unsupported`, `internal`.
+ */
+export async function notesFieldVocabulary(vaultId: string, key: string): Promise<string[]> {
+  return await invoke<string[]>("notes_field_vocabulary", { vaultId, key });
 }
 
 /**

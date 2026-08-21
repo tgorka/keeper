@@ -1424,8 +1424,17 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     if templates::is_template(&fm) || rel.starts_with(&format!("{}/", templates::TEMPLATES_DIR)) {
         flags.push("template".to_owned());
     }
-    if rel.starts_with("spaces/") {
+    // The folder decides, EXCEPT for the two files OKF reserves. `index.md` is
+    // generated from the documents around it and `log.md` is a hand-kept
+    // ledger; neither carries frontmatter, so neither can carry a query. Left
+    // in, a generated listing under `spaces/` becomes a space that selects
+    // nothing and says its query cannot be read — which is what the vault that
+    // prompted this was showing. That is not a broken space; it is not a space.
+    if rel.starts_with("spaces/") && !keeper_core::notes::is_okf_reserved(rel) {
         flags.push("space".to_owned());
+    }
+    if keeper_core::notes::is_okf_reserved(rel) {
+        flags.push("generated".to_owned());
     }
     if rel.starts_with("journal/") {
         flags.push("journal".to_owned());
@@ -1487,6 +1496,25 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
             .into_iter()
             .map(|link| link.target)
             .collect(),
+        // The first predicate wins per target — see `IndexEntry::link_attrs`.
+        // `reference` is the key the convention uses for "what kind of link is
+        // this"; another key on the same link is kept out of the graph rather
+        // than guessed at, because only `reference` has an agreed meaning.
+        link_attrs: links::extract(body)
+            .into_iter()
+            .filter_map(|link| {
+                link.attrs
+                    .iter()
+                    .find(|(key, _)| key == "reference")
+                    .map(|(_, value)| (link.target.clone(), value.clone()))
+            })
+            .fold(
+                std::collections::BTreeMap::new(),
+                |mut acc, (target, value)| {
+                    acc.entry(target).or_insert(value);
+                    acc
+                },
+            ),
         flags,
         snippet: snippet(body),
         // Read once, here, so the list's comparator never re-parses a string
@@ -2805,6 +2833,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
+            link_attrs: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),

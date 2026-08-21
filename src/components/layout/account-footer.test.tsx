@@ -124,11 +124,16 @@ describe("AccountFooter", () => {
     expect(screen.getByLabelText("Syncing")).toBeInTheDocument();
   });
 
-  it("shows the synced glyph when the account is online", () => {
+  // Online is the state the account is in almost all the time, and a glyph that
+  // is present whenever nothing is wrong says nothing to the person reading it.
+  // The two states that are not fine still draw one; this one draws nothing.
+  it("draws no glyph when the account is online, because that is the boring case", () => {
     accountsStore.getState().hydrateAll([alice]);
     accountStatusStore.getState().setStatus(alice.accountId, "online");
     renderFooter();
-    expect(screen.getByLabelText("Synced")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Synced")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Syncing")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Offline")).not.toBeInTheDocument();
   });
 
   it("shows the offline glyph when the account is offline", () => {
@@ -138,49 +143,61 @@ describe("AccountFooter", () => {
     expect(screen.getByLabelText("Offline")).toBeInTheDocument();
   });
 
-  it("clicking an account row filters the inbox to it; clicking again clears it", () => {
+  /**
+   * Story 55.10 reverses Story 49's answer, at the owner's second asking.
+   *
+   * 49 was asked for the same thing — the `⋮` gone, the row opening the menu —
+   * and declined it, for a reason worth keeping: the row was the inbox account
+   * filter, so putting a menu on its click deleted one-click filtering to buy
+   * back one glyph. That reasoning was right about the cost and wrong about the
+   * only way to pay it. The filter is now the menu's first item, so it is still
+   * one control away and its state is still visible; what it costs is a second
+   * click, which is the trade the owner asked for twice.
+   *
+   * What must not regress: the filter still exists, still toggles, and still
+   * shows whether it is on.
+   */
+  it("filters the inbox from the row's menu, and says whether the filter is on", async () => {
     accountsStore.getState().hydrateAll([alice, bob]);
     renderFooter();
-    const row = screen.getByRole("button", { name: `Filter inbox to ${alice.userId}` });
-    fireEvent.click(row);
+
+    await openRowMenu(alice.userId);
+    fireEvent.click(
+      screen.getByRole("menuitemcheckbox", { name: `Filter inbox to ${alice.userId}` }),
+    );
     expect(accountsStore.getState().filterAccountId).toBe(alice.accountId);
-    // The active row now offers to clear the filter.
-    fireEvent.click(screen.getByRole("button", { name: `Clear filter for ${alice.userId}` }));
+
+    await openRowMenu(alice.userId);
+    const clear = screen.getByRole("menuitemcheckbox", {
+      name: `Clear filter for ${alice.userId}`,
+    });
+    // Checked, not merely relabelled: the row used to carry `aria-pressed` and
+    // something has to keep saying the filter is on.
+    expect(clear).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(clear);
     expect(accountsStore.getState().filterAccountId).toBeNull();
   });
 
   /**
-   * Story 49, and the trap in the request.
+   * One control per account in the expanded footer.
    *
-   * The owner asked for the `⋮` to go and the avatar to open the menu. The
-   * avatar is not a picture — it is the inbox account filter, pinned by the
-   * test above — so a menu on its click would have deleted one-click filtering
-   * to buy back one glyph. What went instead is the `⋮`'s PERMANENCE: it is
-   * still a button, still named, still in the tab order, and on the folded rail
-   * it no longer costs a second storey under every avatar. This asserts the two
-   * controls are still two, which is the part a hover class could silently
-   * undo.
+   * The `⋮` sat in a reserved gutter beside a row that did something else, which
+   * is two controls and one of them 24px wide. The row is the control now, and
+   * the gutter is width the account's own name gets back — so a second button
+   * reappearing here is the regression, not a detail.
    */
-  it("keeps the avatar as the filter toggle and the menu as a separate control", () => {
+  it("gives an expanded row one control, not a row plus a three-dot button", () => {
     accountsStore.getState().hydrateAll([alice]);
     renderFooter();
 
-    const filter = screen.getByRole("button", {
-      name: `Filter inbox to ${alice.userId}`,
-      pressed: false,
-    });
-    const menu = screen.getByRole("button", { name: `Account menu for ${alice.userId}` });
-    expect(menu).not.toBe(filter);
-    // The menu trigger is not a toggle and must not claim to be one.
-    expect(menu).not.toHaveAttribute("aria-pressed");
-
-    // Pressing the avatar filters. It does not open a menu.
-    fireEvent.click(filter);
-    expect(accountsStore.getState().filterAccountId).toBe(alice.accountId);
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: `Clear filter for ${alice.userId}`, pressed: true }),
-    ).toBeInTheDocument();
+    const trigger = screen.getByRole("button", { name: `Account menu for ${alice.userId}` });
+    // The row itself: it carries the account's name, so it is not a glyph in a
+    // gutter.
+    expect(trigger).toHaveTextContent(alice.userId);
+    expect(screen.getAllByRole("button", { name: /alice/ })).toHaveLength(1);
+    // A trigger is not a toggle and must not claim to be one; the filter's
+    // state lives on the menu item now.
+    expect(trigger).not.toHaveAttribute("aria-pressed");
   });
 
   it("keeps the collapsed row's menu reachable from the keyboard even though it is quiet", () => {
@@ -370,17 +387,32 @@ describe("AccountFooter", () => {
     });
   });
 
-  it("renders avatar-only rows with a menu when collapsed", () => {
+  it("renders avatar-only rows, and the avatar is the menu", () => {
     accountsStore.getState().hydrateAll([alice]);
     renderFooter(true);
     expect(screen.queryByText(alice.userId)).not.toBeInTheDocument();
+
+    // One control per account, folded as well as unfolded. The avatar used to
+    // toggle the inbox filter while a separate dot in the corner opened the
+    // menu, so the same press meant different things in the two shapes and the
+    // menu sat behind a target a few pixels wide.
     expect(
-      screen.getByRole("button", { name: `Filter inbox to ${alice.userId}` }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: `Filter inbox to ${alice.userId}` }),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: `Account menu for ${alice.userId}` }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  it("still offers the filter, from the menu the avatar opens", async () => {
+    accountsStore.getState().hydrateAll([alice]);
+    renderFooter(true);
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: `Account menu for ${alice.userId}` }));
+    expect(
+      await screen.findByRole("menuitemcheckbox", { name: `Filter inbox to ${alice.userId}` }),
+    ).toBeInTheDocument();
   });
 
   // ── Global Do-Not-Disturb toggle (Story 10.2) ──────────────────────────────

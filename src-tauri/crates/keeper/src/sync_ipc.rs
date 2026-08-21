@@ -211,6 +211,100 @@ impl From<&SyncProfile> for SyncProfileVm {
     }
 }
 
+/// What a synced folder costs on this disk, decomposed (Story 55.9).
+///
+/// **There is no server total here, and its absence is deliberate.** No generic
+/// git request asks a remote how large it is; a host's own API can answer, and
+/// keeper syncs to plain git, so a figure that appeared for one host and not
+/// another would be worse than none. What is knowable without asking anyone is
+/// the half that explains the gap a person actually notices — the bytes held
+/// here that the remote already has.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFootprintVm {
+    /// Everything under the folder, working tree and `.git` together.
+    ///
+    /// `number` rather than ts-rs's `bigint` for `u64`, the same reading every
+    /// other byte count in this file takes: JSON loses precision above 2^53, and
+    /// 2^53 bytes is nine petabytes.
+    pub on_disk: u64,
+    /// The local LFS object cache — the second copy of large content. Inside
+    /// `on_disk`, never beside it.
+    pub lfs_cache: u64,
+    /// Cache the remote already holds, which keeper may release at any time.
+    /// This is the number that explains "why is it bigger here than there".
+    pub reclaimable: u64,
+    /// Transfer scratch left by interrupted runs. Swept by "Recheck all files".
+    pub scratch: u64,
+    /// Everything this folder tracks at full size, whether or not the bytes are
+    /// on this machine — which is what the server holds, worked out without
+    /// asking it.
+    ///
+    /// There is no request in the git protocol for "how big are you", and a
+    /// number that only appeared for one host would be worse than none. But an
+    /// LFS pointer states the size of the object it stands for, so a folder can
+    /// weigh its own contents whether or not it has fetched them. That is the
+    /// number a virtual folder needs: `content` minus `on_disk` is what would
+    /// still be out there.
+    pub content: u64,
+    /// The same five numbers as people read them.
+    ///
+    /// Formatted here, by the one formatter, because a second one in TypeScript
+    /// is how this row and the Files pane's size column end up disagreeing about
+    /// the same folder.
+    pub on_disk_label: String,
+    pub lfs_cache_label: String,
+    pub reclaimable_label: String,
+    pub scratch_label: String,
+    pub content_label: String,
+}
+
+/// Measure one folder's footprint.
+///
+/// Blocking: it walks and stats a tree that may be on a slow external volume,
+/// and doing that on the async runtime would stall every other command sharing
+/// the thread — the same reason `notes_embed_paths` spawns.
+#[tauri::command]
+pub async fn sync_footprint(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SyncFootprintVm, IpcError> {
+    let engine = engine_of(&state)?;
+    // `list_profiles` because that is the accessor the engine offers; a folder
+    // that has been removed between the click and this call is a missing id,
+    // not an error worth a dialog.
+    let profile = engine
+        .list_profiles()
+        .map_err(|e| sync_ipc_error(&e))?
+        .into_iter()
+        .find(|candidate| candidate.id == id)
+        .ok_or_else(|| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!(
+                "no such sync profile: {id}"
+            )))
+        })?;
+    let root = profile.local_path.clone();
+    let measured = tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root))
+        .await
+        .map_err(|err| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
+        })?
+        .map_err(|e| sync_ipc_error(&e))?;
+    Ok(SyncFootprintVm {
+        on_disk: measured.on_disk,
+        lfs_cache: measured.lfs_cache,
+        reclaimable: measured.reclaimable,
+        scratch: measured.scratch,
+        content: measured.content,
+        on_disk_label: keeper_core::size::format_file_size(measured.on_disk),
+        lfs_cache_label: keeper_core::size::format_file_size(measured.lfs_cache),
+        reclaimable_label: keeper_core::size::format_file_size(measured.reclaimable),
+        scratch_label: keeper_core::size::format_file_size(measured.scratch),
+        content_label: keeper_core::size::format_file_size(measured.content),
+    })
+}
+
 /// What a profile is doing right now — the polled snapshot the tray reads.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -2221,6 +2315,148 @@ pub async fn sync_read_text(
 /// escapes the root, a file that is no longer on disk, an unreadable file). A
 /// file that is readable but is not a document keeper knows is NOT a rejection
 /// — it is a `DocumentVm` carrying a sentence, because the viewer draws that.
+
+/// Write `subpath`'s rendered page beside it as a PDF (Story 56, macOS).
+///
+/// The renderer is the webview, because there is no Rust crate that lays out
+/// HTML and CSS to a standard somebody comparing the two files would accept —
+/// and a PDF that does not look like the page defeats the button, whose whole
+/// point is that the two stay the same document. See `pdf_export`.
+///
+/// Returns the subpath of the file written, so the caller can say what it made
+/// rather than guessing at the name.
+#[tauri::command]
+pub async fn sync_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Stated rather than silently absent: the renderer is the webview, and
+        // asking one for a PDF is `createPDF`, which is a WebKit method. A
+        // platform where that does not exist needs a different renderer, not a
+        // different call — so the honest answer here is that this is not built
+        // yet, named as such.
+        let _ = (&app, &state, &id, &subpath);
+        return Err(open_failure(
+            "exporting a PDF is macOS-only for now: it renders through the webview".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder};
+
+        let engine = engine_of(&state)?;
+        let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+        let profile = find_profile(&profiles, &id)?;
+        let source = browse::resolve(&profile.local_path, &subpath)
+            .map_err(|refusal| open_failure(refusal.to_string()))?
+            .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+        let out = crate::pdf_export::pdf_beside(&source);
+
+        // A label per export, so two of them cannot collide and a leaked window from
+        // a previous failure cannot be mistaken for this one's.
+        let label = format!("print-{}", uuid_like(&subpath));
+        if let Some(stale) = app.get_webview_window(&label) {
+            let _ = stale.destroy();
+        }
+        let url = format!(
+            "print.html?profile={}&subpath={}",
+            keeper_core::capture::query_encode(&id),
+            keeper_core::capture::query_encode(&subpath)
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let ready = tx.clone();
+        let failed = tx;
+        let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+            .title("keeper — printing")
+            .inner_size(
+                crate::pdf_export::PAGE_SIZE.0,
+                crate::pdf_export::PAGE_SIZE.1,
+            )
+            .position(
+                crate::pdf_export::OFFSCREEN.0,
+                crate::pdf_export::OFFSCREEN.1,
+            )
+            .visible(true)
+            .decorations(false)
+            .skip_taskbar(true)
+            .build()
+            .map_err(|err| open_failure(format!("could not open a window to render in: {err}")))?;
+
+        tracing::info!(
+            profile = %id,
+            subpath = %subpath,
+            label = %label,
+            out = %out.display(),
+            "pdf export: window opened"
+        );
+        window.listen(crate::pdf_export::READY_EVENT, move |_| {
+            tracing::info!("pdf export: the page reported it is laid out");
+            let _ = ready.try_send(Ok(()));
+        });
+        window.listen(crate::pdf_export::FAILED_EVENT, move |event| {
+            let said = event.payload().trim_matches('"').to_owned();
+            tracing::warn!(said = %said, "pdf export: the page refused");
+            let _ = failed.try_send(Err(said));
+        });
+
+        let rendered = tokio::task::spawn_blocking(move || {
+            match rx.recv_timeout(crate::pdf_export::RENDER_LIMIT) {
+                Ok(answer) => answer,
+                Err(_) => Err("the page never reported that it was ready".to_owned()),
+            }
+        })
+        .await
+        .map_err(|err| open_failure(format!("waiting for the page failed: {err}")))?;
+
+        let captured = match rendered {
+            Ok(()) => {
+                let window = window.clone();
+                tokio::task::spawn_blocking(move || crate::pdf_export::capture(&window))
+                    .await
+                    .map_err(|err| open_failure(format!("rendering failed: {err}")))?
+            }
+            Err(said) => Err(said),
+        };
+
+        // Always, and before the answer is read: a window left off-screen is a
+        // window nobody can find to close.
+        let _ = window.destroy();
+
+        let bytes = match captured {
+            Ok(bytes) => {
+                tracing::info!(bytes = bytes.len(), "pdf export: rendered");
+                bytes
+            }
+            Err(said) => {
+                tracing::error!(said = %said, "pdf export: failed");
+                return Err(open_failure(said));
+            }
+        };
+        std::fs::write(&out, &bytes)
+            .map_err(|err| open_failure(format!("could not write {}: {err}", out.display())))?;
+        Ok(out
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| subpath.clone()))
+    }
+}
+
+/// A label-safe token for one subpath. Not an identifier anybody stores — it
+/// only has to be stable within a run and free of characters a window label
+/// refuses.
+#[cfg(target_os = "macos")]
+fn uuid_like(subpath: &str) -> String {
+    subpath
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn sync_read_document(
     state: tauri::State<'_, AppState>,

@@ -239,6 +239,61 @@ const TASK_MARKER = /^\[[ xX]]$/;
  * the caret onto the line, the reveal rule would show the line's source, and
  * the checkbox would vanish out from under the click that was toggling it.
  */
+/**
+ * The predicate a link carries, drawn as a chip in place of its braces.
+ *
+ * `[Belief](belief.md){reference="supports"}` reads as a link followed by four
+ * words of punctuation until the braces are replaced by the word they contain.
+ * The chip is the author's own vocabulary — keeper neither invents a predicate
+ * nor translates one — so it is shown verbatim.
+ *
+ * Replaced rather than hidden: hiding the braces would leave a link that says
+ * "supports" nowhere, and the whole point of writing one is that a reader can
+ * see what kind of link it is without opening the source.
+ */
+class PredicateWidget extends WidgetType {
+  constructor(private readonly predicate: string) {
+    super();
+  }
+
+  eq(other: PredicateWidget): boolean {
+    return other.predicate === this.predicate;
+  }
+
+  toDOM(): HTMLElement {
+    const chip = document.createElement("span");
+    chip.className = "cm-lp-predicate";
+    chip.textContent = this.predicate;
+    // Named for a screen reader, which gets the link and then this and would
+    // otherwise hear a bare word with no relationship to what precedes it.
+    chip.setAttribute("aria-label", `link kind: ${this.predicate}`);
+    return chip;
+  }
+
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+/**
+ * The attribute block after a link, if there is one: `{reference="supports"}`.
+ *
+ * The markdown parser has never heard of these, so they arrive as ordinary text
+ * after the link node and this reads them off the document directly. Same rules
+ * as the Rust side, and they have to stay the same: no space before the brace,
+ * a quoted value, one line.
+ */
+const LINK_ATTRS = /^\{([^}\n]*)\}/;
+
+function predicateAfter(text: string): { predicate: string; length: number } | null {
+  const block = LINK_ATTRS.exec(text);
+  if (block === null) {
+    return null;
+  }
+  const pair = /(?:^|\s)reference\s*=\s*"([^"]+)"/.exec(block[1] ?? "");
+  return pair === null ? null : { predicate: pair[1] ?? "", length: block[0].length };
+}
+
 class TaskWidget extends WidgetType {
   constructor(private readonly checked: boolean) {
     super();
@@ -378,6 +433,17 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
                 destination === null ? {} : { title: destination, [LINK_ATTR]: destination },
             }).range(node.from, node.to),
           );
+          // `{reference="…"}` written straight after the link. The parser has
+          // never heard of it, so it is plain text sitting after this node and
+          // has to be read off the document.
+          const trailing = predicateAfter(doc.sliceString(node.to, node.to + 200));
+          if (trailing !== null && !isRevealed(node.to, node.to + trailing.length)) {
+            decorations.push(
+              Decoration.replace({
+                widget: new PredicateWidget(trailing.predicate),
+              }).range(node.to, node.to + trailing.length),
+            );
+          }
           return undefined;
         }
 
@@ -621,6 +687,26 @@ export function flashExternal(view: EditorView, from: number, to: number): void 
 }
 
 const livePreviewTheme = EditorView.baseTheme({
+  // The floor under every widget this editor draws, and the reason it is one
+  // line rather than a rule per widget.
+  //
+  // `.cm-content` is a flex item of `.cm-scroller`, so its `min-width` is `auto`
+  // — the widest thing inside it. `EditorView.lineWrapping` makes prose wrap to
+  // that width, which means ONE wide, unbreakable child re-lays the whole
+  // document at its width and the pane clips the rest. Every wide block here is
+  // supposed to be contained and most of them are; a note in the vault proves
+  // they are not all contained, and hunting the last one is a game with no end
+  // — the next widget somebody adds starts it again.
+  //
+  // Measured against a real CodeMirror with `lineWrapping` and one uncontained
+  // block, in a 600px pane: `.cm-content` came out **1796px**, which is exactly
+  // what the pane was showing. With this line, 600px, and the block keeps its
+  // own `overflow-x` so nothing becomes unreachable — it scrolls inside itself
+  // instead of dragging the prose out of the pane with it.
+  ".cm-content": {
+    minWidth: "0",
+  },
+
   ".cm-lp-strong": { fontWeight: "600" },
   ".cm-lp-em": { fontStyle: "italic" },
   ".cm-lp-strike": { textDecoration: "line-through" },
@@ -675,6 +761,17 @@ const livePreviewTheme = EditorView.baseTheme({
   // Sized and spaced to occupy the three columns `[ ]` occupied, so ticking a
   // box does not reflow the paragraph and neither does moving the caret onto
   // the line and getting the source back.
+  // The chip a link's predicate is drawn as. Quiet: it is a label on something
+  // else, not a thing in its own right, and a note with many of them should
+  // still read as prose rather than as a list of badges.
+  ".cm-lp-predicate": {
+    marginInlineStart: "0.3em",
+    padding: "0 0.35em",
+    borderRadius: "0.25em",
+    background: "var(--muted)",
+    color: "var(--muted-foreground)",
+    fontSize: "0.85em",
+  },
   ".cm-lp-task": {
     verticalAlign: "middle",
     margin: "0 0.15em",
@@ -1050,3 +1147,6 @@ export function livePreview(options: LivePreviewOptions): Extension {
     livePreviewTheme,
   ];
 }
+
+/** The predicate reader, for the test that pins it against the Rust rules. */
+export const __predicateAfterForTest = predicateAfter;

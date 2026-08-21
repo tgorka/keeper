@@ -125,13 +125,14 @@
  * form above it" the ordinary way to use this pane — and it destroyed the
  * paragraph, silently, with no prompt.
  */
-import { ChevronDown, ChevronRight, SlidersHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, FileBadge, SlidersHorizontal } from "lucide-react";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { PaneHeader } from "@/components/layout/pane-header";
 import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
 import { FileProperties, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { Button } from "@/components/ui/button";
+import { syncExportPdf } from "@/lib/ipc/client";
 import {
   fileFrameFoldStore,
   hydrateFileFrameFold,
@@ -174,6 +175,19 @@ export const FILE_SAVE_SIZERS: readonly string[] = [fileSaveWord(true)];
 
 /** The Save control. Named as the verb, not as the state. */
 export const FILE_SAVE_LABEL = "Save";
+
+/**
+ * The control that writes a PDF beside an HTML file (Story 56).
+ *
+ * "PDF", not "Export…" and not "Save as…": there is no dialog and no choice to
+ * make. The file's name and folder are decided by the file it comes from, which
+ * is the whole point — a person edits the page and presses this again, and the
+ * PDF beside it is the page they just edited.
+ */
+export const FILE_PDF_LABEL = "PDF";
+
+/** What the control says while WebKit is laying the document out. */
+export const FILE_PDF_WORKING_LABEL = "Rendering…";
 
 /**
  * Why Save is disabled when it is.
@@ -478,6 +492,13 @@ export function TextFileFrame({
   // resolves to the wrong pane.
   const frameId = useId();
   const propertiesRegionId = `${frameId}-properties`;
+
+  // What the PDF control is doing, and what it last said. `null` is "not asked
+  // yet"; a string is the sentence to show, whether that is the name of the file
+  // written or the reason there is none. One state, because a reader wants the
+  // same place to look either way.
+  const [pdfWorking, setPdfWorking] = useState(false);
+  const [pdfSaid, setPdfSaid] = useState<string | null>(null);
   const caveatRegionId = `${frameId}-caveat`;
 
   // The `---` block the properties form below is holding: `null` while its read
@@ -827,6 +848,34 @@ export function TextFileFrame({
                   than gone, the way `tag-combobox.tsx:388` and
                   `sidebar-group.tsx:215` do it. Not `FoldSection`, which is the
                   48px rail-row shape. */}
+              {/* Offered for an HTML file that this surface has an address for,
+                  and for nothing else. A PDF of a CSV is a question nobody
+                  asked, and a file with no profile coordinates has nowhere to
+                  put one. */}
+              {entry.format !== "html" || properties === null ? null : (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  className="shrink-0"
+                  disabled={pdfWorking}
+                  onClick={() => {
+                    setPdfWorking(true);
+                    setPdfSaid(null);
+                    void syncExportPdf(properties.profileId, properties.relativePath)
+                      .then((name) => setPdfSaid(`Wrote ${name}`))
+                      .catch((error: unknown) =>
+                        setPdfSaid(error instanceof Error ? error.message : String(error)),
+                      )
+                      .finally(() => setPdfWorking(false));
+                  }}
+                >
+                  <FileBadge aria-hidden="true" />
+                  <span className={budget >= PROPERTIES_WORD_BUDGET_PX ? undefined : "sr-only"}>
+                    {pdfWorking ? FILE_PDF_WORKING_LABEL : FILE_PDF_LABEL}
+                  </span>
+                </Button>
+              )}
               {propertiesPanel === null ? null : (
                 <Button
                   type="button"
@@ -928,6 +977,16 @@ export function TextFileFrame({
       {error === null ? null : (
         <p className="shrink-0 border-b px-3 py-1.5 text-destructive text-xs" role="alert">
           {error}
+        </p>
+      )}
+      {/* What the last PDF press did, in one line: the name of the file written
+          or the reason there is none. `status` rather than `alert` for both —
+          a failed export leaves the document untouched, so it is news and not
+          an emergency, and switching roles by outcome would make a screen
+          reader interrupt for one and not the other. */}
+      {pdfSaid === null ? null : (
+        <p className="shrink-0 border-b px-3 py-1.5 text-muted-foreground text-xs" role="status">
+          {pdfSaid}
         </p>
       )}
       {/* Above the editor and below the banners, which is where the note editor

@@ -35,6 +35,7 @@ function row(order: NoteOrder, overrides: Partial<NoteRowVm> = {}): NoteRowVm {
     path: "notes/n1.md",
     title: "A note",
     snippet: "the body excerpt",
+    predicate: null,
     tags: [],
     updatedMs: Date.now() - 3_600_000,
     pinned: false,

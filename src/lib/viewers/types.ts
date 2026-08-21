@@ -144,6 +144,8 @@ export type IconName =
   | "file-table"
   | "file-json"
   | "file-document"
+  | "file-pdf"
+  | "file-slides"
   | "folder"
   | "file-question";
 

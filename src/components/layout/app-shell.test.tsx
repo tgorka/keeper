@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
+import { SIDEBAR_WIDTH_CLASS } from "@/components/layout/sidebar-pane";
 import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -274,7 +275,7 @@ describe("AppShell", () => {
     const columns = document.querySelectorAll("[data-tauri-drag-region]");
     expect(columns).toHaveLength(2);
     // The drawer column is exactly the drawer's width, then the rest of the row.
-    expect(columns[0]).toHaveClass("bg-sidebar", "w-[260px]");
+    expect(columns[0]).toHaveClass("bg-sidebar", SIDEBAR_WIDTH_CLASS.expanded);
     expect(columns[1]).toHaveClass("bg-background");
   });
 
@@ -483,7 +484,9 @@ describe("AppShell", () => {
     });
 
     expect(screen.getByRole("button", { name: "Collapse menu" })).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-[260px]");
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass(
+      SIDEBAR_WIDTH_CLASS.expanded,
+    );
   });
 
   it("folds on the press and writes it out, so the next run reads it back", async () => {

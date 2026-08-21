@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "print",
+  "description": "Least-privilege capability for the off-screen window a PDF is rendered in (Story 56). Every capability file in this app is window-scoped and a window with no file of its own can invoke NOTHING — it renders and sits inert, which looks like a frontend bug and is not, so this file exists the moment the window does. The grant is `core:default` and nothing else: the window has to reach the app's own invoke path to read the file it is printing, and to emit the one event that tells Rust the page is laid out. It needs no dialog, no opener, no filesystem and above all no window permission — this window is positioned off-screen deliberately, and a webview that could place itself could place itself back. The label is `print-<subpath with every non-alphanumeric character replaced>`, which is why the glob is what it is; a window whose label matches nothing here fails silently, so `sync_export_pdf` and this list have to agree.",
+  "windows": ["print-*"],
+  "platforms": ["macOS"],
+  "permissions": ["core:default"]
+}

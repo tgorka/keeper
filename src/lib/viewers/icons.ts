@@ -24,6 +24,7 @@
  */
 import type { LucideIcon } from "lucide-react";
 import {
+  FileBadge,
   FileBraces,
   FileCode,
   FileHeadphone,
@@ -34,6 +35,7 @@ import {
   FileText,
   FileType,
   Folder,
+  Presentation,
 } from "lucide-react";
 import type { IconName } from "./types";
 
@@ -47,6 +49,14 @@ export const VIEWER_ICON: Record<IconName, LucideIcon> = {
   "file-table": FileSpreadsheet,
   "file-json": FileBraces,
   "file-document": FileType,
+  // A sealed page. PDF is where a document goes when it is finished — the
+  // signed LOI, the deck that was sent — and the seal is the one thing that
+  // separates it from the editable formats around it.
+  "file-pdf": FileBadge,
+  // Not a `File…` glyph, and that is the point: slides are the one format in
+  // this table that is not read as a page, so drawing it as a page beside the
+  // others is what made a deck indistinguishable from a PDF at a glance.
+  "file-slides": Presentation,
   folder: Folder,
   "file-question": FileQuestionMark,
 };

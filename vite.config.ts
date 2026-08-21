@@ -48,6 +48,7 @@ export default defineConfig(async () => ({
       input: {
         main: path.resolve(__dirname, "index.html"),
         capture: path.resolve(__dirname, "capture.html"),
+        print: path.resolve(__dirname, "print.html"),
       },
     },
   },

@@ -27,8 +27,62 @@ pub struct RawLink {
     pub alias: Option<String>,
     /// `![[…]]` or `![…](…)`: render the target inline rather than link to it.
     pub embed: bool,
-    /// Byte range of the whole link syntax in the body, `!` included.
+    /// Byte range of the whole link syntax in the body, `!` included — and the
+    /// attribute block too, when there is one, because a renderer that hides
+    /// the syntax has to hide all of it.
     pub span: (usize, usize),
+    /// The attribute block written after the link, as written: `{reference="x"}`
+    /// gives `[("reference", "x")]`.
+    ///
+    /// The convention is Pandoc's and Obsidian leaves it alone, which is what
+    /// makes it usable here: a vault carrying these still opens in an editor
+    /// that has never heard of them, and the attributes read as text rather
+    /// than breaking the link.
+    ///
+    /// Empty for the overwhelming majority of links. A pair whose value is not
+    /// quoted is dropped rather than guessed at — `{reference=aaa bbb}` has no
+    /// reading that is obviously right, and a wrong predicate is worse than an
+    /// absent one in a graph somebody queries.
+    pub attrs: Vec<(String, String)>,
+}
+
+/// Read a `{key="value" other="thing"}` block starting at `at`, if one is there.
+///
+/// Returns the pairs and the byte just past the closing brace. The block has to
+/// begin immediately after the link — one space is not allowed, because
+/// `[a](b) {this}` is a sentence with braces in it and `[a](b){this}` is a link
+/// with attributes, and only the author knows which they meant.
+pub fn read_attrs(body: &str, at: usize) -> Option<(Vec<(String, String)>, usize)> {
+    if body.as_bytes().get(at) != Some(&b'{') {
+        return None;
+    }
+    let limit = line_limit(body, at);
+    let close = body[at..limit].find('}')? + at;
+    let inner = &body[at + 1..close];
+    let mut pairs = Vec::new();
+    for chunk in inner.split_whitespace() {
+        let Some((key, value)) = chunk.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            });
+        let Some(unquoted) = unquoted else {
+            continue;
+        };
+        if key.is_empty() || unquoted.is_empty() {
+            continue;
+        }
+        pairs.push((key.to_owned(), unquoted.to_owned()));
+    }
+    Some((pairs, close + 1))
 }
 
 /// Every link in a body, in document order.
@@ -97,11 +151,19 @@ fn wikilink(body: &str, start: usize, outer: usize, embed: bool) -> Option<RawLi
         return None;
     }
 
+    // A wikilink can carry them too. Obsidian writes none, but a vault that
+    // adopts the convention should not have to remember which of its two link
+    // syntaxes it applies to.
+    let (attrs, end) = match read_attrs(body, close + 2) {
+        Some((pairs, past)) => (pairs, past),
+        None => (Vec::new(), close + 2),
+    };
     Some(RawLink {
         target,
         alias: alias.filter(|a| !a.is_empty()),
         embed,
-        span: (outer, close + 2),
+        span: (outer, end),
+        attrs,
     })
 }
 
@@ -140,11 +202,20 @@ fn markdown_link(body: &str, start: usize, outer: usize, embed: bool) -> Option<
     let target = percent_decode_str(target).decode_utf8_lossy().into_owned();
 
     let text = body[start + 1..text_end].trim();
+    // Attributes come after the destination, with no space between: see
+    // `read_attrs`. The span grows to cover them, because a renderer that hides
+    // the link syntax has to hide the attributes too or they are left on screen
+    // as loose braces.
+    let (attrs, end) = match read_attrs(body, dest_end + 1) {
+        Some((pairs, past)) => (pairs, past),
+        None => (Vec::new(), dest_end + 1),
+    };
     Some(RawLink {
         target,
         alias: (!text.is_empty()).then(|| text.to_owned()),
         embed,
-        span: (outer, dest_end + 1),
+        span: (outer, end),
+        attrs,
     })
 }
 
@@ -294,5 +365,92 @@ mod tests {
     #[test]
     fn adjacent_links_are_all_found() {
         assert_eq!(targets("[[A]][[B]][[C]]"), vec!["A", "B", "C"]);
+    }
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::*;
+
+    fn only(body: &str) -> RawLink {
+        let found = extract(body);
+        assert_eq!(found.len(), 1, "expected exactly one link in {body:?}");
+        found.into_iter().next().expect("one link")
+    }
+
+    /// The shape that was asked for, on the syntax it was asked on.
+    #[test]
+    fn a_markdown_link_carries_its_predicate() {
+        let link = only("see [Belief](notes/belief.md){reference=\"supports\"} for the argument");
+        assert_eq!(link.target, "notes/belief.md");
+        assert_eq!(
+            link.attrs,
+            vec![("reference".to_owned(), "supports".to_owned())]
+        );
+    }
+
+    /// A wikilink too: a vault that adopts the convention should not have to
+    /// remember which of its two link syntaxes it applies to.
+    #[test]
+    fn a_wikilink_carries_one_too() {
+        let link = only("[[belief|Belief]]{reference=\"supports\"}");
+        assert_eq!(
+            link.attrs,
+            vec![("reference".to_owned(), "supports".to_owned())]
+        );
+    }
+
+    /// The span has to cover the braces. A renderer that hides the link syntax
+    /// and stops at the destination leaves `{reference="supports"}` on screen.
+    #[test]
+    fn the_span_covers_the_attributes() {
+        let body = "[Belief](notes/belief.md){reference=\"supports\"}";
+        let link = only(body);
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// One space and it is prose. `[a](b) {draft}` is a sentence with braces in
+    /// it; only the author knows, and the author says so by not typing a space.
+    #[test]
+    fn a_space_before_the_brace_makes_it_prose() {
+        let body = "[Belief](notes/belief.md) {reference=\"supports\"}";
+        let link = only(body);
+        assert!(link.attrs.is_empty());
+        // And the span stops at the link, so the braces stay on screen as the
+        // prose they are.
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
+    }
+
+    /// An unquoted value is dropped rather than guessed at: `{reference=a b}`
+    /// has no reading that is obviously right, and a wrong predicate is worse
+    /// than an absent one in a graph somebody queries.
+    #[test]
+    fn an_unquoted_value_is_not_a_predicate() {
+        assert!(only("[Belief](notes/belief.md){reference=supports}")
+            .attrs
+            .is_empty());
+    }
+
+    /// Several, because the convention allows it and a reader who writes two
+    /// should not silently lose one.
+    #[test]
+    fn several_pairs_all_come_through() {
+        let link = only("[Belief](notes/belief.md){reference=\"supports\" strength=\"weak\"}");
+        assert_eq!(
+            link.attrs,
+            vec![
+                ("reference".to_owned(), "supports".to_owned()),
+                ("strength".to_owned(), "weak".to_owned()),
+            ]
+        );
+    }
+
+    /// The ordinary link is the overwhelming majority and must not change.
+    #[test]
+    fn a_plain_link_has_no_attributes_and_the_same_span_as_before() {
+        let body = "[Belief](notes/belief.md)";
+        let link = only(body);
+        assert!(link.attrs.is_empty());
+        assert_eq!(link.span, (0, body.len()));
     }
 }

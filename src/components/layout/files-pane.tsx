@@ -536,6 +536,26 @@ const FILES_ROW_GAP_PX = 4;
 /** What one level of nesting costs, in px — the row's `paddingInlineStart`. */
 const FILES_ROW_INDENT_PX = 16;
 
+/**
+ * How far into the tree indenting starts.
+ *
+ * The first nesting level is free, so a folder sits at the same inset as the
+ * synced folder that contains it. That level never told anybody anything: a
+ * drive has one root and everything is under it, so indenting its children said
+ * "these are inside the thing above" about the only place they could be — and
+ * charged every name in the tree 16px to say it. Depth from there down is real
+ * and is still drawn.
+ *
+ * The tree is also a narrow column holding paths, so 16px of name is not a
+ * rounding error: it is two or three characters on every row at every depth.
+ */
+const FILES_ROW_FREE_LEVELS = 2;
+
+/** The inset a row at this depth is drawn at. */
+export function filesRowIndent(level: number): number {
+  return Math.max(0, level - FILES_ROW_FREE_LEVELS) * FILES_ROW_INDENT_PX + FILES_ROW_PAD_PX;
+}
+
 /** The row's `px-2`, in px. Spent twice: once as the base of the indent, once
  *  at the trailing edge. */
 const FILES_ROW_PAD_PX = 8;
@@ -599,7 +619,7 @@ export function filesRowActionsBudget({ column, level }: FilesRowBudgetInput): n
   if (!Number.isFinite(column) || !Number.isFinite(level)) {
     return 0;
   }
-  const indent = (level - 1) * FILES_ROW_INDENT_PX + FILES_ROW_PAD_PX;
+  const indent = filesRowIndent(level);
   return Math.max(
     0,
     column -
@@ -1779,7 +1799,7 @@ export function FilesPane() {
           selected.has(node.key) && "bg-accent",
         )}
         style={{
-          paddingInlineStart: `${(node.level - 1) * FILES_ROW_INDENT_PX + FILES_ROW_PAD_PX}px`,
+          paddingInlineStart: `${filesRowIndent(node.level)}px`,
         }}
       >
         <RowName name={node.name} tabIndex={actionTabIndex}>

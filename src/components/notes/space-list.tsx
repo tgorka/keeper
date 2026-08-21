@@ -35,6 +35,7 @@ import { spaceIcon } from "@/components/notes/space-icons";
 import { Lamp } from "@/components/ui/lamp";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
+import { UNCATEGORIZED_SPACE_ID } from "@/lib/notes/uncategorized";
 import {
   ALL_NOTES_SCOPE,
   notesFiltersStore,
@@ -299,36 +300,45 @@ export function SpaceList({
                   <FilePlus aria-hidden="true" className="size-3.5" />
                 </button>
               )}
-              {/* Always in the DOM, revealed on hover or focus: an affordance
+              {/* The composed row has no file, so it has nothing to edit and
+                  nothing to delete. Both controls are absent rather than
+                  disabled: a disabled pencil says "you may not do this here",
+                  and the truth is that there is no `this` — the row is the
+                  complement of the rows above it and changes when they do. */}
+              {space.id === UNCATEGORIZED_SPACE_ID ? null : (
+                <>
+                  {/* Always in the DOM, revealed on hover or focus: an affordance
                   that only exists under a pointer is one a keyboard cannot
                   reach. */}
-              <button
-                type="button"
-                aria-label={`Edit space ${space.name}`}
-                onClick={() => setEditing(space.id)}
-                className={cn(
-                  "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
-                  "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-              >
-                <Pencil aria-hidden="true" className="size-3.5" />
-              </button>
-              {/* Same reveal rule as the pencil, and after it: the destructive
+                  <button
+                    type="button"
+                    aria-label={`Edit space ${space.name}`}
+                    onClick={() => setEditing(space.id)}
+                    className={cn(
+                      "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                      "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                      "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    <Pencil aria-hidden="true" className="size-3.5" />
+                  </button>
+                  {/* Same reveal rule as the pencil, and after it: the destructive
                   control is last, so a hand travelling along the row reaches
                   edit before delete. */}
-              <button
-                type="button"
-                aria-label={`${DELETE_SPACE} ${space.name}`}
-                onClick={() => setDeleting(space.id)}
-                className={cn(
-                  "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
-                  "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
-                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-              >
-                <Trash2 aria-hidden="true" className="size-3.5" />
-              </button>
+                  <button
+                    type="button"
+                    aria-label={`${DELETE_SPACE} ${space.name}`}
+                    onClick={() => setDeleting(space.id)}
+                    className={cn(
+                      "mt-1 shrink-0 rounded-md p-1.5 text-muted-foreground outline-none",
+                      "opacity-0 focus-visible:opacity-100 group-hover:opacity-100",
+                      "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    <Trash2 aria-hidden="true" className="size-3.5" />
+                  </button>
+                </>
+              )}
             </li>
           );
         })}

@@ -195,7 +195,7 @@ export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
       folded={folded}
       onToggle={() => notesRailFoldStore.getState().toggleGroup("files")}
       id="notes-rail-files"
-      className="min-h-0 shrink-0"
+      className="shrink-0"
       bodyClassName="max-h-48 overflow-y-auto"
     >
       {dirs !== null && (

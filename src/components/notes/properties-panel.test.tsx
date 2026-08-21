@@ -1031,3 +1031,38 @@ describe("PropertiesPanel — record another like this (Story 45.19, FR-197)", (
     expect(primaryViewStore.getState().view).toBe("notes");
   });
 });
+
+describe("the properties keeper writes, and the ones the vault decides", () => {
+  /**
+   * `updated` is stamped by `save_document` on EVERY save, so a value typed
+   * here is overwritten by the keystroke that saves it — whatever a person
+   * believed they were recording, they were not recording it. `created` is
+   * written once and never again, so a typo there is a lie that stays. Same
+   * conclusion from both ends: shown, copyable, not editable.
+   */
+  it("does not offer a text box for created or updated", () => {
+    renderPanel("---\ncreated: 2026-07-29T16:30:07\nupdated: 2026-08-21T03:53:13\n---\n");
+
+    expect(screen.queryByRole("textbox", { name: "created" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "updated" })).not.toBeInTheDocument();
+    // Still readable — the dates are worth knowing and this is where somebody
+    // would look for them.
+    expect(screen.getByText("2026-08-21T03:53:13")).toBeInTheDocument();
+  });
+
+  /**
+   * A datalist, not a select: the list is what the vault has done so far, not
+   * what it may do. A control that refused a new value would make the fifth
+   * stage impossible to write from the panel that shows the other four.
+   */
+  it("gives stage a suggestion list that still takes a new value", () => {
+    renderPanel("---\nstage: current\n---\n");
+
+    // `combobox`, not `textbox`: an input with a `list` reports itself as one,
+    // which is the whole point — a reader is told there are suggestions before
+    // they start typing, and can still type something that is not in them.
+    const field = screen.getByRole("combobox", { name: "stage" });
+    expect(field).toHaveAttribute("list");
+    expect(screen.queryByRole("textbox", { name: "stage" })).not.toBeInTheDocument();
+  });
+});

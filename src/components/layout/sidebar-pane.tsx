@@ -154,9 +154,36 @@ export const SIDEBAR_TITLE = "Menu";
  * Collapsed is {@link FOLD_STRIP.widthClass} and not a literal of its own: this
  * used to be `w-12` here and `48` in `surface-column.tsx`, each with a comment
  * pointing at the other. */
+/**
+ * The drawer's two widths.
+ *
+ * `expanded` was 260px, which was roughly twice what the drawer holds. It went
+ * to 130px on a measurement of the navigation rows — the widest is
+ * "Recordings", which wants 117px — and 130px was wrong, because the navigation
+ * rows are not the tightest thing in here.
+ *
+ * The tightest is "Add account" in the footer, which sits inside a button with
+ * its own horizontal padding rather than in the navigation's inset. Measured
+ * against the built stylesheet, space left after the label before the button's
+ * own padding:
+ *
+ *   130px   Add account  0px    Recordings   6px
+ *   152px   Add account  4px    Recordings  28px
+ *   156px   Add account  8px    Recordings  32px
+ *
+ * At 130px the footer label ended exactly on its padding — nothing clipped, and
+ * nothing between the word and the edge either, which is what reads as a row
+ * pushed against one side. 156px gives it 8px, which is the inset the drawer
+ * uses everywhere else, so the label sits in the same rhythm as everything
+ * above it.
+ *
+ * The account handle in the footer still truncates, which is a truncation and
+ * not a clip: it had an ellipsis at 260px too, and the synced glyph that used
+ * to sit beside it is gone (`SyncGlyph`).
+ */
 export const SIDEBAR_WIDTH_CLASS = {
   collapsed: FOLD_STRIP.widthClass,
-  expanded: "w-[260px]",
+  expanded: "w-[156px]",
 } as const;
 
 /** The id the fold control's `aria-controls` points at.

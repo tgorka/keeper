@@ -103,6 +103,7 @@ import {
   ATTACH_FILE_LABEL,
   ATTACH_FROM_COMPUTER_LABEL,
 } from "@/components/notes/attach-file-button";
+import { ATTACHMENTS_LABEL } from "@/components/notes/attachments-panel";
 import { NOTE_ACTIONS_LABEL } from "@/components/notes/note-actions";
 import { ADD_NOTE_TAG, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
@@ -253,8 +254,11 @@ describe("the quick-capture draft window", () => {
     // query that resolved to the region would fail as "the item is missing"
     // when the item was fine.
     const menu = await openNoteActions();
+    // Attachments, not Properties: Properties is a leading control now and is
+    // never in this menu, so it can no longer stand for "the editor's own menu
+    // is here".
     expect(
-      within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }),
+      within(menu).getByRole("menuitemcheckbox", { name: ATTACHMENTS_LABEL }),
     ).toBeInTheDocument();
   });
 
@@ -341,8 +345,8 @@ describe("the quick-capture draft window", () => {
     render(<CaptureDraftDocument captureKey={DRAFT_KEY} />);
     await liveEditor();
 
-    const menu = await openNoteActions();
-    fireEvent.click(within(menu).getByRole("menuitemcheckbox", { name: PROPERTIES_LABEL }));
+    // The header control, not the menu: Properties never enters the menu now.
+    fireEvent.click(screen.getByRole("button", { name: PROPERTIES_LABEL }));
     fireEvent.click(await screen.findByRole("button", { name: ADD_NOTE_TAG }));
     const field = await screen.findByLabelText(ADD_NOTE_TAG);
     fireEvent.change(field, { target: { value: "errand" } });

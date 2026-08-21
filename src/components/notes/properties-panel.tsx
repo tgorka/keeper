@@ -66,7 +66,7 @@
  * instead of somewhere to copy.
  */
 import { Copy, FolderOpen, MoreHorizontal, Play, Plus, Video } from "lucide-react";
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { TagCombobox } from "@/components/notes/tag-combobox";
 import { namesTag } from "@/components/tags/tag-match";
 import { Button } from "@/components/ui/button";
@@ -86,6 +86,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import {
   type NoteWriteVm,
+  notesFieldVocabulary,
   notesSave,
   type RecordingNoteTargetVm,
   recordingNoteTargets,
@@ -98,6 +99,7 @@ import {
   tagsVocabulary,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import { truncateGraphemes } from "@/lib/truncate";
@@ -163,7 +165,7 @@ const NUMBER = /^-?\d+(?:\.\d+)?$/;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** Strip one layer of matching quotes, if the value has them. */
-function unquote(raw: string): { text: string; quoted: boolean } {
+export function unquote(raw: string): { text: string; quoted: boolean } {
   if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
     return { text: raw.slice(1, -1), quoted: true };
   }
@@ -1055,6 +1057,74 @@ interface PropertyControlProps {
 }
 
 /** Which HTML input a scalar kind wants. Lists and booleans never reach here. */
+/**
+ * Keys whose values are a convention rather than free text.
+ *
+ * `stage` is the one that was asked for and the rest are its neighbours: a
+ * small vocabulary the vault settles into, written by hand in every note, and
+ * therefore written four slightly different ways. keeper does not know which
+ * words are allowed — that is the vault's business — so this offers what the
+ * vault already uses and accepts anything else typed. A closed dropdown here
+ * would be keeper deciding a convention it did not invent.
+ */
+const SUGGESTED_KEYS = new Set(["stage", "status", "location", "audience", "author"]);
+
+/**
+ * A scalar with a suggestion list behind it.
+ *
+ * `<datalist>`, not `<select>`: the list is what the vault has done so far, not
+ * what it may do, and a control that refuses a new value would make the fifth
+ * stage impossible to write from the panel that shows the other four.
+ *
+ * The vocabulary is read on focus rather than on mount. A note with eight
+ * suggested keys would otherwise ask eight questions of the index every time
+ * anybody opened the panel, to fill lists nobody had opened.
+ */
+function SuggestedProperty({
+  entry,
+  onChange,
+}: {
+  entry: PropertyEntry;
+  onChange: (value: string) => void;
+}) {
+  const listId = useId();
+  const vaultId = useNotesVaultsStore((state) => state.activeVaultId);
+  const [options, setOptions] = useState<readonly string[]>([]);
+
+  const load = () => {
+    if (vaultId === null || options.length > 0) {
+      return;
+    }
+    void notesFieldVocabulary(vaultId, entry.key)
+      .then(setOptions)
+      // A vocabulary that will not load is a control with no suggestions, never
+      // an error: the field still takes whatever is typed into it.
+      .catch(() => setOptions([]));
+  };
+
+  return (
+    <>
+      <Input
+        aria-label={entry.key}
+        list={listId}
+        defaultValue={entry.text}
+        className="h-7 flex-1 text-xs"
+        onFocus={load}
+        onBlur={(event) => {
+          if (event.target.value !== entry.text) {
+            onChange(serialiseScalar(event.target.value, entry.quoted));
+          }
+        }}
+      />
+      <datalist id={listId}>
+        {options.map((option) => (
+          <option key={option} value={option} />
+        ))}
+      </datalist>
+    </>
+  );
+}
+
 const INPUT_TYPES: Record<PropertyKind, string> = {
   text: "text",
   number: "number",
@@ -1075,6 +1145,23 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
   // Being read-only is exactly what makes them need the overflow affordance:
   // an editable value can be scrolled with the caret, and these cannot be
   // scrolled at all.
+  // `created` and `updated` join them, and `updated` is the sharper case:
+  // keeper stamps it on EVERY save (`save_document`), so a value typed here is
+  // overwritten by the keystroke that saves it. Whatever a person believed they
+  // were recording, they were not recording it. `created` is written once and
+  // then never again, so a typo there is a lie that stays — which is the same
+  // reason from the other end.
+  //
+  // Shown and copyable, never editable: the dates are worth reading, and the
+  // panel is where somebody would look for them.
+  if (entry.key === "created" || entry.key === "updated") {
+    return (
+      <div className="min-w-0 flex-1 text-meta text-muted-foreground">
+        <OverflowValue name={entry.key} value={entry.text} monospace />
+      </div>
+    );
+  }
+
   if (entry.key === "id" || entry.key === SESSION_KEY) {
     return (
       <div className="min-w-0 flex-1 text-meta text-muted-foreground">
@@ -1134,6 +1221,10 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
         />
       </div>
     );
+  }
+
+  if (SUGGESTED_KEYS.has(entry.key)) {
+    return <SuggestedProperty entry={entry} onChange={onChange} />;
   }
 
   const inputType = INPUT_TYPES[entry.kind];

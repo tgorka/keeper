@@ -219,7 +219,18 @@ export function TagTree({ vaultId }: { vaultId: string | null }) {
       folded={folded}
       onToggle={() => notesRailFoldStore.getState().toggleGroup("tags")}
       id="notes-rail-tags"
-      className={folded ? "shrink-0" : "min-h-0 flex-1"}
+      // `flex-1` without `min-h-0`, and the missing half is the point. A flex
+      // item with `min-height: 0` may be laid out shorter than its own contents,
+      // and this section's header is `shrink-0` — so when the rail ran out of
+      // room the section's box shrank, the header inside it did not, and the
+      // header painted over the section below. That is the TAGS and FILES
+      // captions sitting on top of each other at the foot of the rail.
+      //
+      // Left at `auto`, the section's floor is its own min-content height: the
+      // header, since the body below carries `min-h-0` and may still collapse to
+      // nothing. Sections shrink to their captions and no further, and the
+      // scroll container around them takes over from there.
+      className={folded ? "shrink-0" : "flex-1"}
       bodyClassName="flex min-h-0 flex-1 flex-col"
     >
       <div aria-label="Tag tree" className="min-h-0 flex-1 overflow-y-auto" role="tree">
