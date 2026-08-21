@@ -5348,6 +5348,15 @@ impl Engine {
         self.with_db(|conn| db::clear_file_state(conn, id))?;
         Self::lock(&self.gates).remove(id);
 
+        // Scratch first: a person pressing this button has a folder that is
+        // misbehaving, and leaked transfer scratch is both a symptom of that and
+        // a cost that nothing else will ever reclaim. Best effort, like the
+        // repair below — housekeeping may not fail the button.
+        if let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            store.sweep_scratch(&profile.name);
+        }
+
         // "Recheck all files" now means git's memory too, not only keeper's.
         //
         // Forgetting `file_state` makes keeper look at everything again; it

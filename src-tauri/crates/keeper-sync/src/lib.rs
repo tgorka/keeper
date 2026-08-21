@@ -35,6 +35,7 @@
 //!   copies, never a modal ([`git::conflict`]).
 //! * **An absent volume is never a deletion** ([`volume`]).
 
+pub mod anomaly;
 pub mod backoff;
 pub mod browse;
 pub mod copy;

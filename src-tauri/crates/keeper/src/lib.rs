@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 #[cfg(desktop)]
+mod build_identity;
 mod copy_ipc;
 mod debug_log;
 // The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
@@ -319,6 +320,8 @@ pub fn run() {
                 keeper_core::config::install(layers);
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                // First, so every line under it can be read as "this build said".
+                build_identity::announce();
                 for fault in keeper_core::config::faults() {
                     // `Display`, not `summary()`: the log form keeps `toml`'s
                     // own caret diagram over the offending line, which is the

@@ -100,6 +100,18 @@ pub fn forget_prefix(oid: &str) {
         .remove(oid);
 }
 
+/// What one sweep found and what it took.
+///
+/// Both halves, because "removed 863" alone cannot say whether the sweep was
+/// thorough or whether 900 more are still there being written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchSweep {
+    pub found: u64,
+    pub found_bytes: u64,
+    pub removed: u64,
+    pub removed_bytes: u64,
+}
+
 impl LfsStore {
     /// Wrap an existing `…/lfs` directory path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -142,6 +154,75 @@ impl LfsStore {
     /// `objects/`, which is what makes the final rename atomic.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+
+    /// How old scratch has to be before a sweep is willing to call it debris.
+    ///
+    /// A live transfer's temp file is seconds old. An hour is far beyond any
+    /// honest write and far short of the days this scratch has been observed to
+    /// survive, so the sweep can run at startup — beside a transfer that is
+    /// genuinely in flight — without ever taking a file somebody is using.
+    const SCRATCH_DEBRIS_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Delete transfer scratch that no live transfer can still be using, and
+    /// report what was there.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// `tempfile` deletes its file when the handle drops — and a process that
+    /// is killed drops nothing. Every crash therefore leaks one file per
+    /// transfer in flight, and nothing has ever removed them. Measured on one
+    /// machine after four days of a crash loop: **100 GB in 863 files**, beside
+    /// 4 GB of abandoned resumable downloads, on a volume with 153 GB free.
+    ///
+    /// # Why by age rather than by name
+    ///
+    /// The names are random by construction, so there is nothing in a name to
+    /// tell a leaked file from a live one. Age can: see
+    /// [`Self::SCRATCH_DEBRIS_AGE`].
+    ///
+    /// Never fails the caller. A sweep is housekeeping, and a folder that
+    /// refused to sync because it could not delete a temp file would have traded
+    /// a disk-space problem for a sync problem.
+    pub fn sweep_scratch(&self, profile: &str) -> ScratchSweep {
+        let mut swept = ScratchSweep::default();
+        for dir in [self.tmp_dir(), self.root.join("incomplete")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                swept.found += 1;
+                swept.found_bytes += meta.len();
+                let old_enough = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age >= Self::SCRATCH_DEBRIS_AGE);
+                if old_enough && std::fs::remove_file(entry.path()).is_ok() {
+                    swept.removed += 1;
+                    swept.removed_bytes += meta.len();
+                }
+            }
+        }
+        if swept.removed > 0 {
+            crate::anomaly::Anomaly {
+                what: "transfer scratch left by an interrupted run",
+                measured: format!(
+                    "found={} found_bytes={} removed={} removed_bytes={}",
+                    swept.found, swept.found_bytes, swept.removed, swept.removed_bytes
+                ),
+                expected: "near zero; scratch is deleted when a transfer ends, and only a \
+                           killed process leaves any",
+                consequence: "disk nothing would have reclaimed; removed now, and the space \
+                              is back",
+            }
+            .report(profile);
+        }
+        swept
     }
 
     /// Create the directory skeleton. Idempotent.
