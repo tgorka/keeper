@@ -237,7 +237,18 @@ pub struct SyncFootprintVm {
     pub reclaimable: u64,
     /// Transfer scratch left by interrupted runs. Swept by "Recheck all files".
     pub scratch: u64,
-    /// The same four numbers as people read them.
+    /// Everything this folder tracks at full size, whether or not the bytes are
+    /// on this machine — which is what the server holds, worked out without
+    /// asking it.
+    ///
+    /// There is no request in the git protocol for "how big are you", and a
+    /// number that only appeared for one host would be worse than none. But an
+    /// LFS pointer states the size of the object it stands for, so a folder can
+    /// weigh its own contents whether or not it has fetched them. That is the
+    /// number a virtual folder needs: `content` minus `on_disk` is what would
+    /// still be out there.
+    pub content: u64,
+    /// The same five numbers as people read them.
     ///
     /// Formatted here, by the one formatter, because a second one in TypeScript
     /// is how this row and the Files pane's size column end up disagreeing about
@@ -246,6 +257,7 @@ pub struct SyncFootprintVm {
     pub lfs_cache_label: String,
     pub reclaimable_label: String,
     pub scratch_label: String,
+    pub content_label: String,
 }
 
 /// Measure one folder's footprint.
@@ -284,10 +296,12 @@ pub async fn sync_footprint(
         lfs_cache: measured.lfs_cache,
         reclaimable: measured.reclaimable,
         scratch: measured.scratch,
+        content: measured.content,
         on_disk_label: keeper_core::size::format_file_size(measured.on_disk),
         lfs_cache_label: keeper_core::size::format_file_size(measured.lfs_cache),
         reclaimable_label: keeper_core::size::format_file_size(measured.reclaimable),
         scratch_label: keeper_core::size::format_file_size(measured.scratch),
+        content_label: keeper_core::size::format_file_size(measured.content),
     })
 }
 

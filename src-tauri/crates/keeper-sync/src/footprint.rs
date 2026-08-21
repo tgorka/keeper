@@ -38,6 +38,15 @@ pub struct Footprint {
     pub reclaimable: u64,
     /// Transfer scratch left by interrupted runs.
     pub scratch: u64,
+    /// Everything this folder tracks, at full size, whether or not its bytes
+    /// are on this machine.
+    ///
+    /// This is the number the remote holds, computed without asking it. An LFS
+    /// pointer carries the size of the object it stands for, so a folder that
+    /// has never downloaded a single video still knows exactly what it would
+    /// weigh — and `content - on_disk` is what a virtual folder would be
+    /// leaving on the server.
+    pub content: u64,
 }
 
 /// Measure `root`.
@@ -54,6 +63,7 @@ pub fn measure(root: &Path) -> Result<Footprint> {
         lfs_cache: tree_bytes(&git_dir.join("lfs").join("objects")),
         scratch: tree_bytes(&store.tmp_dir()) + tree_bytes(&git_dir.join("lfs").join("incomplete")),
         reclaimable: 0,
+        content: 0,
     };
     // Best effort, and last: a repository this cannot open still has a size, and
     // refusing to report it because one of four numbers is unavailable would
@@ -63,9 +73,33 @@ pub fn measure(root: &Path) -> Result<Footprint> {
             if let Ok(plan) = lfs::prune::plan(&repo, root, &store, &tracked, &Default::default()) {
                 out.reclaimable = plan.iter().map(|entry| entry.size).sum();
             }
+            out.content = tracked_content(&repo, root, &tracked);
         }
     }
     Ok(out)
+}
+
+/// The full size of everything tracked, whether or not it is materialised.
+///
+/// Two kinds of path, and the difference is the whole point. An LFS path is
+/// measured from its pointer, which states the object's size — so a file whose
+/// bytes were never fetched, or were released to reclaim space, still counts
+/// for what it actually weighs. Every other path is measured from the worktree,
+/// where a tracked file's bytes are its bytes.
+///
+/// A path that has gone missing contributes nothing rather than failing the
+/// measurement: the index and the worktree disagree constantly on a folder
+/// somebody is using, and a footprint is not an audit.
+fn tracked_content(repo: &gix::Repository, root: &Path, tracked: &[std::path::PathBuf]) -> u64 {
+    tracked
+        .iter()
+        .map(|rela| match lfs::stage::indexed_pointer(repo, rela) {
+            Some(pointer) => pointer.size,
+            None => std::fs::symlink_metadata(root.join(rela))
+                .map(|meta| meta.len())
+                .unwrap_or(0),
+        })
+        .sum()
 }
 
 /// Bytes under a directory, following nothing and failing on nothing.

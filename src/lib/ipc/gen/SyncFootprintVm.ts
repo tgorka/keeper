@@ -34,10 +34,23 @@ reclaimable: bigint,
  */
 scratch: bigint, 
 /**
- * The same four numbers as people read them.
+ * Everything this folder tracks at full size, whether or not the bytes are
+ * on this machine — which is what the server holds, worked out without
+ * asking it.
+ *
+ * There is no request in the git protocol for "how big are you", and a
+ * number that only appeared for one host would be worse than none. But an
+ * LFS pointer states the size of the object it stands for, so a folder can
+ * weigh its own contents whether or not it has fetched them. That is the
+ * number a virtual folder needs: `content` minus `on_disk` is what would
+ * still be out there.
+ */
+content: bigint, 
+/**
+ * The same five numbers as people read them.
  *
  * Formatted here, by the one formatter, because a second one in TypeScript
  * is how this row and the Files pane's size column end up disagreeing about
  * the same folder.
  */
-onDiskLabel: string, lfsCacheLabel: string, reclaimableLabel: string, scratchLabel: string, };
+onDiskLabel: string, lfsCacheLabel: string, reclaimableLabel: string, scratchLabel: string, contentLabel: string, };
