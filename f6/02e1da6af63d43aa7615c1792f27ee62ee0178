@@ -1,0 +1,53 @@
+src-tauri/crates/keeper-core/src/notes/index.rs
+  s_9bfe0bf28c8205::t_5e9164d9e8e824 135-147,948
+src-tauri/crates/keeper-core/src/notes/links.rs
+  s_9bfe0bf28c8205::t_a22309152a6276 30-32,34-85,154-160,165-166,205-212,217-218,370-456
+src-tauri/crates/keeper-core/src/notes/order.rs
+  s_9bfe0bf28c8205::t_1fedd2fd31019f 280
+src-tauri/crates/keeper-core/src/notes/query.rs
+  s_9bfe0bf28c8205::t_dbc16b598cf01b 1474
+src-tauri/crates/keeper-core/src/notes/seed.rs
+  s_9bfe0bf28c8205::t_258b015f98b965 529
+src-tauri/crates/keeper-core/src/notes/sort.rs
+  s_9bfe0bf28c8205::t_b0cc7365d21779 480
+src-tauri/crates/keeper-core/src/notes/vm.rs
+  s_9bfe0bf28c8205::t_903e2f686464d6 134-141,1193
+src-tauri/crates/keeper-core/src/notes/widget.rs
+  s_9bfe0bf28c8205::t_916224287fe14b 229
+src-tauri/crates/keeper-core/src/sessions/pool.rs
+  s_9bfe0bf28c8205::t_b6cecee4622eb0 174
+src-tauri/crates/keeper/src/notes_ipc.rs
+  s_9bfe0bf28c8205::t_abdbea0a674ed6 372-374,2068-2082,2127-2138,5213,5320
+src-tauri/crates/keeper/src/notes_vault.rs
+  s_9bfe0bf28c8205::t_5530863c6679d0 1490-1508,2827
+src/components/notes/links-panel.test.tsx
+  s_9bfe0bf28c8205::t_d1353de996c706 1-62
+src/components/notes/links-panel.tsx
+  s_9bfe0bf28c8205::t_6952d00ba51312 83-93
+src/components/notes/note-list.test.tsx
+  s_9bfe0bf28c8205::t_ee759219ba41c8 44
+src/components/notes/note-row.test.tsx
+  s_9bfe0bf28c8205::t_ffd5390596daae 38
+src/components/notes/notes-pane.test.tsx
+  s_9bfe0bf28c8205::t_b036651003fc50 60
+src/lib/ipc/gen/NoteRowVm.ts
+  s_9bfe0bf28c8205::t_f618977a05bc40 50-59
+src/lib/stores/notes-list.test.ts
+  s_9bfe0bf28c8205::t_ea19d09632c914 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "f602e1da6af63d43aa7615c1792f27ee62ee0178",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
