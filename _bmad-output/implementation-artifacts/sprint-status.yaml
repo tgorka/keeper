@@ -792,6 +792,111 @@ development_status:
   54-2-properties-you-can-see-and-never-in-your-prose: review
   epic-54-retrospective: optional
 
+  # -- EPIC 56, 2026-08-22: virtual files ------------------------------------
+  #
+  # Planned from research, not from a report: four web research passes and three
+  # read-only repository scouts ran before the spine was written
+  # (planning-artifacts/research-virtual-files-2026-08-22.md, run folder
+  # research/virtual-files-2026-08-22/). AD-122..AD-134 in
+  # architecture/architecture-keeper-2026-07-03/ARCHITECTURE-VIRTUAL-FILES.md.
+  #
+  # The load-bearing separation, and the reason the epic is shaped this way:
+  # git-lfs shipped "a gitignore-style list of paths not to download" and "the
+  # rule that authorizes deleting them" as ONE mechanism, and lost data for it
+  # (git-lfs#3092). AD-123 splits them permanently: the pattern file authorizes
+  # HYDRATION decisions; only per-object proof authorizes DELETION.
+  #
+  # 56.4 and 56.5 are the data-loss stories. Both must assert against a real
+  # git fixture, a real rename(2), a real index stat and a real process holding
+  # the file open - story 34.11's model, not a pure function over a TestPlatform.
+  # The two failures the suite cannot otherwise see: a released path that reads
+  # MODIFIED forever (DW-140's shape), and a released path whose bytes existed
+  # nowhere else.
+  #
+  # Ask 5 (Finder / ls integration) is CLOSED, not deferred - macOS File
+  # Provider cannot virtualize a path the user chose, SF_DATALESS is unsettable
+  # from user space, and macFUSE/fuse-t both fail the licence firewall (AD-130).
+  #
+  # SECOND PASS, 2026-08-22 (owner): FR-340..FR-345 and AD-131..AD-134 added.
+  # Three deltas a spec author must not miss:
+  #   (a) AD-131 NARROWS AD-126. For content created or modified locally the
+  #       release clock starts at the SYNC-CONFIRMED edge, not last use, and
+  #       such a path is not eligible at any age until that confirmation
+  #       exists. The materialized ledger's at_ms is the materialization
+  #       clock; synced_at_ms is a NEW column. Two clocks, one selector.
+  #   (b) AD-132. The desktop app and keeper-syncd do NOT share a profile
+  #       store (profiles table in sync.db vs [[profile]] in config.toml) or
+  #       a data dir. Config both surfaces must honour lives in the folder
+  #       TOML tier. Every new SyncProfileReq field is Option or it erases a
+  #       daemon-set value (DW-116 verbatim).
+  #   (c) AD-134. Adding a FilesSyncStatusVm variant is not done when the row
+  #       renders: FilesDeletePlanVm::compose (vm.rs:4402-4422) would classify
+  #       a virtual path as "stays on this machine" by default, so the delete
+  #       confirmation would lie about a deletion that travels. 56.7 carries
+  #       the test.
+  # The first draft's claim that this tree refuses timer-driven work was WRONG
+  # (docs/sync.md:889-893 refuses unattended BINARY replacement only), and its
+  # success-edge citation engine.rs:3052-3066 was adopt_volume; the edge is
+  # mark_synced, engine.rs:3185-3197. Both corrected in the epic.
+  # 56.9 is new and runs after 56.7; 56.8 (docs) stays last.
+  epic-56: backlog
+  56-1-a-policy-that-says-which-files-may-stay-away: backlog
+  56-2-a-listing-that-knows-what-it-does-not-hold: backlog
+  56-3-a-file-you-can-ask-for: backlog
+  56-4-a-release-that-refuses-five-times-before-it-deletes: backlog
+  56-5-it-lets-go-a-day-after-it-landed: backlog
+  56-6-the-checks-stop-calling-the-normal-state-a-fault: backlog
+  56-7-the-row-says-what-it-is-and-what-a-delete-will-do: backlog
+  56-9-the-button-and-the-time-you-have-left: backlog
+  56-8-a-virtual-files-chapter: backlog
+  epic-56-retrospective: optional
+
+  # -- EPIC 57, 2026-08-22: scheduled tasks ----------------------------------
+  #
+  # Split out of epic 56's fourth ask ("cron job like ... widok w ui do
+  # taskow"). AD-135..AD-137 in
+  # architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md.
+  #
+  # The constraint this epic is shaped by is AD-62, not the anti-timer prose:
+  # ONE CLOCK PER HOST PROCESS, because "two schedulers over one git
+  # repository is how you get concurrent index locks". A due task is a
+  # due-gate on a tick that already exists - the engine's TICK_MS supervisor
+  # tick, or the app's own 1 Hz interval at keeper/src/lib.rs:509-541 which
+  # already hosts notes_vault::cadence_tick(). No new interval, anywhere.
+  #
+  # What is genuinely absent is a RECORD: the journal DELETEs rows on success
+  # (db.rs:826-832) and activity is "a human-facing log, not a source of
+  # truth" (db.rs:99-101), so neither can back a tasks view. 57.1 creates
+  # tasks + task_runs.
+  #
+  # The impure-shell risk here is NOT the schedule maths - keep decide() pure
+  # over an injected clock, and never prove a schedule by sleeping. It is TWO
+  # PROCESSES ON ONE sync.db (the daemon and the app both write it -
+  # ipc.rs:4926-4930): 57.2's lease must be raced with two real connections,
+  # the way db::claim_ready is proven. Second risk is SILENCE: an enabled,
+  # unhosted, quiet task looks identical to a working one, so 57.6 asserts the
+  # unhosted state.
+  #
+  # Platform truth (AD-137): macOS has NO daemon - keeper-syncd is
+  # "Linux-first, unix-only" (keeper-syncd/src/platform.rs:11-19) and no
+  # launchd plist exists - so on macOS the desktop app is the only host and a
+  # task runs only while keeper runs. Linux has the user service and gets a
+  # .timer that calls the same one-shot verb.
+  #
+  # `update` may NOT be a task kind: docs/sync.md:889-893 refuses unattended
+  # binary replacement, and that refusal stands.
+  #
+  # 57.4 is the story that closes the owner's ask and can ship before any UI.
+  epic-57: backlog
+  57-1-a-task-is-something-keeper-remembers: backlog
+  57-2-a-schedule-that-refuses-what-it-cannot-parse: backlog
+  57-3-the-verb-a-cron-can-call: backlog
+  57-4-release-becomes-a-task: backlog
+  57-5-the-app-runs-them-too: backlog
+  57-6-a-view-of-what-runs-and-when-it-last-did: backlog
+  57-7-packaging-and-the-chapter: backlog
+  epic-57-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
