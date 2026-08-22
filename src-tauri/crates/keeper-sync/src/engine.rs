@@ -5254,10 +5254,15 @@ impl Engine {
         }
         let repo = self.open_repo(profile)?;
         let cone = SparseCone::new(&profile.subpaths);
-        let tracked: Vec<PathBuf> = git::repo::tracked_paths(&repo)?
-            .into_iter()
-            .filter(|path| cone.includes(path))
-            .collect();
+        // Pointer-sized entries only: see
+        // [`git::repo::pointer_sized_tracked_paths`] for the ten minutes of
+        // worktree I/O the unfiltered list costs on a real folder, and why the
+        // index's own recorded size cannot lose a pointer.
+        let tracked: Vec<PathBuf> =
+            git::repo::pointer_sized_tracked_paths(&repo, lfs::pointer::MAX_POINTER_BYTES as u32)?
+                .into_iter()
+                .filter(|path| cone.includes(path))
+                .collect();
         let pending = lfs::stage::pending_smudges(&profile.local_path, &tracked)?;
         if pending.is_empty() {
             return Ok(());
