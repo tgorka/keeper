@@ -1115,6 +1115,24 @@ pub fn pending_smudges(root: &Path, tracked: &[PathBuf]) -> Result<Vec<PendingSm
 /// then simply retried. The staging name carries keeper's own `.keeper.*.tmp`
 /// prefix, which tier 0 already excludes, so the watcher cannot mistake it for
 /// user content.
+///
+/// # The mode comes from the file being replaced, not from the store
+///
+/// `fs::copy` carries the *source's* permissions, and a store object is
+/// keeper's own file — `0600`, published as `0644`. The pointer in the worktree
+/// is git's file, checked out with the mode the index records, so on a tree
+/// whose entries are `100755` — anything that came off a FAT/exFAT drive, which
+/// is most pendrive content — every materialized file silently lost its
+/// executable bit.
+///
+/// That is not a cosmetic difference: a mode change makes the entry permanently
+/// dirty, and status can only decide that by converting the worktree file
+/// through the LFS clean filter. Measured on the folder that reported it, 378
+/// materialized files turned every status walk into a 343-second content
+/// comparison, which holds the profile's one-operation-at-a-time reservation
+/// and starves the journal drain — a folder that reads "Idle · 95 waiting to
+/// sync" while nothing whatsoever can run. Carrying the mode over keeps the
+/// entry clean, and the walk stat-clean with it.
 pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<()> {
     let oid = &smudge.pointer.oid;
     if !store.contains(oid, smudge.pointer.size) {
@@ -1132,8 +1150,18 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
         .unwrap_or_else(|| "object".to_owned());
     let staging = parent.join(format!(".keeper.{name}.tmp"));
 
+    // Read before the copy: after the rename there is nothing left to ask.
+    let mode = std::fs::symlink_metadata(&target)
+        .map(|metadata| metadata.permissions())
+        .ok();
     std::fs::copy(store.object_path(oid), &staging)
         .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))?;
+    // Applied to the staging file, so the published path never exists with the
+    // wrong mode — the same reason the copy is staged at all.
+    if let Some(mode) = mode {
+        std::fs::set_permissions(&staging, mode)
+            .map_err(|err| SyncError::io("carry the pointer's mode over", staging.clone(), err))?;
+    }
     std::fs::rename(&staging, &target)
         .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))?;
     Ok(())
@@ -1147,6 +1175,60 @@ mod tests {
         let mut p = SyncProfile::new("01J", "p", root, "https://git.invalid/r.git");
         p.lfs_threshold_bytes = 1024;
         p
+    }
+
+    /// A materialized file keeps the mode git checked its pointer out with.
+    ///
+    /// `fs::copy` carries the *source's* permissions, and the source is a store
+    /// object keeper wrote — never executable. So on a tree whose index records
+    /// `100755`, which is every tree that came off a FAT/exFAT drive, each
+    /// materialization silently dropped the bit and left the entry permanently
+    /// dirty. That is expensive, not cosmetic: deciding a mode-changed LFS path
+    /// means converting the worktree file through the clean filter, and 378 of
+    /// them turned every status walk on the folder that reported this into 343
+    /// seconds of hashing — which holds the profile's one-operation-at-a-time
+    /// reservation and starves the journal drain behind it.
+    #[test]
+    #[cfg(unix)]
+    fn materializing_carries_the_replaced_files_mode_over() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let content = vec![7u8; 4_096];
+        let oid = hex::encode(Sha256::digest(&content));
+        let store = LfsStore::in_git_dir(root.join(".git"));
+        store
+            .insert_verified(&oid, &content[..], content.len() as u64)
+            .expect("seed the object");
+
+        // The worktree as git left it: pointer text, executable, because that is
+        // what the index records for this path.
+        let smudge = PendingSmudge {
+            path: PathBuf::from("clip.mp4"),
+            pointer: Pointer::new(oid.clone(), content.len() as u64),
+        };
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, smudge.pointer.render()).expect("check out the pointer");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        materialize(&store, root, &smudge).expect("materialize");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            content,
+            "the content is the object's"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "and the mode is still git's, so the entry stays clean"
+        );
     }
 
     /// A repository whose index holds `rela` as a pointer of `size` bytes,

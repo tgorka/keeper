@@ -577,6 +577,26 @@ pub struct Engine {
     /// [`Engine::sync_once`] reads this before and after its run and reports
     /// the difference, which is exactly "what this run moved".
     transferred: Mutex<HashMap<String, u64>>,
+    /// Transfer rate per profile, measured across the whole run rather than
+    /// within one object.
+    ///
+    /// [`TransferTally`] carries a [`RateMeter`] of its own, but a tally lives
+    /// for exactly one `do_lfs` call, and [`RateMeter`] withholds a figure until
+    /// a full second of movement backs it — correctly, because one 100 ms
+    /// producer tick can carry a whole buffered chunk. Those two facts together
+    /// mean an object that finishes inside a second never reports a rate at all,
+    /// so a folder of ordinary files showed throughput only for the occasional
+    /// object above ~50 MB and nothing whatsoever for the hundred small ones
+    /// around it — which reads as a stalled folder, and was reported as one.
+    ///
+    /// Fed from the same cumulative counter as [`Engine::transferred`], so what
+    /// it measures is the run: previous objects' bytes and the time they took
+    /// are exactly what makes a figure available while the current object is
+    /// still too young to have one. The meter's own rules are untouched — a
+    /// window that carries no bytes still falls silent within
+    /// `RATE_WINDOW_MS`, so a genuine stall stops reporting rather than
+    /// freezing the last number on screen.
+    session_rate: Mutex<HashMap<String, RateMeter>>,
     /// Live filesystem watchers per profile id (AD-34-11).
     ///
     /// The supervisor owns these rather than either host, because the
@@ -743,6 +763,7 @@ impl Engine {
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
             transferred: Mutex::new(HashMap::new()),
+            session_rate: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             watch_wake: Mutex::new(HashSet::new()),
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
@@ -1028,7 +1049,20 @@ impl Engine {
     ///
     /// A sink returning `false` has gone away (a closed IPC channel), and is
     /// dropped here rather than accumulating for the life of the process.
-    fn publish(&self, event: SyncProgress) {
+    ///
+    /// A frame in a rate-carrying phase that arrives without a figure is given
+    /// the run's own (see [`Engine::session_rate`]): the object in flight may be
+    /// too young to have measured anything, and the transfer it is part of is
+    /// not. This is the single choke point every frame passes through, so the
+    /// HTTP leg, the filesystem-remote copy and the fetch leg all report a rate
+    /// on the same terms instead of three of them deciding separately.
+    fn publish(&self, mut event: SyncProgress) {
+        if event.bytes_per_second.is_none() && event.phase.carries_rate() {
+            // Observed rather than merely read, so the window still rolls while
+            // frames arrive: a transfer that stops moving falls silent here
+            // exactly as it does inside one object's tally.
+            event.bytes_per_second = self.observe_session_rate(&event.profile_id, Instant::now());
+        }
         {
             let mut status = Self::lock(&self.status);
             if let Some(snapshot) = status.get_mut(&event.profile_id) {
@@ -6259,13 +6293,33 @@ impl Engine {
     }
 
     /// Add to a profile's cumulative transferred-byte counter.
+    ///
+    /// Every call is also an observation for the run's rate meter: this is the
+    /// moment bytes are known to have landed, and on a folder of small objects
+    /// it is the *only* moment, because each object's own tally dies with the
+    /// `do_lfs` call that owned it.
     fn add_transferred(&self, profile_id: &str, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        let mut totals = Self::lock(&self.transferred);
-        let total = totals.entry(profile_id.to_owned()).or_insert(0);
-        *total = total.saturating_add(bytes);
+        {
+            let mut totals = Self::lock(&self.transferred);
+            let total = totals.entry(profile_id.to_owned()).or_insert(0);
+            *total = total.saturating_add(bytes);
+        }
+        self.observe_session_rate(profile_id, Instant::now());
+    }
+
+    /// Fold the profile's cumulative transferred bytes into its run meter.
+    ///
+    /// The clock is a parameter for [`RateMeter`]'s reason: a rate's window
+    /// boundaries are only testable if a test can choose when things happened.
+    fn observe_session_rate(&self, profile_id: &str, now: Instant) -> Option<u64> {
+        let total = self.transferred_bytes(profile_id);
+        Self::lock(&self.session_rate)
+            .entry(profile_id.to_owned())
+            .or_default()
+            .observe(total, now)
     }
 
     fn transferred_bytes(&self, profile_id: &str) -> u64 {
@@ -7298,6 +7352,84 @@ mod tests {
         );
         assert_eq!(fetched, 6_000_000, "the mark never walked back");
         assert_eq!(event.bytes_per_second, None, "a stalled fetch has no rate");
+    }
+
+    /// A folder of small objects reports throughput, and a stalled one stops.
+    ///
+    /// The rate the UI draws comes from the progress stream, and every figure in
+    /// it used to be measured inside one `do_lfs` call. `RateMeter` withholds a
+    /// number until a full second of movement backs it — correctly — so an
+    /// object that finished inside a second reported nothing, and a folder of
+    /// ordinary files showed a rate only for the occasional object above ~50 MB.
+    /// The owner's reading of that is the honest one: a hundred files landing
+    /// with no throughput figure anywhere looks exactly like a folder that has
+    /// stopped.
+    ///
+    /// So the run keeps its own meter, fed by the cumulative counter every
+    /// completed transfer already updates, and `publish` stamps it on any
+    /// rate-carrying frame that has nothing better. Both halves are asserted
+    /// here: the figure appears for objects far too small to measure alone, and
+    /// it is still withheld once the bytes stop — the meter's rules are reused,
+    /// not weakened.
+    #[test]
+    fn small_objects_still_report_a_rate_because_the_run_is_measured_not_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<u64>>::new()));
+        let sink = Arc::clone(&seen);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event.bytes_per_second);
+            true
+        }));
+
+        // The run's meter is anchored at zero bytes, which is where a run
+        // starts, and then four objects of 1 MB land — none of them on the wire
+        // long enough to measure, because each `add_transferred` is one whole
+        // completed transfer.
+        let t0 = Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        engine.observe_session_rate(&p.id, t0);
+        for _ in 0..4 {
+            engine.add_transferred(&p.id, 1_000_000);
+        }
+        // Two seconds of the run have now passed — time the objects never had
+        // individually, which is the whole point.
+        engine.observe_session_rate(&p.id, at(2_000));
+
+        let mut event = engine.progress(&p, SyncPhase::DownloadingLfs);
+        event.current = Some("clip-05.mp4".to_owned());
+        engine.publish(event);
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            Some(2_000_000),
+            "4 MB over two seconds of the run, on a frame whose object measured nothing"
+        );
+
+        // Nothing moves for a further window. The run's meter falls silent, so
+        // the frame carries no figure rather than freezing the last one.
+        engine.observe_session_rate(&p.id, at(4_000));
+        engine.publish(engine.progress(&p, SyncPhase::DownloadingLfs));
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            None,
+            "a run that has stopped moving bytes has no rate to report"
+        );
+
+        // And a phase with no byte producer never borrows the run's figure:
+        // `SyncPhase::carries_rate` is the whole gate.
+        engine.add_transferred(&p.id, 8_000_000);
+        engine.observe_session_rate(&p.id, at(6_000));
+        engine.publish(engine.progress(&p, SyncPhase::Committing));
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            None,
+            "committing moves no bytes, whatever the run has been doing"
+        );
     }
 
     #[test]
