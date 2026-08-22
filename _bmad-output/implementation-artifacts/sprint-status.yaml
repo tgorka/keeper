@@ -792,6 +792,41 @@ development_status:
   54-2-properties-you-can-see-and-never-in-your-prose: review
   epic-54-retrospective: optional
 
+  # -- EPIC 56, 2026-08-22: virtual files ------------------------------------
+  #
+  # Planned from research, not from a report: four web research passes and three
+  # read-only repository scouts ran before the spine was written
+  # (planning-artifacts/research-virtual-files-2026-08-22.md, run folder
+  # research/virtual-files-2026-08-22/). AD-122..AD-130 in
+  # architecture/architecture-keeper-2026-07-03/ARCHITECTURE-VIRTUAL-FILES.md.
+  #
+  # The load-bearing separation, and the reason the epic is shaped this way:
+  # git-lfs shipped "a gitignore-style list of paths not to download" and "the
+  # rule that authorizes deleting them" as ONE mechanism, and lost data for it
+  # (git-lfs#3092). AD-123 splits them permanently: the pattern file authorizes
+  # HYDRATION decisions; only per-object proof authorizes DELETION.
+  #
+  # 56.4 and 56.5 are the data-loss stories. Both must assert against a real
+  # git fixture, a real rename(2), a real index stat and a real process holding
+  # the file open - story 34.11's model, not a pure function over a TestPlatform.
+  # The two failures the suite cannot otherwise see: a released path that reads
+  # MODIFIED forever (DW-140's shape), and a released path whose bytes existed
+  # nowhere else.
+  #
+  # Ask 5 (Finder / ls integration) is CLOSED, not deferred - macOS File
+  # Provider cannot virtualize a path the user chose, SF_DATALESS is unsettable
+  # from user space, and macFUSE/fuse-t both fail the licence firewall (AD-130).
+  epic-56: backlog
+  56-1-a-policy-that-says-which-files-may-stay-away: backlog
+  56-2-a-listing-that-knows-what-it-does-not-hold: backlog
+  56-3-a-file-you-can-ask-for: backlog
+  56-4-a-release-that-refuses-five-times-before-it-deletes: backlog
+  56-5-it-lets-go-a-day-later-on-its-own: backlog
+  56-6-the-checks-stop-calling-the-normal-state-a-fault: backlog
+  56-7-the-row-says-what-it-is-and-what-you-can-do: backlog
+  56-8-a-virtual-files-chapter: backlog
+  epic-56-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
