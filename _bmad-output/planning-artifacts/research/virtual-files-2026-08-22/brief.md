@@ -46,9 +46,14 @@ never as evidence about the outside world.
 
 - `../../research-virtual-files-2026-08-22.md` — the synthesized, §-numbered research document
   (the citable artifact; Rust doc-comments in this tree cite research by section).
-- `../../architecture/architecture-keeper-2026-07-03/ARCHITECTURE-VIRTUAL-FILES.md` — AD-122…AD-130.
-- `../../epic-56-the-file-is-there-even-when-it-is-not.md` — the epic, FR-328…FR-339, NFR-40/41.
-- `docs/decisions.md` D-2 — the durable "pointer files, not filesystem virtualization" decision.
+- `../../architecture/architecture-keeper-2026-07-03/ARCHITECTURE-VIRTUAL-FILES.md` — AD-122…AD-134
+  (AD-131…AD-134 added by the owner's second pass, 2026-08-22).
+- `../../architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md` — AD-135…AD-137,
+  the scheduler split out of the fourth ask.
+- `../../epic-56-the-file-is-there-even-when-it-is-not.md` — the epic, FR-328…FR-345, NFR-40/41.
+- `../../epic-57-a-task-that-runs-when-it-should.md` — FR-346…FR-352, NFR-42/43.
+- `docs/decisions.md` D-2 — the durable "pointer files, not filesystem virtualization" decision —
+  and D-3, "scheduled work is keeper's own; scheduled self-update is not".
 
 ## The finding that changed the plan
 

@@ -38,10 +38,18 @@ Finder. This is a closed question on macOS and a deferred one on Linux, and it i
 because the "why not" will otherwise be re-asked every time somebody sees Dropbox do it.
 
 - **What is built:** the virtual state is the committed git-LFS pointer in the worktree,
-  byte-for-byte. Metadata (true size, oid, dates, provenance, where the bytes really are) is
-  answered from the index, the pointer, keeper's own ledger and `git log` — never from the
-  worktree stat. Hydrate and dehydrate are explicit verbs; release is lazy, budgeted, and rides a
-  successful sync rather than a timer. (AD-122…AD-129; Epic 56)
+  byte-for-byte. Metadata (true size, oid, modification time, provenance, where the bytes really
+  are) is answered from the index, the pointer, keeper's own ledger and `git log` — never from the
+  worktree stat for the size. Hydrate and dehydrate are explicit verbs; release is lazy, budgeted,
+  and rides a successful sync. (AD-122…AD-134; Epic 56)
+- **When a locally-authored file may be released:** never until keeper has confirmed that exact
+  path reached the remote, and then a TTL (24 h by default) after that confirmation — not after
+  last use. Content that merely arrived from the remote and was never modified here keys off last
+  use instead. Two clocks, because only one of the two cases can lose data, and that case gets the
+  stricter one. (AD-131; Epic 56, story 56.5)
+- **Automatic release is the default, not the only path:** release is a keeper *task* with three
+  modes — off, manual, scheduled — so "a nightly script" is a supported way to run it rather than
+  a workaround. (AD-136; Epic 57, story 57.4)
 - **Why not macOS File Provider:** `NSFileProviderReplicatedExtension` has exactly the right
   semantics — dataless items, `fetchContents` on read, `evictItem` — but its storage is exposed
   under `~/Library/CloudStorage/<Provider>` and its container path is relative to an app-group
@@ -72,3 +80,26 @@ because the "why not" will otherwise be re-asked every time somebody sees Dropbo
   mount (never a virtualization of the worktree itself) is deferred with its shape already
   recorded. (AD-130)
 - **Status / owner:** decided. Owner is the architect; Epic 56 implements the pointer design.
+
+## D-3 — Scheduled work is keeper's own; scheduled *self-update* is not
+
+keeper will hold named tasks with a schedule, a last run and a last result, runnable on the sync
+daemon and on the desktop app and drivable from `cron`. It will **not** let a schedule replace or
+restart a keeper binary. Recorded here because the two look like one feature and only one of them
+is safe.
+
+- **What is built:** a task record, a schedule validated when it is saved, a due-gate on the tick
+  each host already runs, a one-shot CLI verb a `cron` entry or systemd timer can call, and a view
+  that states which host will actually run each task. (AD-135…AD-137; Epic 57)
+- **Why not a second scheduler:** one clock per host process, because two schedulers over one git
+  repository produce concurrent index locks — the rule the notes cadence already follows. (AD-62)
+- **Why `update` is excluded:** the daemon holds a durable journal and can be mid-push at any
+  moment; swapping its binary unattended is how a routine release becomes a corrupted transfer.
+  That refusal predates this decision and survives it. (`docs/sync.md` §12; AD-136)
+- **The platform asymmetry, stated so it is not discovered:** on Linux the systemd user service is
+  a real background host and a timer unit ships beside it. On **macOS there is no keeper daemon at
+  all** — the desktop app is the only host, so a task runs only while keeper is running, and the UI
+  says so rather than implying a schedule that cannot fire. (AD-137)
+- **Revisit trigger:** a launchd agent for `keeper-syncd` on macOS — which needs the daemon crate
+  to build there first. Until then the asymmetry is visible in the product, not hidden.
+- **Status / owner:** decided. Owner is the architect; Epic 57 implements it.
