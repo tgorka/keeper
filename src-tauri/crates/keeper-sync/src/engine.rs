@@ -4943,7 +4943,7 @@ impl Engine {
         if lfsconfig.is_none() {
             if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
                 return self
-                    .copy_lfs_object(profile, remote, oid, size, upload)
+                    .copy_lfs_object(profile, remote, oid, size, upload, label)
                     .await;
             }
         }
@@ -5043,7 +5043,10 @@ impl Engine {
             // The object is in the store; the worktree still holds the pointer
             // that was checked out. Replacing it is what makes a peer's clone
             // contain real bytes rather than a text stub.
-            self.materialize_pending(profile, &store)?;
+            //
+            // The path that just arrived, not the whole tree: see
+            // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
+            self.materialize_landed(profile, &store, label)?;
         }
         Ok(())
     }
@@ -5065,6 +5068,7 @@ impl Engine {
         oid: &str,
         size: u64,
         upload: bool,
+        label: Option<&str>,
     ) -> Result<()> {
         // An unmounted volume is absence, never failure (AD-48), and it must not
         // read as a corrupt or missing object. `Deferred` waits for the volume to
@@ -5103,8 +5107,86 @@ impl Engine {
             // The object is in the store; the worktree still holds the pointer
             // that was checked out. Replacing it is what makes this clone contain
             // real bytes rather than a text stub.
-            self.materialize_pending(profile, &local)?;
+            //
+            // The path that just arrived, not the whole tree: see
+            // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
+            self.materialize_landed(profile, &local, label)?;
         }
+        Ok(())
+    }
+
+    /// Replace the pointer for the one path an object just landed for.
+    ///
+    /// [`Self::materialize_pending`] is the whole-tree sweep, and it is the
+    /// right shape exactly once per pass: it reads the index and then stats —
+    /// and reads — every tracked file small enough to be a pointer. Per
+    /// *object* it is quadratic, and on real content that is not a slow path,
+    /// it is a stopped one. Measured on the folder that reported this: 154,765
+    /// tracked paths on a USB APFS volume at 3.9 ms per path cold is ~10
+    /// minutes for one sweep, so a backlog of 238 objects would have spent ~40
+    /// hours re-reading the same tree — one file materialized every 2 to 15
+    /// minutes, the queue frozen at "238 files left, 4.5 GB", and no throughput
+    /// figure at all, because the worker was inside a sweep instead of on the
+    /// wire. Delivering one object must never cost a walk of the repository.
+    ///
+    /// A transfer names its path in the journal row's label (that is what
+    /// `label_unit` is for), so the object that just arrived needs one stat, one
+    /// read and one index refresh. Two paths sharing an object — ordinary for
+    /// duplicated content — is precisely the case the label cannot name: the
+    /// second path keeps its pointer until the next sweep, which is one tick
+    /// away in [`Self::scan_and_enqueue`] and is where a whole-tree question
+    /// belongs. An unlabelled row (`None`) defers to that sweep for the same
+    /// reason, rather than paying for a walk here.
+    fn materialize_landed(
+        &self,
+        profile: &SyncProfile,
+        store: &lfs::store::LfsStore,
+        label: Option<&str>,
+    ) -> Result<()> {
+        // Pointer-only leaves content as a pointer on purpose — the
+        // whole-profile lever `materialize_pending` documents — and disabled has
+        // no pointers to replace.
+        if profile.lfs_mode != LfsMode::Materialize {
+            return Ok(());
+        }
+        let Some(rela) = label.map(PathBuf::from) else {
+            return Ok(());
+        };
+        let cone = SparseCone::new(&profile.subpaths);
+        if !cone.includes(&rela) {
+            return Ok(());
+        }
+        let candidate = std::slice::from_ref(&rela);
+        let Some(smudge) = lfs::stage::pending_smudges(&profile.local_path, candidate)?.pop()
+        else {
+            // Not a pointer any more: another arm materialized it, or the file
+            // has been replaced since the row was queued. Either way there is
+            // nothing here to replace.
+            return Ok(());
+        };
+        if !store.contains(&smudge.pointer.oid, smudge.pointer.size) {
+            // The pointer in the worktree names a different object than the one
+            // that landed — the path was edited since the row was queued. The
+            // sweep owns that discovery, and queues the object it now needs.
+            return Ok(());
+        }
+        lfs::stage::materialize(store, &profile.local_path, &smudge)?;
+        // The one moment this is knowable: content for this path now exists
+        // here, so the next object for it is a replacement rather than an
+        // arrival.
+        let landed = smudge.path.to_string_lossy().into_owned();
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::remember_materialized(conn, &profile.id, &landed, now))?;
+        tracing::info!(
+            profile = profile.name,
+            path = landed,
+            "materialized LFS content"
+        );
+        // The worktree file just changed size, so its index entry carries the
+        // pointer's stat and status would call it modified. Re-stat it against
+        // the real file.
+        let repo = self.open_repo(profile)?;
+        git::repo::refresh_index_stat(&repo, std::slice::from_ref(&smudge.path))?;
         Ok(())
     }
 
@@ -8844,6 +8926,92 @@ mod tests {
                 .find_reference(&format!("refs/heads/{}", p.branch))
                 .is_ok(),
             "the branch has to reach the remote once its objects have"
+        );
+    }
+
+    /// One object landing costs one path, never a walk of the repository.
+    ///
+    /// This is the shape of the field failure that produced
+    /// [`Engine::materialize_landed`]. The download leg finished by calling the
+    /// whole-tree sweep, so every delivered object re-read the index and then
+    /// stat-and-read every tracked file small enough to be a pointer. On the
+    /// folder that reported it — 154,765 tracked paths on a USB volume, 3.9 ms
+    /// per path cold, so ~10 minutes a sweep — a 238-object backlog moved one
+    /// file every 2 to 15 minutes and showed no throughput whatsoever, because
+    /// the worker spent its life inside a sweep rather than on the wire. Left
+    /// alone it would have taken about 40 hours to deliver 4.5 GB over a LAN.
+    ///
+    /// The cost is not directly observable from a test, but its cause is: the
+    /// sweep materializes *every* pointer whose object happens to be local,
+    /// while a targeted materialization touches the one path the journal row
+    /// names. So a second pointer whose object is already in the store, left
+    /// untouched by a download of the first, is exactly the discriminator — and
+    /// leaving it is safe, because the sweep in `scan_and_enqueue` is one tick
+    /// away and owns that whole-tree question.
+    #[tokio::test]
+    async fn a_landed_object_materializes_its_own_path_and_does_not_sweep_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        let payload = |seed: u8| vec![seed; 4_096];
+        std::fs::write(p.local_path.join("landed.mp4"), payload(1)).expect("write");
+        std::fs::write(p.local_path.join("sibling.mp4"), payload(2)).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+
+        // The inbound state, which is what a clone without a smudge filter
+        // checks out: both objects are in the local store — the commit above put
+        // them there — and both worktree files are pointer text.
+        let repo = engine.open_repo(&p).expect("open");
+        let pointer = |rela: &str| {
+            lfs::stage::indexed_pointer(&repo, Path::new(rela)).expect("the blob is a pointer")
+        };
+        let landed = pointer("landed.mp4");
+        let sibling = pointer("sibling.mp4");
+        drop(repo);
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        for (rela, ptr) in [("landed.mp4", &landed), ("sibling.mp4", &sibling)] {
+            assert!(
+                store.contains(&ptr.oid, ptr.size),
+                "{rela}'s object has to be local for this test to discriminate"
+            );
+            std::fs::write(p.local_path.join(rela), ptr.render()).expect("check out the pointer");
+        }
+
+        // Exactly one object arrives, and the row names the path it arrives for.
+        let unit = WorkKind::LfsDownload {
+            oid: landed.oid.clone(),
+            size: landed.size,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, platform.now_ms(), 0))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::label_unit(conn, id, "landed.mp4"))
+            .expect("label");
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            std::fs::read(p.local_path.join("landed.mp4")).expect("read"),
+            payload(1),
+            "the path the object landed for holds content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.local_path.join("sibling.mp4")).expect("read"),
+            sibling.render(),
+            "and no other path was even looked at — the sweep owns that"
         );
     }
 
