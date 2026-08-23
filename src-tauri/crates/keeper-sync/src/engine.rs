@@ -6056,18 +6056,30 @@ impl Engine {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
+            let interval = self.walk_report_interval;
+            // The walk runs on a blocking thread and cannot touch `&self`, so
+            // its progress comes back over a channel and is published from
+            // here. Without this the Pending list is the one surface that
+            // still went silent for the whole walk - which is exactly where
+            // the owner was looking when they asked what keeper was doing.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
             // The status walk and the untracked expansion are both blocking
             // filesystem work on a tree that may hold a hundred thousand
             // files; running them on the async runtime would stall every other
             // profile while a UI poll finished.
-            let (status, untracked, deleted_sizes) = tokio::task::spawn_blocking(
+            let task = tokio::task::spawn_blocking(
                 move || -> Result<(
                     git::repo::RepoStatus,
                     Vec<PathBuf>,
                     std::collections::HashMap<PathBuf, u64>,
                 )> {
                     let repo = git::repo::open(&repo_path, removable)?;
-                    let status = git::repo::status_paths(&repo)?;
+                    let report = move |seen: u64, entries: u64| {
+                        // A closed receiver means the caller has gone; the walk
+                        // still has a list to finish, so the send is dropped.
+                        let _ = tx.send((seen, entries));
+                    };
+                    let status = git::repo::status_paths_reported(&repo, Some(&report), interval)?;
                     // Asked here, where the repository is already open and on a
                     // blocking thread: a deleted path cannot be stat'd, and the
                     // index is the only thing that still knows how big it was.
@@ -6093,9 +6105,27 @@ impl Engine {
                     let (untracked, _collapsed) = Self::expand_untracked(&repo_path, &candidates)?;
                     Ok((status, untracked, deleted_sizes))
                 },
-            )
-            .await
-            .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
+            );
+
+            // Drain the walk's progress until it finishes. `select!` on the
+            // handle rather than a join at the end: a report that arrived after
+            // the walk was over would be a phase nobody is in.
+            let mut task = task;
+            let scanned = loop {
+                tokio::select! {
+                    report = rx.recv() => {
+                        if let Some((seen, entries)) = report {
+                            let mut event = self.progress(&profile, SyncPhase::Scanning);
+                            event.files_done = seen;
+                            event.files_total = (entries >= seen).then_some(entries);
+                            self.publish(event);
+                        }
+                    }
+                    finished = &mut task => break finished,
+                }
+            };
+            let (status, untracked, deleted_sizes) = scanned
+                .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
 
             let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
                 (&status.added, PendingReason::Added),
@@ -8606,6 +8636,63 @@ mod tests {
                 replacing: false,
             },
             "the size is the whole question about an object that has not arrived"
+        );
+    }
+
+    /// The Pending list is the surface the owner was watching, and it ran its
+    /// OWN walk - so wiring the commit scan alone left it silent.
+    ///
+    /// That walk happens on a blocking thread, which cannot touch the engine,
+    /// so its counts come back over a channel and are published here. This is
+    /// the maintenance guard for that path: a Pending poll over a folder with
+    /// work in it publishes the walk's progress, and the numbers are the pair
+    /// the line renders.
+    #[tokio::test]
+    async fn a_pending_poll_publishes_the_progress_of_its_own_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        // The seed ignores itself, so the first commit needs a file of its own.
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        std::fs::write(p.local_path.join("committed.txt"), b"already here").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        // `pending` only walks a folder that is already a repository - the
+        // first sync is what adopts it - so the fixture commits once before
+        // there is anything for a poll to find.
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        for i in 0..6 {
+            std::fs::write(p.local_path.join(format!("waiting-{i}.txt")), b"x").expect("write");
+        }
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        let listed = engine.pending(&p.id).await.expect("pending");
+        assert!(!listed.is_empty(), "the fixture has work, or nothing walks");
+
+        let counts: Vec<u64> = Engine::lock(&published)
+            .iter()
+            .filter(|event| event.phase == SyncPhase::Scanning && event.files_done > 0)
+            .map(|event| event.files_done)
+            .collect();
+        assert!(
+            !counts.is_empty(),
+            "the Pending poll walked and said nothing: {:?}",
+            Engine::lock(&published).clone()
+        );
+        assert!(
+            counts
+                .windows(2)
+                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+            "a count moved backwards without restarting: {counts:?}"
         );
     }
 
