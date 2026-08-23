@@ -1011,10 +1011,28 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// file return to synchronization the moment its permissions are restored,
 /// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
+    status_paths_reported(repo, None)
+}
+
+/// [`status_paths`], plus a way for a slow walk to say how far it has got.
+///
+/// The walk is the one step that can run for minutes with nothing on screen:
+/// on a 155 000-file folder on a USB volume it stats every tracked file, and
+/// until now it published exactly nothing while doing so - the pane read
+/// `Idle - N waiting to sync` and the owner had no way to tell a folder that
+/// was working from one that was wedged. `report` is called at most once a
+/// second with `(items produced, index entries)`; see [`WalkReport`].
+pub fn status_paths_reported(
+    repo: &gix::Repository,
+    report: Option<WalkReport<'_>>,
+) -> Result<RepoStatus> {
     let known = still_unreadable(repo, remembered_unreadable(repo));
     let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
 
-    let status = match status_paths_excluding(repo, &skip) {
+    // `WalkReport` is a shared reference and therefore `Copy`, which is the
+    // point: the retry arm below needs the same reporter, and a `&mut dyn
+    // FnMut` could not be handed to both walks.
+    let status = match status_paths_excluding(repo, &skip, report) {
         Ok(mut status) => {
             status.unreadable = known;
             status
@@ -1036,7 +1054,7 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
                 return Err(first);
             }
             let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
-            let mut status = status_paths_excluding(repo, &skip)?;
+            let mut status = status_paths_excluding(repo, &skip, report)?;
             for item in &found {
                 tracing::warn!(path = %item.path.display(), reason = %item.reason,
                     "this file could not be read; the rest of the folder was synchronized without it");
@@ -1297,7 +1315,42 @@ const STATUS_THREAD_LIMIT: usize = 4;
 /// core" is what deadlocked 55 conversions against a smaller filter pool.
 const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
 
-fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<RepoStatus> {
+/// How often a slow walk says how far it has got.
+///
+/// The pace is the whole design. A walk over a small folder finishes inside one
+/// interval and reports **nothing**, which is deliberate: publishing `Scanning`
+/// on every poll of an idle folder is what made the menu-bar glyph flip once a
+/// second (DW-116), and that lesson stands. Only a walk that is genuinely
+/// taking time gets to say so.
+const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a walk in progress can say about itself: items produced, and the number
+/// of index entries that bounds them.
+///
+/// The count is not a percentage and the denominator is not exact — a walk also
+/// emits untracked paths the index has never heard of, so `seen` can pass
+/// `entries`. It is the honest pair the walk actually holds, and it is what
+/// turns ten silent minutes into "checked 41 000 of 155 000 files".
+pub type WalkReport<'a> = &'a dyn Fn(u64, u64);
+
+fn status_paths_excluding(
+    repo: &gix::Repository,
+    skip: &[PathBuf],
+    report: Option<WalkReport<'_>>,
+) -> Result<RepoStatus> {
+    status_paths_excluding_paced(repo, skip, report, WALK_REPORT_INTERVAL)
+}
+
+/// [`status_paths_excluding`] with the reporting interval as a parameter.
+///
+/// Only the pace is injected, so what a test drives is the same walk production
+/// runs; a test that had to wait out a real second per item would not be run.
+fn status_paths_excluding_paced(
+    repo: &gix::Repository,
+    skip: &[PathBuf],
+    report: Option<WalkReport<'_>>,
+    interval: Duration,
+) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
@@ -1341,12 +1394,30 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
         .into_iter(patterns)
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
 
+    // The denominator, read once: the index is already mapped by the walk
+    // itself, and re-asking per item would put a load behind a counter whose
+    // whole purpose is to cost nothing.
+    let entries = repo
+        .index_or_empty()
+        .map(|index| index.entries().len() as u64)
+        .unwrap_or(0);
+
+    let mut last_report = Instant::now();
+
     let mut out = RepoStatus::default();
     for item in iter {
         // Before the item is inspected: a walk that is producing anything at
         // all is alive, whatever the item turns out to be. The heartbeat is the
         // count, so there is no second counter to keep in step with it.
         let seen = watchdog.beat();
+        if let Some(report) = report {
+            // Paced, not per item: see `WALK_REPORT_INTERVAL`. Checked after the
+            // beat so the count reported is one the walk has really reached.
+            if last_report.elapsed() >= interval {
+                last_report = Instant::now();
+                report(seen, entries);
+            }
+        }
         let item = item.map_err(|err| {
             // An interrupt usually ends the iterator rather than surfacing
             // here, which is why the real guard is after the loop — but if it
@@ -3080,6 +3151,63 @@ mod tests {
         assert!(status.added.is_empty());
         assert!(status.modified.is_empty());
         assert!(status.deleted.is_empty());
+    }
+
+    /// A walk that finishes inside the pacing interval says nothing.
+    ///
+    /// This half is not an optimisation, it is the constraint: publishing the
+    /// scanning phase on every poll of an idle folder is what made the menu-bar
+    /// glyph flip once a second, and the report exists for the ten-minute walk,
+    /// not the ten-millisecond one.
+    #[test]
+    fn a_walk_that_finishes_immediately_reports_no_progress() {
+        let (dir, repo) = repo_with_two_files();
+        // The walk MUST produce items, or this test would pass for the wrong
+        // reason: a clean tree emits nothing and there is no pacing to prove.
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_reported(&repo, Some(&report)).expect("status");
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "a fast walk must stay silent, got {:?}",
+            seen.lock().expect("lock")
+        );
+    }
+
+    /// And a walk that does take time reports the pair the UI renders.
+    ///
+    /// The interval is forced to zero rather than waited out - the behaviour
+    /// under test is what the numbers *are*, and a test that slept a second per
+    /// item to prove it would be a test nobody runs.
+    #[test]
+    fn a_slow_walk_reports_items_against_the_index_size() {
+        let (dir, repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_excluding_paced(&repo, &[], Some(&report), Duration::ZERO).expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            !seen.is_empty(),
+            "an item was produced and nothing was said"
+        );
+        // The count is the walk's own, and it counts up.
+        assert_eq!(seen.first().map(|pair| pair.0), Some(1));
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 > pair[0].0),
+            "the count never walks backwards: {seen:?}"
+        );
+        // The denominator is the index, which holds the two committed files -
+        // and not the untracked third, which is exactly why `seen` may pass it.
+        assert!(
+            seen.iter().all(|pair| pair.1 == 2),
+            "the denominator is the index entry count: {seen:?}"
+        );
     }
 
     #[test]

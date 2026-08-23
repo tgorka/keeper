@@ -4287,7 +4287,24 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
-        let status = git::repo::status_paths(&repo)?;
+        // A walk that takes longer than a second says so, on the surface the
+        // owner is looking at. Before this, the one step that can run for ten
+        // minutes on a 155 000-file folder published nothing at all, so the pane
+        // read `Idle - N waiting to sync` for the whole of it and there was no
+        // way to tell work from a wedge. Fast folders still report nothing: the
+        // pacing lives in `git::repo`, and DW-116's flipping glyph stays fixed.
+        let status = {
+            let report = |seen: u64, entries: u64| {
+                let mut event = self.progress(profile, SyncPhase::Scanning);
+                event.files_done = seen;
+                // `seen` counts untracked paths the index never had, so it can
+                // pass `entries`; a denominator below the numerator would render
+                // a bar past its end. Say the count alone in that case.
+                event.files_total = (entries >= seen).then_some(entries);
+                self.publish(event);
+            };
+            git::repo::status_paths_reported(&repo, Some(&report))?
+        };
         // The pass only got this far because those paths were stepped over, and
         // a folder that syncs while quietly omitting a file is the one outcome
         // worse than a folder that stops: nobody looks for what they were not
