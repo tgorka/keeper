@@ -506,7 +506,27 @@ export function NotesPane() {
   const list = useSurfaceColumn("notes-list", { rail: listRail });
 
   return (
-    <div className="flex min-h-0 flex-1">
+    // `min-w-0` is the whole of this surface fitting its window, and it is not
+    // defensive: measured in Chromium against this exact chain at a 1000px
+    // viewport, this row came out **1235px** without it and 1000px with it.
+    //
+    // Notes is the only surface that puts a row of its own between the shell and
+    // its columns — Files and Sessions hand their columns straight to the shell
+    // row (`app-shell.tsx`), so their columns are flex items of a box the window
+    // already sized. This row is a flex ITEM of that box, and a flex item's
+    // `min-width` defaults to `auto`, which means its content-based minimum:
+    // the two column bases plus a panel wide enough for its toolbar. Flexbox
+    // then refuses to shrink the row below that floor, the row overflows the
+    // window, and every box inside it is laid out at the wider width and
+    // clipped by the window — the open note's toolbar cut mid-row, and prose
+    // wrapped somewhere off screen so each line ended mid-word.
+    //
+    // Two earlier fixes went to the wrong element: `min-w-0` on the note column
+    // (`NOTE_COLUMN_CLASS`, whose parent is a block box, so it changed nothing)
+    // and a `ResizeObserver` re-measure (which cannot help a box that was never
+    // given a smaller width). The floor belongs on the item that has the
+    // content-based minimum, and that is this row.
+    <div className="flex min-h-0 min-w-0 flex-1">
       {/* Pane 1 — the scope column (Story 48.1: it folds, and it resizes). */}
       <nav
         // No `aria-label` here: the column's own chrome draws the visible name

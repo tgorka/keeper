@@ -166,7 +166,7 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
           No versions yet — the first one is written when this vault next commits.
         </p>
       ) : null}
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 min-w-0 flex-1">
         {/* The revision list owns the seam against the diff beside it, and
             cancels it if it ever ends up last — DESIGN.md → Elevation & Depth. */}
         <ul className="w-56 shrink-0 overflow-y-auto border-r last:border-r-0">
