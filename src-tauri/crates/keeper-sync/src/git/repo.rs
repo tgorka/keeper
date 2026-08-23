@@ -1011,10 +1011,30 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// file return to synchronization the moment its permissions are restored,
 /// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
+    // No reporter, so the interval cannot matter: the walk asks nothing.
+    status_paths_reported(repo, None, Duration::MAX)
+}
+
+/// [`status_paths`], plus a way for a slow walk to say how far it has got.
+///
+/// The walk is the one step that can run for minutes with nothing on screen:
+/// on a 155 000-file folder on a USB volume it stats every tracked file, and
+/// until now it published exactly nothing while doing so - the pane read
+/// `Idle - N waiting to sync` and the owner had no way to tell a folder that
+/// was working from one that was wedged. `report` is called at most once a
+/// second with `(items produced, index entries)`; see [`WalkReport`].
+pub fn status_paths_reported(
+    repo: &gix::Repository,
+    report: Option<WalkReport<'_>>,
+    interval: Duration,
+) -> Result<RepoStatus> {
     let known = still_unreadable(repo, remembered_unreadable(repo));
     let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
 
-    let status = match status_paths_excluding(repo, &skip) {
+    // `WalkReport` is a shared reference and therefore `Copy`, which is the
+    // point: the retry arm below needs the same reporter, and a `&mut dyn
+    // FnMut` could not be handed to both walks.
+    let status = match status_paths_excluding(repo, &skip, report, interval) {
         Ok(mut status) => {
             status.unreadable = known;
             status
@@ -1036,7 +1056,7 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
                 return Err(first);
             }
             let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
-            let mut status = status_paths_excluding(repo, &skip)?;
+            let mut status = status_paths_excluding(repo, &skip, report, interval)?;
             for item in &found {
                 tracing::warn!(path = %item.path.display(), reason = %item.reason,
                     "this file could not be read; the rest of the folder was synchronized without it");
@@ -1297,7 +1317,25 @@ const STATUS_THREAD_LIMIT: usize = 4;
 /// core" is what deadlocked 55 conversions against a smaller filter pool.
 const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
 
-fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<RepoStatus> {
+/// What a walk in progress can say about itself: items produced, and the number
+/// of index entries that bounds them.
+///
+/// The count is not a percentage and the denominator is not exact — a walk also
+/// emits untracked paths the index has never heard of, so `seen` can pass
+/// `entries`. It is the honest pair the walk actually holds, and it is what
+/// turns ten silent minutes into "checked 41 000 of 155 000 files".
+pub type WalkReport<'a> = &'a dyn Fn(u64, u64);
+
+/// The walk, with the pace its caller reports at.
+///
+/// `interval` is the publisher's policy, not git's: see the engine's
+/// `WALK_REPORT_INTERVAL`. `Duration::MAX` with no reporter is the silent case.
+fn status_paths_excluding(
+    repo: &gix::Repository,
+    skip: &[PathBuf],
+    report: Option<WalkReport<'_>>,
+    interval: Duration,
+) -> Result<RepoStatus> {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
@@ -1341,12 +1379,30 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
         .into_iter(patterns)
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
 
+    // The denominator, read once: the index is already mapped by the walk
+    // itself, and re-asking per item would put a load behind a counter whose
+    // whole purpose is to cost nothing.
+    let entries = repo
+        .index_or_empty()
+        .map(|index| index.entries().len() as u64)
+        .unwrap_or(0);
+
+    let mut last_report = Instant::now();
+
     let mut out = RepoStatus::default();
     for item in iter {
         // Before the item is inspected: a walk that is producing anything at
         // all is alive, whatever the item turns out to be. The heartbeat is the
         // count, so there is no second counter to keep in step with it.
         let seen = watchdog.beat();
+        if let Some(report) = report {
+            // Paced, not per item: see `WALK_REPORT_INTERVAL`. Checked after the
+            // beat so the count reported is one the walk has really reached.
+            if last_report.elapsed() >= interval {
+                last_report = Instant::now();
+                report(seen, entries);
+            }
+        }
         let item = item.map_err(|err| {
             // An interrupt usually ends the iterator rather than surfacing
             // here, which is why the real guard is after the loop — but if it
@@ -1431,7 +1487,19 @@ fn status_paths_excluding(repo: &gix::Repository, skip: &[PathBuf]) -> Result<Re
     // The shape of the pass, once, at INFO. A folder that later stalls is
     // diagnosed by comparing this line between runs — how many entries, how
     // long — and its absence is what made the field failure unreadable.
+    //
+    // Named, because two profiles produce interleaved lines and one of them may
+    // hold 641 files while the other holds 155 662: `elapsed_ms=108` next to
+    // `elapsed_ms=3044748` is unreadable without knowing which folder each
+    // belongs to, and that cost real time during the field diagnosis. The
+    // worktree's own directory name is the profile's name in every case that
+    // matters and needs nothing threaded through to obtain.
     tracing::info!(
+        folder = repo
+            .workdir()
+            .and_then(|dir| dir.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         entries = watchdog.beats(),
         elapsed_ms = watchdog.elapsed_ms(),
         added = out.added.len(),
@@ -1842,6 +1910,39 @@ pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Tracked paths whose worktree file could still be a checked-out pointer.
+///
+/// [`tracked_paths`] bounds the materialization sweep to the index, and that was
+/// enough while the answer was cheap to use. It is not: the caller stats — and
+/// for anything small enough, reads — every path it is handed, so on a folder of
+/// 154,765 entries on a USB volume the sweep costs about ten minutes of
+/// filesystem I/O to find the handful of pointers actually waiting. That runs
+/// inside the profile's one-operation-at-a-time reservation, so for those ten
+/// minutes nothing else about the folder can happen at all.
+///
+/// The index already knows the answer. Its entries carry the `stat` git recorded
+/// at checkout, and a checked-out pointer is a file of at most
+/// [`crate::lfs::pointer::MAX_POINTER_BYTES`]; anything larger on disk is
+/// content, not a stub. So the size the index remembers is a filter that costs
+/// no I/O whatsoever, and one that cannot lose a pointer: a pointer only ever
+/// reaches the worktree through a checkout, and a checkout is exactly the moment
+/// git records its size here.
+///
+/// A materialized file whose stat has been refreshed to its real length is
+/// therefore excluded, which is the entire point — it is also, by definition,
+/// the file that no longer needs materializing.
+pub fn pointer_sized_tracked_paths(repo: &gix::Repository, max_bytes: u32) -> Result<Vec<PathBuf>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    Ok(index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stat.size <= max_bytes)
+        .map(|entry| to_path(entry.path(&index)))
+        .collect())
+}
+
 /// Tracked paths git is carrying that keeper cannot spell (Story 47.2).
 ///
 /// The index is the only complete inventory of a repository that costs no
@@ -2071,6 +2172,50 @@ mod tests {
         assert_eq!(watchdog.beat(), 1);
         assert_eq!(watchdog.beat(), 2);
         assert_eq!(watchdog.beats(), 2);
+    }
+
+    /// The filter that keeps the materialization sweep off the filesystem.
+    ///
+    /// A pointer is at most `MAX_POINTER_BYTES` on disk, and git records what it
+    /// checked out, so the index alone separates "might still be a stub" from
+    /// "is content". Handing the caller every tracked path instead cost about
+    /// ten minutes of stats and reads per sweep on a 154,765-entry folder on a
+    /// USB volume — inside the profile's reservation, with ready work queued
+    /// behind it.
+    #[test]
+    fn only_pointer_sized_entries_are_offered_as_smudge_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        // A stub the size a pointer is, and content the size content is.
+        std::fs::write(root.join("stub.mp4"), vec![b'x'; 130]).expect("write");
+        std::fs::write(root.join("content.mp4"), vec![b'y'; 8_192]).expect("write");
+        git(&["add", "-A"]);
+
+        let repo = open(root, false).expect("open");
+        let candidates = pointer_sized_tracked_paths(&repo, 1_024).expect("candidates");
+
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("stub.mp4")],
+            "only the entry small enough to be a pointer is worth a stat"
+        );
+        assert_eq!(
+            tracked_paths(&repo).expect("tracked").len(),
+            2,
+            "and the unfiltered inventory still holds both, so this is a filter and not a loss"
+        );
     }
 
     /// A walk that was abandoned must not be mistaken for one that finished.
@@ -3003,6 +3148,63 @@ mod tests {
         assert!(status.added.is_empty());
         assert!(status.modified.is_empty());
         assert!(status.deleted.is_empty());
+    }
+
+    /// A walk that finishes inside the pacing interval says nothing.
+    ///
+    /// This half is not an optimisation, it is the constraint: publishing the
+    /// scanning phase on every poll of an idle folder is what made the menu-bar
+    /// glyph flip once a second, and the report exists for the ten-minute walk,
+    /// not the ten-millisecond one.
+    #[test]
+    fn a_walk_that_finishes_immediately_reports_no_progress() {
+        let (dir, repo) = repo_with_two_files();
+        // The walk MUST produce items, or this test would pass for the wrong
+        // reason: a clean tree emits nothing and there is no pacing to prove.
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_reported(&repo, Some(&report), Duration::from_secs(1)).expect("status");
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "a fast walk must stay silent, got {:?}",
+            seen.lock().expect("lock")
+        );
+    }
+
+    /// And a walk that does take time reports the pair the UI renders.
+    ///
+    /// The interval is forced to zero rather than waited out - the behaviour
+    /// under test is what the numbers *are*, and a test that slept a second per
+    /// item to prove it would be a test nobody runs.
+    #[test]
+    fn a_slow_walk_reports_items_against_the_index_size() {
+        let (dir, repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            !seen.is_empty(),
+            "an item was produced and nothing was said"
+        );
+        // The count is the walk's own, and it counts up.
+        assert_eq!(seen.first().map(|pair| pair.0), Some(1));
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 > pair[0].0),
+            "the count never walks backwards: {seen:?}"
+        );
+        // The denominator is the index, which holds the two committed files -
+        // and not the untracked third, which is exactly why `seen` may pass it.
+        assert!(
+            seen.iter().all(|pair| pair.1 == 2),
+            "the denominator is the index entry count: {seen:?}"
+        );
     }
 
     #[test]

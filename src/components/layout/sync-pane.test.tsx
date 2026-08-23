@@ -766,6 +766,31 @@ describe("SyncPane profile header", () => {
     expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
   });
 
+  it("leaves no orphaned separator on a phase that cannot carry a rate", async () => {
+    // The walk over a 155 000-file folder. It reports a count and never a rate,
+    // because a scan moves no bytes over any link - so reserving the rate's
+    // eleven characters printed `23/155662 files ·` followed by blank space,
+    // which is what the owner saw the moment the walk began reporting.
+    const scanning = "Scanning tgdrive — 23/155662 files";
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "syncing", phase: "scanning", line: scanning }),
+    ]);
+    render(<SyncPane />);
+    await screen.findByText(scanning);
+
+    act(() => {
+      emitProgress?.(
+        progressVm({ fraction: null, filesDone: 23, filesTotal: 155_662, bytesPerSecond: null }),
+      );
+    });
+
+    const counter = await screen.findByText("23/155662 files");
+    expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
+    // The detail line is the counter and nothing else: no separator, and no
+    // reserved room for a figure this phase can never produce.
+    expect(counter.parentElement?.textContent).toBe("23/155662 files");
+  });
+
   it("drops a stale streamed fraction once the poll says the folder is settled", async () => {
     await renderPane();
     act(() => {

@@ -1184,6 +1184,31 @@ mod tests {
         assert_eq!(status_line(&s), "tgdrive — up to date");
     }
 
+    /// The owner's report: "pending took very long; if keeper has a process
+    /// running it should say which one and roughly how much is left".
+    ///
+    /// A folder mid-walk used to render the *waiting* line — `tgdrive — 34521
+    /// waiting to sync` — for the ten minutes the walk took, because the walk
+    /// published no phase at all and a queue count was the only fact on hand.
+    /// The walk now reports, and the same line names the step and its counts.
+    #[test]
+    fn a_folder_being_walked_says_so_instead_of_only_what_is_queued() {
+        let mut s = status("tgdrive");
+        s.state = ProfileState::Syncing;
+        s.phase = SyncPhase::Scanning;
+        s.pending = 34_521;
+        s.files_done = 41_000;
+        s.files_total = Some(155_662);
+
+        assert_eq!(status_line(&s), "Scanning tgdrive — 41000/155662 files");
+
+        // A walk producing untracked paths can pass the index count, and a
+        // denominator below the numerator is not published: the count alone is
+        // still an answer, and it is still moving.
+        s.files_total = None;
+        assert_eq!(status_line(&s), "Scanning tgdrive — 41000 files");
+    }
+
     /// AD-34-10, and the single most misleading string in the app before this.
     ///
     /// `pending` counts journal rows. A folder where five thousand files are

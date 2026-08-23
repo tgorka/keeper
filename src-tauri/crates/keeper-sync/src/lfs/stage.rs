@@ -91,6 +91,34 @@ pub fn applies(profile: &SyncProfile, size: u64) -> bool {
     profile.lfs_mode != LfsMode::Disabled && size >= profile.lfs_threshold_bytes
 }
 
+/// Files git reads for its own configuration, before any filter runs.
+///
+/// git and gitoxide read these straight out of the worktree (or the index) as
+/// bytes. No smudge filter is ever applied to them, so a path in here that is
+/// tracked through LFS is not stored content that comes back on checkout — it
+/// is a file whose *only* readable content is now a pointer. `.gitattributes`
+/// is the one that bites: git parses the pointer as rules, so
+/// `version https://git-lfs.github.com/spec/v1` becomes a pattern with two
+/// attributes that are not valid attribute names, and every rule the file was
+/// there to carry silently stops applying to the whole subtree below it.
+///
+/// It is not a hypothetical. On the owner's drive two generated eclipse
+/// `.gitattributes` files crossed the threshold, keeper wrote itself an
+/// anchored rule for each, and every later git or gitoxide operation on the
+/// repository printed `is not a valid attribute name` — while the subtree they
+/// governed had no attributes at all.
+const GIT_CONTROL_FILES: [&str; 3] = [".gitattributes", ".gitignore", ".gitmodules"];
+
+/// Is this a file git reads unfiltered, and therefore must never be a pointer?
+///
+/// Matched on the file name at any depth, which is how git finds them: a
+/// `.gitattributes` is read in every directory it appears in.
+fn is_git_control_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| GIT_CONTROL_FILES.contains(&name))
+}
+
 /// The size rule plus the profile's opt-out globs, compiled once per run.
 ///
 /// Two things make the opt-out necessary in a repository that holds both notes
@@ -154,8 +182,11 @@ impl LfsPolicy {
     /// `path` is repository-relative, which is what the globs are written
     /// against — matching an absolute path would make `*.md` depend on where
     /// the folder happens to be mounted.
+    ///
+    /// A git control file is refused before the size rule is even consulted:
+    /// see [`is_git_control_file`] for why size is the wrong question there.
     pub fn applies(&self, path: &Path, size: u64) -> bool {
-        if !self.enabled || size < self.threshold {
+        if !self.enabled || size < self.threshold || is_git_control_file(path) {
             return false;
         }
         !self
@@ -1009,11 +1040,146 @@ fn head_records(repo: &gix::Repository, rela: &Path, blob: gix::hash::ObjectId) 
     })
 }
 
+/// Do this repository's attributes already send `rela` through the LFS filter?
+///
+/// Asked of a path that is **under** the threshold, to catch the per-extension
+/// rule's own siblings: `*.gif` covers a 500-byte gif as surely as the 4 GB one
+/// that produced the rule, and a path git filters must be stored filtered.
+///
+/// Every failure answers `false` - an unreadable attribute stack, an index that
+/// will not open, a path with no index entry (a brand-new file, whose size rule
+/// has already been consulted). That is the conservative direction here: it
+/// leaves a file as an ordinary blob, which is what it is today.
+fn already_routed(repo: &gix::Repository, rela: &Path) -> bool {
+    let Ok(index) = repo.index_or_empty() else {
+        return false;
+    };
+    let key = index_key(rela);
+    // A path the index does not carry has no recorded mode to match patterns
+    // with, and it is new: nothing about it can be inconsistent yet.
+    let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+        return false;
+    };
+    // Already a pointer in the index? Then the blob and the attributes agree
+    // and there is nothing to convert; leave it to the size rule.
+    if pointer_blob(repo, entry.id).is_some() {
+        return false;
+    }
+    routed_through_lfs(repo, &index, &key, entry.mode)
+}
+
+/// Tracked paths whose recorded blob contradicts their own attributes.
+///
+/// The repair list for the inconsistency [`prepare`] now refuses to create: a
+/// path git filters whose committed blob is the file's raw bytes. Such an entry
+/// can never read clean — the filter's output is a pointer and the blob is not,
+/// and no amount of stat data changes that — so a status walk cleans the file,
+/// gets a pointer, compares it against a raw blob, calls it modified, and pays
+/// a full read plus a filter round trip for the privilege. **On every walk.**
+///
+/// Measured on the owner's drive: 73 536 such entries turned a walk whose stat
+/// floor is 84 seconds into 25 to 74 minutes, because the cost is not bytes —
+/// 10.6 GiB is all that is materialized — it is one filter round trip per file,
+/// about 41 ms, four at a time.
+///
+/// # Why the index alone can answer this
+///
+/// Both halves are recorded facts. `.gitattributes` says whether the path is
+/// filtered, and the object header says how big the blob is: a pointer is at
+/// most [`pointer::MAX_POINTER_BYTES`], so anything larger cannot be one. No
+/// file is opened, no content is hashed, and the walk that would have found
+/// these the expensive way never has to run.
+///
+/// Bounded by `cap`, and that is deliberate: a folder in this state has tens of
+/// thousands of them, and one commit of 54 872 files is not a commit anybody
+/// can read or a pass anybody can interrupt. The caller drains the backlog over
+/// several passes.
+pub fn mismatched_filtered_paths(
+    repo: &gix::Repository,
+    tracked: &[PathBuf],
+    from: usize,
+    window: usize,
+    cap: usize,
+) -> (Vec<PathBuf>, usize) {
+    let start = if from >= tracked.len() { 0 } else { from };
+    if cap == 0 || window == 0 || tracked.is_empty() {
+        return (Vec::new(), start);
+    }
+    let Ok(index) = repo.index_or_empty() else {
+        return (Vec::new(), start);
+    };
+    let mut out = Vec::new();
+    let mut at = start;
+    for (examined, rela) in tracked[start..].iter().enumerate() {
+        // `window` bounds what this pass LOOKS AT, so it has to be checked
+        // before the skips below rather than beside the cap: a pass over five
+        // thousand entries that happen to be consistent still costs five
+        // thousand attribute resolutions, and that is the cost being bounded.
+        if examined >= window {
+            break;
+        }
+        at = start + examined + 1;
+        let key = index_key(rela);
+        let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+            continue;
+        };
+        // The attribute question FIRST, and the ordering is the whole cost of
+        // this function. Resolving attributes walks a directory stack gitoxide
+        // keeps in memory — microseconds, and free for every path whose
+        // directory was already resolved. Asking about the blob touches a pack:
+        // measured on the owner's volume, that ordering left keeper holding the
+        // index lock at 0% CPU for eight minutes, because it probed a pack for
+        // every one of 155 662 entries before asking the cheap question.
+        if !routed_through_lfs(repo, &index, &key, entry.mode) {
+            continue;
+        }
+        // Filtered, so its blob MUST be a pointer. `pointer_blob` answers from
+        // the header alone when the blob is too large to be one, and otherwise
+        // reads at most `MAX_POINTER_BYTES` and parses it. Size alone would be
+        // wrong in the direction that matters: the field's mismatched files
+        // include 512-byte gifs, which are *pointer-sized* and not pointers.
+        if pointer_blob(repo, entry.id).is_some() {
+            continue;
+        }
+        out.push(rela.clone());
+        if out.len() >= cap {
+            break;
+        }
+    }
+    if at >= tracked.len() {
+        at = 0;
+    }
+    (out, at)
+}
+
 /// Prepare LFS staging for a set of candidate paths.
 ///
 /// `candidates` are repository-relative paths already cleared by the
-/// completeness gate. Paths under the threshold are left alone entirely.
+/// completeness gate. Paths under the threshold are left alone entirely —
+/// unless `.gitattributes` already routes them through the LFS filter, which
+/// overrides the size rule; see the note below.
+///
+/// # Why the attributes override the threshold
+///
+/// The recorded rule is per-extension ([`pattern_for`]), so one oversized
+/// `.gif` converts `*.gif` for the whole repository. A 500-byte sibling then
+/// has `filter=lfs` in its attributes while staging leaves it a raw blob —
+/// and git's contract is that a path the filter governs is stored as the
+/// filter's output. The repository is now internally inconsistent, and it
+/// shows up as work that never finishes: every status walk cleans the file,
+/// gets a pointer, compares it to a raw blob, and calls it modified. It is
+/// not dismissible either — [`is_false_modification`] only forgives a path
+/// whose *indexed blob is a pointer*.
+///
+/// The cost of that is not a warning in a log. Stat data can only be recorded
+/// for an entry whose content check **passes**, so these paths are re-read in
+/// full on every single walk, forever. On the owner's drive that is 54 872
+/// files, and it is why a walk took eleven minutes.
+///
+/// So the attributes win. One commit converts each such file once, after which
+/// blob and attributes agree and the walk stats it like anything else.
 pub fn prepare(
+    repo: &gix::Repository,
     profile: &SyncProfile,
     store: &LfsStore,
     candidates: &[PathBuf],
@@ -1036,8 +1202,15 @@ pub fn prepare(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(SyncError::io("stat LFS candidate", absolute, err)),
         };
-        // A symlink's blob is its target; its size is meaningless here.
-        if !metadata.is_file() || !policy.applies(rela, metadata.len()) {
+        if !metadata.is_file() {
+            continue;
+        }
+        // A symlink's blob is its target; its size is meaningless here - which
+        // is why the size question is asked only of a real file. The attribute
+        // question is asked second because it reads `.gitattributes` and the
+        // index, and the threshold answers yes for everything this used to
+        // catch: only a file BELOW the threshold reaches the second half.
+        if !policy.applies(rela, metadata.len()) && !already_routed(repo, rela) {
             continue;
         }
 
@@ -1115,6 +1288,24 @@ pub fn pending_smudges(root: &Path, tracked: &[PathBuf]) -> Result<Vec<PendingSm
 /// then simply retried. The staging name carries keeper's own `.keeper.*.tmp`
 /// prefix, which tier 0 already excludes, so the watcher cannot mistake it for
 /// user content.
+///
+/// # The mode comes from the file being replaced, not from the store
+///
+/// `fs::copy` carries the *source's* permissions, and a store object is
+/// keeper's own file — `0600`, published as `0644`. The pointer in the worktree
+/// is git's file, checked out with the mode the index records, so on a tree
+/// whose entries are `100755` — anything that came off a FAT/exFAT drive, which
+/// is most pendrive content — every materialized file silently lost its
+/// executable bit.
+///
+/// That is not a cosmetic difference: a mode change makes the entry permanently
+/// dirty, and status can only decide that by converting the worktree file
+/// through the LFS clean filter. Measured on the folder that reported it, 378
+/// materialized files turned every status walk into a 343-second content
+/// comparison, which holds the profile's one-operation-at-a-time reservation
+/// and starves the journal drain — a folder that reads "Idle · 95 waiting to
+/// sync" while nothing whatsoever can run. Carrying the mode over keeps the
+/// entry clean, and the walk stat-clean with it.
 pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<()> {
     let oid = &smudge.pointer.oid;
     if !store.contains(oid, smudge.pointer.size) {
@@ -1132,8 +1323,18 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
         .unwrap_or_else(|| "object".to_owned());
     let staging = parent.join(format!(".keeper.{name}.tmp"));
 
+    // Read before the copy: after the rename there is nothing left to ask.
+    let mode = std::fs::symlink_metadata(&target)
+        .map(|metadata| metadata.permissions())
+        .ok();
     std::fs::copy(store.object_path(oid), &staging)
         .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))?;
+    // Applied to the staging file, so the published path never exists with the
+    // wrong mode — the same reason the copy is staged at all.
+    if let Some(mode) = mode {
+        std::fs::set_permissions(&staging, mode)
+            .map_err(|err| SyncError::io("carry the pointer's mode over", staging.clone(), err))?;
+    }
     std::fs::rename(&staging, &target)
         .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))?;
     Ok(())
@@ -1147,6 +1348,60 @@ mod tests {
         let mut p = SyncProfile::new("01J", "p", root, "https://git.invalid/r.git");
         p.lfs_threshold_bytes = 1024;
         p
+    }
+
+    /// A materialized file keeps the mode git checked its pointer out with.
+    ///
+    /// `fs::copy` carries the *source's* permissions, and the source is a store
+    /// object keeper wrote — never executable. So on a tree whose index records
+    /// `100755`, which is every tree that came off a FAT/exFAT drive, each
+    /// materialization silently dropped the bit and left the entry permanently
+    /// dirty. That is expensive, not cosmetic: deciding a mode-changed LFS path
+    /// means converting the worktree file through the clean filter, and 378 of
+    /// them turned every status walk on the folder that reported this into 343
+    /// seconds of hashing — which holds the profile's one-operation-at-a-time
+    /// reservation and starves the journal drain behind it.
+    #[test]
+    #[cfg(unix)]
+    fn materializing_carries_the_replaced_files_mode_over() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let content = vec![7u8; 4_096];
+        let oid = hex::encode(Sha256::digest(&content));
+        let store = LfsStore::in_git_dir(root.join(".git"));
+        store
+            .insert_verified(&oid, &content[..], content.len() as u64)
+            .expect("seed the object");
+
+        // The worktree as git left it: pointer text, executable, because that is
+        // what the index records for this path.
+        let smudge = PendingSmudge {
+            path: PathBuf::from("clip.mp4"),
+            pointer: Pointer::new(oid.clone(), content.len() as u64),
+        };
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, smudge.pointer.render()).expect("check out the pointer");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        materialize(&store, root, &smudge).expect("materialize");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            content,
+            "the content is the object's"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "and the mode is still git's, so the entry stays clean"
+        );
     }
 
     /// A repository whose index holds `rela` as a pointer of `size` bytes,
@@ -1166,6 +1421,34 @@ mod tests {
             .expect("write blob")
             .detach();
         let absolute = root.join(rela);
+        let metadata =
+            gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat the worktree");
+        let stat = Stat::from_fs(&metadata).expect("stat convert");
+        let mut index = State::new(repo.object_hash());
+        index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+        index.sort_entries();
+        let mut file = gix::index::File::from_state(index, repo.index_path());
+        file.write(gix::index::write::Options::default())
+            .expect("write index");
+        crate::git::repo::open(root, false).expect("reopen")
+    }
+
+    /// A repository whose index records `rela` as the raw bytes on disk.
+    ///
+    /// The state a per-extension rule leaves behind: the blob is the file's own
+    /// content, not a pointer, while `.gitattributes` says the path is filtered.
+    fn repo_with_indexed_content(root: &Path, rela: &str, content: &[u8]) -> gix::Repository {
+        use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        let repo = crate::git::repo::open(root, false).expect("open");
+        let absolute = root.join(rela);
+        std::fs::write(&absolute, content).expect("write the worktree file");
+        let blob = repo.write_blob(content).expect("write blob").detach();
         let metadata =
             gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat the worktree");
         let stat = Stat::from_fs(&metadata).expect("stat convert");
@@ -1291,6 +1574,37 @@ mod tests {
         // is unaffected.
         assert!(!policy.applies(Path::new("10-notes/a/b.md"), 10_000));
         assert!(policy.applies(Path::new("30-work/10-notes/a.md"), 10_000));
+    }
+
+    /// The field failure: a generated `.gitattributes` crossed the threshold.
+    ///
+    /// keeper wrote itself an anchored rule for it, the commit stored a pointer,
+    /// and from then on git read the pointer as the rule set — so the subtree
+    /// that file governed had no attributes, and every operation on the
+    /// repository printed `sha256:… is not a valid attribute name`. Size is the
+    /// wrong question for a file git reads before filters exist.
+    #[test]
+    fn a_file_git_reads_unfiltered_is_never_routed_through_lfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = profile(dir.path());
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+
+        for name in [".gitattributes", ".gitignore", ".gitmodules"] {
+            assert!(
+                !policy.applies(Path::new(name), 10_000_000),
+                "{name} at the repository root"
+            );
+            assert!(
+                !policy.applies(
+                    &Path::new("30-work/clients/deep/nested").join(name),
+                    u64::MAX
+                ),
+                "{name} is read in every directory it appears in, so depth is irrelevant"
+            );
+        }
+        // A file that merely *contains* the name is content like any other.
+        assert!(policy.applies(Path::new("docs/.gitattributes.bak"), 10_000_000));
+        assert!(policy.applies(Path::new("docs/my.gitignore.example"), 10_000_000));
     }
 
     #[test]
@@ -2000,6 +2314,90 @@ mod tests {
         assert_eq!(std::fs::read(&file).expect("read"), payload);
     }
 
+    /// The repair list, and what must stay off it.
+    ///
+    /// The index-only half of the eleven-minute walk: the same paths the walk
+    /// found by reading files and paying 73 536 filter round trips are named
+    /// here from two recorded facts - the attributes, and the blob's own header.
+    /// Putting a path on this list wrongly rewrites a file nobody asked to
+    /// convert, so every exclusion gets its own assertion.
+    #[test]
+    fn the_repair_list_is_exactly_the_paths_whose_blob_contradicts_the_rules() {
+        use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        // The rule one oversized sibling left behind, covering the extension.
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.gif {ATTRIBUTE_SUFFIX}\n"),
+        )
+        .expect("seed rule");
+
+        let repo = crate::git::repo::open(root, false).expect("open");
+        let mut index = State::new(repo.object_hash());
+        // Three shapes, one index: filtered-but-raw (the inconsistency),
+        // filtered-and-already-a-pointer, and a path nothing filters.
+        let pointer = Pointer::new("a".repeat(64), 4_000_000);
+        for (rela, bytes) in [
+            ("wrong.gif", vec![9u8; 4096]),
+            ("right.gif", pointer.render().into_bytes()),
+            ("ordinary.txt", vec![7u8; 4096]),
+        ] {
+            let absolute = root.join(rela);
+            std::fs::write(&absolute, &bytes).expect("write");
+            let blob = repo.write_blob(&bytes).expect("write blob").detach();
+            let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat");
+            let stat = Stat::from_fs(&metadata).expect("stat convert");
+            index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+        }
+        index.sort_entries();
+        let mut file = gix::index::File::from_state(index, repo.index_path());
+        file.write(gix::index::write::Options::default())
+            .expect("write index");
+        let repo = crate::git::repo::open(root, false).expect("reopen");
+
+        let tracked = crate::git::repo::tracked_paths(&repo).expect("tracked");
+        assert_eq!(
+            tracked.len(),
+            3,
+            "the fixture must hold all three: {tracked:?}"
+        );
+        assert_eq!(
+            mismatched_filtered_paths(&repo, &tracked, 0, 100, 100).0,
+            vec![PathBuf::from("wrong.gif")],
+            "only the filtered path whose blob is its own bytes"
+        );
+
+        // Bounded three ways, because a folder in this state has tens of
+        // thousands of these and a pass must stay short.
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 100, 0)
+            .0
+            .is_empty());
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 0, 100)
+            .0
+            .is_empty());
+        // The window stops the pass, and the cursor says where to resume; the
+        // wrong.gif entry sorts last of the three, so a one-entry window cannot
+        // have reached it yet.
+        let (found, next) = mismatched_filtered_paths(&repo, &tracked, 0, 1, 100);
+        assert!(
+            found.is_empty(),
+            "a one-entry window cannot reach it: {found:?}"
+        );
+        assert_eq!(next, 1, "and the next pass resumes after what it examined");
+        // Resuming from the end wraps rather than stalling.
+        assert_eq!(
+            mismatched_filtered_paths(&repo, &tracked, 999, 100, 100).1,
+            0
+        );
+    }
+
     #[test]
     fn prepare_routes_only_oversized_files_and_leaves_the_rest_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2009,7 +2407,9 @@ mod tests {
         std::fs::write(root.join("small.txt"), vec![1u8; 100]).expect("write");
         std::fs::write(root.join("big.mp4"), vec![2u8; 5000]).expect("write");
 
+        let repo = gix::init(root).expect("init");
         let staging = prepare(
+            &repo,
             &p,
             &store,
             &[PathBuf::from("small.txt"), PathBuf::from("big.mp4")],
@@ -2028,6 +2428,54 @@ mod tests {
         assert!(Pointer::parse(bytes).is_some());
     }
 
+    /// The eleven-minute walk, in one test.
+    ///
+    /// keeper records a per-extension rule, so one oversized `.gif` puts
+    /// `*.gif filter=lfs` in `.gitattributes` for good. A 500-byte sibling is
+    /// then a path git filters, and git's contract is that such a path is
+    /// stored as the filter's output - but staging asked only about size and
+    /// committed the raw bytes. Every later walk cleaned the file, got a
+    /// pointer, compared it against a raw blob and called it modified;
+    /// `is_false_modification` cannot forgive it, because that only covers a
+    /// path whose indexed blob IS a pointer. Stat data is only recorded for a
+    /// check that passes, so those files were re-read in full on every walk
+    /// forever: 54 872 of them on the owner's drive.
+    #[test]
+    fn a_small_file_the_attributes_already_route_is_staged_as_a_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // The rule one oversized sibling left behind, covering the extension.
+        // Written before the index fixture so the attribute stack sees it.
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.gif {ATTRIBUTE_SUFFIX}\n"),
+        )
+        .expect("seed rule");
+        let repo = repo_with_indexed_content(root, "small.gif", &[9u8; 100]);
+        let mut p = profile(root);
+        p.lfs_threshold_bytes = 1024;
+        let store = LfsStore::new(root.join(".git/lfs"));
+
+        let staging = prepare(&repo, &p, &store, &[PathBuf::from("small.gif")]).expect("prepare");
+
+        assert!(
+            staging.substitutions.contains_key(Path::new("small.gif")),
+            "a path git filters has to be stored filtered, whatever its size"
+        );
+        assert!(
+            Pointer::parse(&staging.substitutions[Path::new("small.gif")]).is_some(),
+            "and what is stored is a pointer"
+        );
+        // A file of an extension nothing routes stays an ordinary blob: this is
+        // the size rule, and it is not weakened.
+        std::fs::write(root.join("small.txt"), vec![7u8; 100]).expect("write");
+        let plain = prepare(&repo, &p, &store, &[PathBuf::from("small.txt")]).expect("prepare");
+        assert!(
+            plain.substitutions.is_empty(),
+            "nothing routes *.txt, and 100 bytes is under the threshold"
+        );
+    }
+
     #[test]
     fn prepare_does_nothing_at_all_when_lfs_is_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2036,7 +2484,9 @@ mod tests {
         p.lfs_mode = LfsMode::Disabled;
         std::fs::write(root.join("big.mp4"), vec![2u8; 5000]).expect("write");
 
+        let repo = gix::init(root).expect("init");
         let staging = prepare(
+            &repo,
             &p,
             &LfsStore::new(root.join(".git/lfs")),
             &[PathBuf::from("big.mp4")],
