@@ -673,10 +673,29 @@ fn merge_ff_only_args(reference: &str) -> Result<Vec<String>> {
     ])
 }
 
-/// `git merge -X theirs <ref>` argument vector.
+/// `git merge -X theirs -X no-renames <ref>` argument vector.
 ///
 /// `--no-edit` and an explicit `-m` keep git from opening an editor, which
 /// would hang a headless daemon forever.
+///
+/// # Rename detection is off, and that is what keeps the folder syncing
+///
+/// A rename is a delete plus an add of the same bytes, and keeper reconciles
+/// machine-generated trees where nobody is going to read a rename as such: the
+/// content is identical either way, and `-X theirs` already decides every
+/// content conflict. What detection does add is a failure mode. Above
+/// `merge.renameLimit` git gives up on it — "exhaustive rename detection was
+/// skipped due to too many files" — and the fallback turns one side's
+/// reorganization into rename/delete conflicts, one per path. Measured on the
+/// folder that reported it, a housekeeping pass that moved 128,483 files out of
+/// an inbox produced **138,311 unmerged paths** and `fatal: Exiting because of
+/// an unresolved conflict`: an unattended engine cannot resolve that, so the
+/// profile stopped syncing entirely and sat at "Idle · N waiting to sync" while
+/// the queue behind it never moved.
+///
+/// With detection off the same pass merges cleanly — our deletion of the old
+/// path and their addition of the new one are independent edits — and it is
+/// also markedly faster, because the O(n²) similarity search never runs.
 fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
     Ok(vec![
         "merge".to_owned(),
@@ -691,6 +710,8 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
         "ort".to_owned(),
         "-X".to_owned(),
         "theirs".to_owned(),
+        "-X".to_owned(),
+        "no-renames".to_owned(),
         "-m".to_owned(),
         // Passed verbatim, newlines and all. The message is a single argv
         // element handed to git without a shell, so a newline cannot start
@@ -1090,6 +1111,73 @@ mod tests {
                 "origin",
                 "refs/heads/main:refs/heads/main"
             ]
+        );
+    }
+
+    /// One side moving a file while the other deletes it must MERGE, not stop.
+    ///
+    /// This is the shape a housekeeping pass takes: a script moves files out of
+    /// an inbox and publishes the moves through a branch, while the local clone
+    /// records only the removals. With rename detection on, git calls every one
+    /// of those a rename/delete conflict — 138,311 of them on the folder that
+    /// reported this — and an unattended engine has nothing to resolve them
+    /// with, so the profile stops syncing. Driven through the real `git`, not
+    /// asserted on the argument vector: the vector proves the flag is passed,
+    /// and only git proves the flag is the right one.
+    #[test]
+    fn a_file_the_remote_moved_and_we_deleted_merges_instead_of_conflicting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("inbox")).expect("mkdir");
+        std::fs::write(root.join("inbox/report.pdf"), b"the same bytes either way").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        // Their side: the housekeeping move, on a branch standing in for the
+        // remote.
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::create_dir_all(root.join("records")).expect("mkdir");
+        std::fs::rename(
+            root.join("inbox/report.pdf"),
+            root.join("records/report.pdf"),
+        )
+        .expect("move");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "move it out of the inbox"]);
+
+        // Our side: the same removal, and nothing else.
+        git(&["checkout", "-q", "main"]);
+        std::fs::remove_file(root.join("inbox/report.pdf")).expect("delete");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the drop is empty"]);
+
+        GitCli::new(PathBuf::from("git"))
+            .merge_theirs(root, "refs/heads/remote", "sync: merge remote changes\n")
+            .expect("a move on one side and a delete on the other is not a conflict");
+        assert!(
+            root.join("records/report.pdf").is_file(),
+            "the destination the remote published has to land here"
+        );
+        assert!(
+            !root.join("inbox/report.pdf").exists(),
+            "and the emptied inbox stays empty"
         );
     }
 
