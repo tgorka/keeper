@@ -1068,6 +1068,70 @@ fn already_routed(repo: &gix::Repository, rela: &Path) -> bool {
     routed_through_lfs(repo, &index, &key, entry.mode)
 }
 
+/// Tracked paths whose recorded blob contradicts their own attributes.
+///
+/// The repair list for the inconsistency [`prepare`] now refuses to create: a
+/// path git filters whose committed blob is the file's raw bytes. Such an entry
+/// can never read clean — the filter's output is a pointer and the blob is not,
+/// and no amount of stat data changes that — so a status walk cleans the file,
+/// gets a pointer, compares it against a raw blob, calls it modified, and pays
+/// a full read plus a filter round trip for the privilege. **On every walk.**
+///
+/// Measured on the owner's drive: 73 536 such entries turned a walk whose stat
+/// floor is 84 seconds into 25 to 74 minutes, because the cost is not bytes —
+/// 10.6 GiB is all that is materialized — it is one filter round trip per file,
+/// about 41 ms, four at a time.
+///
+/// # Why the index alone can answer this
+///
+/// Both halves are recorded facts. `.gitattributes` says whether the path is
+/// filtered, and the object header says how big the blob is: a pointer is at
+/// most [`pointer::MAX_POINTER_BYTES`], so anything larger cannot be one. No
+/// file is opened, no content is hashed, and the walk that would have found
+/// these the expensive way never has to run.
+///
+/// Bounded by `cap`, and that is deliberate: a folder in this state has tens of
+/// thousands of them, and one commit of 54 872 files is not a commit anybody
+/// can read or a pass anybody can interrupt. The caller drains the backlog over
+/// several passes.
+pub fn mismatched_filtered_paths(
+    repo: &gix::Repository,
+    tracked: &[PathBuf],
+    cap: usize,
+) -> Vec<PathBuf> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let Ok(index) = repo.index_or_empty() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for rela in tracked {
+        let key = index_key(rela);
+        let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+            continue;
+        };
+        // Is the recorded blob already a pointer? [`pointer_blob`] answers from
+        // the header alone when the blob is too large to be one, and otherwise
+        // reads at most `MAX_POINTER_BYTES` and parses it. Size alone would be
+        // wrong in the direction that matters: the field's mismatched files
+        // include 512-byte gifs, which are *pointer-sized* and not pointers.
+        if pointer_blob(repo, entry.id).is_some() {
+            continue;
+        }
+        // Asked second because it walks a directory stack, where the above is a
+        // pack probe and at most a kilobyte.
+        if !routed_through_lfs(repo, &index, &key, entry.mode) {
+            continue;
+        }
+        out.push(rela.clone());
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
+}
+
 /// Prepare LFS staging for a set of candidate paths.
 ///
 /// `candidates` are repository-relative paths already cleared by the
@@ -2228,6 +2292,71 @@ mod tests {
         assert_eq!(pointer.oid, hex::encode(hasher.finalize()));
         // The worktree file is untouched — the user still sees their data.
         assert_eq!(std::fs::read(&file).expect("read"), payload);
+    }
+
+    /// The repair list, and what must stay off it.
+    ///
+    /// The index-only half of the eleven-minute walk: the same paths the walk
+    /// found by reading files and paying 73 536 filter round trips are named
+    /// here from two recorded facts - the attributes, and the blob's own header.
+    /// Putting a path on this list wrongly rewrites a file nobody asked to
+    /// convert, so every exclusion gets its own assertion.
+    #[test]
+    fn the_repair_list_is_exactly_the_paths_whose_blob_contradicts_the_rules() {
+        use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        // The rule one oversized sibling left behind, covering the extension.
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.gif {ATTRIBUTE_SUFFIX}\n"),
+        )
+        .expect("seed rule");
+
+        let repo = crate::git::repo::open(root, false).expect("open");
+        let mut index = State::new(repo.object_hash());
+        // Three shapes, one index: filtered-but-raw (the inconsistency),
+        // filtered-and-already-a-pointer, and a path nothing filters.
+        let pointer = Pointer::new("a".repeat(64), 4_000_000);
+        for (rela, bytes) in [
+            ("wrong.gif", vec![9u8; 4096]),
+            ("right.gif", pointer.render().into_bytes()),
+            ("ordinary.txt", vec![7u8; 4096]),
+        ] {
+            let absolute = root.join(rela);
+            std::fs::write(&absolute, &bytes).expect("write");
+            let blob = repo.write_blob(&bytes).expect("write blob").detach();
+            let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat");
+            let stat = Stat::from_fs(&metadata).expect("stat convert");
+            index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+        }
+        index.sort_entries();
+        let mut file = gix::index::File::from_state(index, repo.index_path());
+        file.write(gix::index::write::Options::default())
+            .expect("write index");
+        let repo = crate::git::repo::open(root, false).expect("reopen");
+
+        let tracked = crate::git::repo::tracked_paths(&repo).expect("tracked");
+        assert_eq!(
+            tracked.len(),
+            3,
+            "the fixture must hold all three: {tracked:?}"
+        );
+        assert_eq!(
+            mismatched_filtered_paths(&repo, &tracked, 100),
+            vec![PathBuf::from("wrong.gif")],
+            "only the filtered path whose blob is its own bytes"
+        );
+
+        // Bounded, because a folder in this state has tens of thousands.
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0).is_empty());
+        assert_eq!(mismatched_filtered_paths(&repo, &tracked, 1).len(), 1);
     }
 
     #[test]

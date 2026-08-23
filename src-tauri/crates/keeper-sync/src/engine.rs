@@ -334,6 +334,20 @@ pub struct ProblemReport {
 /// profile's reservation for minutes and starve its watcher.
 const CLAIM_LIMIT: u32 = 16;
 
+/// Files repaired per pass when the record contradicts the rules.
+///
+/// Bounded for the same reason [`CLAIM_LIMIT`] is: the folder this was built
+/// for has 54 872 of them, and a single commit of 54 872 files is neither a
+/// commit anybody can read nor a pass anybody can interrupt. Each pass hashes
+/// exactly this many files, publishes a count, and leaves the rest for the
+/// next one - and every pass permanently removes that many full reads from
+/// every future scan.
+///
+/// Larger than `CLAIM_LIMIT` because the work is local and cheap per item (one
+/// read of a file that is, by construction, under the LFS threshold) where a
+/// claimed unit can be a multi-gigabyte transfer.
+const REPAIR_BATCH: usize = 500;
+
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
@@ -3923,6 +3937,47 @@ impl Engine {
         Ok(converged)
     }
 
+    /// A bounded batch of paths whose committed blob contradicts their
+    /// attributes, or `None` when there are none.
+    ///
+    /// `Some` means "commit this instead of walking": these paths are modified
+    /// by definition — the filter's output cannot equal a raw blob — so asking
+    /// the filesystem to confirm it costs a read and a filter round trip each
+    /// and answers what the index already said. See
+    /// [`lfs::stage::mismatched_filtered_paths`].
+    ///
+    /// The stability gate is not consulted, and that is correct rather than a
+    /// shortcut: the gate exists to hold a file whose *writer* has not
+    /// finished, and nothing here is about the file's bytes changing. What is
+    /// wrong is the record, and the record is not being written to.
+    fn repair_recorded_pointers(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<Option<git::commit::StagedChange>> {
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Ok(None);
+        }
+        let repo = self.open_repo(profile)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let found = lfs::stage::mismatched_filtered_paths(&repo, &tracked, REPAIR_BATCH);
+        if found.is_empty() {
+            return Ok(None);
+        }
+        // Said once per batch rather than once per path: a folder in this state
+        // has tens of thousands, and the useful facts are how many are left and
+        // that something is being done about it.
+        tracing::info!(
+            profile = profile.name,
+            batch = found.len(),
+            "these files are committed as plain blobs although this folder's rules filter them; \
+             rewriting them as pointers so the next scan does not have to read them again"
+        );
+        Ok(Some(git::commit::StagedChange {
+            modified: found,
+            ..Default::default()
+        }))
+    }
+
     /// Scan, gate and commit whatever settled. Returns how many paths landed.
     ///
     /// Shared by both legs so the working tree is always clean before a merge
@@ -3941,7 +3996,16 @@ impl Engine {
             // preserved by the merge's own conflict handling instead.
             return Ok(0);
         }
-        let staged = self.collect_stable_changes(profile)?;
+        // Before the walk, not after it: a path whose recorded blob contradicts
+        // its own attributes is already known to be work, and the walk is the
+        // most expensive possible way to rediscover it. Each one costs a full
+        // read and a filter round trip *per walk* until it is committed, which
+        // is what turned this folder's 84-second stat floor into 25 to 74
+        // minutes. The index knows the answer for nothing.
+        let staged = match self.repair_recorded_pointers(profile)? {
+            Some(repair) => repair,
+            None => self.collect_stable_changes(profile)?,
+        };
         if staged.is_empty() {
             return Ok(0);
         }
@@ -7013,6 +7077,112 @@ mod tests {
         assert_eq!(
             engine.status(&p.id).expect("status").state,
             ProfileState::Syncing
+        );
+    }
+
+    /// The repair runs INSTEAD of the walk, which is the whole saving.
+    ///
+    /// A path whose committed blob contradicts its own attributes is modified by
+    /// definition, so asking the filesystem to confirm it buys nothing and costs
+    /// a full read plus a filter round trip - about 41 ms each, four at a time,
+    /// which is how 73 536 of them turned this folder's 84-second stat floor
+    /// into 25 to 74 minutes per pass. The index answers for nothing, so the
+    /// pass that repairs them must not walk at all.
+    #[test]
+    fn a_recorded_inconsistency_is_repaired_without_walking_the_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        // Reporting every item makes a walk impossible to miss: if this pass
+        // walked, `Scanning` would appear in the stream below.
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1_000_000;
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The state a per-extension rule leaves behind, built the way the field
+        // built it. `prepare` will not create it any more (that is the fix in
+        // `lfs::stage`), so the fixture commits the gif with the filter bypassed
+        // - which is exactly what a keeper that only asked about size did: the
+        // rule filters every `.gif`, and the blob is the file's own bytes.
+        std::fs::write(
+            p.local_path.join(".gitattributes"),
+            "*.gif filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .expect("rule");
+        std::fs::write(p.local_path.join("small.gif"), vec![3u8; 512]).expect("write");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=cat",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".gitattributes",
+            "small.gif",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "raw",
+        ]);
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        // Nothing on disk changed, so a walk would find nothing - and would pay
+        // for the discovery anyway.
+        // The sweep names it from the index alone, with no walk in sight.
+        assert_eq!(
+            engine
+                .repair_recorded_pointers(&p)
+                .expect("sweep")
+                .map(|staged| staged.modified),
+            Some(vec![PathBuf::from("small.gif")])
+        );
+        let repaired = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("repair pass");
+        assert!(repaired > 0, "the inconsistency has to be repaired");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "the repair must not walk the folder: {phases:?}"
+        );
+
+        // And it is durable: that path is recorded as a pointer now, so the next
+        // scan stats it like anything else instead of reading it, and it does
+        // not come back on the repair list.
+        let repo = engine.open_repo(&p).expect("open");
+        assert!(
+            lfs::stage::mismatched_filtered_paths(&repo, &[PathBuf::from("small.gif")], 10)
+                .is_empty(),
+            "a repaired path must not be repaired again"
         );
     }
 
