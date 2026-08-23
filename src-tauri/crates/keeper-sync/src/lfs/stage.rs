@@ -91,6 +91,34 @@ pub fn applies(profile: &SyncProfile, size: u64) -> bool {
     profile.lfs_mode != LfsMode::Disabled && size >= profile.lfs_threshold_bytes
 }
 
+/// Files git reads for its own configuration, before any filter runs.
+///
+/// git and gitoxide read these straight out of the worktree (or the index) as
+/// bytes. No smudge filter is ever applied to them, so a path in here that is
+/// tracked through LFS is not stored content that comes back on checkout — it
+/// is a file whose *only* readable content is now a pointer. `.gitattributes`
+/// is the one that bites: git parses the pointer as rules, so
+/// `version https://git-lfs.github.com/spec/v1` becomes a pattern with two
+/// attributes that are not valid attribute names, and every rule the file was
+/// there to carry silently stops applying to the whole subtree below it.
+///
+/// It is not a hypothetical. On the owner's drive two generated eclipse
+/// `.gitattributes` files crossed the threshold, keeper wrote itself an
+/// anchored rule for each, and every later git or gitoxide operation on the
+/// repository printed `is not a valid attribute name` — while the subtree they
+/// governed had no attributes at all.
+const GIT_CONTROL_FILES: [&str; 3] = [".gitattributes", ".gitignore", ".gitmodules"];
+
+/// Is this a file git reads unfiltered, and therefore must never be a pointer?
+///
+/// Matched on the file name at any depth, which is how git finds them: a
+/// `.gitattributes` is read in every directory it appears in.
+fn is_git_control_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| GIT_CONTROL_FILES.contains(&name))
+}
+
 /// The size rule plus the profile's opt-out globs, compiled once per run.
 ///
 /// Two things make the opt-out necessary in a repository that holds both notes
@@ -154,8 +182,11 @@ impl LfsPolicy {
     /// `path` is repository-relative, which is what the globs are written
     /// against — matching an absolute path would make `*.md` depend on where
     /// the folder happens to be mounted.
+    ///
+    /// A git control file is refused before the size rule is even consulted:
+    /// see [`is_git_control_file`] for why size is the wrong question there.
     pub fn applies(&self, path: &Path, size: u64) -> bool {
-        if !self.enabled || size < self.threshold {
+        if !self.enabled || size < self.threshold || is_git_control_file(path) {
             return false;
         }
         !self
@@ -1373,6 +1404,37 @@ mod tests {
         // is unaffected.
         assert!(!policy.applies(Path::new("10-notes/a/b.md"), 10_000));
         assert!(policy.applies(Path::new("30-work/10-notes/a.md"), 10_000));
+    }
+
+    /// The field failure: a generated `.gitattributes` crossed the threshold.
+    ///
+    /// keeper wrote itself an anchored rule for it, the commit stored a pointer,
+    /// and from then on git read the pointer as the rule set — so the subtree
+    /// that file governed had no attributes, and every operation on the
+    /// repository printed `sha256:… is not a valid attribute name`. Size is the
+    /// wrong question for a file git reads before filters exist.
+    #[test]
+    fn a_file_git_reads_unfiltered_is_never_routed_through_lfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = profile(dir.path());
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+
+        for name in [".gitattributes", ".gitignore", ".gitmodules"] {
+            assert!(
+                !policy.applies(Path::new(name), 10_000_000),
+                "{name} at the repository root"
+            );
+            assert!(
+                !policy.applies(
+                    &Path::new("30-work/clients/deep/nested").join(name),
+                    u64::MAX
+                ),
+                "{name} is read in every directory it appears in, so depth is irrelevant"
+            );
+        }
+        // A file that merely *contains* the name is content like any other.
+        assert!(policy.applies(Path::new("docs/.gitattributes.bak"), 10_000_000));
+        assert!(policy.applies(Path::new("docs/my.gitignore.example"), 10_000_000));
     }
 
     #[test]
