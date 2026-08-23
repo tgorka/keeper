@@ -348,6 +348,16 @@ const CLAIM_LIMIT: u32 = 16;
 /// claimed unit can be a multi-gigabyte transfer.
 const REPAIR_BATCH: usize = 500;
 
+/// Index entries examined per repair pass.
+///
+/// The pass reads a pack for every *filtered* entry it examines, and on the
+/// folder this was built for that is most of them. Unbounded, one pass held the
+/// index lock for eight minutes at 0% CPU before it had converted anything -
+/// which is the same mistake as the walk it replaces, one layer down. A window
+/// plus a remembered cursor keeps each pass short and still covers the whole
+/// index over successive passes.
+const REPAIR_WINDOW: usize = 5_000;
+
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
@@ -690,6 +700,13 @@ pub struct Engine {
     /// behaviour without waiting out real seconds per item. Production never
     /// changes it; see [`WALK_REPORT_INTERVAL`] for why the pace exists at all.
     walk_report_interval: Duration,
+    /// Where each profile's next repair pass resumes in its tracked-path list.
+    ///
+    /// A cursor rather than a fresh start, because a pass that always began at
+    /// the top would re-examine the same cheap prefix forever and never reach
+    /// the inconsistencies deeper in the tree. Wraps at the end; see
+    /// [`REPAIR_WINDOW`].
+    repair_cursor: Mutex<HashMap<String, usize>>,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -801,6 +818,7 @@ impl Engine {
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
             walk_report_interval: WALK_REPORT_INTERVAL,
+            repair_cursor: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -3959,7 +3977,18 @@ impl Engine {
         }
         let repo = self.open_repo(profile)?;
         let tracked = git::repo::tracked_paths(&repo)?;
-        let found = lfs::stage::mismatched_filtered_paths(&repo, &tracked, REPAIR_BATCH);
+        let from = Self::lock(&self.repair_cursor)
+            .get(&profile.id)
+            .copied()
+            .unwrap_or(0);
+        let (found, next) = lfs::stage::mismatched_filtered_paths(
+            &repo,
+            &tracked,
+            from,
+            REPAIR_WINDOW,
+            REPAIR_BATCH,
+        );
+        Self::lock(&self.repair_cursor).insert(profile.id.clone(), next);
         if found.is_empty() {
             return Ok(None);
         }
@@ -7180,7 +7209,8 @@ mod tests {
         // not come back on the repair list.
         let repo = engine.open_repo(&p).expect("open");
         assert!(
-            lfs::stage::mismatched_filtered_paths(&repo, &[PathBuf::from("small.gif")], 10)
+            lfs::stage::mismatched_filtered_paths(&repo, &[PathBuf::from("small.gif")], 0, 10, 10,)
+                .0
                 .is_empty(),
             "a repaired path must not be repaired again"
         );

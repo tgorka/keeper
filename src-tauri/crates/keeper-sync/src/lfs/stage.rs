@@ -1097,21 +1097,43 @@ fn already_routed(repo: &gix::Repository, rela: &Path) -> bool {
 pub fn mismatched_filtered_paths(
     repo: &gix::Repository,
     tracked: &[PathBuf],
+    from: usize,
+    window: usize,
     cap: usize,
-) -> Vec<PathBuf> {
-    if cap == 0 {
-        return Vec::new();
+) -> (Vec<PathBuf>, usize) {
+    let start = if from >= tracked.len() { 0 } else { from };
+    if cap == 0 || window == 0 || tracked.is_empty() {
+        return (Vec::new(), start);
     }
     let Ok(index) = repo.index_or_empty() else {
-        return Vec::new();
+        return (Vec::new(), start);
     };
     let mut out = Vec::new();
-    for rela in tracked {
+    let mut at = start;
+    for (examined, rela) in tracked[start..].iter().enumerate() {
+        // `window` bounds what this pass LOOKS AT, so it has to be checked
+        // before the skips below rather than beside the cap: a pass over five
+        // thousand entries that happen to be consistent still costs five
+        // thousand attribute resolutions, and that is the cost being bounded.
+        if examined >= window {
+            break;
+        }
+        at = start + examined + 1;
         let key = index_key(rela);
         let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
             continue;
         };
-        // Is the recorded blob already a pointer? [`pointer_blob`] answers from
+        // The attribute question FIRST, and the ordering is the whole cost of
+        // this function. Resolving attributes walks a directory stack gitoxide
+        // keeps in memory — microseconds, and free for every path whose
+        // directory was already resolved. Asking about the blob touches a pack:
+        // measured on the owner's volume, that ordering left keeper holding the
+        // index lock at 0% CPU for eight minutes, because it probed a pack for
+        // every one of 155 662 entries before asking the cheap question.
+        if !routed_through_lfs(repo, &index, &key, entry.mode) {
+            continue;
+        }
+        // Filtered, so its blob MUST be a pointer. `pointer_blob` answers from
         // the header alone when the blob is too large to be one, and otherwise
         // reads at most `MAX_POINTER_BYTES` and parses it. Size alone would be
         // wrong in the direction that matters: the field's mismatched files
@@ -1119,17 +1141,15 @@ pub fn mismatched_filtered_paths(
         if pointer_blob(repo, entry.id).is_some() {
             continue;
         }
-        // Asked second because it walks a directory stack, where the above is a
-        // pack probe and at most a kilobyte.
-        if !routed_through_lfs(repo, &index, &key, entry.mode) {
-            continue;
-        }
         out.push(rela.clone());
         if out.len() >= cap {
             break;
         }
     }
-    out
+    if at >= tracked.len() {
+        at = 0;
+    }
+    (out, at)
 }
 
 /// Prepare LFS staging for a set of candidate paths.
@@ -2349,14 +2369,33 @@ mod tests {
             "the fixture must hold all three: {tracked:?}"
         );
         assert_eq!(
-            mismatched_filtered_paths(&repo, &tracked, 100),
+            mismatched_filtered_paths(&repo, &tracked, 0, 100, 100).0,
             vec![PathBuf::from("wrong.gif")],
             "only the filtered path whose blob is its own bytes"
         );
 
-        // Bounded, because a folder in this state has tens of thousands.
-        assert!(mismatched_filtered_paths(&repo, &tracked, 0).is_empty());
-        assert_eq!(mismatched_filtered_paths(&repo, &tracked, 1).len(), 1);
+        // Bounded three ways, because a folder in this state has tens of
+        // thousands of these and a pass must stay short.
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 100, 0)
+            .0
+            .is_empty());
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 0, 100)
+            .0
+            .is_empty());
+        // The window stops the pass, and the cursor says where to resume; the
+        // wrong.gif entry sorts last of the three, so a one-entry window cannot
+        // have reached it yet.
+        let (found, next) = mismatched_filtered_paths(&repo, &tracked, 0, 1, 100);
+        assert!(
+            found.is_empty(),
+            "a one-entry window cannot reach it: {found:?}"
+        );
+        assert_eq!(next, 1, "and the next pass resumes after what it examined");
+        // Resuming from the end wraps rather than stalling.
+        assert_eq!(
+            mismatched_filtered_paths(&repo, &tracked, 999, 100, 100).1,
+            0
+        );
     }
 
     #[test]
