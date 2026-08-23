@@ -785,7 +785,7 @@ export function PhoneShell() {
       >
         {level === 1 && edgeSwipeZone}
         <PhoneHeader level={1} onBack={onBack} backRef={back1Ref} />
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1">
           <ConversationPane
             detailOpen={detailOpen}
             onToggleDetail={toggleDetail}
@@ -806,7 +806,7 @@ export function PhoneShell() {
       >
         {level === 2 && edgeSwipeZone}
         <PhoneHeader level={2} onBack={onBack} backRef={back2Ref} />
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1">
           <DetailPanel />
         </div>
       </StackLevel>

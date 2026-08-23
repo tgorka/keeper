@@ -274,7 +274,7 @@ export function AppShell() {
           </div>
         )}
         <VerifyBanner />
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1">
           {phone ? (
             // Below 768px the single-pane stack replaces the sidebar + panes row
             // (Story 13.1); the global overlays/dialogs/shortcut hooks below stay
