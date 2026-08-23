@@ -1011,7 +1011,8 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// file return to synchronization the moment its permissions are restored,
 /// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
-    status_paths_reported(repo, None)
+    // No reporter, so the interval cannot matter: the walk asks nothing.
+    status_paths_reported(repo, None, Duration::MAX)
 }
 
 /// [`status_paths`], plus a way for a slow walk to say how far it has got.
@@ -1025,6 +1026,7 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
 pub fn status_paths_reported(
     repo: &gix::Repository,
     report: Option<WalkReport<'_>>,
+    interval: Duration,
 ) -> Result<RepoStatus> {
     let known = still_unreadable(repo, remembered_unreadable(repo));
     let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
@@ -1032,7 +1034,7 @@ pub fn status_paths_reported(
     // `WalkReport` is a shared reference and therefore `Copy`, which is the
     // point: the retry arm below needs the same reporter, and a `&mut dyn
     // FnMut` could not be handed to both walks.
-    let status = match status_paths_excluding(repo, &skip, report) {
+    let status = match status_paths_excluding(repo, &skip, report, interval) {
         Ok(mut status) => {
             status.unreadable = known;
             status
@@ -1054,7 +1056,7 @@ pub fn status_paths_reported(
                 return Err(first);
             }
             let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
-            let mut status = status_paths_excluding(repo, &skip, report)?;
+            let mut status = status_paths_excluding(repo, &skip, report, interval)?;
             for item in &found {
                 tracing::warn!(path = %item.path.display(), reason = %item.reason,
                     "this file could not be read; the rest of the folder was synchronized without it");
@@ -1315,15 +1317,6 @@ const STATUS_THREAD_LIMIT: usize = 4;
 /// core" is what deadlocked 55 conversions against a smaller filter pool.
 const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
 
-/// How often a slow walk says how far it has got.
-///
-/// The pace is the whole design. A walk over a small folder finishes inside one
-/// interval and reports **nothing**, which is deliberate: publishing `Scanning`
-/// on every poll of an idle folder is what made the menu-bar glyph flip once a
-/// second (DW-116), and that lesson stands. Only a walk that is genuinely
-/// taking time gets to say so.
-const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
-
 /// What a walk in progress can say about itself: items produced, and the number
 /// of index entries that bounds them.
 ///
@@ -1333,19 +1326,11 @@ const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// turns ten silent minutes into "checked 41 000 of 155 000 files".
 pub type WalkReport<'a> = &'a dyn Fn(u64, u64);
 
-fn status_paths_excluding(
-    repo: &gix::Repository,
-    skip: &[PathBuf],
-    report: Option<WalkReport<'_>>,
-) -> Result<RepoStatus> {
-    status_paths_excluding_paced(repo, skip, report, WALK_REPORT_INTERVAL)
-}
-
-/// [`status_paths_excluding`] with the reporting interval as a parameter.
+/// The walk, with the pace its caller reports at.
 ///
-/// Only the pace is injected, so what a test drives is the same walk production
-/// runs; a test that had to wait out a real second per item would not be run.
-fn status_paths_excluding_paced(
+/// `interval` is the publisher's policy, not git's: see the engine's
+/// `WALK_REPORT_INTERVAL`. `Duration::MAX` with no reporter is the silent case.
+fn status_paths_excluding(
     repo: &gix::Repository,
     skip: &[PathBuf],
     report: Option<WalkReport<'_>>,
@@ -3169,7 +3154,7 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_reported(&repo, Some(&report)).expect("status");
+        status_paths_reported(&repo, Some(&report), Duration::from_secs(1)).expect("status");
         assert!(
             seen.lock().expect("lock").is_empty(),
             "a fast walk must stay silent, got {:?}",
@@ -3189,7 +3174,7 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_excluding_paced(&repo, &[], Some(&report), Duration::ZERO).expect("status");
+        status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(

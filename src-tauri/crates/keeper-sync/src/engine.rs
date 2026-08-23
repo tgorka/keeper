@@ -28,7 +28,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -486,6 +486,16 @@ enum ProfileWatch {
     },
 }
 
+/// How often a walk that is taking time says where it has got to.
+///
+/// The pace is the whole design. A walk over a small folder finishes inside one
+/// interval and reports **nothing**, which is deliberate: publishing a phase on
+/// every poll of an idle folder is what made the menu-bar glyph flip once a
+/// second (DW-116), and that lesson stands. Only a walk that is genuinely
+/// taking time gets to say so - and on the folder this was built for, one
+/// second is 30 files out of 155 000, so the line moves visibly.
+const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -660,6 +670,12 @@ pub struct Engine {
     /// construction. Contention is nil: three increments per commit at the
     /// most, against locks the same call already takes for the journal.
     counters: Mutex<HashMap<String, EngineCounters>>,
+    /// How often a walk in progress is allowed to publish where it has got to.
+    ///
+    /// A field rather than a constant so a test can drive the reporting
+    /// behaviour without waiting out real seconds per item. Production never
+    /// changes it; see [`WALK_REPORT_INTERVAL`] for why the pace exists at all.
+    walk_report_interval: Duration,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -770,9 +786,21 @@ impl Engine {
             watch_tap: OnceLock::new(),
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
+            walk_report_interval: WALK_REPORT_INTERVAL,
         };
         engine.seed_status()?;
         Ok(engine)
+    }
+
+    /// Report a walk's progress on every item, for tests.
+    ///
+    /// The pacing is what keeps an idle folder from publishing a phase once a
+    /// second, so a test that wants to *see* a report either waits out a real
+    /// interval per item or says this. It exists to make the long-operation
+    /// behaviour testable, which is the only way it stays true.
+    #[cfg(test)]
+    fn report_every_walk_item(&mut self) {
+        self.walk_report_interval = Duration::ZERO;
     }
 
     /// Poison-tolerant lock. A panic in one profile's handler must not take
@@ -4303,7 +4331,7 @@ impl Engine {
                 event.files_total = (entries >= seen).then_some(entries);
                 self.publish(event);
             };
-            git::repo::status_paths_reported(&repo, Some(&report))?
+            git::repo::status_paths_reported(&repo, Some(&report), self.walk_report_interval)?
         };
         // The pass only got this far because those paths were stepped over, and
         // a folder that syncs while quietly omitting a file is the one outcome
@@ -6953,6 +6981,90 @@ mod tests {
         assert_eq!(
             engine.status(&p.id).expect("status").state,
             ProfileState::Syncing
+        );
+    }
+
+    /// The maintenance guarantee: an operation that takes time SAYS SO.
+    ///
+    /// The field report this exists for: "pending took very long; if keeper has
+    /// a process running it should display which one and give information that
+    /// suggests when it will finish (e.g. how many files are left)". Before it,
+    /// the walk over a 155 000-file folder published nothing for the ten minutes
+    /// it took, so the only line on screen was `tgdrive - 34521 waiting to
+    /// sync` - a fact about the queue, while the work itself was invisible and
+    /// indistinguishable from a wedge.
+    ///
+    /// Simulating "slow" is done by reporting on every item rather than by
+    /// making a disk slow: what has to stay true is that the *counts reach the
+    /// surface the owner reads*, and a test that waited out real seconds to
+    /// prove it would be a test nobody runs. The silent-when-fast half is
+    /// `git::repo`'s `a_walk_that_finishes_immediately_reports_no_progress`.
+    #[test]
+    fn a_long_running_walk_reports_its_progress_where_the_owner_can_see_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // Enough files that a report carries a count worth reading.
+        for i in 0..8 {
+            std::fs::write(p.local_path.join(format!("file-{i}.txt")), b"content").expect("write");
+        }
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        // The stability gate admits a path only once a previous walk has seen
+        // it, so the first scan is the observation and the second is the one
+        // with work to hand the commit. Both walk, which is what is under test.
+        engine.collect_stable_changes(&p).expect("observe");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert!(!engine.collect_stable_changes(&p).expect("scan").is_empty());
+
+        let seen = Engine::lock(&published).clone();
+        let walking: Vec<&SyncProgress> = seen
+            .iter()
+            .filter(|event| event.phase == SyncPhase::Scanning && event.files_done > 0)
+            .collect();
+        assert!(
+            !walking.is_empty(),
+            "a walk in progress published no progress at all: {seen:?}"
+        );
+        let counts: Vec<u64> = walking.iter().map(|event| event.files_done).collect();
+        // It counts up, so a watcher can tell movement from a freeze - within a
+        // walk. Each walk is its own operation and starts again at one, which is
+        // what a restart back to 1 in this stream is.
+        assert!(
+            counts
+                .windows(2)
+                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+            "a count moved backwards without restarting: {counts:?}"
+        );
+        // And it reaches every item the walk produced: eight untracked files,
+        // so a report that stopped at two would mean the pane freezes part way.
+        assert_eq!(
+            counts.iter().copied().max(),
+            Some(8),
+            "the report has to follow the walk to its end: {counts:?}"
+        );
+        // And the line the owner actually reads names the step and the numbers,
+        // rather than only what is queued behind it.
+        let mut status = engine.status(&p.id).expect("status");
+        status.phase = SyncPhase::Scanning;
+        status.files_done = walking.last().expect("a report").files_done;
+        status.files_total = walking.last().expect("a report").files_total;
+        let line = crate::progress::status_line(&status);
+        assert!(
+            line.starts_with("Scanning") && line.contains("files"),
+            "the owner has to be able to read what is happening; got {line:?}"
         );
     }
 
