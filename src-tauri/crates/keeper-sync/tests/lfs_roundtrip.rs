@@ -70,7 +70,8 @@ fn an_oversized_file_is_committed_as_a_pointer_while_the_worktree_keeps_it() {
     let p = profile(root);
     let store = LfsStore::in_git_dir(root.join(".git"));
     let candidates = vec![PathBuf::from("clip.mp4"), PathBuf::from("note.txt")];
-    let staging = stage::prepare(&p, &store, &candidates).expect("prepare");
+    let opened = git::repo::open(root, false).expect("open");
+    let staging = stage::prepare(&opened, &p, &store, &candidates).expect("prepare");
 
     // Only the oversized file is routed.
     assert_eq!(staging.substitutions.len(), 1);
@@ -456,8 +457,14 @@ fn commit_pointer_for_clip(root: &Path, payload: &[u8]) -> stage::LfsStaging {
     init_repo(root);
     std::fs::write(root.join("clip.mp4"), payload).expect("write");
     let store = LfsStore::in_git_dir(root.join(".git"));
-    let staging =
-        stage::prepare(&profile(root), &store, &[PathBuf::from("clip.mp4")]).expect("prepare");
+    let opened = git::repo::open(root, false).expect("open");
+    let staging = stage::prepare(
+        &opened,
+        &profile(root),
+        &store,
+        &[PathBuf::from("clip.mp4")],
+    )
+    .expect("prepare");
     let repo = git::repo::open(root, false).expect("open");
     let changes = git::commit::StagedChange {
         added: vec![PathBuf::from(".gitattributes"), PathBuf::from("clip.mp4")],
@@ -655,8 +662,14 @@ fn the_guard_never_dismisses_a_pointer_with_no_commit_behind_it() {
     std::fs::write(&absolute, &payload).expect("write");
 
     let store = LfsStore::in_git_dir(root.join(".git"));
-    let staging =
-        stage::prepare(&profile(root), &store, &[PathBuf::from("clip.mp4")]).expect("prepare");
+    let opened = git::repo::open(root, false).expect("open");
+    let staging = stage::prepare(
+        &opened,
+        &profile(root),
+        &store,
+        &[PathBuf::from("clip.mp4")],
+    )
+    .expect("prepare");
     let repo = git::repo::open(root, false).expect("open");
     let blob = repo
         .write_blob(&staging.substitutions[Path::new("clip.mp4")])

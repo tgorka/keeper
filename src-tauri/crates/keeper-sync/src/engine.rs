@@ -4539,7 +4539,7 @@ impl Engine {
             .chain(staged.modified.iter())
             .cloned()
             .collect();
-        let staging = lfs::stage::prepare(profile, &store, &candidates)?;
+        let staging = lfs::stage::prepare(&repo, profile, &store, &candidates)?;
 
         // The denominator for staging progress, read before the augmentation
         // below: it is the same count `commit_local` has already published, and
