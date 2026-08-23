@@ -6107,24 +6107,26 @@ impl Engine {
                 },
             );
 
-            // Drain the walk's progress until it finishes. `select!` on the
-            // handle rather than a join at the end: a report that arrived after
-            // the walk was over would be a phase nobody is in.
-            let mut task = task;
-            let scanned = loop {
-                tokio::select! {
-                    report = rx.recv() => {
-                        if let Some((seen, entries)) = report {
-                            let mut event = self.progress(&profile, SyncPhase::Scanning);
-                            event.files_done = seen;
-                            event.files_total = (entries >= seen).then_some(entries);
-                            self.publish(event);
-                        }
-                    }
-                    finished = &mut task => break finished,
-                }
-            };
-            let (status, untracked, deleted_sizes) = scanned
+            // Drain the walk's progress as it arrives, then take its result.
+            //
+            // The channel's own close is the signal: `tx` lives in the closure,
+            // so `recv` yields every report and then `None` once the walk has
+            // returned and dropped it. Nothing is lost and nothing is polled
+            // twice.
+            //
+            // This was a `select!` between `recv` and the join handle, which is
+            // wrong in a way only the macOS gate caught: `select!` picks a ready
+            // branch at RANDOM, so a walk that finished before the first drain
+            // could take the handle's branch and discard every queued report.
+            // On Linux the timing hid it; the same test failed on the Mac.
+            while let Some((seen, entries)) = rx.recv().await {
+                let mut event = self.progress(&profile, SyncPhase::Scanning);
+                event.files_done = seen;
+                event.files_total = (entries >= seen).then_some(entries);
+                self.publish(event);
+            }
+            let (status, untracked, deleted_sizes) = task
+                .await
                 .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
 
             let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
