@@ -146,6 +146,7 @@ import {
   setSyncProfileEnabled,
   startSyncStatusPolling,
   syncErrorMessage,
+  syncPhaseCarriesRate,
   syncProfileNow,
   useSyncStore,
 } from "@/lib/stores/sync";
@@ -1085,6 +1086,12 @@ function SyncProfileCard({
   // about an idle wire (AD-34-13).
   const rate = syncLiveRate(status, progress);
   const rateText = rate === null ? null : `${formatCopyBytes(rate)}/s`;
+  // A phase that cannot carry a rate is given no room for one: see
+  // `syncPhaseCarriesRate`. Reserving the box for `Scanning` printed a
+  // separator followed by eleven blank characters, which is what the line
+  // looked like on the owner's 155 000-file folder the moment the walk began
+  // reporting its progress.
+  const carriesRate = status !== undefined && syncPhaseCarriesRate(status.phase);
   const flying = [files, rateText].filter((figure) => figure !== null);
 
   return (
@@ -1236,7 +1243,7 @@ function SyncProfileCard({
           // shrink-0 half now at the front where the eye lands.
           <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
             {files !== null && <span className="figures shrink-0 font-mono">{files}</span>}
-            {files !== null && <span aria-hidden="true">·</span>}
+            {files !== null && carriesRate && <span aria-hidden="true">·</span>}
             {/* A RESERVED box, not merely a monospaced one. Mono fixes the
                 width of a digit and says nothing about how many there are:
                 `2 kB/s` against `294.8 kB/s` is four characters, and at one
@@ -1250,9 +1257,11 @@ function SyncProfileCard({
                 no rate: the row must not jump because a folder went quiet for a
                 tick. It stands empty then rather than reading `0 B/s`, which
                 would claim a measurement of an idle wire (AD-34-13). */}
-            <span className="figures min-w-[11ch] shrink-0 text-right font-mono">
-              {rateText ?? ""}
-            </span>
+            {carriesRate && (
+              <span className="figures min-w-[11ch] shrink-0 text-right font-mono">
+                {rateText ?? ""}
+              </span>
+            )}
             {current !== null && <span aria-hidden="true">·</span>}
             {current !== null && (
               <span className="truncate font-mono" title={current}>

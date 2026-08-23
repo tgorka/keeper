@@ -239,6 +239,29 @@ export function isSyncStatusActive(status: SyncStatusVm): boolean {
 }
 
 /**
+ * Can this phase have a transfer rate at all?
+ *
+ * Mirrors `SyncPhase::carries_rate` in `keeper-sync`: only the three legs that
+ * move bytes over a link can. A scan, a commit and a verify move none, so a
+ * rate for them is not "not measured yet" — it is a figure that cannot exist.
+ *
+ * The distinction is what a surface needs to tell "quiet for a tick" from
+ * "never applicable". A transfer that has gone quiet keeps its room reserved so
+ * the row does not jump; a phase that cannot carry a rate is not given room,
+ * because holding a slot open forever prints a separator with nothing after it
+ * — which is what the Scanning line did the moment the walk started reporting.
+ *
+ * Named rather than inlined because the membership list is the contract, not
+ * the comparison: it is the TypeScript half of a Rust `match` that is total by
+ * construction there, and a phase added on one side has to be answered on this
+ * one. Three strings in a `||` at a call site say nothing about which side owns
+ * the list.
+ */
+export function syncPhaseCarriesRate(phase: string): boolean {
+  return phase === "fetching" || phase === "uploadingLfs" || phase === "downloadingLfs";
+}
+
+/**
  * The progress fraction in `[0, 1]`, or `null` when no total is known and the
  * meter must render indeterminate.
  *
