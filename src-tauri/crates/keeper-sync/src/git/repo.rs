@@ -1487,7 +1487,19 @@ fn status_paths_excluding(
     // The shape of the pass, once, at INFO. A folder that later stalls is
     // diagnosed by comparing this line between runs — how many entries, how
     // long — and its absence is what made the field failure unreadable.
+    //
+    // Named, because two profiles produce interleaved lines and one of them may
+    // hold 641 files while the other holds 155 662: `elapsed_ms=108` next to
+    // `elapsed_ms=3044748` is unreadable without knowing which folder each
+    // belongs to, and that cost real time during the field diagnosis. The
+    // worktree's own directory name is the profile's name in every case that
+    // matters and needs nothing threaded through to obtain.
     tracing::info!(
+        folder = repo
+            .workdir()
+            .and_then(|dir| dir.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         entries = watchdog.beats(),
         elapsed_ms = watchdog.elapsed_ms(),
         added = out.added.len(),
