@@ -517,6 +517,36 @@ describe("a link's predicates render as chips", () => {
   });
 
   /**
+   * A chip on a fence line needs a different surface, and this is the one
+   * defect in this feature that no DOM assertion found — it was found by
+   * screenshotting the owner's own document in Chromium and reading the
+   * pixels.
+   *
+   * A chip's background is `--muted`. So is a code block's. Both resolved to
+   * `rgb(236, 234, 226)`, so the pill was drawn, correct, and invisible: the
+   * annotation read as bare text on the fence line while identical chips one
+   * line below read as labels. Two colours being equal is not a bug in any
+   * function, which is exactly why only a rendered pixel could catch it.
+   *
+   * The fix measures better than the ordinary case rather than worse:
+   * `--muted-foreground` on `--background` is 5.32:1 light and 7.34:1 dark,
+   * against 4.96:1 and 6.82:1 on `--muted`.
+   */
+  it("gives a fence's chips a surface the code block does not already own", () => {
+    const view = render('```json { :type="Metric" }\nbody\n```\n\nend\n');
+
+    const onCode = view.contentDOM.querySelector(".cm-lp-predicates-on-code");
+    expect(onCode).not.toBeNull();
+    expect(onCode?.querySelector(".cm-lp-predicate")?.textContent).toBe("type=Metric");
+
+    // A link's chips are on ordinary prose, so they keep the ordinary surface —
+    // the marker means "this one is on code", not "predicates".
+    const link = render('[Revenue](m.md){ :type="Metric" }\n\nend\n');
+    expect(link.contentDOM.querySelector(".cm-lp-predicates")).not.toBeNull();
+    expect(link.contentDOM.querySelector(".cm-lp-predicates-on-code")).toBeNull();
+  });
+
+  /**
    * kramdown's presentational tokens draw nothing and must not be mistaken for
    * predicates: a chip saying `highlight` would put a CSS class into a graph
    * somebody queries.

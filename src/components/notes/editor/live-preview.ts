@@ -272,13 +272,25 @@ interface Predicate {
  * exactly as it did — a single chip, no prefix, same class, same aria-label.
  */
 class PredicateWidget extends WidgetType {
-  constructor(private readonly predicates: readonly Predicate[]) {
+  /**
+   * `onCode` is the fence-line case, and it exists because a chip's surface is
+   * `--muted` and so is a code block's. Measured in Chromium on the owner's own
+   * document: both resolved to `rgb(236, 234, 226)`, so the pill was there in
+   * the DOM and invisible on screen — the chips read as bare text on the fence
+   * line while the identical chips one line below read as labels. No DOM test
+   * could see it; two colours being equal is only a defect once it is drawn.
+   */
+  constructor(
+    private readonly predicates: readonly Predicate[],
+    private readonly onCode = false,
+  ) {
     super();
   }
 
   eq(other: PredicateWidget): boolean {
     return (
       other.predicates.length === this.predicates.length &&
+      other.onCode === this.onCode &&
       other.predicates.every(
         (predicate, at) =>
           predicate.name === this.predicates[at]?.name &&
@@ -289,7 +301,9 @@ class PredicateWidget extends WidgetType {
 
   toDOM(): HTMLElement {
     const chips = document.createElement("span");
-    chips.className = "cm-lp-predicates";
+    chips.className = this.onCode
+      ? "cm-lp-predicates cm-lp-predicates-on-code"
+      : "cm-lp-predicates";
     for (const predicate of this.predicates) {
       chips.append(predicateChip(predicate));
     }
@@ -824,10 +838,11 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
                 continue;
               }
               decorations.push(
-                Decoration.replace({ widget: new PredicateWidget(block.chips) }).range(
-                  node.from + block.from,
-                  node.from + block.to,
-                ),
+                Decoration.replace({
+                  // `onCode`: this line is inside the code block's own surface,
+                  // which is the same `--muted` the chip uses.
+                  widget: new PredicateWidget(block.chips, true),
+                }).range(node.from + block.from, node.from + block.to),
               );
             }
           }
@@ -1248,6 +1263,18 @@ const livePreviewTheme = EditorView.baseTheme({
     background: "var(--muted)",
     color: "var(--muted-foreground)",
     fontSize: "0.85em",
+  },
+  // On a fence line the chip is sitting on the code block's surface, which IS
+  // `--muted` — so the pill above would be an invisible rectangle and the
+  // annotation would read as bare text exactly where a reader is least likely
+  // to expect meaning. `--background` is the only other surface in play here,
+  // and it measures BETTER than the ordinary case rather than worse:
+  // `--muted-foreground` on it is 5.32:1 light and 7.34:1 dark (against 4.96:1
+  // and 6.82:1 on `--muted`), and the `=`'s `--faint` is 3.57:1 and 3.97:1,
+  // both over the 3:1 an indicator is held to. Measured from the tokens in
+  // `src/index.css`, not sampled from a screenshot.
+  ".cm-lp-predicates-on-code .cm-lp-predicate": {
+    background: "var(--background)",
   },
   // A CURIE's two halves. The vocabulary is quieter than the term it qualifies,
   // by weight and not by colour: see `predicateChip` for the two ratios that
