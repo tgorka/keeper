@@ -371,7 +371,7 @@ fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> Note
         origin: head.map_or("local", |head| head.origin.as_str()).to_owned(),
         // Filled by the two link projections, which know which edge a row is
         // the far end of. Every other listing produces rows that are not edges.
-        predicate: None,
+        predicates: Vec::new(),
         // The revision the unread mark is cleared against. Filled from the same
         // commit lookup that produced `origin` and `unread`, so accepting from the
         // list cannot acknowledge a revision that moved in between; empty when the
@@ -5378,7 +5378,7 @@ mod tests {
             unread: false,
             conflict: false,
             origin: "local".to_owned(),
-            predicate: None,
+            predicates: Vec::new(),
             head_rev: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
         }

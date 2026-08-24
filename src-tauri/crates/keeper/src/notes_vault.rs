@@ -1499,28 +1499,36 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         fields,
         links: parsed.iter().map(|link| link.target.clone()).collect(),
         // Every predicate the author wrote on a link, per target, in written
-        // order, with the legacy `reference="x"` attribute folded in first so a
-        // vault written before this reads exactly as it did.
+        // order, with the two legacy attribute spellings folded in ahead of the
+        // CURIEs so a vault written before this reads exactly as it did.
         //
-        // Keyed through `link_key`, and that is the whole of the bug this
-        // replaces. The old map was built on the RAW target the author typed and
-        // read back with folded keys, so `{reference="cites"}` written on
-        // `[x](B.md)` — or on any title with a capital letter — matched nothing
-        // and rendered nothing, in either direction. The feature was reported as
-        // missing because it was: one half of it never met the other. There is
-        // one spelling of the key now, and it is produced here.
+        // BOTH spellings, and that is the second half of why this feature read as
+        // missing. keeper looked for `reference="x"`. The owner's drives write
+        // `rel="x"` — it is the word their own `.okf/registry/predicates.md`
+        // declares and validates against, and there are 45 of those edges on
+        // neuradrive against exactly zero `reference=`. So even with the key bug
+        // below fixed, keeper would have rendered nothing on the vault it was
+        // built for, because it was reading a word nobody there writes.
+        //
+        // Keyed through `link_key`, and that is the first half. The old map was
+        // built on the RAW target the author typed and read back with folded
+        // keys, so an attribute written on `[x](B.md)` — or on any title with a
+        // capital letter — matched nothing in either direction. One half of the
+        // feature never met the other. There is one spelling of the key now, and
+        // it is produced here.
         link_predicates: parsed.iter().fold(
             std::collections::BTreeMap::<String, Vec<String>>::new(),
             |mut acc, link| {
+                // Attribute order, not an invented precedence between the two
+                // keys: a link carrying both is the author saying both, and
+                // which they meant first is written down in the file.
                 let legacy = link
                     .attrs
                     .iter()
-                    .find(|(key, _)| key == "reference")
+                    .filter(|(key, _)| key == "reference" || key == "rel")
                     .map(|(_, value)| value.clone());
-                let mut ordered: Vec<String> = legacy
-                    .into_iter()
-                    .chain(link.predicates.iter().cloned())
-                    .collect();
+                let mut ordered: Vec<String> =
+                    legacy.chain(link.predicates.iter().cloned()).collect();
                 // A link with nothing on it must not appear here at all. An entry
                 // holding an empty vec is a second way to say "no predicates",
                 // and the projections would then have to branch on both.
@@ -2858,6 +2866,52 @@ mod tests {
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
         }
+    }
+
+    /// Both legacy spellings reach the panel, and they reach it under the key
+    /// the reader looks them up with.
+    ///
+    /// This is the whole of the reported defect, in one test. keeper carried one
+    /// attribute, `reference="x"`, keyed by the RAW target the author typed,
+    /// and read it back with `link_key`-folded keys — so nothing ever matched
+    /// unless the target was already lowercase and extensionless. And the word
+    /// it looked for is not the word the owner's drives write: their registry
+    /// declares `rel=`, and there are 45 of those against zero `reference=`.
+    /// Either bug alone renders nothing.
+    #[test]
+    fn both_legacy_attribute_spellings_land_under_the_folded_key() {
+        let entry = index_written(
+            "10-notes/a.md",
+            "---\ntype: Note\n---\n\
+             The drive's own spelling: [B](B.md){rel=\"cites\"}\n\
+             keeper's older one: [C](C.md){reference=\"supports\"}\n\
+             A CURIE beside a legacy word: [D](D.md){rel=\"index\", schema:about}\n\
+             Nothing at all: [E](E.md)\n",
+        );
+
+        let at = |target: &str| {
+            entry
+                .link_predicates
+                .get(&keeper_core::notes::index::link_key(target))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        // `B.md` is exactly the target that never matched before: the raw
+        // spelling has an extension and a capital.
+        assert_eq!(at("B.md"), ["cites"], "the drive's own rel= must land");
+        assert_eq!(at("C.md"), ["supports"], "and keeper's older reference=");
+        assert_eq!(
+            at("D.md"),
+            ["index", "schema:about"],
+            "attribute order, not a precedence keeper invented"
+        );
+        assert!(
+            !entry
+                .link_predicates
+                .contains_key(&keeper_core::notes::index::link_key("E.md")),
+            "a link with nothing on it must not appear in the map at all"
+        );
     }
 
     /// A directory tree in memory that records every directory the walk listed.
