@@ -81,6 +81,36 @@ fn predicates_for(target: &str) -> Vec<String> {
         .predicates
 }
 
+/// The owner's SECOND document, supplied after the first shipped, and the
+/// reason this file has two fixtures rather than one edited into agreement.
+///
+/// The link lines and the fence line are verbatim. This is the format the
+/// owner's tooling actually writes: kramdown/Python-Markdown **IAL** braces
+/// carrying Semantic-Markdown-V0 property attributes, where a predicate is
+/// spelled `:name` against the document's default vocabulary rather than with a
+/// published prefix. keeper shipped only the prefixed form first, so every one
+/// of these lines read as prose.
+const IAL_DOCUMENT: &str = r#"---
+title: Revenue Tracking Logic
+type: Concept
+---
+
+### Revenue Tracking Logic
+
+We track daily revenue using this specific configuration block:
+
+```json { :type="Metric" :owned_by="https://company.internal" }
+{
+  "metric_name": "daily_gross_revenue",
+  "aggregation": "SUM",
+  "field": "invoice.amount_paid"
+}
+```
+The checkout pipeline relies heavily on the **[JWT Auth Service](https://github.com)**{ :depends_on }.
+
+This entire system block is actively **[Managed by the Platform Team](https://company.internal)**{ :owned_by }.
+"#;
+
 #[test]
 fn every_predicate_spelling_in_the_request_is_read() {
     // Several CURIEs in one brace pair, comma separated.
@@ -209,4 +239,128 @@ fn the_documents_own_prefixes_expand_its_predicates() {
             );
         }
     }
+}
+
+/// The owner's second document, read at the only layer that can answer for it.
+///
+/// Every predicate here is one keeper read as prose before this change, and each
+/// line breaks a different assumption: the predicate is spelled `:name` with an
+/// empty prefix rather than `prefix:name`, and the brace pair sits after the
+/// `**` that closes the emphasis rather than after the link's `)`.
+///
+/// Read through `read_attrs` and not `extract`, because both of the owner's
+/// links point at external URLs and `extract` deliberately keeps those out of
+/// the vault graph — there is no note at the far end to be a backlink of. The
+/// twin test below runs the same two lines through `extract` with internal
+/// targets, so the emphasis rule itself is not tested only by a helper here.
+#[test]
+fn the_ial_document_carries_its_predicates() {
+    // Mirrors `extract`'s adjacency rule rather than restating it as a constant:
+    // a block may sit behind the emphasis markers that close on the link.
+    let after_emphasis = |needle: &str| {
+        let at = IAL_DOCUMENT
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is in the document"))
+            + needle.len();
+        at + IAL_DOCUMENT[at..]
+            .bytes()
+            .take_while(|b| matches!(b, b'*' | b'_'))
+            .count()
+    };
+
+    let jwt = links::read_attrs(IAL_DOCUMENT, after_emphasis("](https://github.com)"))
+        .expect("the JWT link's attribute block");
+    assert_eq!(jwt.predicates, ["depends_on"]);
+
+    let owned = links::read_attrs(IAL_DOCUMENT, after_emphasis("](https://company.internal)"))
+        .expect("the ownership link's attribute block");
+    assert_eq!(owned.predicates, ["owned_by"]);
+}
+
+/// The owner's two lines with vault targets, through the whole extraction path.
+///
+/// This is the test that actually pins emphasis adjacency, because `extract`
+/// resolves it — the test above can only look at an offset it computed itself.
+#[test]
+fn the_ial_shape_survives_extraction_when_the_target_is_a_note() {
+    let body = "relies heavily on the **[JWT Auth Service](jwt-auth.md)**{ :depends_on }.\n\
+                actively **[Managed by the Platform Team](platform-team.md)**{ :owned_by }.\n";
+
+    let found: Vec<(String, Vec<String>)> = links::extract(body)
+        .into_iter()
+        .map(|link| (link.target, link.predicates))
+        .collect();
+
+    assert_eq!(
+        found,
+        vec![
+            ("jwt-auth.md".to_owned(), vec!["depends_on".to_owned()]),
+            ("platform-team.md".to_owned(), vec!["owned_by".to_owned()]),
+        ]
+    );
+}
+
+/// The colon is stripped, and that is a decision rather than a convenience.
+///
+/// `{ :cites }`, bare `{ cites }` and the older `{rel="cites"}` are the same
+/// edge said three ways, and the owner's registry writes its predicates
+/// unprefixed — so a reader that kept the colon would show one concept under
+/// two names and a graph would carry two predicates where the author meant one.
+/// A published prefix is NOT stripped: `schema:creator` is not `creator`.
+#[test]
+fn the_empty_prefix_collapses_but_a_published_one_does_not() {
+    let body = "[a](a.md){ :cites }\n[b](b.md){ cites }\n[c](c.md){schema:creator}\n";
+    let spellings: Vec<Vec<String>> = links::extract(body)
+        .into_iter()
+        .map(|link| link.predicates)
+        .collect();
+
+    assert_eq!(
+        spellings,
+        vec![
+            vec!["cites".to_owned()],
+            vec!["cites".to_owned()],
+            vec!["schema:creator".to_owned()],
+        ]
+    );
+}
+
+/// A fenced block's CONTENT is not a document, and its annotation is nobody's
+/// business in this crate.
+///
+/// keeper reads a fence's info-string annotation nowhere in Rust. The editor
+/// draws it from the document it already has open and the vault toolkit emits
+/// its triples while standing in the drive that owns the vocabulary; nothing in
+/// this crate would consume it, and a parse with no reader rots quietly until
+/// someone trusts it. What this crate must get right is the other half: a
+/// fenced block is code, so a link written inside one is text.
+///
+/// The owner's own block is the case that matters — its JSON body carries braces
+/// on every line and a `"field": "invoice.amount_paid"` pair that reads exactly
+/// like an attribute — so the fixture keeps that shape and adds the harder thing
+/// a real vault will eventually contain: a genuine vault link, inside the fence,
+/// wearing a predicate.
+#[test]
+fn nothing_inside_a_fenced_block_becomes_an_edge() {
+    let body = "```json { :type=\"Metric\" }\n\
+                { \"field\": \"invoice.amount_paid\" }\n\
+                see [the ledger](ledger.md){ :cites } for the source\n\
+                ```\n\
+                and in prose, [the ledger](ledger.md){ :owned_by } is an edge\n";
+
+    let found: Vec<(String, Vec<String>)> = links::extract(body)
+        .into_iter()
+        .map(|link| (link.target, link.predicates))
+        .collect();
+
+    assert_eq!(
+        found,
+        vec![("ledger.md".to_owned(), vec!["owned_by".to_owned()])],
+        "the fenced copy of the same link must not be an edge, and must not \
+         contribute its predicate to the prose one"
+    );
+
+    // The owner's document reaches the same place from the other direction:
+    // both of its links are external, so it contributes no edges at all.
+    assert!(links::extract(IAL_DOCUMENT).is_empty());
 }

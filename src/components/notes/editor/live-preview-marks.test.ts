@@ -423,15 +423,42 @@ describe("a link's predicates render as chips", () => {
   });
 
   /**
-   * `rel="cites"` is the attribute the vault's own toolkit writes and it is not
-   * a predicate. It keeps the treatment it has always had — it goes with the
-   * block the chip replaces, exactly as `strength="weak"` did beside a
-   * `reference` before this story.
+   * The empty prefix is the document's default vocabulary, and the chip shows
+   * the BARE name. The colon is noise on screen — the name is what the registry
+   * calls the predicate and what a query will be written against — and showing
+   * it would make `{:depends_on}` and `{depends_on}` look like two things.
    */
-  it("draws the CURIE in a mixed block", () => {
-    const view = render('[Satoshi](Satoshi.md){schema:creator, rel="cites"}\n\nend\n');
+  it("draws a default-vocabulary predicate without its colon", () => {
+    const view = render("[JWT](auth.md){:depends_on}\n\nend\n");
 
-    expect(chips(view)).toEqual(["schema:creator"]);
+    expect(chips(view)).toEqual(["depends_on"]);
+    expect(shown(view)).toBe("JWTdepends_on");
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-prefix")).toBeNull();
+  });
+
+  /** Semantic Markdown V0's property-attribute rule: a bare word is a property
+   *  name. It renders identically to the `:`-marked spelling of the same name,
+   *  because it IS the same predicate. */
+  it("draws a bare word as the same chip the colon spelling draws", () => {
+    const view = render("[JWT](auth.md){depends_on}\n\nend\n");
+
+    expect(chips(view)).toEqual(["depends_on"]);
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-prefix")).toBeNull();
+  });
+
+  /**
+   * `rel="cites"` is folded into a predicate name by `IndexProjection`, so the
+   * graph holds `cites` and the links panel shows it. This assertion is the
+   * reverse of what it was before the projection existed, when the editor was
+   * the only reader of this syntax: a chip that stayed away now would have the
+   * editor and the panel disagreeing about which tokens are edges, on one
+   * screen, about one link.
+   */
+  it("draws rel as the edge the index makes of it", () => {
+    const view = render('[Satoshi](Satoshi.md){rel="cites"}\n\nend\n');
+
+    expect(chips(view)).toEqual(["cites"]);
+    expect(shown(view)).toBe("Satoshicites");
   });
 
   /** The spelling keeper shipped first, rendering as it always did: one chip,
@@ -458,24 +485,76 @@ describe("a link's predicates render as chips", () => {
   });
 
   /**
+   * A literal object is data, not a vocabulary term, and it says so by shape:
+   * an `=` — the only part of a chip carrying no fact, so the only part
+   * `--faint`'s 3.32:1 is spendable on — and the value in its own span, italic
+   * at the resting weight against the local part's 500. The value keeps
+   * `--muted-foreground` (5.01:1 light, 6.82:1 dark on `--muted`) because every
+   * quieter token misses the 4.5:1 that anything carrying a fact needs.
+   */
+  it("draws a colon-marked pair as its predicate and its literal object", () => {
+    const view = render('[Revenue](m.md){:type="Metric"}\n\nend\n');
+
+    expect(shown(view)).toBe("Revenuetype=Metric");
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-equals")?.textContent).toBe("=");
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-object")?.textContent).toBe("Metric");
+    // Distinct from a bare predicate, which has neither span — that is the
+    // whole claim, and it is the one a reader depends on.
+    const bare = render("[Revenue](m.md){:type}\n\nend\n");
+    expect(bare.contentDOM.querySelector(".cm-lp-predicate-equals")).toBeNull();
+    expect(bare.contentDOM.querySelector(".cm-lp-predicate-object")).toBeNull();
+  });
+
+  /** A screen reader gets the statement, not two loose words: without the verb
+   *  `type Metric` is indistinguishable from two adjacent predicates. */
+  it("names the literal object to a screen reader", () => {
+    const view = render('[Revenue](m.md){:type="Metric"}\n\nend\n');
+
+    expect(view.contentDOM.querySelector(".cm-lp-predicate")).toHaveAttribute(
+      "aria-label",
+      "link kind: type is Metric",
+    );
+  });
+
+  /**
+   * kramdown's presentational tokens draw nothing and must not be mistaken for
+   * predicates: a chip saying `highlight` would put a CSS class into a graph
+   * somebody queries.
+   */
+  it("draws nothing for a class, an id or a bare IAL marker", () => {
+    const view = render("[Satoshi](Satoshi.md){: .highlight #revenue}\n\nend\n");
+
+    expect(chips(view)).toEqual([]);
+    // No predicate in the block, so it is source — which is also the only way
+    // the author can see the class they wrote.
+    expect(shown(view)).toBe("Satoshi{: .highlight #revenue}");
+  });
+
+  it("draws the predicate of a block that also carries a class", () => {
+    const view = render("[Satoshi](Satoshi.md){.highlight :depends_on}\n\nend\n");
+
+    expect(chips(view)).toEqual(["depends_on"]);
+  });
+
+  /**
    * A block keeper cannot read stays exactly as the author typed it. Drawing a
    * chip over it would show what keeper understood and swallow the rest, which
    * is how somebody comes to trust a predicate they never wrote.
    */
   it("leaves a block of junk exactly as it is", () => {
-    const view = render("[Satoshi](Satoshi.md){not a curie}\n\nend\n");
+    const view = render("[Satoshi](Satoshi.md){oops! 9nope}\n\nend\n");
 
     expect(chips(view)).toEqual([]);
-    expect(shown(view)).toBe("Satoshi{not a curie}");
+    expect(shown(view)).toBe("Satoshi{oops! 9nope}");
   });
 
-  /** `{rel="cites"}` alone writes no predicate, so it is source — the same
-   *  treatment it had before this story. */
-  it("leaves a block of pairs alone", () => {
-    const view = render('[Satoshi](Satoshi.md){rel="cites"}\n\nend\n');
+  /** `{class="wide"}` writes no predicate, so it is source — the same treatment
+   *  a presentational pair has always had. */
+  it("leaves a block of presentational pairs alone", () => {
+    const view = render('[Satoshi](Satoshi.md){class="wide"}\n\nend\n');
 
     expect(chips(view)).toEqual([]);
-    expect(shown(view)).toBe('Satoshi{rel="cites"}');
+    expect(shown(view)).toBe('Satoshi{class="wide"}');
   });
 
   /**
@@ -484,7 +563,7 @@ describe("a link's predicates render as chips", () => {
    * rewrote the source would be a migration nobody asked for.
    */
   it("never changes the document text", () => {
-    const doc = '[Satoshi](Satoshi.md){schema:creator, foaf:knows}{rel="cites"}\n\nend\n';
+    const doc = '[Satoshi](Satoshi.md){schema:creator, foaf:knows}{:type="Metric"}{oops!}\n\nend\n';
     const view = render(doc);
 
     expect(view.state.doc.toString()).toBe(doc);
@@ -504,5 +583,201 @@ describe("a link's predicates render as chips", () => {
     const view = render("[keeper](https://x.example){schema:codeRepository}\n\nend\n");
 
     expect(chips(view)).toEqual(["schema:codeRepository"]);
+  });
+
+  /**
+   * The owner's own spelling: the block goes after the emphasis markers that
+   * CLOSE the link. A reader that scanned from the link's end would find `**`,
+   * stop, and leave the whole annotation on screen as punctuation — which is
+   * the common case in the notes this story was written for.
+   */
+  describe("a block written after the emphasis that closes the link", () => {
+    it.each([
+      ["strong", "**[JWT Auth Service](https://github.com)**{ :depends_on }"],
+      ["emphasis", "*[JWT Auth Service](https://github.com)*{ :depends_on }"],
+      ["underscores", "__[JWT Auth Service](https://github.com)__{ :depends_on }"],
+    ])("draws the chip and hides the block, through %s", (_kind, line) => {
+      const view = render(`${line}\n\nend\n`);
+
+      expect(chips(view)).toEqual(["depends_on"]);
+      // No stray `**` between the bolded text and the chip. Two decorations do
+      // that between them — `EmphasisMark` hides the markers, the block's own
+      // replace draws the chip — and this is the assertion that would catch
+      // either of them letting go.
+      expect(shown(view)).toBe("JWT Auth Servicedepends_on");
+    });
+
+    it("draws the owner's block-level annotation", () => {
+      const view = render(
+        "**[Managed by the Platform Team](https://company.internal)**{ :owned_by }\n\nend\n",
+      );
+
+      expect(chips(view)).toEqual(["owned_by"]);
+      expect(shown(view)).toBe("Managed by the Platform Teamowned_by");
+    });
+
+    /** The block qualifies the emphasis's last word here, not the link, so it
+     *  belongs to neither and nothing is drawn. Attaching it to the link would
+     *  put an edge on the wrong subject. */
+    it("draws nothing when the link is not what the emphasis closes on", () => {
+      const view = render("**[JWT](https://github.com) and more**{ :depends_on }\n\nend\n");
+
+      expect(chips(view)).toEqual([]);
+      expect(shown(view)).toBe("JWT and more{ :depends_on }");
+    });
+  });
+});
+
+/**
+ * A fence's own annotation, on the tail of its opening info string. Every
+ * assertion about WHICH lines have one is really an assertion about the parser
+ * agreeing with CommonMark, which is exactly why the renderer anchors on
+ * `CodeInfo` and writes none of those rules a second time.
+ */
+describe("a fence's info string carries predicates", () => {
+  /** Every chip in the document, in the order a reader meets them. */
+  function chips(view: EditorView): string[] {
+    return [...view.contentDOM.querySelectorAll(".cm-lp-predicate")].map(
+      (chip) => chip.textContent ?? "",
+    );
+  }
+
+  /** What a reader sees on the opening fence line. */
+  function fenceLine(view: EditorView): string {
+    return view.contentDOM.firstElementChild?.textContent ?? "";
+  }
+
+  it("draws the owner's whole annotation as chips beside the language", () => {
+    const view = render(
+      '```json { :type="Metric" :owned_by="https://company.internal" }\n{ "a": 1 }\n```\n\nend\n',
+    );
+
+    expect(chips(view)).toEqual(["type=Metric", "owned_by=https://company.internal"]);
+    // The language stays: it is the one thing a fence says about itself, and the
+    // space the author typed before the brace goes with the block so the line
+    // does not gain a gap.
+    expect(fenceLine(view)).toBe("jsontype=Metricowned_by=https://company.internal");
+  });
+
+  it("draws nothing, and does not throw, for an info string with no block", () => {
+    const view = render("```json\nconst a = 1;\n```\n\nend\n");
+
+    expect(chips(view)).toEqual([]);
+    expect(fenceLine(view)).toBe("json");
+  });
+
+  /** A tilde fence is a fence. CommonMark gives it an info string on the same
+   *  terms, and the parser produces the same `CodeInfo`. */
+  it("annotates a tilde fence", () => {
+    const view = render('~~~json { :type="Metric" }\nx\n~~~\n\nend\n');
+
+    expect(chips(view)).toEqual(["type=Metric"]);
+  });
+
+  /** An unclosed fence still opens one, so its own line is still annotated —
+   *  which is the state a note is in while somebody is typing it. */
+  it("annotates a fence the author has not closed yet", () => {
+    const view = render('```json { :type="Metric" }\nx\n');
+
+    expect(chips(view)).toEqual(["type=Metric"]);
+  });
+
+  /**
+   * Only the OUTERMOST opening fence is a fence. A four-backtick block holds a
+   * three-backtick line as CONTENT, and annotating it would rewrite what is
+   * inside somebody's code sample — the one thing a code fence promises not to
+   * do.
+   */
+  it("leaves a nested ``` line inside a 4-backtick block alone", () => {
+    const view = render('````md\n```json { :type="Metric" }\nx\n```\n````\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+    expect(view.contentDOM.textContent).toContain('```json { :type="Metric" }');
+  });
+
+  /** Four spaces of indent is an indented code block, not a fence, so there is
+   *  no info string to read and the text stays verbatim. */
+  it("leaves a four-space-indented fence line alone", () => {
+    const view = render('    ```json { :type="Metric" }\nx\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+    expect(view.contentDOM.textContent).toContain('```json { :type="Metric" }');
+  });
+
+  /** Under four is a fence, and its annotation is read. */
+  it("annotates a fence indented less than four spaces", () => {
+    const view = render('   ```json { :type="Metric" }\nx\n```\n\nend\n');
+
+    expect(chips(view)).toEqual(["type=Metric"]);
+  });
+
+  /**
+   * A backtick fence's info string may not contain a backtick, so this line
+   * opens no fence at all and the whole thing is a paragraph. Nothing is
+   * annotated, and nothing is hidden.
+   */
+  it("draws nothing when the info string holds a backtick", () => {
+    const view = render('```json { :a="`b`" }\nx\n```\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+  });
+
+  /**
+   * A closing fence carries nothing: CommonMark allows only spaces after it, so
+   * a line with a block on it is not a closer and stays inside the code. The
+   * annotation belongs to the opening fence, once.
+   */
+  it("never reads a block off a closing fence", () => {
+    const view = render('```json { :type="Metric" }\nx\n``` { :nope }\n\nend\n');
+
+    expect(chips(view)).toEqual(["type=Metric"]);
+    expect(view.contentDOM.textContent).toContain("``` { :nope }");
+  });
+
+  /** The reveal rule holds here too: the line you are editing is the line you
+   *  can see the syntax of. */
+  it("gives the info string back when the caret lands on the fence line", () => {
+    const view = render('```json { :type="Metric" }\nx\n```\n\nend\n');
+    view.dispatch({ selection: { anchor: 2 } });
+
+    expect(fenceLine(view)).toBe('```json { :type="Metric" }');
+  });
+
+  /** Braces do not nest, so a brace inside a quoted value leaves the run unable
+   *  to reach the end of the info string. Nothing is drawn rather than a chip
+   *  for `y`, which is a predicate the author never wrote. */
+  it("draws nothing for an info string whose braces do not close cleanly", () => {
+    const view = render('```json { :a="x{y}" }\nx\n```\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+  });
+
+  /**
+   * The block has to be the TAIL of the info string. `json { :a } and more` is
+   * an info string with braces in it, exactly as `[a](b) {schema:creator}` is a
+   * sentence with braces in it, and only the author knows which they meant.
+   */
+  it("draws nothing when the block is not the end of the info string", () => {
+    const view = render('```json { :type="Metric" } and more\nx\n```\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+    expect(fenceLine(view)).toBe('json { :type="Metric" } and more');
+  });
+
+  /** A fence's junk block keeps its source for the same reason a link's does:
+   *  chips over it would show the token keeper read and swallow the one the
+   *  author has to fix. */
+  it("leaves a fence's junk block exactly as it is", () => {
+    const view = render("```json { oops! }\nx\n```\n\nend\n");
+
+    expect(chips(view)).toEqual([]);
+    expect(fenceLine(view)).toBe("json { oops! }");
+  });
+
+  it("never changes the document text", () => {
+    const doc = '```json { :type="Metric" }\n{ "a": 1 }\n```\n\nend\n';
+    const view = render(doc);
+
+    expect(view.state.doc.toString()).toBe(doc);
   });
 });

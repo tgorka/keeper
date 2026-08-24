@@ -27,12 +27,14 @@
 //! `gix`, no `tauri` — the shell (`keeper::notes_vault`) does the IO and hands
 //! this module finished [`IndexEntry`] values.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::notes::links::{predicate_name, RawLink};
 use crate::notes::order::NoteOrder;
 use crate::notes::search;
 use crate::notes::tags::{normalise, TagNode};
@@ -41,7 +43,15 @@ use crate::notes::tags::{normalise, TagNode};
 /// the shape of an [`IndexEntry`] field changes; the loader's only response to a
 /// mismatch is discard-and-cold-scan, so a bump is always safe and never a
 /// migration.
-pub const INDEX_SCHEMA: u32 = 3;
+///
+/// 3 → 4 for the real predicate syntax: `{ :depends_on }`, `{ cites }` and a
+/// colon-keyed pair are edges now where an earlier build of this branch saw
+/// nothing. That is a change of MEANING with no change of shape, and it is
+/// invisible to every other staleness check — the note is byte-identical, so
+/// `size`/`mtime_ns`/`ino` all match and the cached entry is adopted with its
+/// predicates missing. Without the bump the feature stays dark on exactly the
+/// vaults that have been indexed before.
+pub const INDEX_SCHEMA: u32 = 4;
 
 /// The `IndexEntry.fields` key carrying the note's provenance class, written by
 /// the reconciler from the trailers of the last commit touching the file
@@ -132,11 +142,14 @@ pub struct IndexEntry {
     /// not at extraction time, because a link may point at a note that does not
     /// exist yet.
     pub links: Vec<String>,
-    /// Why this note points at each of its targets: the CURIE predicates the
+    /// Why this note points at each of its targets: the predicate names the
     /// author wrote in the link's attribute block, keyed by the target's
     /// [`link_key`] and held in the order they were written.
     ///
-    /// `[a](b.md){schema:about}` puts `b → ["schema:about"]` here.
+    /// `[a](b.md){ :cites }` puts `b → ["cites"]` here. What counts as a
+    /// predicate, in what order, is [`link_predicates_of`] and nowhere else;
+    /// build this map with [`link_predicate_map`] rather than folding one, so
+    /// the key can never be spelled two ways again.
     ///
     /// Beside `links` rather than inside it, because `links` is read by the
     /// query engine and by every consumer of the graph, and none of them has an
@@ -152,8 +165,8 @@ pub struct IndexEntry {
     ///
     /// This map replaced a `BTreeMap<String, String>` of `{reference="cites"}`
     /// attributes: the same concept with a one-predicate-per-link ceiling. The
-    /// legacy value folds in as the first entry of the list, so a vault written
-    /// before the change keeps rendering as it did.
+    /// legacy pair still reads, appended after the modern tokens, so a vault
+    /// written before the change keeps rendering as it did.
     ///
     /// A target with no predicates is ABSENT from the map rather than present
     /// with an empty vector — the map is a sparse annotation on `links`, and
@@ -826,6 +839,139 @@ pub fn link_key(target: &str) -> String {
     let key = key.trim_start_matches("./").trim_start_matches('/');
     let key = key.strip_suffix(".md").unwrap_or(key);
     key.trim().to_lowercase()
+}
+
+/// Every predicate name one link asserts, in the author's order, exact
+/// duplicates dropped.
+///
+/// The ONE fold from a parsed [`RawLink`] to the names the graph shows, because
+/// three spellings mean the same edge and a reader must never see three:
+///
+/// - `{rel="cites"}` — the legacy quoted pair, and the spelling the owner's
+///   drives are already full of. The predicate is the pair's VALUE.
+/// - `{ :cites }` — a kramdown IAL token against the document's default
+///   vocabulary. The empty prefix is stripped by
+///   [`crate::notes::links::predicate_name`], so it arrives here as `cites`.
+/// - `{ cites }` — Semantic Markdown V0: an attribute that is neither a class,
+///   nor an id, nor a pair is a property name. Also `cites` by the time it
+///   reaches this function.
+///
+/// All three land as one name. The owner's `.okf/registry/predicates.md`
+/// declares its predicates unprefixed, so unprefixed is the spelling that
+/// round-trips; keeping the three apart would split one relation into three
+/// columns of a graph nobody could then query in a single go, and the panel
+/// would show a note citing the same target three times for three different
+/// reasons it does not have.
+///
+/// A **colon-keyed** pair asserts its KEY: `{ :type="Metric" }` is the
+/// predicate `type`, and `Metric` stays reachable in [`RawLink::attrs`] under
+/// the key as written (`":type"`), which is what lets a consumer tell a
+/// semantic pair from a presentational one. The colon announces the predicate
+/// by shape alone, so the tokeniser records that name in
+/// [`RawLink::predicates`] with the rest and this fold takes it as given.
+///
+/// A `rel`/`reference` value that is not itself a valid predicate name is NO
+/// predicate: `rel="see also"`, `rel="a b"` and `rel=""` produce nothing. The
+/// legacy spelling puts the name in the value, so the value has to survive the
+/// same shape rule a token does — a relation keeper cannot name is one it
+/// cannot write back out, resolve against a registry, or recognise as the same
+/// edge asserted the modern way. Every other surface mirrors this call, so a
+/// panel and an editor chip that disagree mean somebody re-derived the answer
+/// from `attrs` instead of asking here.
+///
+/// **[`crate::notes::links`] deliberately does not do this fold**, and the line
+/// between the two is syntactic versus vocabulary. A colon is syntax: `:type`
+/// and `dc:title` announce themselves, and recording them needs no vocabulary
+/// knowledge at all. Which BARE key is load-bearing is policy — nothing in the
+/// syntax says `rel` is an edge and `class` is not — and a recording layer that
+/// knew would be the vocabulary's owner, which would let a parser change
+/// silently add or remove edges from a graph somebody queries.
+///
+/// Order: the modern tokens keep TRUE written order, because
+/// [`RawLink::predicates`] saw the block as written and interleaving is a fact
+/// about the document rather than a policy. A legacy `rel=`/`reference=` name
+/// is APPENDED after them. That is a stated limitation, not an accident:
+/// [`RawLink`] holds pairs and tokens in two vectors, the legacy pair is a
+/// compatibility shim, and a block mixing legacy with modern is rare enough
+/// that reshaping the parse to order it would cost every ordinary link. Nothing
+/// is invented — a token with no single obvious reading was dropped by the
+/// tokeniser and is not repaired here, because a wrong edge in a graph somebody
+/// queries is worse than an absent one.
+pub fn link_predicates_of(link: &RawLink) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for predicate in &link.predicates {
+        push_predicate(&mut names, predicate);
+    }
+    for (key, value) in &link.attrs {
+        // The whole vocabulary decision, in one line: these two bare keys are
+        // edges and every other one — `class`, `id`, `width` — is presentation.
+        // Widening this match is all it would take for `class="wide"` to become
+        // an edge. A colon-keyed pair is not read here at all; its name is
+        // already in `predicates`, and deriving it twice would double the chip.
+        if !matches!(key.as_str(), "rel" | "reference") {
+            continue;
+        }
+        if let Some(name) = predicate_name(value) {
+            push_predicate(&mut names, name);
+        }
+    }
+    names
+}
+
+/// Append `name` unless it is already there — first occurrence wins, so the
+/// order stays the order the author wrote and a relation asserted twice in two
+/// spellings is still one chip.
+fn push_predicate(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|had| had == name) {
+        names.push(name.to_owned());
+    }
+}
+
+/// Every link's predicates folded into the map [`IndexEntry::link_predicates`]
+/// is defined as: keyed by [`link_key`], in written order, exact duplicates
+/// dropped, and links carrying nothing absent entirely.
+///
+/// Callers hand over the whole slice rather than folding a map themselves, and
+/// **that is the point of this signature**. The defect it makes unrepeatable:
+/// the producer keyed the map by the RAW target the author typed while every
+/// reader looked it up through [`link_key`], so a predicate written on
+/// `[x](B.md)` — or on any title with a capital letter — matched nothing in
+/// either direction, and the feature rendered blank on the very vault it was
+/// built for. One half never met the other. There is now no way to call this
+/// and forget the folding, which a doc comment on the field could only ask for.
+///
+/// A target with no predicates is absent rather than present with an empty
+/// vector: two ways to say "nothing here" is a branch every projection would
+/// have to get right forever.
+///
+/// Two links in one note whose targets fold to the same key (one by title, one
+/// by path) merge into that key's list, first occurrence of each name winning.
+/// It is the same edge either way, and the panel names the relationship rather
+/// than enumerating every time it was written.
+pub fn link_predicate_map(links: &[RawLink]) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for link in links {
+        let names = link_predicates_of(link);
+        if names.is_empty() {
+            continue;
+        }
+        // The first link to claim a key hands over its vector whole: it is
+        // already deduped and in order, so re-pushing name by name would be a
+        // scan and a fresh allocation each, on the path nearly every annotated
+        // link takes.
+        match map.entry(link_key(&link.target)) {
+            Entry::Vacant(slot) => {
+                slot.insert(names);
+            }
+            Entry::Occupied(slot) => {
+                let merged = slot.into_mut();
+                for name in &names {
+                    push_predicate(merged, name);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// One change to absorb. The reconciler produces these; the builder applies them.
@@ -1715,6 +1861,193 @@ mod tests {
         assert_eq!(
             find(&builder.snapshot().tag_tree(), "client/acme").map(|n| n.count),
             Some(1)
+        );
+    }
+}
+
+/// The RawLink → predicate fold: what counts as an edge, in what order, under
+/// which key. Its own module because these are the rules three other surfaces
+/// mirror, and a reader looking for "why is my chip missing" should find them
+/// together.
+#[cfg(test)]
+mod predicate_projection_tests {
+    use super::*;
+    use crate::notes::links;
+
+    /// A link carrying nothing but the attribute block under test.
+    fn link(target: &str, attrs: &[(&str, &str)], predicates: &[&str]) -> RawLink {
+        RawLink {
+            target: target.to_owned(),
+            alias: None,
+            embed: false,
+            span: (0, 0),
+            attrs: attrs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            predicates: predicates.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    /// The whole reason this fold exists. `{rel="cites"}`, `{ :cites }` and
+    /// `{ cites }` are one relation written three ways — the tokeniser hands
+    /// the last two over already stripped to `cites`, and the legacy pair's
+    /// VALUE has to land on the same name. Three links, one key, one chip.
+    #[test]
+    fn the_three_spellings_of_one_relation_collapse_to_one_name() {
+        let legacy = link("B.md", &[("rel", "cites")], &[]);
+        let ial = link("b", &[], &["cites"]);
+        let bare = link("./b.md", &[], &["cites"]);
+        assert_eq!(link_predicates_of(&legacy), ["cites"]);
+
+        assert_eq!(
+            link_predicate_map(&[legacy, ial, bare]),
+            BTreeMap::from([("b".to_owned(), vec!["cites".to_owned()])]),
+            "one relation however it is spelled, and one key however the \
+             target is written"
+        );
+    }
+
+    /// Order across every source at once, and the presentational keys sitting
+    /// in the middle of it contributing nothing.
+    #[test]
+    fn modern_tokens_keep_written_order_and_the_legacy_pair_is_appended() {
+        let names = link_predicates_of(&link(
+            "b.md",
+            &[
+                ("rel", "cites"),
+                ("class", "wide"),
+                (":type", "Metric"),
+                ("id", "x1"),
+                ("reference", "supports"),
+            ],
+            &["depends_on", "type", "schema:about"],
+        ));
+        assert_eq!(
+            names,
+            ["depends_on", "type", "schema:about", "cites", "supports"],
+            "the tokeniser's order is the document's and survives whole; the \
+             legacy pair is a shim and follows, in the order the pairs were \
+             written"
+        );
+    }
+
+    /// A block of pure presentation is not an edge and not a key.
+    #[test]
+    fn a_presentational_block_puts_nothing_in_the_graph() {
+        let styled = link(
+            "b.md",
+            &[("class", "wide"), ("id", "x1"), ("width", "20")],
+            &[],
+        );
+        assert!(
+            link_predicates_of(&styled).is_empty(),
+            "nothing in the syntax makes `class` an edge, and guessing one \
+             would put a `class` arrow in a graph somebody queries"
+        );
+        assert!(
+            link_predicate_map(&[styled]).is_empty(),
+            "no predicates means no key at all — an empty vec is a second way \
+             to say nothing, and every projection would have to branch on both"
+        );
+    }
+
+    /// The owner's `{ :type="Metric" }`: the key is the edge, the value is the
+    /// literal object and must still be reachable.
+    #[test]
+    fn a_colon_keyed_pair_asserts_its_key_and_keeps_its_object() {
+        let metric = link(
+            "b.md",
+            &[(":type", "Metric"), ("dc:title", "Daily gross revenue")],
+            &["type", "dc:title"],
+        );
+        assert_eq!(
+            link_predicates_of(&metric),
+            ["type", "dc:title"],
+            "the empty prefix is stripped and a real prefix is kept, and \
+             neither is doubled by being read out of `attrs` as well"
+        );
+        assert_eq!(
+            metric.attrs[0],
+            (":type".to_owned(), "Metric".to_owned()),
+            "the object stays under the key AS WRITTEN — the colon is what \
+             tells a consumer this pair is semantic and `class=` is not"
+        );
+    }
+
+    /// Main's ruling, and the one the editor mirrors: the legacy spelling hides
+    /// the name in the value, so the value faces the shape rule a token faces.
+    #[test]
+    fn a_legacy_value_that_is_not_a_name_is_no_edge_rather_than_a_guess() {
+        for value in ["see also", "a b", "9lives", ".hidden", "dc:"] {
+            let vague = link("b.md", &[("rel", value)], &[]);
+            assert!(
+                link_predicates_of(&vague).is_empty(),
+                "`rel=\"{value}\"` has no single obvious reading and must not \
+                 become an edge"
+            );
+        }
+        assert_eq!(
+            link_predicates_of(&link("b.md", &[("reference", "schema:about")], &[])),
+            ["schema:about"],
+            "a value that IS a name still works, prefix and all"
+        );
+    }
+
+    /// Two ways of writing one target are one arrow, not two.
+    #[test]
+    fn links_whose_targets_fold_together_merge_under_the_one_key() {
+        let map = link_predicate_map(&[
+            link("Vault as a Lens", &[], &["cites"]),
+            link(
+                "vault as a lens#Why",
+                &[("rel", "cites")],
+                &["schema:about"],
+            ),
+        ]);
+        assert_eq!(
+            map,
+            BTreeMap::from([(
+                "vault as a lens".to_owned(),
+                vec!["cites".to_owned(), "schema:about".to_owned()]
+            )]),
+            "the anchor and the capital are the same note; the relation \
+             asserted twice is still one chip, and first occurrence wins"
+        );
+    }
+
+    /// End to end from the owner's own syntax, because every rule above is
+    /// worth nothing if the tokeniser and this fold disagree about which vector
+    /// a name arrives in.
+    #[test]
+    fn the_owners_syntax_reaches_the_index_map() {
+        let body = "\
+The checkout pipeline relies on the **[JWT Auth Service](notes/JWT Auth.md)**{ :depends_on }.\n\
+Managed by [the Platform Team](notes/platform.md){ :owned_by, class=\"badge\" }.\n\
+A pair carrying its object: [Revenue](notes/revenue.md){ :type=\"Metric\" }\n\
+Older spelling, same graph: [Belief](notes/belief.md){rel=\"cites\"}\n";
+        let links = links::extract(body);
+        assert_eq!(
+            link_predicate_map(&links),
+            BTreeMap::from([
+                ("notes/jwt auth".to_owned(), vec!["depends_on".to_owned()]),
+                ("notes/platform".to_owned(), vec!["owned_by".to_owned()]),
+                ("notes/revenue".to_owned(), vec!["type".to_owned()]),
+                ("notes/belief".to_owned(), vec!["cites".to_owned()]),
+            ]),
+            "a block behind emphasis markers still annotates its link, a \
+             colon-keyed pair asserts its key, and the `class` beside a \
+             predicate is still not one"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .find(|link| link.target == "notes/revenue.md")
+                .map(|link| link.attrs.as_slice()),
+            Some(&[(":type".to_owned(), "Metric".to_owned())][..]),
+            "and the literal object survives the whole chain, under the key as \
+             written — dropping it would leave the graph knowing the note has \
+             a type but not which"
         );
     }
 }

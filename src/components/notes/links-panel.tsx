@@ -47,6 +47,17 @@ const NOTHING: Record<LinkDirection, string> = {
  */
 const LINK_LABEL = "ml-2 rounded bg-muted px-1 py-0.5 text-meta text-muted-foreground";
 
+/**
+ * Names one predicate chip in the DOM.
+ *
+ * The zero-predicate row is asserted as this row MINUS its chips, so a test has
+ * to be able to lift a chip out without knowing what a chip looks like: a query
+ * written against `bg-muted` would go on passing the day the chip is restyled,
+ * and the assertion it carries — that a link written without a predicate emits
+ * no furniture at all — is the one that must not quietly stop being checked.
+ */
+export const LINK_PREDICATE_SLOT = "link-predicate";
+
 export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: LinksPanelProps) {
   const [rows, setRows] = useState<NoteRowVm[]>([]);
 
@@ -83,6 +94,14 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
     <ul className="flex flex-col gap-0.5 px-3 py-2">
       {rows.map((row) => (
         <li key={row.id}>
+          {/* This row's own floor. `w-full` takes the width from the list
+              rather than from the text, and `truncate`'s `overflow: hidden`
+              makes the button a scroll container, whose min-content
+              contribution is zero — so six predicates on a 180px column clip at
+              the row's edge instead of spilling across the pane beside it. The
+              note column's `min-w-0` (`NOTE_COLUMN_CLASS`) is the floor above
+              this one and is what lets the column reach 180px at all; without
+              the pair here, that is exactly when the spill would show. */}
           <button
             type="button"
             className="w-full truncate text-left text-xs hover:underline"
@@ -90,17 +109,28 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
           >
             <span>{row.title}</span>
             {/* Why these two notes are connected, in the author's own
-                vocabulary: `[Belief](belief.md){schema:creator, foaf:knows}`
-                makes this row say both. Before the snippet and in chips,
-                because it is the thing this list is FOR — "what links here" is
-                a weaker question than "what supports this", and the answer
-                should not be buried in a line of body text.
+                vocabulary: `**[JWT Auth](jwt.md)**{ :depends_on }` makes this
+                row say both. Before the snippet and in chips, because it is the
+                thing this list is FOR — "what links here" is a weaker question
+                than "what supports this", and the answer should not be buried
+                in a line of body text. Ahead of the snippet also decides what a
+                narrow column loses first: the reasons are the last thing the
+                clip takes rather than the first.
 
                 One list, not a list beside a single legacy value. The older
-                `{reference="supports"}` spelling folds into this list as its
-                first entry before the row is built, so a vault written last
-                month renders exactly as it did; two spellings of one fact
-                arriving at one surface is the defect this replaced.
+                `{reference="supports"}` spelling folds into this list before
+                the row is built, so a vault written last month renders exactly
+                as it did; two spellings of one fact arriving at one surface is
+                the defect this replaced.
+
+                Printed as given, and never read: a bare `depends_on`, an
+                empty-prefix `:type` already reduced to `type` upstream, and a
+                CURIE `schema:creator` are one kind of fact and take one code
+                path. A branch on the colon — a chip for a CURIE, something else
+                for the rest — would drop the owner's commonest spelling on the
+                floor, and it is this panel's job to say what the author wrote
+                rather than to hold an opinion about which vocabulary they wrote
+                it in.
 
                 Verbatim and in the written order: keeper neither invents a
                 predicate, translates one, nor sorts them. A wrong predicate in
@@ -122,7 +152,7 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
             {row.predicates.map((predicate) => (
               // Keyed by the predicate itself: exact duplicates are dropped
               // where the attribute block is parsed, so the list cannot repeat.
-              <span key={predicate} className={LINK_LABEL}>
+              <span key={predicate} data-slot={LINK_PREDICATE_SLOT} className={LINK_LABEL}>
                 {predicate}
               </span>
             ))}

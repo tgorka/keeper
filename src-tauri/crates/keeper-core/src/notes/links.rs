@@ -32,40 +32,72 @@ pub struct RawLink {
     /// the syntax has to hide all of it.
     pub span: (usize, usize),
     /// The attribute block written after the link, as written: `{reference="x"}`
-    /// gives `[("reference", "x")]`.
+    /// gives `[("reference", "x")]`, and `{ :type="Metric" }` gives
+    /// `[(":type", "Metric")]` — the key keeps its colon, because that colon is
+    /// the only thing that separates a semantic pair from a presentational
+    /// `class="…"`, and `attrs` is the raw record. What a key *means* is the
+    /// projection's decision, not this parser's.
     ///
-    /// The convention is Pandoc's and Obsidian leaves it alone, which is what
-    /// makes it usable here: a vault carrying these still opens in an editor
-    /// that has never heard of them, and the attributes read as text rather
-    /// than breaking the link.
+    /// The convention is kramdown's inline attribute list, which Pandoc and
+    /// Obsidian both leave alone — which is what makes it usable here: a vault
+    /// carrying these still opens in an editor that has never heard of them,
+    /// and the attributes read as text rather than breaking the link.
     ///
     /// Empty for the overwhelming majority of links. A pair whose value is not
     /// quoted is dropped rather than guessed at — `{reference=aaa bbb}` has no
     /// reading that is obviously right, and a wrong predicate is worse than an
     /// absent one in a graph somebody queries.
     pub attrs: Vec<(String, String)>,
-    /// The CURIE predicates written in the link's attribute block(s), in the
-    /// order they were written, with exact duplicates dropped:
-    /// `{schema:creator, foaf:knows}` gives `["schema:creator", "foaf:knows"]`.
+    /// Every predicate name the link's attribute block(s) announced, in true
+    /// written order, with exact duplicates dropped: `{schema:creator}` gives
+    /// `["schema:creator"]`, and `{ :depends_on }`, `{ depends_on }` and
+    /// `{ :depends_on="soon" }` all give `["depends_on"]`.
     ///
-    /// A token is a predicate by *shape* and by nothing else — `prefix:local`,
-    /// both halves `[A-Za-z][A-Za-z0-9_-]*`. No vocabulary is consulted, and no
-    /// prefix is resolved here: the prefix map lives in the note's frontmatter,
-    /// and a reader that needed it could not read a link in isolation.
+    /// Three spellings, one meaning, because kramdown and the Semantic Markdown
+    /// Spec V0 both allow all three and one vault will contain all three:
+    /// `prefix:local` is a CURIE; `:local` is the same name in the document's
+    /// *default* vocabulary, and the empty prefix's colon is stripped so that
+    /// spelling and the bare one are one string rather than two; a bare `local`
+    /// — no `=`, no leading `.` or `#` — is V0's rule that an attribute which
+    /// is neither a class, an id nor a pair is a property name.
     ///
-    /// A token that is neither a CURIE nor a quoted `key="value"` pair is
-    /// dropped rather than guessed at. `{a b}` and `{:b}` could be read as
-    /// several things and the author only meant one of them; a wrong predicate
-    /// is worse than an absent one in a graph somebody queries.
+    /// No vocabulary is consulted and no prefix is resolved here, the empty one
+    /// least of all: the prefix map lives in the note's frontmatter and the
+    /// empty prefix's base in the drive's registry, and a reader that needed
+    /// either could not read a link in isolation.
+    ///
+    /// A colon is a syntactic marker, so a colon-keyed pair announces itself as
+    /// a predicate by its own shape, and recording its key here is recording
+    /// rather than deciding — and it is the only way written order survives,
+    /// order being a fact about the document: `attrs` and `predicates` are two
+    /// vectors, so `{ cites, :type="x" }` can only be known to read
+    /// `["cites", "type"]` by the tokeniser that walked the block. Deciding
+    /// which *bare* keys are load-bearing — `rel` is an edge, `class` is not —
+    /// is vocabulary policy and lives in `notes::index` alone, so a bare-key
+    /// pair contributes nothing here.
+    ///
+    /// Names only, never objects. `{ :type="Metric" }` gives `["type"]` and
+    /// nothing else; the literal `Metric` is already in `attrs` under `":type"`,
+    /// and carrying it here as well would give two consumers two places to
+    /// disagree about one token.
+    ///
+    /// A token with no single obvious reading is dropped, never repaired: `{a:}`
+    /// and `{a:b:c}` have an empty or an ambiguous half, and a wrong edge in a
+    /// graph somebody queries is worse than an absent one. `{:b}` used to be on
+    /// that list for being readable "several ways", which was wrong — kramdown
+    /// and V0 agree it is the single name `b`, and dropping it lost the
+    /// commonest spelling in the vaults this exists to read.
     pub predicates: Vec<String>,
 }
 
 /// What the attribute block or blocks after a link said.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttrBlocks {
-    /// `key="value"` pairs, in order, as written.
+    /// `key="value"` pairs, in order, with each key exactly as written —
+    /// `":type"` keeps its colon.
     pub attrs: Vec<(String, String)>,
-    /// Bare CURIE tokens, in order, exact duplicates dropped.
+    /// Predicate names, in written order, exact duplicates dropped: the bare and
+    /// colon-marked tokens, and the keys of colon-keyed pairs.
     pub predicates: Vec<String>,
     /// The byte just past the closing brace of the *last* block consumed.
     pub end: usize,
@@ -87,21 +119,26 @@ impl AttrBlocks {
 /// against it, merging them in order: `{dcterms:source}{schema:status}` reads
 /// the same as `{dcterms:source, schema:status}`.
 ///
-/// A block holds `key="value"` pairs and bare CURIE predicates in any mixture,
+/// A block holds `key="value"` pairs and bare predicate tokens in any mixture,
 /// separated by commas, whitespace, or both. Returns `None` when there is no
 /// block, otherwise the contents and the byte just past the last closing brace
 /// — which is what keeps `RawLink::span` covering the whole syntax when an
 /// author wrote more than one block.
 ///
-/// The first block has to begin immediately after the link — one space is not
-/// allowed, because `[a](b) {this}` is a sentence with braces in it and
-/// `[a](b){this}` is a link with attributes, and only the author knows which
-/// they meant. The same rule holds between blocks.
+/// The first block has to begin immediately after the link, or immediately
+/// after the emphasis markers that close against it — `**[x](y)**{ :p }`, see
+/// `emphasis_close`. One space is not allowed, because `[a](b) {this}` is a
+/// sentence with braces in it and `[a](b){this}` is a link with attributes, and
+/// only the author knows which they meant. The same rule holds between blocks.
+///
+/// Nothing here looks at what precedes `at` beyond that emphasis run, so the
+/// same reader serves the tail of a fenced block's info string (```` ```json
+/// { :type="Metric" } ````): pass the offset of the `{`.
 pub fn read_attrs(body: &str, at: usize) -> Option<AttrBlocks> {
     let mut attrs = Vec::new();
     let mut predicates = Vec::new();
     let mut end = None;
-    let mut cursor = at;
+    let mut cursor = emphasis_close(body, at).unwrap_or(at);
 
     while body.as_bytes().get(cursor) == Some(&b'{') {
         // A block never wraps: an unclosed brace is prose, and stopping here
@@ -111,10 +148,18 @@ pub fn read_attrs(body: &str, at: usize) -> Option<AttrBlocks> {
             break;
         };
         for_each_token(&body[cursor + 1..close], |token| {
-            if let Some(pair) = read_pair(token) {
-                attrs.push(pair);
-            } else if is_curie(token) && !predicates.iter().any(|had| had == token) {
-                predicates.push(token.to_owned());
+            if let Some((key, value)) = read_pair(token) {
+                // A colon-marked key is a predicate carrying a literal object.
+                // Only the name is recorded: `attrs` below keeps the object
+                // under the key as written, and a bare key (`rel`, `class`) has
+                // no colon and so contributes no predicate here — what `rel`
+                // means is the projection's decision.
+                if let Some(name) = pair_predicate(&key) {
+                    push_unique(&mut predicates, name);
+                }
+                attrs.push((key, value));
+            } else if let Some(name) = predicate_name(token) {
+                push_unique(&mut predicates, name);
             }
         });
         cursor = close + 1;
@@ -126,6 +171,45 @@ pub fn read_attrs(body: &str, at: usize) -> Option<AttrBlocks> {
         predicates,
         end,
     })
+}
+
+/// Where the attribute block begins when the author closed emphasis between the
+/// link and the block: `**[x](y)**{ :p }`, which is how the owner's documents
+/// mark up a link they also want to shout about. `at` is the byte just past the
+/// link, so the markers inside the link text (`[**x**](y)`) are never in view.
+///
+/// `None` unless this really is a closing run with a block against it: a lone
+/// `**` ending a sentence after a link keeps its own bytes rather than
+/// disappearing into the link's span, and `**[x](y)** {p}` stays prose by the
+/// same one-space rule as everything else here.
+fn emphasis_close(body: &str, at: usize) -> Option<usize> {
+    let marker = match body.as_bytes().get(at) {
+        Some(b'*') => b'*',
+        Some(b'_') => b'_',
+        _ => return None,
+    };
+    let run = body[at..].bytes().take_while(|b| *b == marker).count();
+    // `***x***` is the longest run markdown gives a meaning to; anything longer
+    // is a rule or a typo, and swallowing it into the link's span would delete
+    // characters the author can see.
+    if run > 3 {
+        return None;
+    }
+    // A short-circuit rather than a rule — with no block against the run the
+    // answer is `None` either way — which keeps the backwards scan below off
+    // every ordinary emphasised link.
+    if body.as_bytes().get(at + run) != Some(&b'{') {
+        return None;
+    }
+    // The run has to close something. Without this, prose like
+    // `see [note](n.md)**{ :p }` would have its stray asterisks hidden by a
+    // renderer that trusts the span. Full delimiter matching is CommonMark's
+    // whole emphasis algorithm; the opener being somewhere earlier on the line
+    // is the cheap half of it, and it is the half that rejects the typo.
+    let line = line_start(body, at);
+    body[line..at]
+        .contains(&body[at..at + run])
+        .then_some(at + run)
 }
 
 /// Split a block's contents into tokens on commas and whitespace, except
@@ -155,8 +239,13 @@ fn for_each_token(inner: &str, mut visit: impl FnMut(&str)) {
     }
 }
 
-/// `key="value"`, or `None` if the token is not one. An unquoted value is not
-/// one: `{reference=aaa bbb}` has no reading that is obviously right.
+/// `key="value"`, or `None` if the token is not one. The key is returned
+/// exactly as written, colon and all: `:type` stays `":type"`, because that
+/// colon is what tells a consumer a semantic pair from a `class="…"`, and this
+/// function's job is to record rather than to interpret.
+///
+/// An unquoted value is not a pair: `{reference=aaa bbb}` has no reading that
+/// is obviously right.
 fn read_pair(token: &str) -> Option<(String, String)> {
     let (key, value) = token.split_once('=')?;
     let key = key.trim();
@@ -175,17 +264,51 @@ fn read_pair(token: &str) -> Option<(String, String)> {
     Some((key.to_owned(), unquoted.to_owned()))
 }
 
-/// `prefix:local`, the compact form every RDF serialisation understands.
-fn is_curie(token: &str) -> bool {
+/// The predicate a bare token names, or `None` when it names nothing certain.
+///
+/// - `prefix:local` — a CURIE, kept as written.
+/// - `:local` — the empty prefix, which is the document's default vocabulary.
+///   The colon is stripped so this and the bare form are one string: keeper
+///   displays a name and never invents a base, and resolving the empty prefix
+///   needs the note's own `prefixes:` or the drive's registry, neither of which
+///   a link can see from here.
+/// - `local` — Semantic Markdown V0: an attribute that is not a class, not an
+///   id and not a pair is a property name.
+///
+/// Everything else is dropped rather than repaired. `a:b:c` and `a:` have an
+/// ambiguous or empty half; `.class`, `#id` and the lone `:` of kramdown's
+/// `{: .foo}` marker fall out of `is_name`'s letter-first rule without needing
+/// a case of their own, which is why there is not one.
+pub fn predicate_name(token: &str) -> Option<&str> {
     match token.split_once(':') {
-        Some((prefix, local)) => is_name(prefix) && is_name(local),
-        None => false,
+        Some(("", local)) => is_name(local).then_some(local),
+        Some((prefix, local)) => (is_name(prefix) && is_name(local)).then_some(token),
+        None => is_name(token).then_some(token),
     }
 }
 
-/// A CURIE half: a letter, then letters, digits, `_` or `-`. Deliberately
-/// narrower than XML's NCName — the extra characters buy nothing here and each
-/// one widens what gets mistaken for a predicate.
+/// The predicate a `key="value"` pair announces, or `None` when its key is
+/// presentational. The colon is the whole test, and it is a test of syntax
+/// rather than of vocabulary: `:type` and `dc:title` are predicates carrying a
+/// literal object, while `class`, `id`, `width` — and the legacy
+/// `rel`/`reference`, whose *value* is the predicate name and which are edges
+/// only because a vocabulary says so — are not. Which bare keys are
+/// load-bearing is `notes::index`'s decision, which is why this is private.
+fn pair_predicate(key: &str) -> Option<&str> {
+    key.contains(':').then(|| predicate_name(key)).flatten()
+}
+
+/// Append unless it is already there. Written order wins, so a copy-paste that
+/// left `{ :a, a }` behind draws one edge rather than two.
+fn push_unique(into: &mut Vec<String>, name: &str) {
+    if !into.iter().any(|had| had == name) {
+        into.push(name.to_owned());
+    }
+}
+
+/// A predicate name half: a letter, then letters, digits, `_` or `-`.
+/// Deliberately narrower than XML's NCName — the extra characters buy nothing
+/// here and each one widens what gets mistaken for a predicate.
 fn is_name(part: &str) -> bool {
     let mut chars = part.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
@@ -329,6 +452,12 @@ fn line_limit(body: &str, at: usize) -> usize {
     body[at.min(body.len())..]
         .find('\n')
         .map_or(body.len(), |i| at + i)
+}
+
+/// Start of the line containing `at`, which is as far back as an emphasis
+/// opener may be looked for.
+fn line_start(body: &str, at: usize) -> usize {
+    body[..at.min(body.len())].rfind('\n').map_or(0, |i| i + 1)
 }
 
 /// Match the `)` that closes a destination, tolerating one level of balanced
@@ -695,13 +824,31 @@ mod predicate_tests {
         );
     }
 
-    /// A token that is not a CURIE is dropped rather than guessed at: a wrong
-    /// predicate is worse than an absent one in a graph somebody queries. The
+    /// A token with no single obvious reading is dropped rather than repaired: a
+    /// wrong edge in a graph somebody queries is worse than an absent one. The
     /// block is still consumed, so the span still covers it and the braces do
     /// not survive into the rendered line.
+    ///
+    /// `{:b}` and `{a b}` used to be on this list, which was wrong: kramdown and
+    /// Semantic Markdown V0 both read them as names, and dropping them lost the
+    /// two commonest spellings in the vaults this exists to read.
     #[test]
     fn junk_yields_no_predicates_and_does_not_corrupt_the_span() {
-        for block in ["{not a curie}", "{a:}", "{:b}", "{a b}", "{}"] {
+        for block in [
+            // An empty half either side of the colon, and one colon too many.
+            "{a:}",
+            "{:}",
+            "{a:b:c}",
+            // Presentational: kramdown's class, id and marker.
+            "{.cls}",
+            "{#id}",
+            // Not a name at all: a digit first, punctuation inside, and nothing.
+            "{1st}",
+            "{a.b}",
+            "{}",
+            // A pair with an unquoted value is no pair and no name.
+            "{reference=supports}",
+        ] {
             let body = format!("[Belief](notes/belief.md){block}");
             let link = only(&body);
             assert!(
@@ -742,6 +889,228 @@ mod predicate_tests {
         let body = "[Belief](notes/belief.md){schema:creator\nnext line";
         let link = only(body);
         assert!(link.predicates.is_empty());
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
+    }
+
+    /// The owner's commonest spelling. The empty prefix is the document's
+    /// default vocabulary and the colon is stripped, so this and the bare form
+    /// are one string rather than two names that mean the same thing.
+    #[test]
+    fn an_empty_prefix_is_read_and_loses_its_colon() {
+        assert_eq!(
+            predicates("[Auth](notes/auth.md){ :depends_on }"),
+            vec!["depends_on".to_owned()]
+        );
+    }
+
+    /// Semantic Markdown V0: an attribute that is not a class, not an id and not
+    /// a pair is a property name.
+    #[test]
+    fn a_bare_word_is_a_property_name() {
+        assert_eq!(
+            predicates("[Auth](notes/auth.md){ depends_on }"),
+            vec!["depends_on".to_owned()]
+        );
+    }
+
+    /// The owner's metric block, written the way they write it: no commas, and a
+    /// value that is a URL. Both keys announce predicates; both literals stay in
+    /// `attrs` under the key as written, colon included.
+    #[test]
+    fn colon_keyed_pairs_announce_names_and_keep_their_objects() {
+        let link = only(
+            "[Metric](notes/metric.md){ :type=\"Metric\" :owned_by=\"https://company.internal\" }",
+        );
+        assert_eq!(
+            link.predicates,
+            vec!["type".to_owned(), "owned_by".to_owned()]
+        );
+        assert_eq!(
+            link.attrs,
+            vec![
+                (":type".to_owned(), "Metric".to_owned()),
+                (
+                    ":owned_by".to_owned(),
+                    "https://company.internal".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// Order is a fact about the document, and `attrs` and `predicates` being two
+    /// vectors means this reader is the only layer that can still see it: a
+    /// consumer handed the two lists cannot tell that `cites` came first.
+    #[test]
+    fn a_mixed_block_keeps_its_written_order() {
+        let link = only("[Belief](notes/belief.md){ cites, :type=\"x\" }");
+        assert_eq!(link.predicates, vec!["cites".to_owned(), "type".to_owned()]);
+        assert_eq!(link.attrs, vec![(":type".to_owned(), "x".to_owned())]);
+    }
+
+    /// A bare key is presentational until a vocabulary says otherwise, and that
+    /// decision is not this file's. The pair is still recorded, because `attrs`
+    /// is the raw record: this is how `rel="cites"` keeps working.
+    #[test]
+    fn a_bare_key_pair_is_recorded_and_announces_nothing() {
+        for (block, key, value) in [
+            ("{ rel=\"cites\" }", "rel", "cites"),
+            ("{ class=\"wide\" }", "class", "wide"),
+        ] {
+            let link = only(&format!("[Belief](notes/belief.md){block}"));
+            assert_eq!(
+                link.attrs,
+                vec![(key.to_owned(), value.to_owned())],
+                "attrs for {block}"
+            );
+            assert!(
+                link.predicates.is_empty(),
+                "{block} should announce nothing here, got {:?}",
+                link.predicates
+            );
+        }
+    }
+
+    /// A quoted value is opaque: the space must not split the token, and the
+    /// colon inside it must not be read as a prefix boundary.
+    #[test]
+    fn a_quoted_value_may_contain_a_space_and_a_colon() {
+        let link = only("[Belief](notes/belief.md){ :source=\"see also: the 1998 memo\" }");
+        assert_eq!(
+            link.attrs,
+            vec![(":source".to_owned(), "see also: the 1998 memo".to_owned())]
+        );
+        assert_eq!(link.predicates, vec!["source".to_owned()]);
+    }
+
+    /// kramdown's `{: .cls #id}` is styling. The marker colon, the class and the
+    /// id are all presentational, and none of them is an edge — but the block is
+    /// still consumed, so a renderer hiding the span does not leave braces.
+    #[test]
+    fn a_kramdown_style_block_announces_nothing() {
+        let body = "[Belief](notes/belief.md){: .cls #id }";
+        let link = only(body);
+        assert!(link.predicates.is_empty(), "got {:?}", link.predicates);
+        assert!(link.attrs.is_empty());
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// Two blocks, one in each spelling, are one list — a vault will contain both
+    /// the week after the convention is announced.
+    #[test]
+    fn adjacent_blocks_mix_the_spellings() {
+        let body = "[Belief](notes/belief.md){ :depends_on }{ owned_by }";
+        let link = only(body);
+        assert_eq!(
+            link.predicates,
+            vec!["depends_on".to_owned(), "owned_by".to_owned()]
+        );
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// The three spellings are one name, so they are one edge. Anything else
+    /// draws the same arrow three times in a graph somebody queries.
+    #[test]
+    fn the_spellings_of_one_name_collapse_to_one_edge() {
+        assert_eq!(
+            predicates(
+                "[Belief](notes/belief.md){ :depends_on, depends_on }{ :depends_on=\"soon\" }"
+            ),
+            vec!["depends_on".to_owned()]
+        );
+    }
+
+    /// `**[x](y)**{ :p }` — the author emphasised the link and hung the block off
+    /// the closing markers, which is how the owner's documents mark up a link
+    /// they also want to shout about. The span is one range, so covering the
+    /// block means covering the markers between it and the link.
+    #[test]
+    fn a_block_after_closing_emphasis_belongs_to_the_link() {
+        let body = "The pipeline relies on **[JWT Auth](notes/jwt.md)**{ :depends_on }.";
+        let link = only(body);
+        assert_eq!(link.predicates, vec!["depends_on".to_owned()]);
+        assert_eq!(
+            &body[link.span.0..link.span.1],
+            "[JWT Auth](notes/jwt.md)**{ :depends_on }"
+        );
+    }
+
+    /// Every marker kramdown emphasises with, since a vault writes all of them.
+    #[test]
+    fn every_emphasis_marker_closes_the_same_way() {
+        for (open, close) in [("*", "*"), ("**", "**"), ("_", "_"), ("__", "__")] {
+            let body = format!("{open}[Belief](notes/belief.md){close}{{ :depends_on }}");
+            let link = only(&body);
+            assert_eq!(
+                link.predicates,
+                vec!["depends_on".to_owned()],
+                "predicates for {body}"
+            );
+            assert_eq!(
+                &body[link.span.0..link.span.1],
+                &body[open.len()..],
+                "span for {body}"
+            );
+        }
+    }
+
+    /// The owner's line, verbatim. Its destination is external, so `extract`
+    /// keeps it out of the vault graph — but the block is still a block, and a
+    /// reader that went looking for one (an RDF export walking outward
+    /// citations) must get the predicate and the end of the syntax through the
+    /// markers.
+    #[test]
+    fn the_owners_emphasised_external_link_is_read_through_its_markers() {
+        let body = "The checkout pipeline relies heavily on the **[JWT Auth Service](https://github.com)**{ :depends_on }.";
+        assert!(
+            extract(body).is_empty(),
+            "external links are not vault edges"
+        );
+
+        let after = body.find(")**").expect("the closing markers") + 1;
+        let blocks = read_attrs(body, after).expect("a block after the markers");
+        assert_eq!(blocks.predicates, vec!["depends_on".to_owned()]);
+        assert_eq!(&body[after..blocks.end], "**{ :depends_on }");
+    }
+
+    /// A marker run that closes nothing is not a closer: in
+    /// `see [note](n.md)**{ :p }` the asterisks are a typo, and hiding them
+    /// inside the link's span would delete characters the author can see.
+    #[test]
+    fn a_marker_run_that_closes_nothing_is_not_a_closer() {
+        let body = "see [Belief](notes/belief.md)**{ :depends_on }";
+        let link = only(body);
+        assert!(link.predicates.is_empty(), "got {:?}", link.predicates);
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
+    }
+
+    /// Emphasis *inside* the link text closes nothing after the link, so it can
+    /// never be mistaken for the run that holds a block.
+    #[test]
+    fn emphasis_inside_the_link_text_is_not_a_closer() {
+        let body = "[**Belief**](notes/belief.md){ :depends_on }";
+        let link = only(body);
+        assert_eq!(link.predicates, vec!["depends_on".to_owned()]);
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// One space after the markers and it is prose, by the same rule as
+    /// everywhere else here: the author says which they meant by typing it.
+    #[test]
+    fn a_space_after_the_closing_markers_makes_it_prose() {
+        let body = "**[Belief](notes/belief.md)** { :depends_on }";
+        let link = only(body);
+        assert!(link.predicates.is_empty());
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
+    }
+
+    /// Four markers are a typo or a rule, not emphasis, so the run is left alone
+    /// rather than swallowed — the block goes unread with it, which is the
+    /// conservative half of the trade.
+    #[test]
+    fn a_run_longer_than_emphasis_is_not_a_closer() {
+        let body = "****[Belief](notes/belief.md)****{ :depends_on }";
+        let link = only(body);
+        assert!(link.predicates.is_empty(), "got {:?}", link.predicates);
         assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
     }
 }

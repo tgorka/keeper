@@ -1498,51 +1498,20 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         tags: tags::note_tags(&fm, body),
         fields,
         links: parsed.iter().map(|link| link.target.clone()).collect(),
-        // Every predicate the author wrote on a link, per target, in written
-        // order, with the two legacy attribute spellings folded in ahead of the
-        // CURIEs so a vault written before this reads exactly as it did.
+        // Every predicate the author wrote on a link, per target, keyed the way
+        // both link panels look it up — and computed in `keeper-core`, never
+        // here.
         //
-        // BOTH spellings, and that is the second half of why this feature read as
-        // missing. keeper looked for `reference="x"`. The owner's drives write
-        // `rel="x"` — it is the word their own `.okf/registry/predicates.md`
-        // declares and validates against, and there are 45 of those edges on
-        // neuradrive against exactly zero `reference=`. So even with the key bug
-        // below fixed, keeper would have rendered nothing on the vault it was
-        // built for, because it was reading a word nobody there writes.
-        //
-        // Keyed through `link_key`, and that is the first half. The old map was
-        // built on the RAW target the author typed and read back with folded
-        // keys, so an attribute written on `[x](B.md)` — or on any title with a
-        // capital letter — matched nothing in either direction. One half of the
-        // feature never met the other. There is one spelling of the key now, and
-        // it is produced here.
-        link_predicates: parsed.iter().fold(
-            std::collections::BTreeMap::<String, Vec<String>>::new(),
-            |mut acc, link| {
-                // Attribute order, not an invented precedence between the two
-                // keys: a link carrying both is the author saying both, and
-                // which they meant first is written down in the file.
-                let legacy = link
-                    .attrs
-                    .iter()
-                    .filter(|(key, _)| key == "reference" || key == "rel")
-                    .map(|(_, value)| value.clone());
-                let mut ordered: Vec<String> =
-                    legacy.chain(link.predicates.iter().cloned()).collect();
-                // A link with nothing on it must not appear here at all. An entry
-                // holding an empty vec is a second way to say "no predicates",
-                // and the projections would then have to branch on both.
-                if ordered.is_empty() {
-                    return acc;
-                }
-                let slot = acc
-                    .entry(keeper_core::notes::index::link_key(&link.target))
-                    .or_default();
-                ordered.retain(|predicate| !slot.contains(predicate));
-                slot.append(&mut ordered);
-                acc
-            },
-        ),
+        // The shell deliberately holds no token rules at all. This map used to
+        // be folded inline against the RAW target the author typed while the
+        // readers looked it up through `link_key`, so an attribute written on
+        // `[x](B.md)` — or on any title carrying a capital letter — matched
+        // nothing in either direction and the whole feature rendered blank. One
+        // half of it never met the other. With the producer and its two
+        // consumers naming the key in one place, they cannot drift apart again,
+        // and a new predicate spelling is understood everywhere the moment
+        // `link_predicate_map` understands it.
+        link_predicates: keeper_core::notes::index::link_predicate_map(&parsed),
         flags,
         snippet: snippet(body),
         // Read once, here, so the list's comparator never re-parses a string
@@ -2868,8 +2837,8 @@ mod tests {
         }
     }
 
-    /// Both legacy spellings reach the panel, and they reach it under the key
-    /// the reader looks them up with.
+    /// Every predicate spelling reaches the panel, and each reaches it under
+    /// the key the reader looks it up with.
     ///
     /// This is the whole of the reported defect, in one test. keeper carried one
     /// attribute, `reference="x"`, keyed by the RAW target the author typed,
@@ -2878,15 +2847,25 @@ mod tests {
     /// it looked for is not the word the owner's drives write: their registry
     /// declares `rel=`, and there are 45 of those against zero `reference=`.
     /// Either bug alone renders nothing.
+    ///
+    /// The spellings the owner's notes actually carry — kramdown's `:local`, a
+    /// bare property name, a colon-keyed pair holding a literal, and any of
+    /// them behind the emphasis markers that close the link — are asserted
+    /// through that same folded key here. A parser that learns a new token and
+    /// an index that keys it differently is the identical bug a second time.
     #[test]
-    fn both_legacy_attribute_spellings_land_under_the_folded_key() {
+    fn every_predicate_spelling_lands_under_the_folded_key() {
         let entry = index_written(
             "10-notes/a.md",
             "---\ntype: Note\n---\n\
              The drive's own spelling: [B](B.md){rel=\"cites\"}\n\
              keeper's older one: [C](C.md){reference=\"supports\"}\n\
              A CURIE beside a legacy word: [D](D.md){rel=\"index\", schema:about}\n\
-             Nothing at all: [E](E.md)\n",
+             Nothing at all: [E](E.md)\n\
+             The default vocabulary: [F](F.md){ :cites }\n\
+             A bare property name: [G](G.md){ cites }\n\
+             A pair holding a literal: [H](H.md){ :type=\"Metric\" }\n\
+             Behind the emphasis: **[I](I.md)**{ :depends_on }\n",
         );
 
         let at = |target: &str| {
@@ -2901,16 +2880,50 @@ mod tests {
         // spelling has an extension and a capital.
         assert_eq!(at("B.md"), ["cites"], "the drive's own rel= must land");
         assert_eq!(at("C.md"), ["supports"], "and keeper's older reference=");
+        // Modern tokens keep the order the author wrote; a legacy `rel=` name
+        // is appended after them, even when the author wrote it first. It is a
+        // stated limitation of the compatibility shim rather than a precedence
+        // keeper invented: `RawLink` keeps pairs and tokens in two vectors, so
+        // the interleaving of `{rel="index", schema:about}` is not recoverable,
+        // and inverting that shape to serve a rare mixed block would cost every
+        // ordinary link. Pinned here so a reordering shows up as this test
+        // failing rather than as chips silently swapping in the panel.
         assert_eq!(
             at("D.md"),
-            ["index", "schema:about"],
-            "attribute order, not a precedence keeper invented"
+            ["schema:about", "index"],
+            "tokens in written order, the legacy value appended"
         );
         assert!(
             !entry
                 .link_predicates
                 .contains_key(&keeper_core::notes::index::link_key("E.md")),
             "a link with nothing on it must not appear in the map at all"
+        );
+        // The colon is stripped rather than carried, so the empty prefix, the
+        // bare property and `rel="cites"` arrive as ONE spelling. Keeping it
+        // would let the panel show `cites` and `:cites` as two relationships
+        // and a graph query match only one of them.
+        assert_eq!(
+            at("F.md"),
+            ["cites"],
+            "kramdown's `:local` names a predicate"
+        );
+        assert_eq!(at("G.md"), ["cites"], "and so does a bare property name");
+        // What annotates the edge is the KEY; `Metric` is the object and stays
+        // in `attrs`. Projecting the value here would put a datum where a
+        // relationship goes — `Metric` is not something one note does to another.
+        assert_eq!(
+            at("H.md"),
+            ["type"],
+            "a colon-keyed pair predicates by its key"
+        );
+        // The owner's own line is `**[x](y)**{ :depends_on }`. Demanding that
+        // the block touch the closing `)` is what made their common case — the
+        // bolded link — read as unsupported.
+        assert_eq!(
+            at("I.md"),
+            ["depends_on"],
+            "an attribute block after the emphasis that closes the link"
         );
     }
 
