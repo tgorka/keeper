@@ -48,15 +48,30 @@ conflict: boolean,
  */
 origin: string, 
 /**
- * What kind of link connects this row to the note being looked at, when the
- * author said so: the `reference` attribute on the link.
+ * Why this row is connected to the note being looked at: the predicates
+ * the author wrote in the link's attribute block, in the order written.
  *
- * `None` for every link written without one, which is nearly all of them,
- * and for every row that is not the far end of a link — the field is only
- * filled by the two link projections. A predicate is the author's word for
- * the relationship; keeper neither invents one nor infers one.
+ * A predicate is the author's own word for the relationship —
+ * `schema:about`, `dcterms:source` — and keeper neither invents one nor
+ * infers one. Empty for every link written without a block, which is
+ * nearly all of them, and for every row that is not the far end of a link:
+ * only the two link projections fill this.
+ *
+ * A `Vec` and never an `Option<Vec>`. An empty list and "no predicates"
+ * are the same fact, and shipping two spellings of one fact is how one
+ * surface ends up branching on `null` while another branches on `.length`.
+ * This field REPLACED an `Option<String>` carrying the single
+ * `{reference="cites"}` attribute, which was this same concept with a
+ * one-per-link ceiling; that legacy value folds in as the first entry, so
+ * a vault written before the change renders exactly as it did.
+ *
+ * **On an inbound row these are the OTHER document's words.** A backlink's
+ * attribute block was written in the note that points here, not by the
+ * reader looking at it, so a surface showing them has to say whose words
+ * they are: nothing in the reader's own file contains the string. The
+ * index answers this through `IndexSnapshot::backlink_predicates`.
  */
-predicate: string | null, 
+predicates: Array<string>, 
 /**
  * The head revision that last touched this note's path: the revision
  * `unread` was computed against (`head_rev != acknowledged_rev`).

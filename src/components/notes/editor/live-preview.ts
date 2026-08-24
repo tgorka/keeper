@@ -240,34 +240,41 @@ const TASK_MARKER = /^\[[ xX]]$/;
  * the checkbox would vanish out from under the click that was toggling it.
  */
 /**
- * The predicate a link carries, drawn as a chip in place of its braces.
+ * The predicates a link carries, drawn as chips in place of their braces.
  *
- * `[Belief](belief.md){reference="supports"}` reads as a link followed by four
- * words of punctuation until the braces are replaced by the word they contain.
- * The chip is the author's own vocabulary — keeper neither invents a predicate
- * nor translates one — so it is shown verbatim.
+ * `[Belief](belief.md){schema:creator, foaf:knows}` reads as a link followed by
+ * six words of punctuation until the braces are replaced by the words they
+ * contain. The chips are the author's own vocabulary — keeper neither invents a
+ * predicate nor translates one — so they are shown verbatim, in written order.
  *
  * Replaced rather than hidden: hiding the braces would leave a link that says
- * "supports" nowhere, and the whole point of writing one is that a reader can
+ * "creator" nowhere, and the whole point of writing one is that a reader can
  * see what kind of link it is without opening the source.
+ *
+ * ONE widget for N chips, and one for the `{reference="cites"}` spelling keeper
+ * shipped first: that spelling is the same concept with an older syntax, it
+ * folds into the same list, and a vault written before this story renders
+ * exactly as it did — a single chip, no prefix, same class, same aria-label.
  */
 class PredicateWidget extends WidgetType {
-  constructor(private readonly predicate: string) {
+  constructor(private readonly predicates: readonly string[]) {
     super();
   }
 
   eq(other: PredicateWidget): boolean {
-    return other.predicate === this.predicate;
+    return (
+      other.predicates.length === this.predicates.length &&
+      other.predicates.every((predicate, at) => predicate === this.predicates[at])
+    );
   }
 
   toDOM(): HTMLElement {
-    const chip = document.createElement("span");
-    chip.className = "cm-lp-predicate";
-    chip.textContent = this.predicate;
-    // Named for a screen reader, which gets the link and then this and would
-    // otherwise hear a bare word with no relationship to what precedes it.
-    chip.setAttribute("aria-label", `link kind: ${this.predicate}`);
-    return chip;
+    const chips = document.createElement("span");
+    chips.className = "cm-lp-predicates";
+    for (const predicate of this.predicates) {
+      chips.append(predicateChip(predicate));
+    }
+    return chips;
   }
 
   ignoreEvent(): boolean {
@@ -276,22 +283,139 @@ class PredicateWidget extends WidgetType {
 }
 
 /**
- * The attribute block after a link, if there is one: `{reference="supports"}`.
+ * One chip: `schema:` quiet, `creator` in the weight that carries the meaning.
+ *
+ * The split is weight and not colour, which took a measurement to settle. The
+ * obvious quiet token for the prefix is `--faint`, and on the chip's `--muted`
+ * surface it comes out at **3.32:1** in light and **3.69:1** in dark — over the
+ * 3:1 floor `--faint` is held to, under the 4.5:1 that anything carrying a fact
+ * needs. A CURIE's prefix IS a fact: `schema:creator` and `foaf:creator` are
+ * different predicates, and a reader who cannot read the prefix cannot tell
+ * which vocabulary the link speaks. So both halves keep `--muted-foreground`
+ * (5.01:1 light, 6.82:1 dark on `--muted`) and the local part takes the weight.
+ *
+ * A predicate with no prefix — the legacy `reference` value — gets one text
+ * node and no spans, so its rendering is untouched by all of this.
+ */
+function predicateChip(predicate: string): HTMLElement {
+  const chip = document.createElement("span");
+  chip.className = "cm-lp-predicate";
+  // Named for a screen reader, which gets the link and then this and would
+  // otherwise hear a bare word with no relationship to what precedes it.
+  chip.setAttribute("aria-label", `link kind: ${predicate}`);
+  const colon = predicate.indexOf(":");
+  if (colon === -1) {
+    chip.textContent = predicate;
+    return chip;
+  }
+  const prefix = document.createElement("span");
+  prefix.className = "cm-lp-predicate-prefix";
+  prefix.textContent = predicate.slice(0, colon + 1);
+  const local = document.createElement("span");
+  local.className = "cm-lp-predicate-local";
+  local.textContent = predicate.slice(colon + 1);
+  chip.append(prefix, local);
+  return chip;
+}
+
+/**
+ * A CURIE, which is what makes a token a predicate rather than a word.
+ *
+ * `prefix:local`, both halves `[A-Za-z][A-Za-z0-9_-]*`. The same shape the Rust
+ * side tests, and it has to stay the same: one syntax read twice, once to draw
+ * it and once to put it in the graph, and two readings of one syntax is how a
+ * note comes to show a relationship that no query can find.
+ */
+const CURIE = /^[A-Za-z][A-Za-z0-9_-]*:[A-Za-z][A-Za-z0-9_-]*$/;
+
+/** The one attribute key that has ever meant "predicate" in this codebase. */
+const REFERENCE_KEY = "reference";
+
+/**
+ * One attribute block after a link: `{schema:creator, rel="cites"}`.
+ *
+ * Sticky rather than anchored so a run of ADJACENT blocks can be scanned
+ * without slicing the document window once per block. One line: a stray brace
+ * must not be able to swallow the rest of a note.
+ */
+const LINK_ATTRS = /\{([^}\n]*)\}/y;
+
+/**
+ * One token inside a block: a `key="value"` pair, or anything not a separator.
+ *
+ * The pair alternative comes first so a value containing a comma or a space
+ * stays one token. Commas and whitespace are the separators, interchangeably —
+ * `{a:b, c:d}` and `{a:b c:d}` are the same two predicates.
+ */
+const ATTR_TOKEN = /[A-Za-z][A-Za-z0-9_-]*\s*=\s*"[^"\n]*"|[^\s,]+/g;
+
+/** `key="value"`, as a whole token. */
+const ATTR_PAIR = /^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*"([^"\n]*)"$/;
+
+/** One block of a run, and what its tokens turned out to be. */
+interface AttrBlock {
+  /** Offsets of `{`…`}`, relative to the start of the run. */
+  from: number;
+  to: number;
+  /** The chips this block draws: its predicates, minus any an earlier block in
+   *  the run already drew. Empty when every one of them was a repeat. */
+  chips: string[];
+  /** Whether the block wrote a predicate at all, repeat or not. A block that
+   *  wrote none is not a predicate block and keeps its source. */
+  writesPredicate: boolean;
+  /** A token that is neither a CURIE nor `key="value"`. Nothing in the block is
+   *  decorated when one is present — see the call site. */
+  junk: boolean;
+}
+
+/**
+ * Every attribute block written straight after a link, in order.
  *
  * The markdown parser has never heard of these, so they arrive as ordinary text
  * after the link node and this reads them off the document directly. Same rules
  * as the Rust side, and they have to stay the same: no space before the brace,
- * a quoted value, one line.
+ * a quoted value for a pair, one line, and adjacent blocks merged in order with
+ * exact duplicates dropped.
  */
-const LINK_ATTRS = /^\{([^}\n]*)\}/;
-
-function predicateAfter(text: string): { predicate: string; length: number } | null {
-  const block = LINK_ATTRS.exec(text);
-  if (block === null) {
-    return null;
+function predicatesAfter(text: string): { blocks: AttrBlock[]; length: number } | null {
+  const blocks: AttrBlock[] = [];
+  const seen = new Set<string>();
+  let at = 0;
+  for (;;) {
+    LINK_ATTRS.lastIndex = at;
+    const block = LINK_ATTRS.exec(text);
+    if (block === null) {
+      break;
+    }
+    const chips: string[] = [];
+    let writesPredicate = false;
+    let junk = false;
+    for (const token of (block[1] ?? "").matchAll(ATTR_TOKEN)) {
+      const pair = ATTR_PAIR.exec(token[0]);
+      if (pair === null && !CURIE.test(token[0])) {
+        // A token keeper cannot read. Guessing at one is how a graph comes to
+        // hold a relationship nobody wrote, so it is recorded and the whole
+        // block keeps its source — see the call site.
+        junk = true;
+        continue;
+      }
+      // A CURIE is its own predicate; `reference="cites"` names one in the
+      // spelling keeper shipped first. Any other pair — `rel="cites"`, which
+      // the vault's own toolkit writes — is an attribute and not a predicate.
+      const predicate = pair === null ? token[0] : (pair[2] ?? "");
+      if (pair !== null && (pair[1] !== REFERENCE_KEY || predicate === "")) {
+        continue;
+      }
+      writesPredicate = true;
+      if (!seen.has(predicate)) {
+        seen.add(predicate);
+        chips.push(predicate);
+      }
+    }
+    blocks.push({ from: at, to: at + block[0].length, chips, writesPredicate, junk });
+    at += block[0].length;
   }
-  const pair = /(?:^|\s)reference\s*=\s*"([^"]+)"/.exec(block[1] ?? "");
-  return pair === null ? null : { predicate: pair[1] ?? "", length: block[0].length };
+  return blocks.length === 0 ? null : { blocks, length: at };
 }
 
 class TaskWidget extends WidgetType {
@@ -433,16 +557,39 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
                 destination === null ? {} : { title: destination, [LINK_ATTR]: destination },
             }).range(node.from, node.to),
           );
-          // `{reference="…"}` written straight after the link. The parser has
-          // never heard of it, so it is plain text sitting after this node and
-          // has to be read off the document.
-          const trailing = predicateAfter(doc.sliceString(node.to, node.to + 200));
+          // The attribute blocks written straight after the link. The parser
+          // has never heard of them, so they are plain text sitting after this
+          // node and have to be read off the document.
+          //
+          // 200 characters is the window, which is generous for a run of
+          // predicates and short enough that a note full of links does not
+          // become a note full of string copies.
+          const trailing = predicatesAfter(doc.sliceString(node.to, node.to + 200));
           if (trailing !== null && !isRevealed(node.to, node.to + trailing.length)) {
-            decorations.push(
-              Decoration.replace({
-                widget: new PredicateWidget(trailing.predicate),
-              }).range(node.to, node.to + trailing.length),
-            );
+            for (const block of trailing.blocks) {
+              // Two blocks stay exactly as the author typed them, and both
+              // rules are about not hiding text nobody can see hidden:
+              //
+              //   - one with a token keeper cannot read, because replacing it
+              //     with a chip would show the tokens keeper DID understand and
+              //     silently swallow the one the author needs to fix;
+              //   - one that writes no predicate at all — `{rel="cites"}`,
+              //     `{strength="weak"}` — which is source, and was source
+              //     before this story too.
+              //
+              // A block whose predicates were all written by an earlier block
+              // of the run is neither: it gets an empty widget, so the braces
+              // go and the duplicate does not draw a second identical chip.
+              // The chips are the list the graph gets, exactly.
+              if (block.junk || !block.writesPredicate) {
+                continue;
+              }
+              decorations.push(
+                Decoration.replace({
+                  widget: new PredicateWidget(block.chips),
+                }).range(node.to + block.from, node.to + block.to),
+              );
+            }
           }
           return undefined;
         }
@@ -758,12 +905,9 @@ const livePreviewTheme = EditorView.baseTheme({
     color: "var(--muted-foreground)",
     fontSize: "0.8em",
   },
-  // Sized and spaced to occupy the three columns `[ ]` occupied, so ticking a
-  // box does not reflow the paragraph and neither does moving the caret onto
-  // the line and getting the source back.
-  // The chip a link's predicate is drawn as. Quiet: it is a label on something
-  // else, not a thing in its own right, and a note with many of them should
-  // still read as prose rather than as a list of badges.
+  // The chips a link's predicates are drawn as. Quiet: they are labels on
+  // something else, not things in their own right, and a note with many of them
+  // should still read as prose rather than as a list of badges.
   ".cm-lp-predicate": {
     marginInlineStart: "0.3em",
     padding: "0 0.35em",
@@ -772,6 +916,14 @@ const livePreviewTheme = EditorView.baseTheme({
     color: "var(--muted-foreground)",
     fontSize: "0.85em",
   },
+  // A CURIE's two halves. The vocabulary is quieter than the term it qualifies,
+  // by weight and not by colour: see `predicateChip` for the two ratios that
+  // decided that. `500` rather than the `600` the headings use — a chip that
+  // out-weighed the prose around it would stop being a label.
+  ".cm-lp-predicate-local": { fontWeight: "500" },
+  // Sized and spaced to occupy the three columns `[ ]` occupied, so ticking a
+  // box does not reflow the paragraph and neither does moving the caret onto
+  // the line and getting the source back.
   ".cm-lp-task": {
     verticalAlign: "middle",
     margin: "0 0.15em",
@@ -1149,4 +1301,4 @@ export function livePreview(options: LivePreviewOptions): Extension {
 }
 
 /** The predicate reader, for the test that pins it against the Rust rules. */
-export const __predicateAfterForTest = predicateAfter;
+export const __predicatesAfterForTest = predicatesAfter;

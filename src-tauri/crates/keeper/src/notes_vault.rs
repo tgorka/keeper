@@ -1481,6 +1481,11 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         .and_then(|raw| parse_timestamp_ms(raw))
         .unwrap_or_else(|| mtime_ms(stat, now_ms));
 
+    // One pass. This used to call `links::extract(body)` twice — once for the
+    // targets and once for the attributes — which parses every link in every
+    // note of the vault a second time for a projection of the same result.
+    let parsed = links::extract(body);
+
     IndexEntry {
         id,
         path: rel.to_owned(),
@@ -1492,29 +1497,44 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         updated_ms,
         tags: tags::note_tags(&fm, body),
         fields,
-        links: links::extract(body)
-            .into_iter()
-            .map(|link| link.target)
-            .collect(),
-        // The first predicate wins per target — see `IndexEntry::link_attrs`.
-        // `reference` is the key the convention uses for "what kind of link is
-        // this"; another key on the same link is kept out of the graph rather
-        // than guessed at, because only `reference` has an agreed meaning.
-        link_attrs: links::extract(body)
-            .into_iter()
-            .filter_map(|link| {
-                link.attrs
+        links: parsed.iter().map(|link| link.target.clone()).collect(),
+        // Every predicate the author wrote on a link, per target, in written
+        // order, with the legacy `reference="x"` attribute folded in first so a
+        // vault written before this reads exactly as it did.
+        //
+        // Keyed through `link_key`, and that is the whole of the bug this
+        // replaces. The old map was built on the RAW target the author typed and
+        // read back with folded keys, so `{reference="cites"}` written on
+        // `[x](B.md)` — or on any title with a capital letter — matched nothing
+        // and rendered nothing, in either direction. The feature was reported as
+        // missing because it was: one half of it never met the other. There is
+        // one spelling of the key now, and it is produced here.
+        link_predicates: parsed.iter().fold(
+            std::collections::BTreeMap::<String, Vec<String>>::new(),
+            |mut acc, link| {
+                let legacy = link
+                    .attrs
                     .iter()
                     .find(|(key, _)| key == "reference")
-                    .map(|(_, value)| (link.target.clone(), value.clone()))
-            })
-            .fold(
-                std::collections::BTreeMap::new(),
-                |mut acc, (target, value)| {
-                    acc.entry(target).or_insert(value);
-                    acc
-                },
-            ),
+                    .map(|(_, value)| value.clone());
+                let mut ordered: Vec<String> = legacy
+                    .into_iter()
+                    .chain(link.predicates.iter().cloned())
+                    .collect();
+                // A link with nothing on it must not appear here at all. An entry
+                // holding an empty vec is a second way to say "no predicates",
+                // and the projections would then have to branch on both.
+                if ordered.is_empty() {
+                    return acc;
+                }
+                let slot = acc
+                    .entry(keeper_core::notes::index::link_key(&link.target))
+                    .or_default();
+                ordered.retain(|predicate| !slot.contains(predicate));
+                slot.append(&mut ordered);
+                acc
+            },
+        ),
         flags,
         snippet: snippet(body),
         // Read once, here, so the list's comparator never re-parses a string
@@ -2833,7 +2853,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
-            link_attrs: Default::default(),
+            link_predicates: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),

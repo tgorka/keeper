@@ -390,3 +390,119 @@ describe("DW-165: a mermaid fence in a real view", () => {
     expect(view.contentDOM.textContent).toContain("const a = 1;");
   });
 });
+
+describe("a link's predicates render as chips", () => {
+  /** Every chip on the line, in the order a reader meets them. */
+  function chips(view: EditorView): string[] {
+    return [...view.contentDOM.querySelectorAll(".cm-lp-predicate")].map(
+      (chip) => chip.textContent ?? "",
+    );
+  }
+
+  it("draws one chip for one CURIE, and no braces", () => {
+    const view = render("[Satoshi](Satoshi.md){schema:creator}\n\nend\n");
+
+    expect(chips(view)).toEqual(["schema:creator"]);
+    expect(shown(view)).toBe("Satoshischema:creator");
+  });
+
+  it("draws a chip per predicate in a comma-separated block", () => {
+    const view = render("[Satoshi](Satoshi.md){schema:creator, foaf:knows}\n\nend\n");
+
+    expect(chips(view)).toEqual(["schema:creator", "foaf:knows"]);
+    expect(shown(view)).not.toContain("{");
+  });
+
+  /** Two blocks written back to back are one list, in the order they were
+   *  written — the same merge the graph does. */
+  it("draws adjacent blocks as one run of chips", () => {
+    const view = render("[Satoshi](Satoshi.md){dcterms:source}{schema:status}\n\nend\n");
+
+    expect(chips(view)).toEqual(["dcterms:source", "schema:status"]);
+    expect(shown(view)).not.toContain("{");
+  });
+
+  /**
+   * `rel="cites"` is the attribute the vault's own toolkit writes and it is not
+   * a predicate. It keeps the treatment it has always had — it goes with the
+   * block the chip replaces, exactly as `strength="weak"` did beside a
+   * `reference` before this story.
+   */
+  it("draws the CURIE in a mixed block", () => {
+    const view = render('[Satoshi](Satoshi.md){schema:creator, rel="cites"}\n\nend\n');
+
+    expect(chips(view)).toEqual(["schema:creator"]);
+  });
+
+  /** The spelling keeper shipped first, rendering as it always did: one chip,
+   *  no prefix, and the same label a screen reader has always been given. */
+  it("still draws the legacy reference spelling as one chip", () => {
+    const view = render('[Belief](belief.md){reference="supports"}\n\nend\n');
+
+    expect(chips(view)).toEqual(["supports"]);
+    expect(view.contentDOM.querySelector(".cm-lp-predicate")).toHaveAttribute(
+      "aria-label",
+      "link kind: supports",
+    );
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-prefix")).toBeNull();
+  });
+
+  /** A CURIE's vocabulary is quieter than its term, and the split is by weight
+   *  because `--faint` on the chip's surface measures 3.32:1 — see the comment
+   *  on `predicateChip`. What is pinned here is that both halves are there. */
+  it("splits a chip into its prefix and its local part", () => {
+    const view = render("[Satoshi](Satoshi.md){schema:creator}\n\nend\n");
+
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-prefix")?.textContent).toBe("schema:");
+    expect(view.contentDOM.querySelector(".cm-lp-predicate-local")?.textContent).toBe("creator");
+  });
+
+  /**
+   * A block keeper cannot read stays exactly as the author typed it. Drawing a
+   * chip over it would show what keeper understood and swallow the rest, which
+   * is how somebody comes to trust a predicate they never wrote.
+   */
+  it("leaves a block of junk exactly as it is", () => {
+    const view = render("[Satoshi](Satoshi.md){not a curie}\n\nend\n");
+
+    expect(chips(view)).toEqual([]);
+    expect(shown(view)).toBe("Satoshi{not a curie}");
+  });
+
+  /** `{rel="cites"}` alone writes no predicate, so it is source — the same
+   *  treatment it had before this story. */
+  it("leaves a block of pairs alone", () => {
+    const view = render('[Satoshi](Satoshi.md){rel="cites"}\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+    expect(shown(view)).toBe('Satoshi{rel="cites"}');
+  });
+
+  /**
+   * The braces stay in the file. This is a rendering decision over portable
+   * markdown: the vault has to open in any editor, and a decoration that
+   * rewrote the source would be a migration nobody asked for.
+   */
+  it("never changes the document text", () => {
+    const doc = '[Satoshi](Satoshi.md){schema:creator, foaf:knows}{rel="cites"}\n\nend\n';
+    const view = render(doc);
+
+    expect(view.state.doc.toString()).toBe(doc);
+  });
+
+  it("gives the raw syntax back when the caret lands on the line", () => {
+    const view = render("[Satoshi](Satoshi.md){schema:creator, foaf:knows}\n\nend\n");
+    view.dispatch({ selection: { anchor: 3 } });
+
+    expect(shown(view)).toBe("[Satoshi](Satoshi.md){schema:creator, foaf:knows}");
+    expect(chips(view)).toEqual([]);
+  });
+
+  /** An external link carries them too: the predicate is about the link, not
+   *  about where it points. */
+  it("draws chips on a link to a URL", () => {
+    const view = render("[keeper](https://x.example){schema:codeRepository}\n\nend\n");
+
+    expect(chips(view)).toEqual(["schema:codeRepository"]);
+  });
+});

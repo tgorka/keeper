@@ -57,7 +57,7 @@ function row(id: string, title: string, tags: string[]): NoteRowVm {
   return {
     id,
     path: `${id}.md`,
-    predicate: null,
+    predicates: [],
     title,
     snippet: `${title} body`,
     tags,

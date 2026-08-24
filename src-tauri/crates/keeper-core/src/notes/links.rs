@@ -44,45 +44,152 @@ pub struct RawLink {
     /// reading that is obviously right, and a wrong predicate is worse than an
     /// absent one in a graph somebody queries.
     pub attrs: Vec<(String, String)>,
+    /// The CURIE predicates written in the link's attribute block(s), in the
+    /// order they were written, with exact duplicates dropped:
+    /// `{schema:creator, foaf:knows}` gives `["schema:creator", "foaf:knows"]`.
+    ///
+    /// A token is a predicate by *shape* and by nothing else — `prefix:local`,
+    /// both halves `[A-Za-z][A-Za-z0-9_-]*`. No vocabulary is consulted, and no
+    /// prefix is resolved here: the prefix map lives in the note's frontmatter,
+    /// and a reader that needed it could not read a link in isolation.
+    ///
+    /// A token that is neither a CURIE nor a quoted `key="value"` pair is
+    /// dropped rather than guessed at. `{a b}` and `{:b}` could be read as
+    /// several things and the author only meant one of them; a wrong predicate
+    /// is worse than an absent one in a graph somebody queries.
+    pub predicates: Vec<String>,
 }
 
-/// Read a `{key="value" other="thing"}` block starting at `at`, if one is there.
+/// What the attribute block or blocks after a link said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrBlocks {
+    /// `key="value"` pairs, in order, as written.
+    pub attrs: Vec<(String, String)>,
+    /// Bare CURIE tokens, in order, exact duplicates dropped.
+    pub predicates: Vec<String>,
+    /// The byte just past the closing brace of the *last* block consumed.
+    pub end: usize,
+}
+
+impl AttrBlocks {
+    /// What a link with no block at all has: nothing, ending where the link
+    /// itself ended.
+    fn none_at(end: usize) -> Self {
+        Self {
+            attrs: Vec::new(),
+            predicates: Vec::new(),
+            end,
+        }
+    }
+}
+
+/// Read the attribute block starting at `at`, and every block written directly
+/// against it, merging them in order: `{dcterms:source}{schema:status}` reads
+/// the same as `{dcterms:source, schema:status}`.
 ///
-/// Returns the pairs and the byte just past the closing brace. The block has to
-/// begin immediately after the link — one space is not allowed, because
-/// `[a](b) {this}` is a sentence with braces in it and `[a](b){this}` is a link
-/// with attributes, and only the author knows which they meant.
-pub fn read_attrs(body: &str, at: usize) -> Option<(Vec<(String, String)>, usize)> {
-    if body.as_bytes().get(at) != Some(&b'{') {
+/// A block holds `key="value"` pairs and bare CURIE predicates in any mixture,
+/// separated by commas, whitespace, or both. Returns `None` when there is no
+/// block, otherwise the contents and the byte just past the last closing brace
+/// — which is what keeps `RawLink::span` covering the whole syntax when an
+/// author wrote more than one block.
+///
+/// The first block has to begin immediately after the link — one space is not
+/// allowed, because `[a](b) {this}` is a sentence with braces in it and
+/// `[a](b){this}` is a link with attributes, and only the author knows which
+/// they meant. The same rule holds between blocks.
+pub fn read_attrs(body: &str, at: usize) -> Option<AttrBlocks> {
+    let mut attrs = Vec::new();
+    let mut predicates = Vec::new();
+    let mut end = None;
+    let mut cursor = at;
+
+    while body.as_bytes().get(cursor) == Some(&b'{') {
+        // A block never wraps: an unclosed brace is prose, and stopping here
+        // leaves the span where the previous block ended.
+        let limit = line_limit(body, cursor);
+        let Some(close) = body[cursor..limit].find('}').map(|i| i + cursor) else {
+            break;
+        };
+        for_each_token(&body[cursor + 1..close], |token| {
+            if let Some(pair) = read_pair(token) {
+                attrs.push(pair);
+            } else if is_curie(token) && !predicates.iter().any(|had| had == token) {
+                predicates.push(token.to_owned());
+            }
+        });
+        cursor = close + 1;
+        end = Some(cursor);
+    }
+
+    end.map(|end| AttrBlocks {
+        attrs,
+        predicates,
+        end,
+    })
+}
+
+/// Split a block's contents into tokens on commas and whitespace, except
+/// inside quotes: `{rel="see also", schema:creator}` is two tokens, not three.
+fn for_each_token(inner: &str, mut visit: impl FnMut(&str)) {
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (i, c) in inner.char_indices() {
+        match quote {
+            Some(open) => {
+                if c == open {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == ',' || c.is_whitespace() => {
+                if start < i {
+                    visit(&inner[start..i]);
+                }
+                start = i + c.len_utf8();
+            }
+            None => {}
+        }
+    }
+    if start < inner.len() {
+        visit(&inner[start..]);
+    }
+}
+
+/// `key="value"`, or `None` if the token is not one. An unquoted value is not
+/// one: `{reference=aaa bbb}` has no reading that is obviously right.
+fn read_pair(token: &str) -> Option<(String, String)> {
+    let (key, value) = token.split_once('=')?;
+    let key = key.trim();
+    let value = value.trim();
+    let unquoted = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })?;
+    if key.is_empty() || unquoted.is_empty() {
         return None;
     }
-    let limit = line_limit(body, at);
-    let close = body[at..limit].find('}')? + at;
-    let inner = &body[at + 1..close];
-    let mut pairs = Vec::new();
-    for chunk in inner.split_whitespace() {
-        let Some((key, value)) = chunk.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim();
-        let unquoted = value
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix('"'))
-            .or_else(|| {
-                value
-                    .strip_prefix('\'')
-                    .and_then(|rest| rest.strip_suffix('\''))
-            });
-        let Some(unquoted) = unquoted else {
-            continue;
-        };
-        if key.is_empty() || unquoted.is_empty() {
-            continue;
-        }
-        pairs.push((key.to_owned(), unquoted.to_owned()));
+    Some((key.to_owned(), unquoted.to_owned()))
+}
+
+/// `prefix:local`, the compact form every RDF serialisation understands.
+fn is_curie(token: &str) -> bool {
+    match token.split_once(':') {
+        Some((prefix, local)) => is_name(prefix) && is_name(local),
+        None => false,
     }
-    Some((pairs, close + 1))
+}
+
+/// A CURIE half: a letter, then letters, digits, `_` or `-`. Deliberately
+/// narrower than XML's NCName — the extra characters buy nothing here and each
+/// one widens what gets mistaken for a predicate.
+fn is_name(part: &str) -> bool {
+    let mut chars = part.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 /// Every link in a body, in document order.
@@ -153,17 +260,16 @@ fn wikilink(body: &str, start: usize, outer: usize, embed: bool) -> Option<RawLi
 
     // A wikilink can carry them too. Obsidian writes none, but a vault that
     // adopts the convention should not have to remember which of its two link
-    // syntaxes it applies to.
-    let (attrs, end) = match read_attrs(body, close + 2) {
-        Some((pairs, past)) => (pairs, past),
-        None => (Vec::new(), close + 2),
-    };
+    // syntaxes it applies to, and `[[belief]]{skos:related}` is as legitimate
+    // an edge label as the markdown form.
+    let blocks = read_attrs(body, close + 2).unwrap_or_else(|| AttrBlocks::none_at(close + 2));
     Some(RawLink {
         target,
         alias: alias.filter(|a| !a.is_empty()),
         embed,
-        span: (outer, end),
-        attrs,
+        span: (outer, blocks.end),
+        attrs: blocks.attrs,
+        predicates: blocks.predicates,
     })
 }
 
@@ -203,19 +309,18 @@ fn markdown_link(body: &str, start: usize, outer: usize, embed: bool) -> Option<
 
     let text = body[start + 1..text_end].trim();
     // Attributes come after the destination, with no space between: see
-    // `read_attrs`. The span grows to cover them, because a renderer that hides
-    // the link syntax has to hide the attributes too or they are left on screen
-    // as loose braces.
-    let (attrs, end) = match read_attrs(body, dest_end + 1) {
-        Some((pairs, past)) => (pairs, past),
-        None => (Vec::new(), dest_end + 1),
-    };
+    // `read_attrs`. The span grows to cover them — every block of them — because
+    // a renderer that hides the link syntax has to hide the attributes too or
+    // they are left on screen as loose braces.
+    let blocks =
+        read_attrs(body, dest_end + 1).unwrap_or_else(|| AttrBlocks::none_at(dest_end + 1));
     Some(RawLink {
         target,
         alias: (!text.is_empty()).then(|| text.to_owned()),
         embed,
-        span: (outer, end),
-        attrs,
+        span: (outer, blocks.end),
+        attrs: blocks.attrs,
+        predicates: blocks.predicates,
     })
 }
 
@@ -452,5 +557,191 @@ mod attribute_tests {
         let link = only(body);
         assert!(link.attrs.is_empty());
         assert_eq!(link.span, (0, body.len()));
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::*;
+
+    fn only(body: &str) -> RawLink {
+        let found = extract(body);
+        assert_eq!(found.len(), 1, "expected exactly one link in {body:?}");
+        found.into_iter().next().expect("one link")
+    }
+
+    fn predicates(body: &str) -> Vec<String> {
+        only(body).predicates
+    }
+
+    /// The plainest form: one CURIE, no quotes, no equals sign.
+    #[test]
+    fn one_curie_is_read_as_a_predicate() {
+        let link = only("[Belief](notes/belief.md){schema:creator}");
+        assert_eq!(link.predicates, vec!["schema:creator".to_owned()]);
+        // It is a predicate, not a pair; `attrs` must not have grown a member.
+        assert!(link.attrs.is_empty());
+    }
+
+    /// Commas are what a writer reaches for, so commas have to work.
+    #[test]
+    fn comma_separated_predicates_all_come_through() {
+        assert_eq!(
+            predicates("[Belief](notes/belief.md){schema:creator, foaf:knows}"),
+            vec!["schema:creator".to_owned(), "foaf:knows".to_owned()]
+        );
+    }
+
+    /// Pandoc's own separator is whitespace, and the same vault will contain
+    /// both spellings the week after the convention is announced.
+    #[test]
+    fn space_separated_predicates_all_come_through() {
+        assert_eq!(
+            predicates("[Belief](notes/belief.md){schema:creator foaf:knows}"),
+            vec!["schema:creator".to_owned(), "foaf:knows".to_owned()]
+        );
+    }
+
+    /// Two blocks written against each other are one list. The span has to
+    /// cover both, or a renderer that hides the syntax leaves the second block
+    /// on screen as loose braces.
+    #[test]
+    fn adjacent_blocks_merge_in_order_and_the_span_covers_them_all() {
+        let body = "[Belief](notes/belief.md){dcterms:source}{schema:status}";
+        let link = only(body);
+        assert_eq!(
+            link.predicates,
+            vec!["dcterms:source".to_owned(), "schema:status".to_owned()]
+        );
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// A gap between two blocks ends the run: `{a} {b}` is a block and then a
+    /// sentence, by the same rule that makes `[a](b) {c}` prose.
+    #[test]
+    fn a_gap_between_blocks_ends_the_run() {
+        let body = "[Belief](notes/belief.md){dcterms:source} {schema:status}";
+        let link = only(body);
+        assert_eq!(link.predicates, vec!["dcterms:source".to_owned()]);
+        assert_eq!(
+            &body[link.span.0..link.span.1],
+            "[Belief](notes/belief.md){dcterms:source}"
+        );
+    }
+
+    /// The two kinds of token share a block. `rel="cites"` is what vaults are
+    /// already writing, and adding a predicate beside it must not disturb it.
+    #[test]
+    fn a_predicate_and_a_quoted_pair_share_one_block() {
+        let link = only("[Belief](notes/belief.md){schema:creator, rel=\"cites\"}");
+        assert_eq!(link.predicates, vec!["schema:creator".to_owned()]);
+        assert_eq!(link.attrs, vec![("rel".to_owned(), "cites".to_owned())]);
+    }
+
+    /// Splitting on commas must not split inside a quoted value, or a
+    /// two-word `rel` would be lost the moment a predicate joined it.
+    #[test]
+    fn a_quoted_value_may_contain_the_separators() {
+        let link = only("[Belief](notes/belief.md){rel=\"see also\", schema:creator}");
+        assert_eq!(link.attrs, vec![("rel".to_owned(), "see also".to_owned())]);
+        assert_eq!(link.predicates, vec!["schema:creator".to_owned()]);
+    }
+
+    /// `[[belief]]{skos:related}` is as legitimate an edge label as the
+    /// markdown form, and a vault should not have to remember which of its two
+    /// link syntaxes carries predicates.
+    #[test]
+    fn a_wikilink_carries_predicates_too() {
+        let body = "[[belief|Belief]]{skos:related, prov:wasDerivedFrom}";
+        let link = only(body);
+        assert_eq!(
+            link.predicates,
+            vec!["skos:related".to_owned(), "prov:wasDerivedFrom".to_owned()]
+        );
+        assert_eq!(&body[link.span.0..link.span.1], body);
+    }
+
+    /// An external destination is not an edge in the vault graph, so `extract`
+    /// drops it — but the block after it is still a block, and a reader that
+    /// went looking for one (an RDF export walking outward citations) must get
+    /// the predicates and the end of the syntax. The reader is destination
+    /// blind on purpose.
+    #[test]
+    fn an_external_destination_still_carries_its_predicates() {
+        let body = "[x](https://example.com){schema:codeRepository}";
+        assert!(
+            extract(body).is_empty(),
+            "external links are not vault edges"
+        );
+
+        let at = body.find('{').expect("a block");
+        let blocks = read_attrs(body, at).expect("a block is read there");
+        assert_eq!(blocks.predicates, vec!["schema:codeRepository".to_owned()]);
+        assert_eq!(blocks.end, body.len());
+    }
+
+    /// Duplicates are the shape a copy-paste leaves behind. One edge, once.
+    #[test]
+    fn exact_duplicates_are_dropped_and_order_is_kept() {
+        assert_eq!(
+            predicates(
+                "[Belief](notes/belief.md){schema:creator, foaf:knows}{schema:creator, skos:related}"
+            ),
+            vec![
+                "schema:creator".to_owned(),
+                "foaf:knows".to_owned(),
+                "skos:related".to_owned(),
+            ]
+        );
+    }
+
+    /// A token that is not a CURIE is dropped rather than guessed at: a wrong
+    /// predicate is worse than an absent one in a graph somebody queries. The
+    /// block is still consumed, so the span still covers it and the braces do
+    /// not survive into the rendered line.
+    #[test]
+    fn junk_yields_no_predicates_and_does_not_corrupt_the_span() {
+        for block in ["{not a curie}", "{a:}", "{:b}", "{a b}", "{}"] {
+            let body = format!("[Belief](notes/belief.md){block}");
+            let link = only(&body);
+            assert!(
+                link.predicates.is_empty(),
+                "{block} should yield no predicates, got {:?}",
+                link.predicates
+            );
+            assert!(link.attrs.is_empty(), "{block} should yield no attributes");
+            assert_eq!(&body[link.span.0..link.span.1], body, "span for {block}");
+        }
+    }
+
+    /// One space and it is prose, exactly as for `attrs`. The author says which
+    /// they meant by typing the space or not typing it.
+    #[test]
+    fn a_space_before_the_brace_leaves_the_predicates_unread() {
+        let body = "[Belief](notes/belief.md) {schema:creator}";
+        let link = only(body);
+        assert!(link.predicates.is_empty());
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
+    }
+
+    /// The overwhelming majority of links carry nothing, and they must cost
+    /// nothing and look the same as they did before this field existed.
+    #[test]
+    fn a_plain_link_has_no_predicates() {
+        let body = "[Belief](notes/belief.md)";
+        let link = only(body);
+        assert!(link.predicates.is_empty());
+        assert!(link.attrs.is_empty());
+        assert_eq!(link.span, (0, body.len()));
+    }
+
+    /// An unclosed brace is prose: the run stops before it and the span stays
+    /// where the link ended, so nothing downstream reads past the line.
+    #[test]
+    fn an_unclosed_block_is_not_a_block() {
+        let body = "[Belief](notes/belief.md){schema:creator\nnext line";
+        let link = only(body);
+        assert!(link.predicates.is_empty());
+        assert_eq!(&body[link.span.0..link.span.1], "[Belief](notes/belief.md)");
     }
 }

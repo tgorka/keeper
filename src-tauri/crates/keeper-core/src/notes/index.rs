@@ -41,7 +41,7 @@ use crate::notes::tags::{normalise, TagNode};
 /// the shape of an [`IndexEntry`] field changes; the loader's only response to a
 /// mismatch is discard-and-cold-scan, so a bump is always safe and never a
 /// migration.
-pub const INDEX_SCHEMA: u32 = 2;
+pub const INDEX_SCHEMA: u32 = 3;
 
 /// The `IndexEntry.fields` key carrying the note's provenance class, written by
 /// the reconciler from the trailers of the last commit touching the file
@@ -132,19 +132,38 @@ pub struct IndexEntry {
     /// not at extraction time, because a link may point at a note that does not
     /// exist yet.
     pub links: Vec<String>,
-    /// The predicate written on a link, by target: `[x](y){reference="cites"}`
-    /// puts `y → cites` here.
+    /// Why this note points at each of its targets: the CURIE predicates the
+    /// author wrote in the link's attribute block, keyed by the target's
+    /// [`link_key`] and held in the order they were written.
+    ///
+    /// `[a](b.md){schema:about}` puts `b → ["schema:about"]` here.
     ///
     /// Beside `links` rather than inside it, because `links` is read by the
     /// query engine and by every consumer of the graph, and none of them has an
     /// opinion about predicates — widening the type would have made every one
     /// of them carry a value it ignores.
     ///
-    /// Keyed by target, so a note linking one target twice with two different
-    /// predicates keeps the first. That is a real limitation and a small one:
-    /// the second edge still exists, it is the same edge, and the panel names
-    /// the relationship rather than enumerating every time it was written.
-    pub link_attrs: std::collections::BTreeMap<String, String>,
+    /// **Keyed through [`link_key`], not by the raw target.** Both posting
+    /// lists already fold that way, and the map this replaced was keyed by the
+    /// raw target while its only readers looked it up with folded keys — so a
+    /// predicate on `[x](B.md)` or `[[Vault as a Lens]]` never matched anything
+    /// and never reached the panel. One folding rule for the graph and its
+    /// annotations, or the annotation silently describes a different edge.
+    ///
+    /// This map replaced a `BTreeMap<String, String>` of `{reference="cites"}`
+    /// attributes: the same concept with a one-predicate-per-link ceiling. The
+    /// legacy value folds in as the first entry of the list, so a vault written
+    /// before the change keeps rendering as it did.
+    ///
+    /// A target with no predicates is ABSENT from the map rather than present
+    /// with an empty vector — the map is a sparse annotation on `links`, and
+    /// the overwhelming majority of links are unannotated. Where two of a
+    /// note's link keys resolve to the same note (a link by title and another
+    /// by path), the first key in [`IndexEntry::link_keys`] order wins. That is
+    /// a real limitation and a small one: it is the same edge either way, and
+    /// the panel names the relationship rather than enumerating every time it
+    /// was written.
+    pub link_predicates: BTreeMap<String, Vec<String>>,
     /// Index-computed booleans, as strings so the set can grow without a schema
     /// bump: `pinned`, `archived`, `unread`, `conflict`, `journal`, `template`,
     /// `space`, `capture`, `recording`, `orphan`, `unstable_identity`,
@@ -507,6 +526,53 @@ impl IndexSnapshot {
         let mut rows: Vec<&IndexEntry> = seen.into_iter().filter_map(|s| self.by_id(s)).collect();
         rows.sort_by(|a, b| a.path.cmp(&b.path));
         rows
+    }
+
+    /// Why `from_id` points at `to_id`: the predicates written on that outgoing
+    /// link, in the order the linking body wrote them (empty when the author
+    /// wrote none, which is nearly every link).
+    ///
+    /// The row projection for [`Self::forwardlinks`]. Both directions come
+    /// through here — see [`Self::backlink_predicates`] — because a predicate
+    /// belongs to ONE edge and an edge has one author; two definitions of
+    /// "which words annotate this arrow" would eventually disagree about the
+    /// arrow itself, which is the failure [`IndexEntry::link_keys`] is already
+    /// written against.
+    ///
+    /// Matched against every key the far note answers to, because the author
+    /// reached it through exactly one of its title, its stem or its path and
+    /// only they know which. The `is_empty` guard is not decoration: this runs
+    /// once per row of the links panel, and without it every unannotated link
+    /// in the vault — nearly all of them — would allocate the far note's
+    /// four-key set to learn that the map behind it is empty.
+    pub fn forward_predicates(&self, from_id: &str, to_id: &str) -> &[String] {
+        let (Some(from), Some(to)) = (self.by_id(from_id), self.by_id(to_id)) else {
+            return &[];
+        };
+        if from.link_predicates.is_empty() {
+            return &[];
+        }
+        to.link_keys()
+            .iter()
+            .find_map(|key| from.link_predicates.get(key))
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Why `source_id` points at `of_id`: the predicates on the inbound link, as
+    /// the row projection for [`Self::backlinks`] needs them.
+    ///
+    /// **These are the source note's words, not this note's.** A backlink's
+    /// attribute block was written in the document that points here, so the
+    /// panel is reporting how somebody else classified the relationship — which
+    /// reads as a bug unless the surface says so, because nothing in the reader's
+    /// own file contains the string they are looking at.
+    ///
+    /// One line, and deliberately so: it is [`Self::forward_predicates`] with
+    /// the arrow named from the other end. The argument order is the caller's
+    /// point of view (the note being looked at first, its neighbour second) so
+    /// neither projection has to remember which way round the edge runs.
+    pub fn backlink_predicates(&self, of_id: &str, source_id: &str) -> &[String] {
+        self.forward_predicates(source_id, of_id)
     }
 
     /// Resolve a raw link target — a title, an alias or a vault-relative path —
@@ -945,7 +1011,7 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
-            link_attrs: std::collections::BTreeMap::new(),
+            link_predicates: BTreeMap::new(),
             flags: Vec::new(),
             snippet: String::new(),
             order: NoteOrder::default(),
@@ -1318,6 +1384,83 @@ mod tests {
         assert_eq!(snap.backlinks("o").len(), 1, "the kept link stays");
         assert!(snap.backlinks("t").is_empty(), "the dropped link is gone");
         assert!(snap.backlinks("x").is_empty(), "the dropped link is gone");
+    }
+
+    #[test]
+    fn a_predicate_reaches_both_ends_of_the_edge_it_was_written_on() {
+        // The links panel's whole claim: "why are these two connected" has one
+        // answer, and the reader sees the same string standing at either end.
+        let mut source = entry("l", "notes/linker.md", "Linker");
+        source.links = vec!["b.md".to_owned(), "plain.md".to_owned()];
+        source.link_predicates =
+            BTreeMap::from([("b".to_owned(), vec!["schema:about".to_owned()])]);
+        let snap = IndexBuilder::from_entries(vec![
+            entry("b", "b.md", "Bee"),
+            entry("p", "plain.md", "Plain"),
+            source,
+        ])
+        .snapshot();
+
+        assert_eq!(
+            snap.forward_predicates("l", "b").to_vec(),
+            vec!["schema:about"]
+        );
+        assert_eq!(
+            snap.backlink_predicates("b", "l").to_vec(),
+            vec!["schema:about"],
+            "an inbound edge carries the string the OTHER document wrote"
+        );
+        // A link with no attribute block: empty, and never a one-element list
+        // holding an empty string — the panel would paint that as a blank chip.
+        assert!(snap.forward_predicates("l", "p").is_empty());
+        assert!(snap.backlink_predicates("p", "l").is_empty());
+        // A predicate annotates one arrow, not a pair of notes: `b` has said
+        // nothing about `l`, and asking the other way round must not borrow the
+        // answer from this direction.
+        assert!(snap.forward_predicates("b", "l").is_empty());
+        // An id the index never knew answers empty rather than panicking: a
+        // panel can outlive the note it was opened on.
+        assert!(snap.forward_predicates("l", "gone").is_empty());
+        assert!(snap.backlink_predicates("gone", "l").is_empty());
+    }
+
+    #[test]
+    fn a_predicate_written_against_a_title_finds_its_edge_and_leaves_with_the_link() {
+        // The map this replaced was keyed by the RAW target while its only
+        // readers looked it up with `link_key`-folded keys, so a predicate on
+        // `[[Vault as a Lens]]` could never be found. Keyed the way the graph
+        // itself is keyed, the author may name the target however they think of
+        // the note.
+        let mut source = entry("l", "notes/linker.md", "Linker");
+        source.links = vec!["Vault as a Lens".to_owned()];
+        source.link_predicates = BTreeMap::from([(
+            link_key("Vault as a Lens"),
+            vec!["schema:about".to_owned(), "dcterms:source".to_owned()],
+        )]);
+        let mut builder = IndexBuilder::from_entries(vec![
+            entry("t", "notes/vault-as-a-lens.md", "Vault as a Lens"),
+            source,
+        ]);
+        let snap = builder.snapshot();
+        assert_eq!(
+            snap.backlink_predicates("t", "l").to_vec(),
+            vec!["schema:about", "dcterms:source"],
+            "the order is the author's; sorting would be keeper re-wording them"
+        );
+
+        // Rewriting the note without the block drops the annotation with it. An
+        // index that kept a predicate after the link stopped saying it would be
+        // naming a relationship nobody wrote.
+        let mut plain = entry("l", "notes/linker.md", "Linker");
+        plain.links = vec!["Vault as a Lens".to_owned()];
+        builder.apply(NoteDelta::Upsert(Box::new(plain)));
+        let snap = builder.snapshot();
+        assert_eq!(
+            snap.backlinks("t").len(),
+            1,
+            "the link itself is untouched — only its annotation went"
+        );
+        assert!(snap.backlink_predicates("t", "l").is_empty());
     }
 
     #[test]

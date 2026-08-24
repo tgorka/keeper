@@ -38,6 +38,15 @@ const NOTHING: Record<LinkDirection, string> = {
   to: "This note links to nothing yet.",
 };
 
+/**
+ * One quiet label on a link row.
+ *
+ * Named rather than repeated because the row now paints as many of these as the
+ * link was written with, and a chip style that drifted between the first and the
+ * rest would read as two kinds of fact when there is only one.
+ */
+const LINK_LABEL = "ml-2 rounded bg-muted px-1 py-0.5 text-meta text-muted-foreground";
+
 export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: LinksPanelProps) {
   const [rows, setRows] = useState<NoteRowVm[]>([]);
 
@@ -80,17 +89,43 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
             onClick={() => onOpen(row.id)}
           >
             <span>{row.title}</span>
-            {/* The author's own word for the relationship, when they wrote one:
-                `[Belief](belief.md){reference="supports"}` makes this row say
-                `supports`. Before the title's snippet and in a chip, because it
-                is the thing this list is FOR — "what links here" is a weaker
-                question than "what supports this", and the answer should not be
-                buried in a line of body text. */}
-            {row.predicate === null ? null : (
-              <span className="ml-2 rounded bg-muted px-1 py-0.5 text-meta text-muted-foreground">
-                {row.predicate}
+            {/* Why these two notes are connected, in the author's own
+                vocabulary: `[Belief](belief.md){schema:creator, foaf:knows}`
+                makes this row say both. Before the snippet and in chips,
+                because it is the thing this list is FOR — "what links here" is
+                a weaker question than "what supports this", and the answer
+                should not be buried in a line of body text.
+
+                One list, not a list beside a single legacy value. The older
+                `{reference="supports"}` spelling folds into this list as its
+                first entry before the row is built, so a vault written last
+                month renders exactly as it did; two spellings of one fact
+                arriving at one surface is the defect this replaced.
+
+                Verbatim and in the written order: keeper neither invents a
+                predicate, translates one, nor sorts them. A wrong predicate in
+                a graph somebody queries is worse than an absent one, and
+                `{dcterms:source, schema:creator}` is a different reading from
+                the same two the other way round.
+
+                Real text inside the row's button, so a predicate lands in the
+                row's accessible name. Never a `title` attribute alone: `title`
+                is not reliably announced and cannot be reached from a keyboard,
+                the rule `lamp.tsx` states — and a predicate is a fact about the
+                edge rather than decoration on it.
+
+                Mapped with no wrapping element on purpose. Nearly every link
+                carries none, and a container rendered for an empty list would
+                leave every ordinary row carrying a margin it does not carry
+                today — the orphaned-separator defect class the sync pane grew.
+                Zero predicates emit zero nodes. */}
+            {row.predicates.map((predicate) => (
+              // Keyed by the predicate itself: exact duplicates are dropped
+              // where the attribute block is parsed, so the list cannot repeat.
+              <span key={predicate} className={LINK_LABEL}>
+                {predicate}
               </span>
-            )}
+            ))}
             <span className="ml-2 text-muted-foreground">{row.snippet}</span>
           </button>
         </li>

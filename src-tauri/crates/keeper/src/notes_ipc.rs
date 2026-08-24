@@ -2066,18 +2066,22 @@ pub async fn notes_backlinks(
     let mut inbound = snapshot.backlinks(&note_id);
     inbound.sort_by(|a, b| list_order(a, b));
     let mut rows = rows_of(state.platform.as_ref(), &vault_id, &inbound);
-    // The predicate is written on the SOURCE's link, so for inbound edges it
-    // comes off the linking note and not off this one. Matched by any of this
-    // note's keys, because a link reaches a note through its title, its alias
-    // or its path and the author picked one of them.
-    let keys: std::collections::BTreeSet<String> = snapshot
-        .by_id(&note_id)
-        .map(|entry| entry.link_keys())
-        .unwrap_or_default();
+    // The predicates are written on the SOURCE's link, so for inbound edges they
+    // come off the linking note and not off this one. The reader that has to be
+    // told this is the person looking at "linked from": the words shown there
+    // are the other author's, not theirs.
+    //
+    // The lookup used to be done here, by trying each of this note's link keys
+    // against the source's map. It was wrong, and wrong in the direction that
+    // hides a feature completely: the map was BUILT keyed by the raw target the
+    // author typed and READ with `link_key`-folded keys, so `{reference="cites"}`
+    // on `[x](B.md)` or on any title with a capital letter matched nothing and
+    // rendered nothing. That is what "I do not see support for reference on
+    // links" turned out to be. The index now owns the folding on both sides —
+    // see `IndexSnapshot::backlink_predicates` — so there is one spelling of the
+    // key and no way for the two halves to disagree again.
     for (row, source) in rows.iter_mut().zip(inbound.iter()) {
-        row.predicate = keys
-            .iter()
-            .find_map(|key| source.link_attrs.get(key).cloned());
+        row.predicates = snapshot.backlink_predicates(&note_id, &source.id).to_vec();
     }
     Ok(rows)
 }
@@ -2125,15 +2129,11 @@ pub async fn notes_forwardlinks(
     let mut outbound = snapshot.forwardlinks(&note_id);
     outbound.sort_by(|a, b| list_order(a, b));
     let mut rows = rows_of(state.platform.as_ref(), &vault_id, &outbound);
-    // Outbound is the easy direction: the predicate is on this note's own link,
-    // and the target it was written against is one of the far note's keys.
-    if let Some(here) = snapshot.by_id(&note_id) {
-        for (row, target) in rows.iter_mut().zip(outbound.iter()) {
-            row.predicate = target
-                .link_keys()
-                .iter()
-                .find_map(|key| here.link_attrs.get(key).cloned());
-        }
+    // Outbound is the easy direction: the predicates are on this note's own
+    // links. The key folding lives in the index for both directions now, so this
+    // reads the same way its inbound twin does.
+    for (row, target) in rows.iter_mut().zip(outbound.iter()) {
+        row.predicates = snapshot.forward_predicates(&note_id, &target.id).to_vec();
     }
     Ok(rows)
 }
@@ -5269,7 +5269,7 @@ mod tests {
             tags: Vec::new(),
             fields: std::collections::BTreeMap::new(),
             links: Vec::new(),
-            link_attrs: Default::default(),
+            link_predicates: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
