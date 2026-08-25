@@ -633,6 +633,56 @@ lfsMode = "materialize"
         assert!(err.to_string().contains("pushOnly"), "{err}");
     }
 
+    /// A `releaseTtlMs` that is not a number is refused at startup, with the
+    /// profile named (Story 56.5).
+    ///
+    /// The daemon deletes content on this number's say-so, so "the value did
+    /// not parse, carry on with the default" is not an available answer: an
+    /// operator who typed `"soon"` meant something, and a folder running the
+    /// 24 h default while its config says otherwise is the silent version of
+    /// getting it wrong.
+    #[test]
+    fn a_non_numeric_release_ttl_is_refused_at_startup_with_the_profile_named() {
+        let text = format!("{MINIMAL}release_ttl_ms = \"soon\"\n");
+
+        let err = parse(&text).expect_err("a TTL that is not a duration must not load");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("[[profile]] #1"),
+            "the refusal must say which table: {message}"
+        );
+        assert!(
+            message.contains("docs"),
+            "and name the folder an operator recognises: {message}"
+        );
+    }
+
+    /// The floor and the ceiling reach the operator through the config file,
+    /// and `0` is accepted as the documented way to disable (Story 56.5).
+    ///
+    /// `SyncProfile::validate` owns the rule; this is the assertion that the
+    /// config path actually runs it rather than reimplementing a subset.
+    #[test]
+    fn a_release_ttl_out_of_range_is_refused_and_zero_is_accepted() {
+        let err = parse(&format!("{MINIMAL}releaseTtlMs = 500\n"))
+            .expect_err("half a second is not a retention window");
+        assert!(
+            err.to_string().contains("release TTL"),
+            "the refusal must name the field in words: {err}"
+        );
+
+        let config = parse(&format!("{MINIMAL}releaseTtlMs = 0\n")).expect("zero disables");
+        assert_eq!(config.profiles[0].release_ttl_ms, 0);
+        assert_eq!(config.profiles[0].effective_release_ttl_ms(), None);
+
+        let config = parse(&format!("{MINIMAL}releaseTtlMs = 3600000\n")).expect("an hour");
+        assert_eq!(
+            config.profiles[0].effective_release_ttl_ms(),
+            Some(3_600_000)
+        );
+    }
+
     #[test]
     fn a_later_bad_profile_prevents_every_earlier_one_from_loading() {
         // "Never partially applied": one broken table must not leave the good

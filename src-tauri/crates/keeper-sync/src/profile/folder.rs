@@ -137,6 +137,11 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // through LFS", this one says "its bytes may live only in the store".
     ("virtualPatterns", FolderFieldRule::Allowed),
     ("virtualOverBytes", FolderFieldRule::Allowed),
+    // How long this repository's content may stay is a fact about the
+    // repository — the same media archive wants the same retention on every
+    // clone — and the app and the daemon share no profile store, so the folder
+    // file is the only place one answer can reach both (AD-132, FR-344).
+    ("releaseTtlMs", FolderFieldRule::Allowed),
     ("commitSubjectTemplate", FolderFieldRule::Allowed),
     ("tags", FolderFieldRule::Allowed),
     // --- What the folder contains -------------------------------------------
@@ -563,6 +568,45 @@ pub fn folder_faults() -> Vec<FolderFault> {
         .collect()
 }
 
+/// Does this folder's own config layer currently read as broken?
+///
+/// The one caller is the release sweep, and the one reason is that a caller
+/// which deletes data must not read a permissive default out of a file the
+/// reader could not parse. `releaseTtlMs` is a folder-tier [`Allowed`] field
+/// (FR-344, AD-132) and `0` is the documented way for a repository to say
+/// *never release my content* — but [`FolderTier::apply`] and [`in_force`] are
+/// all-or-nothing: one `validate()` failure or one unknown key anywhere in
+/// `.keeper/keeper.toml` discards the **whole** layer, so the committed
+/// `releaseTtlMs = 0` stops applying and the profile's own 24 h default takes
+/// over. A typo in a file that travels between clones would otherwise turn
+/// "keep everything" into "delete after a day" on every machine that reads it.
+/// This is the first folder field whose default deletes data, so the sweep
+/// fails **closed** on it (Story 56.5).
+///
+/// **Deliberately per-folder, not global.** [`folder_faults`] is a process-wide
+/// snapshot covering every profile that has been read, and another folder's
+/// broken file says nothing about this one — a machine with two folders, one of
+/// them mistyped, must still release from the healthy one. So the answer is
+/// whether any recorded fault names one of *this* folder's own layer paths,
+/// derived through [`FolderTier::layer_paths`] exactly as [`in_force`] derives
+/// the candidates it clears, rather than from a second path list that could
+/// drift out of agreement with it.
+///
+/// `false` when the tier is not armed: nothing can be faulted if nothing is
+/// layered, which is [`in_force`]'s own answer in that case.
+///
+/// [`Allowed`]: FolderFieldRule::Allowed
+pub fn folder_config_is_faulted(local_path: &Path) -> bool {
+    let Some(tier) = installed_folder_tier() else {
+        return false;
+    };
+    let candidates = tier.layer_paths(local_path);
+    let faults = FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    candidates.iter().any(|path| faults.contains_key(path))
+}
+
 /// One profile as it is **in force**: the stored row with its folder files
 /// layered on top.
 ///
@@ -650,7 +694,9 @@ pub fn as_stored(incoming: &SyncProfile, base: Option<&SyncProfile>) -> SyncProf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{DEFAULT_JOURNAL_TEMPLATE, DEFAULT_LFS_THRESHOLD_BYTES};
+    use crate::profile::{
+        DEFAULT_JOURNAL_TEMPLATE, DEFAULT_LFS_THRESHOLD_BYTES, DEFAULT_RELEASE_TTL_MS,
+    };
 
     fn profile(root: &Path) -> SyncProfile {
         SyncProfile::new("01J", "tgdrive", root, "https://example.invalid/r.git")
@@ -755,6 +801,37 @@ mod tests {
             "a layer with a refused key is dropped whole, not half-applied"
         );
         assert!(outcome.owned.is_empty());
+    }
+
+    /// A repository may declare how long its own content stays (Story 56.5,
+    /// FR-344, AD-132).
+    ///
+    /// The reason it is a folder-tier field rather than a per-machine one: the
+    /// app and the daemon share no profile store, so a retention window set in
+    /// one is invisible to the other, and the file that travels with the
+    /// repository is the only place one answer reaches both.
+    #[test]
+    fn a_folder_file_may_set_the_release_ttl() {
+        let (_dir, outcome) = applied("[folder]\nreleaseTtlMs = 3600000\n", &tier());
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(outcome.profile.release_ttl_ms, 3_600_000);
+        assert_eq!(
+            outcome.profile.effective_release_ttl_ms(),
+            Some(3_600_000),
+            "and it is the window in force, not just a stored number"
+        );
+        assert!(
+            outcome.owned.iter().any(|key| key == "releaseTtlMs"),
+            "the file owns the field, so a save from the app is told it cannot \
+             move it: {:?}",
+            outcome.owned
+        );
+
+        // Zero travels too: a repository that says "never release my content"
+        // must be able to say it once and have every clone agree.
+        let (_dir, outcome) = applied("[folder]\nreleaseTtlMs = 0\n", &tier());
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(outcome.profile.effective_release_ttl_ms(), None);
     }
 
     /// The owner's own constraint, and the thing that stops two folders
@@ -1132,7 +1209,99 @@ subfolder = "60-sessions"
         );
     }
 
-    /// The tier is process-wide, so the three tests that arm it take a lock and
+    /// A folder file the reader could not parse makes *this* folder's config
+    /// read as faulted, so a caller that deletes data can fail closed on it
+    /// (Story 56.5, FR-344).
+    ///
+    /// The shape that matters is a repository which committed
+    /// `releaseTtlMs = 0` — "never release my content" — beside one mistyped
+    /// key. A layer is dropped whole, so the retention the repository asked for
+    /// stops applying and the profile's own 24 h default takes over: a typo in a
+    /// file that travels between clones would otherwise turn "keep everything"
+    /// into "delete after a day" on every machine that reads it.
+    #[test]
+    fn a_broken_file_makes_this_folders_config_read_as_faulted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let file = root.join(FOLDER_CONFIG_DIR).join(SHARED_FILE);
+        std::fs::create_dir_all(root.join(FOLDER_CONFIG_DIR)).expect("create .keeper");
+        std::fs::write(
+            &file,
+            "[folder]\nreleaseTtlMs = 0\nlsfThresholdBytes = 512\n",
+        )
+        .expect("write");
+        let _tier = TierGuard::armed(tier());
+
+        let stored = profile(&root);
+        let outcome = tier().apply(&stored);
+        assert_eq!(only_fault(&outcome).path, file, "the fault names this file");
+        assert_eq!(
+            outcome.profile.effective_release_ttl_ms(),
+            Some(DEFAULT_RELEASE_TTL_MS),
+            "the committed `releaseTtlMs = 0` went down with the layer, and what \
+             survived is a default that deletes — which is exactly why the sweep \
+             may not read it"
+        );
+
+        assert!(
+            !folder_config_is_faulted(&root),
+            "nothing is faulted until a read records it"
+        );
+        in_force(stored.clone());
+        assert!(
+            folder_config_is_faulted(&root),
+            "the recorded fault names one of this folder's own layer paths"
+        );
+        assert!(
+            !folder_config_is_faulted(Path::new("/some/other/folder")),
+            "and says nothing about a folder whose own files are fine — one \
+             mistyped file must not hold every other folder closed"
+        );
+
+        std::fs::write(&file, "[folder]\nreleaseTtlMs = 0\n").expect("rewrite");
+        assert_eq!(
+            in_force(stored).effective_release_ttl_ms(),
+            None,
+            "the fixed file's retention is in force"
+        );
+        assert!(
+            !folder_config_is_faulted(&root),
+            "and a file that reads cleanly stops holding the sweep closed"
+        );
+    }
+
+    /// With the tier not armed nothing is layered, so nothing about this folder
+    /// can be faulted — [`in_force`]'s own answer, and the sweep's (Story 56.5).
+    ///
+    /// The fault is recorded first and the tier taken away afterwards, so the
+    /// early return is what makes the answer `false` rather than an empty
+    /// snapshot: a version that derived the layer paths without first asking
+    /// whether anything is layered would pass against an empty map and fail
+    /// here.
+    #[test]
+    fn an_unarmed_tier_reports_no_folder_config_fault() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let file = root.join(FOLDER_CONFIG_DIR).join(SHARED_FILE);
+        std::fs::create_dir_all(root.join(FOLDER_CONFIG_DIR)).expect("create .keeper");
+        std::fs::write(&file, "[folder]\nlsfThresholdBytes = 512\n").expect("write");
+        let _tier = TierGuard::armed(tier());
+
+        in_force(profile(&root));
+        assert!(folder_config_is_faulted(&root), "the file is broken");
+
+        // Only the tier goes away; the recorded fault stays exactly where it is.
+        *TIER
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        assert!(
+            folder_faults().iter().any(|fault| fault.path == file),
+            "the snapshot still holds the fault"
+        );
+        assert!(!folder_config_is_faulted(&root));
+    }
+
+    /// The tier is process-wide, so the five tests that arm it take a lock and
     /// leave it disarmed behind them.
     ///
     /// A guard rather than a call at the end of each test, for the reason every

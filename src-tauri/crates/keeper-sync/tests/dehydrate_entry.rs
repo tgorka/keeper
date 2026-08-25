@@ -227,17 +227,18 @@ fn ledger_paths(platform: &TestPlatform) -> Vec<String> {
         .collect()
 }
 
-/// Pin `path` by writing the column directly, as `db.rs`'s own pin test does:
-/// FR-334's writer is another story's, so the refusal is not yet reachable in
-/// production and the test plants the fact.
-fn pin(platform: &TestPlatform, path: &str) {
-    remember(platform, path);
-    ledger_conn(platform)
-        .execute(
-            "UPDATE materialized SET pinned = 1 WHERE profile_id = ?1 AND path = ?2",
-            (PROFILE_ID, path),
-        )
-        .expect("pin the path");
+/// Pin `path` through the real writer (Story 56.5's `Engine::pin_entry`).
+///
+/// It was a raw `UPDATE pinned = 1` while FR-334 had no writer, which meant
+/// this file asserted a refusal against a column nothing in production could
+/// set. Going through the verb an operator actually has is what makes the
+/// refusal below reachable rather than hypothetical — and `pin_entry` does not
+/// require the content to be present, so it costs the fixture nothing.
+fn pin(engine: &Engine, path: &str) {
+    let done = engine
+        .pin_entry(PROFILE_ID, path, true)
+        .expect("the fixture path is tracked, so a pin is recorded");
+    assert!(done.pinned, "the verb reports the state it wrote");
 }
 
 /// The committed blob's own bytes, read straight out of the index.
@@ -646,7 +647,7 @@ async fn a_pinned_path_is_refused_and_keeps_its_ledger_row() {
     let Some((engine, platform)) = engine_for(root, remote.path(), data.path()) else {
         return;
     };
-    pin(&platform, "clip.mp4");
+    pin(&engine, "clip.mp4");
 
     let err = engine
         .dehydrate_entry(PROFILE_ID, "clip.mp4")
@@ -1529,7 +1530,7 @@ async fn a_pin_that_lands_while_the_proof_is_in_flight_still_stops_the_release()
          before it — the first pin read included — already run"
     );
 
-    pin(&platform, "clip.mp4");
+    pin(&engine, "clip.mp4");
 
     let err = release
         .await

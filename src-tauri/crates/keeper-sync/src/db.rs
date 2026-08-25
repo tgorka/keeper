@@ -141,10 +141,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         -- only fact that makes the distinction true.
         --
         -- `last_used_ms`, `synced_at_ms`, `pinned`, `oid` and `size_bytes`
-        -- (Story 56.2) are missing here on purpose, exactly as `activity`'s
-        -- late columns are: `ensure_materialized_columns` adds them, so a
-        -- fresh install and one that predates them reach the same schema down
-        -- one path.
+        -- (Story 56.2) and `local_origin` (Story 56.5) are missing here on
+        -- purpose, exactly as `activity`'s late columns are:
+        -- `ensure_materialized_columns` adds them, so a fresh install and one
+        -- that predates them reach the same schema down one path.
         CREATE TABLE IF NOT EXISTS materialized (
             profile_id  TEXT NOT NULL,
             path        TEXT NOT NULL,
@@ -254,20 +254,22 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 }
 
 /// Add the late nullable columns `materialized` has grown, if they are not
-/// there yet (Story 56.2).
+/// there yet (Stories 56.2 and 56.5).
 ///
-/// Five facts the ledger has to hold before anything can decide what to
+/// Six facts the ledger has to hold before anything can decide what to
 /// release: when the content was last *read* (`last_used_ms`), when the remote
 /// last confirmed it holds the object (`synced_at_ms`), whether the owner has
-/// asked for this path to stay on the machine (`pinned`), and the object's
+/// asked for this path to stay on the machine (`pinned`), the object's
 /// identity and length (`oid`, `size_bytes`) so a row still answers after the
-/// worktree stops holding a pointer to consult.
+/// worktree stops holding a pointer to consult, and which way the content
+/// travelled (`local_origin`, Story 56.5) so the release sweep knows which of
+/// the two clocks applies to this path.
 ///
 /// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
 /// before the first `conn.execute` — `rusqlite` holds the connection while a
 /// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
 /// statement still alive is a borrow error, not a runtime surprise. The one
-/// difference is that these five columns are not all the same type, so the
+/// difference is that these six columns are not all the same type, so the
 /// loop carries the type beside the name rather than hard-coding `INTEGER`.
 ///
 /// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
@@ -277,8 +279,16 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// idempotence — the rule stated at the top of [`migrate`] — so a second
 /// `migrate` on the same connection adds nothing and errors on nothing.
 ///
-/// `pinned` is an `INTEGER` read as a boolean, which is how SQLite spells one;
-/// [`materialized_rows`] narrows it, so no caller sees the encoding.
+/// `pinned` and `local_origin` are `INTEGER`s read as booleans, which is how
+/// SQLite spells one; [`materialized_rows`] narrows both, so no caller sees
+/// the encoding.
+///
+/// **`NULL` in `local_origin` means *arrived from the remote*, and that is the
+/// truth of the existing data rather than a default** (AD-131). The only two
+/// writers this table had before Story 56.5 — `materialize_landed` and
+/// `materialize_pending` — both publish content *over a pointer*, so every row
+/// that can already exist was written by an arrival. A row this clone authored
+/// carries a `1`, written by [`note_local_authorship`].
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -292,6 +302,7 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
         ("pinned", "INTEGER"),
         ("oid", "TEXT"),
         ("size_bytes", "INTEGER"),
+        ("local_origin", "INTEGER"),
     ] {
         if !existing.iter().any(|c| c == column) {
             conn.execute(
@@ -505,6 +516,221 @@ pub fn remember_materialized(
     Ok(())
 }
 
+/// Record that the content at this path was read through keeper just now
+/// (Story 56.5, `last_used_ms`).
+///
+/// One fact, one column, in [`label_unit`]'s shape. It deliberately does not
+/// touch `local_origin`: a *use* says nothing about who wrote the bytes, and
+/// the whole point of AD-131's two clocks is that a use must never make an
+/// unconfirmed locally-authored path eligible for release.
+///
+/// **UPDATE-only.** A use of a path this clone holds no materialization row
+/// for is a fact this table cannot hold: `at_ms` is `NOT NULL` and means
+/// *content landed here*, which this function has no way to know. An absent
+/// row therefore stays absent and the call succeeds — the caller is a
+/// best-effort memo on a read path, not a transaction.
+pub fn note_use(conn: &Connection, profile_id: &str, path: &str, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET last_used_ms = ?3 WHERE profile_id = ?1 AND path = ?2",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record that the content now at this path arrived from the remote, and which
+/// object it is (Story 56.5, `last_used_ms` + `local_origin = 0` + `oid` +
+/// `size_bytes`).
+///
+/// Called immediately after [`remember_materialized`] on every publish-over-a-
+/// pointer path. Four columns because they are one fact: *this path's content
+/// arrived from the remote just now, and it is this object*. Arriving is the
+/// first thing that ever happened to it here, so the remote-origin clock starts
+/// now rather than at some `NULL` a later reader would have to interpret; and
+/// an arrival is one of only two moments the committed pointer is in hand, so
+/// it is one of only two honest places to record which object is at a path.
+///
+/// # Why the identity is written here and was written nowhere before
+///
+/// `oid` and `size_bytes` had **no writer at all** until this call. Story 56.2
+/// added the columns and [`ensure_materialized_columns`]' own note says why
+/// they exist — so a row still answers "after the worktree stops holding a
+/// pointer to consult" — but nothing ever filled them, so the release sweep's
+/// byte ceiling read `None` for every candidate and bounded nothing. One pass
+/// could hash thirty-two objects of any size while holding the profile's
+/// reservation, which is precisely the cost `RELEASE_BUDGET_BYTES`' own doc
+/// says it exists to prevent.
+///
+/// The length binds as `i64::try_from(size_bytes).unwrap_or(i64::MAX)`, because
+/// SQLite's integer is signed and this one is not. Saturating is the safe
+/// direction: an `as` cast would wrap a `u64` above `i64::MAX` negative,
+/// [`materialized_rows`] narrows a negative to `None`, and `None` is the one
+/// answer that makes a candidate contribute nothing to the budget meant to
+/// bound it. A saturated length reads back as enormous, so the pass stops at
+/// that candidate after giving it its one attempt.
+///
+/// It deliberately does not touch `synced_at_ms`: the object is upstream by
+/// construction, but NFR-40's proof is taken fresh at the moment of deletion,
+/// and this clock's job is only to select which timer applies. It also does
+/// not touch `pinned` — see [`remember_materialized`]'s doc for what a
+/// statement that knew more than it needed to cost last time.
+///
+/// **UPDATE-only**, for [`note_use`]'s reason: `remember_materialized` writes
+/// the row an instant earlier, so the row is there, and if it somehow is not
+/// then this table cannot hold the fact.
+pub fn note_arrival(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET last_used_ms = ?3, local_origin = 0, oid = ?4, size_bytes = ?5
+          WHERE profile_id = ?1 AND path = ?2",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Record that this clone created or modified the content now at this path,
+/// and which object it is (Story 56.5, `local_origin = 1` **and**
+/// `synced_at_ms = NULL`, with `oid` and `size_bytes`).
+///
+/// One fact: *this clone wrote the content now at this path, and it is this
+/// object*. New local bytes are, by definition, bytes the remote has not
+/// confirmed, so clearing `synced_at_ms` is not bookkeeping tidiness — a path
+/// confirmed upstream last week and re-edited this morning would otherwise be
+/// released a TTL after *the old confirmation*, discarding content that exists
+/// nowhere else. FR-341 is the `?` in `Engine::release_due_at`, and this is
+/// what puts the `NULL` there.
+///
+/// The identity travels with the same fact and for the same reason it does in
+/// [`note_arrival`]: a local clean is the other moment the committed pointer is
+/// in hand, so it is the other honest place to record which object is at a
+/// path. Before Story 56.5 `oid` and `size_bytes` had no writer anywhere —
+/// [`ensure_materialized_columns`] records why they exist, "so a row still
+/// answers after the worktree stops holding a pointer to consult", and until
+/// these two writers nothing ever answered. `size_bytes` binds through the same
+/// saturating `i64::try_from(size_bytes).unwrap_or(i64::MAX)`; see
+/// [`note_arrival`] for why saturating rather than wrapping is the safe
+/// direction for a number the release budget reads.
+///
+/// **An upsert, unlike the clock writers.** A local authorship is discovered at
+/// commit time from the worktree, which may be the first thing this ledger ever
+/// hears about the path — a file the owner created here has no arrival to have
+/// written a row. `at_ms` is honest on insert: content for this path does exist
+/// on this machine, that is precisely why there is something to upload. It
+/// never touches `pinned` or `last_used_ms`.
+pub fn note_local_authorship(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO materialized
+             (profile_id, path, at_ms, local_origin, synced_at_ms, oid, size_bytes)
+         VALUES (?1, ?2, ?3, 1, NULL, ?4, ?5)
+         ON CONFLICT(profile_id, path)
+           DO UPDATE SET local_origin = 1, synced_at_ms = NULL,
+                         oid = excluded.oid, size_bytes = excluded.size_bytes",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Record that the remote was observed holding the object for this path
+/// (Story 56.5, `synced_at_ms`).
+///
+/// Written only where a per-path proof already exists — an upload unit that
+/// completed, or an object `lfs::audit::serves` affirmed — and never at
+/// `mark_synced`, which is a per-*profile* edge that says nothing about one
+/// path (AD-131).
+///
+/// **A stored confirmation authorizes eligibility, never a deletion.** It is a
+/// memo taken at some earlier instant; `Engine::remote_serves` re-proves the
+/// object at the moment the content would go, and NFR-40 is unmoved by this
+/// column existing.
+///
+/// **UPDATE-only**, for [`note_use`]'s reason, and it deliberately does not
+/// touch `local_origin`: confirming an upload does not make the path
+/// remote-authored, it makes it a *confirmed local* path, which is the state
+/// the second clock exists to measure.
+pub fn note_synced(conn: &Connection, profile_id: &str, path: &str, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET synced_at_ms = ?3 WHERE profile_id = ?1 AND path = ?2",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record the owner's standing instruction about one path (Story 56.5,
+/// `pinned`), the writer [`is_pinned`] has been reading for.
+///
+/// One column either way, naming exactly `pinned`: it must not disturb either
+/// clock, `local_origin`, the recorded identity or `at_ms`, and unpinning must
+/// leave a path's accumulated history exactly as it was so the path simply
+/// becomes a candidate again.
+///
+/// # Why the two directions are not one statement
+///
+/// **Pinning upserts.** A pin is a standing instruction about a path, not an
+/// observation about content, so pinning a path whose content is not here yet
+/// is the ordinary case: an owner pre-pins what they are about to materialize.
+/// `at_ms` on insert is the instant the instruction was given, which is the
+/// only timestamp this call knows; the arrival that follows overwrites it with
+/// the truth through [`remember_materialized`].
+///
+/// **Unpinning is UPDATE-only**, and the asymmetry is load-bearing. One upsert
+/// serving both directions meant `keeper-syncd unpin media clip.mp4` on a path
+/// with no ledger row *INSERTed* one, asserting "content landed here now" for
+/// content that is not here. `Engine::release_due_at` reads that phantom as a
+/// candidate forever — not pinned, `local_origin` `false`, both clocks `NULL`,
+/// so the `at_ms` fallback applies and it comes due a TTL later — and it can
+/// only ever refuse `AlreadyPointer`, spending a per-pass budget slot every
+/// pass to do it. It also lies to the readers that take this table to mean
+/// *paths this clone has held content for*: [`materialized_paths`], which feeds
+/// `Engine::pending_files`' `replacing` flag, and `lfs::listing::collect`.
+/// Withdrawing an instruction the ledger never recorded is nothing at all,
+/// exactly as [`note_use`] and [`note_synced`] are UPDATE-only for the same
+/// reason.
+pub fn set_pinned(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    pinned: bool,
+    now_ms: i64,
+) -> Result<()> {
+    if pinned {
+        conn.execute(
+            "INSERT INTO materialized (profile_id, path, at_ms, pinned) VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(profile_id, path) DO UPDATE SET pinned = 1",
+            (profile_id, path, now_ms),
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE materialized SET pinned = 0 WHERE profile_id = ?1 AND path = ?2",
+            (profile_id, path),
+        )?;
+    }
+    Ok(())
+}
+
 /// Every path this clone has held content for.
 ///
 /// Read whole rather than asked per row: the caller is deciding a mark for a
@@ -522,20 +748,21 @@ pub fn materialized_paths(
     Ok(out)
 }
 
-/// One row of the `materialized` ledger, late columns included (Story 56.2).
+/// One row of the `materialized` ledger, late columns included (Stories 56.2
+/// and 56.5).
 ///
-/// A struct rather than a tuple because five of the seven fields are
+/// A struct rather than a tuple because five of the eight fields are
 /// `Option`s of two types and four of them are timestamps: a transposition
 /// between `last_used_ms` and `synced_at_ms` would compile, pass every type
 /// check, and make a release decision on the wrong fact.
 ///
-/// **Every late field is an `Option` and that is a fact, not a placeholder.**
-/// A row written before Story 56.2 — or by the one writer that exists,
+/// **Every late timestamp is an `Option` and that is a fact, not a
+/// placeholder.** A row written before Story 56.2 — or by
 /// [`remember_materialized`], which sets `at_ms` and nothing else — reads back
 /// `None` for all of them, and `None` means "nobody recorded this" rather than
-/// zero, epoch, or absent-from-the-remote. Nothing in this story writes them;
-/// they exist so the reader and the schema arrive together instead of a
-/// migration landing in a story that cannot observe it.
+/// zero, epoch, or absent-from-the-remote. Story 56.5's writers
+/// ([`note_use`], [`note_arrival`], [`note_local_authorship`], [`note_synced`],
+/// [`set_pinned`]) fill them in, each one fact at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedRow {
     /// Repository-relative, `/`-joined — the same frame every other path in
@@ -561,6 +788,16 @@ pub struct MaterializedRow {
     /// default, so absence and `0` are the same answer and an `Option` here
     /// would be a distinction nobody can act on.
     pub pinned: bool,
+    /// Which way the content at this path travelled (Story 56.5, AD-131).
+    /// `true` means this clone created or modified it; `false` means it
+    /// arrived from the remote. `false` for every row that has never said
+    /// otherwise, including every row written before the column existed —
+    /// which is honest rather than a default, because the only writers this
+    /// table had before Story 56.5 were arrival paths. It selects which
+    /// release clock applies: `synced_at_ms` for local content, so content
+    /// this machine authored and has not yet pushed is never eligible, and
+    /// `last_used_ms` for content that came from the remote.
+    pub local_origin: bool,
 }
 
 /// Every `materialized` row this profile has, whole.
@@ -573,7 +810,7 @@ pub struct MaterializedRow {
 /// hundred thousand paths becomes a minute of SQLite.
 pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned
+        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin
            FROM materialized
           WHERE profile_id = ?1
           ORDER BY path",
@@ -587,11 +824,12 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             r.get::<_, Option<String>>(4)?,
             r.get::<_, Option<i64>>(5)?,
             r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned) = row?;
+        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin) = row?;
         out.push(MaterializedRow {
             path,
             at_ms,
@@ -602,6 +840,9 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             // negative size is not a size: both mean the same thing here.
             size_bytes: size.and_then(|bytes| u64::try_from(bytes).ok()),
             pinned: pinned.unwrap_or(0) != 0,
+            // `NULL` is *arrived from the remote*: see the column's own note
+            // in [`ensure_materialized_columns`].
+            local_origin: local_origin.unwrap_or(0) != 0,
         });
     }
     Ok(out)
@@ -2631,6 +2872,7 @@ mod tests {
                 oid: None,
                 size_bytes: None,
                 pinned: false,
+                local_origin: false,
             }],
             "the old row survives with its timestamp untouched, and every late \
              column reads as absent rather than as zero, epoch or unpinned-by-record"
@@ -2696,6 +2938,7 @@ mod tests {
                 oid: Some("abc123".to_owned()),
                 size_bytes: Some(4_194_304),
                 pinned: true,
+                local_origin: false,
             }],
             "only the timestamp moved: an upsert that named more than `at_ms`, \
              or a REPLACE that named less, fails here"
@@ -2734,6 +2977,302 @@ mod tests {
         assert!(
             !is_pinned(&c, "q", "40-media/clip.mp4").expect("other profile"),
             "and not another folder's, even at the same path"
+        );
+    }
+
+    /// Each clock writer knows exactly one fact and cannot touch another
+    /// (Story 56.5).
+    ///
+    /// The whole row is planted first, so a statement that named more columns
+    /// than its own fact fails here rather than in a release six months later
+    /// — which is the loss class `remember_materialized`'s doc records.
+    #[test]
+    fn each_clock_writer_moves_its_own_column_and_no_other() {
+        let c = conn();
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("landing");
+        set_pinned(&c, "p", "40-media/clip.mp4", true, 1_700).expect("pin");
+        note_synced(&c, "p", "40-media/clip.mp4", 1_710).expect("confirm");
+        note_use(&c, "p", "40-media/clip.mp4", 1_720).expect("use");
+
+        let only = |c: &Connection| materialized_rows(c, "p").expect("read").remove(0);
+        assert_eq!(
+            only(&c),
+            MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_720),
+                synced_at_ms: Some(1_710),
+                oid: None,
+                size_bytes: None,
+                pinned: true,
+                local_origin: false,
+            },
+            "four writers, four facts, none of them disturbing another"
+        );
+
+        note_use(&c, "p", "40-media/clip.mp4", 9_000).expect("a later use");
+        let row = only(&c);
+        assert_eq!(row.last_used_ms, Some(9_000));
+        assert!(row.pinned, "a use does not withdraw the owner's pin");
+        assert_eq!(
+            row.synced_at_ms,
+            Some(1_710),
+            "nor does it forge a remote confirmation"
+        );
+        assert!(
+            !row.local_origin,
+            "and reading a file is not authoring it — the whole point of AD-131's \
+             two clocks is that a use cannot make an unconfirmed local path eligible"
+        );
+    }
+
+    /// An arrival records one fact whole: the content came from upstream, it is
+    /// here now, and it is this object (Story 56.5).
+    #[test]
+    fn an_arrival_starts_the_remote_origin_clock_and_says_where_it_came_from() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        set_pinned(&c, "p", "clip.mp4", true, 1_700).expect("pin");
+        note_synced(&c, "p", "clip.mp4", 1_650).expect("the remote held the old bytes");
+        note_local_authorship(&c, "p", "clip.mp4", 1_700, "aaa111", 64)
+            .expect("this clone wrote it once");
+        assert!(materialized_rows(&c, "p").expect("read")[0].local_origin);
+
+        // A later pull replaces the content with the remote's version, so the
+        // provenance moves back with it — and so does the identity, because the
+        // object at this path is not the one this clone wrote any more.
+        note_arrival(&c, "p", "clip.mp4", 2_000, "bbb222", 4_194_304).expect("arrival");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(row.last_used_ms, Some(2_000));
+        assert!(
+            !row.local_origin,
+            "the bytes at this path came from upstream now, whoever wrote the last ones"
+        );
+        assert_eq!(
+            row.oid.as_deref(),
+            Some("bbb222"),
+            "an arrival is one of the two moments the committed pointer is in hand, \
+             so it is one of the two places the identity can honestly be recorded"
+        );
+        assert_eq!(
+            row.size_bytes,
+            Some(4_194_304),
+            "and the length travels with it — the sweep's byte ceiling reads this \
+             column, and bounded nothing at all while it had no writer"
+        );
+        assert_eq!(
+            row.at_ms, 1_700,
+            "and the arrival memo does not move the landing timestamp — \
+             `remember_materialized` owns that one"
+        );
+        assert!(row.pinned, "nor does it withdraw the owner's pin");
+        assert_eq!(
+            row.synced_at_ms, None,
+            "nor forge a remote confirmation: the authorship cleared it, and an \
+             arrival knows nothing about NFR-40's per-object proof"
+        );
+    }
+
+    /// A local modification invalidates any prior confirmation, because the
+    /// new bytes are not the ones the remote agreed to (Story 56.5, FR-341).
+    ///
+    /// This is the data-loss case the second column exists for: a path
+    /// confirmed upstream last week and re-edited this morning would otherwise
+    /// be released a TTL after the OLD confirmation, discarding content that
+    /// exists nowhere else.
+    #[test]
+    fn authoring_over_confirmed_content_clears_the_confirmation() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 64).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_800).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+
+        note_local_authorship(&c, "p", "clip.mp4", 2_000, "bbb222", 4_096)
+            .expect("the owner edited it");
+
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert!(row.local_origin, "these bytes are this clone's");
+        assert_eq!(
+            row.synced_at_ms, None,
+            "and the remote has never seen them, whatever it confirmed about the old ones"
+        );
+        assert_eq!(
+            row.oid.as_deref(),
+            Some("bbb222"),
+            "the conflict path records the object this clone wrote, not the one \
+             that arrived"
+        );
+        assert_eq!(row.size_bytes, Some(4_096), "and its length with it");
+        assert!(row.pinned, "the owner's standing instruction is untouched");
+        assert_eq!(
+            row.last_used_ms,
+            Some(1_700),
+            "and so is the use clock, which this writer knows nothing about"
+        );
+    }
+
+    /// A local authorship or a pin may be the first thing this ledger hears
+    /// about a path, so both insert; the three clock writers and a *withdrawn*
+    /// pin may not (Story 56.5).
+    ///
+    /// `at_ms` is `NOT NULL` and means *content landed here*, which a use, a
+    /// confirmation or an `unpin` has no way to know — so a fact about a path
+    /// with no row is a fact this table cannot hold, and the conservative
+    /// outcome is no candidate rather than a fabricated one.
+    #[test]
+    fn only_the_upsert_writers_may_create_a_row() {
+        let c = conn();
+        note_use(&c, "p", "ghost.mp4", 1_700).expect("a use of a path with no row");
+        note_arrival(&c, "p", "ghost.mp4", 1_700, "aaa111", 64).expect("an arrival with no row");
+        note_synced(&c, "p", "ghost.mp4", 1_700).expect("a confirmation with no row");
+        // The phantom-candidate guard. `keeper-syncd unpin` on a path this
+        // ledger has never heard of used to INSERT a row asserting content
+        // landed here now, and `Engine::release_due_at` reads exactly that row
+        // as a candidate a TTL later — forever, one budget slot a pass, for a
+        // release that can only ever refuse `AlreadyPointer`.
+        set_pinned(&c, "p", "ghost.mp4", false, 1_700).expect("an unpin with no row");
+        assert!(
+            materialized_rows(&c, "p").expect("read").is_empty(),
+            "none of the four UPDATE-only writers invented a row, and none errored"
+        );
+
+        // The owner creating a file here is the case with no arrival to have
+        // written a row, and the pin is a standing instruction about a path
+        // whose content may not be here yet. Both insert.
+        note_local_authorship(&c, "p", "written-here.mp4", 2_000, "bbb222", 4_096)
+            .expect("authorship");
+        set_pinned(&c, "p", "not-here-yet.mp4", true, 2_100).expect("pre-pin");
+        let rows = materialized_rows(&c, "p").expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["not-here-yet.mp4", "written-here.mp4"]
+        );
+        assert_eq!(rows[1].at_ms, 2_000);
+        assert!(rows[1].local_origin);
+        assert_eq!(rows[1].oid.as_deref(), Some("bbb222"));
+        assert_eq!(rows[1].size_bytes, Some(4_096));
+        assert!(rows[0].pinned);
+        assert!(
+            !rows[0].local_origin,
+            "pinning a path says nothing about who wrote it"
+        );
+        assert_eq!(
+            rows[0].oid, None,
+            "nor about which object is there: a pin is an instruction, not an \
+             observation about content"
+        );
+    }
+
+    /// Unpinning gives a path back to the sweep and takes nothing else with it
+    /// (Story 56.5, FR-334).
+    #[test]
+    fn withdrawing_a_pin_makes_the_path_a_candidate_again() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 4_096).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_750).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+        assert!(is_pinned(&c, "p", "clip.mp4").expect("pinned"));
+
+        set_pinned(&c, "p", "clip.mp4", false, 1_900).expect("unpin");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0),
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_700),
+                synced_at_ms: Some(1_750),
+                oid: Some("aaa111".to_owned()),
+                size_bytes: Some(4_096),
+                pinned: false,
+                local_origin: false,
+            },
+            "the floor is gone and nothing else moved: both clocks, the \
+             provenance, the identity and the landing instant are exactly where \
+             they were, so the path is due whenever it would have been due had it \
+             never been pinned"
+        );
+
+        // A pin is idempotent, which is what lets the CLI verb be re-run.
+        set_pinned(&c, "p", "clip.mp4", true, 2_000).expect("pin");
+        set_pinned(&c, "p", "clip.mp4", true, 2_100).expect("pin again");
+        assert!(is_pinned(&c, "p", "clip.mp4").expect("still pinned"));
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0).at_ms,
+            1_700,
+            "and re-pinning a row that exists does not restamp the landing instant"
+        );
+    }
+
+    /// A length SQLite's signed integer cannot hold saturates, and never wraps
+    /// (Story 56.5).
+    ///
+    /// This column is the release sweep's byte ceiling, so the direction of the
+    /// degradation is a safety property rather than a rounding choice. An `as`
+    /// cast would turn a `u64` above `i64::MAX` negative, `materialized_rows`
+    /// narrows a negative to `None`, and `None` is the one answer that makes a
+    /// candidate contribute *nothing* to the budget meant to bound it — so the
+    /// largest object in the folder would be the one the ceiling could not see.
+    /// Saturating reads back as enormous instead, which stops the pass at that
+    /// candidate after giving it its one attempt.
+    #[test]
+    fn a_length_larger_than_the_column_can_hold_saturates_rather_than_wrapping() {
+        let c = conn();
+        remember_materialized(&c, "p", "arrived.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "arrived.mp4", 1_700, "aaa111", u64::MAX).expect("arrival");
+        note_local_authorship(&c, "p", "written-here.mp4", 1_800, "bbb222", u64::MAX)
+            .expect("authorship");
+
+        for row in materialized_rows(&c, "p").expect("read") {
+            assert_eq!(
+                row.size_bytes,
+                Some(i64::MAX as u64),
+                "{} saturated at what the column can say rather than wrapping \
+                 negative into `None`",
+                row.path
+            );
+        }
+
+        let smallest: i64 = c
+            .query_row(
+                "SELECT MIN(size_bytes) FROM materialized WHERE profile_id = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read the raw column");
+        assert!(
+            smallest > 0,
+            "nothing negative reached the column: {smallest}"
+        );
+    }
+
+    /// One folder's facts are not another's, at the same path (Story 56.5).
+    #[test]
+    fn every_clock_writer_is_scoped_to_one_profile() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "q", "clip.mp4", 1_700).expect("landing");
+
+        note_use(&c, "p", "clip.mp4", 5_000).expect("use");
+        note_synced(&c, "p", "clip.mp4", 5_100).expect("confirm");
+        set_pinned(&c, "p", "clip.mp4", true, 5_200).expect("pin");
+        note_local_authorship(&c, "p", "clip.mp4", 5_300, "aaa111", 64).expect("authorship");
+
+        let other = materialized_rows(&c, "q").expect("read").remove(0);
+        assert_eq!(
+            other,
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: None,
+                synced_at_ms: None,
+                oid: None,
+                size_bytes: None,
+                pinned: false,
+                local_origin: false,
+            },
+            "the neighbour folder's row at the same path is untouched"
         );
     }
 

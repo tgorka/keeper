@@ -423,6 +423,27 @@ pub struct Release {
     pub size_bytes: u64,
 }
 
+/// What one pin instruction settled on (Story 56.5, FR-334).
+///
+/// A pin is a standing instruction about a path rather than an operation on
+/// content, so there is nothing here about bytes: no oid, no size, no outcome
+/// enum. Setting a pin that is already set is the same answer as setting one
+/// that was not, which is what makes the verb idempotent and why the only
+/// thing worth reporting is the state the path is now in.
+///
+/// Deliberately not `Serialize`, for [`Release`]'s reason: `keeper-syncd`
+/// builds its documents through renderers whose key sets a test can assert,
+/// and a derived serialization would put the shape of the wire out of that
+/// test's reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    /// Repository-relative and `/`-joined, the frame every other path in this
+    /// crate is already in.
+    pub path: String,
+    /// Whether this path's content is now pinned to this machine.
+    pub pinned: bool,
+}
+
 /// What may be done with one path, once every refusal has been ruled out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {

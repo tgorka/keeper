@@ -129,10 +129,15 @@ pub struct LfsFile {
     /// still carry this, because the ledger records history and the state
     /// records the present.
     pub materialized_at_ms: Option<i64>,
-    /// When the content was last read through keeper. Nothing writes it yet.
+    /// When the content was last read through keeper. Written by every use
+    /// keeper can observe — an open, a text or document read, an export, the
+    /// start of a media stream — and by every arrival, since landing here is
+    /// the first thing that happened to the content (Story 56.5).
     pub last_used_ms: Option<i64>,
-    /// When the remote last confirmed it holds the object. Nothing writes it
-    /// yet.
+    /// When the remote last confirmed it holds the object. Written where a
+    /// per-path proof already exists: an upload unit that completed, or an
+    /// object the remote audit affirmed (Story 56.5). Never at `mark_synced`,
+    /// which is a per-profile edge that says nothing about one path.
     pub synced_at_ms: Option<i64>,
     /// Whether the owner has asked for this path to stay on this machine.
     /// `false` for every path with no ledger row and every row that has never
@@ -225,6 +230,7 @@ mod tests {
             oid: None,
             size_bytes: None,
             pinned: false,
+            local_origin: false,
         }
     }
 

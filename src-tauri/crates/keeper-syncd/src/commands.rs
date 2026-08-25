@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use keeper_sync::engine::Engine;
 use keeper_sync::lfs::audit::RemoteAudit;
-use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Release};
+use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Pin, Release};
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
@@ -328,6 +328,36 @@ pub enum Command {
         /// The path inside the folder, as `ls-files` spells it.
         subpath: String,
     },
+    /// Keep one path's content on this machine, whatever the release sweep
+    /// thinks (FR-334).
+    ///
+    /// A standing instruction about a path, not an operation on content: it
+    /// writes one column and touches no file, so a path may be pinned before it
+    /// has ever been materialized. It is the absolute floor `dehydrate` and the
+    /// automatic release sweep both read — a pinned path is never released, at
+    /// any age, by either.
+    ///
+    /// Refused for a path this folder does not track as an LFS path: a pin
+    /// recorded against something no release will ever consider would be a
+    /// promise nothing keeps.
+    Pin {
+        /// Profile id or name. Required: a pin is about one folder's path.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
+    /// Withdraw a pin, making the path an ordinary release candidate again
+    /// (FR-334).
+    ///
+    /// `pin`'s inverse and nothing more: it clears one column and leaves both
+    /// release clocks exactly as they were, so the path is due whenever it
+    /// would have been due had it never been pinned.
+    Unpin {
+        /// Profile id or name. Required: a pin is about one folder's path.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
     /// Check every prerequisite and report what is broken.
     Doctor,
     /// Print the tail of the daemon log.
@@ -617,6 +647,14 @@ pub async fn run(
         Command::Dehydrate { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
             cmd_dehydrate(&printer, &engine, &profile, &subpath).await
+        }
+        Command::Pin { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_pin(&printer, &engine, &profile, &subpath, true)
+        }
+        Command::Unpin { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_pin(&printer, &engine, &profile, &subpath, false)
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1646,6 +1684,75 @@ async fn cmd_dehydrate(
 }
 
 // ---------------------------------------------------------------------------
+// pin / unpin
+// ---------------------------------------------------------------------------
+
+/// One pin instruction as a human reads it.
+///
+/// Pure, taking the profile's *name*, for [`dehydrate_line`]'s reason. Prose
+/// rather than the wire word: `pinned: true` in a sentence a person reads is a
+/// field that escaped from a JSON document.
+fn pin_line(profile_name: &str, done: &Pin) -> String {
+    format!(
+        "{profile_name}: {state}  {path}",
+        state = if done.pinned { "pinned" } else { "unpinned" },
+        path = done.path,
+    )
+}
+
+/// One pin instruction as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `pinned` — and
+/// nothing else. No `oid` and no `sizeBytes`, because a pin says nothing about
+/// content and may be recorded for a path whose bytes are not here; a size of
+/// `0` or a null oid would both be answers to a question nobody asked.
+/// Built by naming the keys rather than by serializing [`Pin`], for
+/// [`dehydrate_json`]'s reason.
+fn pin_json(profile: &SyncProfile, done: &Pin) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "pinned": done.pinned,
+    })
+}
+
+/// Set or clear one path's pin in one folder.
+///
+/// [`Engine::pin_entry`] holds every decision — containment, whether this
+/// folder tracks the path at all, and the write. This function selects the
+/// profile and prints, exactly as [`cmd_dehydrate`] does.
+///
+/// A required profile resolved through [`select`], and a two-folder name match
+/// refused by asking for the id: [`cmd_materialize`]'s rule.
+///
+/// Synchronous, unlike [`cmd_dehydrate`], because a pin takes no reservation
+/// and makes no round trip — there is nothing here to await, and so no `Busy`
+/// to remap either.
+fn cmd_pin(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+    pinned: bool,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = engine.pin_entry(&profile.id, subpath, pinned)?;
+    printer.line(pin_line(&profile.name, &done));
+    printer.json(&pin_json(profile, &done));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // logs
 // ---------------------------------------------------------------------------
 
@@ -2304,6 +2411,8 @@ mod tests {
             &["keeper-syncd", "watch"],
             &["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"],
             &["keeper-syncd", "dehydrate", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "pin", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "unpin", "docs", "40-media/clip.mp4"],
             &["keeper-syncd", "pause", "docs"],
             &["keeper-syncd", "resume", "docs"],
             &["keeper-syncd", "verify"],
@@ -2344,8 +2453,8 @@ mod tests {
                 .expect_err("a profile is required to pause or resume one");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
         }
-        // `materialize` and `dehydrate` each need two: a folder and a path
-        // inside it. One argument is the shape a person trying
+        // `materialize`, `dehydrate`, `pin` and `unpin` each need two: a folder
+        // and a path inside it. One argument is the shape a person trying
         // `materialize clip.mp4` produces, and it must be told what is missing
         // rather than have `clip.mp4` read as a profile name.
         for args in [
@@ -2353,6 +2462,10 @@ mod tests {
             vec!["keeper-syncd", "materialize", "docs"],
             vec!["keeper-syncd", "dehydrate"],
             vec!["keeper-syncd", "dehydrate", "docs"],
+            vec!["keeper-syncd", "pin"],
+            vec!["keeper-syncd", "pin", "docs"],
+            vec!["keeper-syncd", "unpin"],
+            vec!["keeper-syncd", "unpin", "docs"],
         ] {
             let err = parse(&args).expect_err("a profile AND a subpath are required");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
@@ -3220,5 +3333,95 @@ mod tests {
             nothing_to_release(&SyncError::Busy("docs".to_owned())),
             None
         );
+    }
+
+    // --- pin / unpin: the verb that makes 56.4's floor reachable (56.5) -----
+
+    /// Two positionals, in that order, and neither optional — for both verbs.
+    #[test]
+    fn pin_and_unpin_each_take_a_folder_and_a_path_inside_it() {
+        let cli = parse(&["keeper-syncd", "pin", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Pin { profile, subpath } = cli.command else {
+            panic!("expected pin");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+
+        let cli = parse(&["keeper-syncd", "unpin", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Unpin { profile, subpath } = cli.command else {
+            panic!("expected unpin");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    /// The human line says which way the instruction went, in prose.
+    #[test]
+    fn the_pin_line_says_pinned_or_unpinned_in_prose() {
+        let pinned = pin_line(
+            "Field",
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: true,
+            },
+        );
+        assert!(pinned.contains("pinned"), "{pinned}");
+        assert!(pinned.contains("40-media/clip.mp4"), "{pinned}");
+        assert!(
+            !pinned.contains("true"),
+            "the boolean belongs to the document, not the sentence: {pinned}"
+        );
+
+        let unpinned = pin_line(
+            "Field",
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: false,
+            },
+        );
+        assert!(unpinned.contains("unpinned"), "{unpinned}");
+        assert!(
+            !unpinned.contains("false"),
+            "same rule the other way round: {unpinned}"
+        );
+    }
+
+    /// The pin document's key set is exactly the contract.
+    ///
+    /// No `oid` and no `sizeBytes`, and that is the sharp part: a pin says
+    /// nothing about content and may be recorded for a path whose bytes are not
+    /// here, so either key would be an answer to a question nobody asked.
+    #[test]
+    fn the_pin_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = pin_json(
+            &profile,
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: true,
+            },
+        );
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["path", "pinned", "profile", "profileId"]);
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["profile"], serde_json::json!("docs"));
+        assert_eq!(object["path"], serde_json::json!("40-media/clip.mp4"));
+        assert_eq!(
+            object["pinned"],
+            serde_json::json!(true),
+            "a boolean, so a consumer branches on a type rather than on a word"
+        );
+
+        let cleared = pin_json(
+            &profile,
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: false,
+            },
+        );
+        assert_eq!(cleared["pinned"], serde_json::json!(false));
     }
 }

@@ -78,6 +78,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
 | `lfsPruneLocal` | Release local LFS objects once the remote holds them (default **true**) |
+| `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
 
@@ -836,6 +837,8 @@ keeper-syncd verify [id]          # re-verify stored content
 keeper-syncd ls-files [id]        # LFS paths: virtual, materialized or absent
 keeper-syncd materialize <id> <path>  # fetch one virtual path's content
 keeper-syncd dehydrate <id> <path>    # release one path's content again
+keeper-syncd pin <id> <path>          # keep one path's content, whatever the sweep says
+keeper-syncd unpin <id> <path>        # withdraw that instruction again
 keeper-syncd doctor               # diagnose the environment
 keeper-syncd logs
 ```
@@ -902,9 +905,75 @@ broken: keeper has no way to ask this operating system whether a file is open
 without racing, and guessing is the one guess that deletes somebody's only
 copy — so the answer is "cannot tell" and the release declines. A platform that
 can answer race-free will make the verb live; until then it is exercised only
-in tests. Automatic release on a time-to-live, rather than one path at a time by
-name, is a later story and no age, pattern or stored timestamp authorizes a
-deletion here.
+in tests.
+
+### Letting go on its own: `releaseTtlMs`, `pin` and `unpin`
+
+`dehydrate` releases one path because you asked. The **release sweep** releases
+content whose retention window has run out, without anybody asking, and it runs
+every one of the refusals above unchanged — the same hash of the actual bytes,
+the same per-object question to the server taken at the moment of the deletion,
+the same fail-closed answer when this machine cannot tell whether a file is
+open. It is not a privileged caller, so **on a real host today it refuses
+exactly as `dehydrate` does**, for the same reason.
+
+Which clock applies to a path is decided by where its content came from, and it
+is recorded rather than guessed:
+
+* Content that **arrived from the remote** is measured from the last time
+  keeper served it — an open, a text or document read, an export, the start of
+  a media stream — falling back to when it landed if it has never been read
+  through keeper. keeper's own timestamp, never the filesystem's `atime`, which
+  on a `relatime` mount is a day stale and on a `noatime` mount never moves.
+* Content **this machine created or modified** is measured from the instant the
+  remote was observed holding it, and is **never eligible at any age until
+  then**. A file you wrote that has not reached the server exists on one
+  machine, and no window makes deleting it acceptable. Editing a confirmed file
+  puts it back in that state, because the new bytes are not the ones the server
+  agreed to.
+
+`releaseTtlMs` is the window, per profile and settable in a folder's own
+`.keeper/keeper.toml` (how long a repository's content may stay is a fact about
+the repository, and the app and the daemon share no profile store). It defaults
+to **24 hours**. **`0` disables releasing entirely** — the `lfs.pruneoffsetdays`
+convention — and it disables it before any window is armed, so turning the sweep
+back on later starts a fresh window rather than firing on the next sync. A
+non-zero value under a minute, or one over ten years, is **refused at startup**
+with the value and the reason named, rather than clamped: this knob never
+existed before, so every out-of-range number is one somebody typed. And if a
+folder's own `.keeper/keeper.toml` cannot be read at all, the sweep declines for
+that folder rather than falling back to the 24-hour default — an operator whose
+committed `releaseTtlMs = 0` stops applying because of a typo somewhere else in
+that file must not discover it as deletions.
+
+**It never runs on a timer.** There is no schedule, no thread and no `.timer`
+unit: the sweep rides the first successful sync after the window expires, which
+is also the moment keeper has just proved it can reach the remote it would have
+to fetch the content back from. A folder that is paused, or that simply never
+syncs, never releases anything. Neither does the **first** sync of a folder
+keeper has not swept before — one freshly added, one just resumed, or one whose
+daemon has only just restarted: that pass arms the window and releases nothing,
+so a full interval always separates keeper first considering a folder from its
+first deletion. A scan is a read and may run at once; this pass deletes. Each
+pass is bounded — a few dozen paths and a gigabyte of hashing — and the
+remainder waits for the next one: a pass resumes where the last one stopped
+rather than restarting at the top of the folder, so a handful of paths that
+refuse every time cannot hide everything behind them. Like `lfsPruneLocal`, it
+can never fail a sync: a refusal is the expected answer for most candidates and
+an error is logged and dropped.
+
+`pin <id> <path>` is the absolute floor. A pinned path is never released, at any
+age, by the sweep or by `dehydrate`, and the instruction is checked again
+immediately before the deletion. It writes one fact and touches no file, so you
+can pin a path before its content is here; it does refuse a path this folder
+does not track as an LFS path, so a pin is never recorded where nothing will
+consult it. `unpin` withdraws it and disturbs neither clock, so the path is due
+whenever it would have been due had it never been pinned. `--json` for both is
+exactly `profileId`, `profile`, `path`, `pinned`.
+
+Releasing on a schedule you choose, or from a button, is a later story's
+`tasks`; and no stored timestamp authorizes a deletion here — it only decides
+which paths are worth asking about.
 
 Paths follow XDG: `$XDG_CONFIG_HOME/keeper-sync/config.toml`,
 `$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`.

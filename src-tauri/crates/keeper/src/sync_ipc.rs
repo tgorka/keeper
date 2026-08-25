@@ -2269,6 +2269,11 @@ pub async fn sync_open_entry(
     let resolved = browse::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe, so the release clock for this path moves
+    // (Story 56.5, AD-126). Best-effort by signature and no policy here: the
+    // engine owns every rule, because a rule in this crate is one nobody can
+    // exercise on Linux.
+    engine.note_use(&id, &subpath);
     tauri_plugin_opener::open_path(&resolved, None::<&str>).map_err(|error| {
         open_failure(format!(
             "could not open {subpath} with the system's default application: {error}"
@@ -2392,6 +2397,8 @@ pub async fn sync_read_text(
     let resolved = browse::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    engine.note_use(&id, &subpath);
     let named = subpath.clone();
     tokio::task::spawn_blocking(move || keeper_core::text_file::open_text_file(&resolved))
         .await
@@ -2588,6 +2595,8 @@ pub async fn sync_read_document(
     let resolved = browse::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    engine.note_use(&id, &subpath);
     let named = subpath.clone();
     tokio::task::spawn_blocking(move || keeper_core::document::open_document(&resolved))
         .await
@@ -2659,6 +2668,9 @@ pub async fn sync_export_entry(
     let root = find_profile(&profiles, &id)?.local_path.clone();
     let named = subpath.clone();
     let target = std::path::PathBuf::from(&destination);
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    // Before the `subpath` moves into the blocking closure below.
+    engine.note_use(&id, &subpath);
 
     let done = tokio::task::spawn_blocking(move || export::export_entry(&root, &subpath, &target))
         .await
@@ -3583,7 +3595,11 @@ mod tests {
     /// precedence layer. Until a form actually renders these — Story 56.9 — a
     /// save that cannot express them must leave a daemon-set policy alone, which
     /// is the DW-116 rule this whole list exists to enforce.
-    const PRESERVED: [&str; 8] = [
+    /// `releaseTtlMs` (Story 56.5) joins them on the same AD-132 reasoning: how
+    /// long this repository's content may stay is a fact about the repository,
+    /// this story ships no form control for it, and a save that cannot express
+    /// it must not reset a daemon-set retention window to the 24 h default.
+    const PRESERVED: [&str; 9] = [
         "id",
         "volumeId",
         "enabled",
@@ -3592,6 +3608,7 @@ mod tests {
         "regenerable",
         "virtualPatterns",
         "virtualOverBytes",
+        "releaseTtlMs",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -3685,6 +3702,10 @@ mod tests {
         // `parse_req` behaved.
         prior.virtual_patterns = vec!["scans/**".into()];
         prior.virtual_over_bytes = 32 * 1024 * 1024;
+        // Story 56.5's retention window. A fresh profile carries the 24 h
+        // default, so it needs a value a fresh profile never has or the
+        // preservation assertion below would pass however `parse_req` behaved.
+        prior.release_ttl_ms = 7 * 24 * 60 * 60 * 1000;
         // Story 41.1's block, set to something a fresh profile never has. It was
         // a PRESERVED field until Story 41.7 gave the form a switch for it; the
         // distinctive value stays, because it is now what makes the EXPRESSED
