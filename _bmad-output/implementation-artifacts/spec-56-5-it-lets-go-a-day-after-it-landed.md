@@ -2,8 +2,9 @@
 title: '56.5 It lets go a day after it landed, on its own'
 type: 'feature'
 created: '2026-08-25'
-status: 'in-review' # draft | ready-for-dev | in-progress | in-review | done | blocked
+status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: '4a9ebbd522952ea91397a50d669c1e5987c97f6c'
+final_revision: '6792d4a7b3513f5f47cdea0b09a19335a53e11bf'
 review_loop_iteration: 0
 followup_review_recommended: true
 context: []
