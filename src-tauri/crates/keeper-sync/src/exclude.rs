@@ -271,25 +271,30 @@ impl ExcludeSet {
             .map(|pattern| (pattern, false))
             .chain(extra.iter().map(|pattern| (pattern.as_str(), true)));
         for (pattern, from_profile) in corpus {
-            add_pattern(&mut builder, pattern)?;
+            add_pattern(&mut builder, EXCLUDE_PATTERN_SOURCE, pattern)?;
             // A `…/**` pattern is already anchored by its own `/`, so its
             // directory form goes in verbatim rather than back through the
             // basename rule.
             let directory = pattern.trim().strip_suffix("/**");
             if let Some(directory) = directory {
-                add_glob(&mut dir_builder, directory, pattern)?;
+                add_glob(&mut dir_builder, EXCLUDE_PATTERN_SOURCE, directory, pattern)?;
             }
             if from_profile {
-                add_pattern(&mut profile_builder, pattern)?;
+                add_pattern(&mut profile_builder, EXCLUDE_PATTERN_SOURCE, pattern)?;
                 if let Some(directory) = directory {
-                    add_glob(&mut profile_dir_builder, directory, pattern)?;
+                    add_glob(
+                        &mut profile_dir_builder,
+                        EXCLUDE_PATTERN_SOURCE,
+                        directory,
+                        pattern,
+                    )?;
                 }
             }
         }
         let build = |builder: GlobSetBuilder| {
-            builder
-                .build()
-                .map_err(|err| SyncError::Config(format!("could not compile exclude set: {err}")))
+            builder.build().map_err(|err| {
+                SyncError::Config(format!("could not compile the exclude pattern set: {err}"))
+            })
         };
         Ok(Self {
             set: build(builder)?,
@@ -397,17 +402,65 @@ pub struct PatternSet {
 }
 
 impl PatternSet {
-    /// Compile `patterns`. A malformed pattern is [`SyncError::Config`] naming
-    /// the string the user typed, never a panic — these arrive from a
-    /// hand-edited `config.json` like every other profile field.
+    /// Compile `patterns` as exclude patterns. A malformed pattern is
+    /// [`SyncError::Config`] naming the string the user typed, never a panic —
+    /// these arrive from a hand-edited `config.json` like every other profile
+    /// field.
     pub fn new(patterns: &[String]) -> Result<Self> {
+        Self::named(EXCLUDE_PATTERN_SOURCE, patterns)
+    }
+
+    /// Compile `patterns`, applying gitignore's anchoring rule and naming
+    /// `source` in every refusal.
+    ///
+    /// The dialect lives in exactly one place on purpose: a narrower question
+    /// that wants gitignore anchoring reuses [`add_pattern`] rather than
+    /// inlining a third copy of the rule, because copies drift apart one fix at
+    /// a time. All that actually differs between questions is which list the
+    /// refusal names — a typo in a committed `.keepervirtual` must never read
+    /// identically to a typo in one machine's TOML — so `source` is threaded
+    /// through instead of hardcoded. Write it as the list's own name
+    /// (`exclude`, `.keepervirtual`, `virtualPatterns`); the messages supply
+    /// the word "pattern" around it.
+    pub fn named(source: &str, patterns: &[String]) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {
-            add_pattern(&mut builder, pattern)?;
+            add_pattern(&mut builder, source, pattern)?;
         }
-        let set = builder
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not compile pattern set: {err}")))?;
+        Self::finish(source, builder)
+    }
+
+    /// Compile patterns that have already been anchored by their caller.
+    ///
+    /// Each entry is `(source, effective, original)`: which list the line came
+    /// from, the anchored glob to match with, and the line the user actually
+    /// typed. [`Self::named`] is the right entry point when the caller's input
+    /// *is* what the user wrote. It is the wrong one as soon as anchoring has to
+    /// be decided before compilation — gitignore's leading `/`, its trailing `/`
+    /// and a derived subtree form all produce a string the basename rule must
+    /// not see a second time, because re-running it would turn a root-anchored
+    /// rule into "anywhere at any depth". Splitting `effective` from `original`
+    /// keeps the refusal honest while the match uses the anchored form: a user
+    /// reads back their own line, never a glob keeper derived from it.
+    ///
+    /// The source travels per entry rather than per call because one set can be
+    /// the union of two lists — a protection a committed file states and one a
+    /// machine adds — and a refusal has to name the list the bad line is in.
+    pub fn anchored(entries: &[(&str, &str, &str)]) -> Result<Self> {
+        let mut builder = GlobSetBuilder::new();
+        for (source, effective, original) in entries {
+            add_glob(&mut builder, source, effective, original)?;
+        }
+        let set = builder.build().map_err(|err| {
+            SyncError::Config(format!("could not compile the pattern set: {err}"))
+        })?;
+        Ok(Self { set })
+    }
+
+    fn finish(source: &str, builder: GlobSetBuilder) -> Result<Self> {
+        let set = builder.build().map_err(|err| {
+            SyncError::Config(format!("could not compile the {source} pattern set: {err}"))
+        })?;
         Ok(Self { set })
     }
 
@@ -427,24 +480,43 @@ impl PatternSet {
     }
 }
 
+/// The source label [`PatternSet::new`] and [`ExcludeSet`] refuse with. Every
+/// other caller passes its own, so the message names the file or the config key
+/// the bad pattern actually came from.
+const EXCLUDE_PATTERN_SOURCE: &str = "exclude";
+
+/// Apply gitignore's basename rule to one pattern.
+///
+/// A pattern with no `/` matches that basename at any depth; one that contains
+/// a `/` is anchored at the repository root. Exposed to the crate because a
+/// caller that must resolve gitignore's *other* anchoring spellings — a leading
+/// `/`, a trailing `/` — has to reach the same rule without going back through
+/// [`add_pattern`], which would re-anchor a string that is already anchored.
+pub(crate) fn anchor(pattern: &str) -> Cow<'_, str> {
+    if pattern.contains('/') {
+        Cow::Borrowed(pattern)
+    } else {
+        Cow::Owned(format!("**/{pattern}"))
+    }
+}
+
 /// Add one pattern, applying gitignore's anchoring rule.
 ///
 /// `literal_separator(true)` is what makes "basename vs anchored" a real
 /// distinction: without it `*` crosses `/`, so `~$*` would swallow an entire
 /// subtree whose top directory happened to start with `~$`.
-fn add_pattern(builder: &mut GlobSetBuilder, pattern: &str) -> Result<()> {
+///
+/// `source` names the list the refusal points at, so one dialect can serve
+/// several origins without any of them borrowing another's wording.
+fn add_pattern(builder: &mut GlobSetBuilder, source: &str, pattern: &str) -> Result<()> {
     let pattern = pattern.trim();
     if pattern.is_empty() {
         // A blank line in a user's exclude list means nothing, not "match
         // everything" — silently ignoring it is the only safe reading.
         return Ok(());
     }
-    let effective: Cow<'_, str> = if pattern.contains('/') {
-        Cow::Borrowed(pattern)
-    } else {
-        Cow::Owned(format!("**/{pattern}"))
-    };
-    add_glob(builder, &effective, pattern)
+    let effective = anchor(pattern);
+    add_glob(builder, source, &effective, pattern)
 }
 
 /// Compile and add one already-anchored pattern.
@@ -454,12 +526,20 @@ fn add_pattern(builder: &mut GlobSetBuilder, pattern: &str) -> Result<()> {
 /// the original had. Re-running `scratch/**`'s remainder through the basename
 /// rule would turn a profile's root-anchored pattern into "any `scratch` at any
 /// depth" — a rule the user never wrote, silently hiding their folders.
-/// `original` is named in the error so a user reads back the string they typed.
-fn add_glob(builder: &mut GlobSetBuilder, effective: &str, original: &str) -> Result<()> {
+/// `original` is named in the error so a user reads back the string they typed,
+/// and `source` says which list they typed it into.
+fn add_glob(
+    builder: &mut GlobSetBuilder,
+    source: &str,
+    effective: &str,
+    original: &str,
+) -> Result<()> {
     let glob = GlobBuilder::new(effective)
         .literal_separator(true)
         .build()
-        .map_err(|err| SyncError::Config(format!("invalid exclude pattern {original:?}: {err}")))?;
+        .map_err(|err| {
+            SyncError::Config(format!("invalid {source} pattern {original:?}: {err}"))
+        })?;
     builder.add(glob);
     Ok(())
 }

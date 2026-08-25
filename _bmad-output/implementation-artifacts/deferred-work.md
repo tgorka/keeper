@@ -3471,3 +3471,28 @@ status: open
   summary: Nothing detects a broken pointer-stat invariant on its own; the repair runs only when a person presses "Recheck all files".
   evidence: `repair_index_stat` restores it, and `rescan` calls it, but a folder whose invariant broke while nobody was looking still converts its whole worktree on every status pass until somebody notices and presses the button. The card now says the folder needs attention after three consecutive failures, which is what makes the button findable — but a cheap periodic check (does a materialized entry's stat still describe its file?) would make the repair automatic. Left out here because a self-repairing index is a write nobody asked for, and this story's job was to make the failure visible and fixable.
   status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: `tests/hooks_never_run.rs` fails on any host whose git configuration sets `core.hooksPath`, which makes every repo-local `.git/hooks/*` inert.
+  evidence: Pre-existing and unrelated to this story — it exercises `GitCli::push` and git hook behaviour, and touches nothing story 56.1 changed. Its own sanity assertion (`hooks_never_run.rs:87`) requires a planted `.git/hooks/pre-push` to block a plain `git push`, which cannot happen when `core.hooksPath` points elsewhere. Verified: `git config --show-origin --get-all core.hooksPath` reports `file:/home/dev/.gitconfig  /home/dev/.config/git/hooks`, and the test passes under `GIT_CONFIG_GLOBAL=/dev/null cargo test -p keeper-sync --test hooks_never_run`. The fix is for the test to plant its hook and force `-c core.hooksPath=.git/hooks` on the sanity push, so the fixture proves what it claims regardless of the developer's own git config.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: No production path constructs a `VirtualPolicy`, so FR-329's "a malformed pattern refuses at startup" is not yet reachable by any user.
+  evidence: This is 56.1's declared non-goal — 56.2 is the consumer in the epic's strict 56.1 → 56.2 chain — but FR-329 is listed as a requirement 56.1 must satisfy, and it is satisfied only in the sense that `compile` refuses when called. The sibling refusals are reachable (`ExcludeSet::new` at `engine.rs:6111` and `stability.rs:252`, `LfsPolicy::from_profile` at `lfs/stage.rs:1193`), and `SyncProfile::validate` deliberately validates no glob field, so it is not the gate either. 56.2's review must confirm its consumer compiles the policy before any materialization decision, or the refusal machinery ships unreachable.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: A host cannot decline the repository's virtualization policy: an empty `virtualPatterns` is silence, so a machine can replace the committed list but never withdraw from it.
+  evidence: `VirtualPolicy::compile` treats a profile list that says nothing as "this tier is silent", which is the right reading of an unset key and the wrong one for a key deliberately set to `[]`. The operator case that arises is a laptop that is often offline and wants everything materialized; today the only spellings are a pattern that matches nothing or a negation-only list, both accidental. Distinguishing key-absent from key-empty needs the `Option<Vec<String>>` shape on the profile field, which is entangled with the `SyncProfileReq` `Option` rule (DW-116) that 56.1 declared a non-goal. Settle it in the story that renders the control (56.7/56.9), together with the tier surface AD-132 asks for.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: `.keepervirtual` and the virtualization keys have no user-facing documentation; only `keeper-syncd`'s annotated `[[profile]]` template describes them.
+  evidence: The daemon template gained both keys in this story, because the daemon accepts them the moment `SyncProfile` carries them and an operator setting a byte-affecting policy blind is the same failure one step earlier than the typo the module hard-refuses. The committed file is the artifact a whole team meets, and it is documented nowhere. Epic 56 assigns the chapter to story 56.8 (`docs/sync.md` grows a virtual-files section, last of all), which is where it belongs — recorded here so the file name, the `!` protection rule and the union-across-tiers behaviour are not left to be rediscovered from the source.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: The shared gitignore dialect has no spelling for "root-anchored, single segment" outside the virtualization lists.
+  evidence: `exclude::anchor` applies the basename rule to any pattern without a `/`, so `excludes = ["notes.md"]` and `lfsNever = ["notes.md"]` mean "at any depth" with no way to say "the root's own". Story 56.1 resolved this for its own lists by handling gitignore's leading `/` in `virtual_policy::anchor_line`, and deliberately did not change the two older fields, whose current meaning is depended upon. Teaching `add_pattern` the leading slash would make all three consistent; it is a behaviour change to two shipped config keys and needs its own story.
+  status: open

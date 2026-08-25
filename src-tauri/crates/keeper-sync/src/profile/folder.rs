@@ -130,6 +130,13 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     ("regenerable", FolderFieldRule::Allowed),
     ("lfsNever", FolderFieldRule::Allowed),
     ("lfsThresholdBytes", FolderFieldRule::Allowed),
+    // Which paths may keep their content away is a fact about the repository —
+    // the same `40-media/**` is bulk on every clone — so the folder tier is its
+    // canonical home and both hosts honour one list (AD-132). Beside `lfsNever`
+    // on purpose, and not the same question: that one says "never route this
+    // through LFS", this one says "its bytes may live only in the store".
+    ("virtualPatterns", FolderFieldRule::Allowed),
+    ("virtualOverBytes", FolderFieldRule::Allowed),
     ("commitSubjectTemplate", FolderFieldRule::Allowed),
     ("tags", FolderFieldRule::Allowed),
     // --- What the folder contains -------------------------------------------

@@ -113,7 +113,12 @@ const GIT_CONTROL_FILES: [&str; 3] = [".gitattributes", ".gitignore", ".gitmodul
 ///
 /// Matched on the file name at any depth, which is how git finds them: a
 /// `.gitattributes` is read in every directory it appears in.
-fn is_git_control_file(path: &Path) -> bool {
+///
+/// Visible to the crate because the virtualization question has the same
+/// answer for the same reason: a `.gitattributes` whose bytes are absent is a
+/// file git reads as pointer text, so it must be unreachable from both the
+/// routing rule and the policy that decides what may stay away.
+pub(crate) fn is_git_control_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| GIT_CONTROL_FILES.contains(&name))

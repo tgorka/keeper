@@ -32,6 +32,7 @@
 //! | [`endpoint`] | deriving and overriding the LFS server URL |
 //! | [`batch`] | `POST /objects/batch`, the only negotiation step |
 //! | [`basic`] | the `basic` transfer adapter: resumable `GET`, single `PUT` |
+//! | [`virtual_policy`] | which paths' content may stay unmaterialized |
 //!
 //! # The quirks this implementation encodes
 //!
@@ -89,3 +90,4 @@ pub mod prune;
 pub mod ssh;
 pub mod stage;
 pub mod store;
+pub mod virtual_policy;

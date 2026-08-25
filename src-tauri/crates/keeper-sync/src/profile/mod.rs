@@ -827,6 +827,46 @@ pub struct SyncProfile {
     /// of.
     #[serde(default)]
     pub lfs_never: Vec<String>,
+    /// Repository-relative globs whose **content** may stay unmaterialized
+    /// after a pull (AD-122, FR-328).
+    ///
+    /// Gitignore dialect, the same one every other pattern field in this record
+    /// uses: a pattern with no `/` matches that basename at any depth,
+    /// otherwise it is anchored at the repository root; `!` negates, and a
+    /// negated line wins unconditionally over a matching one, because erring
+    /// toward keeping bytes is the only safe direction. A path listed here is
+    /// still tracked, still committed and still wanted — only its bytes are
+    /// allowed to be absent, and the pointer is what answers for it.
+    ///
+    /// This is **not** `lfs_never` directly above, which is very nearly the
+    /// opposite: `lfs_never` says "never route this through LFS at all", so a
+    /// file matched there has no pointer to stay away behind. A file matched
+    /// here is one keeper deliberately routed through LFS and may now leave in
+    /// the store.
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for `notes`
+    /// below and for the same reason: a row written by a keeper that had never
+    /// heard of virtualization simply has no key, so it loads as an empty list
+    /// and says nothing. No SQL change, no schema bump, nothing to run on
+    /// upgrade, and a row written by this keeper still loads on the older one.
+    #[serde(default)]
+    pub virtual_patterns: Vec<String>,
+    /// Smallest size, in bytes, a matched path may stay unmaterialized at
+    /// (inclusive). `0` means no floor.
+    ///
+    /// Every term of the policy has to be answerable from the LFS pointer and
+    /// never from the bytes (AD-122) — reading the bytes to decide whether the
+    /// bytes may be absent is circular — and a size is, because the pointer
+    /// carries it. That is also why the floor lives here and has no spelling in
+    /// the committed pattern file: a size is not expressible in gitignore
+    /// dialect.
+    ///
+    /// No named `default_*` fn, unlike `lfs_threshold_bytes` above: there the
+    /// correct default is a real number a constant has to hold, whereas here it
+    /// really is zero, so `Default` is already the right answer and a named fn
+    /// would only be a second place for it to disagree from.
+    #[serde(default)]
+    pub virtual_over_bytes: u64,
     #[serde(default = "default_settle_ms")]
     pub settle_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
@@ -935,6 +975,8 @@ impl SyncProfile {
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
             lfs_never: Vec::new(),
+            virtual_patterns: Vec::new(),
+            virtual_over_bytes: 0,
             lfs_prune_local: true,
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
@@ -1402,6 +1444,50 @@ mod tests {
         // folder round-trips to the same thing, so rolling back a release
         // cannot turn `notes: null` into a parse failure.
         let round = serde_json::to_string(&parsed).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(parsed, back);
+    }
+
+    /// `#[serde(default)]` is the whole migration for the two virtualization
+    /// keys (AD-122): a row written before this story has neither, and must
+    /// load as "nothing may stay away, and no floor" rather than fail to parse
+    /// — there is no SQL change and nothing to run on upgrade.
+    #[test]
+    fn a_profile_row_written_before_virtualization_existed_still_loads() {
+        let older = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": ["*.csv"],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(older).expect("an older row still loads");
+        assert!(
+            parsed.virtual_patterns.is_empty(),
+            "an absent key means: nothing's content may stay away"
+        );
+        assert_eq!(
+            parsed.virtual_over_bytes, 0,
+            "and no floor, which is the only default that cannot surprise anyone"
+        );
+        assert_eq!(
+            parsed.lfs_never,
+            vec!["*.csv".to_owned()],
+            "the neighbouring field it must never be confused with is untouched"
+        );
+        assert!(parsed.validate().is_ok(), "and it is still a valid profile");
+
+        // The other direction too: the row this keeper writes carries both new
+        // keys and round-trips, so rolling a release back cannot turn them into
+        // a parse failure.
+        let round = serde_json::to_string(&parsed).expect("encode");
+        assert!(
+            round.contains("\"virtualPatterns\"") && round.contains("\"virtualOverBytes\""),
+            "both keys must be present once written: {round}"
+        );
         let back: SyncProfile = serde_json::from_str(&round).expect("decode");
         assert_eq!(parsed, back);
     }

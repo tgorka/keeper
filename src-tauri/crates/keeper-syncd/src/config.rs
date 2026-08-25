@@ -314,6 +314,19 @@ logLevel = "info"
 # complete local copy of everything the worktree holds, at roughly twice the
 # disk.
 # lfsPruneLocal = true
+# Which paths' CONTENT may stay unmaterialized after a pull -- the file stays
+# tracked, committed and listed, and only its bytes live in the LFS object
+# store. NOT the opposite of lfsNever above: that one says "never route this
+# through LFS at all", this one says "route it, then keep it as a pointer".
+# Same gitignore dialect, plus `!` to protect something the zone would
+# otherwise cover; `!` on a folder protects everything inside it, and a
+# protection stated anywhere is honoured everywhere -- a machine can widen what
+# may leave, never narrow what is kept. Editing this list never deletes a byte.
+# The canonical home for it is the folder's own .keeper/keeper.toml, so this
+# daemon and the desktop app honour one answer.
+# virtualPatterns = ["40-media/**", "!40-media/scans/"]
+# Smallest size that may stay away, in bytes. 0 (the default) means no floor.
+# virtualOverBytes = 0
 # How long a file must stop changing before it is considered complete.
 # settleMs = 5000
 # pollIntervalMs = 15000
