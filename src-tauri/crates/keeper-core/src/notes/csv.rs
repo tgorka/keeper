@@ -74,7 +74,7 @@ const DEFAULT_DELIMITER: u8 = b',';
 /// Four and not more: each extra candidate is another way for an ordinary file
 /// to be read as a grid it is not, and these are the four a spreadsheet
 /// actually writes. A space is deliberately absent — prose is full of them.
-const CANDIDATE_DELIMITERS: [u8; 4] = [b',', b';', b'\t', b'|'];
+const CANDIDATE_DELIMITERS: [u8; 4] = *b",;\t|";
 
 /// How many opening records a candidate is judged on.
 ///
