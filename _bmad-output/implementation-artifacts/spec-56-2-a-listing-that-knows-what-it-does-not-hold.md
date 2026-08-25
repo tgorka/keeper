@@ -2,8 +2,9 @@
 title: '56.2 A listing that knows what it does not hold'
 type: 'feature'
 created: '2026-08-25'
-status: 'in-review' # draft | ready-for-dev | in-progress | in-review | done | blocked
+status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: '8760573b0dc9c761229628350c79377cec3e8aff'
+final_revision: 'ef8f4860e3db928f00184d0f79db586ac9047185'
 review_loop_iteration: 0
 followup_review_recommended: true
 context: []
