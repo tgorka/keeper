@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   FilesEntrySyncVm,
@@ -1194,6 +1194,50 @@ describe("FilesPane — a row's verbs against the column's width", () => {
         modified: true,
       }).actions,
     ).toBe(charged);
+  });
+
+  /**
+   * The date's threshold is the same for a folder as for the file beside it
+   * (Story 56.9, and the defect the review found in it).
+   *
+   * The gate asks THIS row's verb count now, and asked literally that recreated
+   * the exact raggedness the rule it replaced existed to prevent, only in the
+   * other direction: a folder has two verbs where a plain file has three, so a
+   * folder would start drawing its date 36px of column before its siblings could
+   * — and it gained neither a cell nor a verb to pay for that. Every width in
+   * between showed a date on the folders and none on the files.
+   *
+   * So the count is floored at an ordinary file's three, which is what the
+   * thresholds below say: a folder and a plain file share the one the story
+   * before this pinned, and only a row that GAINED verbs pays more.
+   */
+  it("gives a folder and a plain file one date threshold, and charges only a row that gained verbs", () => {
+    /** The narrowest column at which a row with this many verbs draws its date.
+     *  Found rather than sampled, so what is compared is the threshold itself. */
+    const threshold = (actions: number): number => {
+      for (let column = 220; column <= 900; column += 1) {
+        const plan = filesRowCellPlan({
+          column,
+          level: FILE_LEVEL,
+          actions,
+          release: false,
+          modified: true,
+        });
+        if (plan.modified) {
+          return column;
+        }
+      }
+      return Number.POSITIVE_INFINITY;
+    };
+
+    expect(threshold(2)).toBe(threshold(3));
+    // And it is the threshold Story 56.7 pinned: the cell's 68px plus three
+    // verbs' worth, which is exactly what the budget reaches there.
+    expect(filesRowActionsBudget({ column: threshold(3), level: FILE_LEVEL })).toBe(68 + 3 * 36);
+    // A row that has more verbs than an ordinary file pays for them, and this is
+    // the whole of the raggedness Story 56.9 introduced.
+    expect(threshold(4)).toBeGreaterThan(threshold(3));
+    expect(threshold(5)).toBeGreaterThan(threshold(4));
   });
 
   /**
@@ -3719,6 +3763,71 @@ describe("FilesPane — the state verbs and the release clock", () => {
     ]);
   });
 
+  /**
+   * Story 56.7's headline win survives the cell this story added — through the
+   * real DOM, because the pure planner passing is not the same claim (the
+   * review's finding).
+   *
+   * 320px is where the pane was worst and where the previous story fixed it: two
+   * verbs, out of 82px of slack against 72px of verbs. Charged unconditionally,
+   * this row's release cell took 68 of those 82 and left 14 — so the row promoted
+   * NOTHING, and the guarantee the constant's own doc still quoted was broken by
+   * the story quoting it.
+   *
+   * Nothing is lost at this width: the cell keeps its element, its id and its
+   * place in the row's description, and every verb is one right-click away.
+   */
+  it("keeps a 320px materialized row its two verbs and speaks the cell it cannot draw", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)], 320);
+    const row = screen.getByRole("treeitem", { name: "clip.mp4" });
+
+    expect(verbs(row)).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL]);
+    const cell = releaseCell("clip.mp4");
+    expect(cell?.className).toBe("sr-only");
+    expect(cell?.textContent).not.toBe("");
+    expect(row.getAttribute("aria-describedby")).toContain(cell?.id ?? "");
+  });
+
+  /** And at the column's shipped default the countdown IS drawn, which is the
+   *  whole reason the cell is charged ahead of the verbs: 122px of budget buys
+   *  the cell and one verb, and the other four are in the menu. */
+  it("draws the countdown and promotes one verb at the shipped 360px default", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)], 360);
+    const row = screen.getByRole("treeitem", { name: "clip.mp4" });
+
+    expect(verbs(row)).toEqual([FILES_OPEN_LABEL]);
+    expect(releaseCell("clip.mp4")?.className).not.toContain("sr-only");
+  });
+
+  /**
+   * The 480px row Story 56.7 pinned, stated rather than left incidental.
+   *
+   * 242px of budget: the cell takes 68 and leaves 174, which is four of a
+   * materialized row's five verbs and short of the 248 its date would want. The
+   * plain file beside it gained neither a cell nor a verb, so it draws all three
+   * of its verbs AND its date at exactly the width it always did — which is what
+   * flooring the date's verb count at an ordinary file's three is for.
+   */
+  it("draws a materialized row's countdown at 480px without taking the plain row's date", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000), entry("plain.md", "file")], 480);
+    const clip = screen.getByRole("treeitem", { name: "clip.mp4" });
+    const plain = screen.getByRole("treeitem", { name: "plain.md" });
+
+    expect(verbs(clip)).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+      FILES_RELEASE_LABEL,
+    ]);
+    expect(releaseCell("clip.mp4")?.className).not.toContain("sr-only");
+    expect(clip.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`)?.className).toBe("sr-only");
+
+    expect(verbs(plain)).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL, FILES_COPY_PATH_LABEL]);
+    expect(plain.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`)?.className).not.toContain(
+      "sr-only",
+    );
+  });
+
   it("materializes the row's own subpath and then re-reads the folder", async () => {
     await tree([
       entry("gone.mp4", "file", "40-media/gone.mp4", { status: "virtual", detail: null }),
@@ -3766,8 +3875,9 @@ describe("FilesPane — the state verbs and the release clock", () => {
   /** Pin only ever sends `true`. Nothing on the wire says whether a path is
    *  pinned — the row learns it as Rust's word — so a toggle could not tell the
    *  person which way it was about to go. */
-  it("pins one way and never toggles", async () => {
+  it("pins one way and never toggles, and re-reads the folder afterwards", async () => {
     await tree([counting("clip.mp4", Date.now() + 3_600_000)]);
+    const before = rootBrowses();
 
     await click(
       within(screen.getByRole("treeitem", { name: "clip.mp4" })).getByRole("button", {
@@ -3776,10 +3886,40 @@ describe("FilesPane — the state verbs and the release clock", () => {
     );
 
     expect(syncPinEntry).toHaveBeenCalledWith("01VAULT", "clip.mp4", true);
+    // The re-read is the ONLY feedback a pin has: the countdown becomes the word
+    // `Pinned`, and nothing else on this surface would ever notice it happened.
+    await waitFor(() => expect(rootBrowses()).toBe(before + 1));
+    expect(screen.queryByTestId(FILES_WRITE_ERROR_TESTID)).toBeNull();
   });
 
   /**
-   * ONE interval for the whole pane, counted rather than read.
+   * A release with nothing to release is a SUCCESS (Story 56.9's matrix).
+   *
+   * `keeper-syncd`'s release door reports an already-pointer path as
+   * `nothing_to_release`, and `sync_release_entry` answers `Ok(())` for the same
+   * reason: a no-op release that painted a red alert would teach the owner to
+   * distrust the alert. So this resolves like any other accepted verb — the
+   * folder is re-read, which is also the only proof Release's own `.then` arm is
+   * wired at all — and nothing is shown.
+   */
+  it("treats a release with nothing to release as a success and re-reads the folder", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)]);
+    const before = rootBrowses();
+
+    await click(
+      within(screen.getByRole("treeitem", { name: "clip.mp4" })).getByRole("button", {
+        name: FILES_RELEASE_LABEL,
+      }),
+    );
+
+    expect(syncReleaseEntry).toHaveBeenCalledWith("01VAULT", "clip.mp4");
+    await waitFor(() => expect(rootBrowses()).toBe(before + 1));
+    expect(screen.queryByTestId(FILES_WRITE_ERROR_TESTID)).toBeNull();
+  });
+
+  /**
+   * ONE interval for the whole pane, counted rather than read — and exactly one
+   * more than the same pane arms with nothing to count.
    *
    * The rows are windowed, so a timer owned by a row would arm and disarm on
    * every scroll, and three counting rows would be three timers computing the
@@ -3787,8 +3927,17 @@ describe("FilesPane — the state verbs and the release clock", () => {
    * tree cannot pollute the count, and spied on the global rather than mocked, so
    * this test would fail on a `setInterval` moved into `renderNode` even though
    * every other assertion in this suite would still pass.
+   *
+   * The period filter is also a hole, which is why the TOTAL is pinned beside it
+   * against a baseline: a mutation that changed the period would arm a timer this
+   * suite never looked at, and every filtered assertion in it would still read
+   * zero-or-one and pass. The baseline is the same tree with its deadlines taken
+   * off, so what is compared is one pane against itself — and each half arranges
+   * itself the same way and polls with exactly one `waitFor`, because `waitFor`
+   * arms an interval of its own and an asymmetric arrangement would count that
+   * instead of the pane's.
    */
-  it("arms exactly one interval however many rows are counting", async () => {
+  it("arms exactly one interval, and one more than the same tree with nothing counting", async () => {
     const spy = vi.spyOn(globalThis, "setInterval");
     try {
       await tree([
@@ -3800,22 +3949,196 @@ describe("FilesPane — the state verbs and the release clock", () => {
       await waitFor(() =>
         expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(1),
       );
+      const armedWhileCounting = spy.mock.calls.length;
+
+      // The same pane, the same three rows, no deadlines. Unmounted and reset
+      // first — the expansion is a module-level store, so a second render would
+      // otherwise open onto a tree that is already open — and the width stub is
+      // restored so the second one is not stacked on top of it.
+      cleanup();
+      restoreWidth?.();
+      restoreWidth = null;
+      resetFilesTreeForTest();
+      spy.mockClear();
+      await tree([entry("a.mp4", "file"), entry("b.mp4", "file"), entry("c.mp4", "file")]);
+
+      await waitFor(() =>
+        expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0),
+      );
+      expect(armedWhileCounting).toBe(spy.mock.calls.length + 1);
     } finally {
       spy.mockRestore();
     }
   });
 
-  /** And a pane with nothing to count arms none at all. The ordinary Files tree
-   *  holds no materialized content, and it must not tick once a second for the
-   *  rest of the session to keep saying so. */
+  /**
+   * And a pane with nothing to count arms none at all. The ordinary Files tree
+   * holds no materialized content, and it must not tick once a second for the
+   * rest of the session to keep saying so.
+   *
+   * Settled first and then asked AGAIN, well past the period. Asserted the
+   * moment `tree()` resolved, this passed for an interval armed one state update
+   * later — which is the only way the pane could arm one at all, since the effect
+   * runs after the paint that lists the rows.
+   */
   it("arms no interval at all when no row has a deadline", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const spy = vi.spyOn(globalThis, "setInterval");
     try {
       await tree([entry("plain.md", "file"), held("pinned.mp4", "Pinned", PINNED_SENTENCE)]);
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * FILES_TICK_MS);
+      });
 
       expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
     } finally {
       spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A row reads `due`, and the pane's timer is CLEARED once the last deadline has
+   * passed (Story 56.9's matrix, untested on either side until now).
+   *
+   * `due` is the figure's last value: no tick moves it again, so a pane still
+   * ticking over it is a pane waking the machine once a second forever to
+   * recompute a string that cannot change. The clear is proven by the timer's own
+   * id rather than by a count, because a count cannot tell "cleared" from "never
+   * armed" and this test needs both halves.
+   */
+  it("reads due and clears the interval once the last deadline has passed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const armed = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([counting("clip.mp4", BASE_MS + 90_000)]);
+      expect(releaseFigure("clip.mp4")).toBe("1 min");
+      const timers = armed.mock.calls
+        .map((call, index) => (call[1] === FILES_TICK_MS ? armed.mock.results[index]?.value : null))
+        .filter((timer) => timer != null);
+      expect(timers).toHaveLength(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(95 * FILES_TICK_MS);
+      });
+
+      expect(releaseFigure("clip.mp4")).toBe("due");
+      expect(cleared.mock.calls.map(([timer]) => timer)).toContain(timers[0]);
+      // And nothing re-armed it: the row still says `due` and says it for free.
+      expect(armed.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(1);
+    } finally {
+      armed.mockRestore();
+      cleared.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A deadline this pane cannot render draws nothing, says nothing and — the part
+   * the review caught — arms nothing.
+   *
+   * `formatReleaseIn` refuses a non-finite instant, one at or before the epoch,
+   * and one past `MAX_DATE_MS` (a `Date` cannot represent it, and formatting it
+   * throws). The cell is therefore absent and names no id. The TIMER used to be
+   * asked a different question — `releasesAfterMs > now`, which all three of
+   * these satisfy or fail independently of what can be drawn — so the beyond-range
+   * row armed a 1 s interval for the life of the pane and re-rendered the whole
+   * tree with it to paint nothing at all.
+   */
+  it("draws no cell and arms no timer for a deadline it cannot render", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([
+        counting("beyond.mp4", 9e15),
+        counting("epoch.mp4", 0),
+        counting("nonsense.mp4", Number.POSITIVE_INFINITY),
+      ]);
+
+      for (const name of ["beyond.mp4", "epoch.mp4", "nonsense.mp4"]) {
+        expect(releaseCell(name)).toBeNull();
+        expect(
+          screen.getByRole("treeitem", { name }).getAttribute("aria-describedby") ?? "",
+        ).not.toContain("files-release-");
+      }
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * FILES_TICK_MS);
+      });
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A row carrying BOTH a word and a deadline shows the word and arms nothing.
+   *
+   * The wire says exactly one is ever present — `ReleaseSchedule` proves it over
+   * every variant where a compiler runs — but this pane is downstream of that
+   * proof and nothing here enforced it: the cell preferred the word while the
+   * timer saw the deadline, so a malformed pair armed an interval over a string
+   * that can never change and nothing would ever clear it.
+   */
+  it("arms no timer for a row that carries a word as well as a deadline", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([
+        entry(
+          "both.mp4",
+          "file",
+          "both.mp4",
+          { status: "materialized", detail: null },
+          {
+            release: {
+              releasesAfterMs: BASE_MS + 3_600_000,
+              hold: "Pinned",
+              detail: PINNED_SENTENCE,
+            },
+          },
+        ),
+      ]);
+
+      expect(releaseFigure("both.mp4")).toBe("Pinned");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * FILES_TICK_MS);
+      });
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A counting row speaks the duration AND Rust's caveat (the review's finding).
+   *
+   * `detail` exists to carry the one claim the frontend must not invent: reaching
+   * zero makes the content ELIGIBLE for release and not gone. Reaching it only
+   * through the `title` left it unsaid — a reader holding the row's description
+   * is not read a tooltip — while the three held rows had spoken their sentence
+   * all along.
+   */
+  it("speaks a counting row's duration and Rust's caveat together", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([counting("clip.mp4", BASE_MS + 3 * 3_600_000 + 1_800_000)]);
+
+      const spoken = releaseCell("clip.mp4")?.querySelector(".sr-only")?.textContent ?? "";
+      expect(spoken).toContain("Releases in 3 hr");
+      expect(spoken).toContain(DUE_SENTENCE);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -3906,8 +4229,13 @@ describe("FilesPane — the state verbs and the release clock", () => {
    * and none may arm the pane's interval. Each still names its cell in the row's
    * `aria-describedby`, because a row that cannot count is still a row that can
    * say why.
+   *
+   * The timer half is asked after the tree has settled and again well past the
+   * period, for the reason the no-deadline test above states: an interval armed
+   * one state update later would satisfy a synchronous count.
    */
   it("draws a word, no digit and no timer for a row on no clock", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const spy = vi.spyOn(globalThis, "setInterval");
     try {
       await tree([
@@ -3934,8 +4262,13 @@ describe("FilesPane — the state verbs and the release clock", () => {
       }
 
       expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * FILES_TICK_MS);
+      });
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
     } finally {
       spy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
@@ -3965,5 +4298,48 @@ describe("FilesPane — the state verbs and the release clock", () => {
     // Tabular numerals, so a figure that ticks does not change the cell's width
     // and shove the sync mark beside it about.
     expect(cell?.className ?? "").toContain("figures");
+  });
+
+  /**
+   * The pane reads its clock once per PAINT, not once per mount (the review's
+   * finding, and the one that reaches back into Story 56.7).
+   *
+   * The tree here has nothing to count, which is the ORDINARY Files tree: it
+   * holds no materialized content, so it arms no interval, which is the rule two
+   * tests above defend. Holding the instant in state and advancing it only from
+   * that interval therefore froze this pane's clock for the whole session — every
+   * relative date as old as the pane, and, because the future-mtime guard is read
+   * against the same instant, a file written after the pane opened rendered NO
+   * date at all and dropped out of its own `aria-describedby`.
+   *
+   * The row is clicked to force the repaint, because that is what a person does
+   * and because nothing else will: with no countdown there is no tick, and the
+   * tick's only job was ever to cause a paint.
+   */
+  it("keeps a date current on a tree that has nothing to count", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(BASE_MS);
+      const written = BASE_MS + 300_000;
+      await tree([entry("later.md", "file", "later.md", undefined, { mtimeMs: written })]);
+      // Five minutes ahead of the mount, so past the future-mtime grace and
+      // refused — which is right, and is the state the frozen clock never left.
+      const row = screen.getByRole("treeitem", { name: "later.md" });
+      expect(row.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`)).toBeNull();
+
+      // Half an hour on, that stamp is in the PAST and the row has a date.
+      vi.setSystemTime(BASE_MS + 1_800_000);
+      await click(row);
+
+      const cell = screen
+        .getByRole("treeitem", { name: "later.md" })
+        .querySelector<HTMLElement>(`[data-slot="${FILES_MTIME_SLOT}"]`);
+      expect(cell?.textContent).toBe(formatDraftAge(written, BASE_MS + 1_800_000));
+      expect(
+        screen.getByRole("treeitem", { name: "later.md" }).getAttribute("aria-describedby"),
+      ).toContain(cell?.id ?? "");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

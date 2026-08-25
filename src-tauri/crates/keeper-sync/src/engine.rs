@@ -8190,7 +8190,12 @@ impl Engine {
     /// nothing about a TTL, so this ledger read plus [`release_schedule`] is the
     /// whole of where a deadline can come from.
     ///
-    /// Two statements — the profile, then its rows — and synchronous for
+    /// **One lock, one answer.** The profile and its rows are read inside a
+    /// single [`Self::with_db`] closure, not two: two locks leave a window in
+    /// which a profile edit lands between them, and every row in the listing
+    /// would then be classified against a folder shape that no longer exists —
+    /// a countdown drawn from a TTL nobody has any more, or a "Kept" for a mode
+    /// that has just been switched off. Two statements, and synchronous for
     /// [`Self::materialized_paths`]' reason: both are indexed `SELECT`s over a
     /// table with a row per materialized path, and there is nothing here to move
     /// off the runtime. Deliberately **not** folded into the shell's cached
@@ -8207,25 +8212,28 @@ impl Engine {
     ///
     /// The TTL and the mode are read once for the folder rather than per row,
     /// because they are facts about the folder; [`release_schedule`] is then a
-    /// pure classification of each row against them.
+    /// pure classification of each row against them. The mode is handed over as
+    /// a mode rather than as [`release_mode_gate`]'s verdict, because the gate
+    /// refuses two opposite configurations with one `Err` and a row's cell has
+    /// to tell them apart — see [`release_schedule`]'s own doc.
     pub fn release_schedules(
         &self,
         profile_id: &str,
     ) -> Result<std::collections::HashMap<String, ReleaseSchedule>> {
-        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
-            return Err(SyncError::Config(format!(
-                "no such sync profile: {profile_id}"
-            )));
-        };
+        let (profile, rows) = self.with_db(|conn| {
+            let Some(profile) = db::get_profile(conn, profile_id)? else {
+                return Err(SyncError::Config(format!(
+                    "no such sync profile: {profile_id}"
+                )));
+            };
+            let rows = db::materialized_rows(conn, profile_id)?;
+            Ok((profile, rows))
+        })?;
         let ttl_ms = profile.effective_release_ttl_ms();
-        // A mode that refuses the request door refuses the sweep too, so it is
-        // also the answer to "when does this go?" — never, on a clock.
-        let mode_keeps = release_mode_gate(&profile).is_err();
-        let rows = self.with_db(|conn| db::materialized_rows(conn, profile_id))?;
         Ok(rows
             .into_iter()
             .map(|row| {
-                let schedule = release_schedule(&row, ttl_ms, mode_keeps);
+                let schedule = release_schedule(&row, ttl_ms, profile.lfs_mode);
                 (row.path, schedule)
             })
             .collect())
@@ -8756,25 +8764,82 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
 /// ticks and this enum carries the instant plus, for the rows that have no
 /// instant, keeper's own words for why.
 ///
-/// The four wordy variants are the four separate reasons a materialized row is
-/// not on a clock — a pin, the folder's LFS mode, a switched-off TTL, and
-/// FR-341's never-confirmed row — and they are kept apart rather than folded
-/// into one "held" case because each is a different sentence to the person who
-/// asked, and because collapsing them would put the choice of words in the
-/// shell crate, which does not compile on every host this is developed on.
+/// The five wordy variants are the five separate reasons a materialized row is
+/// not on a clock — a pin, a folder that keeps large-file content, a folder
+/// with large-file support switched off, a switched-off TTL, and FR-341's
+/// never-confirmed row — and they are kept apart rather than folded into one
+/// "held" case because each is a different sentence to the person who asked,
+/// and because collapsing them would put the choice of words in the shell
+/// crate, which does not compile on every host this is developed on.
+///
+/// **The two mode causes are two sentences and one word.**
+/// [`release_mode_gate`] refuses [`LfsMode::Materialize`] and
+/// [`LfsMode::Disabled`] alike, because its subject is the *request door*:
+/// whether a caller may take content away. A row's cell is a different
+/// subject — what is holding *this* file — and there the two modes are
+/// opposite configurations. Telling the owner of a folder with large-file
+/// support OFF that it "is set to keep large-file content" is false of the
+/// folder and points them at a setting that reads the other way, so
+/// [`ReleaseSchedule::ModeKeeps`] and [`ReleaseSchedule::LfsOff`] are separate
+/// variants with separate sentences. They still draw the same word, because
+/// from the row's side "kept" is the one fact either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSchedule {
     /// Releases no earlier than this absolute epoch-ms instant.
-    Due {
-        at_ms: i64,
-    },
+    Due { at_ms: i64 },
+    /// The path is pinned, so keeper keeps its content until the pin is
+    /// lifted. The one reason that outranks every other, and the only one the
+    /// person holding it can undo from the row itself.
     Pinned,
+    /// FR-341: this clone authored the content and nothing has confirmed the
+    /// remote holds it, so the bytes exist on exactly one machine and are on
+    /// no clock at any age. The only variant whose word is "Not sent".
     Unconfirmed,
+    /// The folder's release TTL is switched off (`releaseTtlMs = 0`), so its
+    /// content stays until a person releases it by hand. Shares its word with
+    /// [`Self::ModeKeeps`] and [`Self::LfsOff`]; what tells it apart is that
+    /// its sentence points at the folder's *release interval*, which is the
+    /// setting that would put these rows on a clock.
     Indefinite,
+    /// The folder is in [`LfsMode::Materialize`], which re-materializes what
+    /// it holds, so a release would be undone on the next pass and a countdown
+    /// would promise something that never comes. Shares its word with
+    /// [`Self::Indefinite`] and [`Self::LfsOff`]; what tells it apart is that
+    /// its sentence names the folder deliberately *keeping* large-file
+    /// content.
     ModeKeeps,
+    /// The folder has large-file support off ([`LfsMode::Disabled`]) and still
+    /// holds `materialized` rows — reachable, because a folder switched away
+    /// from [`LfsMode::PointerOnly`] keeps the ledger rows it already had, and
+    /// `browse::classify` goes on marking them materialized. Shares its word
+    /// with [`Self::Indefinite`] and [`Self::ModeKeeps`]; what tells it apart
+    /// is that its sentence names large-file support being OFF, which is the
+    /// opposite configuration to [`Self::ModeKeeps`] and would be a lie in its
+    /// sentence.
+    LfsOff,
 }
 
 impl ReleaseSchedule {
+    /// The instant, or the words. A `Result` rather than two `Option`s because
+    /// the choice is exclusive by construction: no variant, present or future,
+    /// can answer both or neither, and the compiler is what enforces it rather
+    /// than a list in a test.
+    ///
+    /// [`Self::releases_after_ms`] is this `.ok()` and [`Self::hold`] is this
+    /// `.err()`, so the pairing the shell reads off three wire fields is not
+    /// two matches kept in step by hand — it is one match, and adding a
+    /// variant is a compile error in exactly one place, here.
+    fn instant_or_words(&self) -> std::result::Result<i64, &'static str> {
+        match self {
+            Self::Due { at_ms } => Ok(*at_ms),
+            Self::Pinned => Err("Pinned"),
+            Self::Unconfirmed => Err("Not sent"),
+            // Three reasons, one word: see [`Self::hold`] for why, and
+            // [`Self::sentence`] for what actually separates them.
+            Self::Indefinite | Self::ModeKeeps | Self::LfsOff => Err("Kept"),
+        }
+    }
+
     /// The absolute instant a surface counts down to — `Some` exactly for
     /// [`Self::Due`].
     ///
@@ -8784,15 +8849,15 @@ impl ReleaseSchedule {
     /// word, so two nullable fields is exactly the shape the renderer wants,
     /// and putting the split here means the shell does three field reads and
     /// has no pairing to get wrong. The promise that makes that safe —
-    /// `releases_after_ms().is_some() == hold().is_none()`, over every variant
-    /// — is proven in this crate's own tests
-    /// (`release_schedule_pairs_an_instant_with_words_exactly_one_way`),
-    /// because the crate that consumes it cannot be compiled on this host.
+    /// `releases_after_ms().is_some() == hold().is_none()` — is structural
+    /// rather than tested: both sides are one [`Self::instant_or_words`] away,
+    /// and that function's return type cannot express "both" or "neither", so
+    /// a variant that broke the pairing would not compile. This crate's tests
+    /// (`release_schedule_pairs_an_instant_with_words_exactly_one_way`) still
+    /// assert it, because the crate that consumes it cannot be compiled on
+    /// this host.
     pub fn releases_after_ms(&self) -> Option<i64> {
-        match self {
-            Self::Due { at_ms } => Some(*at_ms),
-            Self::Pinned | Self::Unconfirmed | Self::Indefinite | Self::ModeKeeps => None,
-        }
+        self.instant_or_words().ok()
     }
 
     /// The one or two words a surface draws when there is no instant — `None`
@@ -8801,17 +8866,13 @@ impl ReleaseSchedule {
     /// Short because it stands where a figure would stand, in a cell sized for
     /// `23 hr`; the whole reason is [`Self::sentence`]'s job. "Not sent" rather
     /// than "Unconfirmed" because the person is being told something about
-    /// their own file, not about keeper's bookkeeping, and both the
-    /// switched-off TTL and the mode that keeps content say "Kept" because
-    /// from the row's side they are the same fact — the difference between
-    /// them is a sentence, not a word.
+    /// their own file, not about keeper's bookkeeping, and the switched-off
+    /// TTL, the mode that keeps large-file content and the folder with
+    /// large-file support off all say "Kept" because from the row's side they
+    /// are the same fact — the difference between the three is a sentence, not
+    /// a word.
     pub fn hold(&self) -> Option<&'static str> {
-        match self {
-            Self::Due { .. } => None,
-            Self::Pinned => Some("Pinned"),
-            Self::Unconfirmed => Some("Not sent"),
-            Self::Indefinite | Self::ModeKeeps => Some("Kept"),
-        }
+        self.instant_or_words().err()
     }
 
     /// The sentence, written for the person who asked. Always present.
@@ -8848,6 +8909,10 @@ impl ReleaseSchedule {
                 "This folder is set to keep large-file content on this computer, so nothing \
                  is released on a clock"
             }
+            Self::LfsOff => {
+                "Large-file support is off for this folder, so keeper is not releasing \
+                 anything from it on a clock"
+            }
         }
     }
 }
@@ -8872,19 +8937,31 @@ impl ReleaseSchedule {
 /// third reason to refuse there would silently relabel every pinned row here.
 /// One extra read of one boolean is the cheaper half of that trade.
 ///
+/// **The mode arrives as a mode, not as [`release_mode_gate`]'s refusal.** The
+/// gate answers a different question — may a *caller* take content out of this
+/// folder — and it says no to [`LfsMode::Materialize`] and
+/// [`LfsMode::Disabled`] alike. Those are opposite configurations, so a single
+/// boolean derived from the gate told the owner of a folder with large-file
+/// support OFF that it was "set to keep large-file content". Mapping the mode
+/// belongs here because this is where keeper's words for a *row* are chosen;
+/// the gate's refusal vocabulary is about the request door. Exhaustive, so a
+/// fourth mode has to decide which sentence it draws rather than inherit one.
+///
 /// Pure — no `self`, no I/O, no clock — like [`release_due_at`] and for its
 /// reason: every variant is then reachable from a hand-built row, and the
-/// exactly-one invariant the shell relies on is provable where a compiler runs.
+/// precedence the shell's cells rest on is provable where a compiler runs.
 pub fn release_schedule(
     row: &db::MaterializedRow,
     ttl_ms: Option<u64>,
-    mode_keeps: bool,
+    mode: LfsMode,
 ) -> ReleaseSchedule {
     if row.pinned {
         return ReleaseSchedule::Pinned;
     }
-    if mode_keeps {
-        return ReleaseSchedule::ModeKeeps;
+    match mode {
+        LfsMode::PointerOnly => {}
+        LfsMode::Materialize => return ReleaseSchedule::ModeKeeps,
+        LfsMode::Disabled => return ReleaseSchedule::LfsOff,
     }
     let Some(ttl_ms) = ttl_ms else {
         return ReleaseSchedule::Indefinite;
@@ -9470,24 +9547,25 @@ mod tests {
         const TTL: u64 = 24 * 60 * 60 * 1000;
 
         // The pin is the first question, so it wins over a clock that ran out
-        // long ago and over a mode that keeps everything. A surface must say
-        // "pinned" here: "kept by the mode" would send the owner to change a
-        // setting that is not what is holding this path.
-        for mode_keeps in [false, true] {
+        // long ago and over every mode. A surface must say "pinned" here:
+        // "kept by the mode" would send the owner to change a setting that is
+        // not what is holding this path.
+        for mode in [
+            LfsMode::PointerOnly,
+            LfsMode::Materialize,
+            LfsMode::Disabled,
+        ] {
             let mut row = ledger_row("clip.mp4", 1_000);
             row.pinned = true;
             row.last_used_ms = Some(1);
             assert_eq!(
-                release_schedule(&row, Some(TTL), mode_keeps),
+                release_schedule(&row, Some(TTL), mode),
                 ReleaseSchedule::Pinned,
                 "the pin is asked before anything else, whatever the mode says"
             );
             // And with the sweep switched off entirely, the pin is still the
             // more specific truth.
-            assert_eq!(
-                release_schedule(&row, None, mode_keeps),
-                ReleaseSchedule::Pinned
-            );
+            assert_eq!(release_schedule(&row, None, mode), ReleaseSchedule::Pinned);
         }
 
         // The mode beats a due clock: in a folder that re-materializes what it
@@ -9495,21 +9573,36 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(5_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), true),
+            release_schedule(&row, Some(TTL), LfsMode::Materialize),
             ReleaseSchedule::ModeKeeps
         );
         // And it beats an absent TTL, because the mode is the more specific
         // reason of the two and both would draw the same word.
         assert_eq!(
-            release_schedule(&row, None, true),
+            release_schedule(&row, None, LfsMode::Materialize),
             ReleaseSchedule::ModeKeeps
+        );
+
+        // The OTHER mode `release_mode_gate` refuses, and the reason this is
+        // not one boolean: a folder with large-file support switched OFF still
+        // carries the `materialized` rows it had while it was `PointerOnly`, so
+        // it reaches here — and "set to keep large-file content" would be the
+        // opposite of what its own settings say.
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::Disabled),
+            ReleaseSchedule::LfsOff,
+            "a folder with large-file support off is told that, not that it keeps content"
+        );
+        assert_eq!(
+            release_schedule(&row, None, LfsMode::Disabled),
+            ReleaseSchedule::LfsOff
         );
 
         // `releaseTtlMs = 0` reaches here as `None` (`effective_release_ttl_ms`)
         // and is the operator's documented way to say "never release from this
         // folder" — not a very short TTL.
         assert_eq!(
-            release_schedule(&row, None, false),
+            release_schedule(&row, None, LfsMode::PointerOnly),
             ReleaseSchedule::Indefinite
         );
 
@@ -9520,9 +9613,27 @@ mod tests {
         row.local_origin = true;
         row.last_used_ms = Some(i64::MAX / 2);
         assert_eq!(
-            release_schedule(&row, Some(TTL), false),
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
             ReleaseSchedule::Unconfirmed,
             "content that exists on this machine alone is never put on a clock"
+        );
+
+        // FR-341's other half, and the case the mutation above would otherwise
+        // hide: authored here AND confirmed upstream. This row IS on a clock,
+        // and the clock is the confirmation — the enormous `last_used_ms` beside
+        // it must not move the instant, because for content this clone authored
+        // a local use is not what makes the bytes safe to drop.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.local_origin = true;
+        row.synced_at_ms = Some(7_000);
+        row.last_used_ms = Some(i64::MAX / 2);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            ReleaseSchedule::Due {
+                at_ms: 7_000 + TTL as i64
+            },
+            "a confirmed locally-authored row counts down from the confirmation, \
+             never from a use"
         );
 
         // The ordinary row, and the instant is `release_due_at`'s own answer
@@ -9530,7 +9641,7 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(5_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), false),
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
             ReleaseSchedule::Due {
                 at_ms: 5_000 + TTL as i64
             }
@@ -9538,7 +9649,7 @@ mod tests {
         // …and `at_ms` when it has not been used since it landed.
         let row = ledger_row("clip.mp4", 1_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), false),
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
             ReleaseSchedule::Due {
                 at_ms: 1_000 + TTL as i64
             }
@@ -9550,10 +9661,14 @@ mod tests {
     ///
     /// `sync_ipc` maps this onto three wire fields and lives in a crate that
     /// cannot be compiled on every host this is developed on, so the pairing is
-    /// proven here, where a compiler and a test runner both are. A variant added
-    /// later that answered `None` to both would leave a materialized row with a
-    /// release cell and nothing in it; one answering `Some` to both would draw a
-    /// word over a ticking figure.
+    /// asserted here, where a compiler and a test runner both are. The *type* is
+    /// now what guarantees it — both accessors are one
+    /// `ReleaseSchedule::instant_or_words` away and that `Result` cannot express
+    /// "both" or "neither", so a variant which broke the pairing would not
+    /// compile — and this test is still worth having: it is what catches an
+    /// accessor rewired to the wrong side of the `Result`, and it names the
+    /// consequence a compiler cannot, which is a materialized row with a release
+    /// cell and nothing in it.
     #[test]
     fn release_schedule_pairs_an_instant_with_words_exactly_one_way() {
         let all = [
@@ -9562,6 +9677,7 @@ mod tests {
             ReleaseSchedule::Unconfirmed,
             ReleaseSchedule::Indefinite,
             ReleaseSchedule::ModeKeeps,
+            ReleaseSchedule::LfsOff,
         ];
 
         for schedule in &all {
@@ -9577,9 +9693,9 @@ mod tests {
         }
 
         // Pairwise distinct, because the sentence is the only thing carrying the
-        // difference between two rows that draw the same word: `Indefinite` and
-        // `ModeKeeps` both say "Kept", and they send the owner to different
-        // settings.
+        // difference between rows that draw the same word: `Indefinite`,
+        // `ModeKeeps` and `LfsOff` all say "Kept", and they send the owner to
+        // three different settings — one of them the opposite of another.
         let mut sentences: Vec<&str> = all.iter().map(ReleaseSchedule::sentence).collect();
         sentences.sort_unstable();
         let distinct = sentences.len();
@@ -9587,7 +9703,7 @@ mod tests {
         assert_eq!(
             sentences.len(),
             distinct,
-            "five reasons, five sentences — a shared one would tell somebody the wrong \
+            "six reasons, six sentences — a shared one would tell somebody the wrong \
              thing about their own file"
         );
     }

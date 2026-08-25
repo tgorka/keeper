@@ -114,10 +114,30 @@ describe("formatReleaseIn", () => {
     expect(formatReleaseIn(now + 1_000, now)).toBe("1s");
   });
 
-  it("rounds the final minute up, so a live deadline never reads 0s", () => {
-    // 45.4s left is still a 46th second the owner has.
-    expect(formatReleaseIn(now + 45_400, now)).toBe("46s");
+  it("floors the final minute, so a live deadline never reads 0s", () => {
+    // 45.4s left is 45 whole seconds left; the fraction is not a 46th second.
+    expect(formatReleaseIn(now + 45_400, now)).toBe("45s");
+    // The floor stops one millisecond short of "0s": the deadline has not come.
     expect(formatReleaseIn(now + 1, now)).toBe("1s");
+  });
+
+  it("counts the last minute down and never up, and never reads 60s", () => {
+    // The property the ceil broke: under the pane's 1 s tick the figure must
+    // never grow. Walk every whole second of the final minute plus its edges.
+    const wholeSeconds = Array.from({ length: 59 }, (_, i) => 59_000 - i * 1_000);
+    const samples = [60_000, 59_999, ...wholeSeconds, 1];
+    let previousSeconds = Number.POSITIVE_INFINITY;
+    for (const remainingMs of samples) {
+      const out = formatReleaseIn(now + remainingMs, now);
+      expect(out).not.toBe("60s");
+      const seconds = out.endsWith(" min") ? 60 : Number.parseInt(out, 10);
+      expect(seconds).toBeLessThanOrEqual(previousSeconds);
+      previousSeconds = seconds;
+    }
+    // The ladder's own reading of the rung it used to fumble.
+    expect(formatReleaseIn(now + 60_000, now)).toBe("1 min");
+    expect(formatReleaseIn(now + 59_999, now)).toBe("59s");
+    expect(formatReleaseIn(now + 1_000, now)).toBe("1s");
   });
 
   it("shows whole minutes under an hour", () => {
@@ -138,7 +158,7 @@ describe("formatReleaseIn", () => {
   });
 
   it("changes rung exactly at the minute, hour and day boundaries", () => {
-    expect(formatReleaseIn(now + 59_999, now)).toBe("60s");
+    expect(formatReleaseIn(now + 59_999, now)).toBe("59s");
     expect(formatReleaseIn(now + 60_000, now)).toBe("1 min");
     expect(formatReleaseIn(now + 3_599_999, now)).toBe("59 min");
     expect(formatReleaseIn(now + 3_600_000, now)).toBe("1 hr");
@@ -167,6 +187,15 @@ describe("formatReleaseIn", () => {
     // Past `MAX_DATE_MS` (8.64e15): an instant no `Date` can represent.
     expect(formatReleaseIn(8.64e15 + 1, now)).toBe("");
   });
+
+  it("returns an empty string for a non-finite now", () => {
+    // A NaN / infinite clock makes every rung comparison false, and the days
+    // branch would paint "NaN days" rather than admit it cannot render.
+    const deadline = now + 23 * 3_600_000;
+    expect(formatReleaseIn(deadline, Number.NaN)).toBe("");
+    expect(formatReleaseIn(deadline, Number.POSITIVE_INFINITY)).toBe("");
+    expect(formatReleaseIn(deadline, Number.NEGATIVE_INFINITY)).toBe("");
+  });
 });
 
 describe("formatReleaseSpoken", () => {
@@ -187,5 +216,14 @@ describe("formatReleaseSpoken", () => {
     expect(formatReleaseSpoken(0, now)).toBe("");
     expect(formatReleaseSpoken(Number.NaN, now)).toBe("");
     expect(formatReleaseSpoken(8.64e15 + 1, now)).toBe("");
+  });
+
+  it("speaks nothing when the clock itself is unusable", () => {
+    // Inherited from `formatReleaseIn`, not re-checked here: the phrase and the
+    // figure must agree about whether this row has a countdown at all.
+    const deadline = now + 23 * 3_600_000;
+    expect(formatReleaseSpoken(deadline, Number.NaN)).toBe("");
+    expect(formatReleaseSpoken(deadline, Number.POSITIVE_INFINITY)).toBe("");
+    expect(formatReleaseSpoken(deadline, Number.NEGATIVE_INFINITY)).toBe("");
   });
 });

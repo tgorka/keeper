@@ -116,7 +116,7 @@ export function formatDraftAge(ms: number, now: number = Date.now()): string {
  * table cell (Story 56.9, FR-343).
  *
  * - Past due, or exactly now → `"due"`.
- * - < 1 min → whole seconds, rounded up (e.g. `"45s"`).
+ * - < 1 min → whole seconds, floored (e.g. `"45s"`), never `"60s"`.
  * - < 1 h → whole minutes (e.g. `"12 min"`).
  * - < 24 h → whole hours (e.g. `"23 hr"`).
  * - Longer → whole days (`"1 day"` / `"6 days"`).
@@ -125,8 +125,8 @@ export function formatDraftAge(ms: number, now: number = Date.now()): string {
  * inverted — time remaining, not elapsed — with seconds added in the last
  * minute because the pane's 1 s tick needs something to move. A deadline in
  * the past, or a skewed clock, clamps to `"due"` rather than rendering a
- * negative. An invalid / non-positive / out-of-range deadline yields `""`, and
- * the caller then draws nothing at all.
+ * negative. An invalid / non-positive / out-of-range deadline yields `""`, as
+ * does a non-finite `now`, and the caller then draws nothing at all.
  *
  * `"due"` means *eligible*, never *gone*: keeper's release sweep runs on the
  * first successful sync after its own hourly gate, a bounded number of objects
@@ -142,6 +142,14 @@ export function formatReleaseIn(deadlineMs: number, now: number = Date.now()): s
   if (!Number.isFinite(deadlineMs) || deadlineMs <= 0 || deadlineMs > MAX_DATE_MS) {
     return "";
   }
+  // `now` is guarded for a sharper reason than the deadline: an unrenderable
+  // deadline fails this function's own test, but a `NaN` / `±Infinity` `now`
+  // makes every rung comparison below false, so control would fall through to
+  // the days branch and the cell would paint "NaN days". The answer is the
+  // module's usual one for anything it cannot render honestly — nothing.
+  if (!Number.isFinite(now)) {
+    return "";
+  }
   const remainingMs = deadlineMs - now;
   // The clamp: an expired deadline — or a clock that ran ahead of the backend's
   // — reads "due" instead of a negative figure with a minus sign in it.
@@ -149,9 +157,15 @@ export function formatReleaseIn(deadlineMs: number, now: number = Date.now()): s
     return "due";
   }
   if (remainingMs < 60_000) {
-    // Rounded up: 1 ms left is still a second the owner has, and "0s" would
-    // announce a deadline that has not arrived yet.
-    return `${Math.ceil(remainingMs / 1000)}s`;
+    // Floored, like the minutes, hours and days rungs below, so the whole
+    // ladder is one rule and the figure reads "at least this many seconds
+    // left". A `ceil` here rendered 59 999 ms as "60s", and under the pane's
+    // 1 s tick the last minute then counted *up* in unit terms: 1 min → 60s →
+    // 59s, the figure growing as the time shrank. Flooring makes the sequence
+    // monotonically non-increasing, which is the one property a countdown owes
+    // the person watching it. `max(1, …)` keeps the final millisecond from
+    // announcing "0s" for a deadline that has not arrived.
+    return `${Math.max(1, Math.floor(remainingMs / 1000))}s`;
   }
   if (remainingMs < 3_600_000) {
     return `${Math.floor(remainingMs / 60_000)} min`;
@@ -170,6 +184,11 @@ export function formatReleaseIn(deadlineMs: number, now: number = Date.now()): s
  * about what happens in 23 hours — so the spoken form carries the verb. Empty
  * exactly when the figure is empty, so a row that draws nothing announces
  * nothing either.
+ *
+ * Both of `formatReleaseIn`'s guards — the deadline's and `now`'s — are
+ * inherited through that single call and are deliberately not repeated here:
+ * one place decides what is renderable, so the cell and its screen-reader
+ * phrase cannot disagree about whether this row has a countdown at all.
  *
  * @param deadlineMs - When the row becomes releasable, ms since the Unix epoch (UTC).
  * @param now - Reference "now" in ms; defaults to `Date.now()` (injectable for tests).
