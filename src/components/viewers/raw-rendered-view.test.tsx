@@ -213,6 +213,10 @@ function Host({ initial, onSaved, loadedFrom, ...rest }: HostProps): React.React
 const CSV_TABLE: NoteCsvVm = {
   relPath: "data/rows.csv",
   rev: "rev-1",
+  // Reported by the parser now that it detects `;`, tab and pipe as well as
+  // `,` (owner item 7); a fixture omitting it would be a table no real read
+  // can produce.
+  delimiter: ",",
   columns: 2,
   totalRows: 2,
   rows: [

@@ -19,16 +19,26 @@ import { syntaxTree } from "@codemirror/language";
 import { EditorSelection, EditorState, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { within } from "@testing-library/dom";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import type { NoteCsvVm } from "@/lib/ipc/client";
 import { withRangeRects } from "@/test/layout";
 import { alignedTable, gfmTable } from "./format-commands";
 import { livePreview } from "./live-preview";
 import {
+  csvEmbedTarget,
+  csvTargetFor,
+  realignedCaret,
   splitTableRow,
+  TABLE_ASK_CLASS,
   TABLE_BLOCK_CLASS,
   TABLE_CELL_CLASS,
+  TABLE_FROM_CSV_LABEL,
+  TABLE_KEEP_LABEL,
+  TABLE_NOTICE_CLASS,
   TABLE_RAGGED_CLASS,
+  TABLE_REPLACE_LABEL,
   TABLE_SCROLL_CLASS,
+  TABLE_TO_CSV_LABEL,
   tableAfter,
   tableCellText,
   tableHits,
@@ -202,6 +212,54 @@ describe("the structural edits", () => {
       ["c", "d"],
       ["", ""],
     ]);
+  });
+});
+
+// --- Where a realign leaves the caret ----------------------------------------
+
+/**
+ * The rule the owner's `| a    la |` broke, checked without a view because it
+ * is arithmetic: a caret keeps its offset within its cell's TEXT, and can never
+ * be left standing in the padding around it.
+ */
+describe("the caret across a realign", () => {
+  it("keeps the caret's offset within the cell's text", () => {
+    // After `c`, in a cell that is about to be repadded narrower.
+    expect(realignedCaret("| cx    | d     |", "| cx  | d   |", 4)).toBe(4);
+    // And in the second cell, whose whole span moves left as the first shrinks.
+    expect(realignedCaret("| cx    | d     |", "| cx  | d   |", 10)).toBe(8);
+  });
+
+  /**
+   * The half of the rule the aligner cannot express by trimming. A caret in a
+   * cell's TRAILING padding survives `trim()` untouched, so nothing else pulls
+   * it back to the text — and a caret parked in padding is a caret whose next
+   * keystroke lands four columns away from the word it is in.
+   */
+  it("puts a caret standing in a cell's padding back on the end of its text", () => {
+    expect(realignedCaret("| c     | d     |", "| c   | d   |", 6)).toBe(3);
+    // The far edge of the cell, which is where a press on a wide empty cell
+    // lands: still the end of the text, and for an empty cell that is its
+    // first column.
+    expect(realignedCaret("|       | d     |", "|     | d   |", 7)).toBe(2);
+  });
+
+  /**
+   * The last cell of a row is a cell even when it is empty, and only the piece
+   * BEYOND the closing pipe is fence. Read the other way, an empty final cell
+   * is dropped, the caret standing in it belongs to no cell at all, and the
+   * correction is skipped for exactly the cell a new table is mostly made of.
+   */
+  it("finds an empty cell at the end of a row rather than mistaking it for fence", () => {
+    expect(realignedCaret("| a |   |", "| a   |     |", 6)).toBe(8);
+  });
+
+  it("declines a caret that is not in a cell at all", () => {
+    // Before the opening pipe and after the closing one: the fence is not a
+    // cell, so there is no offset to preserve and CodeMirror's own mapping is
+    // the right answer.
+    expect(realignedCaret("| c   | d   |", "| c | d |", 0)).toBeNull();
+    expect(realignedCaret("| c   | d   |", "| c | d |", 13)).toBeNull();
   });
 });
 
@@ -540,6 +598,59 @@ describe("a table in the note editor", () => {
     expect(line.text.slice(0, view.state.selection.main.head - line.from)).toBe("| cx");
   });
 
+  /**
+   * **The owner's report against 0.8.6, from their screenshot: typing `ala`
+   * into a cell produced `| a    la |`.** The first letter landed in one place
+   * and the other two somewhere else entirely, which makes a table unusable —
+   * you cannot type a word into a cell.
+   *
+   * The caret starts in the cell's alignment PADDING rather than on its first
+   * column, because that is where the gesture leaves it: the rendered block is
+   * replaced wholesale, so a press reveals the pipes and the press that follows
+   * lands wherever in the source line the pointer was — the middle or the right
+   * of a wide empty cell is padding. `End` and the arrow keys reach the same
+   * places.
+   *
+   * The mechanism, measured: the realign correctly pulls the typed `a` to the
+   * cell's first column, and the splice that does it starts BEFORE the caret
+   * and ends AT it, so CodeMirror maps the caret to the end of the inserted
+   * padding — the far end of the cell. `l` and `a` are then typed there, and
+   * because they are now interior to the cell's own text no realign takes the
+   * spaces between them out again.
+   */
+  it("types the owner's `ala` into one cell instead of leaving the first letter behind", () => {
+    const view = open("| Fruit | Notes |\n| ----- | ----- |\n|       |       |\n");
+    const body = view.state.doc.line(3);
+    // The right-hand edge of the first cell's five columns of padding.
+    view.dispatch({ selection: EditorSelection.cursor(body.from + 7) });
+
+    for (const char of [..."ala"]) {
+      type(view, char);
+    }
+
+    expect(view.state.doc.toString().split("\n")[2]).toBe("| ala   |       |");
+    // And the caret is where the typist's eye is: just past what they typed.
+    expect(view.state.selection.main.head).toBe(body.from + 5);
+  });
+
+  /**
+   * The same defect, stated as the rule that fixes it, at every column of one
+   * cell. Wherever in a cell the caret starts, the letter it types is the
+   * letter it is left standing after — the padding is not a place text can be.
+   */
+  it("leaves the caret on the typed letter from anywhere in a cell's padding", () => {
+    for (let column = 2; column <= 7; column += 1) {
+      const view = open("| Fruit | Notes |\n| ----- | ----- |\n|       |       |\n");
+      const body = view.state.doc.line(3);
+      view.dispatch({ selection: EditorSelection.cursor(body.from + column) });
+
+      type(view, "a");
+
+      expect(view.state.doc.toString().split("\n")[2]).toBe("| a     |       |");
+      expect(view.state.selection.main.head - body.from).toBe(3);
+    }
+  });
+
   it("aligns a table the moment the typed delimiter row makes it one", () => {
     // Two cells in the header and one in the delimiter row is not yet a table,
     // so nothing has been rewritten under the typist's hands. The keystroke
@@ -614,5 +725,450 @@ describe("a table in the note editor", () => {
     // Editing the paragraph below must not reformat the table above it: the
     // realign is scoped to the tables the change actually reached.
     expect(view.state.doc.toString()).toBe(`${CRAMPED}\n\nafter!\n`);
+  });
+});
+
+// --- A table and a CSV attachment are the same data --------------------------
+
+/**
+ * Item 8: the owner asked to convert a markdown table into a CSV attachment and
+ * back.
+ *
+ * The point of the forward direction is the file: the data stops being markdown
+ * that only this editor's aligner maintains and becomes something the Files
+ * pane, the export and every machine this vault syncs to can read. The point of
+ * the reverse is that this is not a one-way door.
+ *
+ * Rust is injected rather than mocked at the module boundary, which is
+ * `csv-table.ts`'s pattern for the same problem: the interesting paths here are
+ * the REFUSALS, and a refusal has to be handed to the widget to be tested.
+ */
+describe("converting between a table and a CSV attachment", () => {
+  const views: EditorView[] = [];
+  let restoreRects: (() => void) | null = null;
+
+  /** The table Rust says the file is after a write. `relPath` is the only field
+   *  this module reads — see the wrapper's own doc for why it must be that and
+   *  not the target that was asked for. */
+  function written(relPath: string): NoteCsvVm {
+    return {
+      relPath,
+      rev: "r1",
+      columns: 2,
+      totalRows: 2,
+      rows: [],
+      notices: [],
+      delimiter: ",",
+    };
+  }
+
+  let toRows: Mock<(vaultId: string, target: string) => Promise<string[][]>>;
+  let toCsv: Mock<
+    (vaultId: string, target: string, rows: string[][], overwrite: boolean) => Promise<NoteCsvVm>
+  >;
+
+  beforeEach(() => {
+    restoreRects = withRangeRects();
+    toRows = vi.fn();
+    toCsv = vi.fn();
+  });
+
+  afterEach(() => {
+    for (const view of views.splice(0)) {
+      view.destroy();
+    }
+    restoreRects?.();
+    restoreRects = null;
+  });
+
+  /**
+   * A view carrying the real layer and an injected Rust. `null` is the
+   * no-vault host, spelled as a value rather than as an omitted argument:
+   * passing `undefined` to a defaulted parameter takes the DEFAULT, which is
+   * how the first draft of this test asserted the vault case twice.
+   */
+  function open(doc: string, vaultId: string | null = "vault-1"): EditorView {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    const view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc,
+        // Parked at the end of the document, so a table at the top renders.
+        selection: EditorSelection.cursor(doc.length),
+        extensions: [
+          markdown({ base: markdownLanguage }),
+          tableLayer({
+            vaultId: vaultId ?? undefined,
+            convert: {
+              toRows: (vault, target) => toRows(vault, target),
+              toCsv: (vault, target, rows, overwrite) => toCsv(vault, target, rows, overwrite),
+            },
+          }),
+        ],
+      }),
+    });
+    views.push(view);
+    return view;
+  }
+
+  function control(view: EditorView, label: string): HTMLButtonElement {
+    const found = within(view.contentDOM).getByRole("button", { name: label });
+    if (!(found instanceof HTMLButtonElement)) {
+      throw new Error(`"${label}" is a ${found.tagName}, not a button`);
+    }
+    return found;
+  }
+
+  /** Let the fired-and-forgotten conversion settle. */
+  async function settled(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  const TABLE = ["| Fruit | Notes  |", "| ----- | ------ |", "| apple | crisp  |", ""].join("\n");
+
+  it("writes the table to a CSV attachment and leaves the embed in its place", async () => {
+    toCsv.mockResolvedValue(written("attachments/fruit-notes.csv"));
+    const view = open(TABLE);
+
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // A BARE name: Rust resolves it into the attachments folder, and composing
+    // that path here is the arithmetic AD-65 keeps out of the webview.
+    expect(toCsv).toHaveBeenCalledWith(
+      "vault-1",
+      "fruit-notes.csv",
+      [
+        ["Fruit", "Notes"],
+        ["apple", "crisp"],
+      ],
+      false,
+    );
+    // The path Rust ANSWERED with, not the one it was asked for, and Obsidian's
+    // embed spelling rather than CommonMark's — the other one renders as text.
+    expect(view.state.doc.toString()).toBe("![[attachments/fruit-notes.csv]]\n");
+  });
+
+  it("sends the value a reader sees, not the bytes the cell is escaped with", async () => {
+    toCsv.mockResolvedValue(written("attachments/a-b.csv"));
+    const view = open(["| a \\| b | c |", "| ------ | - |", "| 1      | 2 |", ""].join("\n"));
+
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // CSV has no pipe escape, and `a \| b` in a note is the one value `a | b`.
+    expect(toCsv.mock.calls[0][2][0]).toEqual(["a | b", "c"]);
+  });
+
+  it("fills a short row out to the header's width, because that is the table on screen", async () => {
+    toCsv.mockResolvedValue(written("attachments/a-b-c.csv"));
+    const view = open(["| a | b | c |", "| - | - | - |", "| 1 |", ""].join("\n"));
+
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    expect(toCsv.mock.calls[0][2]).toEqual([
+      ["a", "b", "c"],
+      ["1", "", ""],
+    ]);
+  });
+
+  /**
+   * **The clobber path (AD-89).** The command refuses an existing file rather
+   * than replacing it, and that refusal IS the existence probe: looking first
+   * and writing second has a window in it, because this folder is being synced
+   * and a file can arrive in the gap.
+   */
+  it("asks before it replaces a file, naming the file, and writes nothing until told", async () => {
+    toCsv.mockRejectedValue({
+      code: "notesInvalid",
+      message: "attachments/fruit-notes.csv is already there. The table was not written.",
+    });
+    const view = open(TABLE);
+
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // Rust's own sentence, which names the file — so the question names what it
+    // would destroy without this module composing a path to say it with.
+    const question = view.contentDOM.querySelector(`.${TABLE_ASK_CLASS}`);
+    expect(question?.textContent).toContain("attachments/fruit-notes.csv is already there");
+    // One call, and the table is still the user's table.
+    expect(toCsv).toHaveBeenCalledTimes(1);
+    expect(view.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("keeps the file when that is the answer, and asks again next time", async () => {
+    toCsv.mockRejectedValue({ code: "notesInvalid", message: "already there" });
+    const view = open(TABLE);
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    control(view, TABLE_KEEP_LABEL).dispatchEvent(new MouseEvent("click"));
+
+    // Nothing written, nothing asked twice, and the question is gone rather
+    // than left on screen as an unanswered warning.
+    expect(toCsv).toHaveBeenCalledTimes(1);
+    expect(view.state.doc.toString()).toBe(TABLE);
+    expect(view.contentDOM.querySelector(`.${TABLE_ASK_CLASS}`)).toBeNull();
+  });
+
+  it("replaces the file only on the second, explicit press", async () => {
+    toCsv
+      .mockRejectedValueOnce({ code: "notesInvalid", message: "already there" })
+      .mockResolvedValueOnce(written("attachments/fruit-notes.csv"));
+    const view = open(TABLE);
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    control(view, TABLE_REPLACE_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // The same rows, and now `overwrite` — the flag is never defaulted, because
+    // what is at stake is a file of the user's data.
+    expect(toCsv.mock.calls[1][3]).toBe(true);
+    expect(view.state.doc.toString()).toBe("![[attachments/fruit-notes.csv]]\n");
+  });
+
+  it("says why a conversion failed instead of appearing to do nothing", async () => {
+    toCsv.mockRejectedValue({ code: "unsupported", message: "that file is too large to table." });
+    const view = open(TABLE);
+
+    control(view, TABLE_TO_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    expect(view.contentDOM.querySelector(`.${TABLE_NOTICE_CLASS}`)?.textContent).toBe(
+      "that file is too large to table.",
+    );
+    // A refusal that is not "the file exists" is not a question: there is
+    // nothing here for the user to answer.
+    expect(view.contentDOM.querySelector(`.${TABLE_ASK_CLASS}`)).toBeNull();
+    expect(view.state.doc.toString()).toBe(TABLE);
+  });
+
+  // --- And back ----------------------------------------------------------
+
+  const EMBED = "notes\n\n![[attachments/people.csv]]\n";
+
+  /** The caret on the embed's line, which is where its control appears and
+   *  where `live-preview.ts` has already stopped rendering over the source. */
+  function caretOnEmbed(view: EditorView): void {
+    view.dispatch({ selection: EditorSelection.cursor(view.state.doc.line(3).from) });
+  }
+
+  it("reads the attachment back as an aligned GFM table", async () => {
+    toRows.mockResolvedValue([
+      ["name", "role"],
+      ["Ada", "engineer"],
+      ["Bo", "cook"],
+    ]);
+    const view = open(EMBED);
+    caretOnEmbed(view);
+
+    control(view, TABLE_FROM_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    expect(toRows).toHaveBeenCalledWith("vault-1", "attachments/people.csv");
+    // 44.9's aligner, through this module's one caller of it — not a second
+    // markdown table writer.
+    expect(view.state.doc.toString()).toBe(
+      [
+        "notes",
+        "",
+        "| name | role     |",
+        "| ---- | -------- |",
+        "| Ada  | engineer |",
+        "| Bo   | cook     |",
+        "",
+      ].join("\n"),
+    );
+    // And the file is still on disk: deleting it would be a destructive act
+    // from a button that says "convert".
+    expect(view.state.doc.toString()).not.toContain("![[");
+  });
+
+  it("escapes a field holding a pipe, so the row it writes is still one row", async () => {
+    toRows.mockResolvedValue([["a"], ["x|y"]]);
+    const view = open(EMBED);
+    caretOnEmbed(view);
+
+    control(view, TABLE_FROM_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // Unescaped, `x|y` would be two cells, the row would stop matching the
+    // header, and the block would not be a table at all.
+    expect(view.state.doc.toString()).toContain("| x\\|y |");
+    expect(tableHits(view.state.doc)).toHaveLength(1);
+  });
+
+  it("refuses a field holding a line break and names it, rather than flattening it", async () => {
+    toRows.mockResolvedValue([
+      ["note", "who"],
+      ["two\nlines", "Ada"],
+    ]);
+    const view = open(EMBED);
+    caretOnEmbed(view);
+
+    control(view, TABLE_FROM_CSV_LABEL).dispatchEvent(new MouseEvent("click"));
+    await settled();
+
+    // A markdown cell has no spelling for a line break, and a spreadsheet
+    // export is exactly where multi-line fields come from. Naming the field
+    // beats rewriting the user's data into a space.
+    const notice = view.contentDOM.querySelector(`.${TABLE_NOTICE_CLASS}`);
+    expect(notice?.textContent).toContain("Record 2, field 1 holds a line break");
+    expect(view.state.doc.toString()).toBe(EMBED);
+  });
+
+  /**
+   * The doc alone cannot carry this test: reading the line BEFORE the command
+   * instead of after it leaves the doc equally unchanged, because the stale
+   * offsets are out of range in a note that got shorter and the dispatch throws
+   * inside a promise nobody awaits. So what is asserted is the refusal itself,
+   * on the control that asked for it — which is still the element that was
+   * pressed even though the line it belonged to is gone.
+   */
+  it("refuses instead of writing when the line moved while the read was in flight", async () => {
+    let answer: (rows: string[][]) => void = () => {};
+    toRows.mockReturnValue(
+      new Promise<string[][]>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const view = open(EMBED);
+    caretOnEmbed(view);
+    const pressed = control(view, TABLE_FROM_CSV_LABEL);
+    const host = pressed.parentElement;
+    pressed.dispatchEvent(new MouseEvent("click"));
+
+    // The note is edited while the command is in flight, which is the whole
+    // reason the line is re-found after the read and not before it.
+    const line = view.state.doc.line(3);
+    view.dispatch({ changes: { from: line.from, to: line.to, insert: "gone" } });
+    answer([["a"], ["b"]]);
+    await settled();
+
+    // Three lines of table over whatever now occupies those offsets is the
+    // failure this avoids, and it says so rather than failing silently.
+    expect(host?.querySelector(`.${TABLE_NOTICE_CLASS}`)?.textContent).toContain(
+      "changed while keeper was working",
+    );
+    expect(view.state.doc.toString()).toBe("notes\n\ngone\n");
+  });
+
+  it("offers no control on a line that holds more than the embed", () => {
+    const view = open("notes\n\nsee ![[attachments/people.csv]] for the list\n");
+    caretOnEmbed(view);
+
+    // A table owns its lines: an embed in the middle of a sentence has nowhere
+    // to put three lines of pipes, so it is not offered rather than offered
+    // and refused.
+    expect(
+      within(view.contentDOM).queryAllByRole("button", { name: TABLE_FROM_CSV_LABEL }),
+    ).toHaveLength(0);
+  });
+
+  it("offers no control while a predicate block follows the embed", () => {
+    const view = open("notes\n\n![[attachments/people.csv]]{ :value_of }\n");
+    caretOnEmbed(view);
+
+    // Converting the line would delete a predicate the author wrote, and this
+    // control is not the place that decides what happens to it.
+    expect(
+      within(view.contentDOM).queryAllByRole("button", { name: TABLE_FROM_CSV_LABEL }),
+    ).toHaveLength(0);
+  });
+
+  it("disables both conversions and says why when there is no vault to write to", () => {
+    const view = open(TABLE, null);
+
+    const out = control(view, TABLE_TO_CSV_LABEL);
+    expect(out.disabled).toBe(true);
+    // A control that vanishes is a feature the user concludes does not exist;
+    // one that is dimmed and says why is a fact about this editor.
+    expect(out.title).toContain("cannot see a vault");
+
+    const embed = open(EMBED, null);
+    caretOnEmbed(embed);
+    expect(control(embed, TABLE_FROM_CSV_LABEL).disabled).toBe(true);
+  });
+
+  /**
+   * 60 correct unit tests say nothing about whether the product composes this
+   * at all. These two assertions are the ones that do: without
+   * `tableLayer({ vaultId })` at `livePreview`'s callsite both conversions
+   * would be permanently disabled in the app while every test above passed.
+   */
+  it("is reachable from the product's own renderer and not only from this test", () => {
+    /** A view over the real renderer, with the caret where the test needs it. */
+    function product(doc: string, caret: number): EditorView {
+      const parent = document.createElement("div");
+      document.body.append(parent);
+      const view = new EditorView({
+        parent,
+        state: EditorState.create({
+          doc,
+          selection: EditorSelection.cursor(caret),
+          extensions: [
+            markdown({ base: markdownLanguage }),
+            livePreview({ vaultId: "vault-1", assetUrl: (rel) => rel, onOpenLink: () => {} }),
+          ],
+        }),
+      });
+      views.push(view);
+      return view;
+    }
+
+    const table = product(TABLE, TABLE.length);
+    expect(control(table, TABLE_TO_CSV_LABEL).disabled).toBe(false);
+
+    // The way back, in the renderer that owns the embed. The caret starts ON
+    // the embed's line, which is both where the control belongs and what stops
+    // `livePreview` mounting its CSV panel over the same range — the two
+    // decorations cannot both replace it, and the reveal rule is what keeps
+    // them out of each other's way.
+    const embed = product(EMBED, 7);
+    expect(embed.state.doc.lineAt(7).number).toBe(3);
+    expect(control(embed, TABLE_FROM_CSV_LABEL).disabled).toBe(false);
+  });
+});
+
+// --- The conversion's pure parts ---------------------------------------------
+
+describe("naming the file a table becomes", () => {
+  it("names it after the header, in characters a wikilink can spell", () => {
+    expect(csvTargetFor(["Fruit", "Notes"])).toBe("fruit-notes.csv");
+    // `#`, `|`, `[`, `]` and `^` are the characters no embed can name a file
+    // with, so a header carrying them cannot leave them in the path.
+    expect(csvTargetFor(["Cost (#)", "Δ"])).toBe("cost.csv");
+  });
+
+  it("falls back rather than naming a file after nothing", () => {
+    expect(csvTargetFor(["", ""])).toBe("table.csv");
+    expect(csvTargetFor(["///"])).toBe("table.csv");
+  });
+
+  it("does not leave a truncated name ending in a separator", () => {
+    expect(csvTargetFor(["a".repeat(60)])).toBe(`${"a".repeat(48)}.csv`);
+    expect(csvTargetFor([`${"b".repeat(48)} tail`])).toBe(`${"b".repeat(48)}.csv`);
+  });
+});
+
+describe("reading a CSV embed's line", () => {
+  it("takes the target from a line that holds one embed and nothing else", () => {
+    expect(csvEmbedTarget("![[attachments/people.csv]]")).toBe("attachments/people.csv");
+    expect(csvEmbedTarget("  ![[people.CSV]]  ")).toBe("people.CSV");
+  });
+
+  it("declines anything else", () => {
+    expect(csvEmbedTarget("see ![[a.csv]] here")).toBeNull();
+    // A link, not an embed: nothing was asked to be shown, so nothing is
+    // offered to be converted.
+    expect(csvEmbedTarget("[[a.csv]]")).toBeNull();
+    expect(csvEmbedTarget("![[a.png]]")).toBeNull();
+    expect(csvEmbedTarget("![[a.csv]]{ :value_of }")).toBeNull();
   });
 });

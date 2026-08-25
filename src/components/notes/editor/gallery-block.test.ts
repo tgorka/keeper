@@ -28,6 +28,9 @@ function item(name: string, kind: NoteGalleryItemVm["kind"]): NoteGalleryItemVm 
   return {
     name,
     relPath,
+    // The vault frame, null only above the vault root (owner item 10). A
+    // gallery block lists the vault, so every entry it can show is inside it.
+    vaultRelPath: relPath,
     kind,
     url:
       kind === "video" || kind === "image" || kind === "audio"

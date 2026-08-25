@@ -36,10 +36,20 @@
 //! unterminated quote likewise parses to one enormous field, which is what the
 //! bytes say, and the reader is told so instead of being left to wonder.
 //!
-//! **The vocabulary is RFC 4180 and nothing wider.** The delimiter is a comma;
-//! `;`, tab and pipe are not sniffed, because a sniffer that guesses wrong
-//! rewrites the wrong bytes and a `.tsv` is a different file with a different
-//! extension. A record ends at `\n` or `\r\n` — the same definition
+//! **The grammar is RFC 4180; the delimiter is detected.** A European Excel
+//! export is semicolon-separated, and keeper drew the owner's file as one
+//! column because this module used to insist on a comma. It used to argue that
+//! a sniffer which guesses wrong rewrites the wrong bytes — true of a
+//! parse-then-reserialise writer, and not true here. This writer splices one
+//! field's bytes over the original and re-emits nothing else, so a wrong guess
+//! draws a wrong TABLE and cannot corrupt a file: the delimiters it misread are
+//! bytes it never touched, and a cell whose span is wrong still writes inside
+//! the record the author wrote. The only thing detection has to get right is
+//! agreeing with the author about where the fields are, which is a question the
+//! file itself answers — see [`detect_delimiter`], which believes a candidate
+//! only when it yields the SAME field count, greater than one, across the
+//! opening records, and falls back to the comma when two candidates both do or
+//! neither does. A record ends at `\n` or `\r\n` — the same definition
 //! [`crate::notes::line_bounds`] already uses for every other file in this
 //! crate — so a lone `\r` stays inside its field rather than becoming a second
 //! opinion about what a line is. Anything the grammar does not cover (junk
@@ -52,8 +62,26 @@ use std::borrow::Cow;
 use crate::notes::vm::{NoteCsvRowVm, NoteCsvVm};
 use crate::notes::{bom_len, line_number};
 
-/// The field separator. See the module doc for why this is not configurable.
-const DELIMITER: u8 = b',';
+/// The separator assumed when the file does not say which one it is: an empty
+/// file, a single column, or two candidates that both read the file cleanly.
+/// RFC 4180's own answer, and the one a `.csv` means when nothing suggests
+/// otherwise.
+const DEFAULT_DELIMITER: u8 = b',';
+
+/// The separators [`detect_delimiter`] will consider, in the order it prefers
+/// them. Comma first so a tie resolves to it by the same walk that finds it.
+///
+/// Four and not more: each extra candidate is another way for an ordinary file
+/// to be read as a grid it is not, and these are the four a spreadsheet
+/// actually writes. A space is deliberately absent — prose is full of them.
+const CANDIDATE_DELIMITERS: [u8; 4] = *b",;\t|";
+
+/// How many opening records a candidate is judged on.
+///
+/// Enough that a coincidence in the header alone cannot decide the file, few
+/// enough that detection stays a constant cost on a file of any size — it runs
+/// four times, once per candidate, before the real parse.
+const DETECTION_RECORDS: usize = 10;
 
 /// One field, and the bytes it occupies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,22 +143,47 @@ impl CsvRow {
     }
 }
 
-/// A parsed CSV: every record, every field, and where each one's bytes are.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A parsed CSV: every record, every field, where each one's bytes are, and the
+/// separator those fields were split on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Csv {
     rows: Vec<CsvRow>,
     width: usize,
     unterminated_quote: Option<usize>,
+    delimiter: u8,
+}
+
+/// Hand-written rather than derived: a derived `Default` would put `0` in
+/// `delimiter`, and a NUL is not a separator any parse of this type used. An
+/// empty `Csv` is an empty comma-separated file, which is what
+/// [`DEFAULT_DELIMITER`] means everywhere else here.
+impl Default for Csv {
+    fn default() -> Self {
+        Csv {
+            rows: Vec::new(),
+            width: 0,
+            unterminated_quote: None,
+            delimiter: DEFAULT_DELIMITER,
+        }
+    }
 }
 
 impl Csv {
-    /// Record every field's span and value.
+    /// Record every field's span and value, splitting on the separator the file
+    /// itself indicates ([`detect_delimiter`]).
     ///
     /// Never fails. A CSV has no syntax error that justifies showing the user
     /// nothing — every byte belongs to some field, and the odd shapes are
     /// reported through [`Csv::ragged_rows`] and
     /// [`Csv::unterminated_quote`] rather than by refusing.
     pub fn parse(source: &str) -> Csv {
+        Csv::parse_with(source, detect_delimiter(source))
+    }
+
+    /// [`Csv::parse`] against a separator the caller already knows — the
+    /// conversion entry points, which are told which delimiter to speak, and
+    /// detection itself, which tries all four.
+    pub fn parse_with(source: &str, delimiter: u8) -> Csv {
         let mut rows: Vec<CsvRow> = Vec::new();
         let mut unterminated_quote = None;
         // The BOM belongs to the file, not to the first field: including it in
@@ -138,7 +191,7 @@ impl Csv {
         // edit of that cell would eat it.
         let mut at = bom_len(source);
         while at < source.len() {
-            let (row, open_quote, next) = parse_record(source, at);
+            let (row, open_quote, next) = parse_record(source, at, delimiter);
             if open_quote && unterminated_quote.is_none() {
                 unterminated_quote = Some(row.line);
             }
@@ -150,7 +203,13 @@ impl Csv {
             rows,
             width,
             unterminated_quote,
+            delimiter,
         }
+    }
+
+    /// The separator these fields were split on.
+    pub fn delimiter(&self) -> u8 {
+        self.delimiter
     }
 
     pub fn rows(&self) -> &[CsvRow] {
@@ -242,7 +301,7 @@ pub fn set_cell(source: &str, row: usize, column: usize, value: &str) -> Result<
     }
 
     let (from, to) = field.span;
-    let encoded = encode(value, field.quoted);
+    let encoded = encode(value, field.quoted, csv.delimiter);
     let mut out = String::with_capacity(source.len() - (to - from) + encoded.len());
     out.push_str(&source[..from]);
     out.push_str(&encoded);
@@ -250,16 +309,21 @@ pub fn set_cell(source: &str, row: usize, column: usize, value: &str) -> Result<
     Ok(out)
 }
 
-/// The bytes a new cell value is written as.
+/// The bytes a new cell value is written as, for a file separated by
+/// `delimiter`.
 ///
-/// Quoted when the value forces it — a delimiter, a quote or a line ending
-/// inside an unquoted field would end the field early and shift every column
-/// after it — and also when the field was already quoted, so an edit inside
-/// `"a","b","c"` does not leave one bare column behind.
-fn encode(value: &str, keep_quoted: bool) -> Cow<'_, str> {
+/// Quoted when the value forces it — the file's own delimiter, a quote or a
+/// line ending inside an unquoted field would end the field early and shift
+/// every column after it — and also when the field was already quoted, so an
+/// edit inside `"a","b","c"` does not leave one bare column behind.
+///
+/// `delimiter` and not a constant: writing a semicolon file's cell as if the
+/// separator were a comma would leave `a;b` bare in a `;`-separated record and
+/// split one cell into two the next time it is read.
+fn encode(value: &str, keep_quoted: bool, delimiter: u8) -> Cow<'_, str> {
     let must_quote = value
         .bytes()
-        .any(|byte| matches!(byte, DELIMITER | b'"' | b'\n' | b'\r'));
+        .any(|byte| byte == delimiter || matches!(byte, b'"' | b'\n' | b'\r'));
     if !must_quote && !keep_quoted {
         return Cow::Borrowed(value);
     }
@@ -276,19 +340,19 @@ fn encode(value: &str, keep_quoted: bool) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// One record starting at `start`. Returns it, whether a quote was left open,
-/// and the offset the next record starts at.
-fn parse_record(source: &str, start: usize) -> (CsvRow, bool, usize) {
+/// One record starting at `start`, split on `delimiter`. Returns it, whether a
+/// quote was left open, and the offset the next record starts at.
+fn parse_record(source: &str, start: usize, delimiter: u8) -> (CsvRow, bool, usize) {
     let bytes = source.as_bytes();
     let mut fields = Vec::new();
     let mut open_quote = false;
     let mut at = start;
     loop {
-        let (field, unterminated, next) = parse_field(source, at);
+        let (field, unterminated, next) = parse_field(source, at, delimiter);
         open_quote |= unterminated;
         fields.push(field);
         at = next;
-        if bytes.get(at) == Some(&DELIMITER) {
+        if bytes.get(at) == Some(&delimiter) {
             at += 1;
             continue;
         }
@@ -319,9 +383,9 @@ fn parse_record(source: &str, start: usize) -> (CsvRow, bool, usize) {
 
 /// One field starting at `start`. Returns it, whether its opening quote never
 /// closed, and the offset of the delimiter or terminator that ended it.
-fn parse_field(source: &str, start: usize) -> (CsvField, bool, usize) {
+fn parse_field(source: &str, start: usize, delimiter: u8) -> (CsvField, bool, usize) {
     if source.as_bytes().get(start) != Some(&b'"') {
-        let end = scan_bare(source, start);
+        let end = scan_bare(source, start, delimiter);
         return (
             CsvField {
                 span: (start, end),
@@ -360,7 +424,7 @@ fn parse_field(source: &str, start: usize) -> (CsvField, bool, usize) {
     // Bytes between the closing quote and the field's real end — `"a"x,b` — are
     // not RFC 4180 and are in somebody's file anyway. They join the value
     // instead of being dropped.
-    let end = scan_bare(source, at);
+    let end = scan_bare(source, at, delimiter);
     value.push_str(&source[at..end]);
     (
         CsvField {
@@ -375,19 +439,140 @@ fn parse_field(source: &str, start: usize) -> (CsvField, bool, usize) {
 
 /// Advance to the delimiter, the line terminator or the end of the source.
 ///
-/// Byte-wise, which is safe and returns a char boundary because none of `,`,
-/// `\n` or `\r` can occur inside a multi-byte UTF-8 sequence.
-fn scan_bare(source: &str, from: usize) -> usize {
+/// Byte-wise, which is safe and returns a char boundary because every
+/// candidate delimiter is ASCII and neither it, `\n` nor `\r` can occur inside
+/// a multi-byte UTF-8 sequence. A non-ASCII `delimiter` would break that, which
+/// is why [`CANDIDATE_DELIMITERS`] is the only source of one.
+fn scan_bare(source: &str, from: usize, delimiter: u8) -> usize {
     let bytes = source.as_bytes();
     let mut at = from;
     while at < bytes.len() {
         match bytes[at] {
-            DELIMITER | b'\n' => return at,
+            byte if byte == delimiter => return at,
+            b'\n' => return at,
             b'\r' if bytes.get(at + 1) == Some(&b'\n') => return at,
             _ => at += 1,
         }
     }
     at
+}
+
+// ---------------------------------------------------------------------------
+// Which separator the file is using
+// ---------------------------------------------------------------------------
+
+/// The separator this file is written with, one of [`CANDIDATE_DELIMITERS`].
+///
+/// The owner's real attachment is semicolon-separated — which is what Excel
+/// exports anywhere the decimal separator is a comma — and keeper drew it as a
+/// single column, because the parser only ever split on `,`. That is the defect
+/// this exists to close.
+///
+/// **The test is agreement, not frequency.** A count of candidate bytes picks
+/// the comma out of `a;b;"1,5";c` and gets the file wrong. Instead each
+/// candidate is used to actually parse the opening records, and one is believed
+/// only when every record it produced has the SAME number of fields and that
+/// number is greater than one. A separator that is really a separator lays the
+/// file out in a rectangle; a character that merely occurs in the text does
+/// not. That is also why the shape `id,"a; b",tail` cannot be misread as
+/// semicolon-separated: splitting on `;` cuts through the quoted field and the
+/// row below it has one field, so the counts disagree and `;` is not believed.
+///
+/// **Two believable candidates mean the comma.** `a,b;c` reads as a rectangle
+/// either way and only the author knows which; RFC 4180 and the file extension
+/// both say comma, so an ambiguous file is read the way it always was rather
+/// than by a coin toss that changes with the row count.
+///
+/// Records with a single empty field — a blank line, and the trailing one a
+/// great many exports end with — are passed over rather than counted. A line
+/// with nothing on it contains no evidence about any candidate, and letting it
+/// break the agreement test would send every file that ends in a blank line
+/// back to the comma.
+pub fn detect_delimiter(source: &str) -> u8 {
+    let mut believed: Option<u8> = None;
+    for candidate in CANDIDATE_DELIMITERS {
+        // A width of one is what a candidate that is simply absent produces on
+        // every line, so it is evidence of nothing rather than a rectangle.
+        if !matches!(agreed_width(source, candidate), Some(width) if width > 1) {
+            continue;
+        }
+        if believed.is_some() {
+            return DEFAULT_DELIMITER;
+        }
+        believed = Some(candidate);
+    }
+    believed.unwrap_or(DEFAULT_DELIMITER)
+}
+
+/// The field count every one of the opening records has under `delimiter`, or
+/// `None` when they disagree or there is nothing to judge.
+fn agreed_width(source: &str, delimiter: u8) -> Option<usize> {
+    let mut at = bom_len(source);
+    let mut agreed: Option<usize> = None;
+    let mut judged = 0usize;
+    while at < source.len() && judged < DETECTION_RECORDS {
+        let (record, _open_quote, next) = parse_record(source, at, delimiter);
+        at = next;
+        judged += 1;
+        // A blank line: one field, holding nothing. Skipped, never compared.
+        if record.fields.len() == 1 && record.fields[0].value.is_empty() {
+            continue;
+        }
+        match agreed {
+            None => agreed = Some(record.fields.len()),
+            Some(width) if width == record.fields.len() => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
+}
+
+// ---------------------------------------------------------------------------
+// Bytes to a grid and back, for the table/markdown conversions
+// ---------------------------------------------------------------------------
+
+/// A CSV's cells as a plain grid, for the conversion that turns an attachment
+/// into a markdown table.
+///
+/// Spans are dropped on purpose. A conversion has no cell to splice — it is
+/// producing a different document in a different syntax — so it needs the
+/// values and nothing else, and handing it a [`Csv`] would hand it the
+/// machinery for a byte-preserving write it must not perform. Ragged records
+/// keep the field count they have, exactly as the table shows them: a
+/// conversion is not the moment to start padding somebody's export.
+pub fn table_rows(source: &str, delimiter: u8) -> Vec<Vec<String>> {
+    Csv::parse_with(source, delimiter)
+        .rows
+        .into_iter()
+        .map(|record| record.fields.into_iter().map(|field| field.value).collect())
+        .collect()
+}
+
+/// A grid written back out as RFC 4180 bytes separated by `delimiter`.
+///
+/// The one place in this module that composes a whole file rather than splicing
+/// one field, and it is only reachable from a conversion — the user asked for a
+/// markdown table to become an attachment, so these bytes have no original to
+/// preserve. [`set_cell`] remains the only path an EXISTING file is written by,
+/// and it still never re-serialises.
+///
+/// Quoting is minimal: a value is bare unless the delimiter, a quote or a line
+/// ending inside it would end the field early. `\n` terminators including a
+/// final one, because a text file's last line ends — and an empty grid is an
+/// empty file rather than a lone newline.
+pub fn csv_bytes(rows: &[Vec<String>], delimiter: u8) -> String {
+    let separator = delimiter as char;
+    let mut out = String::new();
+    for row in rows {
+        for (column, value) in row.iter().enumerate() {
+            if column > 0 {
+                out.push(separator);
+            }
+            out.push_str(&encode(value, false, delimiter));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +664,10 @@ pub fn project(source: &str, rel_path: String, rev: String) -> NoteCsvVm {
         total_rows: total as u32,
         rows,
         notices,
+        // The detected separator, so a table the user edits and a conversion
+        // back to bytes speak the file's own dialect rather than re-deciding
+        // it from cells that no longer carry it.
+        delimiter: (csv.delimiter() as char).to_string(),
     }
 }
 
@@ -852,6 +1041,229 @@ mod tests {
         assert!(
             notice.contains("9 MB") && notice.contains("4 MB"),
             "{notice}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Which separator the file is using (item 7)
+    // -----------------------------------------------------------------------
+
+    /// The owner's file. A European Excel export is semicolon-separated, and
+    /// keeper drew it as a single column of `id;name;amount` strings.
+    #[test]
+    fn a_semicolon_export_parses_into_its_columns_rather_than_one() {
+        let source = "id;name;amount\n1;Kowalski;12,50\n2;Nowak;3,00\n";
+        assert_eq!(detect_delimiter(source), b';');
+
+        let csv = Csv::parse(source);
+        assert_eq!(csv.width(), 3, "three columns, not one");
+        assert_eq!(csv.rows().len(), 3);
+        assert_eq!(csv.cell(1, 1), Some("Kowalski"));
+        // The decimal comma is part of the value, which is the whole reason
+        // this file is semicolon-separated in the first place.
+        assert_eq!(csv.cell(1, 2), Some("12,50"));
+        assert_eq!(csv.ragged_rows(), 0);
+    }
+
+    #[test]
+    fn a_tab_and_a_pipe_file_are_read_the_same_way() {
+        let tabbed = "id\tname\n1\tKowalski\n2\tNowak\n";
+        assert_eq!(detect_delimiter(tabbed), b'\t');
+        assert_eq!(Csv::parse(tabbed).cell(1, 1), Some("Kowalski"));
+        assert_eq!(Csv::parse(tabbed).width(), 2);
+
+        let piped = "id|name\n1|Kowalski\n2|Nowak\n";
+        assert_eq!(detect_delimiter(piped), b'|');
+        assert_eq!(Csv::parse(piped).cell(1, 1), Some("Kowalski"));
+        assert_eq!(Csv::parse(piped).width(), 2);
+    }
+
+    /// The regression that matters most: every file that worked before still
+    /// reads as comma-separated, including the awkward ones detection could
+    /// plausibly get wrong (ragged, unterminated quote, BOM, CRLF, one row).
+    #[test]
+    fn every_comma_file_is_still_read_as_comma_separated() {
+        for (name, source) in corpus() {
+            assert_eq!(
+                detect_delimiter(source),
+                b',',
+                "{name}: a comma file must not be detected as anything else"
+            );
+        }
+        // And a trailing blank line — which a great many exports have — does
+        // not send a semicolon file back to the comma by breaking the
+        // agreement test with a one-field record.
+        assert_eq!(detect_delimiter("a;b\nc;d\n\n"), b';');
+        assert_eq!(detect_delimiter("a;b\n\nc;d\n"), b';');
+    }
+
+    /// A file with no separator in it at all is one column, not a failure and
+    /// not a file the detector talks itself into splitting.
+    #[test]
+    fn a_single_column_file_stays_one_column() {
+        let source = "heading\nalpha\nbeta\ngamma\n";
+        assert_eq!(detect_delimiter(source), b',');
+        let csv = Csv::parse(source);
+        assert_eq!(csv.width(), 1);
+        assert_eq!(csv.rows().len(), 4);
+        assert_eq!(csv.cell(2, 0), Some("beta"));
+        assert_eq!(csv.ragged_rows(), 0);
+    }
+
+    /// A semicolon INSIDE a quoted field of a comma-separated file. Splitting
+    /// on `;` cuts straight through the quotes, so the rows it produces do not
+    /// agree on a field count and the candidate is not believed.
+    ///
+    /// The second assertion is the harder one: with only the header to judge,
+    /// both candidates lay the file out in a rectangle, and an ambiguous file
+    /// must fall back to the comma rather than pick by frequency.
+    #[test]
+    fn a_semicolon_inside_a_quoted_comma_field_does_not_win() {
+        let source = "id,\"note; with a semicolon\",tail\n1,x,y\n2,p,q\n";
+        assert_eq!(detect_delimiter(source), b',');
+        let csv = Csv::parse(source);
+        assert_eq!(csv.width(), 3);
+        assert_eq!(csv.cell(0, 1), Some("note; with a semicolon"));
+        assert_eq!(csv.ragged_rows(), 0);
+
+        assert_eq!(
+            detect_delimiter("id,\"note; here\",tail\n"),
+            b',',
+            "one record reads as a rectangle under both, so the comma wins the tie"
+        );
+        assert_eq!(
+            detect_delimiter("a,b;c\nd,e;f\n"),
+            b',',
+            "two candidates that both read the file cleanly mean the comma, \
+             not a coin toss that changes with the row count"
+        );
+    }
+
+    /// The byte-identity promise, on a file that is not comma-separated. The
+    /// splice has to know the file's own delimiter or the spans are wrong.
+    #[test]
+    fn a_semicolon_file_is_written_back_byte_for_byte_and_spliced_in_place() {
+        let source = "\u{feff}id;note;tail\r\n1;\"Doe; Jane\";x\r\n2;plain;y";
+        let csv = Csv::parse(source);
+        for (row, record) in csv.rows().iter().enumerate() {
+            for (column, field) in record.fields().iter().enumerate() {
+                assert_eq!(
+                    set_cell(source, row, column, field.value())
+                        .expect("the cell exists")
+                        .as_bytes(),
+                    source.as_bytes(),
+                    "writing ({row},{column}) back changed the file"
+                );
+            }
+        }
+        assert_eq!(
+            set_cell(source, 1, 1, "Roe; Richard").expect("the edit applies"),
+            "\u{feff}id;note;tail\r\n1;\"Roe; Richard\";x\r\n2;plain;y"
+        );
+        // A value carrying the FILE's delimiter must be quoted even though it
+        // holds no comma at all — bare, it would split one cell into two.
+        assert_eq!(
+            set_cell("a;b\n", 0, 0, "x;y").expect("the edit applies"),
+            "\"x;y\";b\n"
+        );
+        assert_eq!(
+            set_cell("a;b\n", 0, 0, "x,y").expect("the edit applies"),
+            "x,y;b\n",
+            "a comma is ordinary text in a semicolon file and must not be quoted"
+        );
+    }
+
+    #[test]
+    fn the_projected_table_tells_the_webview_which_separator_it_read() {
+        assert_eq!(
+            project("a;b\n1;2\n", "d.csv".to_owned(), "r".to_owned()).delimiter,
+            ";"
+        );
+        assert_eq!(
+            project("a,b\n1,2\n", "d.csv".to_owned(), "r".to_owned()).delimiter,
+            ","
+        );
+        assert_eq!(
+            project("a\tb\n1\t2\n", "d.csv".to_owned(), "r".to_owned()).delimiter,
+            "\t"
+        );
+        assert_eq!(
+            project("", "d.csv".to_owned(), "r".to_owned()).delimiter,
+            ",",
+            "an empty file is a comma-separated file with nothing in it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bytes to a grid and back (item 8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_grid_survives_the_round_trip_through_bytes_and_back() {
+        let rows = vec![
+            vec!["id".to_owned(), "note".to_owned(), "tail".to_owned()],
+            // Every shape that forces quoting, plus one that must not be
+            // quoted, plus a ragged row a conversion must not pad.
+            vec![
+                "1".to_owned(),
+                "Doe, Jane".to_owned(),
+                "say \"hi\"".to_owned(),
+            ],
+            vec!["2".to_owned(), "line\nbreak".to_owned(), String::new()],
+            vec!["3".to_owned(), "plain".to_owned()],
+            vec![String::new()],
+        ];
+        for delimiter in CANDIDATE_DELIMITERS {
+            let bytes = csv_bytes(&rows, delimiter);
+            assert_eq!(
+                table_rows(&bytes, delimiter),
+                rows,
+                "round trip through {:?} lost or changed a cell",
+                delimiter as char
+            );
+        }
+
+        // Minimal quoting: nothing is quoted that does not have to be.
+        assert_eq!(
+            csv_bytes(
+                &[vec!["a".to_owned(), "b;c".to_owned(), "d,e".to_owned()]],
+                b','
+            ),
+            "a,b;c,\"d,e\"\n"
+        );
+        assert_eq!(
+            csv_bytes(
+                &[vec!["a".to_owned(), "b;c".to_owned(), "d,e".to_owned()]],
+                b';'
+            ),
+            "a;\"b;c\";d,e\n"
+        );
+        // An empty grid is an empty file, not a stray newline.
+        assert_eq!(csv_bytes(&[], b','), "");
+    }
+
+    /// `table_rows` speaks the delimiter it is told, not the one it would have
+    /// guessed — the conversion commands carry the file's own separator so a
+    /// one-column `;` file with a comma in it cannot be re-split.
+    #[test]
+    fn table_rows_splits_on_the_delimiter_it_is_given() {
+        let source = "a;b,c\n";
+        assert_eq!(
+            table_rows(source, b';'),
+            vec![vec!["a".to_owned(), "b,c".to_owned()]]
+        );
+        assert_eq!(
+            table_rows(source, b','),
+            vec![vec!["a;b".to_owned(), "c".to_owned()]]
+        );
+        // A ragged export converts as it is. Padding it here would put a cell
+        // into somebody's table that their file does not have.
+        assert_eq!(
+            table_rows("a,b,c\n1,2\n", b','),
+            vec![
+                vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                vec!["1".to_owned(), "2".to_owned()],
+            ]
         );
     }
 }

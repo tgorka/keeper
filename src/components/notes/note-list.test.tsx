@@ -40,8 +40,11 @@ beforeAll(() => {
 function row(overrides: Partial<NoteRowVm> & { id: string; title: string }): NoteRowVm {
   return {
     path: `${overrides.id}.md`,
+    // Empty on a row that IS a note; carried only by an outbound edge to a
+    // target nobody has written yet (owner item 2).
+    unresolvedTarget: "",
     snippet: "the body excerpt",
-    predicate: null,
+    predicates: [],
     tags: [],
     updatedMs: Date.now() - 3_600_000,
     pinned: false,

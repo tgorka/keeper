@@ -44,11 +44,11 @@ use keeper_core::notes::template_update::{
 use keeper_core::notes::vm::{
     NoteAttachSourceVm, NoteAttachTargetVm, NoteAttachmentVm, NoteBodyBatch, NoteBodyVm,
     NoteChangeBatch, NoteConflictChoiceReq, NoteConflictVm, NoteCreateReq, NoteCreateVm, NoteCsvVm,
-    NoteDeletePlanVm, NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm, NoteGalleryVm,
-    NoteIndexProgressVm, NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm, NoteQueryReq,
-    NoteRefVm, NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm, NoteSearchReq,
-    NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm, NoteTemplateVm,
-    NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
+    NoteDeletePlanVm, NoteDiffVm, NoteFlag, NoteFolderVm, NoteGalleryItemVm, NoteGalleryScope,
+    NoteGalleryVm, NoteIndexProgressVm, NoteLinkTargetVm, NoteListOp, NoteListVm, NoteQueryCheckVm,
+    NoteQueryReq, NoteRefVm, NoteRevisionVm, NoteRowVm, NoteSearchBatch, NoteSearchHitVm,
+    NoteSearchReq, NoteSpaceReq, NoteSpaceTermsVm, NoteSpaceVm, NoteTagNodeVm, NoteTagTreeVm,
+    NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm, NoteWriteVm,
 };
 use keeper_core::notes::{
     attach, counts, csv, naming, order, query, search, seed, sort, tags, templates, widget,
@@ -371,7 +371,11 @@ fn row_of(entry: &IndexEntry, head: Option<&HeadRevision>, unread: bool) -> Note
         origin: head.map_or("local", |head| head.origin.as_str()).to_owned(),
         // Filled by the two link projections, which know which edge a row is
         // the far end of. Every other listing produces rows that are not edges.
-        predicate: None,
+        predicates: Vec::new(),
+        // Empty here because this function projects an index ENTRY, and an
+        // entry is a note that exists. Only `notes_forwardlinks` fills it, for
+        // the rows it builds itself out of targets no note answers to.
+        unresolved_target: String::new(),
         // The revision the unread mark is cleared against. Filled from the same
         // commit lookup that produced `origin` and `unread`, so accepting from the
         // list cannot acknowledge a revision that moved in between; empty when the
@@ -1235,18 +1239,67 @@ pub async fn notes_tree(
     })
 }
 
-/// What a gallery says about a folder that is simply not in the vault.
+/// What a gallery says about a folder that is simply not there.
 ///
 /// Worded here rather than in the webview, on this module's standing rule that
 /// a finished sentence about the filesystem is composed where the filesystem
 /// was asked. It names the two things the reader can act on — the block's own
 /// text and the folder's absence — and claims nothing about why.
-const GALLERY_MISSING_FOLDER: &str =
-    "this folder is not in the vault, so there is nothing to show; check the folder named on the \
-     gallery's first line";
+///
+/// Two sentences because there are two roots. "Not in the vault" is a FALSE
+/// sentence about a folder that is missing from the synced folder, and it is
+/// false in the confusing direction: the reader would go looking in the notes
+/// subfolder for something that was never meant to be there.
+fn gallery_missing_folder(scope: NoteGalleryScope) -> &'static str {
+    match scope {
+        NoteGalleryScope::Vault => {
+            "this folder is not in the vault, so there is nothing to show; check the folder \
+             named on the gallery's first line"
+        }
+        NoteGalleryScope::SyncedFolder => {
+            "this folder is not in the synced folder, so there is nothing to show; it may have \
+             been moved or renamed since this list was drawn"
+        }
+    }
+}
 
-/// One folder of the vault, for a note's gallery block (Story 44.15, FR-171,
-/// AD-84, AD-65).
+/// The vault-relative path of an entry a listing produced, or `None` when the
+/// entry is not inside the vault at all.
+///
+/// **This is the field that decides whether a file can be embedded**, and it
+/// exists so the webview does not work it out. `keeper-note://` is served by
+/// `note_protocol::contained_read`, which resolves against `vault.root` and
+/// refuses anything above it, and `embed::candidates` composes vault-relative
+/// candidates only — so a file that lives beside the vault rather than inside
+/// it can be LINKED (`notes_open_file` accepts a profile-relative path) but can
+/// never RENDER as an `![[…]]` embed, on any machine. A surface that guessed
+/// would offer an Attach button that produces a permanently broken embed.
+///
+/// Derived from the two canonical roots the vault was registered with rather
+/// than by stripping the configured subfolder's text off the front of a string:
+/// the subfolder is user-entered, so the text and the resolved root can
+/// disagree about whitespace or separators, and only the roots decide what is
+/// inside what.
+///
+/// `None` also comes back for the vault root directory ITSELF, which appears as
+/// an ordinary folder row when the synced folder is listed. That is the right
+/// answer for a different reason — a folder is not embeddable whatever it is —
+/// and it is unreachable for a file, because no file can be the root.
+fn vault_relative(vault: &Vault, root: &Path, listed_rel: &str) -> Option<String> {
+    let absolute = root.join(listed_rel);
+    // Both roots were canonicalised once at registration, so this is a
+    // comparison of resolved paths and not of the user-entered subfolder text.
+    let inside = absolute.strip_prefix(&vault.root).ok()?;
+    let joined = inside
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// One folder, for a note's gallery block or for the attach-from-vault dialog
+/// (Story 44.15, FR-171, AD-84, AD-65).
 ///
 /// **`notes_tree` cannot answer this and must not learn to.** That command
 /// reads the index, and the index holds notes — a folder of four hundred
@@ -1256,10 +1309,33 @@ const GALLERY_MISSING_FOLDER: &str =
 /// noise filter, the cap and the stable order all come from there rather than
 /// from a second `read_dir` written next to it.
 ///
-/// **The frontend never joins a root and a subpath.** `folder` is the text of
-/// the block's own callout title; `browse_root` resolves it against the vault
-/// root and gets to say no. Each item's `keeper-note://` URL is composed here
-/// too, so no path arithmetic happens in the webview at all (AD-65).
+/// **`scope` says which root, and it is explicit because a default that
+/// changed would be invisible.** [`NoteGalleryScope::Vault`] — which is what
+/// `None` means, so every existing call site is unchanged — lists `vault.root`,
+/// the notes subfolder. [`NoteGalleryScope::SyncedFolder`] lists
+/// `vault.local_path`, the whole synced folder.
+///
+/// The second one exists because the attach dialog offered only the first, so a
+/// person attaching a file from a folder that holds ten years of documents was
+/// shown eight note-ish subfolders and nothing else, with no way to say that
+/// was not what they meant. What made the wider listing a *parameter* rather
+/// than a widened default is that this command also feeds the gallery block
+/// inside every note: silently rerooting it would point a photo gallery at a
+/// synced folder of 155 662 files.
+///
+/// **The frontend never joins a root and a subpath.** `folder` is relative to
+/// the scope's root — the block's own callout title, or the row the dialog was
+/// navigated to — and `browse_root` resolves it and gets to say no. Each item's
+/// `keeper-note://` URL is composed here too, so no path arithmetic happens in
+/// the webview at all (AD-65).
+///
+/// **Two paths per item, because there are two identifiers.** `rel_path` is
+/// relative to the root that was LISTED, which is what navigating and
+/// `notes_open_file` need. `vault_rel_path` is the vault-relative one, present
+/// only for an entry inside the vault, which is what an `![[…]]` embed needs;
+/// see [`vault_relative`] for why the difference is not the caller's to work
+/// out. `url` follows `vault_rel_path`, so a photograph living above the vault
+/// root gets no URL rather than one the protocol will refuse to serve.
 ///
 /// **Nothing is filtered.** Every entry crosses with the kind the one
 /// classifier gave it (AD-73), including the ones a gallery will not show. The
@@ -1268,16 +1344,28 @@ const GALLERY_MISSING_FOLDER: &str =
 /// run.
 ///
 /// **A folder that cannot be listed is not an error.** A missing folder, an
-/// unreadable one and a path that escapes the vault all come back as a
+/// unreadable one and a path that escapes the root all come back as a
 /// `problem` sentence inside a normal reply, because the block has to render
 /// something and a rejected promise gives a widget nothing to say. Each is
 /// logged at INFO: this command declining to list a folder is a thing the
 /// user's log must show, and `debug!` does not reach it (DW-162).
 #[tauri::command]
-pub async fn notes_gallery(vault_id: String, folder: String) -> Result<NoteGalleryVm, IpcError> {
+pub async fn notes_gallery(
+    vault_id: String,
+    folder: String,
+    scope: Option<NoteGalleryScope>,
+) -> Result<NoteGalleryVm, IpcError> {
     let vault = vault_of(&vault_id)?;
+    let scope = scope.unwrap_or_default();
+    // Cloned rather than borrowed because the listing runs on the blocking
+    // pool, and kept afterwards because every item's vault-relative path is
+    // resolved against it.
+    let root = match scope {
+        NoteGalleryScope::Vault => vault.root.clone(),
+        NoteGalleryScope::SyncedFolder => vault.local_path.clone(),
+    };
     let listing = {
-        let root = vault.root.clone();
+        let root = root.clone();
         let excludes = Arc::clone(&vault.excludes);
         let folder = folder.clone();
         // A directory of hundreds on a network share can take a long time to
@@ -1304,6 +1392,7 @@ pub async fn notes_gallery(vault_id: String, folder: String) -> Result<NoteGalle
             tracing::info!(
                 vault = %vault_id,
                 folder = %folder,
+                ?scope,
                 listing = ?other,
                 "gallery: the folder was not listed",
             );
@@ -1311,13 +1400,14 @@ pub async fn notes_gallery(vault_id: String, folder: String) -> Result<NoteGalle
                 folder,
                 items: Vec::new(),
                 truncated: false,
-                problem: Some(GALLERY_MISSING_FOLDER.to_owned()),
+                problem: Some(gallery_missing_folder(scope).to_owned()),
             });
         }
         Err(refusal) => {
             tracing::info!(
                 vault = %vault_id,
                 folder = %folder,
+                ?scope,
                 "gallery: {refusal}",
             );
             return Ok(NoteGalleryVm {
@@ -1340,16 +1430,28 @@ pub async fn notes_gallery(vault_id: String, folder: String) -> Result<NoteGalle
             } else {
                 kind_for_file_name(&entry.name)
             };
+            let vault_rel_path = vault_relative(&vault, &root, &entry.relative_path);
             NoteGalleryItemVm {
-                url: matches!(
-                    kind,
-                    RecordingNoteTargetKind::Video
-                        | RecordingNoteTargetKind::Image
-                        | RecordingNoteTargetKind::Audio
-                )
-                .then(|| notes_vault::asset_url(&vault_id, &entry.relative_path)),
+                // Composed from the VAULT-relative path, never from the listed
+                // one: `keeper-note://` resolves against the vault root, so a
+                // synced-folder listing's `10-notes/photo.png` would be looked
+                // for at `<vault>/10-notes/photo.png` and 404. An entry with no
+                // vault-relative path gets no URL at all, which is the honest
+                // answer — the protocol would refuse to serve it.
+                url: vault_rel_path
+                    .as_deref()
+                    .filter(|_| {
+                        matches!(
+                            kind,
+                            RecordingNoteTargetKind::Video
+                                | RecordingNoteTargetKind::Image
+                                | RecordingNoteTargetKind::Audio
+                        )
+                    })
+                    .map(|rel| notes_vault::asset_url(&vault_id, rel)),
                 name: entry.name,
                 rel_path: entry.relative_path,
+                vault_rel_path,
                 kind,
             }
         })
@@ -2066,18 +2168,22 @@ pub async fn notes_backlinks(
     let mut inbound = snapshot.backlinks(&note_id);
     inbound.sort_by(|a, b| list_order(a, b));
     let mut rows = rows_of(state.platform.as_ref(), &vault_id, &inbound);
-    // The predicate is written on the SOURCE's link, so for inbound edges it
-    // comes off the linking note and not off this one. Matched by any of this
-    // note's keys, because a link reaches a note through its title, its alias
-    // or its path and the author picked one of them.
-    let keys: std::collections::BTreeSet<String> = snapshot
-        .by_id(&note_id)
-        .map(|entry| entry.link_keys())
-        .unwrap_or_default();
+    // The predicates are written on the SOURCE's link, so for inbound edges they
+    // come off the linking note and not off this one. The reader that has to be
+    // told this is the person looking at "linked from": the words shown there
+    // are the other author's, not theirs.
+    //
+    // The lookup used to be done here, by trying each of this note's link keys
+    // against the source's map. It was wrong, and wrong in the direction that
+    // hides a feature completely: the map was BUILT keyed by the raw target the
+    // author typed and READ with `link_key`-folded keys, so `{reference="cites"}`
+    // on `[x](B.md)` or on any title with a capital letter matched nothing and
+    // rendered nothing. That is what "I do not see support for reference on
+    // links" turned out to be. The index now owns the folding on both sides —
+    // see `IndexSnapshot::backlink_predicates` — so there is one spelling of the
+    // key and no way for the two halves to disagree again.
     for (row, source) in rows.iter_mut().zip(inbound.iter()) {
-        row.predicate = keys
-            .iter()
-            .find_map(|key| source.link_attrs.get(key).cloned());
+        row.predicates = snapshot.backlink_predicates(&note_id, &source.id).to_vec();
     }
     Ok(rows)
 }
@@ -2113,7 +2219,40 @@ pub async fn notes_field_vocabulary(
     Ok(seen.into_iter().take(LIMIT).collect())
 }
 
-/// Every note this one links to (the other direction of [`notes_backlinks`]).
+/// Every note this one links to, **and every note it links to that nobody has
+/// written yet** (the other direction of [`notes_backlinks`]).
+///
+/// # Why an edge with no note is a row
+///
+/// It used to be dropped. `IndexSnapshot::forwardlinks` resolved each target
+/// and silently skipped the ones nothing answered to, so the Linked-to tab
+/// showed one row for a note with nine outbound links: eight of the targets had
+/// no file behind them. The feature read as broken because almost all of it was
+/// invisible.
+///
+/// OKF v0.2 §6.1 settles it: "Consumers MUST tolerate broken links: a link
+/// whose target does not exist in the bundle is not malformed; it may simply
+/// represent not-yet-written knowledge." A vault is written forwards — you link
+/// the note you are about to write — so the dropped edges were exactly the ones
+/// the writer most wanted to see. They are rows now, carrying their predicates
+/// like any other edge, and marked as not yet written by the one field only
+/// they set.
+///
+/// The row is deliberately NOT clickable as a note and there is no
+/// create-on-click: opening a note that does not exist is a separate question
+/// nobody has asked. `unresolved_target` is the raw text the author typed and
+/// the only populated field besides `predicates`, because a title synthesised
+/// from the target would be the same string living in two fields, which is how
+/// the two of them drift.
+///
+/// # Why the two halves are sorted separately
+///
+/// [`list_order`] reads pinned, then updated, then path. An edge with no note
+/// has none of the three, so there is nothing to interleave on: sorting both
+/// halves together would mean inventing a timestamp, and a `0` would sort them
+/// to the bottom while making the tab's stated ordering a lie. So the resolved
+/// half is sorted exactly as it always was, and the rest follow in the order
+/// the body wrote them — the only order they have.
 #[tauri::command]
 pub async fn notes_forwardlinks(
     state: State<'_, AppState>,
@@ -2122,20 +2261,70 @@ pub async fn notes_forwardlinks(
 ) -> Result<Vec<NoteRowVm>, IpcError> {
     let snapshot = notes_vault::snapshot(&vault_id)
         .ok_or_else(|| notes_error(NotesError::VaultUnknown(vault_id.clone())))?;
-    let mut outbound = snapshot.forwardlinks(&note_id);
-    outbound.sort_by(|a, b| list_order(a, b));
-    let mut rows = rows_of(state.platform.as_ref(), &vault_id, &outbound);
-    // Outbound is the easy direction: the predicate is on this note's own link,
-    // and the target it was written against is one of the far note's keys.
-    if let Some(here) = snapshot.by_id(&note_id) {
-        for (row, target) in rows.iter_mut().zip(outbound.iter()) {
-            row.predicate = target
-                .link_keys()
-                .iter()
-                .find_map(|key| here.link_attrs.get(key).cloned());
+    let outbound = snapshot.forwardlinks(&note_id);
+
+    // Split before sorting, not after: the sort applies to one half only, and
+    // the predicates have to travel WITH the entry rather than be looked up
+    // again afterwards. Pairing them here is what makes the sort safe — the old
+    // code re-derived predicates by zipping the sorted rows against the sorted
+    // entries, which only worked because the two were the same length.
+    let mut written: Vec<(&IndexEntry, &[String])> = Vec::new();
+    let mut unwritten: Vec<(&str, &[String])> = Vec::new();
+    for link in &outbound {
+        match link.note {
+            Some(entry) => written.push((entry, link.predicates)),
+            None => unwritten.push((link.target, link.predicates)),
         }
     }
+    written.sort_by(|a, b| list_order(a.0, b.0));
+
+    let entries: Vec<&IndexEntry> = written.iter().map(|(entry, _)| *entry).collect();
+    let mut rows = rows_of(state.platform.as_ref(), &vault_id, &entries);
+    // Outbound is the easy direction: the predicates are on this note's own
+    // links. `ForwardLink` carries them for both branches, so there is no
+    // second lookup keyed by the far end's id — which an unresolved edge has
+    // not got.
+    for (row, (_, predicates)) in rows.iter_mut().zip(written.iter()) {
+        row.predicates = predicates.to_vec();
+    }
+
+    rows.extend(
+        unwritten
+            .into_iter()
+            .map(|(target, predicates)| unwritten_row(target, predicates)),
+    );
     Ok(rows)
+}
+
+/// A row for an outbound edge whose target resolves to no note.
+///
+/// Every field is written out rather than spread from a default, so a field
+/// added to [`NoteRowVm`] tomorrow fails to compile here and somebody decides
+/// what it means for an edge with no note behind it. A `..Default::default()`
+/// would silently give it whatever the derive picked.
+fn unwritten_row(target: &str, predicates: &[String]) -> NoteRowVm {
+    NoteRowVm {
+        // No id, path or title: there is no note, and a synthesised one is a
+        // row the surface could try to open. The panel is told not to read
+        // these on this branch, and empty is what makes that checkable.
+        id: String::new(),
+        path: String::new(),
+        title: String::new(),
+        snippet: String::new(),
+        tags: Vec::new(),
+        updated_ms: 0,
+        pinned: false,
+        archived: false,
+        // Not unread and not conflicted: both are claims about bytes on disk,
+        // and there are none.
+        unread: false,
+        conflict: false,
+        origin: String::new(),
+        predicates: predicates.to_vec(),
+        unresolved_target: target.to_owned(),
+        head_rev: String::new(),
+        order: keeper_core::notes::order::NoteOrder::default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4185,6 +4374,208 @@ pub async fn notes_csv_set_cell(
     Ok(csv::project(&written, rel, next_rev))
 }
 
+/// The delimiter a CSV keeper writes from scratch is separated by.
+///
+/// A markdown table has no delimiter to preserve — it is pipes and dashes — so
+/// there is nothing to detect and nothing to honour. RFC 4180's comma is the
+/// one every spreadsheet opens without being asked. A file that ALREADY exists
+/// and is being replaced also gets a comma, because its bytes are wholly
+/// replaced rather than spliced; a caller that wants the old separator kept
+/// reads the file with [`notes_table_from_csv`] first, which detects it.
+const NEW_CSV_DELIMITER: u8 = b',';
+
+/// A CSV attachment as plain rows, for turning it into a markdown table
+/// (item 8).
+///
+/// The read half of the round trip. It is deliberately NOT [`notes_csv_read`]:
+/// that projects a `NoteCsvVm` for the rendered table widget — windowed to
+/// `csv::MAX_TABLE_ROWS`, carrying revisions, line numbers and ragged flags —
+/// and a markdown conversion wants every record and nothing else. Reusing the
+/// widget's projection would silently convert only the first screenful.
+///
+/// **The delimiter is detected, not assumed.** A semicolon or tab export used
+/// to come back as one column per row, which is the whole of "CSV rendering is
+/// wrong — tables do not render". `csv::detect_delimiter` is the same detection
+/// the read path uses, so a file that renders as a table converts to a markdown
+/// table with identical columns.
+///
+/// Rows are handed over exactly as parsed, including ragged ones: their lengths
+/// may differ. Padding them here would invent empty cells the file does not
+/// contain, and dropping them would lose somebody's row — the rule
+/// `NoteCsvRowVm::ragged` already states for the widget.
+#[tauri::command]
+pub async fn notes_table_from_csv(
+    vault_id: String,
+    target: String,
+) -> Result<Vec<Vec<String>>, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    let (rel, path) = embed_path(&vault, &target)?;
+    let text = read_csv(&rel, &path)?;
+    let delimiter = csv::detect_delimiter(&text);
+    let rows = csv::table_rows(&text, delimiter);
+    tracing::info!(
+        %rel,
+        rows = rows.len(),
+        delimiter = %char::from(delimiter),
+        "notes: csv read as table rows"
+    );
+    Ok(rows)
+}
+
+/// Where a table asks to be written, and whether something is already there.
+///
+/// `(vault-relative path, replacing)`. Split out from
+/// [`notes_csv_from_table`] so the one decision that could be path arithmetic
+/// is a function with a name, testable against a real scratch vault without a
+/// Tauri app around it.
+///
+/// The whole rule, in terms of [`embed::candidates`] and nothing else:
+///
+/// - a candidate already resolves to a file — that file, `replacing = true`. It
+///   is the file the viewer opens and the export carries, so writing anywhere
+///   else would leave the reader looking at stale bytes forever;
+/// - nothing resolves — the LAST candidate, `replacing = false`. `attachments/`
+///   for a bare name, the target as spelled for anything with a `/` in it.
+///
+/// `None` only for a target that produces no candidates at all, which the
+/// candidate list does not do today; it is an error rather than an `unwrap` so
+/// that a future `candidates` returning nothing is a sentence and not a panic
+/// inside an IPC command.
+fn csv_destination(vault: &Vault, target: &str) -> Option<(String, bool)> {
+    if let Some((rel, _)) = embed_path_opt(vault, target) {
+        return Some((rel, true));
+    }
+    embed::candidates(target, ATTACHMENTS_DIR)
+        .last()
+        .cloned()
+        .map(|rel| (rel, false))
+}
+
+/// Write a markdown table's rows out as a CSV attachment (item 8).
+///
+/// The write half of the round trip, and the direction that can destroy
+/// something, so most of this is about refusing to.
+///
+/// # Where the file goes, and why that is not path arithmetic
+///
+/// The same candidate list [`notes_embed_read`], [`notes_csv_read`] and the
+/// `keeper-note://` protocol resolve through: [`embed::candidates`]. Nothing
+/// here composes a path out of a root and a subpath, and the webview hands over
+/// the text between the brackets exactly as it does for every other embed
+/// command (AD-65).
+///
+/// Two cases, both expressed in that one list:
+///
+/// - **A file already answers to this target.** Then the destination IS that
+///   file — [`embed_path_opt`], first candidate that resolves, which is by
+///   construction the file the viewer opens and the export carries. Writing to
+///   any other candidate would create a second file the reader would never see,
+///   because the resolver would keep finding the first one.
+/// - **Nothing answers to it yet.** Then the destination is the LAST candidate.
+///   For a target with a `/` in it that is the target as spelled; for a bare
+///   name it is `attachments/<name>`, because that is where keeper puts
+///   attachments (`import_attachment` writes there) and a bare data file
+///   dropped in the vault root litters the folder the note list reads.
+///
+/// Reading takes the shallowest candidate that exists and writing takes the
+/// deepest, and those are not in tension: reading must find a file wherever it
+/// already lies, and a new file has to be put where its kind belongs.
+///
+/// # What it refuses
+///
+/// - **An existing file, unless `overwrite`.** The refusal names the resolved
+///   path, so the surface can say which file it would have destroyed rather
+///   than asking the user to confirm something unnamed. `overwrite` is required
+///   and has no default: a caller who never considered clobbering would
+///   otherwise silently inherit whichever behaviour was convenient to write.
+/// - **A note.** [`embed::write_refusal`], overwrite or not. A `.md` written
+///   here bypasses `notes_save`'s `base_rev`, its conflict copy and its
+///   reindex, so a stale table would overwrite a note edited elsewhere with
+///   nothing left to recover.
+/// - **No rows.** An empty table is not a table, and the file it would produce
+///   is an empty one that renders as nothing.
+/// - **Bytes over [`csv::MAX_CSV_BYTES`].** Checked BEFORE the write, because
+///   [`read_csv`] refuses a file that large: writing it anyway would leave a
+///   table on disk keeper can never reopen, and this command would have
+///   returned a projection of it to prove otherwise.
+///
+/// Everything else is the vault's own write path — `write_vault_file`'s
+/// temp-and-rename, then `mark_dirty` so the commit cadence picks it up, and no
+/// `touch`, because the notes walk collects `.md` and asking the reconciler to
+/// index a `.csv` is asking for an entry that cannot exist.
+#[tauri::command]
+pub async fn notes_csv_from_table(
+    vault_id: String,
+    target: String,
+    rows: Vec<Vec<String>>,
+    overwrite: bool,
+) -> Result<NoteCsvVm, IpcError> {
+    let vault = vault_of(&vault_id)?;
+    if rows.is_empty() {
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: "there are no rows to write, so no table was created".to_owned(),
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    let (rel, replacing) = csv_destination(&vault, &target).ok_or_else(|| {
+        notes_error(NotesError::Name(format!(
+            "{target} does not name a file this vault could hold"
+        )))
+    })?;
+
+    if let Some(refusal) = embed::write_refusal(&rel, notes_vault::extension(&rel).as_deref()) {
+        tracing::warn!(%rel, "notes: refused to write a note as a csv table");
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: refusal,
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    if replacing && !overwrite {
+        tracing::info!(%rel, "notes: refused to replace an existing csv without an explicit intent");
+        return Err(IpcError {
+            code: IpcErrorCode::NotesInvalid,
+            message: format!(
+                "{rel} is already there, so the table was not written; \
+                 nothing has changed on disk"
+            ),
+            account_id: None,
+            // Retriable in the one sense that matters to a surface: the same
+            // call with `overwrite` set is the answer, so this is a question to
+            // put to the user rather than a dead end.
+            retriable: true,
+        });
+    }
+
+    let written = csv::csv_bytes(&rows, NEW_CSV_DELIMITER);
+    if written.len() as u64 > csv::MAX_CSV_BYTES {
+        let message = csv::too_large_notice(&rel, written.len() as u64);
+        tracing::warn!(%rel, bytes = written.len(), "notes: csv table too large to write");
+        return Err(IpcError {
+            code: IpcErrorCode::Unsupported,
+            message,
+            account_id: None,
+            retriable: false,
+        });
+    }
+
+    notes_vault::write_vault_file(&vault, &rel, &written).map_err(notes_error)?;
+    notes_vault::mark_dirty(&vault.id);
+    tracing::info!(
+        %rel,
+        rows = rows.len(),
+        replacing,
+        "notes: wrote a csv table"
+    );
+    let rev = notes_vault::content_rev(&written);
+    Ok(csv::project(&written, rel, rev))
+}
+
 /// A file embedded in a note, as text an editor can show (Story 45.12, FR-186).
 ///
 /// **The vault-scoped sibling of `sync_read_text`, and it exists because the
@@ -5269,7 +5660,7 @@ mod tests {
             tags: Vec::new(),
             fields: std::collections::BTreeMap::new(),
             links: Vec::new(),
-            link_attrs: Default::default(),
+            link_predicates: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
@@ -5378,7 +5769,8 @@ mod tests {
             unread: false,
             conflict: false,
             origin: "local".to_owned(),
-            predicate: None,
+            predicates: Vec::new(),
+            unresolved_target: String::new(),
             head_rev: String::new(),
             order: keeper_core::notes::order::NoteOrder::default(),
         }
@@ -5967,5 +6359,170 @@ mod heading_title_tests {
         assert_eq!(heading_title("\n\n### Deep heading\nbody"), "Deep heading");
         assert_eq!(heading_title("no markers here\n# later"), "no markers here");
         assert_eq!(heading_title("   \n\n"), "Untitled");
+    }
+}
+
+/// The three decisions this batch added to the shell, each against a real
+/// scratch directory rather than a mock: two of them are questions about what
+/// is on disk, and a fake filesystem would answer them by construction.
+#[cfg(test)]
+mod attach_and_table_tests {
+    use super::*;
+
+    /// A vault that lives in a SUBFOLDER of its synced folder, which is the
+    /// ordinary shape and the one `tests::test_vault` deliberately does not
+    /// have: it sets `local_path == root`, so every path is trivially inside
+    /// the vault and nothing about item 10 can go wrong in it.
+    fn nested_vault(tag: &str) -> Vault {
+        let local_path = std::env::temp_dir().join(format!(
+            "keeper-nested-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        let root = local_path.join("10-notes");
+        std::fs::create_dir_all(&root).expect("vault root");
+        let local_path = local_path.canonicalize().expect("canonical synced folder");
+        let root = root.canonicalize().expect("canonical vault root");
+        Vault {
+            id: "01NESTED".to_owned(),
+            name: "mind".to_owned(),
+            root,
+            local_path,
+            config: NotesConfig::default(),
+            excludes: Arc::new(keeper_sync::exclude::ExcludeSet::new(&[]).expect("excludes")),
+        }
+    }
+
+    /// Item 10's whole point. Listing the synced folder produces entries
+    /// addressed from the SYNCED FOLDER, and an `![[…]]` embed can only name a
+    /// path addressed from the VAULT — so the two have to be told apart, and
+    /// the difference is a fact about the roots rather than a string the
+    /// webview can strip.
+    ///
+    /// The `None` rows are the ones that matter: before this field existed the
+    /// dialog had no way to know that attaching `photos/holiday.png` from
+    /// beside the vault produces an embed that renders nothing on every machine
+    /// forever.
+    #[test]
+    fn a_synced_folder_listing_says_which_entries_an_embed_could_name() {
+        let vault = nested_vault("relative");
+        let synced = vault.local_path.clone();
+
+        // Inside the vault: the subfolder prefix comes off, because that prefix
+        // is exactly what `keeper-note://` adds back.
+        assert_eq!(
+            vault_relative(&vault, &synced, "10-notes/attachments/data.csv"),
+            Some("attachments/data.csv".to_owned()),
+        );
+        // Beside the vault: not embeddable at all, and saying so is the point.
+        assert_eq!(vault_relative(&vault, &synced, "photos/holiday.png"), None);
+        assert_eq!(vault_relative(&vault, &synced, "invoice.pdf"), None);
+        // A folder that merely starts with the same letters is not inside the
+        // vault. A prefix test done on the STRING would say it was.
+        assert_eq!(
+            vault_relative(&vault, &synced, "10-notes-archive/x.png"),
+            None
+        );
+        // The vault root directory itself, which appears as a folder row.
+        assert_eq!(vault_relative(&vault, &synced, "10-notes"), None);
+
+        // And in the default scope the listed root IS the vault root, so every
+        // entry is embeddable and the path is unchanged — the guarantee that
+        // makes this field safe to add to the existing gallery block.
+        let root = vault.root.clone();
+        assert_eq!(
+            vault_relative(&vault, &root, "attachments/data.csv"),
+            Some("attachments/data.csv".to_owned()),
+        );
+
+        std::fs::remove_dir_all(&vault.local_path).ok();
+    }
+
+    /// The sentence has to match the root that was searched. "Not in the vault"
+    /// shown for a folder missing from the synced folder sends the reader into
+    /// the notes subfolder to look for something that was never there.
+    #[test]
+    fn the_missing_folder_sentence_names_the_root_that_was_searched() {
+        let vault = gallery_missing_folder(NoteGalleryScope::Vault);
+        let synced = gallery_missing_folder(NoteGalleryScope::SyncedFolder);
+        assert!(vault.contains("vault"), "{vault}");
+        assert!(synced.contains("synced folder"), "{synced}");
+        assert!(
+            !synced.contains("in the vault"),
+            "the synced-folder sentence must not claim anything about the vault: {synced}"
+        );
+        assert_ne!(vault, synced);
+    }
+
+    /// Item 2. A row for an edge nobody has written yet carries the raw target
+    /// and its predicates and NOTHING else.
+    ///
+    /// The empty `id` is the load-bearing assertion, not a tidiness one: it is
+    /// what stops the panel opening a note that does not exist, and a title
+    /// synthesised from the target would be the same string in two fields.
+    #[test]
+    fn an_unwritten_edge_carries_only_its_target_and_its_predicates() {
+        let row = unwritten_row("auth-service.md", &["cites".to_owned()]);
+
+        assert_eq!(row.unresolved_target, "auth-service.md");
+        assert_eq!(row.predicates, vec!["cites".to_owned()]);
+        assert_eq!(row.id, "", "an unwritten edge must not look openable");
+        assert_eq!(row.path, "");
+        assert_eq!(
+            row.title, "",
+            "a title from the target is a second home for it"
+        );
+        assert_eq!(row.snippet, "");
+        assert_eq!(row.head_rev, "");
+        assert_eq!(row.origin, "");
+        assert!(row.tags.is_empty());
+        // Both are claims about bytes on disk, and there are none.
+        assert!(!row.unread);
+        assert!(!row.conflict);
+
+        // And the zero-predicate case the panel pinned: an edge written without
+        // an attribute block is still a row, with an empty predicate list.
+        let bare = unwritten_row("deck.md", &[]);
+        assert_eq!(bare.unresolved_target, "deck.md");
+        assert!(bare.predicates.is_empty());
+    }
+
+    /// Item 8's destination rule, which is the one place this slice could have
+    /// invented path arithmetic.
+    ///
+    /// Two halves, and the first is the one that can destroy something: a
+    /// target a file already answers to must resolve to THAT file, so the
+    /// overwrite refusal has something to refuse and a replacement lands where
+    /// the reader is looking. The second half decides where a new file goes.
+    #[test]
+    fn a_table_is_written_to_the_file_the_embed_already_resolves_to() {
+        let vault = nested_vault("destination");
+        std::fs::create_dir_all(vault.root.join("attachments")).expect("attachments dir");
+        std::fs::write(vault.root.join("attachments/data.csv"), "a,b\n").expect("existing csv");
+
+        // A bare name that already resolves under attachments/ — replacing, and
+        // the resolved path, not the bare target.
+        assert_eq!(
+            csv_destination(&vault, "data.csv"),
+            Some(("attachments/data.csv".to_owned(), true)),
+        );
+        // Nothing answers to this one, so it is a new file: the LAST candidate,
+        // which puts a bare name where attachments live rather than in the
+        // vault root beside the notes.
+        assert_eq!(
+            csv_destination(&vault, "budget.csv"),
+            Some(("attachments/budget.csv".to_owned(), false)),
+        );
+        // A target that spells a path is honoured as spelled: there is only one
+        // candidate, so first and last are the same, and keeper does not move
+        // somebody's file into attachments/ because it happened to be a table.
+        assert_eq!(
+            csv_destination(&vault, "research/survey.csv"),
+            Some(("research/survey.csv".to_owned(), false)),
+        );
+
+        std::fs::remove_dir_all(&vault.local_path).ok();
     }
 }

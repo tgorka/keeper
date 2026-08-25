@@ -24,6 +24,15 @@
  * error and not hidden: it renders raw, with a line saying so, because the
  * note is the user's and the panel is ours.
  *
+ * One level in from that subset are the indented maps: `keeper:`, and in an OKF
+ * note `generated:` and `prefixes:`. Those are read but never written — a typed
+ * control over a map would write back a flattened version and lose the author's
+ * structure — and for a long time "never written" was implemented as "never
+ * shown", which put the sentence `nested value — edit it in the note` where
+ * `generated.at`, `generated.by` and the prefix map binding every predicate in
+ * the document should have been. The value is rendered now, read-only, and the
+ * pointer at the note stays.
+ *
  * One family of keys is read rather than edited: the `session:`, `recording:`
  * and `files:` a recording note carries (Story 42.4). Those are keeper's own
  * record of where a recording's bytes landed, written in relative form because
@@ -126,11 +135,28 @@ export interface PropertyEntry {
   /** Byte offset at the end of the value (the last block-list line, or EOL). */
   valueTo: number;
   /**
-   * The value carries an indented map (the reserved `keeper:` key is the one
-   * shape that has them). Rendered read-only: a typed control over a nested
-   * map would either flatten it or invent a shape the parser does not have.
+   * The value carries an indented map, or a list of them. `keeper:` is the
+   * reserved key that has one; an OKF note's `generated:` and `prefixes:` are
+   * the ones its author reads.
+   *
+   * Read-only, and this is the guarantee rather than a limitation to lift: a
+   * typed control over a nested map would either flatten it or invent a shape
+   * the parser does not have, and either way the write would destroy structure
+   * the author put there. {@link nestedLines} is what makes it readable without
+   * making it writable.
    */
   nested: boolean;
+  /**
+   * The indented lines this entry owns, verbatim and in file order, for
+   * {@link nestedRows} to shape.
+   *
+   * Both indented shapes land here — the `- ` items of a block list and the
+   * `key: value` pairs of a map — because it takes both to describe a list OF
+   * maps, whose first line is a dash and whose second is a pair. Read only when
+   * {@link nested} is set: a plain block list is already in {@link items}, in
+   * the form the list control can write back.
+   */
+  nestedLines: string[];
   /**
    * The line ending the block this entry came from is written with (Story
    * 50.4). Carried per entry rather than passed alongside because a rewrite of
@@ -225,6 +251,9 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
       owner.style = "block";
       owner.kind = "list";
       owner.items.push(unquote(item[2].trim()).text);
+      // Kept verbatim too: `items` flattens `- name: Alice` to one string, and
+      // that is exactly the shape a list of maps needs to survive as.
+      owner.nestedLines.push(line);
       owner.valueTo = lineFrom + line.length;
       continue;
     }
@@ -238,6 +267,7 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
         continue;
       }
       owner.nested = true;
+      owner.nestedLines.push(line);
       owner.valueTo = lineFrom + line.length;
       continue;
     }
@@ -272,6 +302,7 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
         valueFrom,
         valueTo,
         nested: false,
+        nestedLines: [],
         newline,
       });
       continue;
@@ -295,6 +326,7 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
       valueFrom,
       valueTo,
       nested: false,
+      nestedLines: [],
       newline,
     });
   }
@@ -305,6 +337,118 @@ export function readFrontmatter(source: string): ParsedFrontmatter {
     unparsed,
     newline,
   };
+}
+
+/** One line of a nested value, flattened for a render that must not nest boxes. */
+export interface NestedRow {
+  /**
+   * How far in the line sits, `0` for the value's own top level.
+   *
+   * Counted by comparing source columns rather than dividing by a step size: a
+   * vault indenting by four and a vault indenting by two both mean one level
+   * in, and a divisor would make the first look twice as deep as it is.
+   */
+  depth: number;
+  /**
+   * The dotted key chain from the entry's value down to this line — `at`, or
+   * `layout.columns`. List items contribute nothing to it, because their
+   * position is not a name and inventing an index would put a number in the
+   * accessible name of every field of every item.
+   */
+  path: string;
+  /** The line's own key, or `""` for a line that has none. */
+  key: string;
+  /** The scalar on this line, or `""` when the value is the lines below it. */
+  text: string;
+  /** The line opened with a `- `, so it is one entry of a list. */
+  item: boolean;
+}
+
+/** A `- ` opening a list item, in the same grammar {@link LIST_ITEM} reads. */
+const NESTED_ITEM = /^-[ \t]+/;
+
+/**
+ * A `key: value` line split in two. The key is `""` for a line the property
+ * grammar does not describe, which is then all value — shown rather than
+ * dropped, because the reader already accepted it into the block.
+ */
+function splitPair(line: string): { key: string; text: string } {
+  const keyed = KEY_LINE.exec(line);
+  return keyed === null
+    ? { key: "", text: unquote(line.trim()).text }
+    : { key: keyed[1], text: unquote(keyed[2].trim()).text };
+}
+
+/**
+ * A nested value's lines, shaped for reading.
+ *
+ * Flat rows carrying their own depth, not a tree of children: the panel paints
+ * this inside ONE grid cell of a sidebar, and a box per level would spend the
+ * value column's width on indentation before it reached a value. A depth is a
+ * number the renderer can cap; a chain of nested flex boxes is not.
+ *
+ * A `- ` gets a row of its own rather than being folded into the pair beside
+ * it. The fields under one item are fields of the ITEM, so they have to sit one
+ * level in from the dash — folding the dash into `name:` would leave `role:` at
+ * the same depth as `name:` and render Alice's role as a sibling of her name.
+ *
+ * Takes {@link PropertyEntry.nestedLines}, which the reader has already stripped
+ * of blank lines and comments, so every line here has something to show.
+ */
+export function nestedRows(lines: readonly string[]): NestedRow[] {
+  const rows: NestedRow[] = [];
+  // The levels currently open, innermost last: the source column each was
+  // opened at, and the key that opened it. Depth is this stack's height and
+  // `path` is its keys, which is why one stack answers both.
+  const open: { column: number; key: string }[] = [];
+
+  const enter = (column: number, key: string): { depth: number; path: string } => {
+    // A line at or left of the innermost open level closes it. `>=`, not `>`:
+    // a sibling sits at the same column, and `>` would nest every line of a
+    // flat map under the first one.
+    while (open.length > 0 && open[open.length - 1].column >= column) {
+      open.pop();
+    }
+    open.push({ column, key });
+    let path = "";
+    for (const level of open) {
+      if (level.key !== "") {
+        path = path === "" ? level.key : `${path}.${level.key}`;
+      }
+    }
+    return { depth: open.length - 1, path };
+  };
+
+  for (const line of lines) {
+    const column = line.length - line.trimStart().length;
+    const rest = line.slice(column);
+    const dash = NESTED_ITEM.exec(rest);
+    if (dash === null) {
+      const pair = splitPair(rest);
+      const level = enter(column, pair.key);
+      rows.push({ depth: level.depth, path: level.path, ...pair, item: false });
+      continue;
+    }
+    const opened = enter(column, "");
+    const item: NestedRow = {
+      depth: opened.depth,
+      path: opened.path,
+      key: "",
+      text: "",
+      item: true,
+    };
+    rows.push(item);
+    const pair = splitPair(rest.slice(dash[0].length));
+    if (pair.key === "") {
+      // `- work`: the item IS the scalar. One row, not a dash parenting a leaf.
+      item.text = pair.text;
+      continue;
+    }
+    const level = enter(column + dash[0].length, pair.key);
+    rows.push({ depth: level.depth, path: level.path, ...pair, item: false });
+  }
+
+  return rows;
 }
 
 /**
@@ -407,6 +551,47 @@ export const UNPARSED_BLOCK_LABEL = "Properties block";
  * then showed a replacement glyph that is in nobody's file.
  */
 export const UNPARSED_PREVIEW_GRAPHEMES = 400;
+
+/**
+ * What a nested value's full-value affordance opens, and the heading over it.
+ *
+ * A noun, like {@link UNPARSED_BLOCK_LABEL} above it: both hand back the file's
+ * own bytes once the panel has shown as much of them as it can fit.
+ */
+export const NESTED_VALUE_LABEL = "Nested value";
+
+/**
+ * The line under a nested value.
+ *
+ * What is left of `nested value — edit it in the note`, which used to be the
+ * WHOLE of what the panel said about a `generated:` or a `prefixes:` block. The
+ * pointer at the note stays, because the render above it is still read-only and
+ * a reader who wants to change a prefix has to be told where to go.
+ */
+export const NESTED_VALUE_HINT = "read-only here — edit it in the note";
+
+/**
+ * How many lines of a nested value the panel paints before it stops.
+ *
+ * A prefix map binding every predicate in an OKF document runs to twenty lines,
+ * and twenty lines inside one row is taller than the whole rest of the panel: it
+ * would push the tag row and the Add-a-property box off the bottom of a sidebar
+ * whose every other row is one line. What is cut is one press away, whole and
+ * monospaced, exactly as the unparsed block already offers itself — rather than
+ * behind a scroller competing with the panel's own.
+ */
+export const NESTED_ROWS_SHOWN = 8;
+
+/**
+ * The left inset for each level of a nested value, capped.
+ *
+ * Capped rather than multiplied because this is painted INSIDE the value
+ * column, the narrow half of a sidebar: a map five levels deep would spend the
+ * column on indentation and leave nothing for the values that are the point.
+ * Past the last entry every level draws at the same inset, and the keys still
+ * say where they are.
+ */
+const NESTED_INSETS = ["", "pl-3", "pl-6"] as const;
 
 /**
  * How the panel reaches a file that is not a note (Story 50.4, FR-283).
@@ -1125,6 +1310,79 @@ function SuggestedProperty({
   );
 }
 
+/** Test id on each rendered line of a nested value. */
+export const NESTED_ROW_TESTID = "nested-row";
+
+/**
+ * A nested value, read-only (the owner's item 1).
+ *
+ * Each line the reader kept, as `key value` at its own inset, every part of it
+ * truncating and offering itself in full the way every other value in this panel
+ * does. That is what keeps a twenty-line prefix map inside the value column: the
+ * lines are flex rows over a `min-w-0` cell, so a URI long enough to widen the
+ * sidebar is cut and handed over whole instead.
+ *
+ * No control, and deliberately so — see {@link PropertyEntry.nested}. What
+ * changed is only that the panel now shows what it will not write.
+ */
+function NestedValue({ entry }: { entry: PropertyEntry }) {
+  const rows = nestedRows(entry.nestedLines);
+  const shown = rows.length > NESTED_ROWS_SHOWN ? rows.slice(0, NESTED_ROWS_SHOWN) : rows;
+  return (
+    <div className="min-w-0 flex-1">
+      {shown.map((row, index) => (
+        <div
+          // Position, not the key: a hand-edited map can carry the same key
+          // twice, and a list of maps has no key at all for its dash rows, so
+          // two rows sharing a React key would collapse into one — a line of
+          // the user's file silently missing from the panel that claims to be
+          // showing it.
+          //
+          // Sound here because these rows are derived from immutable source
+          // lines and replaced whole on every read: never reordered, never
+          // spliced in place. `links-panel.tsx` carries the same suppression
+          // for the same reason, and measured what goes wrong without it.
+          // biome-ignore lint/suspicious/noArrayIndexKey: a nested map's rows have no unique key of their own; the list is replaced whole and never reordered
+          key={`${index} ${row.path}`}
+          data-testid={NESTED_ROW_TESTID}
+          className={cn(
+            "flex min-w-0 items-baseline gap-1",
+            NESTED_INSETS[Math.min(row.depth, NESTED_INSETS.length - 1)],
+          )}
+        >
+          {/* The file's own item marker, and not hidden from a screen reader:
+              an item whose value is the map below it has nothing else on its
+              line, so hiding the dash would make it a row that announces
+              nothing at all. */}
+          {row.item && <span className="shrink-0 text-muted-foreground">-</span>}
+          {row.key === "" ? null : (
+            <div className="min-w-0 text-muted-foreground">
+              <OverflowValue name={PROPERTY_NAME_LABEL} value={row.key} />
+            </div>
+          )}
+          {row.text === "" ? null : (
+            <div className="min-w-0 flex-1 text-meta">
+              <OverflowValue name={`${entry.key}.${row.path}`} value={row.text} monospace />
+            </div>
+          )}
+        </div>
+      ))}
+      <div className="flex items-baseline gap-1">
+        <p className="min-w-0 flex-1 text-meta text-muted-foreground">{NESTED_VALUE_HINT}</p>
+        {/* Only when there is more, so a two-line `generated:` map grows no
+            affordance — the same condition the unparsed preview uses. */}
+        {rows.length > shown.length && (
+          <FullValueButton
+            name={NESTED_VALUE_LABEL}
+            value={entry.nestedLines.join(entry.newline)}
+            monospace
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
 const INPUT_TYPES: Record<PropertyKind, string> = {
   text: "text",
   number: "number",
@@ -1171,7 +1429,7 @@ function PropertyControl({ entry, onChange }: PropertyControlProps) {
   }
 
   if (entry.nested) {
-    return <span className="text-muted-foreground">nested value — edit it in the note</span>;
+    return <NestedValue entry={entry} />;
   }
 
   if (entry.kind === "boolean") {

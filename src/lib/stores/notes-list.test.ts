@@ -7,7 +7,8 @@ function row(id: string, title = id): NoteRowVm {
   return {
     id,
     path: `${id}.md`,
-    predicate: null,
+    unresolvedTarget: "",
+    predicates: [],
     title,
     snippet: "",
     tags: [],

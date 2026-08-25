@@ -1055,6 +1055,8 @@ pub fn run() {
         notes_ipc::notes_body_write,
         notes_ipc::notes_csv_read,
         notes_ipc::notes_csv_set_cell,
+        notes_ipc::notes_table_from_csv,
+        notes_ipc::notes_csv_from_table,
         notes_ipc::notes_embed_paths,
         notes_ipc::notes_embed_read,
         notes_ipc::notes_embed_write,

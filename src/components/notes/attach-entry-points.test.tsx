@@ -45,7 +45,7 @@ const pickFiles = vi.fn<() => Promise<string[] | string | null>>();
  *  mounting the panel or opening the chooser, which is why 45.13's mock factory
  *  had neither. */
 const notesEmbedPaths = vi.fn<(v: string, targets: string[]) => Promise<(string | null)[]>>();
-const notesGallery = vi.fn<(v: string, folder: string) => Promise<NoteGalleryVm>>();
+const notesGallery = vi.fn<(v: string, folder: string, scope?: string) => Promise<NoteGalleryVm>>();
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: () => pickFiles(),
@@ -94,7 +94,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesBufferReport: vi.fn(async () => {}),
   notesBacklinks: vi.fn(async () => []),
   notesEmbedPaths: (v: string, targets: string[]) => notesEmbedPaths(v, targets),
-  notesGallery: (v: string, folder: string) => notesGallery(v, folder),
+  notesGallery: (v: string, folder: string, scope?: string) => notesGallery(v, folder, scope),
 }));
 
 import { readNoteDocument, resetNotesEditorStoreForTest } from "@/lib/stores/notes-editor";
@@ -105,11 +105,17 @@ import {
   ATTACH_FROM_VAULT_HINT,
 } from "./attach-file-button";
 import {
+  ATTACH_FROM_VAULT_CAPPED,
+  ATTACH_FROM_VAULT_FILTER_LABEL,
   ATTACH_FROM_VAULT_LABEL,
+  ATTACH_FROM_VAULT_LIST_TESTID,
   ATTACH_FROM_VAULT_OUTCOME_TESTID,
   ATTACH_FROM_VAULT_PROMISE,
+  ATTACH_FROM_VAULT_ROW_CAP,
+  ATTACH_FROM_VAULT_TRUNCATED,
   ATTACH_FROM_VAULT_UP_LABEL,
-  VAULT_ROOT_LABEL,
+  REASON_OUTSIDE_VAULT,
+  SYNCED_ROOT_LABEL,
 } from "./attach-from-vault-dialog";
 import {
   ATTACH_ACTION_LABEL,
@@ -150,25 +156,111 @@ const RELATIVE = "recordings/2026/standup/screen-0000.mov";
 const OPENED = "alpha\nbeta\n";
 
 /**
- * The vault the in-vault chooser browses, one folder per key (Story 46.11).
+ * The synced folder the in-vault chooser browses, one folder per key (Story
+ * 46.11; widened for item 10).
  *
  * A real walk down to the same file the other three entry points attach, rather
  * than a root listing that implausibly holds a nested path: the chooser hands
  * `notes_gallery` the folder it is looking at, and a fixture that skipped the
  * navigation would not exercise the one thing the dialog does with a folder row.
+ *
+ * This profile's notes subfolder is empty — the vault IS the synced folder — so
+ * every entry's `vaultRelPath` equals its `relPath`, which is what Rust promises
+ * for that configuration. {@link SYNCED} is the other one, where the two frames
+ * differ and files exist above the vault root.
  */
 const VAULT: Record<string, NoteGalleryVm["items"]> = {
-  "": [{ name: "recordings", relPath: "recordings", kind: "folder", url: null }],
-  recordings: [{ name: "2026", relPath: "recordings/2026", kind: "folder", url: null }],
+  "": [
+    {
+      name: "recordings",
+      relPath: "recordings",
+      vaultRelPath: "recordings",
+      kind: "folder",
+      url: null,
+    },
+  ],
+  recordings: [
+    {
+      name: "2026",
+      relPath: "recordings/2026",
+      vaultRelPath: "recordings/2026",
+      kind: "folder",
+      url: null,
+    },
+  ],
   "recordings/2026": [
-    { name: "standup", relPath: "recordings/2026/standup", kind: "folder", url: null },
+    {
+      name: "standup",
+      relPath: "recordings/2026/standup",
+      vaultRelPath: "recordings/2026/standup",
+      kind: "folder",
+      url: null,
+    },
   ],
   "recordings/2026/standup": [
     {
       name: "screen-0000.mov",
       relPath: "recordings/2026/standup/screen-0000.mov",
+      vaultRelPath: "recordings/2026/standup/screen-0000.mov",
       kind: "video",
       url: "keeper-note://v1/recordings/2026/standup/screen-0000.mov",
+    },
+  ],
+};
+
+/**
+ * The other configuration, and the one item 10 is about: a profile synced at
+ * `~/tgdrive` whose notes subfolder is `notes`, so the synced folder root holds
+ * the vault **and** two siblings the vault has never seen.
+ *
+ * Every path here is synced-folder relative, which is what `notes_gallery`
+ * answers with under `"syncedFolder"`. `vaultRelPath` is Rust's second frame: the
+ * same file's vault-relative path, or `null` for a file above the vault root.
+ * Both come from Rust so the webview does no path arithmetic (AD-65) — note that
+ * `notes/attachments/holiday.png` and `photos/holiday.png` share a file name and
+ * differ only in that frame, which is exactly the confusion the second field
+ * exists to prevent.
+ */
+const SYNCED: Record<string, NoteGalleryVm["items"]> = {
+  "": [
+    { name: "notes", relPath: "notes", vaultRelPath: "", kind: "folder", url: null },
+    { name: "photos", relPath: "photos", vaultRelPath: null, kind: "folder", url: null },
+    {
+      name: "tax-return.pdf",
+      relPath: "tax-return.pdf",
+      vaultRelPath: null,
+      kind: "file",
+      url: null,
+    },
+  ],
+  notes: [
+    {
+      name: "attachments",
+      relPath: "notes/attachments",
+      vaultRelPath: "attachments",
+      kind: "folder",
+      url: null,
+    },
+  ],
+  "notes/attachments": [
+    {
+      name: "holiday.png",
+      relPath: "notes/attachments/holiday.png",
+      vaultRelPath: "attachments/holiday.png",
+      kind: "image",
+      url: "keeper-note://v1/attachments/holiday.png",
+    },
+  ],
+  photos: [
+    {
+      name: "holiday.png",
+      relPath: "photos/holiday.png",
+      // Above the vault root. `keeper-note://` resolves against the vault root
+      // and refuses a climbing path, so no embed can ever name this file — which
+      // is why Rust sends no URL for it either.
+      vaultRelPath: null,
+      kind: "image",
+      url: null,
     },
   ],
 };
@@ -875,7 +967,7 @@ describe("the two doors on the attach control", () => {
     expect(written).not.toContain("/Users/");
   });
 
-  it("says which folder it is showing, and never where the vault is", async () => {
+  it("says which folder it is showing, and never where that folder is", async () => {
     await mountEditor();
     const menu = await openAttachMenu();
     fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
@@ -883,21 +975,24 @@ describe("the two doors on the attach control", () => {
     // The promise, before anything is chosen.
     expect(await screen.findByText(ATTACH_FROM_VAULT_PROMISE)).toBeInTheDocument();
     // A phrase for the root, not a path — the webview is never told where the
-    // vault is (AD-65) and must not put one on screen (FR-145).
-    expect(screen.getByText(VAULT_ROOT_LABEL)).toBeInTheDocument();
+    // synced folder is (AD-65) and must not put one on screen (FR-145).
+    expect(screen.getByText(SYNCED_ROOT_LABEL)).toBeInTheDocument();
     // No way up from the root, because there is nothing above it in this frame.
     expect(screen.queryByRole("button", { name: ATTACH_FROM_VAULT_UP_LABEL })).toBeNull();
 
     fireEvent.click(await screen.findByRole("button", { name: "recordings/" }));
 
-    expect(await screen.findByText(`${VAULT_ROOT_LABEL} / recordings`)).toBeInTheDocument();
-    expect(notesGallery).toHaveBeenLastCalledWith("v1", "recordings");
+    expect(await screen.findByText(`${SYNCED_ROOT_LABEL} / recordings`)).toBeInTheDocument();
+    // The scope, said out loud on every call (item 10). Without the third
+    // argument this door lists the notes subfolder and the whole widening is
+    // gone, so it is asserted here and not left implicit.
+    expect(notesGallery).toHaveBeenLastCalledWith("v1", "recordings", "syncedFolder");
 
     // And back out again, to the folder above and not to the root.
     fireEvent.click(await screen.findByRole("button", { name: "2026/" }));
-    await screen.findByText(`${VAULT_ROOT_LABEL} / recordings / 2026`);
+    await screen.findByText(`${SYNCED_ROOT_LABEL} / recordings / 2026`);
     fireEvent.click(screen.getByRole("button", { name: ATTACH_FROM_VAULT_UP_LABEL }));
-    expect(await screen.findByText(`${VAULT_ROOT_LABEL} / recordings`)).toBeInTheDocument();
+    expect(await screen.findByText(`${SYNCED_ROOT_LABEL} / recordings`)).toBeInTheDocument();
   });
 
   /**
@@ -910,9 +1005,27 @@ describe("the two doors on the attach control", () => {
     notesGallery.mockResolvedValue({
       folder: "",
       items: [
-        { name: "holiday.png", relPath: "holiday.png", kind: "image", url: "keeper-note://x" },
-        { name: "daily.md", relPath: "daily.md", kind: "file", url: null },
-        { name: "why#not.png", relPath: "why#not.png", kind: "image", url: null },
+        {
+          name: "holiday.png",
+          relPath: "holiday.png",
+          vaultRelPath: "holiday.png",
+          kind: "image",
+          url: "keeper-note://x",
+        },
+        {
+          name: "daily.md",
+          relPath: "daily.md",
+          vaultRelPath: "daily.md",
+          kind: "file",
+          url: null,
+        },
+        {
+          name: "why#not.png",
+          relPath: "why#not.png",
+          vaultRelPath: "why#not.png",
+          kind: "image",
+          url: null,
+        },
       ],
       truncated: false,
       problem: null,
@@ -974,5 +1087,173 @@ describe("the two doors on the attach control", () => {
       await screen.findByText(/not in the vault, so there is nothing to show/),
     ).toBeInTheDocument();
     expect(screen.queryByText("This folder is empty.")).toBeNull();
+  });
+});
+
+/**
+ * Item 10: *"when you attach a file from a folder, offer the WHOLE folder — not
+ * only the notes part."*
+ *
+ * The door used to list the vault root, which for a profile with a notes
+ * subfolder is a strict subset of the folder the person syncs. It now lists the
+ * synced folder, so these are the two facts that were not true before and the
+ * one that must not stop being true:
+ *
+ * - a file beside the vault is REACHED, so the listing really is the whole
+ *   folder;
+ * - it is not OFFERED, because `keeper-note://` resolves against the vault root
+ *   and refuses a climbing path, so its embed would render nothing anywhere;
+ * - the path that lands in the note is the vault's, never the one the listing
+ *   was keyed on — the two differ for every file under the subfolder, and no
+ *   arithmetic in the webview turns one into the other (AD-65).
+ */
+describe("the whole synced folder, not only the notes part", () => {
+  /** Point the chooser at {@link SYNCED} instead of the default {@link VAULT}. */
+  function browsingTheSyncedFolder(): void {
+    notesGallery.mockImplementation(async (_vault, folder) => ({
+      folder,
+      items: SYNCED[folder] ?? [],
+      truncated: false,
+      // Rust's sentence is scope-aware now: "not in the vault" would be a false
+      // claim about a folder that is not in the SYNCED FOLDER.
+      problem: folder in SYNCED ? null : "that folder is not in the folder you sync",
+    }));
+  }
+
+  /** Mount the editor and open the in-vault door, which is all four of these
+   *  tests do before they diverge. */
+  async function openTheChooser(): Promise<void> {
+    await mountEditor();
+    const menu = await openAttachMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: ATTACH_FROM_VAULT_LABEL }));
+    await screen.findByText(ATTACH_FROM_VAULT_PROMISE);
+  }
+
+  it("reaches a file that lives beside the vault, and says why it cannot be attached", async () => {
+    browsingTheSyncedFolder();
+    await openTheChooser();
+
+    // The vault's own folder is now one row among the synced folder's, which is
+    // the widening: before this, `photos/` was not on screen at all. Both are
+    // browsable — a folder is opened, never embedded, so being above the vault
+    // root costs it nothing.
+    expect(await screen.findByRole("button", { name: "notes/" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "photos/" })).toBeInTheDocument();
+
+    // A file at the synced root, above the vault: shown, and shown with the
+    // reason where its button would be. Hiding it would answer "offer the whole
+    // folder" with a listing that is once again not the whole folder.
+    expect(screen.getByTitle("tax-return.pdf")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Attach tax-return.pdf" })).toBeNull();
+    // Exactly one, and on the file: the reason belongs to the row that would
+    // otherwise carry a button, and `photos/` must not wear it.
+    expect(screen.getAllByText(REASON_OUTSIDE_VAULT)).toHaveLength(1);
+
+    // The copier, still never called — the invariant `attach-file-button.tsx`
+    // documents. Widening the listing widened what this door can SHOW, and must
+    // not have quietly given it a way to copy the files it cannot embed.
+    expect(notesAttachSources).not.toHaveBeenCalled();
+    expect(readNoteDocument("v1", "n1").text).toBe(OPENED);
+  });
+
+  /**
+   * The name collision, which is the whole reason Rust sends two paths.
+   *
+   * `photos/holiday.png` and `notes/attachments/holiday.png` have the same file
+   * name and the same listing-frame shape. Only the second one has a
+   * vault-relative path, and a surface that guessed by stripping a prefix would
+   * offer both and embed the wrong bytes for one of them.
+   */
+  it("offers the one of two same-named files that the vault can actually name", async () => {
+    browsingTheSyncedFolder();
+    await openTheChooser();
+
+    fireEvent.click(await screen.findByRole("button", { name: "photos/" }));
+    // Reached, listed, and refused: this is the file above the vault root.
+    expect(await screen.findByTitle("photos/holiday.png")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Attach / })).toBeNull();
+    expect(screen.getByText(REASON_OUTSIDE_VAULT)).toBeInTheDocument();
+
+    // The same name, under the vault this time.
+    fireEvent.click(screen.getByRole("button", { name: ATTACH_FROM_VAULT_UP_LABEL }));
+    fireEvent.click(await screen.findByRole("button", { name: "notes/" }));
+    fireEvent.click(await screen.findByRole("button", { name: "attachments/" }));
+
+    // Named by the path the NOTE will hold, not by the path the listing was
+    // keyed on: `attachments/holiday.png` and not `notes/attachments/holiday.png`.
+    const attach = await screen.findByRole("button", { name: "Attach attachments/holiday.png" });
+    expect(screen.getByTitle("notes/attachments/holiday.png")).toBeInTheDocument();
+
+    fireEvent.click(attach);
+    await waitFor(() => {
+      expect(readNoteDocument("v1", "n1").text).toBe(`${OPENED}![[attachments/holiday.png]]`);
+    });
+    // The synced-folder frame must never reach the note: `![[notes/…]]` would be
+    // a path `keeper-note://` resolves under the vault root and does not find.
+    expect(readNoteDocument("v1", "n1").text).not.toContain("notes/attachments");
+    expect(notesAttachSources).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The synced folder is not vault-sized — the owner's holds 155,662 files — so
+   * `browse`'s thousand-entry cap is the listing this dialog actually gets. A
+   * thousand mounted rows in a scroller eight rows tall is the defect widening
+   * the scope would otherwise have shipped.
+   */
+  it("mounts a bounded number of rows for a huge folder, and keeps the rest reachable", async () => {
+    const many = Array.from({ length: 1000 }, (_unused, index) => {
+      const name = `f${String(index).padStart(4, "0")}.png`;
+      return { name, relPath: name, vaultRelPath: name, kind: "image" as const, url: null };
+    });
+    notesGallery.mockResolvedValue({
+      folder: "",
+      items: many,
+      // Rust cut the folder short as well, which is a different fact from the
+      // dialog's own cap and gets its own sentence.
+      truncated: true,
+      problem: null,
+    });
+    await openTheChooser();
+
+    const list = await screen.findByTestId(ATTACH_FROM_VAULT_LIST_TESTID);
+    await waitFor(() => {
+      expect(within(list).getAllByRole("listitem")).toHaveLength(ATTACH_FROM_VAULT_ROW_CAP);
+    });
+    // Both limits said, separately: one is Rust's and cannot be undone here, the
+    // other is this dialog's and typing gets past it.
+    expect(screen.getByText(ATTACH_FROM_VAULT_TRUNCATED)).toBeInTheDocument();
+    expect(screen.getByText(ATTACH_FROM_VAULT_CAPPED)).toBeInTheDocument();
+
+    // The last entry is far beyond the cap, so it is not mounted…
+    expect(screen.queryByRole("button", { name: "Attach f0999.png" })).toBeNull();
+    // …and the filter is what reaches it. A cap without this would make 800
+    // files unreachable rather than merely unmounted.
+    fireEvent.change(screen.getByLabelText(ATTACH_FROM_VAULT_FILTER_LABEL), {
+      target: { value: "f0999" },
+    });
+
+    expect(await screen.findByRole("button", { name: "Attach f0999.png" })).toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+    // Narrowed to one row, so the dialog's own cap is no longer in force — while
+    // Rust's cut still is, and still says so.
+    expect(screen.queryByText(ATTACH_FROM_VAULT_CAPPED)).toBeNull();
+    expect(screen.getByText(ATTACH_FROM_VAULT_TRUNCATED)).toBeInTheDocument();
+  });
+
+  it("clears the filter when the folder changes, so the next folder is not silently narrowed", async () => {
+    browsingTheSyncedFolder();
+    await openTheChooser();
+
+    const filter = await screen.findByLabelText(ATTACH_FROM_VAULT_FILTER_LABEL);
+    fireEvent.change(filter, { target: { value: "photos" } });
+    // Only the folder whose name matches survives the needle.
+    expect(screen.queryByRole("button", { name: "notes/" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "photos/" }));
+
+    // `photos/` holds no file called "photos", so a needle carried across would
+    // render an empty folder and be read as one.
+    expect(await screen.findByTitle("photos/holiday.png")).toBeInTheDocument();
+    expect(screen.getByLabelText(ATTACH_FROM_VAULT_FILTER_LABEL)).toHaveValue("");
   });
 });

@@ -526,7 +526,7 @@ pub fn projected(seed: &Seed, title: &str, body: &str, stamp: &str, now_ms: i64)
         tags,
         fields,
         links: Vec::new(),
-        link_attrs: std::collections::BTreeMap::new(),
+        link_predicates: std::collections::BTreeMap::new(),
         flags,
         snippet: body.to_owned(),
         order: NoteOrder::default(),

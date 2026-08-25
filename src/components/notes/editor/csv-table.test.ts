@@ -68,6 +68,10 @@ function table(overrides: Partial<NoteCsvVm> = {}): NoteCsvVm {
   return {
     relPath: TARGET,
     rev: "rev-1",
+    // Reported by the parser now that it detects `;`/tab/pipe as well as `,`
+    // (owner item 7); a fixture that omitted it would be a table no real read
+    // can produce.
+    delimiter: ",",
     columns: 2,
     totalRows: 3,
     rows: [

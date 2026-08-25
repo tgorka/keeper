@@ -30,7 +30,7 @@
  *   the note names the copy. FR-145 forbids an absolute path in a note and the
  *   vault syncs to other machines, so a link out to `~/Desktop` would be a note
  *   that shows a picture on exactly one computer.
- * - **From a folder you sync.** The vault already holds the file and the engine
+ * - **From a folder you sync.** The folder already holds the file and the engine
  *   already carries it, so the note points at it where it is and **nothing is
  *   copied**. See {@link AttachFromVaultDialog}, which cannot copy: it never
  *   calls `notes_attach_sources`, which is the only copier in this app.
@@ -40,6 +40,15 @@
  * first door is the only one that can reach such a file. That is why both remain,
  * and why the difference is on screen before the click rather than in the receipt
  * afterwards.
+ *
+ * That last sentence is also why the second door did NOT become the only door
+ * when it was widened. Since item 10 it browses the whole synced folder and not
+ * only the notes subfolder, so it now shows files that live **beside** the vault
+ * — and those are exactly the files `keeper-note://` refuses, because
+ * `notes_vault::contained` will not resolve a path that climbs out of the vault
+ * root. The dialog shows such a row and puts a reason where its button would be.
+ * Getting one of those files into a note therefore still means this first door,
+ * and still means a copy.
  *
  * # Why the file picker and not a drag target
  *

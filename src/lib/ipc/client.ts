@@ -124,6 +124,7 @@ export type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 export type { NoteFlag } from "./gen/NoteFlag";
 export type { NoteFolderVm } from "./gen/NoteFolderVm";
 export type { NoteGalleryItemVm } from "./gen/NoteGalleryItemVm";
+export type { NoteGalleryScope } from "./gen/NoteGalleryScope";
 export type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 export type { NoteHunkVm } from "./gen/NoteHunkVm";
 export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
@@ -325,6 +326,7 @@ import type { NoteEmbedPathVm } from "./gen/NoteEmbedPathVm";
 import type { NoteEmbedVm } from "./gen/NoteEmbedVm";
 import type { NoteFlag } from "./gen/NoteFlag";
 import type { NoteFolderVm } from "./gen/NoteFolderVm";
+import type { NoteGalleryScope } from "./gen/NoteGalleryScope";
 import type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 import type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
 import type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
@@ -3958,15 +3960,20 @@ export async function notesTree(vaultId: string, relDir: string): Promise<NoteFo
 }
 
 /**
- * One folder of the vault, listed for a note's gallery block (FR-171, AD-84,
- * Story 44.15).
+ * One folder, listed for a note's gallery block or for the attach-from-folder
+ * dialog (FR-171, AD-84, Story 44.15).
  *
- * `folder` is the vault-relative path the block's own first line names, handed
- * over verbatim: Rust resolves it against the vault root and refuses anything
- * that is not a plain descendant, so nothing here joins a root and a subpath
- * (AD-65). Each item comes back with the kind the one classifier decided
- * (Story 43.5) and, for the kinds `keeper-note://` will serve, the URL to load
- * — also composed in Rust.
+ * `folder` is relative to the root `scope` selects — the vault root by default,
+ * the profile's whole synced folder for `syncedFolder` — and is handed over
+ * verbatim: Rust resolves it against that root and refuses anything that is not
+ * a plain descendant, so nothing here joins a root and a subpath (AD-65). Each
+ * item comes back with the kind the one classifier decided (Story 43.5) and,
+ * for the kinds `keeper-note://` will serve, the URL to load — also in Rust.
+ *
+ * `scope` is omitted by every caller that wants what this function always did.
+ * It is a parameter rather than a changed default because the alternative is a
+ * dialog somewhere else quietly starting to list a synced folder holding
+ * 155,662 files, which is the actual size of one of the owner's.
  *
  * A folder that could not be listed is NOT a rejection: it resolves with an
  * empty `items` and a `problem` sentence to render, because a block on screen
@@ -3974,8 +3981,12 @@ export async function notesTree(vaultId: string, relDir: string): Promise<NoteFo
  *
  * Rejects with: `unsupported`, `internal` (no such vault).
  */
-export async function notesGallery(vaultId: string, folder: string): Promise<NoteGalleryVm> {
-  return await invoke<NoteGalleryVm>("notes_gallery", { vaultId, folder });
+export async function notesGallery(
+  vaultId: string,
+  folder: string,
+  scope?: NoteGalleryScope,
+): Promise<NoteGalleryVm> {
+  return await invoke<NoteGalleryVm>("notes_gallery", { vaultId, folder, scope: scope ?? null });
 }
 
 /**
@@ -4359,9 +4370,22 @@ export async function notesBacklinks(vaultId: string, noteId: string): Promise<N
  * projected from the same graph and stored no more than that one is.
  *
  * Deduplicated by note rather than by target, so a body naming the same note
- * twice lists it once, and a target nothing answers to is left out entirely:
- * this is what the note points at that exists, and an unresolved `[[link]]` is
- * already visible where it was written.
+ * twice lists it once.
+ *
+ * **A target with no note behind it is still a row**, carrying
+ * `unresolvedTarget` and its predicates. This doc used to promise the opposite
+ * — "a target nothing answers to is left out entirely" — and that sentence was
+ * the written justification for a defect the owner reported: a note with nine
+ * outbound edges showed ONE row, because one of its nine targets happened to
+ * exist. A vault is written forwards, so the links a writer most wants to see
+ * are exactly the ones pointing at notes they have not written yet, and OKF
+ * v0.2 §6.1 requires it of any consumer: "a link whose target does not exist in
+ * the bundle is not malformed; it may simply represent not-yet-written
+ * knowledge."
+ *
+ * Resolved rows come first in `list_order`, unresolved after in body order —
+ * an unresolved edge has no timestamp, no pin and no path, so interleaving
+ * would mean inventing the value to sort on.
  *
  * Rejects with: `invalidInput`, `unsupported`, `internal`.
  */
@@ -4658,6 +4682,58 @@ export async function notesCsvSetCell(
     column,
     value,
   });
+}
+
+/**
+ * A CSV attachment, as rows, so a markdown table can be written from it
+ * (Story 56.x, the owner's request: "convert md tables to csv files in
+ * attachments — and the other way").
+ *
+ * Rows only, never markdown: Rust owns the file's bytes and the editor owns the
+ * markdown, and `alignedTable` in `format-commands.ts` is the one thing in this
+ * app that writes a GFM table. A second writer here would be the version whose
+ * alignment quietly disagrees with the one the toolbar produces.
+ *
+ * The delimiter is detected by `keeper-core::notes::csv` and reported on
+ * {@link notesCsvRead}'s view model — a `;` file (which is what a European
+ * Excel writes) reads as columns, not as one wide column.
+ *
+ * Rejects with: `notesInvalid` (no such file, or too large to open as a table),
+ * `unsupported`, `internal`.
+ */
+export async function notesTableFromCsv(vaultId: string, target: string): Promise<string[][]> {
+  return await invoke<string[][]>("notes_table_from_csv", { vaultId, target });
+}
+
+/**
+ * Write rows to a CSV attachment and answer with the table the file now is.
+ *
+ * `overwrite` is REQUIRED and has no default. A defaulted flag here is the shape
+ * where a caller who never thought about clobbering gets whichever behaviour the
+ * author of the default preferred, and the thing at stake is a file of the
+ * user's data. Refused with an error naming the existing file, so a dialog can
+ * say which file it would have destroyed.
+ *
+ * **The refusal IS the probe.** A caller must not look first and write second:
+ * between the two calls this folder is being synced, so a file can appear in the
+ * gap and the write would destroy it. Catch the rejection, ask, and call again
+ * with `overwrite` true — that ordering has no window.
+ *
+ * **Write the answer's `relPath` into the note, not the `target` you passed.**
+ * A bare `people.csv` resolves under `attachments/`, so the two differ exactly
+ * when a caller is most likely to assume they do not, and an embed naming the
+ * unresolved spelling points at a file the reader will not find.
+ *
+ * Rejects with: `notesInvalid` (the file exists and `overwrite` is false),
+ * `unsupported`, `internal`.
+ */
+export async function notesCsvFromTable(
+  vaultId: string,
+  target: string,
+  rows: string[][],
+  overwrite: boolean,
+): Promise<NoteCsvVm> {
+  return await invoke<NoteCsvVm>("notes_csv_from_table", { vaultId, target, rows, overwrite });
 }
 
 /**

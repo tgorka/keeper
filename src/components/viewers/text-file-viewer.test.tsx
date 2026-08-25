@@ -568,6 +568,7 @@ describe("the CSV table, now that a panel can resolve its vault (Story 45.18)", 
     notesCsvRead.mockResolvedValue({
       relPath: "rows.csv",
       rev: "rev-1",
+      delimiter: ",",
       columns: 2,
       totalRows: 3,
       rows: [
@@ -668,6 +669,7 @@ describe("a file knows its note (Story 45.18, FR-196)", () => {
     notesCsvRead.mockResolvedValue({
       relPath: "rows.csv",
       rev: "r",
+      delimiter: ",",
       columns: 2,
       totalRows: 1,
       rows: [{ index: 0, line: 1, cells: ["a", "b"], ragged: false }],

@@ -60,6 +60,10 @@ const JSON_TARGET = "attachments/config.json";
 function table(overrides: Partial<NoteCsvVm> = {}): NoteCsvVm {
   return {
     relPath: CSV_TARGET,
+    // Reported by the parser now that it detects `;`, tab and pipe as well as
+    // `,` (owner item 7); a fixture omitting it would be a table no real read
+    // can produce.
+    delimiter: ",",
     rev: "rev-1",
     columns: 2,
     totalRows: 3,

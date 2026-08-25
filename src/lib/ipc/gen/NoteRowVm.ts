@@ -48,15 +48,53 @@ conflict: boolean,
  */
 origin: string, 
 /**
- * What kind of link connects this row to the note being looked at, when the
- * author said so: the `reference` attribute on the link.
+ * Why this row is connected to the note being looked at: the predicates
+ * the author wrote in the link's attribute block, in the order written.
  *
- * `None` for every link written without one, which is nearly all of them,
- * and for every row that is not the far end of a link — the field is only
- * filled by the two link projections. A predicate is the author's word for
- * the relationship; keeper neither invents one nor infers one.
+ * A predicate is the author's own word for the relationship —
+ * `schema:about`, `dcterms:source` — and keeper neither invents one nor
+ * infers one. Empty for every link written without a block, which is
+ * nearly all of them, and for every row that is not the far end of a link:
+ * only the two link projections fill this. The forward projection fills it
+ * for an edge with NO note at the far end as well — a predicate is written
+ * on the arrow, and the arrow exists whether or not its target does.
+ *
+ * A `Vec` and never an `Option<Vec>`. An empty list and "no predicates"
+ * are the same fact, and shipping two spellings of one fact is how one
+ * surface ends up branching on `null` while another branches on `.length`.
+ * This field REPLACED an `Option<String>` carrying the single
+ * `{reference="cites"}` attribute, which was this same concept with a
+ * one-per-link ceiling; that legacy value folds in as the first entry, so
+ * a vault written before the change renders exactly as it did.
+ *
+ * **On an inbound row these are the OTHER document's words.** A backlink's
+ * attribute block was written in the note that points here, not by the
+ * reader looking at it, so a surface showing them has to say whose words
+ * they are: nothing in the reader's own file contains the string. The
+ * index answers this through `IndexSnapshot::backlink_predicates`.
  */
-predicate: string | null, 
+predicates: Array<string>, 
+/**
+ * The raw link target, for an outbound edge whose target resolves to no
+ * note. Empty on every other row — the same empty-means-absent spelling
+ * `origin` and `head_rev` use here, so a surface branches on emptiness and
+ * never on null.
+ *
+ * **Why the row exists at all.** OKF v0.2 §6.1: consumers MUST tolerate
+ * broken links; a link whose target does not exist in the bundle is not
+ * malformed, it may simply represent not-yet-written knowledge. A vault is
+ * written forwards — you link the note you are about to write — so the
+ * forward projection used to drop precisely the edges a writer most wants
+ * to see, and the owner read a Linked-to tab showing one of nine targets
+ * as a broken feature. It was not truncating anything: eight of the nine
+ * had no note behind them.
+ *
+ * It is the label such a row shows, because there is no title to show. A
+ * surface must not make it clickable as though a note were there, and must
+ * not offer to create one — nobody asked for that, and inventing it here
+ * would turn a report into a prompt.
+ */
+unresolvedTarget: string, 
 /**
  * The head revision that last touched this note's path: the revision
  * `unread` was computed against (`head_rev != acknowledged_rev`).

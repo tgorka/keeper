@@ -57,7 +57,10 @@ function row(id: string, title: string, tags: string[]): NoteRowVm {
   return {
     id,
     path: `${id}.md`,
-    predicate: null,
+    // Empty on a row that IS a note; carried only by an outbound edge to a
+    // target nobody has written yet (owner item 2).
+    unresolvedTarget: "",
+    predicates: [],
     title,
     snippet: `${title} body`,
     tags,

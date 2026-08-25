@@ -33,9 +33,12 @@ function row(order: NoteOrder, overrides: Partial<NoteRowVm> = {}): NoteRowVm {
   return {
     id: "n1",
     path: "notes/n1.md",
+    // Empty on a row that IS a note; carried only by an outbound edge to a
+    // target nobody has written yet (owner item 2).
+    unresolvedTarget: "",
     title: "A note",
     snippet: "the body excerpt",
-    predicate: null,
+    predicates: [],
     tags: [],
     updatedMs: Date.now() - 3_600_000,
     pinned: false,
