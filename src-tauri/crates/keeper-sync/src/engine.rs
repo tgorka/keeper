@@ -4542,7 +4542,13 @@ impl Engine {
             }
         }
         for rela in &staged.deleted {
-            if let Some(size) = Self::removed_size(&repo, rela) {
+            // A deleted path cannot be stat'd, so the index is the only place
+            // left to ask — and it answers an LFS entry with the size the
+            // pointer names rather than the pointer's own ~130 bytes. This used
+            // to be `Self::removed_size`, a second inlined copy of exactly that
+            // derivation; `lfs::stage::indexed_size` is now the only one
+            // (Story 56.2).
+            if let Some(size) = lfs::stage::indexed_size(&repo, rela) {
                 staged.sizes.insert(rela.clone(), size);
             }
         }
@@ -4788,30 +4794,6 @@ impl Engine {
         }
         let now = self.platform.now_ms();
         self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))
-    }
-
-    /// How big a deleted path used to be, if the repository still knows.
-    ///
-    /// The index entry git kept for the path names the blob it last recorded,
-    /// and a blob's length *is* the file's length — except for an LFS-tracked
-    /// path, where the blob is a pointer and the real size is the number
-    /// written inside it. Both are answered here. Anything else — a path whose
-    /// index entry an earlier, half-finished stage already removed — answers
-    /// `None`: a guessed figure in a size column is worse than a blank one.
-    fn removed_size(repo: &gix::Repository, rela: &Path) -> Option<u64> {
-        let index = repo.index_or_empty().ok()?;
-        // The index keys paths with forward slashes on every platform, the
-        // same conversion `lfs::stage::indexed_pointer` makes.
-        let key = rela.to_string_lossy().replace('\\', "/");
-        let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
-        let blob = repo.find_header(entry.id).ok()?.size();
-        // A pointer is under 1 KiB by specification, so a larger blob cannot
-        // be one and must not be loaded to find that out.
-        if blob > lfs::pointer::MAX_POINTER_BYTES as u64 {
-            return Some(blob);
-        }
-        let object = repo.find_object(entry.id).ok()?;
-        Some(lfs::pointer::Pointer::parse(&object.data).map_or(blob, |pointer| pointer.size))
     }
 
     /// Where this profile's LFS server is, and what to show it (Story 34.17).
@@ -5888,6 +5870,84 @@ impl Engine {
             .with_auth_refresh(self.lfs_auth_refresh(&profile, auth.clone()));
         let specs = client.download(&objects).await?;
         Ok(lfs::audit::report(&specs, &paths, checked, bytes))
+    }
+
+    /// Every LFS path in this profile, and whether this machine holds its
+    /// content (Story 56.2, FR-336, FR-337).
+    ///
+    /// The engine's answer rather than the caller's, for the reason every other
+    /// verb here is: `keeper-syncd` and the desktop shell both need it, and a
+    /// listing assembled twice is a listing that will eventually disagree with
+    /// itself about one folder (AD-52). What the daemon adds on top is two
+    /// renderings of this `Vec` and nothing else.
+    ///
+    /// # Cost
+    ///
+    /// One `SELECT`, one `lstat` per LFS path, and a bounded read of the paths
+    /// whose length says they could be pointer text — the discipline
+    /// [`lfs::stage::worktree_pointer`] documents. The index is read and parsed
+    /// **once** through [`lfs::stage::indexed_pointers`], where the per-path
+    /// `indexed_pointer` this could have been built from re-parses it per row.
+    ///
+    /// The index read is not the whole cost, and understating it would be the
+    /// mistake `is_pointer_candidate` was written to avoid one layer down:
+    /// recognising a pointer means asking the object database for a blob's
+    /// **header** once per unconflicted index entry, and loading the blob for
+    /// every entry whose header says 1..=1024 bytes. There is no cheaper
+    /// prefilter available — an index entry's `stat.size` is the *worktree*
+    /// file's for an LFS path, so `git::repo::pointer_sized_tracked_paths`'
+    /// filter would drop every materialized LFS path — so on a hundred-thousand
+    /// path folder this is a hundred thousand header lookups in one blocking
+    /// call. That is the honest figure for a verb a human invokes, and the
+    /// reason nothing calls it on a tick.
+    ///
+    /// # It reads; it does not create
+    ///
+    /// Deliberately **not** [`Self::open_repo`], which is the engine's
+    /// *materialize* path: for a folder that is not a repository yet it clones
+    /// over the network or adopts in place, then pins repo config and runs
+    /// [`Self::reconcile_sparse_cone`], which adds and deletes worktree files.
+    /// A listing that did any of that would be the opposite of what it is sold
+    /// as — an operator asking which paths are virtual would pull gigabytes, or
+    /// silently turn a plain folder into a keeper repository. So a folder with
+    /// no `.git` answers with an **empty listing**: it has no index, therefore
+    /// no LFS paths, and creating one is somebody else's verb.
+    ///
+    /// `lfs_mode` is deliberately **not** consulted. A profile switched to
+    /// [`LfsMode::Disabled`] does not stop its committed pointers from being
+    /// pointers, and short-circuiting on the mode would make this verb tell an
+    /// operator "no LFS paths" about a folder whose Files pane shows a dozen —
+    /// which is precisely the assembled-twice divergence AD-52 is about. A
+    /// folder that never used LFS has no pointers in its index and answers
+    /// empty for the honest reason.
+    ///
+    /// Blocking, like every other repository caller: a `gix::Repository` is
+    /// neither `Send` nor cheap to hold, so it never spans an await point.
+    pub fn lfs_files(&self, id: &str) -> Result<Vec<lfs::listing::LfsFile>> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        if !profile.local_path.join(".git").exists() {
+            return Ok(Vec::new());
+        }
+        let pointers = {
+            // Removable media is opened with full trust for the reason
+            // `open_repo` states (AD-48); the difference is that this opens
+            // what is there and never makes one.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            lfs::stage::indexed_pointers(&repo)
+        };
+        if pointers.is_empty() {
+            // Nothing to join a ledger against, and the `SELECT` would be a
+            // query issued to answer about no rows.
+            return Ok(Vec::new());
+        }
+        let ledger = self.with_db(|conn| db::materialized_rows(conn, &profile.id))?;
+        Ok(lfs::listing::collect(
+            &profile.local_path,
+            &pointers,
+            &ledger,
+        ))
     }
 
     /// Re-publish anything the server is missing that this machine can still

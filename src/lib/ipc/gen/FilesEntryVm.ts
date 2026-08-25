@@ -68,6 +68,45 @@ sync: FilesEntrySyncVm,
  */
 size: FileSizeVm | null, 
 /**
+ * The object id of the LFS pointer this entry's bytes are, if they are one
+ * (Story 56.2, FR-336).
+ *
+ * **`Some` is what makes [`Self::size`] legible.** A virtual path is about
+ * 130 bytes on disk and its `size` is the gigabytes the pointer names, so
+ * without this field a surface has a number it cannot account for and no
+ * way to tell it apart from an ordinary file's. With it, the row can say
+ * where the bytes are.
+ *
+ * Also the handle the later verbs of this epic need — the store path, the
+ * batch request and the release ledger are all keyed by oid — carried on
+ * the entry rather than re-derived, because re-deriving it means reading
+ * the file again.
+ *
+ * `None` for a directory, for an ordinary file, and for an entry whose
+ * metadata could not be read.
+ */
+lfsOid: string | null, 
+/**
+ * When this entry was last written, ms since the Unix epoch (Story 56.2,
+ * FR-340).
+ *
+ * **`Option`, not the `0` sentinel** `SessionEntryVm::mtime_ms` uses. Both
+ * spellings exist in this crate and this is the chain in which
+ * [`Self::size`] is already an absence-when-unknown for exactly this
+ * reason: a struct carrying `size: null` beside `mtimeMs: 0` would be
+ * answering the same question two ways, and 1970 is a plausible-looking
+ * date rather than an admission.
+ *
+ * Carried for a **directory** too, unlike the size. A folder's mtime is a
+ * real fact about the folder; a folder's `len()` is a fact about its own
+ * bookkeeping and about nothing anybody asked.
+ *
+ * `#[ts(type = "number | null")]` because ts-rs maps a 64-bit integer to
+ * `bigint` otherwise, which no `JSON.parse` produces and no comparison
+ * against a `number` accepts.
+ */
+mtimeMs: number | null, 
+/**
  * Whether keeper itself put something here (Story 45.5, FR-178).
  *
  * `Some` only for the folder the profile's configuration names as its

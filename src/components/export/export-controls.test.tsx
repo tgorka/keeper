@@ -100,11 +100,16 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     sync: { status: "synced", detail: null },
     // Spelled out rather than cast past. Dropping `as FilesEntryVm` showed
     // this fixture was missing three fields the real listing always sends
-    // (W3NoteFile's shape: a cast asserts a literal instead of checking it).
+    // (W3NoteFile's shape: a cast asserts a literal instead of checking it),
+    // and that is why Story 56.2's two additions reached it too.
     // `size` is what a real `stat` produced; `write` refuses because these are
     // panel-rendering fixtures and a panel must draw a listing identically
-    // whether or not the folder happens to be writable.
+    // whether or not the folder happens to be writable. `lfsOid` is null
+    // because these are ordinary files, not virtual ones — a null there is the
+    // statement that `size` came off the dirent.
     size: { bytes: 4300000, label: "4.3 MB" },
+    lfsOid: null,
+    mtimeMs: 1700000000000,
     folderRole: null,
     write: {
       writable: false,

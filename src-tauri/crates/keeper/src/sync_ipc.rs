@@ -2042,6 +2042,8 @@ fn files_listing_vm(
                         is_dir: entry.is_dir,
                         sync,
                         size_bytes: entry.size_bytes,
+                        lfs_oid: entry.lfs_oid,
+                        mtime_ms: entry.mtime_ms,
                         roles,
                         write,
                     })
@@ -2122,6 +2124,27 @@ fn files_listing_vm(
 /// as a folder rather than borrowing whichever descendant's word came first
 /// alphabetically. "This folder is untracked" about a folder holding one new
 /// file would be a small, confident lie.
+///
+/// # Why `Virtual` is routed onto `Synced` here (Story 56.2, and 56.7's debt)
+///
+/// [`browse::EntrySyncStatus::Virtual`] is a real state — the path's bytes are
+/// the committed LFS pointer and its content lives on the remote — and
+/// [`FilesSyncStatusVm`] deliberately does **not** gain a variant for it in
+/// this story. That is not a shrug; it is chosen for one property.
+/// `FilesDeletePlanVm::compose`'s `travels` filter is a **non-exhaustive**
+/// `matches!` over `Synced | Waiting | Unknown`, so a new wire variant added
+/// without touching it would compile silently into the "stays on this machine"
+/// bucket — and the delete confirmation would start telling people a deletion
+/// is local while it removes tracked content that only the remote holds
+/// (AD-134). Routing onto `Synced` keeps that answer correct with no code in
+/// `compose` at all, while the honest facts still reach the surface: the
+/// sentence below says where the bytes are, `FilesEntryVm::size` carries the
+/// number the pointer names, and `FilesEntryVm::lfs_oid` says why.
+///
+/// Story 56.7 replaces this arm with the three wire states, and it inherits
+/// three obligations from here: give each state a label, a shape and a tone in
+/// all three `Record<FilesSyncStatusVm, …>` maps in `sync-status-mark.tsx`, and
+/// add every new variant to `travels` **explicitly** (FR-345).
 fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> FilesEntrySyncVm {
     match status {
         browse::EntrySyncStatus::Synced => FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
@@ -2151,6 +2174,19 @@ fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> 
             FilesSyncStatusVm::Excluded,
             "A pattern in this folder's sync settings excludes it, so keeper will never \
              copy it.",
+        ),
+        // `Synced` on the wire, and a sentence rather than silence — but a
+        // sentence about THIS machine. The evidence is only that the worktree
+        // bytes are the pointer; `docs/sync.md` documents the state where such a
+        // pointer's object never reached the server, so "your content is safe on
+        // the remote" is exactly the claim keeper is not entitled to make for
+        // free. `verify --remote` is the check that earns it. What the sentence
+        // does have to account for is the size, which is the content's rather
+        // than the placeholder's. 56.7 gives this state a mark of its own.
+        browse::EntrySyncStatus::Virtual => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Synced,
+            "This file's content is not stored on this computer — only a placeholder is, \
+             so it takes up almost no space. The size shown is the content's.",
         ),
         browse::EntrySyncStatus::NotInRepository => FilesEntrySyncVm::explained(
             FilesSyncStatusVm::NotInRepository,
@@ -2709,7 +2745,15 @@ pub(crate) async fn sessions_pending(
         .map_err(|error| error.to_string())
 }
 
-/// The five sentences, verbatim — [`sync_mark`], for the sessions tree.
+/// The Files pane's own sentences, verbatim — [`sync_mark`], for the sessions
+/// tree.
+///
+/// Deliberately not a count. This doc said "the five sentences" until Story
+/// 56.2 added a sixth arm, and a number in a doc comment is a fact that goes
+/// stale silently: nothing compiles against it and nothing tests it. What
+/// matters is that there is exactly one function wording these states, so a
+/// session file the Files pane calls excluded is called excluded here in the
+/// same words.
 pub(crate) fn sessions_sync_mark(
     status: &browse::EntrySyncStatus,
     engine_failure: Option<&str>,

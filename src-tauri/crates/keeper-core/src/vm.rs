@@ -4055,6 +4055,42 @@ pub struct FilesEntryVm {
     /// in both cases keeper does not know and says nothing rather than
     /// guessing.
     pub size: Option<FileSizeVm>,
+    /// The object id of the LFS pointer this entry's bytes are, if they are one
+    /// (Story 56.2, FR-336).
+    ///
+    /// **`Some` is what makes [`Self::size`] legible.** A virtual path is about
+    /// 130 bytes on disk and its `size` is the gigabytes the pointer names, so
+    /// without this field a surface has a number it cannot account for and no
+    /// way to tell it apart from an ordinary file's. With it, the row can say
+    /// where the bytes are.
+    ///
+    /// Also the handle the later verbs of this epic need — the store path, the
+    /// batch request and the release ledger are all keyed by oid — carried on
+    /// the entry rather than re-derived, because re-deriving it means reading
+    /// the file again.
+    ///
+    /// `None` for a directory, for an ordinary file, and for an entry whose
+    /// metadata could not be read.
+    pub lfs_oid: Option<String>,
+    /// When this entry was last written, ms since the Unix epoch (Story 56.2,
+    /// FR-340).
+    ///
+    /// **`Option`, not the `0` sentinel** `SessionEntryVm::mtime_ms` uses. Both
+    /// spellings exist in this crate and this is the chain in which
+    /// [`Self::size`] is already an absence-when-unknown for exactly this
+    /// reason: a struct carrying `size: null` beside `mtimeMs: 0` would be
+    /// answering the same question two ways, and 1970 is a plausible-looking
+    /// date rather than an admission.
+    ///
+    /// Carried for a **directory** too, unlike the size. A folder's mtime is a
+    /// real fact about the folder; a folder's `len()` is a fact about its own
+    /// bookkeeping and about nothing anybody asked.
+    ///
+    /// `#[ts(type = "number | null")]` because ts-rs maps a 64-bit integer to
+    /// `bigint` otherwise, which no `JSON.parse` produces and no comparison
+    /// against a `number` accepts.
+    #[ts(type = "number | null")]
+    pub mtime_ms: Option<i64>,
     /// Whether keeper itself put something here (Story 45.5, FR-178).
     ///
     /// `Some` only for the folder the profile's configuration names as its
@@ -4098,6 +4134,13 @@ pub struct FilesEntryFacts<'a> {
     pub sync: FilesEntrySyncVm,
     /// `None` when the metadata could not be read. A directory's is discarded.
     pub size_bytes: Option<u64>,
+    /// The pointer's oid when this entry's bytes are pointer text, from
+    /// `keeper_sync::browse::BrowseEntry::lfs_oid`. `None` for every ordinary
+    /// entry.
+    pub lfs_oid: Option<String>,
+    /// The dirent's modification time in ms, or `None` when the metadata could
+    /// not be read. A directory's is KEPT, unlike its size.
+    pub mtime_ms: Option<i64>,
     /// The profile's configuration, not the folder's name (Story 45.5).
     pub roles: FilesFolderRoles<'a>,
     /// The location verdict `keeper_sync::files_write` already reached.
@@ -4120,6 +4163,17 @@ impl FilesEntryVm {
     /// unconditionally — a caller that passes one for a directory cannot leak
     /// it (Story 45.5).
     ///
+    /// `size_bytes` may already be the LFS pointer's number rather than the
+    /// dirent's, and this constructor cannot tell — it is the same `u64` and
+    /// the substitution happened in `keeper_sync::browse`, which is the only
+    /// place that has the bytes to make it (Story 56.2, FR-336). `lfs_oid` is
+    /// the flag that says so, and it is passed through untouched.
+    ///
+    /// `mtime_ms` is passed through untouched for a directory as well as a
+    /// file, which is the one place this constructor treats a folder's facts
+    /// differently from its size — see the field docs for why that is one rule
+    /// and not two.
+    ///
     /// `roles` is the profile's configuration, not the folder's name.
     ///
     /// `write` is the location verdict `keeper_sync::files_write` already
@@ -4135,6 +4189,8 @@ impl FilesEntryVm {
             is_dir,
             sync,
             size_bytes,
+            lfs_oid,
+            mtime_ms,
             roles,
             write,
         } = facts;
@@ -4152,6 +4208,11 @@ impl FilesEntryVm {
             } else {
                 size_bytes.map(FileSizeVm::new)
             },
+            // Not discarded for a directory the way the size is: see the field
+            // docs for why the two facts differ even though the rule is one
+            // rule.
+            lfs_oid,
+            mtime_ms,
             folder_role: roles.role_of(&relative_path, is_dir),
             relative_path,
             sync,
@@ -6914,6 +6975,8 @@ mod tests {
                 is_dir: false,
                 sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
                 size_bytes: Some(7),
+                lfs_oid: None,
+                mtime_ms: None,
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
             });
@@ -6933,6 +6996,8 @@ mod tests {
             is_dir: true,
             sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
             size_bytes: None,
+            lfs_oid: None,
+            mtime_ms: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7315,6 +7380,12 @@ mod tests {
                 "This file has changed and has not been committed yet.",
             ),
             size_bytes: Some(1_500_000),
+            // A virtual path, so the size above is the pointer's number and
+            // the oid is what says so (Story 56.2).
+            lfs_oid: Some(
+                "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            ),
+            mtime_ms: Some(1_700_000_000_123),
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7344,6 +7415,20 @@ mod tests {
             "json was: {json}"
         );
         assert!(json.contains("\"folderRole\":null"), "json was: {json}");
+        // Story 56.2: the two fields a virtual row needs, camel-cased and
+        // carrying a JSON number rather than a `bigint`. The oid is asserted
+        // beside the size because the pair is the claim — 1.5 MB from a
+        // 130-byte file is only legible when the row says where the bytes are.
+        assert!(
+            json.contains(
+                "\"lfsOid\":\"3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea\""
+            ),
+            "json was: {json}"
+        );
+        assert!(
+            json.contains("\"mtimeMs\":1700000000123"),
+            "json was: {json}"
+        );
     }
 
     /// A directory carries no size, even when the caller offers one (Story
@@ -7363,12 +7448,25 @@ mod tests {
             is_dir: true,
             sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
             size_bytes: Some(4_096),
+            lfs_oid: None,
+            // Offered for the folder as well, and kept: a folder's mtime is a
+            // fact about the folder, where its `len()` is not (Story 56.2).
+            mtime_ms: Some(1_700_000_000_456),
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
         assert_eq!(entry.size, None, "a folder's size is absent, never zero");
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(json.contains("\"size\":null"), "json was: {json}");
+        assert_eq!(
+            entry.mtime_ms,
+            Some(1_700_000_000_456),
+            "the mtime survives for a folder even though the size does not"
+        );
+        assert!(
+            json.contains("\"mtimeMs\":1700000000456"),
+            "json was: {json}"
+        );
         assert!(
             !json.contains("0 B") && !json.contains("0 bytes"),
             "a folder must never carry a rendered zero: {json}"
@@ -7386,6 +7484,8 @@ mod tests {
             is_dir: false,
             sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Unknown),
             size_bytes: None,
+            lfs_oid: None,
+            mtime_ms: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7397,6 +7497,8 @@ mod tests {
             is_dir: false,
             sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
             size_bytes: Some(0),
+            lfs_oid: None,
+            mtime_ms: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7429,6 +7531,8 @@ mod tests {
                 is_dir,
                 sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
                 size_bytes: None,
+                lfs_oid: None,
+                mtime_ms: None,
                 roles,
                 write: FilesWriteVm::allowed(),
             })
@@ -7458,6 +7562,8 @@ mod tests {
             is_dir: true,
             sync: FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
             size_bytes: None,
+            lfs_oid: None,
+            mtime_ms: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });

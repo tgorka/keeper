@@ -32,6 +32,7 @@
 //! | [`endpoint`] | deriving and overriding the LFS server URL |
 //! | [`batch`] | `POST /objects/batch`, the only negotiation step |
 //! | [`basic`] | the `basic` transfer adapter: resumable `GET`, single `PUT` |
+//! | [`listing`] | which LFS paths this clone holds, and which it only names |
 //! | [`virtual_policy`] | which paths' content may stay unmaterialized |
 //!
 //! # The quirks this implementation encodes
@@ -83,6 +84,7 @@ pub mod basic;
 pub mod batch;
 pub mod endpoint;
 pub mod filter;
+pub mod listing;
 pub mod local;
 pub mod pktline;
 pub mod pointer;

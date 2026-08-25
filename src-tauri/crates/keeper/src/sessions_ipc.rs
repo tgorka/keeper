@@ -155,7 +155,9 @@ const SESSION_TREE_DIR_UNDELETABLE: &str =
 /// **The sync mark is the Files tab's, not a second opinion.** `pending` is
 /// asked once for the whole tree and every entry is classified through
 /// [`keeper_sync::browse::status_of`] — the same function the listing and the
-/// delete confirmation go through — then worded by the same five sentences.
+/// delete confirmation go through — then worded by the Files pane's own
+/// wording function, `sync_ipc::sessions_sync_mark`, rather than by a count of
+/// sentences that goes stale the moment a state is added.
 /// A session file that the Files pane calls excluded is called excluded here,
 /// in those words, because it is one fact asked from two places.
 ///

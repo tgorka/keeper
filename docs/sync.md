@@ -833,9 +833,20 @@ keeper-syncd sync [--once]        # sync now
 keeper-syncd watch                # the daemon entry point
 keeper-syncd pause <id> | resume <id>
 keeper-syncd verify [id]          # re-verify stored content
+keeper-syncd ls-files [id]        # LFS paths: virtual, materialized or absent
 keeper-syncd doctor               # diagnose the environment
 keeper-syncd logs
 ```
+
+`ls-files` answers "what does this clone actually hold" for LFS-tracked paths.
+Each row carries the size and object id the **pointer** names — never the ~130
+bytes of pointer text a virtual path occupies on disk — plus a modification time
+and, once a path has been materialized, what the ledger recorded about it. The
+global `--json` flag makes the output a stable document whose field names are the
+contract. Remote presence is **absent unless you ask**: `--remote` adds the same
+batch round trip `verify --remote` makes, because whether the server holds an
+object cannot be known without asking it, and a listing that implied it did
+would be guessing about the one thing worth being sure of.
 
 Paths follow XDG: `$XDG_CONFIG_HOME/keeper-sync/config.toml`,
 `$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`.

@@ -832,6 +832,124 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
     pointer_blob(repo, entry.id)
 }
 
+/// The pointer the worktree file at `absolute` **is**, if its bytes are
+/// pointer text.
+///
+/// The answer [`indexed_pointer`] gives, reachable by a caller that holds no
+/// [`gix::Repository`] and must not open one — `crate::browse`, whose module
+/// doc forbids opening twice over. It is the same answer because the worktree
+/// bytes of an unmaterialized LFS path *are* the committed pointer byte for
+/// byte (FR-331), so parsing them settles the question without going near the
+/// trust levels, config enforcement and index refreshes an open performs.
+///
+/// # Not `prune::worktree_holds_content`
+///
+/// That predicate looks like the one to reuse and is not: it opens with
+/// `metadata.len() != recorded.size → false`, so a **locally modified** LFS
+/// file answers "does not hold content", and a caller reading the complement
+/// as "holds a pointer" would report a file full of real unstaged bytes as
+/// virtual. This asks the positive question directly and inherits only the
+/// discipline.
+///
+/// # Length leads, then a bounded read
+///
+/// The `meta` the caller already bound settles every file that cannot be a
+/// pointer, so nothing above [`pointer::MAX_POINTER_BYTES`] is ever opened.
+/// Taking the [`std::fs::Metadata`] rather than stat'ing again is why the
+/// caller pays no second `stat`: `crate::browse::list_resolved` binds one per
+/// dirent, and a second one here would have doubled the syscall cost of
+/// browsing a network share to gain a column.
+///
+/// It is **not** free, and the caller's ordering is what keeps it small: a file
+/// inside the window is opened and read. So `crate::browse::classify` asks this
+/// question last, of a path whose mark would otherwise be `Synced` and of no
+/// other — because the folders keeper is for are full of small text files, and
+/// a probe run per dirent would be one open per note.
+///
+/// The read is bounded by the ceiling rather than by the file: `std::fs::read`
+/// loops to EOF, so a file that **grew** past the ceiling between the caller's
+/// `stat` and this call — a large copy landing in a watched folder is exactly
+/// that — would have been read into memory whole and then thrown away at the
+/// first memcmp. Taking [`pointer::MAX_POINTER_BYTES`] makes the bound the
+/// documented one; a truncated read of a grown file cannot parse anyway, since
+/// [`Pointer::parse`] refuses input at or above the ceiling.
+///
+/// A **zero-length** file is refused, for the reason [`pointer_blob`] refuses
+/// the empty blob: [`Pointer::parse`] reads zero bytes as the empty pointer,
+/// but an empty worktree file is a real size of its own and stands in for
+/// nothing, and calling every empty tracked file virtual is the failure that
+/// carve-out has already caused once (Story 34.13 review).
+pub fn worktree_pointer(absolute: &Path, meta: &std::fs::Metadata) -> Option<Pointer> {
+    use std::io::Read as _;
+
+    // `is_file` rather than `!is_dir`: a fifo, a socket or a device node has a
+    // length that is not a number of bytes anyone can read out of it.
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    if len == 0 || len > pointer::MAX_POINTER_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    std::fs::File::open(absolute)
+        .ok()?
+        .take(pointer::MAX_POINTER_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    // The cheap memcmp first, so a small ordinary file — a `.md`, a `.json` —
+    // is rejected without a parse. A false positive here is harmless; the
+    // parse below is the decision.
+    if !pointer::is_pointer_candidate(&bytes) {
+        return None;
+    }
+    Pointer::parse(&bytes)
+}
+
+/// Every pointer the index records, keyed by the path git spells it under.
+///
+/// **One index read for a whole repository.** [`indexed_pointer`] is the right
+/// shape for the single-path callers that dominate this module and the wrong
+/// shape for a listing: it opens, reads and parses the index once per row, so
+/// a folder of a hundred thousand tracked paths would pay a hundred thousand
+/// index parses to answer one question. `lfs::listing` and
+/// [`crate::engine::Engine::lfs_files`] take this instead.
+///
+/// Keys come from [`index_key`] over the entry's own stored path, so this is
+/// the same forward-slash spelling every other helper here looks paths up
+/// under and the same frame a `/`-joined relative path is already in — no
+/// caller does path arithmetic on either side of the join, and the rule that
+/// git keys paths with forward slashes is written down once.
+///
+/// **Unconflicted stages only.** A conflicted path carries up to three entries
+/// under one name, which a map cannot hold and which is not an answer to "what
+/// does the index record for this path" anyway: AD-43 resolves divergence by
+/// copy rather than by merge, so a conflicted stage is a state keeper is on
+/// its way out of. `git::commit::write_tree_from_index` skips them for the
+/// same reason.
+///
+/// An ordinary entry is **absent** rather than present-with-`None`: the
+/// question is which paths are LFS, and a map holding every tracked path in
+/// the repository would be the wrong answer at the wrong size. An unreadable
+/// index answers with an empty map, exactly as [`indexed_pointer`] answers
+/// `None` — a listing with no rows beats a listing that fails.
+pub fn indexed_pointers(repo: &gix::Repository) -> BTreeMap<String, Pointer> {
+    let Ok(index) = repo.index_or_empty() else {
+        return BTreeMap::new();
+    };
+    let state = &*index;
+    let mut out = BTreeMap::new();
+    for entry in state.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        if let Some(pointer) = pointer_blob(repo, entry.id) {
+            out.insert(index_key(&gix::path::from_bstr(entry.path(state))), pointer);
+        }
+    }
+    out
+}
+
 /// How big the content behind `rela` is, according to the index.
 ///
 /// For a path that is **gone from the worktree** this is the only place left to

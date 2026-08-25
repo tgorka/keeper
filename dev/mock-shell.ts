@@ -198,6 +198,12 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     sync: { status: "synced", detail: null },
     size: isDir ? null : size,
     folderRole: name === "10-notes" ? "notesVault" : null,
+    // Story 56.2's two additions. `lfsOid` is null because none of these rows
+    // is a virtual path, which is the statement that `size` came off a `stat`;
+    // `mtimeMs` is a fixed instant so the harness renders identically on every
+    // run.
+    lfsOid: null,
+    mtimeMs: 1_700_000_000_000,
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.

@@ -30,6 +30,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use keeper_sync::engine::Engine;
+use keeper_sync::lfs::audit::RemoteAudit;
+use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
@@ -259,6 +261,25 @@ pub enum Command {
         /// reached the server is a valid blob, a clean status and content only
         /// one machine still has. Costs one batch round trip per few hundred
         /// objects and transfers nothing.
+        #[arg(long)]
+        remote: bool,
+    },
+    /// List the LFS paths in a folder and whether this machine holds them.
+    ///
+    /// The honest size of every row is the one the pointer names, never the
+    /// ~130 bytes of pointer text a virtual path holds on disk (FR-336). Reads
+    /// the index, the worktree and the materialization ledger; transfers
+    /// nothing and writes nothing.
+    LsFiles {
+        /// Profile id or name. Omit for all profiles.
+        profile: Option<String>,
+        /// Also ask the server whether it holds every object the pointers
+        /// name, and splice the answer in under `remote`.
+        ///
+        /// Costs one batch round trip per few hundred objects, which is why it
+        /// is opt-in: without it the key is ABSENT from the document rather
+        /// than null, so a consumer can tell "nobody asked" from "the server
+        /// answered" (FR-337).
         #[arg(long)]
         remote: bool,
     },
@@ -539,6 +560,10 @@ pub async fn run(
         } => {
             let engine = engine_for(&platform, config)?;
             cmd_verify(&printer, &engine, profile.as_deref(), remote, repair).await
+        }
+        Command::LsFiles { profile, remote } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_ls_files(&printer, &engine, profile.as_deref(), remote).await
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1149,6 +1174,156 @@ async fn cmd_verify(
             "{missing_total} pointer(s) name content the server does not have"
         )));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ls-files
+// ---------------------------------------------------------------------------
+
+/// One profile's listing as a human reads it (Story 56.2, FR-336, FR-337).
+///
+/// **Pure, and returning lines rather than printing them.** [`Printer`] writes
+/// to process stdout, so an assertion about what this verb *says* would
+/// otherwise need the binary spawned — and the claim worth asserting is a claim
+/// about a string: that the size named is the four megabytes the pointer stands
+/// for and never the ~130 bytes of pointer text the worktree actually holds.
+///
+/// The state word comes from [`LfsFileState`]'s own [`std::fmt::Display`],
+/// which is the same string the `--json` form carries, so the two renderings
+/// cannot come to call one row two different things.
+///
+/// The oid is printed in full rather than abbreviated. It is the handle
+/// `verify`, the store and every later verb take, and a prefix somebody has to
+/// expand by hand is not a handle.
+fn ls_files_lines(profile_name: &str, files: &[LfsFile]) -> Vec<String> {
+    if files.is_empty() {
+        // An honest empty answer, not an error: a folder with no LFS paths —
+        // or one whose `lfs_mode` is `disabled` — has nothing to list, and
+        // saying so beats a failure about a feature nobody asked for.
+        return vec![format!("{profile_name}: no LFS paths")];
+    }
+    let counted = |wanted: LfsFileState| files.iter().filter(|f| f.state == wanted).count();
+    let mut lines = vec![format!(
+        "{profile_name}: {total} LFS path(s) — {virtual_count} virtual, \
+         {materialized} materialized, {absent} absent",
+        total = files.len(),
+        virtual_count = counted(LfsFileState::Virtual),
+        materialized = counted(LfsFileState::Materialized),
+        absent = counted(LfsFileState::Absent),
+    )];
+    lines.extend(files.iter().map(|file| {
+        format!(
+            "  {state:<12}  {size:>9}  {path}  {oid}{pinned}",
+            state = file.state,
+            size = format_bytes(file.size_bytes),
+            path = file.path,
+            oid = file.oid,
+            pinned = if file.pinned { "  [pinned]" } else { "" },
+        )
+    }));
+    lines
+}
+
+/// One profile's listing as the `--json` document carries it.
+///
+/// The key set is the contract (FR-337): `files` is [`LfsFile`]'s own
+/// serialization, unmodified, and `total` is beside it so a consumer that only
+/// wants the count does not have to parse the array. `profileId` and `profile`
+/// mirror what `verify` puts on its per-profile entry, because an operator with
+/// three folders configured reads both documents the same way.
+///
+/// `remote` is a **parameter**, and `None` is what makes the key absent rather
+/// than `null`. Absent means "nobody asked the server"; `null` cannot say that,
+/// and a consumer has to be able to tell it from "the server answered and holds
+/// nothing". Taking it here rather than splicing it in afterwards is what lets
+/// the contract be asserted: the branch that decides absence is in a function a
+/// test can call, not in an `if` around an `await`.
+///
+/// Note that `total` counts **paths** while `remote.checked` counts
+/// path-to-object usages over the objects the batch API was asked about, so the
+/// two are not the same number and are not meant to reconcile.
+fn ls_files_entry(
+    profile: &SyncProfile,
+    files: &[LfsFile],
+    remote: Option<&RemoteAudit>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "total": files.len(),
+        "files": files,
+    });
+    if let Some(audit) = remote {
+        entry["remote"] = serde_json::to_value(audit).unwrap_or(serde_json::Value::Null);
+    }
+    entry
+}
+
+/// The whole `--json` document, envelope included.
+///
+/// The envelope is as much of the contract as the rows are — renaming
+/// `listings` breaks every consumer — so it is built here where a test can
+/// assert it, rather than inline in [`cmd_ls_files`] where nothing could.
+fn ls_files_document(listings: Vec<serde_json::Value>) -> serde_json::Value {
+    let total: usize = listings
+        .iter()
+        .map(|entry| entry["total"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    serde_json::json!({ "listings": listings, "total": total })
+}
+
+/// List every LFS path in the selected profiles, and whether this machine holds
+/// its content.
+///
+/// [`Engine::lfs_files`] reads the index, the worktree and the ledger and
+/// creates nothing; `--remote` adds one batch round trip per few hundred
+/// objects and still transfers nothing. Objects the server is missing are
+/// *reported* and do not change the exit code — this is a listing, and
+/// `verify --remote` is the command whose job is to fail on them.
+async fn cmd_ls_files(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: Option<&str>,
+    remote: bool,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let selected: Vec<SyncProfile> = select(&profiles, wanted)?.into_iter().cloned().collect();
+
+    let mut listings = Vec::with_capacity(selected.len());
+    for profile in &selected {
+        let files = engine.lfs_files(&profile.id)?;
+        for line in ls_files_lines(&profile.name, &files) {
+            printer.line(line);
+        }
+        // The one place the flag is read. `None` past this point is the whole
+        // absent-versus-answered contract, and it is carried as a value rather
+        // than as a later mutation.
+        let audit = if remote {
+            Some(engine.audit_remote_objects(&profile.id).await?)
+        } else {
+            None
+        };
+        if let Some(audit) = &audit {
+            printer.line(format!(
+                "{}: {} pointer(s) on the server, {} missing ({})",
+                profile.name,
+                audit.checked,
+                audit.missing.len(),
+                format_bytes(audit.missing_bytes()),
+            ));
+            for object in &audit.missing {
+                printer.line(format!(
+                    "  {} ({}): {}",
+                    object.path,
+                    format_bytes(object.size),
+                    object.reason
+                ));
+            }
+        }
+        listings.push(ls_files_entry(profile, &files, audit.as_ref()));
+    }
+    printer.json(&ls_files_document(listings));
     Ok(())
 }
 
@@ -1812,6 +1987,10 @@ mod tests {
             &["keeper-syncd", "resume", "docs"],
             &["keeper-syncd", "verify"],
             &["keeper-syncd", "verify", "docs"],
+            &["keeper-syncd", "ls-files"],
+            &["keeper-syncd", "ls-files", "docs"],
+            &["keeper-syncd", "ls-files", "--remote"],
+            &["keeper-syncd", "ls-files", "docs", "--remote"],
             &["keeper-syncd", "doctor"],
             &["keeper-syncd", "logs"],
             &["keeper-syncd", "logs", "-n", "20"],
@@ -1846,6 +2025,7 @@ mod tests {
         }
         // ...and the optional ones really are optional.
         assert!(parse(&["keeper-syncd", "verify"]).is_ok());
+        assert!(parse(&["keeper-syncd", "ls-files"]).is_ok());
     }
 
     #[test]
@@ -2191,5 +2371,186 @@ mod tests {
         assert_eq!(CheckStatus::Warn.label(), "warn");
         assert_eq!(CheckStatus::Fail.label(), "FAIL");
         assert_ne!(CheckStatus::Warn, CheckStatus::Fail);
+    }
+
+    // --- ls-files: the two renderings are the contract -------------------
+
+    fn lfs_file(path: &str, state: LfsFileState, size_bytes: u64) -> LfsFile {
+        LfsFile {
+            path: path.to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes,
+            state,
+            mtime_ms: Some(1_700_000_000_123),
+            materialized_at_ms: None,
+            last_used_ms: None,
+            synced_at_ms: None,
+            pinned: false,
+        }
+    }
+
+    /// The human line names the honest size, and never the pointer's own byte
+    /// count (FR-336).
+    ///
+    /// The 4 MiB virtual path is the whole story in one row: the file on disk is
+    /// about 130 bytes, and an implementation that reported `metadata().len()`
+    /// would put `130 B` here. Asserted on the rendered string because that
+    /// string is what an operator reads and what an agent greps.
+    #[test]
+    fn the_human_line_carries_the_state_the_pointers_size_and_the_oid() {
+        let files = [
+            lfs_file("media/away.mp4", LfsFileState::Virtual, 4 * 1024 * 1024),
+            lfs_file("media/held.mp4", LfsFileState::Materialized, 2_048),
+            lfs_file("media/gone.mp4", LfsFileState::Absent, 99),
+        ];
+        let lines = ls_files_lines("Field", &files);
+
+        assert_eq!(lines.len(), 4, "a header and one line per path: {lines:?}");
+        assert!(
+            lines[0].contains("3 LFS path(s)")
+                && lines[0].contains("1 virtual")
+                && lines[0].contains("1 materialized")
+                && lines[0].contains("1 absent"),
+            "the header counts every state: {}",
+            lines[0]
+        );
+
+        let virtual_line = &lines[1];
+        assert!(virtual_line.contains("virtual"), "{virtual_line}");
+        assert!(
+            virtual_line.contains("4.0 MB"),
+            "the size is the one the pointer names: {virtual_line}"
+        );
+        assert!(
+            virtual_line.contains(&files[0].oid),
+            "the full oid is the handle every later verb takes: {virtual_line}"
+        );
+        assert!(
+            !virtual_line.contains("130"),
+            "the pointer's own byte count must never appear: {virtual_line}"
+        );
+        assert!(lines[2].contains("materialized") && lines[2].contains("2.0 KB"));
+        assert!(lines[3].contains("absent") && lines[3].contains("99 B"));
+    }
+
+    /// A folder with no LFS paths says so instead of failing — the `disabled`
+    /// and the no-LFS-at-all cases both arrive here as an empty slice.
+    #[test]
+    fn an_empty_listing_is_one_honest_line() {
+        assert_eq!(ls_files_lines("Field", &[]), vec!["Field: no LFS paths"]);
+    }
+
+    /// A pinned row says so, because 56.5's release sweep treats `pinned` as a
+    /// floor it may not cross and an operator has to be able to see which paths
+    /// are behind it.
+    #[test]
+    fn a_pinned_row_is_marked_in_the_human_form() {
+        let mut file = lfs_file("keep.bin", LfsFileState::Materialized, 10);
+        file.pinned = true;
+        let lines = ls_files_lines("Field", std::slice::from_ref(&file));
+        assert!(lines[1].contains("[pinned]"), "{}", lines[1]);
+        assert!(
+            !ls_files_lines("Field", &[lfs_file("x.bin", LfsFileState::Absent, 1)])[1]
+                .contains("[pinned]"),
+            "and an unpinned row is not marked"
+        );
+    }
+
+    /// FR-337 calls the JSON form stable, so the assertion is on the KEY SET
+    /// rather than on a substring: a renamed or dropped field is the breakage
+    /// that matters to a consumer, and a `contains` check would miss both. The
+    /// envelope is asserted for the same reason — renaming `listings` breaks
+    /// every consumer and would otherwise break no gate.
+    #[test]
+    fn the_json_documents_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let files = [lfs_file("a.bin", LfsFileState::Virtual, 4 * 1024 * 1024)];
+        let entry = ls_files_entry(&profile, &files, None);
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["files", "profile", "profileId", "total"]);
+        assert_eq!(object["total"], serde_json::json!(1));
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+
+        let row = object["files"][0].as_object().expect("one file object");
+        let mut row_keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        row_keys.sort_unstable();
+        assert_eq!(
+            row_keys,
+            vec![
+                "lastUsedMs",
+                "materializedAtMs",
+                "mtimeMs",
+                "oid",
+                "path",
+                "pinned",
+                "sizeBytes",
+                "state",
+                "syncedAtMs",
+            ]
+        );
+        assert_eq!(row["state"], serde_json::json!("virtual"));
+        assert_eq!(
+            row["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes on disk"
+        );
+
+        let document = ls_files_document(vec![entry.clone(), entry]);
+        let envelope = document.as_object().expect("an object");
+        let mut envelope_keys: Vec<&str> = envelope.keys().map(String::as_str).collect();
+        envelope_keys.sort_unstable();
+        assert_eq!(envelope_keys, vec!["listings", "total"]);
+        assert_eq!(
+            envelope["total"],
+            serde_json::json!(2),
+            "the envelope's total is every profile's paths added up"
+        );
+        assert_eq!(envelope["listings"].as_array().expect("array").len(), 2);
+    }
+
+    /// Without `--remote` the key is ABSENT, not null (FR-337).
+    ///
+    /// The distinction is the whole point of making the round trip opt-in: a
+    /// consumer must be able to tell "nobody asked the server" from "the server
+    /// answered and holds nothing", and `null` cannot say the first. Asserted
+    /// through the renderer's own parameter rather than by re-enacting a splice:
+    /// `None` is what `cmd_ls_files` passes when the flag is absent, so the
+    /// branch under test is the branch that ships.
+    #[test]
+    fn the_remote_key_is_absent_unless_remote_was_asked_for() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let files = [lfs_file("a.bin", LfsFileState::Virtual, 10)];
+
+        let plain = ls_files_entry(&profile, &files, None);
+        assert!(
+            !plain.as_object().expect("object").contains_key("remote"),
+            "no round trip was made, so there is no key to carry: {plain}"
+        );
+
+        let audit = RemoteAudit::default();
+        let asked = ls_files_entry(&profile, &files, Some(&audit));
+        assert!(
+            asked.as_object().expect("object").contains_key("remote"),
+            "and when it was asked for, the audit document is there: {asked}"
+        );
+        assert!(
+            !asked["remote"].is_null(),
+            "present-and-null is the one value the contract says cannot occur: {asked}"
+        );
+
+        // ...and the flag really is optional and really does parse.
+        assert!(matches!(
+            parse(&["keeper-syncd", "ls-files"]).expect("parse").command,
+            Command::LsFiles { remote: false, .. }
+        ));
+        assert!(matches!(
+            parse(&["keeper-syncd", "ls-files", "--remote"])
+                .expect("parse")
+                .command,
+            Command::LsFiles { remote: true, .. }
+        ));
     }
 }

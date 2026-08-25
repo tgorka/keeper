@@ -139,6 +139,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         --
         -- One row per path, written when content lands. Cheap to keep and the
         -- only fact that makes the distinction true.
+        --
+        -- `last_used_ms`, `synced_at_ms`, `pinned`, `oid` and `size_bytes`
+        -- (Story 56.2) are missing here on purpose, exactly as `activity`'s
+        -- late columns are: `ensure_materialized_columns` adds them, so a
+        -- fresh install and one that predates them reach the same schema down
+        -- one path.
         CREATE TABLE IF NOT EXISTS materialized (
             profile_id  TEXT NOT NULL,
             path        TEXT NOT NULL,
@@ -154,6 +160,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     )?;
     ensure_activity_columns(conn)?;
     ensure_journal_columns(conn)?;
+    ensure_materialized_columns(conn)?;
     ensure_prune_default(conn)?;
     Ok(())
 }
@@ -246,6 +253,56 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the late nullable columns `materialized` has grown, if they are not
+/// there yet (Story 56.2).
+///
+/// Five facts the ledger has to hold before anything can decide what to
+/// release: when the content was last *read* (`last_used_ms`), when the remote
+/// last confirmed it holds the object (`synced_at_ms`), whether the owner has
+/// asked for this path to stay on the machine (`pinned`), and the object's
+/// identity and length (`oid`, `size_bytes`) so a row still answers after the
+/// worktree stops holding a pointer to consult.
+///
+/// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
+/// before the first `conn.execute` — `rusqlite` holds the connection while a
+/// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
+/// statement still alive is a borrow error, not a runtime surprise. The one
+/// difference is that these five columns are not all the same type, so the
+/// loop carries the type beside the name rather than hard-coding `INTEGER`.
+///
+/// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
+/// honest reading of every one of them on a pre-existing row: nobody measured
+/// a last use, no remote confirmation was recorded, nothing was pinned. An
+/// `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
+/// idempotence — the rule stated at the top of [`migrate`] — so a second
+/// `migrate` on the same connection adds nothing and errors on nothing.
+///
+/// `pinned` is an `INTEGER` read as a boolean, which is how SQLite spells one;
+/// [`materialized_rows`] narrows it, so no caller sees the encoding.
+fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
+    // Column 1 of `table_info` is the column name.
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (column, kind) in [
+        ("last_used_ms", "INTEGER"),
+        ("synced_at_ms", "INTEGER"),
+        ("pinned", "INTEGER"),
+        ("oid", "TEXT"),
+        ("size_bytes", "INTEGER"),
+    ] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(
+                &format!("ALTER TABLE materialized ADD COLUMN {column} {kind}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Add `label`, the journal's one late column, if it is not there yet.
 ///
 /// A unit's payload says what work to do; the label says what to *call* it
@@ -323,8 +380,25 @@ pub fn queued_downloads(
 /// Record that content for `path` now exists on this machine.
 ///
 /// Called when an object is materialized, which is the one moment the fact is
-/// known. `INSERT OR REPLACE` because materializing again is the ordinary case
-/// — a second version arriving — and the newest timestamp is the useful one.
+/// known. Materializing again is the ordinary case — a second version arriving
+/// — and the newest timestamp is the useful one, so the conflicting row is
+/// updated rather than rejected.
+///
+/// # Why this is an upsert and not `INSERT OR REPLACE`
+///
+/// It was `INSERT OR REPLACE` until Story 56.2, and that spelling became a
+/// data-loss bug the moment this table grew a column: under the
+/// `(profile_id, path)` primary key SQLite resolves a REPLACE by **deleting
+/// the conflicting row and inserting a fresh one**, so every column this
+/// statement does not name is silently reset to `NULL`. The first
+/// re-materialization after [`ensure_materialized_columns`] ran would have
+/// blanked `pinned`, `synced_at_ms` and `last_used_ms` — and `pinned` is the
+/// hard floor a release sweep is not allowed to cross, so the loss would be
+/// invisible until content the owner asked to keep was gone.
+///
+/// Naming `at_ms` explicitly in the `DO UPDATE` is therefore the whole point:
+/// this function knows exactly one fact, and it is now incapable of touching
+/// any other.
 pub fn remember_materialized(
     conn: &Connection,
     profile_id: &str,
@@ -332,7 +406,8 @@ pub fn remember_materialized(
     now_ms: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)",
+        "INSERT INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(profile_id, path) DO UPDATE SET at_ms = excluded.at_ms",
         (profile_id, path, now_ms),
     )?;
     Ok(())
@@ -351,6 +426,91 @@ pub fn materialized_paths(
     let mut out = std::collections::HashSet::new();
     for row in rows {
         out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// One row of the `materialized` ledger, late columns included (Story 56.2).
+///
+/// A struct rather than a tuple because five of the seven fields are
+/// `Option`s of two types and four of them are timestamps: a transposition
+/// between `last_used_ms` and `synced_at_ms` would compile, pass every type
+/// check, and make a release decision on the wrong fact.
+///
+/// **Every late field is an `Option` and that is a fact, not a placeholder.**
+/// A row written before Story 56.2 — or by the one writer that exists,
+/// [`remember_materialized`], which sets `at_ms` and nothing else — reads back
+/// `None` for all of them, and `None` means "nobody recorded this" rather than
+/// zero, epoch, or absent-from-the-remote. Nothing in this story writes them;
+/// they exist so the reader and the schema arrive together instead of a
+/// migration landing in a story that cannot observe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedRow {
+    /// Repository-relative, `/`-joined — the same frame every other path in
+    /// this database is in.
+    pub path: String,
+    /// When content for this path last landed here. The one column with a
+    /// writer.
+    pub at_ms: i64,
+    /// When the content was last read through keeper.
+    pub last_used_ms: Option<i64>,
+    /// When the remote last confirmed it holds the object.
+    pub synced_at_ms: Option<i64>,
+    /// The object this path's content is, when the row recorded one.
+    pub oid: Option<String>,
+    /// How large that object is, when the row recorded it. Narrowed from
+    /// SQLite's signed integer the same way `list_activity` narrows a size: a
+    /// negative byte count is not a byte count, and it means exactly what
+    /// `NULL` means.
+    pub size_bytes: Option<u64>,
+    /// Whether the owner has asked for this path to stay on this machine.
+    /// `false` for every row that has never said otherwise, including every
+    /// row written before the column existed — an unpinned path is the
+    /// default, so absence and `0` are the same answer and an `Option` here
+    /// would be a distinction nobody can act on.
+    pub pinned: bool,
+}
+
+/// Every `materialized` row this profile has, whole.
+///
+/// Wider than [`materialized_paths`], and beside it rather than replacing it:
+/// that one answers a single yes/no per path, which is all the arrival
+/// decision needs and all it should be able to see, while this one carries the
+/// columns a listing reports. Read in one statement for the same reason it is:
+/// the caller is building a list, and a query per row is how a folder of a
+/// hundred thousand paths becomes a minute of SQLite.
+pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned
+           FROM materialized
+          WHERE profile_id = ?1
+          ORDER BY path",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned) = row?;
+        out.push(MaterializedRow {
+            path,
+            at_ms,
+            last_used_ms,
+            synced_at_ms,
+            oid,
+            // A row from before the column existed reads back `NULL`, and a
+            // negative size is not a size: both mean the same thing here.
+            size_bytes: size.and_then(|bytes| u64::try_from(bytes).ok()),
+            pinned: pinned.unwrap_or(0) != 0,
+        });
     }
     Ok(out)
 }
@@ -1807,6 +1967,110 @@ mod tests {
         let row = &list_activity(&c, "p", 10).expect("list")[0];
         assert_eq!(row.size_bytes, Some(12_288));
         assert_eq!(row.unit_id, Some(unit));
+    }
+
+    #[test]
+    fn a_materialized_table_predating_the_late_columns_upgrades_in_place() {
+        // The exact shape `sync.db` had before Story 56.2. A row of it records
+        // that content for a path landed on this machine, which is the only
+        // evidence distinguishing an arriving object that REPLACES something
+        // from one that is simply new here — so losing one is losing that
+        // distinction permanently, and recreating the table empty would lose
+        // every one at once.
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE materialized (
+                 profile_id  TEXT NOT NULL,
+                 path        TEXT NOT NULL,
+                 at_ms       INTEGER NOT NULL,
+                 PRIMARY KEY (profile_id, path)
+             );
+             INSERT INTO materialized (profile_id, path, at_ms)
+             VALUES ('p', '40-media/clip.mp4', 1_700);",
+        )
+        .expect("plant the pre-56.2 schema");
+
+        migrate(&c).expect("migrate an existing install");
+
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger"),
+            vec![MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: None,
+                synced_at_ms: None,
+                oid: None,
+                size_bytes: None,
+                pinned: false,
+            }],
+            "the old row survives with its timestamp untouched, and every late \
+             column reads as absent rather than as zero, epoch or unpinned-by-record"
+        );
+
+        // A second `migrate` on the same connection is the upgrade path an
+        // ordinary `open` takes on every launch. `ALTER TABLE ... ADD COLUMN`
+        // guarded by the column list is its own idempotence, which is why this
+        // schema addition needs no `meta` marker — assert it rather than trust
+        // it, because the failure mode is a daemon that cannot start.
+        migrate(&c).expect("migrating twice changes nothing");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger").len(),
+            1
+        );
+        assert_eq!(
+            materialized_paths(&c, "p").expect("read the paths"),
+            std::collections::HashSet::from(["40-media/clip.mp4".to_owned()]),
+            "the narrow reader the arrival decision uses still answers the same"
+        );
+    }
+
+    /// Re-materializing a path moves `at_ms` and touches nothing else (Story
+    /// 56.2).
+    ///
+    /// This is the hazard the story exists to close, and it is invisible by
+    /// construction: `remember_materialized` was `INSERT OR REPLACE`, and under
+    /// the `(profile_id, path)` primary key SQLite resolves a REPLACE by
+    /// DELETING the conflicting row and inserting a fresh one — so every column
+    /// the statement does not name comes back `NULL`. Nothing would have
+    /// complained; the first re-download after this table grew a `pinned`
+    /// column would simply have un-pinned the path, and 56.5's release sweep
+    /// reads `pinned` as the one thing it may not cross.
+    ///
+    /// The row is planted with all five late columns filled, because a test that
+    /// only checked `pinned` would pass against a statement that named `pinned`
+    /// and forgot the rest.
+    #[test]
+    fn re_materializing_a_pinned_path_moves_only_its_timestamp() {
+        let c = conn();
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("first landing");
+        c.execute(
+            "UPDATE materialized
+                SET pinned = 1,
+                    last_used_ms = 1_750,
+                    synced_at_ms = 1_760,
+                    oid = 'abc123',
+                    size_bytes = 4_194_304
+              WHERE profile_id = 'p' AND path = '40-media/clip.mp4'",
+            [],
+        )
+        .expect("fill the late columns the way a later story will");
+
+        remember_materialized(&c, "p", "40-media/clip.mp4", 9_900).expect("a second landing");
+
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger"),
+            vec![MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 9_900,
+                last_used_ms: Some(1_750),
+                synced_at_ms: Some(1_760),
+                oid: Some("abc123".to_owned()),
+                size_bytes: Some(4_194_304),
+                pinned: true,
+            }],
+            "only the timestamp moved: an upsert that named more than `at_ms`, \
+             or a REPLACE that named less, fails here"
+        );
     }
 
     #[test]
