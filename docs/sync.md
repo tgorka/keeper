@@ -314,7 +314,34 @@ Two guards sit behind it:
 ### Verifying the half that loses data
 
 `keeper-syncd verify` checks that every pointer in the worktree names an object
-*this machine* still has. That is the half answerable without a network.
+*this machine* still has — except where the folder's virtual-file policy
+authorizes that content to stay away. Those paths are counted and reported as
+virtual (`N virtual`, `verified[].virtual` in `--json`) instead of being called
+a fault, because that is the normal state of a folder that keeps pointers.
+
+The policy in force is read from the `.keepervirtual` standing in the
+**worktree**, never from `HEAD`, and a `virtualPatterns` list on the profile or
+in a folder TOML layer above it replaces the file's list wholesale — so what is
+in force may be neither committed nor in that file at all. (Protections, the
+`!` lines, are the union of every source and are never dropped.) A folder with
+no policy at all, and a folder whose `lfsMode` is `disabled`, excuse nothing.
+
+An excuse needs every fact that is free, and misses none of them:
+
+- the **index** carries a pointer for that path whose oid and size are the ones
+  on disk, which is what tells a checkout's committed pointer from a
+  pointer-shaped file somebody saved by hand;
+- the **policy** answers that the path may stay away;
+- the object is genuinely **absent** from this machine's store rather than
+  sitting there truncated;
+- and where the folder's remote is a **directory this machine can see**, that
+  store holds the object. Without this one the division of labour below is
+  false for an external drive, whose remote half asks nothing at all. A drive
+  that is out is absence rather than failure, and leaves the excuse to the
+  facts above it.
+
+Everything unproven is still reported. That is the half answerable without a
+network.
 
 `keeper-syncd verify --remote` asks the other half, and it is the one that finds
 permanent loss: a pointer whose object never reached the server is a valid git

@@ -184,10 +184,19 @@ pub struct PathDurability {
     pub problem: Option<String>,
 }
 
-/// Result of a verification pass (Story 25.6).
+/// Result of a verification pass (Story 25.6, Story 56.6).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     pub checked: u64,
+    /// Paths whose content is deliberately not on this machine: the index
+    /// carries the committed pointer the worktree holds, and the folder's
+    /// compiled [`lfs::virtual_policy::VirtualPolicy`] authorizes that content
+    /// to stay away (AD-129).
+    ///
+    /// Counted rather than merely suppressed. A row nobody reports anywhere is
+    /// indistinguishable from a check that stopped running, and the whole risk
+    /// of this story is a check that went quiet.
+    pub virtual_paths: u64,
     /// `(path, reason)` for everything that failed.
     pub bad: Vec<(String, String)>,
 }
@@ -7635,15 +7644,43 @@ impl Engine {
                 // Not in the store. The worktree file may still be the content
                 // — that is the ordinary state on the machine that recorded it
                 // — so hash it back in and check what came out.
-                match lfs::stage::clean(&store, &absolute) {
-                    Ok(pointer) => pointer.oid == object.oid && pointer.size == object.size,
-                    Err(err) => {
-                        tracing::debug!(
-                            path = %object.path,
-                            error = %err,
-                            "cannot rebuild a missing object from the worktree"
-                        );
-                        false
+                //
+                // Unless the worktree holds the pointer that names THIS
+                // object, which since Epic 56 is the ordinary state of an
+                // authorized virtual path. Asked BEFORE the call and not
+                // around its answer, because `stage::clean` is not a probe: it
+                // streams the file into the store, so re-cleaning ~130 bytes
+                // of pointer text would deposit a junk object under the
+                // pointer text's own sha — an object no pointer names, that
+                // `prune` will not remove for want of a reference — and then
+                // compare that sha to the oid it stands for, which can never
+                // match. No read, no store write, no comparison.
+                //
+                // Only that pointer, and the oid comparison is what keeps the
+                // gate the width of the sentence. A tracked file whose genuine
+                // content IS pointer text — this project's own LFS
+                // documentation under a small `lfs_threshold_bytes`, a test
+                // fixture that holds an example pointer — is recoverable
+                // exactly as it always was, and calling it beyond this machine
+                // would be the loudest warning the product prints, told about
+                // a file sitting right there.
+                let holds_the_pointer_for_this_object = std::fs::metadata(&absolute)
+                    .ok()
+                    .and_then(|meta| lfs::stage::worktree_pointer(&absolute, &meta))
+                    .is_some_and(|pointer| pointer.oid == object.oid);
+                if holds_the_pointer_for_this_object {
+                    false
+                } else {
+                    match lfs::stage::clean(&store, &absolute) {
+                        Ok(pointer) => pointer.oid == object.oid && pointer.size == object.size,
+                        Err(err) => {
+                            tracing::debug!(
+                                path = %object.path,
+                                error = %err,
+                                "cannot rebuild a missing object from the worktree"
+                            );
+                            false
+                        }
                     }
                 }
             };
@@ -7684,17 +7721,96 @@ impl Engine {
         Ok(report)
     }
 
-    /// Re-verify stored content for a profile (Story 25.6).
+    /// Re-verify stored content for a profile (Story 25.6, Story 56.6).
+    ///
+    /// # Why the remote proof is NOT taken here
+    ///
+    /// A pointer whose object is not in this machine's store is either damage
+    /// or the entirely normal state of a folder that keeps pointers
+    /// (Epic 56). Telling the two apart from bytes on this disk is what the
+    /// index and the compiled policy do below; telling them apart *for
+    /// certain* would need the server, and this verb deliberately does not ask
+    /// it. [`Self::remote_serves`] is one batch round trip **per object**, so
+    /// composing it per path would answer NFR-41's own fixture — a folder with
+    /// 10 000 authorized virtual paths — with 10 000 round trips, and would
+    /// break the contract `docs/sync.md` states: that plain `verify` is the
+    /// half answerable without a network.
+    ///
+    /// The proof lives where it is already batched, index-driven and paid for
+    /// once: [`Self::audit_remote_objects`] behind `--remote`, whose
+    /// `missing_total` carries its own non-zero exit gate in `keeper-syncd`.
+    /// The offline half excuses; the remote half condemns.
+    ///
+    /// # What earns an excuse
+    ///
+    /// Four facts, and every one of them free. The **index** says the bytes on
+    /// disk are the pointer this repository committed; the compiled
+    /// **policy** says that path is authorized to stay away; the object is
+    /// **absent** rather than sitting here truncated; and where the folder's
+    /// remote is a directory this machine can see
+    /// ([`filesystem_remote_store`]) that store **holds** the object. The
+    /// fourth is what keeps the division of labour honest for an external
+    /// drive, whose remote half asks nothing. A folder whose `lfs_mode` is
+    /// `Disabled` earns nothing: with LFS off, no pass will ever materialize
+    /// the path, so calling its absent content normal would be a promise
+    /// nothing keeps.
     pub async fn verify(&self, id: &str) -> Result<VerifyReport> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
             return Err(SyncError::Config(format!("no such sync profile: {id}")));
         };
         self.publish(self.progress(&profile, SyncPhase::Verifying));
 
-        let root = profile.local_path.clone();
+        // Everything the walk needs, moved in whole — the policy compiled
+        // INSIDE the closure and not before it. `verify` takes no reservation,
+        // so `Reservation::drop` cannot clean up after it and the `Idle`
+        // publish at the tail is the only thing that does; a `?` between the
+        // `Verifying` publish and that line leaves the tray spinning and a bar
+        // on the card until the process ends. That is Story 34.8, and a config
+        // typo (FR-329) is a new way to reach it.
+        let walked = profile.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<VerifyReport> {
+            let root = walked.local_path.clone();
+            // Compiled ONCE per call and never per path: the struct's own doc
+            // forbids building a `GlobSet` inside a walk. A policy that cannot
+            // be parsed fails the verb quoting the line (FR-329) rather than
+            // being read as a permissive "nothing is virtual" — the direction
+            // 56.5 settled for a folder config that could not be read.
+            let policy = lfs::virtual_policy::VirtualPolicy::compile(&walked)?;
             let mut report = VerifyReport::default();
             let store = lfs::store::LfsStore::in_git_dir(root.join(".git"));
+            // Whether ANY path in this folder could be excused, settled once
+            // because both halves are facts about the folder rather than about
+            // a path. No source said what may stay away, so nothing may; or
+            // LFS is off entirely, in which case nothing will ever materialize
+            // a pointer and calling the path's absent content normal would be
+            // dishonest. Settling it here is also what keeps the ordinary
+            // folder — the overwhelming majority, carrying no policy at all —
+            // from paying an index parse plus one object-header lookup per
+            // tracked path on every verify, the scheduled ones included.
+            let excusable = policy.tier() != lfs::virtual_policy::VirtualPolicyTier::Unset
+                && walked.lfs_mode != LfsMode::Disabled;
+            // One index read for the whole walk. A folder with no repository,
+            // or one whose index cannot be read, answers with an empty map and
+            // therefore excuses NOTHING: the index is the only thing that can
+            // tell a checkout's committed pointer from a pointer-shaped file
+            // somebody saved by hand, and `VirtualPolicy::resolve` does no I/O
+            // by design (FR-328) so it cannot.
+            let indexed = if excusable {
+                git::repo::open(&root, walked.removable)
+                    .ok()
+                    .map(|repo| lfs::stage::indexed_pointers(&repo))
+                    .unwrap_or_default()
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            // The third fact, taken here because it is free: a remote that is
+            // a directory this machine can see is asked with a `stat`, not a
+            // round trip. Resolved once, and only when an excuse is possible.
+            let remote = if excusable {
+                filesystem_remote_store(&walked)
+            } else {
+                None
+            };
             let mut stack = vec![root.clone()];
             while let Some(dir) = stack.pop() {
                 let entries = match std::fs::read_dir(&dir) {
@@ -7723,10 +7839,63 @@ impl Engine {
                         if lfs::pointer::is_pointer_candidate(&head) {
                             if let Some(pointer) = lfs::pointer::Pointer::parse(&head) {
                                 if !store.contains(&pointer.oid, pointer.size) {
-                                    report.bad.push((
-                                        display_relative(&root, &path),
-                                        format!("LFS object {} is missing locally", pointer.oid),
-                                    ));
+                                    // The excuse is earned by every fact that
+                                    // is free, never by one (AD-129). The
+                                    // policy answer is an authorization about
+                                    // a pattern and a size — "this path *may*
+                                    // stay away" — and the index is what
+                                    // proves the bytes on disk are the pointer
+                                    // this repository committed rather than a
+                                    // stray file that happens to start with
+                                    // `version https://git-lfs...`. Either
+                                    // alone is a guess, and everything
+                                    // unproven stays reported, word for word
+                                    // as before.
+                                    let rela = path.strip_prefix(&root).unwrap_or(&path);
+                                    let committed = indexed
+                                        .get(&lfs::stage::index_key(rela))
+                                        .is_some_and(|entry| {
+                                            entry.oid == pointer.oid && entry.size == pointer.size
+                                        });
+                                    let authorized = policy.resolve(rela, pointer.size)
+                                        == lfs::virtual_policy::Virtualization::Virtual;
+                                    // `contains` is length-verified, so an
+                                    // object sitting here at the WRONG length
+                                    // answered `false` above — a truncated
+                                    // blob left by a `kill -9` or a
+                                    // half-restored backup, which is the very
+                                    // damage `LfsStore::contains` exists to
+                                    // catch. Only a genuinely ABSENT object is
+                                    // the normal state of a virtual path.
+                                    let absent = !store.object_path(&pointer.oid).exists();
+                                    // The third fact, and without it "the
+                                    // offline half excuses, the remote half
+                                    // condemns" is simply false for an
+                                    // external drive: `audit_remote_objects`
+                                    // short-circuits a filesystem remote to
+                                    // `missing: []` without asking it
+                                    // anything, so an object that vanished
+                                    // from the drive would be reported by
+                                    // nothing at all. When the drive is there
+                                    // the proof costs a `stat`, so it is taken.
+                                    // `None` — a remote that is a URL, or a
+                                    // drive that is out (absence is never
+                                    // failure, AD-48) — leaves the two-fact
+                                    // excuse exactly as it was.
+                                    let elsewhere = remote.as_ref().is_none_or(|remote| {
+                                        remote.contains(&pointer.oid, pointer.size)
+                                    });
+                                    if committed && authorized && absent && elsewhere {
+                                        report.virtual_paths += 1;
+                                    } else {
+                                        report.bad.push((
+                                            display_relative(&root, &path),
+                                            format!(
+                                                "LFS object {} is missing locally",
+                                                pointer.oid
+                                            ),
+                                        ));
+                                    }
                                 }
                                 continue;
                             }
@@ -7744,10 +7913,18 @@ impl Engine {
         .await
         .map_err(|err| SyncError::Journal(format!("verify task failed: {err}")));
 
-        // Published before the `?`, not after it. `verify` takes no reservation
-        // — it only reads — so it is the one pass `Reservation::drop` does not
-        // cover, and an unreadable tree used to leave `Verifying` on the tray
-        // and a bar on the card until the process ended (Story 34.8).
+        // Published before the `?`, not after it, and this is the reason every
+        // fallible step above lives inside the closure. `verify` takes no
+        // reservation, so it is the one pass `Reservation::drop` does not
+        // cover, and an unreadable tree — or a policy that will not compile —
+        // used to leave `Verifying` on the tray and a bar on the card until the
+        // process ended (Story 34.8).
+        //
+        // It moves nothing a user owns: no worktree file is written and no
+        // object is added to the store. It is not *pure*, though, and the
+        // claim is worth narrowing rather than repeating — opening the
+        // repository to read the index is a `gix` open, which may clear a stale
+        // `index.lock` and may write `.git/config` on first use.
         self.publish(self.progress(&profile, SyncPhase::Idle));
         report?
     }
@@ -8542,6 +8719,111 @@ fn minute_of_day(hhmm: &str) -> Option<u16> {
     (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
 }
 
+/// The hydration capability a verified copy asks for (Story 56.6).
+///
+/// `copy.rs` knows nothing about profiles, indexes or object stores and must
+/// keep knowing nothing, so the path→profile rule lives here — in the crate
+/// that owns both facts, and the one that compiles on every host.
+impl crate::copy::ContentSource for Engine {
+    fn materialize(&self, absolute: &Path) -> Result<()> {
+        use lfs::hydrate::{ContentRefusal, MaterializeOutcome};
+
+        let profiles = self.with_db(db::list_profiles)?;
+        // Canonicalized before comparing, both sides, for the reason
+        // `browse::resolve` canonicalizes both sides (AD-59): a lexical
+        // `strip_prefix` over raw paths answers `NotTracked` for a synced
+        // folder reached through a symlinked ancestor — `/tmp` and `/var` are
+        // symlinks on macOS, and a relocated home directory is one everywhere
+        // — or through an ancestor spelled with different case on APFS or
+        // NTFS. That is a sentence the user knows to be false, and it would be
+        // told about every large file that then silently failed to reach the
+        // pendrive. The raw path is the fallback: a path that cannot be
+        // canonicalized is one nobody can compare, and refusing to look would
+        // be worse than comparing what was asked for.
+        let target = absolute
+            .canonicalize()
+            .unwrap_or_else(|_| absolute.to_path_buf());
+        // Longest matching root wins. A profile nested inside another one is
+        // the folder that actually carries the path, and resolving against the
+        // shorter root would ask the wrong repository for a subpath it does not
+        // track.
+        let owner = profiles
+            .iter()
+            .filter_map(|profile| {
+                let root = profile
+                    .local_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| profile.local_path.clone());
+                let rest = target.strip_prefix(&root).ok()?.to_path_buf();
+                Some((profile, rest, root))
+            })
+            .max_by_key(|(_, _, root)| root.as_os_str().len());
+        let Some((profile, rest, _)) = owner else {
+            // Under no folder keeper syncs, so there is no committed pointer
+            // and nothing to ask for — `NotTracked`'s own sentence, which
+            // already collapses exactly these cases.
+            return Err(SyncError::Refused(ContentRefusal::NotTracked {
+                path: absolute.to_string_lossy().into_owned(),
+            }));
+        };
+        // `/`-joined, the frame every subpath in this crate is already in;
+        // rebuilt from components rather than string-replaced so a Windows `\`
+        // never reaches `browse::plain_segments`.
+        //
+        // A component that is not valid UTF-8 is REFUSED rather than rendered,
+        // and `browse::BrowseRefusal::Unspellable` is the sentence for exactly
+        // this: `to_string_lossy` maps every invalid byte onto `U+FFFD`, so two
+        // distinct names collapse onto one key and the index lookup can succeed
+        // at the wrong entry — hydrating a different file than the one being
+        // copied. The lossy rendering appears in the message, where it can
+        // mislead nobody, and never in the key.
+        let mut segments = Vec::with_capacity(rest.components().count());
+        for part in rest.components() {
+            let Some(name) = part.as_os_str().to_str() else {
+                return Err(SyncError::Refused(ContentRefusal::Escapes(
+                    crate::browse::BrowseRefusal::Unspellable {
+                        subpath: absolute.to_string_lossy().into_owned(),
+                    },
+                )));
+            };
+            segments.push(name);
+        }
+        let subpath = segments.join("/");
+
+        // Asked BEFORE `materialize_entry`, because by the time that answers
+        // `Queued` it has already enqueued the download, labelled it, promoted
+        // it and woken the supervisor — and `wake_now` also clears
+        // `next_release_ms` and `release_cursor`, resetting 56.5's sweep
+        // rotation. So a copy of a folder that holds nothing but pointers
+        // would start fetching the whole zone the user never asked for, as a
+        // side effect of being refused. This is a read of at most
+        // `MAX_POINTER_BYTES` and one `stat` per path, and it decides the
+        // common case without touching the journal at all.
+        if let Some(pointer) = std::fs::symlink_metadata(absolute)
+            .ok()
+            .and_then(|meta| lfs::stage::worktree_pointer(absolute, &meta))
+        {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            if !store.contains(&pointer.oid, pointer.size) {
+                return Err(SyncError::Refused(ContentRefusal::ContentNotHere {
+                    path: subpath,
+                }));
+            }
+        }
+
+        match self.materialize_entry(&profile.id, &subpath)?.outcome {
+            MaterializeOutcome::Materialized | MaterializeOutcome::AlreadyMaterialized => Ok(()),
+            // Belt and braces for the check above: a download queued between
+            // the two means the object is not on this machine, a copy cannot
+            // wait for one, and calling that hydrated is the silent-pointer-copy
+            // bug in a new place.
+            MaterializeOutcome::Queued => Err(SyncError::Refused(ContentRefusal::ContentNotHere {
+                path: subpath,
+            })),
+        }
+    }
+}
+
 /// UTC `yyyymmdd-hhmmss` for a conflict filename.
 ///
 /// UTC deliberately, unlike the `.trashinfo` `DeletionDate`
@@ -8574,6 +8856,33 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// The object store belonging to this folder's remote, when that remote is a
+/// directory this machine can see (Story 56.6).
+///
+/// [`Engine::remote_serves`]' filesystem fast path without the network half.
+/// A remote that is a path has a real LFS store in the client layout
+/// ([`lfs::local::remote_store`]), so [`lfs::store::LfsStore::contains`] is a
+/// genuine, size-verified, per-object answer for the price of a `stat` — which
+/// is what makes it affordable inside a walk that must stay offline.
+///
+/// `None` in three cases, each meaning "do not read anything into this":
+///
+/// * the remote is a URL, so it has a server and [`Engine::audit_remote_objects`]
+///   is the half that asks it;
+/// * an explicit `.lfsconfig` names a server, which wins over the shape of the
+///   remote URL — the same precedence [`Engine::remote_serves`] and
+///   `lfs_access` apply, and a folder that has one may be pushing its objects
+///   somewhere the remote path knows nothing about;
+/// * the store's root is not on disk, which is an unplugged drive. Absence is
+///   never failure (AD-48), and a store nobody could ask must never be read as
+///   a store that answered no.
+fn filesystem_remote_store(profile: &SyncProfile) -> Option<lfs::store::LfsStore> {
+    if profile.local_path.join(".lfsconfig").exists() {
+        return None;
+    }
+    lfs::local::remote_store(&profile.remote_url).filter(|store| store.root().exists())
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use keeper_sync::engine::Engine;
+use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
 use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Pin, Release};
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
@@ -1172,6 +1172,85 @@ fn join_outcome(
 // verify
 // ---------------------------------------------------------------------------
 
+/// One profile's verification as a human reads it (Story 25.6, Story 56.6).
+///
+/// **Pure, and returning lines rather than printing them**, for the reason
+/// [`ls_files_lines`] is: [`Printer`] writes to process stdout, so an assertion
+/// about what this verb *says* would otherwise need the binary spawned — and
+/// the claim worth asserting is a claim about a string.
+///
+/// The `virtual` count is the whole anti-quietness argument in one word. Since
+/// Story 56.6 `verify` excuses an authorized virtual path instead of calling it
+/// a fault, and a row that is suppressed and reported *nowhere* is
+/// indistinguishable from a check that stopped running. So the count is
+/// rendered unconditionally, in both forms, beside the two numbers that were
+/// always there.
+///
+/// `Err` is a folder whose verify could not run at all — a `.keepervirtual`
+/// that will not compile (FR-329) is the ordinary way — and it is one folder's
+/// line rather than the end of the verb. See [`cmd_verify`].
+fn verify_lines(profile: &SyncProfile, report: Result<&VerifyReport, &str>) -> Vec<String> {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => return vec![format!("{}: could not be checked: {error}", profile.name)],
+    };
+    let mut lines = vec![format!(
+        "{}: {} checked, {} bad, {} virtual",
+        profile.name,
+        report.checked,
+        report.bad.len(),
+        report.virtual_paths
+    )];
+    lines.extend(
+        report
+            .bad
+            .iter()
+            .map(|(path, reason)| format!("  {path}: {reason}")),
+    );
+    lines
+}
+
+/// One profile's verification as the `--json` document carries it.
+///
+/// The key set is the contract, and `virtual` joins it for the reason
+/// [`verify_lines`] renders the count: suppressed and nowhere reported is not a
+/// state this document may describe. `profileId` and `profile` are the same two
+/// keys [`ls_files_entry`] carries, so an operator with three folders reads
+/// both documents the same way.
+///
+/// An `Err` entry carries `error` and **no** `bad` array. A consumer must be
+/// able to tell "this folder was checked and nothing was wrong" from "this
+/// folder was never checked", and an empty array cannot say the second.
+fn verify_entry(profile: &SyncProfile, report: Result<&VerifyReport, &str>) -> serde_json::Value {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            return serde_json::json!({
+                "profileId": profile.id,
+                "profile": profile.name,
+                "error": error,
+            })
+        }
+    };
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "checked": report.checked,
+        "virtual": report.virtual_paths,
+        "bad": report.bad
+            .iter()
+            .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Check every selected folder, and let one folder's failure be one folder's.
+///
+/// A `?` on the per-profile `verify` used to discard every report already
+/// computed, skip every folder still to come, and emit no `--json` document at
+/// all — so a typo in one folder's `.keepervirtual` blinded the operator to the
+/// other two. Contained instead: the failure is that folder's own entry, it
+/// counts against the exit code, and the loop carries on.
 async fn cmd_verify(
     printer: &Printer,
     engine: &Engine,
@@ -1185,27 +1264,28 @@ async fn cmd_verify(
     let mut reports = Vec::with_capacity(selected.len());
     let mut bad_total = 0usize;
     let mut missing_total = 0usize;
+    let mut refused_total = 0usize;
     for profile in &selected {
-        let report = engine.verify(&profile.id).await?;
-        bad_total += report.bad.len();
-        printer.line(format!(
-            "{}: {} checked, {} bad",
-            profile.name,
-            report.checked,
-            report.bad.len()
-        ));
-        for (path, reason) in &report.bad {
-            printer.line(format!("  {path}: {reason}"));
+        let checked = match engine.verify(&profile.id).await {
+            Ok(report) => report,
+            Err(err) => {
+                let reason = err.to_string();
+                refused_total += 1;
+                for line in verify_lines(profile, Err(reason.as_str())) {
+                    printer.line(line);
+                }
+                reports.push(verify_entry(profile, Err(reason.as_str())));
+                // The remote half of a folder whose local half never ran would
+                // be an audit of an unknown, and `--repair` over it would be a
+                // write decided from one.
+                continue;
+            }
+        };
+        bad_total += checked.bad.len();
+        for line in verify_lines(profile, Ok(&checked)) {
+            printer.line(line);
         }
-        let mut entry = serde_json::json!({
-            "profileId": profile.id,
-            "profile": profile.name,
-            "checked": report.checked,
-            "bad": report.bad
-                .iter()
-                .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
-                .collect::<Vec<_>>(),
-        });
+        let mut entry = verify_entry(profile, Ok(&checked));
 
         if remote {
             let audit = engine.audit_remote_objects(&profile.id).await?;
@@ -1263,6 +1343,13 @@ async fn cmd_verify(
         // still save it is somebody noticing today.
         return Err(CliError::Operational(format!(
             "{missing_total} pointer(s) name content the server does not have"
+        )));
+    }
+    if refused_total > 0 {
+        // Last, so neither gate above is weakened or reworded, and non-zero
+        // regardless: a check that could not run is not a check that passed.
+        return Err(CliError::Operational(format!(
+            "{refused_total} folder(s) could not be checked"
         )));
     }
     Ok(())
@@ -3011,6 +3098,124 @@ mod tests {
         ));
     }
 
+    // --- verify: the two renderings are the contract (Story 56.6) ----------
+
+    fn verified(checked: u64, virtual_paths: u64, bad: &[(&str, &str)]) -> VerifyReport {
+        VerifyReport {
+            checked,
+            virtual_paths,
+            bad: bad
+                .iter()
+                .map(|(path, reason)| ((*path).to_owned(), (*reason).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// The whole anti-quietness argument is this string, and until now nothing
+    /// asserted it.
+    ///
+    /// `verify` no longer reports an authorized virtual path as a fault, so the
+    /// only thing standing between "excused correctly" and "stopped looking" is
+    /// a count on the line an operator reads. A thousand quiet paths with no
+    /// number beside them is the failure this story could have shipped.
+    #[test]
+    fn the_human_line_counts_what_was_excused_beside_what_was_wrong() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let lines = verify_lines(
+            &profile,
+            Ok(&verified(
+                1_001,
+                1_000,
+                &[("30-docs/report.bin", "LFS object abc is missing locally")],
+            )),
+        );
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "a header and one line per bad path: {lines:?}"
+        );
+        assert_eq!(lines[0], "Field: 1001 checked, 1 bad, 1000 virtual");
+        assert_eq!(
+            lines[1],
+            "  30-docs/report.bin: LFS object abc is missing locally"
+        );
+    }
+
+    /// A clean folder still says how many paths are deliberately away, because
+    /// zero bad and a thousand virtual is the normal state Epic 56 created and
+    /// an operator has to be able to see it.
+    #[test]
+    fn a_clean_folder_still_names_its_virtual_count() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        assert_eq!(
+            verify_lines(&profile, Ok(&verified(1_000, 1_000, &[]))),
+            vec!["Field: 1000 checked, 0 bad, 1000 virtual"]
+        );
+    }
+
+    /// The JSON form's key set is what a consumer parses, so `virtual` is
+    /// asserted as a KEY and not as a substring: a renamed or dropped field is
+    /// the breakage that matters, and a `contains` check would miss both.
+    #[test]
+    fn the_verify_entrys_key_set_carries_the_virtual_count() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let entry = verify_entry(
+            &profile,
+            Ok(&verified(
+                7,
+                4,
+                &[("a.bin", "LFS object abc is missing locally")],
+            )),
+        );
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["bad", "checked", "profile", "profileId", "virtual"]
+        );
+        assert_eq!(object["virtual"], serde_json::json!(4));
+        assert_eq!(object["checked"], serde_json::json!(7));
+        assert_eq!(
+            object["bad"],
+            serde_json::json!([{ "path": "a.bin", "reason": "LFS object abc is missing locally" }])
+        );
+    }
+
+    /// A folder whose verify could not run is its own entry, and it carries
+    /// `error` with **no** `bad` array.
+    ///
+    /// Both halves matter. The entry exists because a `?` used to discard every
+    /// report already computed and emit no document at all, so one folder's
+    /// `.keepervirtual` typo blinded the operator to the folders beside it. The
+    /// absent `bad` matters because an empty array cannot distinguish "checked,
+    /// nothing wrong" from "never checked", and those are the two answers a
+    /// consumer must never confuse.
+    #[test]
+    fn a_folder_that_could_not_be_checked_is_its_own_entry_and_not_a_clean_one() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let reason = "40-media/[unclosed in .keepervirtual is not a valid pattern";
+
+        assert_eq!(
+            verify_lines(&profile, Err(reason)),
+            vec![format!("Field: could not be checked: {reason}")]
+        );
+
+        let entry = verify_entry(&profile, Err(reason));
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["error", "profile", "profileId"]);
+        assert_eq!(object["error"], serde_json::json!(reason));
+        assert!(
+            !object.contains_key("bad"),
+            "an empty `bad` would read as a folder that was checked: {entry}"
+        );
+        assert!(!object.contains_key("virtual"));
+    }
+
     // --- materialize: the two renderings are the contract (Story 56.3) ------
 
     fn materialization(outcome: MaterializeOutcome, unit_id: Option<i64>) -> Materialization {
@@ -3302,7 +3507,8 @@ mod tests {
             ContentRefusal::Missing { path: path.clone() },
             ContentRefusal::NotTracked { path: path.clone() },
             ContentRefusal::OutsideSubpaths { path: path.clone() },
-            ContentRefusal::LocallyModified { path },
+            ContentRefusal::LocallyModified { path: path.clone() },
+            ContentRefusal::ContentNotHere { path },
             ContentRefusal::Paused {
                 profile: "docs".to_owned(),
             },

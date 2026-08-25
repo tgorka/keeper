@@ -232,6 +232,34 @@ pub enum ContentRefusal {
         /// The profile's name — the folder's setting is the thing to change.
         profile: String,
     },
+    /// The path holds only its pointer here, so the bytes a caller asked to
+    /// read are not on this machine.
+    ///
+    /// Raised for the *reader* rather than for the writer the rest of this
+    /// enum serves, which is why it is worded around what the person asked
+    /// for. Several callers produce it and they all mean the same thing:
+    ///
+    /// * a verified copy handed no [`crate::copy::ContentSource`], which
+    ///   therefore cannot hydrate;
+    /// * a verified copy whose source answered `Ok` and left the pointer
+    ///   standing;
+    /// * [`crate::engine::Engine`]'s implementation of that seam, when this
+    ///   machine's object store does not hold the object the worktree pointer
+    ///   names — including the case where asking would merely have queued a
+    ///   download ([`MaterializeOutcome::Queued`]), which a copy cannot wait
+    ///   for.
+    ///
+    /// In every one of them the only alternative is copying ~130 bytes of
+    /// pointer text and reporting it as a verified copy — the "present but
+    /// empty" failure `crate::lfs::local` already fixed once.
+    ///
+    /// The path is named in the **caller's** frame, and a verified copy
+    /// re-renders it in its own before it reaches a report row
+    /// (`crate::copy`'s `entry_reason`).
+    ContentNotHere {
+        /// The path as the caller named it, verbatim.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for ContentRefusal {
@@ -310,6 +338,11 @@ impl std::fmt::Display for ContentRefusal {
                 "\"{profile}\" keeps its content on this machine, so letting one file go here \
                  would be undone the next time keeper looks at the folder; set the folder to \
                  keep pointers only if that is what you want"
+            ),
+            Self::ContentNotHere { path } => write!(
+                f,
+                "\"{path}\" holds only its pointer on this machine, so its content is not here \
+                 to hand over; keeper refused rather than pass off the pointer as the file"
             ),
         }
     }
@@ -698,6 +731,9 @@ mod tests {
                 path: "40-media/clip.mp4".to_owned(),
             },
             ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::ContentNotHere {
                 path: "40-media/clip.mp4".to_owned(),
             },
         ];

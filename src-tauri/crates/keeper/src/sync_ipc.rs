@@ -1566,8 +1566,18 @@ fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile,
 /// NOT a digest comparison — keeper records no per-file hash (`file_state` has
 /// no digest column). Each file is read and fails only if it changed under the
 /// read (a torn read), and each LFS pointer's object must be present at its
-/// recorded size. Worth having, but the earlier "against its recorded digests"
-/// wording described a check that does not exist.
+/// recorded size — **except** where the folder's virtual-file policy authorizes
+/// that content to stay away, which `verify` counts as virtual rather than
+/// reporting as a fault (Story 56.6). That policy is read from the
+/// `.keepervirtual` standing in the **worktree**, never from `HEAD`, and a
+/// `virtualPatterns` list on the profile or in a folder TOML layer above it
+/// replaces the file's list wholesale — so what is in force may be neither
+/// committed nor in that file at all. The excuse also needs the index to
+/// confirm the bytes on disk are the pointer this repository committed, the
+/// object to be genuinely absent rather than truncated, and — for a folder
+/// whose remote is a directory this machine can see — that store to hold the
+/// object. Worth having, but the earlier "against its recorded digests" wording
+/// described a check that does not exist.
 #[tauri::command]
 pub async fn sync_verify(
     state: tauri::State<'_, AppState>,
