@@ -1041,6 +1041,49 @@ function buildDecorations(view: EditorView, options: LivePreviewOptions): Decora
           const target = match[1];
           const label = match[2] ?? target;
 
+          // The attribute block written straight after `]]`, for EVERY wikilink
+          // form — an embed, a piped label, a bare `[[note]]`.
+          //
+          // The owner reported `![[attachments/….csv]]{ :value_of }` rendering
+          // as a panel with the braces left on screen as source, and this is
+          // the whole of that defect: each of the three branches below reaches
+          // `continue` before anything reads the document past `end`, so the
+          // run was never looked at. Read HERE rather than inside a branch
+          // because a predicate is about the link and not about what the target
+          // turned out to be — an embedded CSV, a recording's video and a plain
+          // note all carry them.
+          //
+          // Rust already agreed: `links::extract` calls `read_attrs` at
+          // `close + 2` whatever `RawLink::embed` says, `link_predicate_map`
+          // never reads that flag, and `RawLink::span` covers the block. So
+          // before this the graph held the edge and the note showed the braces,
+          // which is the editor and the links panel disagreeing about which
+          // tokens are edges — on one screen, about one link.
+          //
+          // No `isRevealed` call: this whole loop is already inside
+          // `!revealed.has(line.number)`, and a block never crosses a newline,
+          // so the run is on a line that is known to be hiding its source.
+          // 200 characters, the same window the `Link` branch uses: generous for
+          // a run of predicates, short enough that a note full of links is not a
+          // note full of string copies.
+          const runFrom = (match.index ?? 0) + match[0].length;
+          const attrs = predicatesAfter(line.text.slice(runFrom, runFrom + 200));
+          for (const block of attrs?.blocks ?? []) {
+            // Junk and a block that writes no predicate stay as the author typed
+            // them, for the two reasons the `Link` branch gives above: a chip
+            // over an unreadable token hides the one thing the author has to
+            // fix, and `{width="40"}` was source before this and still is.
+            if (block.junk || !block.writesPredicate) {
+              continue;
+            }
+            decorations.push(
+              Decoration.replace({ widget: new PredicateWidget(block.chips) }).range(
+                end + block.from,
+                end + block.to,
+              ),
+            );
+          }
+
           // `![[….csv]]`, `![[….json]]`, `![[….jsonl]]`: the one embed syntax,
           // rendered as the panel Story 45.12 mounts. WHICH targets get one is
           // 45.2's registry's answer and not a list here — `embedEntryFor`
@@ -1243,9 +1286,37 @@ const livePreviewTheme = EditorView.baseTheme({
     paddingLeft: "0.75em",
     color: "var(--muted-foreground)",
   },
+  // The one line decoration in this file that paints a SURFACE rather than
+  // recolouring glyphs, which is why it is the only one that has to answer for
+  // its own edges.
+  //
+  // `Decoration.line` puts this class on `.cm-line`, and CodeMirror's own base
+  // theme gives every line `padding: 0 2px 0 6px`. A background paints the
+  // padding box, so the grey ran the FULL width of the content box while the
+  // text inside it — and every other line's text in the note — occupied the
+  // column 6px in from the left and 2px in from the right. Measured in
+  // Chromium, 520px pane, content box x=2..518: the fence's grey was
+  // **2..518** against prose text at **8..516**, so it overhung the reading
+  // column by 6px on the left and 2px on the right and ran flush into the
+  // note's border with no gutter. Which is the report — a rendered fence
+  // bleeding past the note's edge — and note the asymmetry is the part a reader
+  // actually sees: 6 one side, 2 the other, a wonky edge nobody can name.
+  //
+  // The inset is a MARGIN and not a smaller padding, because padding is where
+  // the code's own breathing room comes from and because CodeMirror reads the
+  // first line's `paddingLeft`/`paddingRight` to place selection rectangles
+  // (`rectanglesForRange`) — a fence with different padding from prose would
+  // draw a selection that disagreed with the text it covers. Horizontal only:
+  // a vertical margin on `.cm-line` would lie to the height map.
+  //
+  // Nothing reflows when the caret arrives, either. `.cm-lp-fence` is applied
+  // to every line of a `FencedCode` unconditionally — there is no `isRevealed`
+  // test on it — so the revealed and rendered states have the same box.
   ".cm-lp-fence": {
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     backgroundColor: "var(--muted)",
+    marginLeft: "6px",
+    marginRight: "2px",
   },
   // The language name, on the opening fence line. Quiet, because it labels the
   // block rather than being part of it.
@@ -1510,11 +1581,66 @@ const livePreviewTheme = EditorView.baseTheme({
     fontFamily: "var(--font-mono, ui-monospace, monospace)",
     whiteSpace: "pre-wrap",
   },
+  // # The note's two block columns (items 5 and 6 of the owner's report)
+  //
+  // A note has exactly two left edges and they are different on purpose.
+  //
+  // **The reading column.** Prose, a fence's code, a rendered table: things a
+  // reader is READING. CodeMirror's `.cm-line` puts that column 6px in from the
+  // content box on the left and 2px in on the right, so in a 520px pane whose
+  // content box measures x=2..518 the column is **8..516**.
+  //
+  // **The pane.** A mounted panel — an embedded CSV, JSON or HTML file — is a
+  // viewport onto ANOTHER document, not a paragraph of this one, so the reading
+  // column around it is wasted margin. It gets the whole content box, **2..518**.
+  //
+  // What made both of these wrong was one fact about CodeMirror's DOM: a
+  // `block: true` replacement's host is a direct child of `.cm-content`, a
+  // SIBLING of the `.cm-line` elements and not inside one, so it inherits none
+  // of the line's padding; an INLINE replacement's host is inside a `.cm-line`
+  // and inherits all of it. The two rules below put each one where it belongs.
+  ".cm-content > :not(.cm-line):not(.cm-widgetBuffer)": {
+    // A block widget, indented to the reading column. Measured in Chromium in a
+    // 520px pane: `.cm-md-table` was **2..518** against prose text at 8..516 —
+    // the grid's first cell border sitting on the note's own border with no
+    // breathing room, which is the report.
+    //
+    // Written as "every content child that is not a line" rather than per
+    // widget, because the alternative is a list that the next block widget
+    // somebody adds is missing from, and the defect it produces is invisible in
+    // every DOM assertion. It covers the markdown table, the mermaid fence, the
+    // gallery block and FR-264's widget today.
+    //
+    // `.cm-widgetBuffer` is excluded because it is not a block of the note:
+    // it is the zero-width `<img>` CodeMirror draws beside an uneditable widget
+    // to work around browser caret bugs. Indenting it would change nothing
+    // visible, which is exactly why it is named — a rule that reads "every
+    // block of the note except the lines" should be true rather than
+    // accidentally true.
+    //
+    // The inset is on the WIDGET and never on `.cm-line`: the widget replaces
+    // the source lines, and moving the caret in brings them back. Padding the
+    // line instead would shift the paragraph sideways at the moment the caret
+    // lands on it, which is a reflow a reader reads as the note jumping.
+    marginLeft: "6px",
+    marginRight: "2px",
+  },
   // Story 45.12's embed host. `block`, because an inline replace is all a
   // `ViewPlugin` may supply (DW-165) and a panel wedged into a line of prose is
   // neither readable nor usable. The height is set on the body element by the
   // widget, from the same constant its `estimatedHeight` reports.
-  ".cm-embed-block": { display: "block" },
+  //
+  // The negative margins cancel `.cm-line`'s `padding: 0 2px 0 6px` exactly, so
+  // the panel spans the content box instead of the reading column: measured in
+  // Chromium, **8..516 before, 2..518 after**. BOTH sides, and that is the
+  // point rather than a detail — cancelling only the left would leave the panel
+  // flush on one edge and 2px short on the other, which is precisely the
+  // asymmetry item 3 was reported for, reproduced one element over.
+  ".cm-embed-block": {
+    display: "block",
+    marginLeft: "-6px",
+    marginRight: "-2px",
+  },
   ".cm-embed-body": {
     border: "1px solid var(--border)",
     borderRadius: "4px",
@@ -1665,7 +1791,11 @@ export function livePreview(options: LivePreviewOptions): Extension {
     plugin,
     galleryLayer({ list: options.listFolder }),
     noteWidgetLayer({ vaultId: options.vaultId, mount: options.mountWidget }),
-    tableLayer(),
+    // The vault the table is in, so Story 56's two conversion controls
+    // ("to CSV attachment" and back) have somewhere to write. Passed rather
+    // than defaulted: without it both controls render permanently disabled,
+    // which is a feature present in the code and unreachable in the product.
+    tableLayer({ vaultId: options.vaultId }),
     mermaidLayer(),
     externalFlashField,
     livePreviewTheme,

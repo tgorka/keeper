@@ -38,6 +38,11 @@ import { ELLIPSIS } from "@/lib/truncate";
 import { withRect, withTextLayout } from "@/test/layout";
 import {
   ADD_NOTE_TAG,
+  NESTED_ROW_TESTID,
+  NESTED_ROWS_SHOWN,
+  NESTED_VALUE_HINT,
+  NESTED_VALUE_LABEL,
+  nestedRows,
   PROPERTIES_COLUMN_LABEL,
   PROPERTY_KEY_COLUMN,
   PropertiesPanel,
@@ -1064,5 +1069,219 @@ describe("the properties keeper writes, and the ones the vault decides", () => {
     const field = screen.getByRole("combobox", { name: "stage" });
     expect(field).toHaveAttribute("list");
     expect(screen.queryByRole("textbox", { name: "stage" })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * The owner's item 1 — "render nested value as well".
+ *
+ * The panel printed one sentence, `nested value — edit it in the note`, for
+ * every indented map. In the note the owner was looking at, the two keys that
+ * got it were `generated:` and `prefixes:` — which in an OKF document are the
+ * interesting fields: when and by what the note was generated, and the prefix
+ * map that binds every predicate in it. So the panel described exactly the
+ * values somebody opens the panel to read.
+ *
+ * The read-only guarantee is unchanged and is not a limitation being lifted: a
+ * typed control over a nested map writes back a flattened version, and the
+ * write would destroy structure its author put there. What changed is that not
+ * writing a value stopped meaning not showing it.
+ */
+describe("PropertiesPanel — a nested value is shown, not described", () => {
+  let restoreLayout: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreLayout?.();
+    restoreLayout = null;
+  });
+
+  /** An OKF note's generated tail: the two maps from the owner's screenshot. */
+  const OKF = [
+    "---",
+    "title: Company wiki",
+    "generated:",
+    "  at: 2026-08-25T09:12:04Z",
+    "  by: keeper 0.9.3",
+    "prefixes:",
+    "  okf: https://openknowledge.foundation/ns/okf#",
+    "  ex: https://example.com/vocab#",
+    "---",
+    "",
+  ].join("\n");
+
+  it("renders every leaf of a two-level map beside its own key", () => {
+    renderPanel(OKF);
+
+    // The whole of item 1: six things on screen where one sentence used to be.
+    for (const shown of [
+      "at",
+      "2026-08-25T09:12:04Z",
+      "by",
+      "keeper 0.9.3",
+      "okf",
+      "https://openknowledge.foundation/ns/okf#",
+      "ex",
+      "https://example.com/vocab#",
+    ]) {
+      expect(screen.getByText(shown)).toBeInTheDocument();
+    }
+
+    // And still read-only, which is the guarantee and not an oversight: no
+    // control over the map, and none over a leaf of it either — a box for `at`
+    // would have to write the map back, and writing it back is what loses it.
+    expect(screen.queryByRole("textbox", { name: "generated" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "at" })).toBeNull();
+    // The pointer at the note survives, once per nested value rather than once
+    // per panel: two maps, two rows, each saying where its own value is edited.
+    expect(screen.getAllByText(NESTED_VALUE_HINT)).toHaveLength(2);
+  });
+
+  it("keeps the typed controls of the scalars beside a nested map", () => {
+    renderPanel(
+      ["---", "title: Company wiki", "pinned: true", "generated:", "  by: keeper", "---", ""].join(
+        "\n",
+      ),
+    );
+
+    // The nested render must not swallow the rows around it. A `nested` flag
+    // read one entry too widely would take the whole block read-only, and the
+    // panel's reason to exist is the controls.
+    expect(screen.getByRole("textbox", { name: "title" })).toHaveValue("Company wiki");
+    expect(screen.getByRole("switch", { name: "pinned" })).toBeChecked();
+    expect(screen.getByText("by")).toBeInTheDocument();
+    expect(screen.getByText("keeper")).toBeInTheDocument();
+  });
+
+  it("renders a list of maps as items, each with its own fields", () => {
+    renderPanel(
+      ["---", "authors:", "  - name: Alice", "    role: editor", "  - name: Bob", "---", ""].join(
+        "\n",
+      ),
+    );
+
+    const rows = screen.getAllByTestId(NESTED_ROW_TESTID);
+    // The dash gets a line of its own, so Bob reads as a second entry and not
+    // as a third field of the first one.
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "-",
+      "nameAlice",
+      "roleeditor",
+      "-",
+      "nameBob",
+    ]);
+    // And the fields of an item sit one level in from its dash. Folded flat,
+    // the panel would say Alice's role is a sibling of `authors`.
+    expect(rows[0]).not.toHaveClass("pl-3");
+    expect(rows[1]).toHaveClass("pl-3");
+    expect(rows[2]).toHaveClass("pl-3");
+  });
+
+  /**
+   * `tags:` keeps its special case (Story 44.14): an indented map under it is
+   * not a tag list. Now that the map is drawn, the two states are much easier
+   * to confuse — a rendered map looks like a rendered list of tags.
+   */
+  it("shows an indented map under tags without making it a tag list", () => {
+    renderPanel(["---", "tags:", "  work: true", "---", ""].join("\n"));
+
+    // Drawn, where `work: true` used to be the sentence and nothing else.
+    expect(screen.getByText("work")).toBeInTheDocument();
+    expect(screen.getByText("true")).toBeInTheDocument();
+
+    // And not a tag: no chip made out of the map's own key, and no switch made
+    // out of its `true` either — a nested value gets no control of any kind.
+    expect(screen.queryByRole("button", { name: "Remove work from tags" })).toBeNull();
+    expect(screen.queryByRole("switch", { name: "tags" })).toBeNull();
+    // The chooser on screen is the one a note with no `tags:` key gets, which
+    // is what keeps the first tag from splicing a flat list over the map.
+    expect(screen.getAllByRole("button", { name: ADD_NOTE_TAG })).toHaveLength(1);
+  });
+
+  it("cuts a long nested value instead of widening the row", () => {
+    const prefix = "https://openknowledge.foundation/ns/okf-extended-vocabulary-2026#";
+    restoreLayout = withTextLayout(120);
+    renderPanel(["---", "prefixes:", `  okf: ${prefix}`, "---", ""].join("\n"));
+
+    // 65 characters at 8px each into 120px of column: the value truncates and
+    // becomes the control that opens it, the way every other value in this
+    // panel does. Painted whole it is 520px of a 120px cell, and a sidebar that
+    // grows to 520px is AD-83's failure with a URI instead of a ULID.
+    const trigger = screen.getByRole("button", { name: prefix });
+    expect(trigger).toHaveClass("truncate");
+    expect(trigger).toHaveAttribute("data-overflowing", "true");
+
+    // The floor that lets it truncate at all, checked against the real chain
+    // rather than assumed: every flex item from the grid cell down to the text
+    // has to be allowed below its content width, or `truncate` is never handed
+    // a width smaller than the URI and there is nothing to truncate.
+    const chain: HTMLElement[] = [];
+    for (let box = trigger.parentElement; box !== null; box = box.parentElement) {
+      chain.push(box);
+      if (box.className.includes("col-start-3")) {
+        break;
+      }
+    }
+    expect(chain[chain.length - 1]?.className).toContain("col-start-3");
+    for (const box of chain) {
+      expect(box).toHaveClass("min-w-0");
+    }
+  });
+
+  it("stops after a fixed number of lines and offers the whole map in one press", () => {
+    const lines = Array.from(
+      { length: NESTED_ROWS_SHOWN + 4 },
+      (_, index) => `  p${index}: https://example.com/${index}#`,
+    );
+    renderPanel(["---", "prefixes:", ...lines, "---", ""].join("\n"));
+
+    // Twelve lines inside one row is taller than the rest of the panel put
+    // together, and what falls off the bottom is the tag row and the Add box.
+    expect(screen.getAllByTestId(NESTED_ROW_TESTID)).toHaveLength(NESTED_ROWS_SHOWN);
+    expect(screen.getByText(`p${NESTED_ROWS_SHOWN - 1}`)).toBeInTheDocument();
+    expect(screen.queryByText(`p${NESTED_ROWS_SHOWN}`)).toBeNull();
+
+    // Nothing is only readable by opening the note in another pane.
+    fireEvent.click(
+      screen.getByRole("button", { name: `${OVERFLOW_TRIGGER_LABEL} ${NESTED_VALUE_LABEL}` }),
+    );
+    expect(
+      screen.getByLabelText(`${OVERFLOW_PANEL_LABEL}: ${NESTED_VALUE_LABEL}`),
+    ).toHaveTextContent(`p${NESTED_ROWS_SHOWN + 3}: https://example.com/${NESTED_ROWS_SHOWN + 3}#`);
+  });
+
+  /** A two-line `generated:` map grows no affordance it does not need. */
+  it("offers nothing extra for a map that fits", () => {
+    renderPanel(OKF);
+
+    expect(
+      screen.queryByRole("button", { name: `${OVERFLOW_TRIGGER_LABEL} ${NESTED_VALUE_LABEL}` }),
+    ).toBeNull();
+  });
+});
+
+describe("nestedRows", () => {
+  it("nests by comparing columns rather than dividing by a step", () => {
+    // A vault that indents by four means one level in, not two — and the line
+    // after the inner map is a sibling of `layout`, not a third level.
+    expect(
+      nestedRows(["    layout:", "        columns: 3", "    dense: true"]).map((row) => [
+        row.depth,
+        row.path,
+        row.key,
+        row.text,
+      ]),
+    ).toEqual([
+      [0, "layout", "layout", ""],
+      [1, "layout.columns", "columns", "3"],
+      [0, "dense", "dense", "true"],
+    ]);
+  });
+
+  it("reads a dash carrying a bare scalar as one line, not a dash parenting one", () => {
+    expect(nestedRows(["  - work", "  - name: Bob"])).toEqual([
+      { depth: 0, path: "", key: "", text: "work", item: true },
+      { depth: 0, path: "", key: "", text: "", item: true },
+      { depth: 1, path: "name", key: "name", text: "Bob", item: false },
+    ]);
   });
 });

@@ -10,11 +10,29 @@ export type NoteGalleryItemVm = {
  */
 name: string, 
 /**
- * The entry's vault-relative path, `/`-joined. This is what a pin is
- * written as, so the note holds a path Obsidian resolves and never an
- * absolute one (FR-145).
+ * The entry's path relative to the LISTED ROOT, `/`-joined — the vault
+ * root under [`NoteGalleryScope::Vault`], the synced folder under
+ * [`NoteGalleryScope::SyncedFolder`]. Never an absolute path (FR-145).
+ * The vault-relative spelling, which is what a pin is written as, is
+ * `vault_rel_path`.
  */
 relPath: string, 
+/**
+ * The entry's path relative to the VAULT ROOT, or `None` when it lives
+ * above that root — which only the synced-folder scope can reach.
+ *
+ * Presence is the answer to "can this be embedded?". `keeper-note://` and
+ * [`crate::notes::embed`] are both vault-root-only, so an entry from above
+ * the vault can be attached as a link and can never render as an embed.
+ * The value is the path to write, composed here so the webview never
+ * joins a root and a subpath itself (AD-65) — which is also why this is
+ * not a bool: a bool would leave the frontend to derive the path it just
+ * asked permission for.
+ *
+ * Always `Some(rel_path.clone())` under [`NoteGalleryScope::Vault`], where
+ * the listed root IS the vault root.
+ */
+vaultRelPath: string | null, 
 /**
  * What this entry is, from the one classifier (Story 43.5, AD-73).
  */

@@ -138,7 +138,9 @@ pub struct NoteRowVm {
     /// `schema:about`, `dcterms:source` — and keeper neither invents one nor
     /// infers one. Empty for every link written without a block, which is
     /// nearly all of them, and for every row that is not the far end of a link:
-    /// only the two link projections fill this.
+    /// only the two link projections fill this. The forward projection fills it
+    /// for an edge with NO note at the far end as well — a predicate is written
+    /// on the arrow, and the arrow exists whether or not its target does.
     ///
     /// A `Vec` and never an `Option<Vec>`. An empty list and "no predicates"
     /// are the same fact, and shipping two spellings of one fact is how one
@@ -154,6 +156,25 @@ pub struct NoteRowVm {
     /// they are: nothing in the reader's own file contains the string. The
     /// index answers this through `IndexSnapshot::backlink_predicates`.
     pub predicates: Vec<String>,
+    /// The raw link target, for an outbound edge whose target resolves to no
+    /// note. Empty on every other row — the same empty-means-absent spelling
+    /// `origin` and `head_rev` use here, so a surface branches on emptiness and
+    /// never on null.
+    ///
+    /// **Why the row exists at all.** OKF v0.2 §6.1: consumers MUST tolerate
+    /// broken links; a link whose target does not exist in the bundle is not
+    /// malformed, it may simply represent not-yet-written knowledge. A vault is
+    /// written forwards — you link the note you are about to write — so the
+    /// forward projection used to drop precisely the edges a writer most wants
+    /// to see, and the owner read a Linked-to tab showing one of nine targets
+    /// as a broken feature. It was not truncating anything: eight of the nine
+    /// had no note behind them.
+    ///
+    /// It is the label such a row shows, because there is no title to show. A
+    /// surface must not make it clickable as though a note were there, and must
+    /// not offer to create one — nobody asked for that, and inventing it here
+    /// would turn a report into a prompt.
+    pub unresolved_target: String,
     /// The head revision that last touched this note's path: the revision
     /// `unread` was computed against (`head_rev != acknowledged_rev`).
     ///
@@ -889,6 +910,20 @@ pub struct NoteCsvVm {
     /// closes, a row count that was capped. Empty when there is nothing to say.
     /// Worded here rather than in the webview, on this module's standing rule.
     pub notices: Vec<String>,
+    /// The separator the file is actually written with, as a one-character
+    /// string: `","`, `";"`, `"\t"` or `"|"`.
+    ///
+    /// Detected from the bytes ([`crate::notes::csv::detect_delimiter`]), not
+    /// assumed: a European Excel export is semicolon-separated, and keeper drew
+    /// the owner's real attachment as a single column for exactly as long as
+    /// this was a constant comma.
+    ///
+    /// Carried to the webview because the conversion between a table and an
+    /// attachment has to write the file back in its own dialect — a round trip
+    /// that re-emitted commas would silently rewrite every row of a `;` file.
+    /// A one-character string rather than a byte, because that is what survives
+    /// JSON and what a `<select>` of separators would show.
+    pub delimiter: String,
 }
 
 /// One record of a CSV table.
@@ -927,9 +962,11 @@ pub struct NoteCsvRowVm {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteGalleryVm {
-    /// The vault-relative folder that was listed, echoed back so a reply that
-    /// arrives after the block was retargeted can be discarded rather than
-    /// rendered under the wrong heading.
+    /// The folder that was listed, relative to the LISTED ROOT — the vault root
+    /// under [`NoteGalleryScope::Vault`] and the synced folder under
+    /// [`NoteGalleryScope::SyncedFolder`]. Echoed back so a reply that arrives
+    /// after the block was retargeted can be discarded rather than rendered
+    /// under the wrong heading.
     pub folder: String,
     /// The folder's entries in the listing's own order, or empty when
     /// `problem` says why there are none.
@@ -951,10 +988,26 @@ pub struct NoteGalleryVm {
 pub struct NoteGalleryItemVm {
     /// The entry's own file name, with no path in it — what a tile is labelled.
     pub name: String,
-    /// The entry's vault-relative path, `/`-joined. This is what a pin is
-    /// written as, so the note holds a path Obsidian resolves and never an
-    /// absolute one (FR-145).
+    /// The entry's path relative to the LISTED ROOT, `/`-joined — the vault
+    /// root under [`NoteGalleryScope::Vault`], the synced folder under
+    /// [`NoteGalleryScope::SyncedFolder`]. Never an absolute path (FR-145).
+    /// The vault-relative spelling, which is what a pin is written as, is
+    /// `vault_rel_path`.
     pub rel_path: String,
+    /// The entry's path relative to the VAULT ROOT, or `None` when it lives
+    /// above that root — which only the synced-folder scope can reach.
+    ///
+    /// Presence is the answer to "can this be embedded?". `keeper-note://` and
+    /// [`crate::notes::embed`] are both vault-root-only, so an entry from above
+    /// the vault can be attached as a link and can never render as an embed.
+    /// The value is the path to write, composed here so the webview never
+    /// joins a root and a subpath itself (AD-65) — which is also why this is
+    /// not a bool: a bool would leave the frontend to derive the path it just
+    /// asked permission for.
+    ///
+    /// Always `Some(rel_path.clone())` under [`NoteGalleryScope::Vault`], where
+    /// the listed root IS the vault root.
+    pub vault_rel_path: Option<String>,
     /// What this entry is, from the one classifier (Story 43.5, AD-73).
     pub kind: RecordingNoteTargetKind,
     /// The `keeper-note://…` URL a tile's element loads, composed here so the
@@ -962,6 +1015,32 @@ pub struct NoteGalleryItemVm {
     /// entry the protocol will serve and `None` for the rest — a `File` or a
     /// `Folder` has no URL because nothing asks for its bytes.
     pub url: Option<String>,
+}
+
+/// Which root a gallery listing walks (item 10).
+///
+/// The attach picker used to offer the vault only, so a drive whose notes are
+/// one folder of a larger synced tree could not attach anything that lived
+/// beside them — the owner's report is that attaching from a folder must offer
+/// the WHOLE folder, not only the notes part.
+///
+/// A named scope rather than a silently widened default: the vault listing is
+/// what every existing block and every existing caller means, and changing what
+/// they get without them asking would put files above the vault into galleries
+/// that never wanted them. Widening is opt-in, per call, and
+/// [`NoteGalleryItemVm::vault_rel_path`] is how a caller tells the two apart in
+/// the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum NoteGalleryScope {
+    /// The vault root and below — every entry is embeddable. The default, and
+    /// what a listing means when the caller says nothing.
+    #[default]
+    Vault,
+    /// The whole synced folder the vault sits in, so entries beside the notes
+    /// are offered too. Those carry no `vault_rel_path` and are link-only.
+    SyncedFolder,
 }
 
 /// One wikilink autocomplete candidate (FR-108).
@@ -1221,6 +1300,7 @@ mod tests {
             conflict: false,
             origin: String::new(),
             head_rev: String::new(),
+            unresolved_target: String::new(),
             order: NoteOrder::own(2.5),
         };
         let json = serde_json::to_string(&row).expect("serialize row");
@@ -1232,6 +1312,10 @@ mod tests {
         // back to branching on two spellings of "no predicates", which is the
         // reason this field is not an `Option<Vec<_>>`.
         assert!(json.contains("\"predicates\":[]"), "json: {json}");
+        // An ordinary row's target resolved, so this is empty — the same
+        // "absent" spelling as `origin` and `headRev` two lines up, and never
+        // `null`, which would give the panel a second way to spell "no".
+        assert!(json.contains("\"unresolvedTarget\":\"\""), "json: {json}");
         // The webview switches on this discriminant, so it has to be the
         // camelCase name and not a Rust variant spelling.
         assert!(
@@ -1262,6 +1346,7 @@ mod tests {
             conflict: false,
             origin: String::new(),
             head_rev: String::new(),
+            unresolved_target: String::new(),
             order: NoteOrder::default(),
         };
         let json = serde_json::to_string(&row).expect("serialize row");

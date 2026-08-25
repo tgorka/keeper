@@ -811,3 +811,239 @@ describe("a fence's info string carries predicates", () => {
     expect(view.state.doc.toString()).toBe(doc);
   });
 });
+
+/**
+ * The predicates a WIKILINK carries, which is the half of the syntax the
+ * renderer never read.
+ *
+ * The owner photographed `![[attachments/username-password-recovery-code.csv]]{
+ * :value_of }` rendering as a CSV panel with `{ :value_of }` left beside it as
+ * source. Rust had already agreed the edge exists: `links::extract` calls
+ * `read_attrs` at `close + 2` whatever `RawLink::embed` says, `link_predicate_map`
+ * never reads that flag, and `RawLink::span` covers the block. So the graph held
+ * the edge and the note showed the braces — the editor and the links panel
+ * disagreeing about which tokens are edges, on one screen, about one link.
+ *
+ * Every case here is an EMBED or a bare `[[…]]`, never a `[text](url)` link:
+ * the markdown branch above has always worked, and these are the forms the
+ * grammar does not see at all.
+ */
+describe("a wikilink's predicates render as chips", () => {
+  /** Every chip in the document, in the order a reader meets them. */
+  function chips(view: EditorView): string[] {
+    return [...view.contentDOM.querySelectorAll(".cm-lp-predicate")].map(
+      (chip) => chip.textContent ?? "",
+    );
+  }
+
+  /** Whether any brace survived anywhere in the rendered note. The chip's job
+   *  is to replace the block, so one left on screen is the whole defect. */
+  function braces(view: EditorView): boolean {
+    return (view.contentDOM.textContent ?? "").includes("{ :");
+  }
+
+  it("draws the chip the owner's embed carries", () => {
+    const view = render(
+      "![[attachments/username-password-recovery-code.csv]]{ :value_of }\n\nend\n",
+    );
+
+    expect(chips(view)).toEqual(["value_of"]);
+    expect(braces(view)).toBe(false);
+  });
+
+  /** A bare wikilink is the same syntax with the same reader, and it was just
+   *  as broken: this is not an embed-only fix, because `predicatesAfter` is
+   *  called for the match and not for whichever widget the target earned. */
+  it("draws the chip on a bare wikilink", () => {
+    const view = render("[[auth-service]]{ :depends_on }\n\nend\n");
+
+    expect(chips(view)).toEqual(["depends_on"]);
+    expect(shown(view)).toBe("auth-servicedepends_on");
+  });
+
+  /** A piped label is still one wikilink, and the block goes after the `]]` and
+   *  not after the label. */
+  it("draws the chip on a wikilink with a label", () => {
+    const view = render("[[auth-service|the auth service]]{schema:dependency}\n\nend\n");
+
+    expect(chips(view)).toEqual(["schema:dependency"]);
+    expect(shown(view)).toBe("the auth serviceschema:dependency");
+  });
+
+  it("draws a run of adjacent blocks as one list of chips", () => {
+    const view = render('![[attachments/q3.csv]]{ :value_of }{:type="Metric"}\n\nend\n');
+
+    expect(chips(view)).toEqual(["value_of", "type=Metric"]);
+  });
+
+  /**
+   * A block keeper cannot read stays exactly as the author typed it — the same
+   * rule the markdown branch follows, and for the same reason: a chip drawn over
+   * junk shows the tokens keeper understood and swallows the one that needs
+   * fixing.
+   */
+  it("leaves a block of junk on a wikilink exactly as it is", () => {
+    const view = render("[[auth-service]]{oops! 9nope}\n\nend\n");
+
+    expect(chips(view)).toEqual([]);
+    expect(shown(view)).toBe("auth-service{oops! 9nope}");
+  });
+
+  /** `{class="wide"}` writes no predicate, so it is source. */
+  it("leaves a presentational block on a wikilink alone", () => {
+    const view = render('[[auth-service]]{class="wide"}\n\nend\n');
+
+    expect(chips(view)).toEqual([]);
+    expect(shown(view)).toBe('auth-service{class="wide"}');
+  });
+
+  it("gives the raw syntax back when the caret lands on the line", () => {
+    const view = render("[[auth-service]]{ :depends_on }\n\nend\n");
+    view.dispatch({ selection: { anchor: 3 } });
+
+    expect(shown(view)).toBe("[[auth-service]]{ :depends_on }");
+    expect(chips(view)).toEqual([]);
+  });
+
+  it("never changes the document text", () => {
+    const doc = "![[attachments/q3.csv]]{ :value_of }\n\nend\n";
+    const view = render(doc);
+
+    expect(view.state.doc.toString()).toBe(doc);
+  });
+});
+
+/**
+ * # The note's two block columns
+ *
+ * Three of the owner's reports were one question — where does a block of a note
+ * begin and end — and none of them is visible to an assertion about classes or
+ * text. They were measured in real Chromium 131 (headless), a 520px pane whose
+ * `.cm-content` box is x=2..518, with a wide mermaid fence, a 113-character
+ * unbreakable fence line and a seven-column CSV panel all present at once:
+ *
+ *   element                     before      after     the report
+ *   prose text column           8..516      8..516    (the reference)
+ *   `.cm-line.cm-lp-fence`      2..518      8..516    item 3, bleeds past the edge
+ *   `.cm-md-table`              2..518      8..516    item 5, flush against the border
+ *   `.cm-mermaid-block`         2..518      8..516    the same rule, same defect
+ *   `.cm-embed-block`           8..516      2..518    item 6, an indent it should not carry
+ *
+ * `scrollWidth` stayed equal to `clientWidth` (516) throughout, so none of this
+ * is a containment failure — `min-width: 0` on `.cm-content` is holding, and
+ * `content-width-floor.test.ts` is what guards that. Item 3 was a PAINTED
+ * surface overhanging the column it sits in, by 6px one side and 2px the other:
+ * the asymmetry is what a reader sees without being able to name it.
+ *
+ * What is assertable here is the computed inset — jsdom resolves CodeMirror's
+ * injected base theme — and the DOM shape each rule depends on, which is the
+ * half that silently rots when CodeMirror changes how it hosts a widget.
+ */
+describe("the note's two block columns", () => {
+  /** The one number every rule here is stated against: CodeMirror's own
+   *  `.cm-line` padding, which IS the reading column. */
+  function readingColumn(view: EditorView): [string, string] {
+    const line = view.contentDOM.querySelector(".cm-line") as HTMLElement;
+    const style = getComputedStyle(line);
+    return [style.paddingLeft, style.paddingRight];
+  }
+
+  it("takes the reading column from CodeMirror and not from a constant of ours", () => {
+    const view = render("plain prose\n\nend\n");
+
+    // If CodeMirror ever changes this, every number below is wrong and this is
+    // the assertion that says so first.
+    expect(readingColumn(view)).toEqual(["6px", "2px"]);
+  });
+
+  /**
+   * Item 3. A fence is the only line decoration in the layer that paints a
+   * surface, so it is the only one whose background has edges to get wrong.
+   */
+  it("insets a fence's painted surface to the reading column", () => {
+    const view = render("```json\nconst a = 1;\n```\n\nend\n");
+    const fence = view.contentDOM.querySelector(".cm-lp-fence") as HTMLElement;
+    const style = getComputedStyle(fence);
+
+    expect([style.marginLeft, style.marginRight]).toEqual(readingColumn(view));
+    // A margin and not a smaller padding: CodeMirror reads the first line's
+    // padding to place selection rectangles, so a fence padded differently from
+    // prose would draw a selection that disagreed with the text under it.
+    expect(style.paddingLeft).toBe("6px");
+  });
+
+  /** Every line of the block, not only the one with the info string: the grey is
+   *  one rectangle to a reader, and a single line left full-bleed is a notch. */
+  it("insets every line of the fence, including its delimiters", () => {
+    const view = render("```json\nconst a = 1;\n```\n\nend\n");
+    const insets = [...view.contentDOM.querySelectorAll(".cm-lp-fence")].map(
+      (line) => getComputedStyle(line).marginLeft,
+    );
+
+    expect(insets).toEqual(["6px", "6px", "6px"]);
+  });
+
+  /**
+   * Item 6. A mounted panel is a viewport onto another file rather than a
+   * paragraph of this note, so the reading column around it is wasted margin —
+   * and the cancellation is of BOTH sides, because a panel flush on one edge and
+   * 2px short on the other reproduces item 3 one element over.
+   */
+  it("gives a mounted panel the whole content box, symmetrically", () => {
+    const view = render("![[attachments/q3.csv]]\n\nend\n");
+    const embed = view.contentDOM.querySelector(".cm-embed-block") as HTMLElement;
+    const style = getComputedStyle(embed);
+    const [left, right] = readingColumn(view);
+
+    expect(style.marginLeft).toBe(`-${left}`);
+    expect(style.marginRight).toBe(`-${right}`);
+    // The DOM fact the negative margins cancel: an inline replace's host lives
+    // INSIDE a line and inherits its padding. The day CodeMirror hosts it
+    // elsewhere, these margins are an indent rather than a cancellation.
+    expect(embed.parentElement?.classList.contains("cm-line")).toBe(true);
+  });
+
+  /**
+   * Item 5, and the one rule in this file jsdom cannot resolve.
+   *
+   * The declaration is `.cm-content > :not(.cm-line):not(.cm-widgetBuffer)`,
+   * specificity (0,4,0) once CodeMirror's theme scope is prepended, against
+   * `.cm-md-table`'s `margin: 1em 0` at (0,2,0) — so a browser picks the inset
+   * whatever the order. jsdom's cascade is order-only: the shorthand is emitted
+   * 17 rules later and wins there, and `getComputedStyle` reports `0px` for a
+   * rule Chromium applies. Measured in Chromium the table moved 2..518 → 8..516.
+   *
+   * So what is pinned is the two halves that can actually break: the emitted
+   * selector and declaration, and the DOM shape it depends on.
+   */
+  it("insets a block widget to the reading column", () => {
+    const view = render("| a | b |\n| --- | --- |\n| 1 | 2 |\n\nend\n");
+    const table = view.contentDOM.querySelector(".cm-md-table") as HTMLElement;
+
+    // The DOM fact: a `block: true` replacement's host is a SIBLING of the
+    // lines, which is why it inherits none of the reading column and why a rule
+    // was needed at all. If CodeMirror ever nests it in a line, the rule below
+    // stops matching and the inset doubles instead of applying once.
+    expect(table.parentElement).toBe(view.contentDOM);
+
+    const rules = [...document.styleSheets].flatMap((sheet) => [...(sheet.cssRules ?? [])]);
+    const inset = rules.find((rule) =>
+      (rule.cssText ?? "").includes(".cm-content > :not(.cm-line):not(.cm-widgetBuffer)"),
+    );
+    // Named separately so an absent rule reads as "the selector is gone" rather
+    // than as a confused complaint about `undefined`.
+    expect(inset, "no inset rule matched the block-widget selector").toBeDefined();
+    expect(inset?.cssText).toContain("margin-left: 6px");
+    expect(inset?.cssText).toContain("margin-right: 2px");
+  });
+
+  /** The mermaid fence is a block widget too, so it is carried by the same rule
+   *  — which is the reason the rule is written against the shape and not against
+   *  a list of widget classes somebody has to remember to extend. */
+  it("carries every block widget with one rule", () => {
+    const view = render("```mermaid\nflowchart LR\n  a --> b\n```\n\nend\n");
+    const block = view.contentDOM.querySelector(".cm-mermaid-block") as HTMLElement;
+
+    expect(block.parentElement).toBe(view.contentDOM);
+  });
+});

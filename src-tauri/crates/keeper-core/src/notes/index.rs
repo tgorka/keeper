@@ -316,6 +316,38 @@ impl IndexEntry {
     }
 }
 
+/// One outbound edge of a note, as [`IndexSnapshot::forwardlinks`] reports it.
+///
+/// A borrowed view over the snapshot, never a VM: the shell decides what a row
+/// looks like, and everything here is already in the index. Nothing is cloned
+/// to build one.
+///
+/// `Eq` is absent because [`IndexEntry`] holds no `Eq`; `PartialEq` compares
+/// two edges by identity of the note behind them, which is what a test asserts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForwardLink<'a> {
+    /// The target as the author wrote it — a title, an alias or a
+    /// vault-relative path. When `note` is `None` this is all there is to show,
+    /// because a note that has not been written has no title to show instead.
+    pub target: &'a str,
+    /// The note at the far end, or `None` when nothing in the vault answers to
+    /// `target` yet.
+    ///
+    /// `None` is not an error and not a warning: OKF v0.2 §6.1 says a link
+    /// whose target does not exist is not malformed, it may simply represent
+    /// not-yet-written knowledge. It IS the whole difference a surface has to
+    /// render, and a surface must not make such a row behave as if a note were
+    /// behind it.
+    pub note: Option<&'a IndexEntry>,
+    /// Why this note points there, in the order the author wrote them; empty
+    /// for the great majority of links, which carry no attribute block.
+    ///
+    /// Filled on both branches. A predicate is written on the arrow, so an edge
+    /// to a note nobody has written yet still says what it is for — which is
+    /// most of the value of seeing it at all.
+    pub predicates: &'a [String],
+}
+
 /// The state one tag chip contributes to the note-list query (FR-148, UX-DR54).
 ///
 /// **There is no `Off`.** A chip nobody has touched contributes no term, and off
@@ -513,31 +545,86 @@ impl IndexSnapshot {
         rows
     }
 
-    /// Every note this one links to, sorted by path — the other direction of
-    /// [`Self::backlinks`].
+    /// Every outbound edge of this note, sorted by path — the other direction
+    /// of [`Self::backlinks`], and **including the edges whose target is not
+    /// written yet**.
     ///
-    /// Deduplicated by note rather than by target, so a body that names the same
-    /// note twice — once by title and once by path — lists it once. A target
-    /// nothing answers to is dropped rather than listed as a broken row: this
-    /// answers "what does this note point at that exists", and the editor is
-    /// where an unresolved `[[link]]` is already visible as one.
+    /// This used to answer "what does this note point at that exists", dropping
+    /// an unresolvable target on the grounds that the editor already shows it
+    /// as a broken link. Measured against the owner's own example note: nine
+    /// outbound targets, eight of which named notes nobody had written, and the
+    /// Linked-to tab showed one row. Nothing was truncated or deduplicated away
+    /// — the panel was simply never handed eight of the nine edges, and the
+    /// feature read as broken.
+    ///
+    /// OKF v0.2 §6.1 settles it: consumers MUST tolerate broken links, and a
+    /// link whose target does not exist in the bundle is not malformed — it may
+    /// simply represent not-yet-written knowledge. A vault is written forwards,
+    /// so the dropped edges were precisely the ones a writer most wants to see.
+    /// They come back as rows carrying [`ForwardLink::target`] and no note.
+    ///
+    /// Deduplicated by EDGE rather than by occurrence, on both branches and
+    /// through the one [`link_key`] fold: a body naming the same note twice —
+    /// once by title, once by path — lists it once, and so does a body naming
+    /// the same unwritten target twice. That is the same rule
+    /// [`IndexEntry::link_predicates`] is keyed by, so a row's predicates are
+    /// the merged predicates of every spelling of its edge.
+    ///
+    /// Resolved rows first, sorted by path; unresolved rows after, in the order
+    /// the body wrote them, which is the only order they have — they have no
+    /// path, no title and no timestamp, and inventing one to interleave them
+    /// would be inventing the value the sort then reports.
     ///
     /// Self-links are excluded on the same grounds backlinks excludes them: a
     /// note is not its own neighbour.
-    pub fn forwardlinks(&self, id: &str) -> Vec<&IndexEntry> {
+    pub fn forwardlinks(&self, id: &str) -> Vec<ForwardLink<'_>> {
         let Some(entry) = self.by_id(id) else {
             return Vec::new();
         };
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        // Both halves fold through `link_key`, and both keep the FIRST raw
+        // target that reached the edge: `auth-service.md` written twice, or
+        // `[[Foo]]` and `[foo](notes/foo.md)` in one body, are one edge and one
+        // row, showing that edge's merged predicates once.
+        let mut written: Vec<(&str, &IndexEntry)> = Vec::new();
+        let mut unwritten: Vec<(String, &str)> = Vec::new();
         for target in &entry.links {
             if let Some(found) = self.resolve_link(target) {
-                if found.id != id {
-                    seen.insert(found.id.as_str());
+                if found.id != id && !written.iter().any(|(_, had)| had.id == found.id) {
+                    written.push((target.as_str(), found));
                 }
+                continue;
             }
+            let key = link_key(target);
+            if unwritten.iter().any(|(had, _)| *had == key) {
+                continue;
+            }
+            unwritten.push((key, target.as_str()));
         }
-        let mut rows: Vec<&IndexEntry> = seen.into_iter().filter_map(|s| self.by_id(s)).collect();
-        rows.sort_by(|a, b| a.path.cmp(&b.path));
+
+        written.sort_by(|(_, a), (_, b)| a.path.cmp(&b.path));
+        let mut rows: Vec<ForwardLink<'_>> = written
+            .into_iter()
+            .map(|(target, note)| ForwardLink {
+                target,
+                predicates: self.forward_predicates(id, &note.id),
+                note: Some(note),
+            })
+            .collect();
+        rows.extend(unwritten.into_iter().map(|(key, target)| {
+            ForwardLink {
+                target,
+                note: None,
+                // The far end has no entry to ask through, so the predicates come
+                // straight out of this note's own map. Keyed by the same fold, so
+                // an unwritten target's annotation is found exactly as a written
+                // one's is — and a predicate belongs to the arrow, which exists
+                // whether or not anybody has written the note at its head.
+                predicates: entry
+                    .link_predicates
+                    .get(&key)
+                    .map_or(&[][..], Vec::as_slice),
+            }
+        }));
         rows
     }
 
@@ -1609,6 +1696,153 @@ mod tests {
         assert!(snap.backlink_predicates("t", "l").is_empty());
     }
 
+    /// The owner's own example note (item 2): it links to nine targets and the
+    /// Linked-to tab showed ONE row.
+    ///
+    /// Reproduced as the body it really is, and run through the whole chain —
+    /// `links::extract`, `link_predicate_map`, the snapshot — because a
+    /// hand-built entry would have proved only that the projection agrees with
+    /// whatever I typed into it.
+    ///
+    /// Measured on the owner's machine: of the nine targets exactly one,
+    /// `10-notes/log.md`, is a note that exists; the other seven were written
+    /// forwards, against notes nobody has written yet. Nothing was truncated,
+    /// scrolled or deduplicated away — `forwardlinks` simply did not carry an
+    /// edge whose far end did not resolve. OKF v0.2 §6.1 says it must: a link
+    /// whose target does not exist in the bundle is not malformed, it may
+    /// simply represent not-yet-written knowledge.
+    #[test]
+    fn every_outbound_edge_is_a_row_including_the_notes_nobody_has_written() {
+        // Nine link occurrences, eight distinct edges: `auth-service` is
+        // written twice, once as a path and once as a wikilink.
+        let body = "\
+Grounded in [Company wiki — update log](10-notes/log.md){ :cites }.\n\
+Method from [[2025-method]]{ :based_on }.\n\
+Runs on [auth service](auth-service.md){ :depends_on }.\n\
+Last night's numbers: ![[nightly-run.md]]{ :value_of }\n\
+Shaped by [platform spec](platform-spec.md){ :conforms_to }.\n\
+Tracks [Revenue](revenue.md){ :type=\"Metric\" }.\n\
+Written by [Jan Kowalski](jan-kowalski.md){ schema:creator }.\n\
+Pitched in [the deck](deck.md){rel=\"supports\"}.\n\
+And again, the same service: [[auth-service]]{ :depends_on }.\n";
+        let parsed = crate::notes::links::extract(body);
+        assert_eq!(parsed.len(), 9, "nine link occurrences in the body");
+
+        let mut example = entry(
+            "ex",
+            "10-notes/2026-08-24-typed-links-example.md",
+            "Typed links",
+        );
+        example.links = parsed.iter().map(|link| link.target.clone()).collect();
+        example.link_predicates = link_predicate_map(&parsed);
+
+        let snap = IndexBuilder::from_entries(vec![
+            entry("log", "10-notes/log.md", "Company wiki — update log"),
+            example,
+        ])
+        .snapshot();
+
+        let rows = snap.forwardlinks("ex");
+        assert_eq!(
+            rows.len(),
+            8,
+            "nine occurrences, eight edges — and the seven unwritten ones are rows"
+        );
+
+        // The one that resolves comes first and carries its note.
+        assert_eq!(rows[0].note.map(|note| note.id.as_str()), Some("log"));
+        assert_eq!(rows[0].predicates, ["cites"]);
+
+        // The seven that do not, in the order the body wrote them, each with
+        // the raw target the reader will see and the predicate the author put
+        // on the arrow. `auth-service.md` appears once despite being written
+        // twice, and its second spelling `[[auth-service]]` folds into it.
+        let unwritten: Vec<(&str, &[String])> = rows[1..]
+            .iter()
+            .map(|row| {
+                assert!(row.note.is_none(), "{} resolved unexpectedly", row.target);
+                (row.target, row.predicates)
+            })
+            .collect();
+        assert_eq!(
+            unwritten
+                .iter()
+                .map(|(target, _)| *target)
+                .collect::<Vec<_>>(),
+            [
+                "2025-method",
+                "auth-service.md",
+                "nightly-run.md",
+                "platform-spec.md",
+                "revenue.md",
+                "jan-kowalski.md",
+                "deck.md",
+            ]
+        );
+        assert_eq!(
+            unwritten
+                .iter()
+                .map(|(_, predicates)| predicates.first().map(String::as_str))
+                .collect::<Vec<_>>(),
+            [
+                Some("based_on"),
+                Some("depends_on"),
+                // An EMBED carrying a predicate is an edge like any other
+                // (item 9): the `!` says where to draw it, not whether it is.
+                Some("value_of"),
+                Some("conforms_to"),
+                Some("type"),
+                Some("schema:creator"),
+                Some("supports"),
+            ],
+            "a predicate is written on the arrow, and the arrow exists whether \
+             or not anybody has written the note at its head"
+        );
+
+        // The rest of the graph is unmoved: an unwritten target creates no
+        // note, so it can never appear as a backlink source or resolve.
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.backlinks("log").len(), 1);
+        assert_eq!(snap.resolve_link("auth-service.md"), None);
+    }
+
+    /// A note is not its own neighbour, and a target named two ways is one
+    /// edge — the two rules the item-2 widening must not have loosened.
+    #[test]
+    fn a_self_link_is_no_row_and_one_note_named_twice_is_one_row() {
+        let mut source = entry("l", "notes/linker.md", "Linker");
+        source.links = vec![
+            "Linker".to_owned(),
+            "notes/linker.md".to_owned(),
+            "Bee".to_owned(),
+            "b.md".to_owned(),
+            "ghost".to_owned(),
+            "./ghost.md".to_owned(),
+        ];
+        let snap = IndexBuilder::from_entries(vec![entry("b", "b.md", "Bee"), source]).snapshot();
+
+        let rows = snap.forwardlinks("l");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one written edge, one unwritten, no self-link"
+        );
+        assert_eq!(rows[0].note.map(|note| note.id.as_str()), Some("b"));
+        assert_eq!(
+            rows[0].target, "Bee",
+            "the row keeps the FIRST spelling the author reached the note by"
+        );
+        assert!(rows[1].note.is_none());
+        assert_eq!(
+            rows[1].target, "ghost",
+            "`ghost` and `./ghost.md` fold to one key and one row"
+        );
+
+        // An id the index never knew answers empty rather than panicking: a
+        // panel can outlive the note it was opened on.
+        assert!(snap.forwardlinks("gone").is_empty());
+    }
+
     #[test]
     fn rescan_empties_the_index_rather_than_merging_into_stale_state() {
         let mut builder = IndexBuilder::from_entries(vec![tagged("a", "a.md", &["x"])]);
@@ -2048,6 +2282,52 @@ Older spelling, same graph: [Belief](notes/belief.md){rel=\"cites\"}\n";
             "and the literal object survives the whole chain, under the key as \
              written — dropping it would leave the graph knowing the note has \
              a type but not which"
+        );
+    }
+
+    /// Item 9: a predicate written on an EMBED is an edge like any other.
+    ///
+    /// `![[attachments/q3.csv]]{ :value_of }` and `[q3](attachments/q3.csv){
+    /// :value_of }` are the same assertion about the same file, and the owner
+    /// writes the first one because they also want the table rendered. The
+    /// `!` says "show it here"; it says nothing about whether the arrow exists.
+    ///
+    /// This passed the first time it was run, which is the finding: `extract`
+    /// reads the attribute block after `]]` whether or not the wikilink is an
+    /// embed, and `link_predicate_map` folds an embed's target through
+    /// [`link_key`] with everything else — it never looks at `RawLink::embed`.
+    /// The owner saw `{ :value_of }` as raw text on screen, which is a
+    /// RENDERING defect in the editor's decoration pass and not an index one.
+    /// The test is here so a later change to either side cannot quietly make
+    /// the index defect real while the rendering one is being fixed.
+    #[test]
+    fn a_predicate_on_an_embed_is_the_same_edge_as_one_on_a_plain_link() {
+        let embedded = links::extract("![[attachments/q3.csv]]{ :value_of }\n");
+        assert_eq!(embedded.len(), 1);
+        assert!(embedded[0].embed, "the `!` is still read as an embed");
+        assert_eq!(embedded[0].target, "attachments/q3.csv");
+        assert_eq!(embedded[0].predicates, ["value_of"]);
+        // The span covers the block too, so a renderer that hides the syntax
+        // hides all of it rather than leaving `{ :value_of }` on the page.
+        assert_eq!(embedded[0].span, (0, 36));
+
+        let expected =
+            BTreeMap::from([("attachments/q3.csv".to_owned(), vec!["value_of".to_owned()])]);
+        assert_eq!(link_predicate_map(&embedded), expected);
+        assert_eq!(
+            link_predicate_map(&links::extract("[q3](attachments/q3.csv){ :value_of }\n")),
+            expected,
+            "the `!` is the only difference, and it is not a difference to the graph"
+        );
+
+        // The markdown embed spelling and every predicate spelling, on a file
+        // rather than a note, all reaching the one folded key.
+        assert_eq!(
+            link_predicate_map(&links::extract(
+                "![chart](attachments/Q3.CSV){rel=\"value_of\"}\n"
+            )),
+            expected,
+            "a markdown embed with the legacy pair folds to the same key and name"
         );
     }
 }

@@ -55,7 +55,9 @@ origin: string,
  * `schema:about`, `dcterms:source` — and keeper neither invents one nor
  * infers one. Empty for every link written without a block, which is
  * nearly all of them, and for every row that is not the far end of a link:
- * only the two link projections fill this.
+ * only the two link projections fill this. The forward projection fills it
+ * for an edge with NO note at the far end as well — a predicate is written
+ * on the arrow, and the arrow exists whether or not its target does.
  *
  * A `Vec` and never an `Option<Vec>`. An empty list and "no predicates"
  * are the same fact, and shipping two spellings of one fact is how one
@@ -72,6 +74,27 @@ origin: string,
  * index answers this through `IndexSnapshot::backlink_predicates`.
  */
 predicates: Array<string>, 
+/**
+ * The raw link target, for an outbound edge whose target resolves to no
+ * note. Empty on every other row — the same empty-means-absent spelling
+ * `origin` and `head_rev` use here, so a surface branches on emptiness and
+ * never on null.
+ *
+ * **Why the row exists at all.** OKF v0.2 §6.1: consumers MUST tolerate
+ * broken links; a link whose target does not exist in the bundle is not
+ * malformed, it may simply represent not-yet-written knowledge. A vault is
+ * written forwards — you link the note you are about to write — so the
+ * forward projection used to drop precisely the edges a writer most wants
+ * to see, and the owner read a Linked-to tab showing one of nine targets
+ * as a broken feature. It was not truncating anything: eight of the nine
+ * had no note behind them.
+ *
+ * It is the label such a row shows, because there is no title to show. A
+ * surface must not make it clickable as though a note were there, and must
+ * not offer to create one — nobody asked for that, and inventing it here
+ * would turn a report into a prompt.
+ */
+unresolvedTarget: string, 
 /**
  * The head revision that last touched this note's path: the revision
  * `unread` was computed against (`head_rev != acknowledged_rev`).

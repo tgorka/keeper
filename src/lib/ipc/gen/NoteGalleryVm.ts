@@ -18,9 +18,11 @@ import type { NoteGalleryItemVm } from "./NoteGalleryItemVm";
  */
 export type NoteGalleryVm = { 
 /**
- * The vault-relative folder that was listed, echoed back so a reply that
- * arrives after the block was retargeted can be discarded rather than
- * rendered under the wrong heading.
+ * The folder that was listed, relative to the LISTED ROOT — the vault root
+ * under [`NoteGalleryScope::Vault`] and the synced folder under
+ * [`NoteGalleryScope::SyncedFolder`]. Echoed back so a reply that arrives
+ * after the block was retargeted can be discarded rather than rendered
+ * under the wrong heading.
  */
 folder: string, 
 /**

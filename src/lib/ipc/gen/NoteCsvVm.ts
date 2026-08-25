@@ -38,4 +38,20 @@ rows: Array<NoteCsvRowVm>,
  * closes, a row count that was capped. Empty when there is nothing to say.
  * Worded here rather than in the webview, on this module's standing rule.
  */
-notices: Array<string>, };
+notices: Array<string>, 
+/**
+ * The separator the file is actually written with, as a one-character
+ * string: `","`, `";"`, `"\t"` or `"|"`.
+ *
+ * Detected from the bytes ([`crate::notes::csv::detect_delimiter`]), not
+ * assumed: a European Excel export is semicolon-separated, and keeper drew
+ * the owner's real attachment as a single column for exactly as long as
+ * this was a constant comma.
+ *
+ * Carried to the webview because the conversion between a table and an
+ * attachment has to write the file back in its own dialect — a round trip
+ * that re-emitted commas would silently rewrite every row of a `;` file.
+ * A one-character string rather than a byte, because that is what survives
+ * JSON and what a `<select>` of separators would show.
+ */
+delimiter: string, };
