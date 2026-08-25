@@ -793,6 +793,15 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // renders as "invalid sync configuration", sending somebody to look for
         // a broken setting that does not exist.
         SyncError::Busy(_) => IpcErrorCode::SyncUnavailable,
+        // A typed refusal about ONE path (Story 56.3): keeper will not change
+        // the bytes there, and the reason is the refusal's own sentence.
+        // `internal` rather than a new code, on the same reasoning
+        // `write_refused` uses for `WriteRefusal`: the frontend has no
+        // affordance to build from a distinct code here — 56.7 owns the row
+        // states and 56.9 the button — and the message is written to be shown
+        // verbatim. `retriable` is `false` from `Retriability::Permanent`,
+        // which is correct: asking again unchanged gets the same answer.
+        SyncError::Refused(_) => IpcErrorCode::Internal,
         // Everything else keeps the `internal` this funnel has always given it.
         // Spelled out rather than defaulted so that growing the taxonomy asks
         // the question here instead of answering it.
@@ -2265,6 +2274,81 @@ pub async fn sync_open_entry(
             "could not open {subpath} with the system's default application: {error}"
         ))
     })
+}
+
+/// Ask for one virtual path's content (Story 56.3, FR-338).
+///
+/// **The app's door onto `Engine::materialize_entry`**, and the CLI's
+/// `keeper-syncd materialize` is the other. Every decision is the engine's:
+/// containment, the LFS mode, the index, the sparse cone, whether the worktree
+/// bytes may be replaced, and whether the object is already here or has to be
+/// fetched. Nothing is decided in this crate, which does not build on Linux, so
+/// a rule written here would be one nobody could exercise until macOS (AD-55,
+/// AD-56).
+///
+/// **Returns nothing, on purpose.** The CLI needs the outcome because it prints
+/// it; the app does not, yet — 56.7 owns the row states and 56.9 the button —
+/// and every fact a row needs already has a surface: `sync_browse` and
+/// `Engine::lfs_files` report whether a path is virtual or materialized, and
+/// `sync_subscribe_progress` reports `DownloadingLfs` with the path in
+/// `current`. A view model nothing renders would mean a new `keeper-core` type,
+/// a new generated binding and two uncast TypeScript fixtures, all so the
+/// frontend could ignore it. `Result<(), IpcError>` is the shape
+/// `sync_open_entry` and `sync_write_entry` already have.
+///
+/// **A refusal is a rejection carrying the refusal's own sentence.** A path
+/// whose bytes are neither the committed pointer nor the content it names is
+/// `ContentRefusal::LocallyModified`, and it arrives through
+/// [`sync_ipc_error`]'s `Refused` arm as `internal` with that sentence — logged
+/// `warn!` here for the reason [`write_refused`] logs one: `GatedMakeWriter`
+/// only puts `INFO` on disk in debug mode, and a refusal is the thing a person
+/// asks about later (DW-162).
+///
+/// Runs on the blocking pool. Copying a four-gigabyte object out of the local
+/// store is a filesystem copy that hashes nothing but moves everything, and
+/// holding the IPC thread for it would freeze every other profile's poll behind
+/// one click. The engine's own reservation means only one operation runs per
+/// folder *in this process*, so two clicks cannot race the index — the daemon
+/// is a separate process and its own reservation, which is stated on
+/// `Engine::materialize_entry`.
+///
+/// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
+/// (no such profile, an unplugged removable volume, a subpath that escapes the
+/// root — including through a symlinked parent, a path that is not a tracked
+/// large file, a path outside the folder's subpaths, a file that is gone, a
+/// file keeper will not overwrite, LFS turned off for the folder, the folder
+/// paused).
+#[tauri::command]
+pub async fn sync_materialize_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    // The owned `Arc` `engine_of` hands back is moved into the blocking task
+    // rather than borrowed: `Engine` lives behind an `Arc` precisely so a call
+    // that may copy gigabytes can hold it without holding `state`.
+    let engine = engine_of(&state)?;
+    let asked = subpath.clone();
+    let done = tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath))
+        .await
+        .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
+    match done {
+        Ok(outcome) => {
+            tracing::info!(
+                path = %outcome.path,
+                outcome = %outcome.outcome,
+                unit = ?outcome.unit_id,
+                "files: materialize"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: materialize refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
 }
 
 /// Read one file inside a synced folder as editable text (Story 45.6, FR-179,

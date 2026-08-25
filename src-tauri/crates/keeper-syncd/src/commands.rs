@@ -31,6 +31,7 @@ use serde::Serialize;
 
 use keeper_sync::engine::Engine;
 use keeper_sync::lfs::audit::RemoteAudit;
+use keeper_sync::lfs::hydrate::Materialization;
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
@@ -136,6 +137,12 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // the folder first, so a one-shot that lands here did nothing wrong and
         // must not earn a `Restart=on-failure` for losing a race.
         SyncError::Busy(_) => EXIT_OK,
+        // A refusal ends the command without doing what was asked, which for a
+        // one-shot verb is a failed run: an agent or a script that asked for a
+        // file and did not get it must be able to see that in `$?`. Never
+        // `EXIT_CONFIG` — nothing about the configuration is wrong when keeper
+        // declines to overwrite a file the user edited.
+        SyncError::Refused(_) => EXIT_FAILURE,
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }
@@ -282,6 +289,21 @@ pub enum Command {
         /// answered" (FR-337).
         #[arg(long)]
         remote: bool,
+    },
+    /// Ask for one virtual path's content (FR-338).
+    ///
+    /// Publishes the file inline when this machine already holds the object,
+    /// and otherwise queues the transfer and says so — the running daemon
+    /// delivers it, because this verb has no event loop to wait on. A path
+    /// whose worktree bytes are neither the committed pointer nor the content
+    /// it names is **refused by name** and left exactly as it is: keeper does
+    /// not overwrite a local modification.
+    Materialize {
+        /// Profile id or name. Required: materializing is a write, and "all
+        /// folders" is not a thing anybody means by it.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
     },
     /// Check every prerequisite and report what is broken.
     Doctor,
@@ -564,6 +586,10 @@ pub async fn run(
         Command::LsFiles { profile, remote } => {
             let engine = engine_for(&platform, config)?;
             cmd_ls_files(&printer, &engine, profile.as_deref(), remote).await
+        }
+        Command::Materialize { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_materialize(&printer, &engine, &profile, &subpath)
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1328,6 +1354,128 @@ async fn cmd_ls_files(
 }
 
 // ---------------------------------------------------------------------------
+// materialize
+// ---------------------------------------------------------------------------
+
+/// One materialization as a human reads it.
+///
+/// Pure, and taking the profile's name rather than the profile, so the sentence
+/// a person reads is asserted by a test that owns no engine. One line: this
+/// verb settles exactly one path, and a header over a single row would be
+/// noise.
+///
+/// The size is the **pointer's**, never the ~130 bytes of pointer text a
+/// virtual path holds on disk (FR-336) — the same discipline `ls-files` states,
+/// and the number is the one a person was asking about when they asked for the
+/// file.
+///
+/// The outcome word is [`MaterializeOutcome`]'s own [`std::fmt::Display`],
+/// which is prose; the `--json` form carries serde's camelCase spelling of the
+/// same variant, so one enum still decides what happened and each surface
+/// spells it the way its reader expects.
+fn materialize_lines(profile_name: &str, done: &Materialization) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{profile_name}: {outcome}  {size}  {path}",
+        outcome = done.outcome,
+        size = format_bytes(done.size_bytes),
+        path = done.path,
+    )];
+    if let Some(unit) = done.unit_id {
+        // Said out loud because this verb does NOT wait: `keeper-syncd` has no
+        // event subscription, so the object is delivered by the supervisor —
+        // and by the supervisor's own next pass, since this process's `wake_now`
+        // reaches only its own engine. An operator with no daemon running would
+        // otherwise wait for something that is never going to happen.
+        lines.push(format!(
+            "  queued as unit {unit}; a running `keeper-syncd watch` fetches it \
+             on its next pass"
+        ));
+    }
+    lines
+}
+
+/// One materialization as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `oid`,
+/// `sizeBytes`, `outcome` — plus `unitId` **only** when something was queued.
+///
+/// Absent rather than null, and built by naming the keys here rather than by
+/// serializing [`Materialization`], for the reason `ls_files_entry` states:
+/// `null` cannot distinguish "nothing was queued" from "a unit whose id we
+/// lost", and a derived serialization would emit exactly that `null`. The
+/// branch that decides absence is therefore in a function a test can call.
+fn materialize_json(profile: &SyncProfile, done: &Materialization) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "oid": done.oid,
+        "sizeBytes": done.size_bytes,
+        "outcome": done.outcome,
+    });
+    if let Some(unit) = done.unit_id {
+        entry["unitId"] = serde_json::json!(unit);
+    }
+    entry
+}
+
+/// Ask for one path's content in one folder.
+///
+/// [`Engine::materialize_entry`] holds every decision — containment, the mode,
+/// the index, the cone, whether the bytes on disk may be replaced, and whether
+/// the object is here or has to be fetched. This function selects the profile
+/// and prints; adding any policy here would be the second implementation AD-52
+/// exists to prevent.
+///
+/// A required profile, resolved through [`select`] so a mistyped name is
+/// refused with the alternatives named rather than silently addressing a
+/// different folder. `select` returns a list because its other callers accept
+/// `None` for "every profile"; this verb writes to one worktree, so it takes
+/// the one match and prints its document exactly once.
+fn cmd_materialize(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        // `select` refuses a selector nothing matches and names the
+        // alternatives; what it cannot refuse is a selector matching two
+        // folders, because nothing makes a profile's NAME unique. For a read
+        // verb the answer is both listings; for a write there is no defensible
+        // arbitrary choice, so this asks for the id.
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = engine
+        .materialize_entry(&profile.id, subpath)
+        .map_err(|err| {
+            // `Busy` is `EXIT_OK` for `sync --once`, where losing a race did no
+            // wrong and a `Restart=on-failure` unit must not fire for it. This verb
+            // promises one path now holds content, so a run that did not deliver it
+            // has to be visible in `$?` — the same reasoning the `Refused` arm of
+            // `sync_exit_code` carries.
+            match err {
+                SyncError::Busy(name) => CliError::Operational(format!(
+                    "{name} is busy syncing right now; ask again in a moment"
+                )),
+                other => other.into(),
+            }
+        })?;
+    for line in materialize_lines(&profile.name, &done) {
+        printer.line(line);
+    }
+    printer.json(&materialize_json(profile, &done));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // logs
 // ---------------------------------------------------------------------------
 
@@ -1948,6 +2096,7 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use clap::CommandFactory as _;
+    use keeper_sync::lfs::hydrate::MaterializeOutcome;
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
@@ -1983,6 +2132,7 @@ mod tests {
             &["keeper-syncd", "sync", "--once"],
             &["keeper-syncd", "sync", "docs", "--once"],
             &["keeper-syncd", "watch"],
+            &["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"],
             &["keeper-syncd", "pause", "docs"],
             &["keeper-syncd", "resume", "docs"],
             &["keeper-syncd", "verify"],
@@ -2022,6 +2172,17 @@ mod tests {
             let err = parse(&["keeper-syncd", subcommand])
                 .expect_err("a profile is required to pause or resume one");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        }
+        // `materialize` needs two: a folder and a path inside it. One argument
+        // is the shape a person trying `materialize clip.mp4` produces, and it
+        // must be told what is missing rather than have `clip.mp4` read as a
+        // profile name.
+        for args in [
+            vec!["keeper-syncd", "materialize"],
+            vec!["keeper-syncd", "materialize", "docs"],
+        ] {
+            let err = parse(&args).expect_err("a profile AND a subpath are required");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
         }
         // ...and the optional ones really are optional.
         assert!(parse(&["keeper-syncd", "verify"]).is_ok());
@@ -2222,6 +2383,16 @@ mod tests {
                     "/srv/docs",
                     std::io::Error::from(std::io::ErrorKind::PermissionDenied),
                 ),
+                EXIT_FAILURE,
+            ),
+            // Story 56.3's one new variant. `EXIT_FAILURE` and not
+            // `EXIT_CONFIG`: an agent that asked for a file and was told keeper
+            // will not overwrite the edit there has to see a non-zero `$?`,
+            // and nothing about the configuration is wrong.
+            (
+                SyncError::Refused(keeper_sync::lfs::hydrate::ContentRefusal::LocallyModified {
+                    path: "40-media/clip.mp4".to_owned(),
+                }),
                 EXIT_FAILURE,
             ),
         ];
@@ -2552,5 +2723,158 @@ mod tests {
                 .command,
             Command::LsFiles { remote: true, .. }
         ));
+    }
+
+    // --- materialize: the two renderings are the contract (Story 56.3) ------
+
+    fn materialization(outcome: MaterializeOutcome, unit_id: Option<i64>) -> Materialization {
+        Materialization {
+            path: "40-media/clip.mp4".to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes: 4 * 1024 * 1024,
+            outcome,
+            unit_id,
+        }
+    }
+
+    /// The human line names the outcome, the honest size and the path.
+    ///
+    /// The size assertion is the load-bearing one: it is derived from the
+    /// `size_bytes` the pointer named — 4 MiB — where the file on disk before
+    /// the call is about 130 bytes, so a renderer reading the worktree's own
+    /// length could not produce this string (FR-336). Asserted by moving the
+    /// field rather than by looking for the absence of `130`, which no possible
+    /// body of a function with no filesystem access could have printed.
+    #[test]
+    fn the_human_line_carries_the_outcome_the_honest_size_and_the_path() {
+        let lines = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::Materialized, None),
+        );
+        assert_eq!(lines.len(), 1, "one path, one line: {lines:?}");
+        assert!(lines[0].contains("materialized"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("4.0 MB"),
+            "the size is the one the pointer names: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("40-media/clip.mp4"), "{}", lines[0]);
+
+        // The same renderer over a pointer-text-sized number, so the field the
+        // line reads is pinned rather than assumed: 4 MiB above and 130 B here
+        // can only both hold if `size_bytes` is what is rendered.
+        let mut small = materialization(MaterializeOutcome::Materialized, None);
+        small.size_bytes = 130;
+        assert!(
+            materialize_lines("Field", &small)[0].contains("130 B"),
+            "the line renders `size_bytes`, whatever it says"
+        );
+
+        // Prose in the sentence, camelCase on the wire: one enum, two
+        // spellings, each where its reader expects it.
+        let already = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::AlreadyMaterialized, None),
+        );
+        assert!(
+            already[0].contains("already materialized"),
+            "a person reads a sentence, not a JSON token: {}",
+            already[0]
+        );
+
+        // A queued outcome says who will deliver it, because this verb does not
+        // wait and an operator with no daemon running would otherwise wait for
+        // something that cannot happen.
+        let queued = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::Queued, Some(42)),
+        );
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued[0].contains("queued"), "{}", queued[0]);
+        assert!(
+            queued[1].contains("unit 42") && queued[1].contains("watch"),
+            "{}",
+            queued[1]
+        );
+    }
+
+    /// The JSON key set is the promise, so the assertion is on the KEY SET.
+    ///
+    /// A renamed or dropped field is the breakage that matters to a consumer
+    /// and a `contains` check would miss both — the same reasoning
+    /// `the_json_documents_key_set_is_exactly_the_contract` states for
+    /// `ls-files`.
+    #[test]
+    fn the_materialize_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let done = materialization(MaterializeOutcome::Queued, Some(42));
+        let entry = materialize_json(&profile, &done);
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "oid",
+                "outcome",
+                "path",
+                "profile",
+                "profileId",
+                "sizeBytes",
+                "unitId",
+            ]
+        );
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["outcome"], serde_json::json!("queued"));
+        assert_eq!(object["unitId"], serde_json::json!(42));
+        assert_eq!(
+            object["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes on disk"
+        );
+    }
+
+    /// `unitId` is ABSENT for an outcome that queued nothing, not null.
+    ///
+    /// `null` would say "there is a unit and I do not know its id", which is a
+    /// thing that cannot happen — and a consumer polling for delivery has to be
+    /// able to tell "nothing to wait for" from "wait for this". Asserted
+    /// through the renderer's own parameter, so the branch under test is the
+    /// branch that ships.
+    #[test]
+    fn the_unit_id_is_absent_unless_something_was_queued() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        for outcome in [
+            MaterializeOutcome::Materialized,
+            MaterializeOutcome::AlreadyMaterialized,
+        ] {
+            let entry = materialize_json(&profile, &materialization(outcome, None));
+            assert!(
+                !entry.as_object().expect("object").contains_key("unitId"),
+                "nothing was queued, so there is no key to carry: {entry}"
+            );
+        }
+        // The wire spelling is serde's, and it is camelCase where the prose is
+        // a sentence: pinned here because a consumer branches on this string.
+        assert_eq!(
+            materialize_json(
+                &profile,
+                &materialization(MaterializeOutcome::AlreadyMaterialized, None)
+            )["outcome"],
+            serde_json::json!("alreadyMaterialized")
+        );
+    }
+
+    /// Two positionals, in that order, and neither optional.
+    #[test]
+    fn materialize_takes_a_folder_and_a_path_inside_it() {
+        let cli =
+            parse(&["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Materialize { profile, subpath } = cli.command else {
+            panic!("expected materialize");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
     }
 }

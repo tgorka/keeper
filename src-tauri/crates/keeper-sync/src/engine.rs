@@ -3210,9 +3210,18 @@ impl Engine {
     // Work execution
     // -----------------------------------------------------------------------
 
-    /// `unit_id` is the journal row being executed. Only the push leg uses it:
-    /// the activity rows its commit records name it as the unit whose success
-    /// delivers them (Story 34.16).
+    /// `unit_id` is the journal row being executed. The push leg names it as
+    /// the unit whose success delivers the activity rows its commit records
+    /// (Story 34.16), and the LFS legs carry it down to
+    /// [`Self::materialize_landed`], which asks the journal whether anybody is
+    /// waiting for that row (Story 56.3).
+    ///
+    /// The id travels rather than the answer. A request that arrives while its
+    /// covering download is already `running` — the ordinary case, since
+    /// [`WorkKind::covered_while_running`] makes a running transfer count as
+    /// cover — raises the urgency of a row this loop read before the person
+    /// asked, so a `bool` copied out at claim time would drop that request
+    /// silently. See [`db::unit_urgency`].
     async fn execute(
         &self,
         profile: &SyncProfile,
@@ -3235,10 +3244,12 @@ impl Engine {
                 Ok(())
             }
             WorkKind::LfsDownload { oid, size } => {
-                self.do_lfs(profile, oid, *size, label, false).await
+                self.do_lfs(profile, oid, *size, label, false, Some(unit_id))
+                    .await
             }
             WorkKind::LfsUpload { oid, size } => {
-                self.do_lfs(profile, oid, *size, label, true).await
+                self.do_lfs(profile, oid, *size, label, true, Some(unit_id))
+                    .await
             }
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
@@ -5044,6 +5055,10 @@ impl Engine {
         })
     }
 
+    /// `unit` is the journal row this transfer belongs to, carried through to
+    /// [`Self::materialize_landed`], which asks the journal whether anybody is
+    /// waiting for it. `None` for a caller that is not draining a row. Ignored
+    /// on the upload leg, which publishes nothing to the worktree.
     async fn do_lfs(
         &self,
         profile: &SyncProfile,
@@ -5051,6 +5066,7 @@ impl Engine {
         size: u64,
         label: Option<&str>,
         upload: bool,
+        unit: Option<i64>,
     ) -> Result<()> {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
@@ -5097,7 +5113,7 @@ impl Engine {
         if lfsconfig.is_none() {
             if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
                 return self
-                    .copy_lfs_object(profile, remote, oid, size, upload, label)
+                    .copy_lfs_object(profile, remote, oid, size, upload, label, unit)
                     .await;
             }
         }
@@ -5200,7 +5216,7 @@ impl Engine {
             //
             // The path that just arrived, not the whole tree: see
             // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
-            self.materialize_landed(profile, &store, label)?;
+            self.materialize_landed(profile, &store, oid, label, unit)?;
         }
         Ok(())
     }
@@ -5215,6 +5231,12 @@ impl Engine {
     ///
     /// Blocking, so it runs on `spawn_blocking`: the copy hashes every byte to
     /// verify it, which for this subsystem means gigabytes.
+    ///
+    /// `unit` rides through for [`Self::do_lfs`]'s reason: this is the
+    /// filesystem-remote half of the same leg, so a requested unit delivered
+    /// off a pendrive must publish on the same terms one delivered over HTTP
+    /// does.
+    #[allow(clippy::too_many_arguments)]
     async fn copy_lfs_object(
         &self,
         profile: &SyncProfile,
@@ -5223,6 +5245,7 @@ impl Engine {
         size: u64,
         upload: bool,
         label: Option<&str>,
+        unit: Option<i64>,
     ) -> Result<()> {
         // An unmounted volume is absence, never failure (AD-48), and it must not
         // read as a corrupt or missing object. `Deferred` waits for the volume to
@@ -5264,7 +5287,7 @@ impl Engine {
             //
             // The path that just arrived, not the whole tree: see
             // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
-            self.materialize_landed(profile, &local, label)?;
+            self.materialize_landed(profile, &local, &oid, label, unit)?;
         }
         Ok(())
     }
@@ -5285,62 +5308,136 @@ impl Engine {
     ///
     /// A transfer names its path in the journal row's label (that is what
     /// `label_unit` is for), so the object that just arrived needs one stat, one
-    /// read and one index refresh. Two paths sharing an object — ordinary for
-    /// duplicated content — is precisely the case the label cannot name: the
-    /// second path keeps its pointer until the next sweep, which is one tick
-    /// away in [`Self::scan_and_enqueue`] and is where a whole-tree question
-    /// belongs. An unlabelled row (`None`) defers to that sweep for the same
-    /// reason, rather than paying for a walk here.
+    /// read and one index refresh. An unlabelled row (`None`) defers to the
+    /// sweep rather than paying for a walk here.
+    ///
+    /// # A request is for content, so it covers every path that content sits at
+    ///
+    /// Two paths holding identical bytes share one object and therefore one
+    /// download — the case `label_unit`'s first-writer-wins rule exists for.
+    /// For a *background* arrival the label is the whole answer: the second
+    /// path keeps its pointer until the next sweep, one tick away in
+    /// [`Self::scan_and_enqueue`], which is where a whole-tree question
+    /// belongs.
+    ///
+    /// For a *requested* arrival the label is not enough, and the first version
+    /// of this shipped believing it was. Ask for `a.mp4` and then for
+    /// `a-copy.mp4` before delivery: the second request deduplicates onto the
+    /// same row (correctly — the bytes are identical), the label still says
+    /// `a.mp4`, and under `PointerOnly` nothing publishes `a-copy.mp4` ever,
+    /// because the sweep is switched off in that mode. The request reported a
+    /// unit id and silently never delivered. So a requested arrival asks the
+    /// index which paths this oid belongs to and publishes each of them that
+    /// still holds pointer text. The cost — one index read per requested
+    /// completion, never per background one — is bounded by the thing that
+    /// makes it safe: a human, or one click, produced it.
+    ///
+    /// # Whether it was requested is read from the journal, not passed in
+    ///
+    /// [`db::unit_urgency`] is consulted here rather than at claim time,
+    /// because a request that arrives while its covering download is already
+    /// `running` — which [`WorkKind::covered_while_running`] makes ordinary —
+    /// raises the urgency of a row the supervisor read before the person asked.
+    ///
+    /// # Being requested bypasses the mode gate, and nothing else
+    ///
+    /// `lfs_mode != Materialize` is the right answer for *arrival*:
+    /// [`LfsMode::PointerOnly`] means "leave what arrives as pointers", and
+    /// [`LfsMode::Disabled`] has no pointers to replace. It is fatal for a
+    /// *request*, because `PointerOnly` is the mode in which paths are virtual
+    /// in the first place — so without this, asking for a file under
+    /// `PointerOnly` would fetch the object into the store, return `Ok`, and
+    /// leave the worktree holding pointer text: green tests over an inert
+    /// feature (Story 56.3).
+    ///
+    /// It bypasses exactly that one gate. `Disabled` still refuses, because
+    /// nothing routes the path through the clean filter there and real bytes
+    /// would become a new blob in the next commit. The sparse cone, the
+    /// pointer-text check and the store-contains check below all still hold,
+    /// because each of them answers a question the request did not settle —
+    /// what the worktree holds *now*, not what it held when the row was queued.
     fn materialize_landed(
         &self,
         profile: &SyncProfile,
         store: &lfs::store::LfsStore,
+        oid: &str,
         label: Option<&str>,
+        unit: Option<i64>,
     ) -> Result<()> {
+        let requested = match unit {
+            Some(id) => self.with_db(|conn| db::unit_urgency(conn, id))? == db::Urgency::Requested,
+            None => false,
+        };
         // Pointer-only leaves content as a pointer on purpose — the
         // whole-profile lever `materialize_pending` documents — and disabled has
-        // no pointers to replace.
-        if profile.lfs_mode != LfsMode::Materialize {
+        // no pointers to replace. A path somebody asked for is the exception,
+        // and only for `PointerOnly`: see this function's doc.
+        if profile.lfs_mode == LfsMode::Disabled
+            || (profile.lfs_mode != LfsMode::Materialize && !requested)
+        {
             return Ok(());
         }
         let Some(rela) = label.map(PathBuf::from) else {
             return Ok(());
         };
         let cone = SparseCone::new(&profile.subpaths);
-        if !cone.includes(&rela) {
+        // The labelled path first: it is the one the progress line named and
+        // the one a caller is most likely waiting on.
+        let mut wanted: Vec<PathBuf> = Vec::new();
+        if cone.includes(&rela) {
+            wanted.push(rela.clone());
+        }
+        if requested {
+            let repo = self.open_repo(profile)?;
+            for (key, pointer) in lfs::stage::indexed_pointers(&repo) {
+                if pointer.oid != oid {
+                    continue;
+                }
+                let other = PathBuf::from(&key);
+                if other != rela && cone.includes(&other) {
+                    wanted.push(other);
+                }
+            }
+        }
+
+        let mut landed: Vec<PathBuf> = Vec::new();
+        for candidate in &wanted {
+            let one = std::slice::from_ref(candidate);
+            let Some(smudge) = lfs::stage::pending_smudges(&profile.local_path, one)?.pop() else {
+                // Not a pointer any more: another arm materialized it, or the
+                // file has been replaced since the row was queued. Either way
+                // there is nothing here to replace.
+                continue;
+            };
+            if !store.contains(&smudge.pointer.oid, smudge.pointer.size) {
+                // The pointer in the worktree names a different object than the
+                // one that landed — the path was edited since the row was
+                // queued. The sweep owns that discovery, and queues the object
+                // it now needs.
+                continue;
+            }
+            lfs::stage::materialize(store, &profile.local_path, &smudge)?;
+            // The one moment this is knowable: content for this path now exists
+            // here, so the next object for it is a replacement rather than an
+            // arrival.
+            let published = smudge.path.to_string_lossy().into_owned();
+            let now = self.platform.now_ms();
+            self.with_db(|conn| db::remember_materialized(conn, &profile.id, &published, now))?;
+            tracing::info!(
+                profile = profile.name,
+                path = published,
+                "materialized LFS content"
+            );
+            landed.push(smudge.path);
+        }
+        if landed.is_empty() {
             return Ok(());
         }
-        let candidate = std::slice::from_ref(&rela);
-        let Some(smudge) = lfs::stage::pending_smudges(&profile.local_path, candidate)?.pop()
-        else {
-            // Not a pointer any more: another arm materialized it, or the file
-            // has been replaced since the row was queued. Either way there is
-            // nothing here to replace.
-            return Ok(());
-        };
-        if !store.contains(&smudge.pointer.oid, smudge.pointer.size) {
-            // The pointer in the worktree names a different object than the one
-            // that landed — the path was edited since the row was queued. The
-            // sweep owns that discovery, and queues the object it now needs.
-            return Ok(());
-        }
-        lfs::stage::materialize(store, &profile.local_path, &smudge)?;
-        // The one moment this is knowable: content for this path now exists
-        // here, so the next object for it is a replacement rather than an
-        // arrival.
-        let landed = smudge.path.to_string_lossy().into_owned();
-        let now = self.platform.now_ms();
-        self.with_db(|conn| db::remember_materialized(conn, &profile.id, &landed, now))?;
-        tracing::info!(
-            profile = profile.name,
-            path = landed,
-            "materialized LFS content"
-        );
-        // The worktree file just changed size, so its index entry carries the
-        // pointer's stat and status would call it modified. Re-stat it against
-        // the real file.
+        // Every worktree file just changed size, so its index entry carries the
+        // pointer's stat and status would call it modified. Re-stat them in one
+        // pass, which is what `refresh_index_stat` takes a slice for.
         let repo = self.open_repo(profile)?;
-        git::repo::refresh_index_stat(&repo, std::slice::from_ref(&smudge.path))?;
+        git::repo::refresh_index_stat(&repo, &landed)?;
         Ok(())
     }
 
@@ -5948,6 +6045,268 @@ impl Engine {
             &pointers,
             &ledger,
         ))
+    }
+
+    /// Ask for one virtual path's content (Story 56.3, FR-338, AD-128).
+    ///
+    /// The engine's single entry point for on-demand hydration, and both doors
+    /// onto it — `keeper-syncd materialize` and the `sync_materialize_entry`
+    /// command — call exactly this and add no policy of their own. Three
+    /// answers, all of them `Ok`: the content was published here and now, it
+    /// was already there, or a transfer was queued and the id of the unit that
+    /// will deliver it is on the [`lfs::hydrate::Materialization`].
+    ///
+    /// # Nothing here is a second implementation
+    ///
+    /// [`lfs::stage::materialize`] stays the only publish,
+    /// [`git::repo::refresh_index_stat`] the only index-stat repair,
+    /// [`WorkKind::LfsDownload`] the only transfer and
+    /// [`Self::materialize_landed`] the only completion arm. The per-path
+    /// decision is [`lfs::hydrate::plan`]'s, the containment rule is
+    /// [`crate::browse::plain_segments`]'s, and the queue is the journal's.
+    ///
+    /// Deliberately **not** [`Self::materialize_pending`], the whole-tree
+    /// sweep: its own doc records the 40 hours lost to calling it per object,
+    /// and a request for one path must cost one path.
+    ///
+    /// # The order of the checks is the contract
+    ///
+    /// Containment first, so an escaping subpath is refused whatever state the
+    /// folder is in and the refusal cannot be probed for. Then the mode, which
+    /// needs no disk. Then the repository — opened with
+    /// [`git::repo::open`] and never [`Self::open_repo`], which for a folder
+    /// that is not a repository yet clones over the network or adopts in place:
+    /// a verb sold as "give me this file" must not be able to pull gigabytes or
+    /// turn a plain folder into a keeper repository, which is the high-severity
+    /// defect 56.2's review found in the sibling listing. Then the index, the
+    /// cone, and only then the worktree.
+    ///
+    /// # One operation at a time, within this process
+    ///
+    /// Takes [`Self::reserve`], and a busy profile answers
+    /// [`SyncError::Busy`] exactly as [`Self::sync_once`] does. The reservation
+    /// is released on every exit path including a panic, and clears the
+    /// progress phase with it (see `Reservation::drop`).
+    ///
+    /// It is an **in-process** exclusion, and the honest limit is worth writing
+    /// down here because this is the first verb designed to be run *while* a
+    /// daemon runs: `keeper-syncd materialize` is a different process from
+    /// `keeper-syncd watch`, each with its own reservation map, so nothing
+    /// stops the two from writing the index at the same time. Ordinary use is
+    /// the app door, where the engine is a singleton and the exclusion is real.
+    /// A cross-process lock is a change to every one-shot verb, not to this
+    /// one (recorded in `deferred-work.md`).
+    ///
+    /// Blocking, like every other repository caller: a `gix::Repository` is
+    /// neither `Send` nor cheap to hold, so each open is scoped to a block and
+    /// never spans an await point.
+    pub fn materialize_entry(
+        &self,
+        id: &str,
+        subpath: &str,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        // The one lexical containment rule in the crate (AD-65), carried across
+        // verbatim rather than restated. Ahead of the reservation, so a subpath
+        // that may not be asked for is refused whatever the folder is doing —
+        // and it costs no disk, so there is nothing to serialize yet.
+        let segments = crate::browse::plain_segments(subpath)
+            .map_err(ContentRefusal::from)
+            .map_err(SyncError::Refused)?;
+        if segments.is_empty() {
+            // `plain_segments` answers the profile ROOT with no segments, which
+            // is correct for a listing and meaningless here: a folder has no
+            // content to materialize. Refused as an escape because that is what
+            // asking for the root as a file is — browse's own sentence names the
+            // subpath that was asked for.
+            return Err(SyncError::Refused(ContentRefusal::Escapes(
+                crate::browse::BrowseRefusal::Escapes {
+                    subpath: subpath.to_owned(),
+                },
+            )));
+        }
+        // The other half of the same rule, and this verb needs it more than the
+        // read verbs that already run it: `plain_segments` is lexical, so it
+        // cannot see a *parent* component replaced by a symlink pointing out of
+        // the folder — and this is a write. `browse::resolve` canonicalizes
+        // both ends and refuses after resolution (AD-59). `Ok(None)` is a path
+        // that is simply not on disk, which is [`ContentRefusal::Missing`]'s
+        // business a few lines down, not an escape.
+        crate::browse::resolve(&profile.local_path, subpath)
+            .map_err(ContentRefusal::from)
+            .map_err(SyncError::Refused)?;
+        let rela = lfs::hydrate::joined(&segments);
+        let path = rela.to_string_lossy().into_owned();
+
+        // A paused folder is one keeper does not touch — the rule
+        // `commit_local` and the watcher both state — and a request is no
+        // exception: the bytes would land in a working tree the user took
+        // keeper's hands off, and a queued unit would never be claimed, because
+        // the tick skips a disabled profile entirely. Saying so is the only
+        // honest answer available.
+        if !profile.enabled {
+            return Err(SyncError::Refused(ContentRefusal::Paused {
+                profile: profile.name.clone(),
+            }));
+        }
+        // An unplugged volume is absence, never failure (AD-48). Without this
+        // the `.git` test below reports the folder as tracking nothing, which
+        // tells the user their file is not tracked when their drive is merely
+        // out.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        // Before the disk, because it needs none. A listing deliberately
+        // ignores the mode; a write must not — see
+        // [`ContentRefusal::LfsDisabled`].
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Err(SyncError::Refused(ContentRefusal::LfsDisabled {
+                profile: profile.name.clone(),
+            }));
+        }
+        // A folder with no `.git` has no index, therefore no committed pointer,
+        // therefore nothing to ask for — and creating one is somebody else's
+        // verb, which is the whole reason this does not use `open_repo`.
+        if !profile.local_path.join(".git").exists() {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        }
+        let indexed = {
+            // Removable media is opened with full trust for the reason
+            // `open_repo` states (AD-48); the difference is that this opens what
+            // is there and never makes one.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            lfs::stage::indexed_pointer(&repo, &rela)
+        };
+        let Some(indexed) = indexed else {
+            // A plain tracked file and a path git does not track land here
+            // together, deliberately: neither has a committed pointer.
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        };
+        // The same cone `materialize_landed` applies, so a request cannot reach
+        // content the profile exists to keep away (Story 27.2).
+        if !SparseCone::new(&profile.subpaths).includes(&rela) {
+            return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+
+        let smudge = match lfs::hydrate::plan(&profile.local_path, &rela, &indexed)
+            .map_err(SyncError::Refused)?
+        {
+            Plan::AlreadyHeld => {
+                // The content is here, and this is also the only verb that can
+                // notice its index entry still describing the pointer — after a
+                // crash between the publish and the re-stat, or after a `git
+                // lfs pull` that keeper never saw. `refresh_index_stat` writes
+                // only when an entry's stat has actually gone stale, so for an
+                // ordinary already-materialized path this reads the index and
+                // stops. The alternative is a path that reads MODIFIED forever
+                // and cannot be repaired by asking for it again.
+                {
+                    let repo = git::repo::open(&profile.local_path, profile.removable)?;
+                    git::repo::refresh_index_stat(&repo, std::slice::from_ref(&rela))?;
+                }
+                return Ok(Materialization {
+                    path,
+                    oid: indexed.oid,
+                    size_bytes: indexed.size,
+                    outcome: MaterializeOutcome::AlreadyMaterialized,
+                    unit_id: None,
+                });
+            }
+            Plan::Publish(smudge) => smudge,
+        };
+
+        // Not `ensure_layout`: this reads the store to decide, and a verb that
+        // created the store's directory tree on the way to refusing would be
+        // writing to answer a question.
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        if !store.contains(&indexed.oid, indexed.size) {
+            // The object is not here. The journal is the queue, and
+            // `enqueue_unique` returns whatever unit already covers this work —
+            // so a repeat request is one row and one download, and a request for
+            // an object already in flight is covered by
+            // `WorkKind::covered_while_running`.
+            let unit = WorkKind::LfsDownload {
+                oid: indexed.oid.clone(),
+                size: indexed.size,
+            };
+            let now = self.platform.now_ms();
+            let unit_id = self.with_db(|conn| {
+                let unit_id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
+                // The path is carried BESIDE the unit rather than inside it, and
+                // so is the urgency: the payload is what `enqueue_unique`
+                // deduplicates on, so either one folded into it would re-fetch
+                // bytes this machine is already getting (`db::promote_unit`).
+                db::label_unit(conn, unit_id, &path)?;
+                // Marks the row and makes it claimable now: the covering row
+                // may be one a backoff or an absent volume deferred, and
+                // urgency on a row `claim_ready` cannot see is worth nothing.
+                db::promote_unit(conn, unit_id, now)?;
+                Ok(unit_id)
+            })?;
+            // The supervisor claims it, not this call: `keeper-syncd` has no
+            // event loop to wait on and draining inline would make urgency
+            // pointless. In this process that collapses the wait to the next
+            // tick; from the CLI, whose engine is its own, the running daemon
+            // picks the row up on its own next pass instead.
+            self.wake_now(&profile.id);
+            tracing::info!(
+                profile = profile.name,
+                path = path,
+                unit = unit_id,
+                "queued a requested LFS download"
+            );
+            return Ok(Materialization {
+                path,
+                oid: indexed.oid,
+                size_bytes: indexed.size,
+                outcome: MaterializeOutcome::Queued,
+                unit_id: Some(unit_id),
+            });
+        }
+
+        // One frame of the phase the queued branch already publishes, so a
+        // local copy of a four-gigabyte object is not silent. No new phase, no
+        // new field, no new channel.
+        let mut event = self.progress(&profile, SyncPhase::DownloadingLfs);
+        event.current = Some(path.clone());
+        self.publish(event);
+
+        lfs::stage::materialize(&store, &profile.local_path, &smudge)?;
+        // The one moment this is knowable: content for this path now exists
+        // here, so the next object for it is a replacement rather than an
+        // arrival.
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::remember_materialized(conn, &profile.id, &path, now))?;
+        {
+            // The worktree file just changed size, so its index entry carries
+            // the pointer's stat and status would call it modified. Re-stat that
+            // ONE path — `repair_index_stat` is the whole-repository button and
+            // this is not it. Writing the index through a read-only open is the
+            // existing `repair_stat_invariant` precedent.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            git::repo::refresh_index_stat(&repo, std::slice::from_ref(&smudge.path))?;
+        }
+        tracing::info!(
+            profile = profile.name,
+            path = path,
+            "materialized LFS content on request"
+        );
+        Ok(Materialization {
+            path,
+            oid: indexed.oid,
+            size_bytes: indexed.size,
+            outcome: MaterializeOutcome::Materialized,
+            unit_id: None,
+        })
     }
 
     /// Re-publish anything the server is missing that this machine can still
@@ -13318,6 +13677,388 @@ mod tests {
             0,
             "reading durability must never publish anything"
         );
+    }
+
+    /// Under `PointerOnly`, a REQUESTED download publishes and a background one
+    /// does not (Story 56.3).
+    ///
+    /// The one decision point the story turns on, asserted directly on the
+    /// completion arm because nothing else can see it. `materialize_landed`
+    /// opens with `lfs_mode != Materialize → return Ok(())`, which is right for
+    /// arrival and fatal for a request: `PointerOnly` is the mode in which
+    /// paths are virtual in the first place, so without the flag asking for a
+    /// file under it would fetch the object into the store, return `Ok`, and
+    /// leave the worktree holding pointer text — a green test over an inert
+    /// feature.
+    ///
+    /// Both directions are asserted in one test on purpose: "it publishes" is
+    /// only half the claim, and a flag that published unconditionally would
+    /// pass the first half while silently retiring `PointerOnly` for everybody.
+    #[test]
+    fn a_requested_download_publishes_under_pointer_only_and_a_background_one_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::PointerOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        // A real repository first, before anything writes into `.git`: the
+        // completion arm refreshes the index stat through `open_repo`, and a
+        // `.git` that exists and holds no `HEAD` is the half-made state that
+        // refuses to open. The folder has to be non-empty for adoption to be
+        // the path taken — `open_repo` clones an EMPTY directory, and this
+        // fixture's remote does not resolve — and adoption is `git init` plus a
+        // remote config, never network.
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&p).expect("adopt the fixture folder");
+
+        // The state a download leaves behind: the object in this machine's
+        // store, the worktree still holding the pointer git checked out.
+        let content = vec![9u8; 4_096];
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content.clone()))
+            .expect("seed the object");
+        let pointer = lfs::pointer::Pointer::new(oid.clone(), size);
+        let target = p.local_path.join("clip.mp4");
+        std::fs::write(&target, pointer.render()).expect("check out the pointer");
+
+        // The unit itself, in the journal, because the journal is where the
+        // answer is read from: a literal `true` here would assert the
+        // destination and leave the source — `claim_ready` → `promote_unit` →
+        // `unit_urgency` — untested, which is how a request that arrives while
+        // its download is already running got dropped.
+        let unit = WorkKind::LfsDownload {
+            oid: oid.clone(),
+            size,
+        };
+        let unit_id = engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &unit, 1, 1))
+            .expect("queue the download");
+
+        // Arrival policy, unchanged: `PointerOnly` means "leave what arrives as
+        // pointers", and nobody has asked for this one.
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("a background arrival is not an error");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            pointer.render().into_bytes(),
+            "a background download under `PointerOnly` still leaves the pointer"
+        );
+
+        // The request arrives — and it arrives against a row that is already
+        // being executed, which is the case `covered_while_running` makes
+        // ordinary and a claim-time snapshot cannot see.
+        engine
+            .with_db(|conn| db::promote_unit(conn, unit_id, 2))
+            .expect("promote the row somebody asked for");
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("a requested arrival publishes");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            content,
+            "the path somebody asked for holds the real bytes, which is the \
+             whole point of the verb under the mode that makes paths virtual"
+        );
+
+        // `Disabled` is NOT bypassed: nothing routes the path through the clean
+        // filter there, so real bytes in the worktree would become a new blob
+        // in the next commit.
+        let mut disabled = p.clone();
+        disabled.lfs_mode = LfsMode::Disabled;
+        std::fs::write(&target, pointer.render()).expect("back to the pointer");
+        engine
+            .materialize_landed(&disabled, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("still not an error");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            pointer.render().into_bytes(),
+            "a request cannot turn LFS back on for a folder whose owner turned it off"
+        );
+    }
+
+    /// Every path the requested object sits at is published, not just the one
+    /// whose name the row happens to carry (Story 56.3 review).
+    ///
+    /// Two paths holding identical bytes share one oid, so they share one
+    /// download and one journal row — and `label_unit` is first-writer-wins, so
+    /// the row keeps the name of whichever was asked for first. Publishing only
+    /// the label meant the second request reported a unit id and never
+    /// delivered: under `PointerOnly` the whole-tree sweep is switched off, so
+    /// nothing would ever have repaired it.
+    ///
+    /// The background half is asserted in the same test, because "publish
+    /// everything" would retire `PointerOnly`'s arrival policy for duplicated
+    /// content.
+    #[test]
+    fn a_requested_object_publishes_every_path_it_is_committed_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::PointerOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&p).expect("adopt the fixture folder");
+
+        let content = vec![7u8; 8_192];
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content.clone()))
+            .expect("seed the object");
+        let pointer = lfs::pointer::Pointer::new(oid.clone(), size);
+        // Both paths hold the same pointer text, and both are committed, so the
+        // index records the same oid twice — which is what makes them one unit.
+        for name in ["clip.mp4", "clip-copy.mp4"] {
+            std::fs::write(p.local_path.join(name), pointer.render()).expect("check out");
+        }
+        let repo = git::repo::open(&p.local_path, false).expect("open");
+        let changes = git::commit::StagedChange {
+            added: vec![
+                PathBuf::from("clip.mp4"),
+                PathBuf::from("clip-copy.mp4"),
+                PathBuf::from("keep.txt"),
+            ],
+            ..Default::default()
+        };
+        let signature = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@example.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let provenance = Provenance::new(
+            &p.name,
+            "dev",
+            "01JDEV",
+            "host",
+            crate::provenance::SyncSource::Cli,
+        );
+        git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &provenance,
+            &p,
+            &signature,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit both pointers");
+        drop(repo);
+
+        let unit = WorkKind::LfsDownload {
+            oid: oid.clone(),
+            size,
+        };
+        let unit_id = engine
+            .with_db(|conn| {
+                let id = db::enqueue_unique(conn, &p.id, &unit, 1, 1)?;
+                // The first request names the first path, and the second one
+                // cannot rename it.
+                db::label_unit(conn, id, "clip.mp4")?;
+                db::promote_unit(conn, id, 1)?;
+                Ok(id)
+            })
+            .expect("queue and promote one unit for both paths");
+
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("publish");
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip.mp4")).expect("read"),
+            content,
+            "the labelled path holds its content"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip-copy.mp4")).expect("read"),
+            content,
+            "and so does the path the row could not name — the request was for \
+             this content, and this is where the folder commits it"
+        );
+
+        // The background half: the same fixture, the same object, no promotion.
+        for name in ["clip.mp4", "clip-copy.mp4"] {
+            std::fs::write(p.local_path.join(name), pointer.render()).expect("back to pointers");
+        }
+        let second = engine
+            .with_db(|conn| {
+                let id = db::enqueue(conn, &p.id, &unit, 2, 2)?;
+                db::label_unit(conn, id, "clip.mp4")?;
+                Ok(id)
+            })
+            .expect("queue a background unit");
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(second))
+            .expect("a background arrival is not an error");
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip.mp4")).expect("read"),
+            pointer.render().into_bytes(),
+            "under `PointerOnly` a background arrival still publishes nothing"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip-copy.mp4")).expect("read"),
+            pointer.render().into_bytes(),
+            "and it certainly does not reach for the sibling"
+        );
+    }
+
+    /// Every refusal the door itself produces, on one fixture (Story 56.3
+    /// review).
+    ///
+    /// These were the nine matrix rows nothing exercised: each is a sentence a
+    /// user meets and a branch a refactor can silently invert, and none of them
+    /// needs a committed pointer to reach. Asserted on the refusal's *variant*,
+    /// which is what "a typed error the caller can distinguish" has to mean.
+    #[test]
+    fn the_door_refuses_by_name_before_it_touches_a_worktree() {
+        use lfs::hydrate::ContentRefusal;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let refusal = |subpath: &str| match engine.materialize_entry(&p.id, subpath) {
+            Err(SyncError::Refused(refusal)) => refusal,
+            other => panic!("expected a refusal for {subpath:?}, got {other:?}"),
+        };
+
+        // Containment, both halves of it, and the root itself.
+        assert!(matches!(
+            refusal("../etc/passwd"),
+            ContentRefusal::Escapes(_)
+        ));
+        assert!(matches!(refusal("/etc/passwd"), ContentRefusal::Escapes(_)));
+        assert!(matches!(refusal(""), ContentRefusal::Escapes(_)));
+        // Refused whatever the folder is doing: the containment answer must not
+        // depend on whether a tick happens to hold the reservation, which is
+        // what putting it after `reserve` did.
+        {
+            let _held = engine.reserve(&p.id).expect("hold the reservation");
+            assert!(matches!(
+                refusal("../etc/passwd"),
+                ContentRefusal::Escapes(_)
+            ));
+            assert!(
+                matches!(
+                    engine.materialize_entry(&p.id, "clip.mp4"),
+                    Err(SyncError::Busy(_))
+                ),
+                "and a path that IS askable answers busy while the folder is"
+            );
+        }
+
+        // A folder with no repository in it has no committed pointer, so there
+        // is nothing to ask for — and no `.git` is created by asking.
+        assert!(matches!(
+            refusal("clip.mp4"),
+            ContentRefusal::NotTracked { .. }
+        ));
+        assert!(
+            !p.local_path.join(".git").exists(),
+            "asking must not make a repository"
+        );
+
+        // Paused: keeper is not writing into this working tree at all, and a
+        // queued unit would never be claimed either.
+        let mut paused = p.clone();
+        paused.enabled = false;
+        engine.upsert_profile(&paused).expect("pause");
+        assert!(matches!(refusal("clip.mp4"), ContentRefusal::Paused { .. }));
+        engine.upsert_profile(&p).expect("resume");
+
+        // LFS off for the folder: real bytes here would become a new blob in
+        // the next commit, so it is refused by the mode's own name.
+        let mut disabled = p.clone();
+        disabled.lfs_mode = LfsMode::Disabled;
+        engine.upsert_profile(&disabled).expect("disable lfs");
+        assert!(matches!(
+            refusal("clip.mp4"),
+            ContentRefusal::LfsDisabled { .. }
+        ));
+        engine.upsert_profile(&p).expect("re-enable lfs");
+
+        // Outside the cone this profile exists to keep away — asserted through
+        // a real repository, because the cone is checked after the index, and
+        // in a SUBDIRECTORY, because git's cone matching (and so
+        // `SparseCone::includes`) always keeps the repository root's own files.
+        let mut coned = p.clone();
+        coned.subpaths = vec!["docs".to_owned()];
+        engine.upsert_profile(&coned).expect("cone");
+        std::fs::write(coned.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&coned).expect("adopt");
+        let content = vec![3u8; 2_048];
+        let store = lfs::store::LfsStore::in_git_dir(coned.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content))
+            .expect("seed");
+        let pointer = lfs::pointer::Pointer::new(oid, size);
+        std::fs::create_dir_all(coned.local_path.join("media")).expect("zone");
+        std::fs::write(coned.local_path.join("media/clip.mp4"), pointer.render())
+            .expect("write pointer");
+        let repo = git::repo::open(&coned.local_path, false).expect("open");
+        let changes = git::commit::StagedChange {
+            added: vec![PathBuf::from("media/clip.mp4"), PathBuf::from("keep.txt")],
+            ..Default::default()
+        };
+        let signature = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@example.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let provenance = Provenance::new(
+            &coned.name,
+            "dev",
+            "01JDEV",
+            "host",
+            crate::provenance::SyncSource::Cli,
+        );
+        git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &provenance,
+            &coned,
+            &signature,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit the pointer");
+        drop(repo);
+        assert!(matches!(
+            match engine.materialize_entry(&coned.id, "media/clip.mp4") {
+                Err(SyncError::Refused(refusal)) => refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            },
+            ContentRefusal::OutsideSubpaths { .. }
+        ));
+
+        // A plain tracked file has no pointer, and a path in the index that is
+        // gone from the worktree must not be resurrected.
+        engine.upsert_profile(&p).expect("no cone");
+        assert!(matches!(
+            refusal("keep.txt"),
+            ContentRefusal::NotTracked { .. }
+        ));
+        std::fs::remove_file(p.local_path.join("media/clip.mp4")).expect("delete it locally");
+        assert!(matches!(
+            refusal("media/clip.mp4"),
+            ContentRefusal::Missing { .. }
+        ));
+
+        // An unknown profile is a configuration error, not a refusal: the
+        // caller named something that does not exist.
+        assert!(matches!(
+            engine.materialize_entry("01NOSUCHPROFILE", "clip.mp4"),
+            Err(SyncError::Config(_))
+        ));
     }
 }
 

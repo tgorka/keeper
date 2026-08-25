@@ -834,6 +834,7 @@ keeper-syncd watch                # the daemon entry point
 keeper-syncd pause <id> | resume <id>
 keeper-syncd verify [id]          # re-verify stored content
 keeper-syncd ls-files [id]        # LFS paths: virtual, materialized or absent
+keeper-syncd materialize <id> <path>  # fetch one virtual path's content
 keeper-syncd doctor               # diagnose the environment
 keeper-syncd logs
 ```
@@ -847,6 +848,28 @@ contract. Remote presence is **absent unless you ask**: `--remote` adds the same
 batch round trip `verify --remote` makes, because whether the server holds an
 object cannot be known without asking it, and a listing that implied it did
 would be guessing about the one thing worth being sure of.
+
+`materialize` is the verb that asks for one of those paths by name. If this
+machine already holds the object it is published straight into the worktree and
+the line says `materialized`; if the worktree already had the content the line
+says `already materialized` and nothing is written; if the object is not here
+the transfer is **queued** and the line names the journal unit that will deliver
+it. This command has no event loop and does not wait, so a queued object arrives
+only once `keeper-syncd watch` (or the app) reaches it on a later pass — and not
+at all if no daemon is running. Asking twice returns the same unit rather than
+queueing a second download of the same bytes; a requested unit is claimed ahead
+of background work in the same tick, though never as the *whole* tick, so the
+push that backs up your local edits still runs. Two paths committed with
+identical content share one download, and a request publishes every one of them.
+
+A path whose bytes on disk are neither the committed pointer nor the content it
+names is **refused by name** and left exactly as it is: keeper does not
+overwrite a local modification, and it will not write content back over a file
+you deleted. It also refuses a **paused** folder (keeper writes nothing into
+one), a folder with LFS turned off, a path outside the folder's `subpaths`, and
+a subpath that leaves the folder — including through a symlink. Exit code `1`
+with the reason on stderr; exit `1` too when the folder is busy syncing, so a
+script can tell "you have the file" from "ask again".
 
 Paths follow XDG: `$XDG_CONFIG_HOME/keeper-sync/config.toml`,
 `$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`.

@@ -33,6 +33,7 @@
 //! | [`batch`] | `POST /objects/batch`, the only negotiation step |
 //! | [`basic`] | the `basic` transfer adapter: resumable `GET`, single `PUT` |
 //! | [`listing`] | which LFS paths this clone holds, and which it only names |
+//! | [`hydrate`] | asking for one path's content, and the refusal that protects the bytes there |
 //! | [`virtual_policy`] | which paths' content may stay unmaterialized |
 //!
 //! # The quirks this implementation encodes
@@ -84,6 +85,7 @@ pub mod basic;
 pub mod batch;
 pub mod endpoint;
 pub mod filter;
+pub mod hydrate;
 pub mod listing;
 pub mod local;
 pub mod pktline;

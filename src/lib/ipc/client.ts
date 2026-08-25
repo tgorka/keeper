@@ -3257,6 +3257,35 @@ export async function syncReadText(id: string, subpath: string): Promise<TextFil
 }
 
 /**
+ * Ask for one virtual path's content (FR-338, Story 56.3).
+ *
+ * Takes the profile id and the profile-relative `subpath` this surface was
+ * handed by {@link syncBrowse}, never a path and never one composed here
+ * (AD-65) — Rust re-resolves it through the same containment rule the listing
+ * uses. It is NOT given `FilesEntryVm.absolutePath`.
+ *
+ * **Two things can happen and both resolve.** If this machine already holds
+ * the object, the file on disk becomes the real bytes before this resolves. If
+ * it does not, a transfer is queued and this resolves as soon as it is queued —
+ * the sync daemon delivers it, so watch `sync_subscribe_progress` for
+ * `downloadingLfs` with the path in `current`, and re-read the listing to see
+ * the row turn from virtual to materialized. Nothing is returned, because every
+ * fact a row needs already has a surface.
+ *
+ * **A file the user has edited is refused, never overwritten.** So is a path
+ * that is not a tracked large file, one outside the folder's subpaths, one that
+ * has been deleted, and any path in a folder with large-file support turned
+ * off. Each rejection's message is Rust's own sentence, written to be shown
+ * verbatim.
+ *
+ * Rejects with: `syncUnavailable` (the folder is already syncing — the run in
+ * progress will finish first), `unsupported`, `internal`.
+ */
+export async function syncMaterializeEntry(id: string, subpath: string): Promise<void> {
+  await invoke<void>("sync_materialize_entry", { id, subpath });
+}
+
+/**
  * Write an HTML file's rendered page beside it as a PDF (Story 56, macOS).
  *
  * Same stem, same folder: `deck-v8.html` produces `deck-v8.pdf`, and pressing

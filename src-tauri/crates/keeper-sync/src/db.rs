@@ -303,18 +303,26 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add `label`, the journal's one late column, if it is not there yet.
+/// Add the journal's late columns — `label` and `urgency` — if they are not
+/// there yet.
 ///
 /// A unit's payload says what work to do; the label says what to *call* it
-/// while it is being done. They are separate columns because they have
-/// different identities: [`enqueue_unique`] deduplicates on the payload string,
-/// so folding a display name into it would make two paths that share one object
-/// — the ordinary case for duplicated content — into two downloads of the same
+/// while it is being done, and the urgency says whether anybody is waiting for
+/// it. All three are separate columns because they have different identities:
+/// [`enqueue_unique`] deduplicates on the payload string, so folding either of
+/// the other two into it would make two paths that share one object — the
+/// ordinary case for duplicated content — into two downloads of the same
 /// bytes.
 ///
-/// Nullable, and read as "no better name than the work itself". A row written
-/// before this column existed, or by a code path that has no path to offer,
-/// reads back `NULL` and the UI falls back to the profile name.
+/// Both nullable and both without a `DEFAULT`, which is the honest reading of
+/// a row written before they existed: no better name than the work itself, and
+/// nobody waiting. `ALTER TABLE ... ADD COLUMN` guarded by the column list is
+/// its own idempotence — the rule stated at the top of [`migrate`] — so this
+/// needs no `meta` marker and a second `migrate` adds nothing.
+///
+/// One column at a time rather than [`ensure_materialized_columns`]' typed-pair
+/// loop: two additions do not earn a table, and `PRAGMA table_info`'s statement
+/// must be dropped before any `conn.execute` runs on the same connection.
 fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(journal)")?;
     let existing: Vec<String> = stmt
@@ -323,6 +331,9 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     drop(stmt);
     if !existing.iter().any(|c| c == "label") {
         conn.execute("ALTER TABLE journal ADD COLUMN label TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "urgency") {
+        conn.execute("ALTER TABLE journal ADD COLUMN urgency INTEGER", [])?;
     }
     Ok(())
 }
@@ -341,6 +352,87 @@ pub fn label_unit(conn: &Connection, id: i64, label: &str) -> Result<()> {
         (id, label),
     )?;
     Ok(())
+}
+
+/// Mark a queued unit as something somebody is waiting for, and make it
+/// claimable now (Story 56.3).
+///
+/// Two writes rather than one, because "somebody is waiting" is worth nothing
+/// on a row [`claim_ready`] cannot see. Both are narrow, both are by id, and
+/// both are idempotent.
+///
+/// # Why urgency is not a payload field
+///
+/// This is a **separate narrow UPDATE** on whatever id [`enqueue_unique`]
+/// returned, and that is not a style choice. `enqueue_unique` deduplicates on
+/// the serialized payload, so an urgency field inside
+/// [`WorkKind::LfsDownload`] would make the requested unit a *different* unit
+/// from the background one and fetch the same immutable bytes twice — the
+/// defect [`WorkKind::covered_while_running`] records with its own measurement
+/// (106 queued units for 95 distinct objects). The urgency belongs to the row
+/// that will deliver the work, and that row is the covering one.
+///
+/// [`recover_running`] is the second reason it has to live there rather than on
+/// a duplicate: its `MIN(id)` collapse deletes every pending row but the oldest
+/// for a payload, so an urgency written onto a row that was going to be
+/// collapsed would simply vanish at the next restart.
+///
+/// # `MAX`, where `label_unit` is first-writer-wins
+///
+/// The tie-break is inverted on purpose. A label must not flicker — with
+/// several paths sharing one object any of their names is truthful, so the
+/// first one wins. A request must be able to raise a row a background scan
+/// queued minutes ago, and must never be able to lower one another request
+/// raised, so it takes the maximum. `COALESCE` because the column is nullable
+/// for every row written before it existed.
+///
+/// # Why it also lifts a deferral and a backoff
+///
+/// `enqueue_unique` counts `deferred` as cover, and [`claim_ready`] only ever
+/// offers `state = 'pending'`. A request that deduplicated onto a deferred row
+/// — an `LfsDownload` whose removable remote was absent, say — would otherwise
+/// report a unit id for work nothing will claim until an unrelated resume or
+/// volume re-attach happens to run [`undefer_profile`]. The same holds for a
+/// pending row whose `not_before_ms` is a retry backoff in the future. So a
+/// promotion returns the row to `pending` and brings its earliest attempt
+/// forward to now: the person asking is a reason to try again immediately, and
+/// `attempts` is deliberately left alone so a second failure backs off exactly
+/// as far as it would have.
+pub fn promote_unit(conn: &Connection, id: i64, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET urgency = MAX(COALESCE(urgency, 0), ?2) WHERE id = ?1",
+        (id, Urgency::Requested.level()),
+    )?;
+    conn.execute(
+        "UPDATE journal
+            SET state = 'pending', not_before_ms = MIN(not_before_ms, ?2)
+          WHERE id = ?1 AND state IN ('pending', 'deferred')",
+        (id, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Whether anybody is waiting for one unit, read at the moment the answer
+/// matters (Story 56.3).
+///
+/// The journal is the memory, and this is what makes that claim true rather
+/// than decorative: the level is read when the completion arm decides what to
+/// publish, not copied out of the row when the unit was claimed. A request that
+/// arrives while its covering download is already `running` — which
+/// [`WorkKind::covered_while_running`] makes the ordinary case — raises the
+/// urgency of a row the supervisor read minutes ago, and a snapshot taken at
+/// claim time would drop that request on the floor.
+///
+/// A row that is gone reads [`Urgency::Background`]: the only way to be asked
+/// about a deleted row is a completion arm running after [`complete`], and the
+/// conservative answer there is the arrival policy the profile configured.
+pub fn unit_urgency(conn: &Connection, id: i64) -> Result<Urgency> {
+    let level: Option<Option<i64>> = conn
+        .query_row("SELECT urgency FROM journal WHERE id = ?1", [id], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()?;
+    Ok(Urgency::from_level(level.flatten().unwrap_or(0)))
 }
 
 /// Every download this profile is still waiting for: its name, object and size.
@@ -847,6 +939,66 @@ impl WorkState {
     }
 }
 
+/// Whether anybody is waiting for a queued unit (Story 56.3).
+///
+/// Two levels and no more. The question a claim has to answer is "did a human
+/// ask for this, or did a scan find it", and a numeric priority space would
+/// invite a third answer nobody can define — the journal has no notion of how
+/// *much* somebody wants a file.
+///
+/// # It is a column, not a second queue
+///
+/// [`claim_ready`] is one statement over `state = 'pending' AND not_before_ms
+/// <= now`; urgency prepends one term to its `ORDER BY` and changes nothing
+/// else. A separate "urgent" table would duplicate the claim, and a
+/// `not_before_ms = 0` trick would lie about scheduling and still lose to an
+/// older background row. One nullable integer keeps FIFO order within a level,
+/// keeps `CLAIM_LIMIT` per profile per tick, and keeps the batch bounded: a
+/// requested unit takes a slot, it does not take the tick, so nothing is
+/// starved.
+///
+/// # It is not part of the payload
+///
+/// See [`raise_urgency`] — putting it in the payload would change
+/// [`enqueue_unique`]'s dedup key and re-download bytes this machine is already
+/// fetching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    /// A scan found this work. The level a row written before the column
+    /// existed reads back as, which is why it is the default.
+    #[default]
+    Background,
+    /// A person asked for this path by name, so it is claimed ahead of
+    /// background work in the same tick and published even under
+    /// [`crate::profile::LfsMode::PointerOnly`].
+    Requested,
+}
+
+impl Urgency {
+    /// The stored integer. Ordered, because the whole point is that
+    /// `COALESCE(urgency, 0) DESC` sorts by it and `MAX` raises by it.
+    pub fn level(self) -> i64 {
+        match self {
+            Self::Background => 0,
+            Self::Requested => 1,
+        }
+    }
+
+    /// The level a stored integer names.
+    ///
+    /// Saturating rather than exact: `NULL` arrives here as `0` from the
+    /// caller's `unwrap_or`, and anything a future release writes above
+    /// `Requested` still reads as "somebody is waiting" rather than as an error
+    /// that would park an otherwise perfectly good row.
+    pub fn from_level(level: i64) -> Self {
+        if level >= Self::Requested.level() {
+            Self::Requested
+        } else {
+            Self::Background
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkItem {
     pub id: i64,
@@ -867,6 +1019,12 @@ pub struct WorkItem {
     /// (a push carries many), and the line then says the profile's name alone,
     /// exactly as it did before this column existed.
     pub label: Option<String>,
+    /// Whether anybody is waiting for this unit.
+    ///
+    /// Read from the row rather than remembered anywhere else, so it is the
+    /// *journal* that remembers a human asked — which is what makes the fact
+    /// survive a restart, a `recover_running` and a re-drive.
+    pub urgency: Urgency,
 }
 
 /// Record a unit of work before attempting it.
@@ -909,15 +1067,22 @@ pub fn enqueue_unique(
     // `running` counts as cover only for work whose identity is its content —
     // see [`WorkKind::covered_while_running`] for the asymmetry and what
     // ignoring it cost.
+    //
+    // `ORDER BY id`, so "the covering row" is a defined row and not whichever
+    // one the query planner reached first. It matters for the two writes a
+    // caller makes onto the returned id: [`recover_running`]'s duplicate
+    // collapse keeps `MIN(id)`, so a label or an urgency written onto the
+    // higher of a legacy duplicate pair would be thrown away at the next
+    // restart.
     let sql = if kind.covered_while_running() {
         "SELECT id FROM journal
           WHERE profile_id = ?1 AND payload = ?2
             AND state IN ('pending','deferred','running')
-          LIMIT 1"
+          ORDER BY id LIMIT 1"
     } else {
         "SELECT id FROM journal
           WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
-          LIMIT 1"
+          ORDER BY id LIMIT 1"
     };
     let existing: Option<i64> = conn
         .query_row(sql, (profile_id, &payload), |r| r.get(0))
@@ -928,32 +1093,75 @@ pub fn enqueue_unique(
     enqueue(conn, profile_id, kind, now_ms, not_before_ms)
 }
 
-/// Claim the ready units for one profile, marking them `running` in the same
-/// statement so two supervisors can never take the same row.
+/// Claim the ready units for one profile, marking them `running` so two
+/// supervisors can never take the same row.
+///
+/// # The order is urgency, then age — and one slot is kept back
+///
+/// `COALESCE(urgency, 0) DESC, id` puts a unit somebody asked for ahead of
+/// every background unit in the same batch, and leaves background work in its
+/// existing FIFO order among itself (Story 56.3). `COALESCE` because the
+/// column is nullable for every row queued before it existed, and `DESC` on a
+/// two-level [`Urgency`] rather than a priority number for the reason that
+/// type gives.
+///
+/// That order alone would starve background work outright, and the first
+/// version of this shipped believing it could not. `limit` is a bound per
+/// *tick*, not per request: ask for sixteen files and every slot in the batch
+/// is a requested download, `drain_journal` runs the batch serially, and the
+/// `Push` that carries a local edit to the server waits for all sixteen
+/// transfers — then for the next batch, for as long as requests keep arriving.
+/// A folder that stops publishing local work while somebody browses media is
+/// unbacked-up data, which outranks any latency a request can lose.
+///
+/// So a full batch is never *entirely* requested work while background work is
+/// waiting: the youngest requested row gives its slot back to the oldest
+/// background row. One slot is enough — `drain_journal` runs every tick, so the
+/// background queue drains at one unit per second in the worst case while
+/// fifteen sixteenths of the batch still serve the person waiting. The batch
+/// size, and therefore `limit`'s meaning, does not change.
 pub fn claim_ready(
     conn: &Connection,
     profile_id: &str,
     now_ms: i64,
     limit: u32,
 ) -> Result<Vec<WorkItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, payload, attempts, last_error, label FROM journal
+    let mut rows = ready_rows(
+        conn,
+        "SELECT id, payload, attempts, last_error, label, urgency FROM journal
          WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
-         ORDER BY id LIMIT ?3",
+         ORDER BY COALESCE(urgency, 0) DESC, id LIMIT ?3",
+        profile_id,
+        now_ms,
+        limit,
     )?;
-    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    })?;
+    // Only when the batch is full AND holds nothing but requested work: with a
+    // spare slot the background row was claimed by the statement above anyway,
+    // and with one row in the batch there is no slot to keep back.
+    let all_requested = rows
+        .iter()
+        .all(|(_, _, _, _, _, urgency)| urgency.unwrap_or(0) > 0);
+    if limit > 1 && rows.len() as u32 == limit && all_requested {
+        let background = ready_rows(
+            conn,
+            "SELECT id, payload, attempts, last_error, label, urgency FROM journal
+             WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+               AND COALESCE(urgency, 0) = 0
+             ORDER BY id LIMIT ?3",
+            profile_id,
+            now_ms,
+            1,
+        )?;
+        if let Some(oldest) = background.into_iter().next() {
+            // The youngest requested row, which is the last one: it keeps its
+            // place in the queue and is claimed on the next tick.
+            rows.pop();
+            rows.push(oldest);
+        }
+    }
 
     let mut claimed = Vec::new();
-    for row in rows {
-        let (id, payload, attempts, last_error, label) = row?;
+    for (id, payload, attempts, last_error, label, urgency) in rows {
         match serde_json::from_str::<WorkKind>(&payload) {
             Ok(kind) => claimed.push(WorkItem {
                 id,
@@ -962,6 +1170,7 @@ pub fn claim_ready(
                 attempts: attempts.max(0).saturating_add(1) as u32,
                 last_error,
                 label,
+                urgency: Urgency::from_level(urgency.unwrap_or(0)),
             }),
             Err(err) => {
                 // An unreadable payload can never succeed; parking it keeps the
@@ -981,6 +1190,42 @@ pub fn claim_ready(
         )?;
     }
     Ok(claimed)
+}
+
+/// One claim query's raw rows, in the order the statement returned them.
+///
+/// Split out because [`claim_ready`] runs the same projection twice — once for
+/// the batch and once for the background row it keeps a slot for — and two
+/// spellings of six column indices is how the two come to disagree.
+type ReadyRow = (
+    i64,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn ready_rows(
+    conn: &Connection,
+    sql: &str,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+) -> Result<Vec<ReadyRow>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(SyncError::from)
 }
 
 /// Clear a unit that completed. This is the only place work leaves the journal.
@@ -1009,6 +1254,14 @@ pub fn reschedule(
 /// Called at startup: a unit left `running` is one whose process died
 /// mid-flight, and it must be re-driven rather than stranded. This single
 /// statement is what turns "crashed" into "repeated".
+///
+/// Neither statement below touches `label` or `urgency`, and that is what makes
+/// a request survive a crash: the row comes back `pending` still carrying the
+/// level [`raise_urgency`] wrote, so the person who asked keeps their place in
+/// the next claim. It is also the second reason urgency must live on the
+/// *covering* row rather than on a duplicate — the `MIN(id)` collapse below
+/// deletes every pending row but the oldest for a payload, so an urgency
+/// written onto a duplicate would be thrown away here.
 pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     let n = conn.execute(
         "UPDATE journal SET state = 'pending', not_before_ms = ?1 WHERE state = 'running'",
@@ -1825,6 +2078,317 @@ mod tests {
         assert!(claim_ready(&c, "p", 999_999, 10).expect("claim").is_empty());
         assert_eq!(undefer_profile(&c, "p", 1_000).expect("undefer"), 1);
         assert_eq!(claim_ready(&c, "p", 1_000, 10).expect("claim").len(), 1);
+    }
+
+    /// AC 3 is a property of ONE statement, so it is asserted on that statement
+    /// (Story 56.3).
+    ///
+    /// Twenty background downloads, then one a person asked for, then one claim
+    /// of `CLAIM_LIMIT`-many rows. The requested unit must be first and the
+    /// background units behind it must still be in id order — that second half
+    /// is what stops "urgency" from quietly becoming "reshuffle the queue", and
+    /// it is the property no clock and no sleeping is needed to see.
+    #[test]
+    fn a_requested_unit_is_claimed_ahead_of_background_work_without_reordering_it() {
+        let c = conn();
+        let background: Vec<i64> = (0..20)
+            .map(|n| {
+                enqueue(
+                    &c,
+                    "p",
+                    &WorkKind::LfsDownload {
+                        oid: format!("{n:064x}"),
+                        size: 10,
+                    },
+                    1,
+                    0,
+                )
+                .expect("queue background work")
+            })
+            .collect();
+        let asked = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 999),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("queue the requested unit");
+        assert!(
+            asked > background[19],
+            "the requested unit is the YOUNGEST row, so id order alone would put \
+             it last: that is the whole test"
+        );
+        promote_unit(&c, asked, 1).expect("promote");
+
+        // 16 is `engine::CLAIM_LIMIT`, spelled here because this crate's db
+        // layer must not depend on the engine's constant to state its own
+        // property.
+        let claimed = claim_ready(&c, "p", 1, 16).expect("claim");
+        assert_eq!(claimed.len(), 16, "the batch is still bounded by the limit");
+        assert_eq!(
+            claimed[0].id, asked,
+            "the unit somebody is waiting for is claimed first"
+        );
+        assert_eq!(claimed[0].urgency, Urgency::Requested);
+        assert_eq!(
+            claimed[1..].iter().map(|item| item.id).collect::<Vec<_>>(),
+            background[..15].to_vec(),
+            "and background work keeps its FIFO order among itself"
+        );
+        assert!(claimed[1..]
+            .iter()
+            .all(|item| item.urgency == Urgency::Background));
+
+        // The rest are still there and claimable: a requested unit took a slot,
+        // not the tick.
+        let rest = claim_ready(&c, "p", 1, 16).expect("second claim");
+        assert_eq!(
+            rest.iter().map(|item| item.id).collect::<Vec<_>>(),
+            background[15..].to_vec()
+        );
+    }
+
+    /// A batch is never entirely requested work while background work waits.
+    ///
+    /// The starvation the first version of the urgency order shipped with, in
+    /// the shape that matters: the `Push` carrying a local edit to the server is
+    /// the oldest row in the queue, and the user then asks for more files than
+    /// one batch holds. Under a pure `urgency DESC, id` order the push waits for
+    /// sixteen transfers, then sixteen more, for as long as requests keep
+    /// arriving — a folder that stops publishing local work while somebody
+    /// browses media. One slot is kept for it, so it runs on the very next tick.
+    #[test]
+    fn a_burst_of_requests_cannot_starve_the_push_that_backs_up_local_work() {
+        let c = conn();
+        let push = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("queue the push first");
+        for n in 0..20 {
+            let id = enqueue(
+                &c,
+                "p",
+                &WorkKind::LfsDownload {
+                    oid: format!("{n:064x}"),
+                    size: 10,
+                },
+                1,
+                0,
+            )
+            .expect("queue a requested download");
+            promote_unit(&c, id, 1).expect("promote");
+        }
+
+        let claimed = claim_ready(&c, "p", 1, 16).expect("claim");
+        assert_eq!(claimed.len(), 16, "the batch is still full");
+        assert_eq!(
+            claimed.iter().filter(|i| i.id == push).count(),
+            1,
+            "the oldest background unit is in the batch although sixteen \
+             requested units could have filled it: {:?}",
+            claimed.iter().map(|i| i.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            claimed[..15]
+                .iter()
+                .filter(|i| i.urgency == Urgency::Requested)
+                .count(),
+            15,
+            "and the other fifteen slots still serve the person waiting, ahead \
+             of the push in execution order"
+        );
+    }
+
+    /// A request may raise a queued row and nothing may lower one.
+    ///
+    /// `MAX` is the inversion of [`label_unit`]'s first-writer-wins, and the
+    /// direction matters: a background scan that re-enqueued the covering row
+    /// must not be able to demote a file a person is sitting and waiting for.
+    #[test]
+    fn urgency_can_be_raised_and_never_lowered() {
+        let c = conn();
+        let id = enqueue(&c, "p", &WorkKind::Pull, 1, 0).expect("enqueue");
+
+        promote_unit(&c, id, 1).expect("promote");
+        // The only writer of a lower level is a fresh row, so this is the shape
+        // that could demote: the same UPDATE with `Background`'s level.
+        c.execute(
+            "UPDATE journal SET urgency = MAX(COALESCE(urgency, 0), ?2) WHERE id = ?1",
+            (id, Urgency::Background.level()),
+        )
+        .expect("try to lower");
+        assert_eq!(
+            claim_ready(&c, "p", 1, 10).expect("claim")[0].urgency,
+            Urgency::Requested,
+            "a later background write must not demote a row somebody asked for"
+        );
+    }
+
+    /// A promotion lifts a deferral and a backoff, or the request is a unit
+    /// nothing will ever claim.
+    ///
+    /// `enqueue_unique` counts a `deferred` row as cover, and `claim_ready` only
+    /// ever offers `pending`. Without this the CLI would print "queued as unit
+    /// N" for a download whose removable remote was absent an hour ago and wait
+    /// for a resume nobody is going to perform.
+    #[test]
+    fn promoting_a_deferred_or_backed_off_unit_makes_it_claimable_now() {
+        let c = conn();
+        let deferred = enqueue(&c, "p", &WorkKind::Pull, 1, 0).expect("enqueue");
+        // Claimed and then deferred, which is the state an absent volume leaves
+        // behind — and it is the shape that makes the attempt assertion below
+        // mean something, because the claim is what spends an attempt.
+        claim_ready(&c, "p", 1, 10).expect("first attempt");
+        reschedule(
+            &c,
+            deferred,
+            WorkState::Deferred,
+            9_000,
+            Some("media absent"),
+        )
+        .expect("defer it, as an absent volume does");
+        assert!(
+            claim_ready(&c, "p", 1_000, 10).expect("claim").is_empty(),
+            "a deferred row is not claimable, which is the premise"
+        );
+
+        promote_unit(&c, deferred, 1_000).expect("promote");
+        let claimed = claim_ready(&c, "p", 1_000, 10).expect("claim after the promotion");
+        assert_eq!(claimed.len(), 1, "the person asking is a reason to try now");
+        assert_eq!(claimed[0].id, deferred);
+        assert_eq!(claimed[0].urgency, Urgency::Requested);
+        assert_eq!(
+            claimed[0].attempts, 2,
+            "the promotion neither spends nor refunds an attempt, so a second \
+             failure backs off exactly as far as it would have"
+        );
+    }
+
+    /// The journal is what remembers a human asked, so a crash must not forget
+    /// it.
+    #[test]
+    fn urgency_survives_a_restart() {
+        let c = conn();
+        let id = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 7),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("enqueue");
+        promote_unit(&c, id, 1).expect("promote");
+        claim_ready(&c, "p", 1, 10).expect("claim it, then die");
+
+        assert_eq!(recover_running(&c, 200).expect("recover"), 1);
+        let again = claim_ready(&c, "p", 200, 10).expect("re-claim");
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].urgency,
+            Urgency::Requested,
+            "the row is pending again and still requested"
+        );
+    }
+
+    /// The urgency a completion arm acts on is read from the row, not from a
+    /// snapshot taken when the row was claimed.
+    ///
+    /// The sequence that made this necessary: a background download is already
+    /// `running` when the person asks for its path.
+    /// `WorkKind::covered_while_running` makes that running row the covering
+    /// unit, so `promote_unit` writes onto a row the supervisor read minutes
+    /// ago. [`unit_urgency`] is what lets the completion arm see it.
+    #[test]
+    fn a_running_units_urgency_is_still_readable_after_it_was_claimed() {
+        let c = conn();
+        let id = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 11),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("enqueue");
+        let claimed = claim_ready(&c, "p", 1, 10).expect("claim");
+        assert_eq!(claimed[0].urgency, Urgency::Background);
+        assert_eq!(
+            unit_urgency(&c, id).expect("read"),
+            Urgency::Background,
+            "nobody has asked yet"
+        );
+
+        // The request arrives mid-transfer and deduplicates onto the running
+        // row, exactly as `enqueue_unique` promises.
+        promote_unit(&c, id, 2).expect("promote the running row");
+        assert_eq!(
+            unit_urgency(&c, id).expect("read"),
+            Urgency::Requested,
+            "the row the transfer is running for now says somebody is waiting"
+        );
+        complete(&c, id).expect("complete");
+        assert_eq!(
+            unit_urgency(&c, id).expect("read a row that is gone"),
+            Urgency::Background,
+            "a deleted row falls back to the profile's own arrival policy"
+        );
+    }
+
+    /// A `journal` planted at the pre-56.3 DDL upgrades in place, and its rows
+    /// still claim.
+    ///
+    /// The failure mode this guards is a daemon that cannot start: `claim_ready`
+    /// now names `urgency` in its projection, so an install whose table predates
+    /// the column would raise `no such column` on every tick. `ALTER TABLE ...
+    /// ADD COLUMN` guarded by the column list is its own idempotence, which is
+    /// why this needs no `meta` marker — asserted rather than trusted, twice,
+    /// because the second `migrate` is what every launch performs.
+    #[test]
+    fn a_journal_predating_the_urgency_column_upgrades_in_place() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE journal (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 profile_id  TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 payload     TEXT NOT NULL,
+                 state       TEXT NOT NULL,
+                 attempts    INTEGER NOT NULL DEFAULT 0,
+                 not_before_ms INTEGER NOT NULL DEFAULT 0,
+                 created_ms  INTEGER NOT NULL,
+                 last_error  TEXT,
+                 label       TEXT
+             );
+             INSERT INTO journal
+                 (profile_id, kind, payload, state, not_before_ms, created_ms, label)
+             VALUES ('p', 'pull', '{\"kind\":\"pull\"}', 'pending', 0, 1, 'old');",
+        )
+        .expect("plant the pre-56.3 schema");
+
+        migrate(&c).expect("migrate an existing install");
+        let claimed = claim_ready(&c, "p", 1, 10).expect("the old row still claims");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].label.as_deref(), Some("old"));
+        assert_eq!(
+            claimed[0].urgency,
+            Urgency::Background,
+            "NULL is the honest reading of a row queued before anybody could ask"
+        );
+
+        migrate(&c).expect("migrating twice changes nothing");
+        recover_running(&c, 2).expect("put it back");
+        assert_eq!(
+            claim_ready(&c, "p", 2, 10)
+                .expect("claim after a second migrate")
+                .len(),
+            1
+        );
     }
 
     #[test]

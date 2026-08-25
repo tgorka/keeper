@@ -183,6 +183,23 @@ pub enum SyncError {
     #[error("invalid sync configuration: {0}")]
     Config(String),
 
+    /// keeper will not change the bytes at one path, and the refusal says why
+    /// (Story 56.3, FR-338).
+    ///
+    /// The one variant that carries a *typed* refusal rather than a string,
+    /// because two exhaustive matches have to classify it —
+    /// `keeper-syncd::sync_exit_code` and `keeper::sync_ipc::sync_ipc_error` —
+    /// and 56.4 adds four more refusals to the same vocabulary. Growing
+    /// [`crate::lfs::hydrate::ContentRefusal`] therefore costs no churn in
+    /// either match, where five more `SyncError` variants would have cost it
+    /// twice each.
+    ///
+    /// The message is the refusal's own sentence, unchanged: it is written for
+    /// the person who asked, and a prefix worded here would be a second voice
+    /// in front of it.
+    #[error("{0}")]
+    Refused(crate::lfs::hydrate::ContentRefusal),
+
     /// A sync for this folder is already running.
     ///
     /// Not a misconfiguration and not a failure: a scheduled run and a "Sync
@@ -244,6 +261,11 @@ impl SyncError {
             Self::Git(_) | Self::Io { .. } | Self::RemoteMoved { .. } => Retriability::Transient,
             // Nothing to retry: the run that holds the folder is doing this work.
             Self::Busy(_) | Self::Cancelled => Retriability::Permanent,
+            // A refusal is an ANSWER, not a fault: the request named a path
+            // whose bytes keeper will not change, and asking again unchanged
+            // gets the same answer. A retry could only succeed by overwriting
+            // the very thing the refusal protects.
+            Self::Refused(_) => Retriability::Permanent,
         }
     }
 
@@ -253,6 +275,13 @@ impl SyncError {
     /// an inline action. Deliberately narrow: the product promise (FR-89) is
     /// that convergence never waits on a prompt, so only conditions no policy
     /// can decide are allowed to return `true`.
+    ///
+    /// [`Self::Refused`] is deliberately absent. It answers ONE request about
+    /// ONE path and says nothing about the folder: a user who asked for a file
+    /// they had edited has a working folder that needs nothing done to it, and
+    /// returning `true` would raise the folder-needs-attention surface — an
+    /// amber warning and a notice with an inline action — over a sentence the
+    /// caller has already been shown.
     pub fn needs_user_action(&self) -> bool {
         matches!(
             self,
@@ -287,6 +316,7 @@ impl SyncError {
             Self::Io { .. } => "io",
             Self::Config(_) => "config",
             Self::Busy(_) => "busy",
+            Self::Refused(_) => "refused",
             Self::Cancelled => "cancelled",
         }
     }
@@ -384,6 +414,10 @@ mod tests {
             SyncError::Git(String::new()).code(),
             SyncError::io("read", "/x", std::io::Error::other("x")).code(),
             SyncError::Config(String::new()).code(),
+            SyncError::Refused(crate::lfs::hydrate::ContentRefusal::Missing {
+                path: String::new(),
+            })
+            .code(),
             SyncError::Cancelled.code(),
         ];
         let mut seen = codes.to_vec();
