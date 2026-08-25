@@ -20,10 +20,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use keeper_sync::browse::{self, BrowseListing, EntrySyncStatus, PendingView};
-use keeper_sync::engine::Engine;
+use keeper_sync::browse::{self, BrowseListing, EntrySyncStatus, MaterializedView, PendingView};
+use keeper_sync::engine::{Engine, PendingReason};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::git;
+use keeper_sync::lfs::hydrate::MaterializeOutcome;
 use keeper_sync::lfs::listing::LfsFileState;
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::store::LfsStore;
@@ -147,9 +148,17 @@ fn a_committed_pointer_reports_its_own_size_through_browse_and_through_the_engin
     // --- Through `browse`, which never opens a repository -------------------
     let excludes = ExcludeSet::new(&[]).expect("the builtin corpus compiles");
     let pending = PendingView::Known(BTreeMap::new());
-    let BrowseListing::Listed(dir) =
-        browse::browse(&profile(root), "", &excludes, &pending).expect("no refusal")
-    else {
+    let BrowseListing::Listed(dir) = browse::browse(
+        &profile(root),
+        "",
+        &excludes,
+        &pending,
+        // No path here was ever materialized, so the ledger is empty — and an
+        // empty view is what a caller that never read one hands over too. This
+        // assertion therefore also fixes what the *less specific* answer is.
+        &MaterializedView::none(),
+    )
+    .expect("no refusal") else {
         panic!("expected a listing");
     };
     let rows: Vec<(&str, Option<u64>, Option<&str>, &EntrySyncStatus)> = dir
@@ -281,5 +290,270 @@ fn listing_a_folder_that_is_not_a_repository_yet_creates_nothing() {
         std::fs::read(root.join("already-here.txt")).expect("still there"),
         b"content",
         "nor touched what was in it"
+    );
+}
+
+/// `EntrySyncStatus::Materialized` is reachable from the real engine, and it
+/// is the ledger plus the worktree that decides it (Story 56.7, FR-345).
+///
+/// Constructing a `MaterializedView` by hand in a unit test proves the rung and
+/// says nothing about whether the state a real materialization leaves behind is
+/// the state this rung recognises. So the row is produced the only way a user
+/// can produce one — `Engine::materialize_entry` publishing an object that is
+/// already in the store — and read back through `Engine::materialized_paths`,
+/// the accessor the Files pane actually calls.
+///
+/// The sibling pointer is the half that makes the assertion mean something. The
+/// two files are byte-identical in the index and differ only in what the
+/// worktree holds, so a rung that consulted the ledger without the worktree, or
+/// the worktree without the ledger, would mark them the same.
+#[test]
+fn a_materialized_path_reads_materialized_and_its_untouched_sibling_stays_virtual() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let clip = seed(root);
+
+    // A second committed pointer whose object is also in the store, left alone.
+    // A different fill byte, so its oid cannot collide with the first's.
+    const AWAY_BYTES: u64 = 1024 * 1024;
+    let store = LfsStore::in_git_dir(root.join(".git"));
+    let (oid, size) = store
+        .insert_streaming(std::io::Cursor::new(vec![7u8; AWAY_BYTES as usize]))
+        .expect("insert the sibling's object");
+    let away = Pointer::new(oid, size);
+    std::fs::write(root.join("away.mp4"), away.render()).expect("write the sibling's pointer");
+    commit(
+        &git::repo::open(root, false).expect("open the fixture repository"),
+        &git::commit::StagedChange {
+            added: vec![std::path::PathBuf::from("away.mp4")],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        porcelain(root),
+        "",
+        "the fixture starts clean, so nothing below is measuring a dirty tree"
+    );
+
+    let data = tempfile::tempdir().expect("data dir");
+    let platform = Arc::new(TestPlatform::new(data.path()));
+    let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+        return;
+    };
+    let p = profile(root);
+    engine.upsert_profile(&p).expect("register the profile");
+
+    let done = engine
+        .materialize_entry(&p.id, "clip.mp4")
+        .expect("the object is in the store, so this publishes inline");
+    assert_eq!(done.outcome, MaterializeOutcome::Materialized);
+    assert_eq!(done.oid, clip.oid);
+
+    let ledger = engine
+        .materialized_paths(&p.id)
+        .expect("read the ledger keeper just wrote");
+    assert_eq!(
+        ledger,
+        std::collections::HashSet::from(["clip.mp4".to_owned()]),
+        "the verb recorded exactly the path it published, and nothing else"
+    );
+
+    let excludes = ExcludeSet::new(&[]).expect("the builtin corpus compiles");
+    let pending = PendingView::Known(BTreeMap::new());
+    let BrowseListing::Listed(dir) = browse::browse(
+        &profile(root),
+        "",
+        &excludes,
+        &pending,
+        &MaterializedView::from_paths(ledger),
+    )
+    .expect("no refusal") else {
+        panic!("expected a listing");
+    };
+    let rows: Vec<(&str, Option<u64>, Option<&str>, &EntrySyncStatus)> = dir
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                entry.size_bytes,
+                entry.lfs_oid.as_deref(),
+                &entry.sync,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "a.md",
+                Some(PLAIN_BYTES.len() as u64),
+                None,
+                &EntrySyncStatus::Synced
+            ),
+            (
+                "away.mp4",
+                Some(AWAY_BYTES),
+                Some(away.oid.as_str()),
+                &EntrySyncStatus::Virtual
+            ),
+            (
+                "clip.mp4",
+                Some(CONTENT_BYTES),
+                None,
+                &EntrySyncStatus::Materialized
+            ),
+        ],
+        "the ledger row plus real bytes is materialized; the ledger says nothing \
+         about the sibling, whose bytes are still the pointer, so it is virtual. \
+         The materialized row's number is the worktree's own length and it carries \
+         no oid, which is what says the size did not come from a pointer"
+    );
+
+    // The engine's own listing agrees, from the index rather than from a
+    // `MaterializedView` — the two vocabularies must not diverge over one file.
+    let mut files = engine.lfs_files(&p.id).expect("list the LFS paths");
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        files
+            .iter()
+            .map(|f| (f.path.as_str(), f.state))
+            .collect::<Vec<_>>(),
+        vec![
+            ("away.mp4", LfsFileState::Virtual),
+            ("clip.mp4", LfsFileState::Materialized),
+        ]
+    );
+
+    // `porcelain` is deliberately not re-read here. Publishing four mebibytes
+    // over pointer text lands the file and the index stat in the same second,
+    // and git's racy-clean rule makes that second report ` M` however correct
+    // the refresh was — `tests/materialize_entry.rs` owns that claim and stamps
+    // the index forward to settle it. Repeating it here without the stamp would
+    // be a flake, not a check.
+}
+
+/// `EntrySyncStatus::Materializing` is reachable from the real engine, and the
+/// journal's label lands in the same frame a `BrowseEntry::relative_path` is in
+/// (Story 56.7, FR-345).
+///
+/// The argument the test above makes applies verbatim to the arriving-content
+/// rung: building a `PendingView::Known` by hand proves the rung and says
+/// nothing about whether what `Engine::pending` really emits for a queued
+/// download is what the rung recognises. What no unit test can see is how the
+/// engine spells the answer. `Engine::pending`'s inbound half names a row by its
+/// journal *label*, falling back to `LFS object <oid…>` when there is none — so
+/// the label has to be the profile-relative, `/`-joined path the listing joins
+/// on, or the row sits in the pending map under a key no dirent matches and
+/// every arriving file reads `Synced`. And the reason has to be
+/// `PendingReason::Incoming`, because that is the only one the rung narrows.
+///
+/// The row is produced the only way a user can produce one: `materialize_entry`
+/// over a committed pointer whose object is **not** in the store, which is the
+/// state a clone of somebody else's folder arrives in.
+#[tokio::test]
+async fn a_queued_download_reads_materializing_through_the_engines_own_pending_list() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let pointer = seed(root);
+    // Empty the store and leave the committed pointer on disk, so
+    // `materialize_entry` queues a transfer instead of publishing inline. The
+    // queued row is the whole fixture.
+    let store = LfsStore::in_git_dir(root.join(".git"));
+    std::fs::remove_file(store.object_path(&pointer.oid)).expect("empty the store");
+    assert_eq!(
+        porcelain(root),
+        "",
+        "the fixture starts clean, so nothing below is measuring a dirty tree"
+    );
+
+    let data = tempfile::tempdir().expect("data dir");
+    let platform = Arc::new(TestPlatform::new(data.path()));
+    let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+        return;
+    };
+    let p = profile(root);
+    engine.upsert_profile(&p).expect("register the profile");
+
+    let queued = engine
+        .materialize_entry(&p.id, "clip.mp4")
+        .expect("a queued transfer is an outcome, not a failure");
+    assert_eq!(queued.outcome, MaterializeOutcome::Queued);
+    assert!(
+        queued.unit_id.is_some(),
+        "a queued outcome names the unit it queued"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        pointer.render().into_bytes(),
+        "requesting the transfer wrote no content, so the worktree bytes are \
+         still the pointer the rung probes for"
+    );
+
+    let pending = engine.pending(&p.id).await.expect("the pending list");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|file| (file.path.as_str(), &file.reason))
+            .collect::<Vec<_>>(),
+        vec![(
+            "clip.mp4",
+            &PendingReason::Incoming {
+                size_bytes: CONTENT_BYTES,
+                replacing: false,
+            }
+        )],
+        "the engine names the queued row with the profile-relative, `/`-joined \
+         path a listing joins on — not with the `LFS object …` fallback, and not \
+         with an absolute one"
+    );
+
+    let excludes = ExcludeSet::new(&[]).expect("the builtin corpus compiles");
+    let BrowseListing::Listed(dir) = browse::browse(
+        &profile(root),
+        "",
+        &excludes,
+        &PendingView::from_pending(pending),
+        // The ledger is deliberately empty. `Materializing` is the journal plus
+        // the worktree, and must not need a row keeper has not written yet —
+        // it writes one when the content lands, not when it is asked for.
+        &MaterializedView::none(),
+    )
+    .expect("no refusal") else {
+        panic!("expected a listing");
+    };
+    assert_eq!(
+        dir.entries
+            .iter()
+            .map(|entry| (
+                entry.name.as_str(),
+                entry.size_bytes,
+                entry.lfs_oid.as_deref(),
+                &entry.sync,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "a.md",
+                Some(PLAIN_BYTES.len() as u64),
+                None,
+                &EntrySyncStatus::Synced
+            ),
+            (
+                "clip.mp4",
+                Some(CONTENT_BYTES),
+                Some(pointer.oid.as_str()),
+                &EntrySyncStatus::Materializing
+            ),
+        ],
+        "the arriving row reports the size the pointer names and the oid the \
+         transfer will deliver, so the mark and the number agree about what is \
+         on its way; the plain file beside it does not move"
     );
 }

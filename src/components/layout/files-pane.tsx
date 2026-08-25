@@ -128,6 +128,7 @@ import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel, ITEMS } from "@/lib/count-label";
+import { formatDraftAge } from "@/lib/format-time";
 import type {
   FilesDeletePlanVm,
   FilesEntryVm,
@@ -338,6 +339,31 @@ export const FILES_STATE_DETAIL_TESTID = "files-state-detail";
 /** Test id for a row's size cell (Story 45.5). A slot, so a test reads the
  * rendered figure rather than re-deriving the sentence around it. */
 export const FILES_SIZE_SLOT = "files-entry-size";
+
+/** Test id for a row's modification-time cell (Story 56.7, FR-340). A slot for
+ * the reason the size beside it is one: a test reads the rendered figure, and
+ * "this row has no modification time" stays distinguishable from "some other
+ * row shows that one". */
+export const FILES_MTIME_SLOT = "files-entry-mtime";
+
+/**
+ * How far ahead of this machine's clock a modification time may sit and still be
+ * rendered (Story 56.7).
+ *
+ * `formatDraftAge` clamps anything less than a minute old — including anything
+ * in the FUTURE, deliberately, so a file written a few seconds ahead of the
+ * clock reads "just now" instead of "in 5 min". That clamp is right for the skew
+ * it was written for and wrong for the dates `browse::mtime_ms` faithfully
+ * carries: an SMB or NTFS share, an archive unpacked with forward stamps, or a
+ * machine whose clock is a week out all reach this cell as a real timestamp, and
+ * "just now" about a file dated next year is the one output this cell's own rule
+ * forbids. So the window is exactly the clamp's — a date inside it is
+ * indistinguishable from a fresh write and reads honestly — and anything past it
+ * renders as nothing, for the reason a pre-1970 date does. The number is
+ * restated here rather than imported because `format-time` does not export it;
+ * the two only have to agree about which side of a minute a date falls on.
+ */
+const FILES_MTIME_FUTURE_GRACE_MS = 60_000;
 
 /** Test id for the words behind a configured folder's glyph (Story 45.5). The
  * glyph is the visible form of the same fact; this is the speakable one. */
@@ -571,8 +597,43 @@ const FILES_ROW_GLYPHS_PX = 46;
  * Pixels the row spends after the name and before the actions: the size or count
  * cell at the width a five-character figure takes in the mono face, plus the
  * sync mark and their gaps.
+ *
+ * The modification-time cell is deliberately NOT in here — see
+ * {@link FILES_ROW_MTIME_PX} for the cell that yields instead of being reserved.
  */
 const FILES_ROW_META_PX = 64;
+
+/**
+ * Pixels the modification-time cell costs the row, its own gap included: the
+ * `w-16` the cell is drawn at, plus the row's `gap-1` before it.
+ *
+ * Declared apart from {@link FILES_ROW_META_PX} because this is the one meta
+ * cell that YIELDS. Folding it into that reserve would charge every row at every
+ * width, and two pinned guarantees forbid that: the name never gives up
+ * {@link FILES_NAME_FLOOR_PX}, and a 320px row shows two verbs — the previous
+ * story's headline win, where the slack is 82px against 72px of verbs, so any
+ * usable cell added to the reserve is paid for with a verb.
+ *
+ * So the row spends in a stated order: the name's floor first, then the verbs
+ * that are already one click away, then this date. It is charged only where the
+ * row can pay for it out of slack no verb wants — see
+ * {@link filesRowShowsModified} — and where it cannot, the date is still SPOKEN
+ * and merely unpainted.
+ */
+const FILES_ROW_MTIME_PX = FILES_ROW_GAP_PX + 64;
+
+/**
+ * The most verbs a row has, which is what it must still be able to promote
+ * before it pays for a date.
+ *
+ * The `actions` array's own maximum, and it is written as a number rather than
+ * read off a `.length` because that array is built per row, inside the render,
+ * out of the row's own conditionals: a file that can be revealed takes Open,
+ * Reveal in Finder and Copy path. A verb added there has to be added here too,
+ * and the assertion that the widest row still affords all of them beside the
+ * date is what fails if it is not.
+ */
+const FILES_ROW_MAX_ACTIONS = 3;
 
 /**
  * Pixels the name is never asked to give up, whatever else wants the row.
@@ -628,6 +689,28 @@ export function filesRowActionsBudget({ column, level }: FilesRowBudgetInput): n
       FILES_ROW_GLYPHS_PX -
       FILES_ROW_META_PX -
       FILES_NAME_FLOOR_PX,
+  );
+}
+
+/**
+ * Whether this row PAINTS its modification time, as against only speaking it.
+ *
+ * The date is the row's lowest-priority cell, and the order it comes last in is
+ * {@link FILES_ROW_MTIME_PX}'s: the name's floor, then every verb the row could
+ * promote, then this. So the question is asked of what the row has left over
+ * rather than of the column's width, and it is asked against the FULL verb
+ * count and not against how many this particular row happens to have — a date
+ * that appears on a folder and vanishes on the file beside it is a column that
+ * moves as the eye goes down it.
+ *
+ * A row that cannot afford it renders the cell `sr-only` and keeps its id in
+ * `aria-describedby`, so a narrow row still describes itself with the date it
+ * has no room to draw. Nothing is lost; a fact is unpainted.
+ */
+export function filesRowShowsModified(input: FilesRowBudgetInput): boolean {
+  return (
+    filesRowActionsBudget(input) >=
+    FILES_ROW_MTIME_PX + FILES_ROW_MAX_ACTIONS * (FILES_ROW_ACTION_PX + FILES_ROW_GAP_PX)
   );
 }
 
@@ -741,6 +824,11 @@ export function FilesPane() {
   // what its own doc says it is for — a hook per row would be one timer per row
   // in a virtualised list.
   const longPress = useLongPress();
+  // One reading of the clock for every row's modification time (Story 56.7),
+  // the way `session-tree.tsx:212` takes it. Per-row `Date.now()` would let two
+  // rows in one paint be relative to different instants; an interval would be a
+  // tick this pane deliberately does not own — Story 56.9 adds the one there is.
+  const nowMs = Date.now();
 
   /**
    * The selection model the rest of the pane reads (Story 45.3, FR-175).
@@ -1665,7 +1753,33 @@ export function FilesPane() {
     // two ids, neither of which exists.
     const countId = `files-count-${encodeURIComponent(node.key)}`;
     const sizeId = `files-size-${encodeURIComponent(node.key)}`;
+    const mtimeId = `files-mtime-${encodeURIComponent(node.key)}`;
     const roleId = `files-role-${encodeURIComponent(node.key)}`;
+    // When this file was last written (Story 56.7, FR-340), relative under a day
+    // and an absolute date beyond it — `formatDraftAge`'s split, taken whole so
+    // the Files row and the session tree age a file the same way.
+    //
+    // **THE GUARD IS THE FORMATTED STRING, NOT THE FIELD.** `formatDraftAge`
+    // answers `""` for anything it cannot render honestly — non-finite, zero, or
+    // negative — and `browse::mtime_ms` deliberately carries a pre-1970 mtime as
+    // a negative rather than as an absence, so asking the field would put "" in
+    // an element and name an empty id in `aria-describedby`. A date keeper cannot
+    // render honestly renders as NOTHING, for the reason a directory shows no
+    // size rather than "0 B".
+    //
+    // `!= null` and not `> 0` as the session tree writes it: `SessionEntryVm`
+    // carries a `0` sentinel for "no mtime", `FilesEntryVm.mtimeMs` is
+    // `number | null`, and a `> 0` test here would silently agree with the
+    // sentinel while dropping the negative the string check catches anyway.
+    //
+    // The future is refused HERE and not in the cell, so the painted figure, the
+    // cell's id and the row's description cannot come to disagree about whether
+    // this row has a date — see {@link FILES_MTIME_FUTURE_GRACE_MS} for why
+    // `formatDraftAge`'s own clamp is not enough on its own.
+    const modified =
+      entry?.mtimeMs == null || entry.mtimeMs > nowMs + FILES_MTIME_FUTURE_GRACE_MS
+        ? ""
+        : formatDraftAge(entry.mtimeMs, nowMs);
     // Everything that DESCRIBES the row, in the order a person would say it.
     // Each of these is visible-but-unspeakable on its own: `aria-label` on the
     // row replaces its subtree's contribution to the name, so a size or a
@@ -1676,6 +1790,7 @@ export function FilesPane() {
       [
         node.count === null ? null : countId,
         entry?.size == null ? null : sizeId,
+        modified === "" ? null : mtimeId,
         role === null ? null : roleId,
       ]
         .filter((id) => id !== null)
@@ -1738,6 +1853,11 @@ export function FilesPane() {
               onSelect: () => copyPath(entry.absolutePath),
             },
           ];
+    // Whether the date is drawn, and it is decided BEFORE the verbs are planned
+    // because the pixels it takes are pixels they may not have. `modified` first,
+    // so a row with no date to show is never charged for one.
+    const showsModified =
+      modified !== "" && filesRowShowsModified({ column: treeWidth, level: node.level });
     // How many of them are on the row, as against only in its menu. The note
     // header's own policy, applied to a narrower row: a PREFIX of the list, so a
     // verb is out here only if everything above it is, and the cluster never
@@ -1746,8 +1866,16 @@ export function FilesPane() {
     // Every promoted control is charged its own gap, which over-reserves the last
     // one by 4px — the group is the row's final child, so there is nothing to its
     // right. Four pixels in the name's favour is the safe direction.
+    //
+    // The date's own pixels come off the top when it is drawn, and off nothing
+    // when it is not: `filesRowActionsBudget` reserves the cells every row has,
+    // and this is the one cell a row can decline. Charging it in the reserve
+    // instead would take it from the only flexible child there is — the name —
+    // which is the floor {@link FILES_NAME_FLOOR_PX} exists to hold.
     const promoted = planPriorityActions({
-      available: filesRowActionsBudget({ column: treeWidth, level: node.level }),
+      available:
+        filesRowActionsBudget({ column: treeWidth, level: node.level }) -
+        (showsModified ? FILES_ROW_MTIME_PX : 0),
       reserved: 0,
       widths: actions.map(() => FILES_ROW_ACTION_PX),
       gap: FILES_ROW_GAP_PX,
@@ -1884,6 +2012,36 @@ export function FilesPane() {
             className="shrink-0 font-mono text-muted-foreground text-xs"
           >
             {entry.size.label}
+          </span>
+        )}
+        {/* When this file was last written (Story 56.7, FR-340).
+
+            One line, `shrink-0`, and the session tree's own age classes — the
+            two surfaces show the same fact about the same files, and a second
+            geometry for it is a second thing to keep aligned. No tooltip, for
+            the same reason: `formatDraftAge` is already absolute beyond a day,
+            and `Intl` called here would be a second spelling of a date this
+            codebase converts in one place — a second chance for two surfaces to
+            disagree about one file's mtime. The session tree's age cell has none
+            either.
+
+            `modified !== ""` is the test that DECIDES that there is a date at
+            all, and it is the same one `describedBy` above made, so the cell and
+            its id can never disagree. `showsModified` decides only whether it is
+            PAINTED: the narrow row keeps the same element with the same id and
+            the same slot and hides it from the eye alone, because the row that
+            has no room for a date is still a row that can say what it is. */}
+        {modified !== "" && (
+          <span
+            id={mtimeId}
+            data-slot={FILES_MTIME_SLOT}
+            className={
+              showsModified
+                ? "figures w-16 shrink-0 text-right text-muted-foreground text-xs"
+                : "sr-only"
+            }
+          >
+            {modified}
           </span>
         )}
         {/* Between the name and the actions: what this file's sync state is.

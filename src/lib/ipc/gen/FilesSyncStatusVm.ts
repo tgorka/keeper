@@ -17,9 +17,19 @@
  * behind it, and the two available guesses are "your work is safe" and "keep
  * waiting". Neither is honest.
  *
+ * `virtual`, `materializing` and `materialized` are the states an LFS path
+ * moves between (Story 56.7, FR-345), and the distinction they exist for
+ * is **where the bytes are**, which is orthogonal to whether the file syncs:
+ * all of them are tracked content that a deletion would remove from every
+ * machine. Collapsing them onto `synced` — which is what this enum did before
+ * the story — was true and silent about the one fact that separates a
+ * four-gigabyte recording taking 130 bytes of disk from one taking four
+ * gigabytes, and about whether a person can expect either number to change on
+ * its own.
+ *
  * Deliberately keeper's own vocabulary and not git's. `staged`, `untracked`
  * and `ahead` are answers to a question nobody browsing a folder is asking;
  * the sentence in [`FilesEntrySyncVm::detail`] is where the specific reason
  * goes, composed in Rust like every other sentence this surface renders.
  */
-export type FilesSyncStatusVm = "synced" | "waiting" | "excluded" | "notInRepository" | "unknown";
+export type FilesSyncStatusVm = "synced" | "waiting" | "excluded" | "virtual" | "materializing" | "materialized" | "notInRepository" | "unknown";

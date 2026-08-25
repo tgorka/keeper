@@ -8154,6 +8154,34 @@ impl Engine {
         Ok(out)
     }
 
+    /// Every path this clone has held content for (Story 56.7, FR-345).
+    ///
+    /// The fact [`crate::browse::MaterializedView`] is built from, and the
+    /// reason the Files pane can tell a hydrated LFS path from an ordinary
+    /// file: `browse` opens no repository, so both are just regular files to
+    /// it, and this ledger is what closes the gap.
+    ///
+    /// Synchronous like [`Self::list_profiles`], because it is one indexed
+    /// `SELECT` over a table with a row per materialized path and there is
+    /// nothing here to move off the runtime. Deliberately **not** folded into
+    /// the shell's cached `browse_marks_for` walk alongside [`Self::pending`]:
+    /// that cache exists to stop a repeated tree walk, a statement this cheap
+    /// has no need of it, and caching the answer would let a stale row outlive
+    /// a release — the pane would offer to free space that is already free.
+    ///
+    /// Narrower than [`db::materialized_rows`] on purpose, for the reason
+    /// [`db::materialized_paths`] itself gives: this is one yes-or-no per
+    /// path, which is the whole of what a mark needs and the whole of what it
+    /// should be able to see. A caller that wants the timestamps, the pin or
+    /// the recorded size is asking a listing question and wants
+    /// [`Self::lfs_files`].
+    pub fn materialized_paths(
+        &self,
+        profile_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        self.with_db(|conn| db::materialized_paths(conn, profile_id))
+    }
+
     /// Everything currently wrong with this profile (Story 32.2).
     pub async fn problems(&self, profile_id: &str) -> Result<ProblemReport> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
@@ -13024,6 +13052,10 @@ mod tests {
             "",
             &ExcludeSet::new(&p.excludes).expect("excludes"),
             &view,
+            // The path is untracked, so `classify` answers at the waiting rung
+            // and never reaches the ledger. Saying "no rows" is therefore the
+            // honest input as well as the cheap one.
+            &crate::browse::MaterializedView::none(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");

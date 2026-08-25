@@ -38,6 +38,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   FileSizeVm,
+  FilesEntrySyncVm,
   FilesEntryVm,
   FilesListingVm,
   SessionSpaceFilesVm,
@@ -211,6 +212,40 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
   };
 }
 
+/**
+ * A row whose bytes are not where its size says they are (Story 56.7).
+ *
+ * A sibling rather than two more parameters on {@link browseEntry}, so the rows
+ * above it are untouched. The sentence is typed out here because in the real
+ * product `sync_ipc::sync_mark` composes it and this file is what stands in for
+ * that — a paraphrase would put words on the harness's marks that keeper never
+ * says, and reviewing the wrong words is worse than reviewing none.
+ *
+ * `lfsOid` makes {@link browseEntry}'s statement in reverse: a non-null oid says
+ * `size` is the POINTER's number rather than a `stat`'s, which is exactly the
+ * claim a virtual row makes and a materialized one does not.
+ */
+function lfsEntry(
+  name: string,
+  size: FileSizeVm,
+  sync: FilesEntrySyncVm,
+  lfsOid: string | null,
+): FilesEntryVm {
+  return { ...browseEntry(name, false, size), sync, lfsOid };
+}
+
+/** Verbatim from `sync_ipc::sync_mark`, for the reason {@link lfsEntry} gives. */
+const VIRTUAL_SENTENCE =
+  "This file's content is not stored on this computer — only a placeholder is, so it takes up almost no space. The size shown is the content's.";
+/** The state a `queued_downloads` row puts a pointer in: queued, running or
+ *  deferred, which is why the words are about the QUEUE and not about an
+ *  activity — a deferred download whose removable remote is absent waits
+ *  indefinitely, and "is downloading" would be false about it. */
+const MATERIALIZING_SENTENCE =
+  "keeper has this file's content queued to download to this computer.";
+const MATERIALIZED_SENTENCE =
+  "This file's content is on this computer. keeper may release it again later to free the space, and can fetch it back.";
+
 /** A folder tree with the depth and the awkward names a real drive has. */
 const ENTRIES: FilesEntryVm[] = [
   browseEntry("00-inbox", true, null),
@@ -224,13 +259,40 @@ const ENTRIES: FilesEntryVm[] = [
   browseEntry("README.md", false, { bytes: 3_380, label: "3.4 kB" }),
   browseEntry("deck-v10-complete.pdf", false, { bytes: 8_400_000, label: "8.4 MB" }),
   browseEntry("screen-0000.mov", false, { bytes: 412_000_000, label: "412 MB" }),
+  // The states Story 56.7 made visible, side by side and all large, so the
+  // harness shows what the pane's whole point is: rows claiming the same four
+  // gigabytes, two of which are 130 bytes of placeholder on this disk. The
+  // middle one is here because it is the only state that takes the mark's
+  // `role="progressbar"` branch, its own arrow glyph and a non-recessive tone —
+  // a state nothing can show is a state nobody reviews.
+  lfsEntry(
+    "master-2026-04.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "virtual", detail: VIRTUAL_SENTENCE },
+    "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+  ),
+  lfsEntry(
+    "master-2026-05.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materializing", detail: MATERIALIZING_SENTENCE },
+    // Still a pointer on disk, which is what `browse::classify` requires before
+    // it will call a queued download this content arriving — so `size` is the
+    // pointer's number here exactly as it is for the virtual row above.
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  ),
+  lfsEntry(
+    "master-2026-06.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+  ),
 ];
 
 /**
  * What one folder inside the root holds.
  *
  * One and not six: an expansion has to show something other than the root's own
- * eleven rows again, and beyond that this is a viewing aid rather than a disk.
+ * rows again, and beyond that this is a viewing aid rather than a disk.
  * Every other folder answers `listed` with nothing in it, which is a state the
  * pane draws a sentence for and is worth seeing too.
  */
@@ -1664,7 +1726,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return { rev: "rev-mock", text: `# ${title}\n${rest}` };
   },
   // The tree asks this once per folder it opens, so a table would answer the
-  // root's eleven rows for every expansion and the tree would repeat itself
+  // root's own rows for every expansion and the tree would repeat itself
   // down the pane. `state`, `detail` and `write` are the listing's own fields
   // and not the entries' — the folder that cannot be written into is a
   // different fact from the file that cannot be.

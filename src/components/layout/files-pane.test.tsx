@@ -45,6 +45,7 @@ import {
   FILES_CREATE_LABEL,
   FILES_DELETE_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
+  FILES_MTIME_SLOT,
   FILES_NAME_FLOOR_PX,
   FILES_NAME_LABEL,
   FILES_NEW_FILE_LABEL,
@@ -69,6 +70,7 @@ import {
   FilesPane,
   filesRowActionsBudget,
   filesRowIndent,
+  filesRowShowsModified,
   filesSelectionSentence,
 } from "@/components/layout/files-pane";
 import {
@@ -91,6 +93,7 @@ import {
   SURFACE_COLUMNS,
 } from "@/lib/column-widths";
 import { formatFileSize } from "@/lib/file-size";
+import { formatDraftAge } from "@/lib/format-time";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { COLUMN_FOLD_COOKIE, resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import {
@@ -176,13 +179,31 @@ function profile(p: Partial<SyncProfileVm> & Pick<SyncProfileVm, "id" | "name">)
   } as SyncProfileVm;
 }
 
+/** The instant every fixture row was last written, unless it says otherwise.
+ *
+ * Fixed, and well over a day before any clock this suite will run under, so the
+ * date a row renders is `formatDraftAge`'s absolute-date branch and does not
+ * change between one run and the next. */
+const FIXTURE_MTIME_MS = 1_700_000_000_000;
+
 /** A synced entry — the state a row is in when nothing is wrong with it, so
  * every test that is not about the mark keeps reading as before.
  *
  * `extra` carries the fields a story added that most tests do not care about
  * (Story 45.5's `size` and `folderRole`), defaulted to the absences Rust sends
- * for an ordinary file: no size known, no configured role. A test that is about
- * one of them says so and overrides it. */
+ * for an ordinary file: no size known, no configured role.
+ *
+ * **Every field is set and there is NO cast**, which is the change Story 56.7
+ * had to make before it could see its own defect. `as FilesEntryVm` let this
+ * fixture omit `lfsOid` and `mtimeMs` — on the wire since 56.2 — so the pane
+ * read `undefined`, `== null` answered true, and every row-geometry test in this
+ * file rendered a row with no modification-time cell in it: the story's own
+ * addition was unreachable from the suite that was supposed to cover it. The
+ * annotation is the gate `dev/mock-shell.ts` argues for in its own fixture ("a
+ * gate rather than a comment"), and the next field Rust adds now fails here
+ * instead of being quietly absent from every row this file draws.
+ *
+ * The mtime is a fixed instant so a row's date does not move with the clock. */
 function entry(
   name: string,
   kind: FilesEntryVm["kind"],
@@ -198,6 +219,8 @@ function entry(
     kind,
     sync,
     size: null,
+    lfsOid: null,
+    mtimeMs: FIXTURE_MTIME_MS,
     folderRole: null,
     // Story 45.3's location verdict. The default is the ordinary case for the
     // fixtures in this file — a file inside a vault keeper may write — because
@@ -205,7 +228,7 @@ function entry(
     // The tests that ARE about it use `readOnly` below.
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
     ...extra,
-  } as FilesEntryVm;
+  };
 }
 
 /** An entry whose size is what Rust would actually have sent for `bytes`.
@@ -1062,6 +1085,59 @@ describe("FilesPane — a row's verbs against the column's width", () => {
     ]);
   });
 
+  /**
+   * The date is the row's lowest-priority cell, and NO width trades a verb for
+   * it (Story 56.7).
+   *
+   * The cell is 64px of `w-16` plus the row's 4px gap, and the row cannot simply
+   * reserve that: two pinned guarantees sit either side of it. The name never
+   * gives up {@link FILES_NAME_FLOOR_PX} — the owner's 360px report — and a
+   * 320px row shows two verbs, which is the previous story's headline win with
+   * 82px of slack against 72px of verbs. Reserving the cell would spend that
+   * slack, so the cell yields instead: it appears only where the row can pay for
+   * it AND every verb it could promote.
+   *
+   * Those are the widths pinned here. 480 is the first of the sampled ones where
+   * it fits, and the assertion under it is the one that matters — after the
+   * charge, all three verbs are still affordable, so no column ever shows fewer
+   * verbs than it did before this cell existed.
+   */
+  it("paints a row's date only at a width that owes no verb for it", () => {
+    for (const column of [220, 320, 360]) {
+      expect(filesRowShowsModified({ column, level: FILE_LEVEL })).toBe(false);
+    }
+    expect(filesRowShowsModified({ column: 480, level: FILE_LEVEL })).toBe(true);
+
+    // The budget itself is UNCHANGED by any of this — the figures above are what
+    // it always answered — and what the cell costs comes off the row's own
+    // leftovers instead. 68px of cell out of 242 leaves 174, and three verbs
+    // cost 108.
+    const charged = filesRowActionsBudget({ column: 480, level: FILE_LEVEL }) - 68;
+    expect(charged).toBe(174);
+    expect(charged).toBeGreaterThanOrEqual(3 * (32 + 4));
+  });
+
+  it("keeps a 480px row all three verbs beside the date it draws", async () => {
+    const row = await rowAt(480);
+    expect(verbs(row)).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL, FILES_COPY_PATH_LABEL]);
+    const cell = row.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`);
+    expect(cell).not.toBeNull();
+    expect(cell?.className).not.toContain("sr-only");
+  });
+
+  /** A narrow row still SAYS its date; it only stops drawing it. The fact is
+   *  never lost — same element, same id, same slot, and still named by the row's
+   *  own `aria-describedby`, which is what makes the cell's yielding a layout
+   *  decision rather than a dropped column. */
+  it("speaks a narrow row's date without drawing it, and keeps both its verbs", async () => {
+    const row = await rowAt(320);
+    expect(verbs(row)).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL]);
+    const cell = row.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`);
+    expect(cell?.className).toBe("sr-only");
+    expect(cell?.textContent).not.toBe("");
+    expect(row.getAttribute("aria-describedby")).toContain(cell?.id ?? "");
+  });
+
   it("still reaches every verb through the menu at the narrowest column", async () => {
     const row = await rowAt(220);
     expect(verbs(row)).toEqual([]);
@@ -1246,6 +1322,15 @@ describe("FilesPane — is this file synced", () => {
     "This folder is not a repository yet. The first sync sets one up and takes everything in it.";
   const UNKNOWN_SENTENCE =
     "keeper could not read this folder's sync state: status failed: index is sparse";
+  /** Story 56.7's three, character for character. The em dash is Rust's and so
+   * is the "The size shown is the content's." half — a paraphrase here would
+   * pass while the product said something else. */
+  const VIRTUAL_SENTENCE =
+    "This file's content is not stored on this computer — only a placeholder is, so it takes up almost no space. The size shown is the content's.";
+  const MATERIALIZING_SENTENCE =
+    "keeper has this file's content queued to download to this computer.";
+  const MATERIALIZED_SENTENCE =
+    "This file's content is on this computer. keeper may release it again later to free the space, and can fetch it back.";
 
   function marked(
     name: string,
@@ -1265,6 +1350,9 @@ describe("FilesPane — is this file synced", () => {
         marked("scratch.tmp", "excluded", EXCLUDED_SENTENCE),
         marked("orphan.md", "notInRepository", NO_REPO_SENTENCE),
         marked("puzzling.md", "unknown", UNKNOWN_SENTENCE),
+        marked("clip-2026-04.wav", "virtual", VIRTUAL_SENTENCE),
+        marked("clip-2026-05.wav", "materializing", MATERIALIZING_SENTENCE),
+        marked("clip-2026-06.wav", "materialized", MATERIALIZED_SENTENCE),
       ]),
     );
     render(<FilesPane />);
@@ -1279,17 +1367,49 @@ describe("FilesPane — is this file synced", () => {
     );
   }
 
+  /**
+   * Every row the mixed folder holds, paired with the state it is in.
+   *
+   * One list and not one per test: the assertions below are about the same rows,
+   * and the failure this suite exists to catch is a state that is on the wire
+   * and in nobody's table. `FilesSyncStatusVm`'s own order, so a reader can diff
+   * this against the generated union by eye.
+   */
+  const STATES = [
+    ["clean.md", "synced"],
+    ["fresh.md", "waiting"],
+    ["scratch.tmp", "excluded"],
+    ["clip-2026-04.wav", "virtual"],
+    ["clip-2026-05.wav", "materializing"],
+    ["clip-2026-06.wav", "materialized"],
+    ["orphan.md", "notInRepository"],
+    ["puzzling.md", "unknown"],
+  ] as const;
+
+  /**
+   * The lucide glyph one row's MARK renders, read off the svg inside the mark.
+   *
+   * Deliberately not `glyphOf` further down this file: that one reads the row's
+   * LEADING icon — the file-kind glyph from the viewer registry — which is
+   * identical for every row here, so every assertion below would pass for a
+   * reason that has nothing to do with sync state.
+   *
+   * The class is the only handle a rendered lucide icon has: it takes
+   * `aria-hidden` inside a mark that already carries the name.
+   */
+  function markGlyphOf(rowName: string): string | null {
+    const svg = markOf(rowName).querySelector("svg");
+    return (
+      Array.from(svg?.classList ?? []).find(
+        (className) => className.startsWith("lucide-") && className !== "lucide-react",
+      ) ?? null
+    );
+  }
+
   it("gives each state its own mark, so an excluded file never reads as waiting", async () => {
     await openMixedFolder();
 
-    const states = [
-      ["clean.md", "synced"],
-      ["fresh.md", "waiting"],
-      ["scratch.tmp", "excluded"],
-      ["orphan.md", "notInRepository"],
-      ["puzzling.md", "unknown"],
-    ] as const;
-    for (const [name, status] of states) {
+    for (const [name, status] of STATES) {
       expect(markOf(name)).toHaveAttribute("data-sync-status", status);
     }
 
@@ -1301,6 +1421,47 @@ describe("FilesPane — is this file synced", () => {
     expect(excluded).toHaveAccessibleName(EXCLUDED_SENTENCE);
     expect(waiting).toHaveAccessibleName(WAITING_SENTENCE);
     expect(excluded.innerHTML).not.toEqual(waiting.innerHTML);
+  });
+
+  it("keeps every state a different shape with a different name, colour ignored", async () => {
+    await openMixedFolder();
+
+    // Three axes, three `Set`s, so the failure message names WHICH one
+    // collapsed rather than saying two rows looked alike somehow.
+    const statuses = STATES.map(([name]) => markOf(name).dataset.syncStatus ?? null);
+    const names = STATES.map(([name]) => markOf(name).getAttribute("aria-label"));
+    const glyphs = STATES.map(([name]) => markGlyphOf(name));
+
+    expect(new Set(statuses).size).toBe(STATES.length);
+    expect(new Set(names).size).toBe(STATES.length);
+    // Read off the GLYPH class alone, with every tone class ignored on purpose:
+    // this is the assertion that survives someone simplifying two states onto
+    // one icon and leaning on colour to tell them apart. The recessive tone is
+    // shared by several of these states at once — every settled one — so colour
+    // cannot be what tells any two of them apart.
+    expect(glyphs).not.toContain(null);
+    expect(new Set(glyphs).size).toBe(STATES.length);
+  });
+
+  it("renders materializing as indeterminate and promises nothing", async () => {
+    await openMixedFolder();
+
+    const arriving = markOf("clip-2026-05.wav");
+    // A meter that invents a percentage is worse than one that admits it cannot
+    // say: keeper knows what is QUEUED, not when it lands. So the state is an
+    // indeterminate progress role, and the absence of `aria-valuenow` IS the
+    // indeterminacy — `settings/sync-section.tsx` says the same thing the same
+    // way for a sync with no known total.
+    expect(arriving).toHaveAttribute("role", "progressbar");
+    expect(arriving).not.toHaveAttribute("aria-valuenow");
+    expect(arriving).toHaveAccessibleName(MATERIALIZING_SENTENCE);
+    // The mechanical guard: no digit anywhere in what a screen reader says. A
+    // percentage, a byte count or an ETA would all trip this.
+    expect(arriving.getAttribute("aria-label")).not.toMatch(/\d/);
+
+    // And it is this state that is in flight, not all of them: a settled mark
+    // stays an image, so the branch cannot quietly become the whole component.
+    expect(markOf("clip-2026-04.wav")).toHaveAttribute("role", "img");
   });
 
   it("renders the sentence Rust composed rather than one of its own", async () => {
@@ -1493,6 +1654,18 @@ function sizeOf(name: string): string | null {
 }
 
 /**
+ * The modification time a row shows, or `null` when it shows none (Story 56.7).
+ *
+ * Mirrors {@link sizeOf} exactly, and for the same reason: a row that renders no
+ * date has to be distinguishable from a row whose date some other row is also
+ * showing. `null` here is the assertion that keeper declined to guess.
+ */
+function mtimeOf(name: string): string | null {
+  const row = screen.getByRole("treeitem", { name });
+  return row.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`)?.textContent ?? null;
+}
+
+/**
  * The lucide glyph name a row renders, read off the icon's own class.
  *
  * `lucide-react` emits `class="lucide lucide-<kebab-name>"`, which is the only
@@ -1600,6 +1773,105 @@ describe("FilesPane — what it is and how big", () => {
     expect(cell).not.toBeNull();
     expect(cell?.getAttribute("title")).toBe(`1048576 bytes. ${FILES_SIZE_BASE_NOTE}`);
     expect(FILES_SIZE_BASE_NOTE).toContain("1000");
+  });
+
+  /**
+   * A virtual row shows the CONTENT's size and the worktree's modification
+   * time — never the ~130 bytes of pointer text on this disk (Story 56.7,
+   * FR-336/FR-340).
+   *
+   * `keeper_sync::browse::list_resolved` substitutes the pointer's own number
+   * for a virtual path and sets `lfsOid` to say it did, so the fixture carries
+   * both: a `size` no `stat` of that file could have produced, and the oid that
+   * is the statement it came off the pointer. What this proves about the PANE is
+   * that it renders what it was handed — nothing here re-stats anything, and a
+   * pane that had grown its own `metadata().len()` would print a three-digit
+   * byte count that the regex below refuses.
+   *
+   * The mtime is a fixed instant well over a day old, so the expected string is
+   * `formatDraftAge`'s absolute-date branch and does not move with the clock.
+   */
+  it("shows a virtual row the pointer's size and its modification time", async () => {
+    const FIXED_MTIME = 1_700_000_000_000;
+    await expandVault([
+      entry(
+        "master.wav",
+        "audio",
+        "master.wav",
+        { status: "virtual", detail: null },
+        {
+          size: { bytes: 4_194_304, label: formatFileSize(4_194_304) },
+          lfsOid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+          mtimeMs: FIXED_MTIME,
+        },
+      ),
+    ]);
+
+    expect(sizeOf("master.wav")).toBe(formatFileSize(4_194_304));
+    // The placeholder's own length is around 130 bytes. Any three-digit byte
+    // figure on this row is the pane having asked the filesystem instead of
+    // rendering what Rust sent.
+    const row = screen.getByRole("treeitem", { name: "master.wav" });
+    expect(row.textContent).not.toMatch(/13[0-9]\s*(B|bytes)/);
+    expect(mtimeOf("master.wav")).toBe(formatDraftAge(FIXED_MTIME));
+    expect(mtimeOf("master.wav")).not.toBe("");
+  });
+
+  /**
+   * A modification time keeper cannot render honestly renders as NOTHING.
+   *
+   * Three absences, because they arrive differently and one guard has to catch
+   * all of them. `mtimeMs: null` is an unreadable `stat`. A NEGATIVE `mtimeMs`
+   * is a real value `browse::mtime_ms` deliberately sends for a pre-1970 mtime
+   * rather than dropping it, and `formatDraftAge` answers `""` for it — which is
+   * why the pane's guard is the formatted string and not the field: a
+   * `mtimeMs != null` test alone would render an empty element and name its id in
+   * `aria-describedby`, giving the row a description with no words in it.
+   *
+   * And a FUTURE mtime, which is the one this cell cannot delegate.
+   * `formatDraftAge` clamps anything ahead of the clock to "just now" on
+   * purpose, for skew — so a share whose clock is a week out, or an archive
+   * unpacked with forward stamps, reaches this cell and claims the file was
+   * written moments ago. That is the single output the cell's own rule forbids,
+   * so the pane refuses a date past the grace the clamp itself covers. A date
+   * just inside that grace still renders, which is what keeps this a rejection
+   * of the future and not a rejection of skew.
+   */
+  it("renders no modification time it cannot state, for a null, a pre-1970 or a future one", async () => {
+    const now = Date.now();
+    await expandVault([
+      entry("no-stat.md", "file", "no-stat.md", undefined, { mtimeMs: null }),
+      entry("before-epoch.md", "file", "before-epoch.md", undefined, { mtimeMs: -86_400_000 }),
+      entry("next-year.md", "file", "next-year.md", undefined, {
+        mtimeMs: now + 365 * 86_400_000,
+      }),
+      entry("skewed.md", "file", "skewed.md", undefined, { mtimeMs: now + 5_000 }),
+      entry("ordinary.md", "file", "ordinary.md", undefined, { mtimeMs: FIXTURE_MTIME_MS }),
+    ]);
+
+    expect(mtimeOf("no-stat.md")).toBeNull();
+    expect(mtimeOf("before-epoch.md")).toBeNull();
+    expect(mtimeOf("next-year.md")).toBeNull();
+    // Not a dash and not 1970 either: nothing at all.
+    expect(screen.getByRole("treeitem", { name: "before-epoch.md" }).textContent).not.toMatch(
+      /1970|—|-{1,2}$/,
+    );
+    // And never the one word a clamped future date would have produced.
+    expect(screen.getByRole("treeitem", { name: "next-year.md" }).textContent).not.toContain(
+      "just now",
+    );
+    // A few seconds ahead of the clock is skew, not a claim about the future, and
+    // it renders — the guard refuses dates, not imprecision.
+    expect(mtimeOf("skewed.md")).toBe("just now");
+    // The row beside them does carry one, so the absences are about the
+    // timestamps and not about the cell having gone missing.
+    expect(mtimeOf("ordinary.md")).toBe(formatDraftAge(FIXTURE_MTIME_MS));
+    // And the description a row is given never names an id with no words behind
+    // it, which is the failure the string guard exists to prevent.
+    for (const name of ["no-stat.md", "before-epoch.md", "next-year.md"]) {
+      const ids = screen.getByRole("treeitem", { name }).getAttribute("aria-describedby");
+      expect(ids ?? "").not.toContain("files-mtime-");
+    }
   });
 
   /**
@@ -2168,6 +2440,58 @@ describe("FilesPane — the write path", () => {
     // And every file is named, not merely counted.
     expect(within(dialog).getByText("a.md")).toBeInTheDocument();
     expect(within(dialog).getByText("b.md")).toBeInTheDocument();
+  });
+
+  /**
+   * A deletion over content that lives in LFS says it travels (Story 56.7,
+   * FR-345, AD-134).
+   *
+   * **The COUNTING is asserted in Rust**, by
+   * `keeper_core::vm`'s `a_virtual_or_materialized_deletion_is_told_to_travel`:
+   * `FilesDeletePlanVm::compose`'s `travels` filter is a `matches!` and not an
+   * exhaustive `match`, so a state left out of it lands silently in the "stays on
+   * this machine" bucket. That test is pure and runs on every host, which is
+   * where a classification rule belongs.
+   *
+   * This is the other half, and only the other half: that the sentence Rust
+   * composed reaches the screen unparaphrased over a selection of exactly these
+   * states. A pointer is not a copy of the content, but it IS the content as far
+   * as the repository is concerned, and a person told a deletion is local while
+   * it removes the only copy anything holds has been lied to.
+   */
+  it("says a virtual and a materialized deletion travels, in Rust's words", async () => {
+    const TRAVELS =
+      "These 2 files sync, so deleting them here removes them from every machine that syncs Vault.";
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(
+      listed("01VAULT", "", [
+        entry("placeholder.wav", "audio", "placeholder.wav", {
+          status: "virtual",
+          detail: null,
+        }),
+        entry("fetched.wav", "audio", "fetched.wav", { status: "materialized", detail: null }),
+      ]),
+    );
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    await screen.findByRole("treeitem", { name: "placeholder.wav" });
+    syncDeletePlan.mockResolvedValue({
+      files: ["placeholder.wav", "fetched.wav"],
+      question: "Delete 2 files?",
+      consequence: TRAVELS,
+      recovery: "keeper moves them into the vault's trash rather than erasing them.",
+      refusals: [],
+    });
+
+    await click(screen.getByRole("treeitem", { name: "placeholder.wav" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("treeitem", { name: "fetched.wav" }), { metaKey: true });
+      await Promise.resolve();
+    });
+    await click(screen.getByRole("button", { name: FILES_DELETE_LABEL }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByTestId(FILES_CONFIRM_TESTID)).toHaveTextContent(TRAVELS);
   });
 
   it("removes every file in the multiselection and re-reads the folder they were in", async () => {

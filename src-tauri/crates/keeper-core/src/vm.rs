@@ -3802,6 +3802,16 @@ pub enum FilesListingState {
 /// behind it, and the two available guesses are "your work is safe" and "keep
 /// waiting". Neither is honest.
 ///
+/// `virtual`, `materializing` and `materialized` are the states an LFS path
+/// moves between (Story 56.7, FR-345), and the distinction they exist for
+/// is **where the bytes are**, which is orthogonal to whether the file syncs:
+/// all of them are tracked content that a deletion would remove from every
+/// machine. Collapsing them onto `synced` — which is what this enum did before
+/// the story — was true and silent about the one fact that separates a
+/// four-gigabyte recording taking 130 bytes of disk from one taking four
+/// gigabytes, and about whether a person can expect either number to change on
+/// its own.
+///
 /// Deliberately keeper's own vocabulary and not git's. `staged`, `untracked`
 /// and `ahead` are answers to a question nobody browsing a folder is asking;
 /// the sentence in [`FilesEntrySyncVm::detail`] is where the specific reason
@@ -3820,6 +3830,37 @@ pub enum FilesSyncStatusVm {
     /// *only* so it can say so; keeper's built-in noise corpus is not listed at
     /// all, because nobody chose those patterns and nobody is waiting on them.
     Excluded,
+    /// The content this entry names is not on this computer: the bytes on disk
+    /// are the LFS pointer that stands for it. It syncs, nothing is wrong, and
+    /// the size the row shows is the content's rather than the placeholder's.
+    ///
+    /// The distinction it exists for is against `synced`, which is what this
+    /// state used to be worded as: both are settled, and only one of them
+    /// explains why the folder's contents do not add up to what the disk says.
+    ///
+    /// A claim about **here**, never about the remote. A pointer whose object
+    /// never reached the server is a valid, clean-looking file; `verify
+    /// --remote` is the check that earns the other claim.
+    Virtual,
+    /// The content is on its way to this computer: a download for this path is
+    /// queued and the bytes on disk are still the pointer.
+    ///
+    /// The distinction it exists for is against `waiting`. Both mean the engine
+    /// has work outstanding, and they point in opposite directions: `waiting`
+    /// is about something this machine changed and has not sent, and this is
+    /// something the remote holds and has not arrived. It is the one state on
+    /// this enum whose owner can do nothing at all but wait, so a surface must
+    /// not word it as an action.
+    Materializing,
+    /// The content is on this computer, and keeper may take it away again to
+    /// free the space.
+    ///
+    /// The distinction it exists for is against `virtual`: same tracked path,
+    /// opposite answer to "is the content here", and therefore an opposite
+    /// answer to "will opening this file need the network". Distinct from
+    /// `synced` because an ordinary file's bytes are the user's to keep, where
+    /// these are ones keeper put there and is entitled to release.
+    Materialized,
     /// The folder is not a git repository yet, so nothing in it is going
     /// anywhere until the first sync adopts it.
     NotInRepository,
@@ -4460,6 +4501,17 @@ impl FilesDeletePlanVm {
     /// "this deletion travels", and only one of them is safe to be wrong
     /// about. Silently picking the quiet one would be the same lie
     /// [`FilesSyncStatusVm::Unknown`] was introduced to refuse.
+    ///
+    /// **A virtual, materializing or materialized path travels too** (FR-345,
+    /// AD-134), and each is named in `travels` by hand. The bytes on disk may
+    /// be only the pointer, but that pointer IS the tracked content: deleting
+    /// it commits a deletion the remote learns about and every other machine
+    /// applies. Before Story 56.7 the filter was a non-exhaustive `matches!`
+    /// that did not name them, so each would have fallen into the "stays on
+    /// this machine" bucket with no compile error anywhere, and the
+    /// confirmation would have promised a local deletion while removing
+    /// content only the remote holds — the quiet guess, chosen silently, for
+    /// the reason the paragraph above says is never safe.
     pub fn compose(
         profile_name: &str,
         files: Vec<(String, FilesSyncStatusVm, FilesDeleteDestinationVm)>,
@@ -4477,6 +4529,9 @@ impl FilesDeletePlanVm {
                     status,
                     FilesSyncStatusVm::Synced
                         | FilesSyncStatusVm::Waiting
+                        | FilesSyncStatusVm::Virtual
+                        | FilesSyncStatusVm::Materializing
+                        | FilesSyncStatusVm::Materialized
                         | FilesSyncStatusVm::Unknown
                 )
             })
@@ -7163,6 +7218,29 @@ mod tests {
              syncs Vault."
         );
 
+        // AD-134. All three of these are tracked content whose deletion the
+        // remote learns about, however few bytes of it are on this disk, so
+        // each gets the SAME sentence a plainly synced file gets. They are
+        // deliberately not in the local-only loop below: before Story 56.7
+        // `travels` was a non-exhaustive `matches!`, so a new variant landed in
+        // that bucket with nothing to catch it, and the confirmation would have
+        // promised a local deletion while removing content only the remote
+        // holds.
+        for status in [
+            FilesSyncStatusVm::Virtual,
+            FilesSyncStatusVm::Materializing,
+            FilesSyncStatusVm::Materialized,
+        ] {
+            let away =
+                FilesDeletePlanVm::compose("Vault", vec![note("clip.mp4", status)], Vec::new());
+            assert_eq!(
+                away.consequence,
+                "This file syncs, so deleting it here removes it from every machine that \
+                 syncs Vault.",
+                "{status:?}"
+            );
+        }
+
         // Excluded and not-in-a-repository are both "this stays here", and the
         // sentence must not promise a remote that has never heard of the file.
         for status in [
@@ -7204,6 +7282,65 @@ mod tests {
             "2 of these 3 files sync, so deleting them removes them from every machine \
              that syncs Vault; the other 1 do not and go from this machine only."
         );
+
+        // One path whose bytes are on this machine because keeper put them
+        // there, and one the profile's own patterns will never carry.
+        let away_and_local = FilesDeletePlanVm::compose(
+            "Vault",
+            vec![
+                note("clip.mp4", FilesSyncStatusVm::Materialized),
+                note("scratch.tmp", FilesSyncStatusVm::Excluded),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            away_and_local.consequence,
+            "1 of these 2 files sync, so deleting them removes them from every machine \
+             that syncs Vault; the other 1 do not and go from this machine only."
+        );
+    }
+
+    /// The pinning test AD-134 asks for: every state whose bytes may be a
+    /// pointer is counted as **travelling**, one variant at a time (FR-345).
+    ///
+    /// `FilesDeletePlanVm::compose`'s `travels` filter is a `matches!` and a
+    /// `matches!` is non-exhaustive, so a variant left out of it produces no
+    /// compile error anywhere — it simply falls into `local` and the
+    /// confirmation starts promising that a deletion stays on this machine
+    /// while it removes tracked content the remote holds. Nothing but an
+    /// assertion per variant catches that, which is why each one is named here
+    /// rather than looped over a list some later edit could shorten in the same
+    /// breath as the filter.
+    ///
+    /// Each is paired with one excluded path, because the mixed sentence is the
+    /// one that reports the COUNT: a variant that slipped out of `travels`
+    /// flips it from "1 of these 2" to "None of these 2", which no wording
+    /// change can disguise.
+    #[test]
+    fn a_virtual_or_materialized_deletion_is_told_to_travel() {
+        let expected = "1 of these 2 files sync, so deleting them removes them from every \
+                        machine that syncs Vault; the other 1 do not and go from this \
+                        machine only.";
+
+        for status in [
+            FilesSyncStatusVm::Virtual,
+            FilesSyncStatusVm::Materializing,
+            FilesSyncStatusVm::Materialized,
+        ] {
+            let plan = FilesDeletePlanVm::compose(
+                "Vault",
+                vec![
+                    loose("clip.mp4", status),
+                    loose("scratch.tmp", FilesSyncStatusVm::Excluded),
+                ],
+                Vec::new(),
+            );
+            assert_eq!(
+                plan.consequence, expected,
+                "{status:?} must be counted as travelling; if this reads \"None of \
+                 these 2\", the variant is missing from `travels`"
+            );
+        }
     }
 
     /// An engine that could not answer is counted as syncing and SAYS so.

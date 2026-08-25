@@ -934,9 +934,13 @@ pub fn indexed_pointer_blob(repo: &gix::Repository, rela: &Path) -> Option<(Poin
 ///
 /// It is **not** free, and the caller's ordering is what keeps it small: a file
 /// inside the window is opened and read. So `crate::browse::classify` asks this
-/// question last, of a path whose mark would otherwise be `Synced` and of no
-/// other — because the folders keeper is for are full of small text files, and
-/// a probe run per dirent would be one open per note.
+/// question only on the rungs whose answer it can change — a path the journal
+/// says has content arriving, where pointer text on disk is the whole of what
+/// separates `Materializing` from an ordinary `Waiting`, and a path whose mark
+/// would otherwise be `Synced` — and of no other, because the folders keeper is
+/// for are full of small text files, and a probe run per dirent would be one
+/// open per note. Only one of those branches is reachable per entry, so the
+/// open is still paid at most once however many rungs could ask.
 ///
 /// The read is bounded by the ceiling rather than by the file: `std::fs::read`
 /// loops to EOF, so a file that **grew** past the ceiling between the caller's

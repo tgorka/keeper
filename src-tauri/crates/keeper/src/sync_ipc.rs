@@ -1971,12 +1971,54 @@ pub async fn sync_browse(
     // walk takes minutes still lists its entries now. See `browse_marks_for`.
     let (pending, unavailable) = browse_marks_for(&engine, &id).await;
 
+    // One indexed SELECT, deliberately not part of `browse_marks_for`'s cached
+    // walk (Story 56.7): that cache exists to stop a repeated tree walk, and a
+    // cached materialized set would call a path keeper has already released
+    // materialized — offering to free space that is already free.
+    //
+    // `Engine::pending` is this table's other reader: it consults the same rows
+    // for `PendingReason::Incoming`'s `replacing` flag, and that answer reaches
+    // us through the marks cache above, so it can be up to `BROWSE_MARKS_TTL`
+    // older than this one and the two can disagree about a row inside one
+    // listing. They are deliberately not made one read: sharing the set would
+    // mean serving the mark from whichever copy the cache happened to hold,
+    // which is the stale offer to free already-free space again.
+    //
+    // Skipped outright when the marks walk could not answer, which is the case
+    // `notes_ipc` documents for its own `PendingView::Unavailable`: `classify`
+    // returns `Unknown` before the ledger is ever consulted then, so the read
+    // cannot change a row — and it is an unfiltered scan of everything this
+    // profile has ever hydrated, paid on every folder expansion.
+    //
+    // A read that fails is not a listing failure either. An empty view reads as
+    // `Synced`, which is true and merely less specific, where an empty
+    // `PendingView` would be a lie. That is also why the log is not optional:
+    // the degradation is BY DESIGN invisible on screen, so the `warn` is the
+    // only trace anywhere that a row lost its state.
+    let materialized = if unavailable.is_some() {
+        browse::MaterializedView::none()
+    } else {
+        engine
+            .materialized_paths(&id)
+            .map(browse::MaterializedView::from_paths)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    profile = id,
+                    error = %error,
+                    "files: could not read which paths keeper has materialized"
+                );
+                browse::MaterializedView::none()
+            })
+    };
+
     let listing = {
         let profile = profile.clone();
         let subpath = subpath.clone();
-        tokio::task::spawn_blocking(move || browse::browse(&profile, &subpath, &excludes, &pending))
-            .await
-            .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
+        tokio::task::spawn_blocking(move || {
+            browse::browse(&profile, &subpath, &excludes, &pending, &materialized)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
     }
     .map_err(|refusal| open_failure(refusal.to_string()))?;
 
@@ -2144,26 +2186,40 @@ fn files_listing_vm(
 /// alphabetically. "This folder is untracked" about a folder holding one new
 /// file would be a small, confident lie.
 ///
-/// # Why `Virtual` is routed onto `Synced` here (Story 56.2, and 56.7's debt)
+/// # Where the bytes are, on the wire (Story 56.7, FR-345)
 ///
-/// [`browse::EntrySyncStatus::Virtual`] is a real state — the path's bytes are
-/// the committed LFS pointer and its content lives on the remote — and
-/// [`FilesSyncStatusVm`] deliberately does **not** gain a variant for it in
-/// this story. That is not a shrug; it is chosen for one property.
-/// `FilesDeletePlanVm::compose`'s `travels` filter is a **non-exhaustive**
-/// `matches!` over `Synced | Waiting | Unknown`, so a new wire variant added
-/// without touching it would compile silently into the "stays on this machine"
-/// bucket — and the delete confirmation would start telling people a deletion
-/// is local while it removes tracked content that only the remote holds
-/// (AD-134). Routing onto `Synced` keeps that answer correct with no code in
-/// `compose` at all, while the honest facts still reach the surface: the
-/// sentence below says where the bytes are, `FilesEntryVm::size` carries the
-/// number the pointer names, and `FilesEntryVm::lfs_oid` says why.
+/// [`browse::EntrySyncStatus::Virtual`], `Materializing` and `Materialized`
+/// each reach the surface as a [`FilesSyncStatusVm`] of their own. Story 56.2
+/// routed the one state it had onto `Synced` and said so; the states are real,
+/// a person acts on each of them differently, and this is the arm that names
+/// them.
 ///
-/// Story 56.7 replaces this arm with the three wire states, and it inherits
-/// three obligations from here: give each state a label, a shape and a tone in
-/// all three `Record<FilesSyncStatusVm, …>` maps in `sync-status-mark.tsx`, and
-/// add every new variant to `travels` **explicitly** (FR-345).
+/// **`FilesDeletePlanVm::compose`'s `travels` filter names every one of them
+/// explicitly, and that had to be done by hand.** It is a `matches!` and not
+/// an exhaustive `match`, so a wire variant left out of it is not a compile
+/// error anywhere — it lands silently in the "stays on this machine" bucket,
+/// and the delete confirmation tells someone a deletion is local while it
+/// removes tracked content that only the remote holds (AD-134). A pointer is
+/// not a copy of the content, but it *is* the content as far as the repository
+/// is concerned.
+///
+/// **A variant added after this story inherits the same obligations.** It
+/// needs a label, a shape and a tone in each of the
+/// `Record<FilesSyncStatusVm, …>` maps in
+/// `src/components/layout/sync-status-mark.tsx` — those are total, so the
+/// TypeScript build is the checklist for them — and its own arm in `travels`,
+/// which fails nothing and must be visited deliberately.
+///
+/// **None of the sentences below claims the remote holds anything.** The
+/// evidence is the bytes on this disk and this machine's own journal;
+/// `docs/sync.md` documents the state where a pointer's object never reached
+/// the server, and `verify --remote` is the check that earns the other claim.
+/// The materializing sentence names a queued STATE rather than an activity in
+/// flight, and names no percentage and no finish time, for the same reason the
+/// mark carries no spinner: what keeper has is a journal row, and a row whose
+/// state is `deferred` — waiting on a volume nobody has re-attached — reaches
+/// this mark exactly as a running one does. Keeper knows what is queued, not
+/// whether anything is moving, and not when it lands.
 fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> FilesEntrySyncVm {
     match status {
         browse::EntrySyncStatus::Synced => FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
@@ -2194,18 +2250,36 @@ fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> 
             "A pattern in this folder's sync settings excludes it, so keeper will never \
              copy it.",
         ),
-        // `Synced` on the wire, and a sentence rather than silence — but a
-        // sentence about THIS machine. The evidence is only that the worktree
-        // bytes are the pointer; `docs/sync.md` documents the state where such a
-        // pointer's object never reached the server, so "your content is safe on
-        // the remote" is exactly the claim keeper is not entitled to make for
-        // free. `verify --remote` is the check that earns it. What the sentence
-        // does have to account for is the size, which is the content's rather
-        // than the placeholder's. 56.7 gives this state a mark of its own.
+        // A sentence about THIS machine, for the reason the doc above gives:
+        // the evidence is only that the worktree bytes are the pointer. What
+        // the sentence has to account for beyond the state is the size, which
+        // is the content's rather than the placeholder's.
         browse::EntrySyncStatus::Virtual => FilesEntrySyncVm::explained(
-            FilesSyncStatusVm::Synced,
+            FilesSyncStatusVm::Virtual,
             "This file's content is not stored on this computer — only a placeholder is, \
              so it takes up almost no space. The size shown is the content's.",
+        ),
+        // Words a STATE, not an activity, and that is the whole point:
+        // `db::queued_downloads` takes every `lfsDownload` journal row whose
+        // state is not `parked`, so `deferred` reaches `PendingReason::Incoming`
+        // too — the canonical one being a download whose removable remote was
+        // absent, which waits for a volume re-attach and may wait indefinitely.
+        // "keeper is downloading this" would be a present-progressive claim
+        // about a path nothing is transferring; "has it queued" is true of
+        // queued, running and deferred alike. No duration, no percentage, no
+        // denominator either — see the doc above. The queue is what keeper
+        // knows; a number here would be one it invented.
+        browse::EntrySyncStatus::Materializing => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Materializing,
+            "keeper has this file's content queued to download to this computer.",
+        ),
+        // Says the space is recoverable without promising when, because 56.5's
+        // sweep decides that and this row does not know its answer. "can fetch
+        // it back" is the half that keeps a release from reading as a loss.
+        browse::EntrySyncStatus::Materialized => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Materialized,
+            "This file's content is on this computer. keeper may release it again \
+             later to free the space, and can fetch it back.",
         ),
         browse::EntrySyncStatus::NotInRepository => FilesEntrySyncVm::explained(
             FilesSyncStatusVm::NotInRepository,
@@ -3225,6 +3299,26 @@ pub async fn sync_delete_plan(
         Ok(files) => (browse::PendingView::from_pending(files), None),
         Err(error) => (browse::PendingView::Unavailable, Some(error.to_string())),
     };
+    // The same single SELECT the listing takes, and for the same reason: the
+    // confirmation must word a materialized path exactly as the row it was
+    // opened from does (Story 56.7). A failed read degrades to `Synced`, which
+    // still counts as travelling in `FilesDeletePlanVm::compose`, so it cannot
+    // turn this sentence into the quiet guess.
+    let materialized = engine
+        .materialized_paths(&id)
+        .map(browse::MaterializedView::from_paths)
+        .unwrap_or_else(|error| {
+            // The log is the only trace this degradation leaves. The dialog
+            // goes on to word a truth rather than an error — a less specific
+            // one — so nothing on screen, and nothing in the plan that crosses
+            // the wire, says the state was ever read for.
+            tracing::warn!(
+                profile = id,
+                error = %error,
+                "files: could not read which paths keeper has materialized"
+            );
+            browse::MaterializedView::none()
+        });
 
     let mut files = Vec::new();
     let mut refusals = Vec::new();
@@ -3235,8 +3329,14 @@ pub async fn sync_delete_plan(
                 // so anything that got this far is a file. The old
                 // `DeleteTarget.is_dir` could only ever be `false` here too —
                 // it was a fact carried past the check that made it constant.
-                let status =
-                    browse::status_of(&profile.local_path, &subpath, false, &excludes, &pending);
+                let status = browse::status_of(
+                    &profile.local_path,
+                    &subpath,
+                    false,
+                    &excludes,
+                    &pending,
+                    &materialized,
+                );
                 files.push((
                     subpath,
                     sync_mark(&status, unavailable.as_deref()).status,
