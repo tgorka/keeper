@@ -3447,13 +3447,23 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    const PRESERVED: [&str; 6] = [
+    /// `virtualPatterns` and `virtualOverBytes` (Story 56.1) are here for
+    /// exactly the `regenerable` reason, and AD-132 states it: which paths may
+    /// stay unmaterialized is a fact the repository declares, so its home is the
+    /// committed pattern file and the folder's `.keeper/keeper.toml` tier, which
+    /// both the daemon and this app read. The profile is only the last
+    /// precedence layer. Until a form actually renders these — Story 56.9 — a
+    /// save that cannot express them must leave a daemon-set policy alone, which
+    /// is the DW-116 rule this whole list exists to enforce.
+    const PRESERVED: [&str; 8] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
+        "virtualPatterns",
+        "virtualOverBytes",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -3541,6 +3551,12 @@ mod tests {
         prior.regenerable = vec!["index.md".into()];
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
+        // Story 56.1's virtualization policy. A fresh profile virtualizes
+        // nothing and has no size floor, so both need a value a fresh profile
+        // never has, or the preservation assertion below would pass however
+        // `parse_req` behaved.
+        prior.virtual_patterns = vec!["scans/**".into()];
+        prior.virtual_over_bytes = 32 * 1024 * 1024;
         // Story 41.1's block, set to something a fresh profile never has. It was
         // a PRESERVED field until Story 41.7 gave the form a switch for it; the
         // distinctive value stays, because it is now what makes the EXPRESSED
