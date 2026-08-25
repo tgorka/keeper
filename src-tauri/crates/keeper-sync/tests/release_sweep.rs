@@ -46,7 +46,8 @@ use std::sync::Arc;
 
 use keeper_sync::db;
 use keeper_sync::engine::{
-    release_due_at, Engine, RELEASE_BUDGET_BYTES, RELEASE_BUDGET_OBJECTS, RELEASE_LOOK_EVERY_MS,
+    release_due_at, Engine, ReleaseSchedule, RELEASE_BUDGET_BYTES, RELEASE_BUDGET_OBJECTS,
+    RELEASE_LOOK_EVERY_MS,
 };
 use keeper_sync::git;
 use keeper_sync::lfs::pointer::Pointer;
@@ -1373,4 +1374,85 @@ async fn a_paused_folder_releases_nothing_and_keeps_its_bytes() {
         vec!["clip.mp4".to_owned()],
         "and so is the row that would have gone with them"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What a surface is told
+// ---------------------------------------------------------------------------
+
+/// A surface is handed exactly the instant the sweep would use, and a pin
+/// replaces it with words (Story 56.9, FR-343).
+///
+/// `Engine::release_schedules` is the Files pane's only source of a deadline,
+/// so the claim worth asserting through a real engine, a real repository and a
+/// real ledger is that it agrees with `release_due_at` — the predicate the
+/// sweep filters candidates with — on the very row the sweep would read. A
+/// classifier that re-derived 56.5's clock selection would pass a unit test
+/// over hand-built rows and still show a countdown to an instant nothing
+/// releases anything at.
+///
+/// The pin half is taken through `Engine::pin_entry`, the verb an operator
+/// actually has, rather than a planted column: the whole point of the words is
+/// that they appear on the row a person just pinned.
+///
+/// No sync and no sweep here, deliberately. This is a read, the look-gate has
+/// nothing to do with it, and spending the first look would move the clock the
+/// deadline is measured from.
+#[tokio::test]
+async fn a_surface_is_told_the_instant_the_sweep_would_use_and_a_pin_replaces_it() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    let landed = f.platform.now_ms();
+    f.arrived("clip.mp4", landed);
+
+    let schedules = f
+        .engine
+        .release_schedules(PROFILE_ID)
+        .expect("the profile is registered");
+    let schedule = schedules
+        .get("clip.mp4")
+        .expect("the ledger's own path spelling, the same key `materialized_paths` hands back");
+    assert_eq!(
+        *schedule,
+        ReleaseSchedule::Due {
+            at_ms: landed + TTL_MS as i64
+        },
+        "a TTL after the instant the ledger row names, and not a millisecond else"
+    );
+
+    // The stronger claim: the same instant the sweep itself would compare
+    // against, taken from the same row through the sweep's own predicate.
+    let row = ledger_rows(&f.platform)
+        .into_iter()
+        .find(|row| row.path == "clip.mp4")
+        .expect("the ledger holds the row a surface was just told about");
+    assert_eq!(
+        schedule.releases_after_ms(),
+        release_due_at(&row, TTL_MS),
+        "the pane counts down to the instant the sweep acts on"
+    );
+    assert!(
+        schedule.hold().is_none(),
+        "a row on a clock draws a figure, so it carries no word instead"
+    );
+
+    // Pinned through the verb, and the countdown is gone rather than frozen:
+    // there is no instant left to count down to, and the words say which of the
+    // four reasons this is.
+    f.engine
+        .pin_entry(PROFILE_ID, "clip.mp4", true)
+        .expect("the path is tracked, so the pin is recorded");
+    let pinned = f
+        .engine
+        .release_schedules(PROFILE_ID)
+        .expect("the profile is registered");
+    let pinned = pinned.get("clip.mp4").expect("the row is still there");
+    assert_eq!(*pinned, ReleaseSchedule::Pinned);
+    assert_eq!(
+        pinned.releases_after_ms(),
+        None,
+        "a pinned row has no deadline to draw, at any age"
+    );
+    assert_eq!(pinned.hold(), Some("Pinned"));
 }

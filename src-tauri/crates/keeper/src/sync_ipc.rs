@@ -17,13 +17,14 @@ use std::time::{Duration, Instant};
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
     FilesDeleteRefusalVm, FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState,
-    FilesListingVm, FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
+    FilesListingVm, FilesReleaseVm, FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
 };
 use keeper_sync::browse;
-use keeper_sync::engine::{PendingReason, SyncOutcome};
+use keeper_sync::engine::{PendingReason, ReleaseSchedule, SyncOutcome};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::export::{self, ExportRefusal};
 use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
+use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
     LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
     DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER, DEFAULT_SETTLE_MS,
@@ -2011,6 +2012,35 @@ pub async fn sync_browse(
             })
     };
 
+    // When each materialized path becomes releasable, as one absolute instant
+    // per path (Story 56.9, FR-343). Two statements — the in-force profile and
+    // the ledger — resolved in the engine, because the choice between 56.5's
+    // two clocks needs `materialized.local_origin`, which nothing on the wire
+    // carries and nothing in this crate may re-derive.
+    //
+    // Beside the ledger read above rather than folded into it, and NOT cached,
+    // for the reason that read gives: a stale deadline keeps counting down
+    // after the sweep has already let the content go. Skipped under the same
+    // condition too — a row that answers `Unknown` two rungs earlier is never
+    // `Materialized`, and `FilesEntryVm::new` drops a deadline for every other
+    // state, so the read could not change a row.
+    //
+    // A read that fails costs the rows their countdown and nothing else, so it
+    // degrades to an empty map with a `warn!` — the only trace anywhere, since
+    // a row with no deadline renders exactly as a row that has none.
+    let schedules = if unavailable.is_some() {
+        HashMap::new()
+    } else {
+        engine.release_schedules(&id).unwrap_or_else(|error| {
+            tracing::warn!(
+                profile = id,
+                error = %error,
+                "files: could not read when this folder's content is released"
+            );
+            HashMap::new()
+        })
+    };
+
     let listing = {
         let profile = profile.clone();
         let subpath = subpath.clone();
@@ -2034,6 +2064,7 @@ pub async fn sync_browse(
         listing,
         unavailable.as_deref(),
         &scope,
+        &schedules,
     ))
 }
 
@@ -2054,12 +2085,22 @@ pub async fn sync_browse(
 /// than letting a surface match a name — is why a vault called `Second Brain`
 /// is marked and an ordinary folder called `10-notes` is not. Borrowed for the
 /// whole listing, so a thousand rows resolve against two `&str`.
+///
+/// `schedules` is when each materialized path becomes releasable, keyed by the
+/// ledger's own `/`-joined spelling — which is the spelling
+/// `BrowseEntry::relative_path` already carries. Borrowed for the whole
+/// listing, and looked up rather than computed: the classification is
+/// `keeper_sync::engine::release_schedule`'s, and the pairing of an instant
+/// with a hold is proven in that crate's tests, so all this layer does is read
+/// three accessors. An absent key is a path with no ledger row, which is every
+/// ordinary file.
 fn files_listing_vm(
     profile: &SyncProfile,
     subpath: String,
     listing: browse::BrowseListing,
     engine_failure: Option<&str>,
     scope: &files_write::WriteScope<'_>,
+    schedules: &HashMap<String, ReleaseSchedule>,
 ) -> FilesListingVm {
     let roles = keeper_core::vm::FilesFolderRoles {
         notes_subfolder: profile.notes.as_ref().map(|notes| notes.subfolder.as_str()),
@@ -2096,6 +2137,16 @@ fn files_listing_vm(
                         ),
                         Err(refusal) => FilesWriteVm::refused(refusal.to_string()),
                     };
+                    // Looked up BEFORE the facts literal, because
+                    // `relative_path` is moved into it.
+                    let release =
+                        schedules
+                            .get(&entry.relative_path)
+                            .map(|schedule| FilesReleaseVm {
+                                releases_after_ms: schedule.releases_after_ms(),
+                                hold: schedule.hold().map(str::to_owned),
+                                detail: schedule.sentence().to_owned(),
+                            });
                     FilesEntryVm::new(FilesEntryFacts {
                         name: entry.name,
                         relative_path: entry.relative_path,
@@ -2105,6 +2156,7 @@ fn files_listing_vm(
                         size_bytes: entry.size_bytes,
                         lfs_oid: entry.lfs_oid,
                         mtime_ms: entry.mtime_ms,
+                        release,
                         roles,
                         write,
                     })
@@ -2434,6 +2486,120 @@ pub async fn sync_materialize_entry(
         Err(err) => {
             if let SyncError::Refused(refusal) = &err {
                 tracing::warn!(%refusal, "files: materialize refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
+/// Let one materialized path go back to being its pointer, on request (Story
+/// 56.9, FR-343, FR-332).
+///
+/// **The app's door onto `Engine::dehydrate_entry`**, and `keeper-syncd
+/// dehydrate` is the other. Every one of 56.4's five refusals applies
+/// unchanged, taken fresh at the moment of deletion: this command is not a
+/// privileged caller and adds no gate of its own, because a rule written in
+/// this crate is a rule nobody can exercise until macOS (AD-55, AD-56).
+///
+/// **Not on the blocking pool, unlike [`sync_materialize_entry`].**
+/// `dehydrate_entry` is `async fn` — the per-object proof that the remote can
+/// still serve these bytes is a batch round trip — so it is awaited directly.
+/// `spawn_blocking` cannot host a future, and wrapping one would mean a runtime
+/// inside a runtime.
+///
+/// **[`ContentRefusal::AlreadyPointer`] is answered `Ok`, deliberately.** The
+/// CLI door reports it as `nothing_to_release` rather than a failure, because
+/// the worktree already holds what the caller asked for; surfacing it as a
+/// rejection would paint a red alert over a no-op. Every other refusal is a
+/// rejection carrying its own sentence, through [`sync_ipc_error`]'s existing
+/// `Refused` arm, and is logged `warn!` for the reason
+/// [`sync_materialize_entry`] logs one (DW-162).
+///
+/// On a host whose platform cannot answer "is this file open" race-free — which
+/// is every host today — the honest answer is `ContentRefusal::OpenUnknown`,
+/// and that sentence is what a person sees. That is 56.4's recorded and
+/// deliberate consequence, not a defect in this command.
+///
+/// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
+/// (no such profile, an unplugged removable volume, a subpath that escapes the
+/// root, a path that is not a tracked large file, a path outside the folder's
+/// subpaths, a path whose bytes are not what this folder committed, a path some
+/// process may be reading, a path nothing has confirmed the server holds, a
+/// pinned path, a folder that always materializes, LFS turned off for the
+/// folder, the folder paused).
+#[tauri::command]
+pub async fn sync_release_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    match engine.dehydrate_entry(&id, &subpath).await {
+        Ok(released) => {
+            tracing::info!(
+                path = %released.path,
+                oid = %released.oid,
+                bytes = released.size_bytes,
+                "files: release"
+            );
+            Ok(())
+        }
+        Err(SyncError::Refused(ContentRefusal::AlreadyPointer { path })) => {
+            tracing::info!(%path, "files: nothing to release");
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: release refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
+/// Hold one path against release, or stop holding it (Story 56.9, FR-334).
+///
+/// **The app's door onto `Engine::pin_entry`**, and `keeper-syncd pin` /
+/// `unpin` are the others. A pin is a standing instruction about a path rather
+/// than an operation on its content: it takes no reservation, writes nothing
+/// into the worktree, is idempotent, and does not require the content to be
+/// here — 56.4's `Pinned` refusal is what enforces it when a release later
+/// asks.
+///
+/// On the blocking pool, [`sync_materialize_entry`]'s shape exactly: one index
+/// read and one `UPDATE` is cheap, but `pin_entry` is a synchronous engine call
+/// and the IPC thread is not the place to make one.
+///
+/// **`pinned` is an argument rather than a toggle**, so two clicks in a row
+/// cannot leave the ledger in a state neither the caller nor the row expected.
+/// The Files row only ever sends `true` today: nothing on the wire says whether
+/// a path is pinned — the row learns it as Rust's own word in
+/// `FilesReleaseVm::hold` — so an unpin control could not say which way it
+/// would go. `keeper-syncd unpin` is that door until a story adds the bit.
+///
+/// Rejects with: `internal` (no such profile, an unplugged removable volume, a
+/// subpath that escapes the root, a path that is not a tracked large file, a
+/// path outside the folder's subpaths).
+#[tauri::command]
+pub async fn sync_pin_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    pinned: bool,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let asked = subpath.clone();
+    let done = tokio::task::spawn_blocking(move || engine.pin_entry(&id, &subpath, pinned))
+        .await
+        .map_err(|err| open_failure(format!("could not pin {asked}: {err}")))?;
+    match done {
+        Ok(pin) => {
+            tracing::info!(path = %pin.path, pinned = pin.pinned, "files: pin");
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: pin refused");
             }
             Err(sync_ipc_error(&err))
         }

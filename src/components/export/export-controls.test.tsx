@@ -110,6 +110,9 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     size: { bytes: 4300000, label: "4.3 MB" },
     lfsOid: null,
     mtimeMs: 1700000000000,
+    // Story 56.9: `null` because an ordinary file has no release standing —
+    // keeper put none of these bytes here, so there is nothing to let go of.
+    release: null,
     folderRole: null,
     write: {
       writable: false,

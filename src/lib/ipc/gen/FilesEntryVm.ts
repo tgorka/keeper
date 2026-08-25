@@ -2,6 +2,7 @@
 import type { FileSizeVm } from "./FileSizeVm";
 import type { FilesEntrySyncVm } from "./FilesEntrySyncVm";
 import type { FilesFolderRoleVm } from "./FilesFolderRoleVm";
+import type { FilesReleaseVm } from "./FilesReleaseVm";
 import type { FilesWriteVm } from "./FilesWriteVm";
 import type { RecordingNoteTargetKind } from "./RecordingNoteTargetKind";
 
@@ -106,6 +107,17 @@ lfsOid: string | null,
  * against a `number` accepts.
  */
 mtimeMs: number | null, 
+/**
+ * When keeper may let this entry's content go again, or why it will not
+ * (Story 56.9, FR-343).
+ *
+ * `None` means release is not a concept for this row: an ordinary file
+ * whose bytes are the user's own, a folder, a pointer with nothing here
+ * to release, or a download still in flight. Only a materialized file can
+ * carry one, and [`Self::new`] enforces that rather than trusting its
+ * caller.
+ */
+release: FilesReleaseVm | null, 
 /**
  * Whether keeper itself put something here (Story 45.5, FR-178).
  *

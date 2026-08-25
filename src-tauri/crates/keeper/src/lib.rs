@@ -930,6 +930,13 @@ pub fn run() {
         // plus the subpath the listing produced — and desktop-only with the
         // rest of sync.
         sync_ipc::sync_materialize_entry,
+        // And the two verbs beside it that the row offers once the content is
+        // here (Story 56.9, FR-343, FR-334): let it go again, and hold it
+        // against being let go. Desktop-only with the rest of sync — `mod
+        // sync_ipc` is itself `#[cfg(desktop)]`, so neither has a
+        // `#[cfg(not(desktop))]` twin to name.
+        sync_ipc::sync_release_entry,
+        sync_ipc::sync_pin_entry,
         // The document reader (Story 45.8). Returns a bounded projection of a
         // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
         sync_ipc::sync_read_document,

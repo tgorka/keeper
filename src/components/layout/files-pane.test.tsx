@@ -15,6 +15,12 @@ const syncDeletePlan = vi.fn();
 const syncDeleteEntries = vi.fn();
 const syncCreateEntry = vi.fn();
 const revealPath = vi.fn();
+// Story 56.9's three state verbs. The factory below is EXHAUSTIVE — it replaces
+// the module — so a wrapper the pane imports and this list omits is a pane whose
+// verb throws on click rather than a test that skips it.
+const syncMaterializeEntry = vi.fn();
+const syncReleaseEntry = vi.fn();
+const syncPinEntry = vi.fn();
 // Story 45.13's chooser is mounted by this pane and imports these four. They
 // answer for the two tests at the bottom of this file; every other test never
 // opens the dialog and never reaches them.
@@ -31,6 +37,10 @@ vi.mock("@/lib/ipc/client", () => ({
   syncCreateEntry: (id: unknown, subpath: unknown, name: unknown) =>
     syncCreateEntry(id, subpath, name),
   revealPath: (path: unknown) => revealPath(path),
+  syncMaterializeEntry: (id: unknown, subpath: unknown) => syncMaterializeEntry(id, subpath),
+  syncReleaseEntry: (id: unknown, subpath: unknown) => syncReleaseEntry(id, subpath),
+  syncPinEntry: (id: unknown, subpath: unknown, pinned: unknown) =>
+    syncPinEntry(id, subpath, pinned),
   notesAttachTargets: (v: unknown, q: unknown, n: unknown) => notesAttachTargets(v, q, n),
   notesAttachSources: (v: unknown, s: unknown) => notesAttachSources(v, s),
   notesBodyRead: (v: unknown, n: unknown) => notesBodyRead(v, n),
@@ -45,6 +55,7 @@ import {
   FILES_CREATE_LABEL,
   FILES_DELETE_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
+  FILES_MATERIALIZE_LABEL,
   FILES_MTIME_SLOT,
   FILES_NAME_FLOOR_PX,
   FILES_NAME_LABEL,
@@ -56,7 +67,10 @@ import {
   FILES_OPEN_LABEL,
   FILES_PANE_SUBTITLE,
   FILES_PANE_TITLE,
+  FILES_PIN_LABEL,
   FILES_REFRESH_LABEL,
+  FILES_RELEASE_LABEL,
+  FILES_RELEASE_SLOT,
   FILES_REVEAL_LABEL,
   FILES_ROLE_SLOT,
   FILES_SELECTED_TESTID,
@@ -64,13 +78,14 @@ import {
   FILES_SIZE_BASE_NOTE,
   FILES_SIZE_SLOT,
   FILES_STATE_DETAIL_TESTID,
+  FILES_TICK_MS,
   FILES_TREE_LABEL,
   FILES_UNBUILT_CONTROL_LABELS,
   FILES_WRITE_ERROR_TESTID,
   FilesPane,
   filesRowActionsBudget,
+  filesRowCellPlan,
   filesRowIndent,
-  filesRowShowsModified,
   filesSelectionSentence,
 } from "@/components/layout/files-pane";
 import {
@@ -227,6 +242,11 @@ function entry(
     // most tests are not about writing and would otherwise all have to opt in.
     // The tests that ARE about it use `readOnly` below.
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
+    // Story 56.9's release standing. `null` is the ordinary case for the fixtures
+    // in this file — a plain synced row is on no release clock, and Rust drops
+    // the field for everything but a materialized file — so the tests that ARE
+    // about it pass one through `extra`, which stays LAST for that reason.
+    release: null,
     ...extra,
   };
 }
@@ -325,6 +345,15 @@ beforeEach(() => {
   syncCreateEntry.mockResolvedValue("");
   revealPath.mockReset();
   revealPath.mockResolvedValue(undefined);
+  // Story 56.9's three state verbs. Resolved by default, so a test that only
+  // asserts a call does not also have to arrange one; the refusal test replaces
+  // the one it is about.
+  syncMaterializeEntry.mockReset();
+  syncMaterializeEntry.mockResolvedValue(undefined);
+  syncReleaseEntry.mockReset();
+  syncReleaseEntry.mockResolvedValue(undefined);
+  syncPinEntry.mockReset();
+  syncPinEntry.mockResolvedValue(undefined);
   capabilitiesStore.getState().applySnapshot({
     ...DEFAULT_CAPABILITIES,
     sync: true,
@@ -948,6 +977,66 @@ describe("FilesPane — a name too long for the tree", () => {
 });
 
 /**
+ * The width the tree reports for itself, before it mounts and measures.
+ *
+ * `role="tree"` rather than a class: it is the element the rows are laid out in
+ * and the one the pane's ref reads. Every other element keeps jsdom's honest
+ * zero, so nothing else in the pane changes behaviour under this.
+ *
+ * At module scope because two suites need it now (Story 56.9): the geometry suite
+ * below and the release suite at the bottom, which has to widen the column to see
+ * a promoted verb at all. Each caller keeps the returned restore and runs it in
+ * its own `afterEach` — the descriptor is on `Element.prototype`, so a suite that
+ * forgot would leave every later test measuring its column.
+ */
+function withTreeWidth(px: number): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+  Object.defineProperty(Element.prototype, "clientWidth", {
+    configurable: true,
+    get(this: Element) {
+      return this.getAttribute("role") === "tree" ? px : 0;
+    },
+  });
+  return () => {
+    if (descriptor === undefined) {
+      Reflect.deleteProperty(Element.prototype, "clientWidth");
+    } else {
+      Object.defineProperty(Element.prototype, "clientWidth", descriptor);
+    }
+  };
+}
+
+/** A file two levels down — a profile root and one entry inside it, which is the
+ *  shallowest a file can be and therefore the widest row a file gets. */
+const FILE_LEVEL = 2;
+
+/**
+ * Which of the row's verbs are ON it, in order — as against only in its menu.
+ *
+ * A hardcoded allow-list, so a verb added to the pane is invisible here until it
+ * is added here too; the row also holds an expander and a New file button, and a
+ * bare `queryAllByRole("button")` would count those as verbs.
+ *
+ * At module scope for {@link withTreeWidth}'s reason: two suites read a row's
+ * cluster now (Story 56.9), and two allow-lists is two things to keep in step.
+ */
+function verbs(row: HTMLElement): string[] {
+  return within(row)
+    .queryAllByRole("button")
+    .map((button) => button.getAttribute("aria-label") ?? "")
+    .filter((label) =>
+      [
+        FILES_OPEN_LABEL,
+        FILES_REVEAL_LABEL,
+        FILES_COPY_PATH_LABEL,
+        FILES_MATERIALIZE_LABEL,
+        FILES_RELEASE_LABEL,
+        FILES_PIN_LABEL,
+      ].includes(label),
+    );
+}
+
+/**
  * The owner's second report against 0.8.5: a file row's controls "merged and
  * messed up", and folder rows fine.
  *
@@ -965,34 +1054,6 @@ describe("FilesPane — a name too long for the tree", () => {
  * stubbed `clientWidth` can honestly carry — which of the row's verbs are on it.
  */
 describe("FilesPane — a row's verbs against the column's width", () => {
-  /**
-   * The width the tree reports for itself, before it mounts and measures.
-   *
-   * `role="tree"` rather than a class: it is the element the rows are laid out
-   * in and the one the pane's ref reads. Every other element keeps jsdom's
-   * honest zero, so nothing else in the pane changes behaviour under this.
-   */
-  function withTreeWidth(px: number): () => void {
-    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
-    Object.defineProperty(Element.prototype, "clientWidth", {
-      configurable: true,
-      get(this: Element) {
-        return this.getAttribute("role") === "tree" ? px : 0;
-      },
-    });
-    return () => {
-      if (descriptor === undefined) {
-        Reflect.deleteProperty(Element.prototype, "clientWidth");
-      } else {
-        Object.defineProperty(Element.prototype, "clientWidth", descriptor);
-      }
-    };
-  }
-
-  /** A file two levels down — a profile root and one entry inside it, which is
-   *  the shallowest a file can be and therefore the widest row a file gets. */
-  const FILE_LEVEL = 2;
-
   let restoreWidth: (() => void) | null = null;
 
   afterEach(() => {
@@ -1007,16 +1068,6 @@ describe("FilesPane — a row's verbs against the column's width", () => {
     render(<FilesPane />);
     await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
     return await screen.findByRole("treeitem", { name: "clip.mov" });
-  }
-
-  /** Which verbs are ON the row, in order. */
-  function verbs(row: HTMLElement): string[] {
-    return within(row)
-      .queryAllByRole("button")
-      .map((button) => button.getAttribute("aria-label") ?? "")
-      .filter((label) =>
-        [FILES_OPEN_LABEL, FILES_REVEAL_LABEL, FILES_COPY_PATH_LABEL].includes(label),
-      );
   }
 
   it("keeps the name its floor at the column's own minimum, and promotes nothing", () => {
@@ -1087,34 +1138,127 @@ describe("FilesPane — a row's verbs against the column's width", () => {
 
   /**
    * The date is the row's lowest-priority cell, and NO width trades a verb for
-   * it (Story 56.7).
+   * it (Story 56.7, restated against Story 56.9's planner).
    *
    * The cell is 64px of `w-16` plus the row's 4px gap, and the row cannot simply
    * reserve that: two pinned guarantees sit either side of it. The name never
    * gives up {@link FILES_NAME_FLOOR_PX} — the owner's 360px report — and a
-   * 320px row shows two verbs, which is the previous story's headline win with
-   * 82px of slack against 72px of verbs. Reserving the cell would spend that
-   * slack, so the cell yields instead: it appears only where the row can pay for
-   * it AND every verb it could promote.
+   * 320px row shows two verbs, which is Story 56.7's headline win with 82px of
+   * slack against 72px of verbs. Reserving the cell would spend that slack, so
+   * the cell yields instead: it appears only where the row can pay for it AND
+   * every verb THIS row has.
    *
-   * Those are the widths pinned here. 480 is the first of the sampled ones where
-   * it fits, and the assertion under it is the one that matters — after the
-   * charge, all three verbs are still affordable, so no column ever shows fewer
-   * verbs than it did before this cell existed.
+   * Those are the same widths, and the same answers. A three-verb row with no
+   * release standing — the ordinary file row this whole suite renders — needs
+   * 68 + 3 × 36 = 176px, which is exactly the threshold the story before this
+   * one pinned. So nothing about the ordinary row moved when the global maximum
+   * became this row's own count; what moved is that a row with FIVE verbs is now
+   * asked for five verbs' worth and a folder is asked for a folder's.
    */
   it("paints a row's date only at a width that owes no verb for it", () => {
     for (const column of [220, 320, 360]) {
-      expect(filesRowShowsModified({ column, level: FILE_LEVEL })).toBe(false);
+      expect(
+        filesRowCellPlan({
+          column,
+          level: FILE_LEVEL,
+          actions: 3,
+          release: false,
+          modified: true,
+        }).modified,
+      ).toBe(false);
     }
-    expect(filesRowShowsModified({ column: 480, level: FILE_LEVEL })).toBe(true);
+    expect(
+      filesRowCellPlan({
+        column: 480,
+        level: FILE_LEVEL,
+        actions: 3,
+        release: false,
+        modified: true,
+      }).modified,
+    ).toBe(true);
 
     // The budget itself is UNCHANGED by any of this — the figures above are what
     // it always answered — and what the cell costs comes off the row's own
     // leftovers instead. 68px of cell out of 242 leaves 174, and three verbs
-    // cost 108.
+    // cost 108. The planner's own `actions` is that same 174, which is the
+    // arithmetic the row then hands to `planPriorityActions`.
     const charged = filesRowActionsBudget({ column: 480, level: FILE_LEVEL }) - 68;
     expect(charged).toBe(174);
     expect(charged).toBeGreaterThanOrEqual(3 * (32 + 4));
+    expect(
+      filesRowCellPlan({
+        column: 480,
+        level: FILE_LEVEL,
+        actions: 3,
+        release: false,
+        modified: true,
+      }).actions,
+    ).toBe(charged);
+  });
+
+  /**
+   * The order the planner spends in, at the width most people have (Story 56.9).
+   *
+   * 360px is the column's shipped default and its budget is 122px. A materialized
+   * row has five verbs, which cost 180px on their own — so the rule the date
+   * lives by, "only out of slack no verb wants", would refuse the release cell at
+   * this width and at every width below about 600. That is why the release cell
+   * is charged BEFORE the verbs and the date is not: the countdown is what this
+   * story is, and a verb it displaces is still one right-click away.
+   *
+   * What is left after the cell buys one verb, and the date — asked last and
+   * against this row's five — is refused and spoken instead. Nothing is lost at
+   * any width; the order decides only what is drawn.
+   */
+  it("charges the release cell before the verbs, and the date after them", () => {
+    const wide = filesRowCellPlan({
+      column: 700,
+      level: FILE_LEVEL,
+      actions: 5,
+      release: true,
+      modified: true,
+    });
+    // 462 of budget: 68 for the cell, 68 for the date, 326 left, and five verbs
+    // cost 180. Everything fits, which is the shape a wide column has.
+    expect(filesRowActionsBudget({ column: 700, level: FILE_LEVEL })).toBe(462);
+    expect(wide).toEqual({ release: true, modified: true, actions: 326 });
+
+    const shipped = filesRowCellPlan({
+      column: 360,
+      level: FILE_LEVEL,
+      actions: 5,
+      release: true,
+      modified: true,
+    });
+    expect(filesRowActionsBudget({ column: 360, level: FILE_LEVEL })).toBe(122);
+    expect(shipped).toEqual({ release: true, modified: false, actions: 54 });
+
+    // At the column's floor the budget is nothing, so the cell is refused
+    // OUTRIGHT rather than taken out of the name: that is the guarantee the
+    // charge-it-first order needed in order to be safe.
+    expect(
+      filesRowCellPlan({
+        column: 220,
+        level: FILE_LEVEL,
+        actions: 5,
+        release: true,
+        modified: true,
+      }),
+    ).toEqual({ release: false, modified: false, actions: 0 });
+  });
+
+  /** A row with nothing to show in a cell is never charged for it — which is what
+   *  makes the two `!== ""` tests in the row the same fact as the plan. */
+  it("charges a row nothing for a cell it has no figure for", () => {
+    expect(
+      filesRowCellPlan({
+        column: 700,
+        level: FILE_LEVEL,
+        actions: 3,
+        release: false,
+        modified: false,
+      }),
+    ).toEqual({ release: false, modified: false, actions: 462 });
   });
 
   it("keeps a 480px row all three verbs beside the date it draws", async () => {
@@ -3373,5 +3517,453 @@ describe("FilesPane — the header the prose has to fit in", () => {
 
     expect(open).toBe("lucide-refresh-cw");
     expect(lucide(screen.getByRole("button", { name: FILES_REFRESH_LABEL }))).toBe(open);
+  });
+});
+
+/**
+ * Story 56.9, FR-343 — the three state verbs, and the time a row has left.
+ *
+ * Epic 56 could put content on this machine, let one path go and say which of
+ * the three states a row was in, and a person could do none of it: the engine's
+ * three doors were reachable from `keeper-syncd`'s CLI and from nowhere a hand
+ * could get to. And 56.5's release clock was invisible — the sweep was its only
+ * reader — so nothing told the owner how long the content he asked for would
+ * still be there.
+ *
+ * Two things are asserted here that no amount of reading the source would
+ * establish. The first is that ONE interval exists for the whole pane however
+ * many rows are counting, which is proved by counting timers rather than by
+ * inspecting where the `setInterval` call is written. The second is that the
+ * wire's value is an INSTANT: advance the clock by an hour over one unchanged
+ * listing and the row must show less time left, which is exactly what fails if
+ * anyone ever treats `releasesAfterMs` as a duration.
+ */
+describe("FilesPane — the state verbs and the release clock", () => {
+  /**
+   * The instant the two clock-driving tests pin their world to, with
+   * `vi.setSystemTime`. A named moment rather than an offset, because those two
+   * tests are exactly the ones about the deadline being an ABSOLUTE instant: a
+   * fixture written as "now plus three hours" could not tell an instant from a
+   * duration, which is the defect they exist to catch.
+   *
+   * Every other test in this suite hangs its deadline off the real `Date.now()`,
+   * because the pane only counts a deadline in the FUTURE and those tests run on
+   * the real clock.
+   */
+  const BASE_MS = Date.UTC(2026, 7, 25, 12, 0, 0);
+
+  /** Rust's sentences, VERBATIM from `keeper_sync::engine::ReleaseSchedule::sentence`,
+   *  which is all this pane is allowed to show. Copied rather than paraphrased for
+   *  the reason `dev/mock-shell.ts` states about the marks: a fixture that
+   *  paraphrases puts words on the screen keeper never says, and reviewing the
+   *  wrong words is worse than reviewing none. Digit-free on purpose for the three
+   *  held rows — the assertion that a row on no clock draws no figure reads the
+   *  whole cell, tooltip sentence included. */
+  const DUE_SENTENCE =
+    "keeper lets this content go on the first sync after the time runs out; the copy stays here until then";
+  const PINNED_SENTENCE =
+    "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
+  const UNCONFIRMED_SENTENCE =
+    "Nothing has confirmed this content reached the server, so keeper will not put it on a release clock";
+  /** The folder's `releaseTtlMs` is `0`, so the sweep is off for every row in it. */
+  const INDEFINITE_SENTENCE =
+    "This folder keeps content on this computer until someone releases it";
+
+  /** One of story 56.4's five refusals, verbatim. The whole point of the sink is
+   *  that this sentence reaches the screen unaltered. */
+  const OPEN_UNKNOWN =
+    'keeper cannot tell whether "40-media/clip.mp4" is in use on this machine, and it will not remove content something may be reading';
+
+  let restoreWidth: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreWidth?.();
+    restoreWidth = null;
+  });
+
+  /** A materialized file on a live release clock. */
+  function counting(name: string, releasesAfterMs: number): FilesEntryVm {
+    return entry(
+      name,
+      "file",
+      name,
+      { status: "materialized", detail: null },
+      { release: { releasesAfterMs, hold: null, detail: DUE_SENTENCE } },
+    );
+  }
+
+  /** A materialized file on no clock at all, carrying Rust's word for why. */
+  function held(name: string, hold: string, detail: string): FilesEntryVm {
+    return entry(
+      name,
+      "file",
+      name,
+      { status: "materialized", detail: null },
+      { release: { releasesAfterMs: null, hold, detail } },
+    );
+  }
+
+  /**
+   * One profile holding these entries, expanded, at a column wide enough to
+   * promote every verb a row can have.
+   *
+   * 700px is the wide shape the budget suite pins: a materialized row's five
+   * verbs cost 180px of the 326 the plan leaves after the release cell, so the
+   * cluster and the menu hold the same list and either can be read.
+   */
+  async function tree(entries: readonly FilesEntryVm[], px = 700): Promise<void> {
+    restoreWidth = withTreeWidth(px);
+    syncProfiles.mockResolvedValue([profile({ id: "01VAULT", name: "Vault" })]);
+    syncBrowse.mockResolvedValue(listed("01VAULT", "", [...entries]));
+    render(<FilesPane />);
+    await click(expander(await screen.findByRole("treeitem", { name: "Vault" })));
+    for (const one of entries) {
+      await screen.findByRole("treeitem", { name: one.name });
+    }
+  }
+
+  /** The release cell on the named row, or `null` when the row has none. */
+  function releaseCell(name: string): HTMLElement | null {
+    return screen
+      .getByRole("treeitem", { name })
+      .querySelector<HTMLElement>(`[data-slot="${FILES_RELEASE_SLOT}"]`);
+  }
+
+  /** What the EYE reads in that cell — the `aria-hidden` figure, not the phrase
+   *  beside it for the reader. */
+  function releaseFigure(name: string): string {
+    return releaseCell(name)?.querySelector('[aria-hidden="true"]')?.textContent ?? "";
+  }
+
+  /** How many times the vault's root folder has been asked for. */
+  function rootBrowses(): number {
+    return syncBrowse.mock.calls.filter(([id, subpath]) => id === "01VAULT" && subpath === "")
+      .length;
+  }
+
+  it("offers each sync state exactly the verbs that state has", async () => {
+    await tree([
+      entry("40-media", "folder"),
+      counting("here.mp4", Date.now() + 3_600_000),
+      entry("gone.mp4", "file", "gone.mp4", { status: "virtual", detail: null }),
+      entry("coming.mp4", "file", "coming.mp4", { status: "materializing", detail: null }),
+      entry("plain.md", "file"),
+    ]);
+
+    // Content that is HERE can be let go of or held on to; content that is not
+    // here can be fetched. Nothing else offers either.
+    expect(verbs(screen.getByRole("treeitem", { name: "here.mp4" }))).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+      FILES_RELEASE_LABEL,
+      FILES_PIN_LABEL,
+    ]);
+    expect(verbs(screen.getByRole("treeitem", { name: "gone.mp4" }))).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+      FILES_MATERIALIZE_LABEL,
+    ]);
+    // A row whose content is already on its way offers nothing: the only honest
+    // verb there would be a cancel, and this story was not asked for one.
+    expect(verbs(screen.getByRole("treeitem", { name: "coming.mp4" }))).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
+    expect(verbs(screen.getByRole("treeitem", { name: "plain.md" }))).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
+    // A folder has no content of its own to fetch or free, and its own gesture is
+    // expand/collapse rather than Open.
+    expect(verbs(screen.getByRole("treeitem", { name: "40-media" }))).toEqual([
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+    ]);
+  });
+
+  /** One array, two surfaces. The cluster slices a prefix of it and the menu
+   *  spells all of it, so a verb reachable from only one of them is a verb
+   *  somebody added twice. */
+  it("puts every one of a materialized row's verbs on the row AND in its menu", async () => {
+    await tree([counting("here.mp4", Date.now() + 3_600_000)]);
+    const row = screen.getByRole("treeitem", { name: "here.mp4" });
+
+    expect(verbs(row)).toEqual([
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+      FILES_RELEASE_LABEL,
+      FILES_PIN_LABEL,
+    ]);
+
+    await act(async () => {
+      fireEvent.contextMenu(row);
+      await Promise.resolve();
+    });
+    expect(
+      within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).toEqual([
+      FILES_OPEN_HERE_LABEL,
+      FILES_OPEN_BESIDE_LABEL,
+      FILES_OPEN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
+      FILES_RELEASE_LABEL,
+      FILES_PIN_LABEL,
+    ]);
+  });
+
+  it("materializes the row's own subpath and then re-reads the folder", async () => {
+    await tree([
+      entry("gone.mp4", "file", "40-media/gone.mp4", { status: "virtual", detail: null }),
+    ]);
+    const before = rootBrowses();
+
+    await click(
+      within(screen.getByRole("treeitem", { name: "gone.mp4" })).getByRole("button", {
+        name: FILES_MATERIALIZE_LABEL,
+      }),
+    );
+
+    // The profile id and the subpath the LISTING handed over, never a path this
+    // surface composed (AD-65).
+    expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4");
+    // And the folder is re-read, because the row's own mark is the feedback: it
+    // becomes `materializing`, and nothing else on this surface would notice.
+    await waitFor(() => expect(rootBrowses()).toBe(before + 1));
+  });
+
+  it("shows a refused Release as Rust's own sentence, verbatim", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)]);
+    syncReleaseEntry.mockRejectedValue({
+      code: "internal",
+      message: OPEN_UNKNOWN,
+      accountId: null,
+      retriable: false,
+    });
+
+    await click(
+      within(screen.getByRole("treeitem", { name: "clip.mp4" })).getByRole("button", {
+        name: FILES_RELEASE_LABEL,
+      }),
+    );
+
+    expect(syncReleaseEntry).toHaveBeenCalledWith("01VAULT", "clip.mp4");
+    // The pane's ONE sink and its one `role="alert"`. Story 56.4 wrote five
+    // sentences that each name the path and the next step; a generic "failed"
+    // here would throw all of that away.
+    const alert = await screen.findByTestId(FILES_WRITE_ERROR_TESTID);
+    expect(alert).toHaveAttribute("role", "alert");
+    expect(alert).toHaveTextContent(OPEN_UNKNOWN);
+  });
+
+  /** Pin only ever sends `true`. Nothing on the wire says whether a path is
+   *  pinned — the row learns it as Rust's word — so a toggle could not tell the
+   *  person which way it was about to go. */
+  it("pins one way and never toggles", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)]);
+
+    await click(
+      within(screen.getByRole("treeitem", { name: "clip.mp4" })).getByRole("button", {
+        name: FILES_PIN_LABEL,
+      }),
+    );
+
+    expect(syncPinEntry).toHaveBeenCalledWith("01VAULT", "clip.mp4", true);
+  });
+
+  /**
+   * ONE interval for the whole pane, counted rather than read.
+   *
+   * The rows are windowed, so a timer owned by a row would arm and disarm on
+   * every scroll, and three counting rows would be three timers computing the
+   * same subtraction. Filtered by PERIOD so an unrelated timer somewhere in the
+   * tree cannot pollute the count, and spied on the global rather than mocked, so
+   * this test would fail on a `setInterval` moved into `renderNode` even though
+   * every other assertion in this suite would still pass.
+   */
+  it("arms exactly one interval however many rows are counting", async () => {
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      await tree([
+        counting("a.mp4", Date.now() + 3_600_000),
+        counting("b.mp4", Date.now() + 7_200_000),
+        counting("c.mp4", Date.now() + 10_800_000),
+      ]);
+
+      await waitFor(() =>
+        expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(1),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /** And a pane with nothing to count arms none at all. The ordinary Files tree
+   *  holds no materialized content, and it must not tick once a second for the
+   *  rest of the session to keep saying so. */
+  it("arms no interval at all when no row has a deadline", async () => {
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      await tree([entry("plain.md", "file"), held("pinned.mp4", "Pinned", PINNED_SENTENCE)]);
+
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /**
+   * One tick, three rows, and all three figures move.
+   *
+   * A DECREMENT rather than a pair of exact strings, and deliberately: the fake
+   * clock is installed with `shouldAdvanceTime` so the `findBy*` helpers in the
+   * arrangement above can still poll, which means real time bleeds into the
+   * seconds rung and an exact "45s" would be a flake waiting for a slow machine.
+   * What the story claims is that the pane's own tick moves every counting row,
+   * and that is what is asserted: three seconds-shaped figures, then three
+   * strictly smaller ones.
+   *
+   * All three move together because ONE `nowMs` drives them, so two cells in one
+   * paint can never be relative to different instants.
+   */
+  it("moves every counting row's figure on one tick", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([
+        counting("a.mp4", BASE_MS + 630_000),
+        counting("b.mp4", BASE_MS + 690_000),
+        counting("c.mp4", BASE_MS + 750_000),
+      ]);
+      const names = ["a.mp4", "b.mp4", "c.mp4"] as const;
+      const before = names.map(releaseFigure);
+      // Ten minutes out and half a minute clear of the rung's boundary, so the
+      // seconds a `shouldAdvanceTime` clock bleeds in cannot move the figure by
+      // itself: only the 120 s advance below can.
+      expect(before).toEqual(["10 min", "11 min", "12 min"]);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120 * FILES_TICK_MS);
+      });
+
+      const after = names.map(releaseFigure);
+      expect(after).toEqual(["8 min", "9 min", "10 min"]);
+      expect(after.every((text, index) => text !== before[index])).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * The staleness assertion, and the one that fails if `releasesAfterMs` is ever
+   * treated as a duration.
+   *
+   * ONE listing, whose deadline is a fixed absolute instant three and a half
+   * hours out. Nothing re-browses; the clock moves an hour and the same wire
+   * value now means an hour less. A duration would read the same three hours
+   * forever, which is exactly the defect an absolute instant on the wire exists
+   * to prevent.
+   */
+  it("shows less time left after the clock advances over one unchanged listing", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([counting("clip.mp4", BASE_MS + 3 * 3_600_000 + 1_800_000)]);
+      expect(releaseFigure("clip.mp4")).toBe("3 hr");
+      const browsed = rootBrowses();
+
+      vi.setSystemTime(BASE_MS + 3_600_000);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILES_TICK_MS);
+      });
+
+      expect(releaseFigure("clip.mp4")).toBe("2 hr");
+      // And the tick asked Rust for nothing: this pane's listings are on demand,
+      // and a countdown reaching zero means eligible rather than gone.
+      expect(rootBrowses()).toBe(browsed);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A row on no release clock draws Rust's WORD and no timer at all.
+   *
+   * All three causes, because the pane must not distinguish them and Rust's own
+   * words are the only thing that does: the path is pinned, nothing has
+   * confirmed its content reached the server (FR-341), or the folder's
+   * `releaseTtlMs` is `0` and the sweep is off for everything in it.
+   *
+   * A timer that never moves is a lie with a second hand, so none of these rows
+   * may contain a digit anywhere in its cell — the tooltip sentence included —
+   * and none may arm the pane's interval. Each still names its cell in the row's
+   * `aria-describedby`, because a row that cannot count is still a row that can
+   * say why.
+   */
+  it("draws a word, no digit and no timer for a row on no clock", async () => {
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      await tree([
+        held("pinned.mp4", "Pinned", PINNED_SENTENCE),
+        held("fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE),
+        held("forever.mp4", "Kept", INDEFINITE_SENTENCE),
+      ]);
+
+      for (const [name, word, sentence] of [
+        ["pinned.mp4", "Pinned", PINNED_SENTENCE],
+        ["fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE],
+        ["forever.mp4", "Kept", INDEFINITE_SENTENCE],
+      ] as const) {
+        const cell = releaseCell(name);
+        expect(cell).not.toBeNull();
+        expect(releaseFigure(name)).toBe(word);
+        // Rust's whole sentence is what a reader hears, because "Pinned" alone
+        // does not say what being pinned did.
+        expect(cell?.textContent).toBe(`${word}${sentence}`);
+        expect(cell?.textContent ?? "").not.toMatch(/\d/);
+        expect(screen.getByRole("treeitem", { name }).getAttribute("aria-describedby")).toContain(
+          cell?.id ?? "",
+        );
+      }
+
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  /** `materializing` promises no finish time (Story 56.7), and Rust enforces that
+   *  by dropping the field — so the row has no cell to draw at all. */
+  it("draws no release cell on a materializing row", async () => {
+    await tree([
+      entry("coming.mp4", "file", "coming.mp4", { status: "materializing", detail: null }),
+    ]);
+
+    expect(releaseCell("coming.mp4")).toBeNull();
+    expect(
+      screen.getByRole("treeitem", { name: "coming.mp4" }).getAttribute("aria-describedby") ?? "",
+    ).not.toContain("files-release-");
+  });
+
+  /** The countdown reads as text under `motion-reduce` because it has no motion
+   *  at all: no ring, no spinner, no transition. This is the mechanical form of
+   *  that rule, so `motion-reduce` needs no branch anywhere in the cell. */
+  it("gives the release cell no animation and Rust's sentence as its tooltip", async () => {
+    await tree([counting("clip.mp4", Date.now() + 3_600_000)]);
+
+    const cell = releaseCell("clip.mp4");
+    expect(cell?.className ?? "").not.toContain("animate-");
+    expect(cell?.className ?? "").not.toContain("transition-");
+    expect(cell).toHaveAttribute("title", DUE_SENTENCE);
+    // Tabular numerals, so a figure that ticks does not change the cell's width
+    // and shove the sync mark beside it about.
+    expect(cell?.className ?? "").toContain("figures");
   });
 });

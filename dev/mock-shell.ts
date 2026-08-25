@@ -41,6 +41,7 @@ import type {
   FilesEntrySyncVm,
   FilesEntryVm,
   FilesListingVm,
+  FilesReleaseVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
@@ -205,6 +206,10 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     // run.
     lfsOid: null,
     mtimeMs: 1_700_000_000_000,
+    // Story 56.9: no release standing, because release is a fact about content
+    // keeper itself put here and none of these rows is that. The two rows that
+    // are get one below.
+    release: null,
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.
@@ -230,8 +235,9 @@ function lfsEntry(
   size: FileSizeVm,
   sync: FilesEntrySyncVm,
   lfsOid: string | null,
+  release: FilesReleaseVm | null = null,
 ): FilesEntryVm {
-  return { ...browseEntry(name, false, size), sync, lfsOid };
+  return { ...browseEntry(name, false, size), sync, lfsOid, release };
 }
 
 /** Verbatim from `sync_ipc::sync_mark`, for the reason {@link lfsEntry} gives. */
@@ -245,6 +251,16 @@ const MATERIALIZING_SENTENCE =
   "keeper has this file's content queued to download to this computer.";
 const MATERIALIZED_SENTENCE =
   "This file's content is on this computer. keeper may release it again later to free the space, and can fetch it back.";
+
+/** Verbatim from `keeper_sync::engine::ReleaseSchedule::sentence`, for the
+ *  reason {@link lfsEntry} gives. The deadline beside it is `Date.now()`-relative
+ *  and not a fixed instant, unlike every other timestamp in this file: a
+ *  countdown frozen at a stored epoch would render `due` for ever, which is the
+ *  one thing the cell it is here to show cannot demonstrate. */
+const RELEASE_DUE_SENTENCE =
+  "keeper lets this content go on the first sync after the time runs out; the copy stays here until then";
+const RELEASE_PINNED_SENTENCE =
+  "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
 
 /** A folder tree with the depth and the awkward names a real drive has. */
 const ENTRIES: FilesEntryVm[] = [
@@ -285,6 +301,29 @@ const ENTRIES: FilesEntryVm[] = [
     { bytes: 4_294_967_296, label: "4.3 GB" },
     { status: "materialized", detail: MATERIALIZED_SENTENCE },
     null,
+  ),
+  // The two shapes Story 56.9's release cell takes, so both can be looked at:
+  // one row counting down to a real instant, and one row whose words say there
+  // is no clock at all. `hold` and `releasesAfterMs` are never both set —
+  // `ReleaseSchedule` guarantees it and this harness must not be the one place
+  // that reads otherwise.
+  lfsEntry(
+    "master-2026-07.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    {
+      releasesAfterMs: Date.now() + 23 * 3_600_000 + 30 * 60_000,
+      hold: null,
+      detail: RELEASE_DUE_SENTENCE,
+    },
+  ),
+  lfsEntry(
+    "master-2026-08.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    { releasesAfterMs: null, hold: "Pinned", detail: RELEASE_PINNED_SENTENCE },
   ),
 ];
 

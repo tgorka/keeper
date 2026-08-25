@@ -4045,6 +4045,59 @@ fn same_folder_path(left: &str, right: &str) -> bool {
     !left.is_empty() && left == normalise(right)
 }
 
+/// Why one path's content is still on this computer, and until when (Story
+/// 56.9, FR-343).
+///
+/// **An absolute instant, never a duration and never a rendered string.** A
+/// countdown is stale the moment it is serialized, and the Files tree does not
+/// poll at all — its listings are on demand and this story does not change
+/// that — so a `23 hr` composed here would be wrong by however long the pane
+/// stayed open on one listing. What crosses is the deadline itself; the
+/// surface subtracts its own clock and renders what is left. This is the one
+/// string this crate deliberately does not compose, and [`Self::detail`] is
+/// why that exception costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FilesReleaseVm {
+    /// The absolute instant, ms since the Unix epoch, at or after which keeper
+    /// may take this content away again. `None` when the row is on no release
+    /// clock at all, in which case [`Self::hold`] says so in words.
+    ///
+    /// `#[ts(type = "number | null")]` for the reason
+    /// [`FilesEntryVm::mtime_ms`] states below: ts-rs maps a 64-bit integer to
+    /// `bigint` otherwise, which no `JSON.parse` produces and no comparison
+    /// against a `number` accepts — and every single use of this field is a
+    /// comparison against the surface's own clock.
+    #[ts(type = "number | null")]
+    pub releases_after_ms: Option<i64>,
+    /// Rust's own one or two words for a row that is on no release clock at
+    /// all: it is pinned, or nothing has confirmed its content reached the
+    /// server (FR-341), or its folder releases nothing on a clock. A surface
+    /// draws these instead of a timer, because a timer that never moves is a
+    /// lie with a second hand.
+    ///
+    /// `None` EXACTLY when [`Self::releases_after_ms`] is `Some`, and the two
+    /// are never both empty. That complementary emptiness is a property of
+    /// `keeper_sync::engine::ReleaseSchedule` and is proven by that module's
+    /// own tests over every variant: this crate is deliberately
+    /// `keeper-sync`-free (AD-40), so it cannot see the classifier and carries
+    /// the resolved pair rather than holding a second opinion about it.
+    pub hold: Option<String>,
+    /// The sentence, written for the person who asked, composed in Rust for
+    /// the same reason [`FilesEntrySyncVm::detail`] is: two surfaces must not
+    /// word one fact twice, because that is how they come to word it
+    /// differently.
+    ///
+    /// Always present, whichever of the two fields above it accompanies. It is
+    /// also where the caveat lives that a deadline reaching zero means
+    /// *eligible*, not released — the sweep runs on the first successful sync
+    /// after its own hourly due-gate and is budgeted per pass — which is
+    /// exactly the claim a frontend rendering `due` must not be left to
+    /// invent.
+    pub detail: String,
+}
+
 /// One entry in a browsed synced folder (Story 43.8, FR-153, FR-145, AD-65,
 /// AD-73).
 ///
@@ -4132,6 +4185,15 @@ pub struct FilesEntryVm {
     /// against a `number` accepts.
     #[ts(type = "number | null")]
     pub mtime_ms: Option<i64>,
+    /// When keeper may let this entry's content go again, or why it will not
+    /// (Story 56.9, FR-343).
+    ///
+    /// `None` means release is not a concept for this row: an ordinary file
+    /// whose bytes are the user's own, a folder, a pointer with nothing here
+    /// to release, or a download still in flight. Only a materialized file can
+    /// carry one, and [`Self::new`] enforces that rather than trusting its
+    /// caller.
+    pub release: Option<FilesReleaseVm>,
     /// Whether keeper itself put something here (Story 45.5, FR-178).
     ///
     /// `Some` only for the folder the profile's configuration names as its
@@ -4182,6 +4244,10 @@ pub struct FilesEntryFacts<'a> {
     /// The dirent's modification time in ms, or `None` when the metadata could
     /// not be read. A directory's is KEPT, unlike its size.
     pub mtime_ms: Option<i64>,
+    /// The schedule `keeper_sync::engine::release_schedules` already resolved
+    /// for this path, or `None` when the ledger holds no row for it. DROPPED
+    /// unless this entry is a materialized file (Story 56.9, FR-343).
+    pub release: Option<FilesReleaseVm>,
     /// The profile's configuration, not the folder's name (Story 45.5).
     pub roles: FilesFolderRoles<'a>,
     /// The location verdict `keeper_sync::files_write` already reached.
@@ -4215,6 +4281,16 @@ impl FilesEntryVm {
     /// differently from its size — see the field docs for why that is one rule
     /// and not two.
     ///
+    /// `release` is GATED where the `mtime_ms` beside it is not, because the
+    /// two facts differ in kind: an mtime is true of anything on disk, where a
+    /// release deadline is a claim about content keeper itself put here and is
+    /// entitled to take away. A directory has no content of its own, a
+    /// `materializing` row promises no finish time at all (Story 56.7), and a
+    /// row that is virtual again has nothing here to release however recently
+    /// its ledger row was written — so this constructor drops all three rather
+    /// than trusting the caller, exactly as it drops a directory's size (Story
+    /// 56.9, FR-343).
+    ///
     /// `roles` is the profile's configuration, not the folder's name.
     ///
     /// `write` is the location verdict `keeper_sync::files_write` already
@@ -4232,6 +4308,7 @@ impl FilesEntryVm {
             size_bytes,
             lfs_oid,
             mtime_ms,
+            release,
             roles,
             write,
         } = facts;
@@ -4254,6 +4331,17 @@ impl FilesEntryVm {
             // rule.
             lfs_oid,
             mtime_ms,
+            // A release deadline is a fact about content that is HERE. A row
+            // that is materializING promises no finish time (Story 56.7), a row
+            // that is virtual again has nothing here to release whatever a
+            // stale ledger row says, and a directory has no content of its own
+            // — so this constructor drops it, exactly as it drops a
+            // directory's size, rather than trusting the caller.
+            release: if !is_dir && matches!(sync.status, FilesSyncStatusVm::Materialized) {
+                release
+            } else {
+                None
+            },
             folder_role: roles.role_of(&relative_path, is_dir),
             relative_path,
             sync,
@@ -7032,6 +7120,7 @@ mod tests {
                 size_bytes: Some(7),
                 lfs_oid: None,
                 mtime_ms: None,
+                release: None,
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
             });
@@ -7053,6 +7142,7 @@ mod tests {
             size_bytes: None,
             lfs_oid: None,
             mtime_ms: None,
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7523,6 +7613,7 @@ mod tests {
                 "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
             ),
             mtime_ms: Some(1_700_000_000_123),
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7589,6 +7680,7 @@ mod tests {
             // Offered for the folder as well, and kept: a folder's mtime is a
             // fact about the folder, where its `len()` is not (Story 56.2).
             mtime_ms: Some(1_700_000_000_456),
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7610,6 +7702,63 @@ mod tests {
         );
     }
 
+    /// Story 56.9, FR-343: only a materialized FILE carries a release
+    /// deadline, and the constructor enforces it rather than asserting it
+    /// somewhere a shell crate would have to be compiled to reach.
+    ///
+    /// 56.7's rule is why `materializing` is in the list: a download in flight
+    /// promises no finish time, so a row mid-materialize must not paint a
+    /// countdown inherited from the ledger row that preceded its release. The
+    /// virtual row is the mirror case — whatever the ledger still says, there
+    /// is nothing here to let go of — and the directory is the same shape as
+    /// the size it already drops.
+    #[test]
+    fn only_a_materialized_file_carries_a_release_deadline() {
+        let offered = FilesReleaseVm {
+            releases_after_ms: Some(1_700_000_000_000),
+            hold: None,
+            detail: "keeper lets this content go on the first sync after the time runs out; \
+                     the copy stays here until then"
+                .to_owned(),
+        };
+        let release_of = |status: FilesSyncStatusVm, is_dir: bool| {
+            FilesEntryVm::new(FilesEntryFacts {
+                name: "clip.mov".to_owned(),
+                relative_path: "2026/clip.mov".to_owned(),
+                absolute_path: "/v/2026/clip.mov".to_owned(),
+                is_dir,
+                sync: FilesEntrySyncVm::plain(status),
+                size_bytes: Some(4_000_000_000),
+                lfs_oid: None,
+                mtime_ms: None,
+                release: Some(offered.clone()),
+                roles: FilesFolderRoles::default(),
+                write: FilesWriteVm::allowed(),
+            })
+            .release
+        };
+        assert_eq!(
+            release_of(FilesSyncStatusVm::Materialized, false),
+            Some(offered.clone()),
+            "the one row whose content is actually here keeps its deadline"
+        );
+        assert_eq!(
+            release_of(FilesSyncStatusVm::Materializing, false),
+            None,
+            "a download in flight promises no finish time (Story 56.7)"
+        );
+        assert_eq!(
+            release_of(FilesSyncStatusVm::Virtual, false),
+            None,
+            "a pointer has nothing here to release, whatever the ledger says"
+        );
+        assert_eq!(
+            release_of(FilesSyncStatusVm::Materialized, true),
+            None,
+            "a folder has no content of its own to let go of"
+        );
+    }
+
     /// An unreadable file has an unknown size, and an empty one has a size of
     /// zero. They are different facts and must stay so.
     #[test]
@@ -7623,6 +7772,7 @@ mod tests {
             size_bytes: None,
             lfs_oid: None,
             mtime_ms: None,
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7636,6 +7786,7 @@ mod tests {
             size_bytes: Some(0),
             lfs_oid: None,
             mtime_ms: None,
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });
@@ -7670,6 +7821,7 @@ mod tests {
                 size_bytes: None,
                 lfs_oid: None,
                 mtime_ms: None,
+                release: None,
                 roles,
                 write: FilesWriteVm::allowed(),
             })
@@ -7701,6 +7853,7 @@ mod tests {
             size_bytes: None,
             lfs_oid: None,
             mtime_ms: None,
+            release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
         });

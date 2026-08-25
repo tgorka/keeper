@@ -82,6 +82,8 @@ import {
   ChevronRight,
   Clapperboard,
   Copy,
+  Download,
+  Eraser,
   ExternalLink,
   Folder,
   FolderOpen,
@@ -89,6 +91,7 @@ import {
   ListChecks,
   NotebookPen,
   Paperclip,
+  Pin,
   RefreshCw,
   Trash2,
 } from "lucide-react";
@@ -128,7 +131,7 @@ import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel, ITEMS } from "@/lib/count-label";
-import { formatDraftAge } from "@/lib/format-time";
+import { formatDraftAge, formatReleaseIn, formatReleaseSpoken } from "@/lib/format-time";
 import type {
   FilesDeletePlanVm,
   FilesEntryVm,
@@ -144,8 +147,11 @@ import {
   syncCreateEntry,
   syncDeleteEntries,
   syncDeletePlan,
+  syncMaterializeEntry,
   syncOpenEntry,
+  syncPinEntry,
   syncProfiles,
+  syncReleaseEntry,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { columnFoldStore } from "@/lib/stores/column-fold";
@@ -289,6 +295,22 @@ export const FILES_NEW_FILE_NAME_LABEL = "New file name";
 export const FILES_CREATE_LABEL = "Create";
 export const FILES_CANCEL_LABEL = "Cancel";
 
+/**
+ * The three state verbs (Story 56.9, FR-343): what a row does about the content
+ * behind it, as against what it does with the file it names.
+ *
+ * One word each, and the word the epic's own vocabulary already uses — the CLI
+ * spells them `keeper-syncd materialize`, `release` and `pin`, `sync_mark`'s
+ * sentences say "materializing" about the state between the first two, and a
+ * surface that invented "Download" / "Free up space" / "Keep offline" here would
+ * give the owner two vocabularies for one epic. `Release` and not `Dehydrate`:
+ * the command is `dehydrate_entry`, and that is a word about a mechanism rather
+ * than about what the person gets.
+ */
+export const FILES_MATERIALIZE_LABEL = "Materialize";
+export const FILES_RELEASE_LABEL = "Release";
+export const FILES_PIN_LABEL = "Pin";
+
 /** How the header counts what Delete would act on. A count, because the
  * confirmation is where the files are named. */
 export const FILES_SELECTED_TESTID = "files-selection-count";
@@ -345,6 +367,26 @@ export const FILES_SIZE_SLOT = "files-entry-size";
  * "this row has no modification time" stays distinguishable from "some other
  * row shows that one". */
 export const FILES_MTIME_SLOT = "files-entry-mtime";
+
+/** Test id for a row's release cell (Story 56.9, FR-343). A slot for the reason
+ * the date beside it is one: a test reads what this row says about its own
+ * content, and "this row is on no release clock" stays distinguishable from
+ * "some other row's countdown". */
+export const FILES_RELEASE_SLOT = "files-entry-release";
+
+/**
+ * How often the pane re-reads its own clock, in ms (Story 56.9, FR-343).
+ *
+ * The ONE interval this pane owns, and one second because that is the smallest
+ * rung `formatReleaseIn`'s ladder has: the last minute before a deadline is
+ * counted in seconds, so a slower tick would leave a figure visibly stale, and a
+ * faster one would redraw a string that cannot have changed.
+ *
+ * Exported so a test can COUNT the timers by period rather than by reading the
+ * source — see the pane's tick effect for why one interval for the whole tree is
+ * a correctness rule and not a tidiness one.
+ */
+export const FILES_TICK_MS = 1000;
 
 /**
  * How far ahead of this machine's clock a modification time may sit and still be
@@ -607,33 +649,32 @@ const FILES_ROW_META_PX = 64;
  * Pixels the modification-time cell costs the row, its own gap included: the
  * `w-16` the cell is drawn at, plus the row's `gap-1` before it.
  *
- * Declared apart from {@link FILES_ROW_META_PX} because this is the one meta
- * cell that YIELDS. Folding it into that reserve would charge every row at every
- * width, and two pinned guarantees forbid that: the name never gives up
- * {@link FILES_NAME_FLOOR_PX}, and a 320px row shows two verbs — the previous
- * story's headline win, where the slack is 82px against 72px of verbs, so any
- * usable cell added to the reserve is paid for with a verb.
+ * Declared apart from {@link FILES_ROW_META_PX} because this is one of the two
+ * meta cells that YIELD. Folding either into that reserve would charge every row
+ * at every width, and two pinned guarantees forbid that: the name never gives up
+ * {@link FILES_NAME_FLOOR_PX}, and a 320px row shows two verbs — Story 56.7's
+ * headline win, where the slack is 82px against 72px of verbs, so any usable
+ * cell added to the reserve is paid for with a verb.
  *
- * So the row spends in a stated order: the name's floor first, then the verbs
- * that are already one click away, then this date. It is charged only where the
- * row can pay for it out of slack no verb wants — see
- * {@link filesRowShowsModified} — and where it cannot, the date is still SPOKEN
- * and merely unpainted.
+ * So the row spends in a stated order, and {@link filesRowCellPlan} is where
+ * that order is written down: the name's floor first, then the release cell,
+ * then the verbs that are already one click away, then this date. The date is
+ * last because it is the row's lowest-priority cell and because it is the one
+ * that has always yielded; where the row cannot pay for it, the date is still
+ * SPOKEN and merely unpainted.
  */
 const FILES_ROW_MTIME_PX = FILES_ROW_GAP_PX + 64;
 
 /**
- * The most verbs a row has, which is what it must still be able to promote
- * before it pays for a date.
+ * Pixels the release cell costs the row, its own gap included — the same `w-16`
+ * and the same `gap-1` as {@link FILES_ROW_MTIME_PX}, because the two cells are
+ * drawn to the same measure and read down the tree against each other.
  *
- * The `actions` array's own maximum, and it is written as a number rather than
- * read off a `.length` because that array is built per row, inside the render,
- * out of the row's own conditionals: a file that can be revealed takes Open,
- * Reveal in Finder and Copy path. A verb added there has to be added here too,
- * and the assertion that the widest row still affords all of them beside the
- * date is what fails if it is not.
+ * The other yielding cell, and the one charged FIRST of the two. Which of them
+ * comes before the verbs and why is {@link filesRowCellPlan}'s doc, because that
+ * is the function that spends it.
  */
-const FILES_ROW_MAX_ACTIONS = 3;
+const FILES_ROW_RELEASE_PX = FILES_ROW_GAP_PX + 64;
 
 /**
  * Pixels the name is never asked to give up, whatever else wants the row.
@@ -692,26 +733,79 @@ export function filesRowActionsBudget({ column, level }: FilesRowBudgetInput): n
   );
 }
 
+export interface FilesRowCellInput extends FilesRowBudgetInput {
+  /** How many verbs THIS row has. */
+  readonly actions: number;
+  /** Whether this row has a release standing to show at all. */
+  readonly release: boolean;
+  /** Whether this row has a modification time to show at all. */
+  readonly modified: boolean;
+}
+
+export interface FilesRowCellPlan {
+  /** Whether the release cell is PAINTED. It is spoken either way. */
+  readonly release: boolean;
+  /** Whether the date is PAINTED. It is spoken either way. */
+  readonly modified: boolean;
+  /** Pixels left for the verb cluster, never negative. */
+  readonly actions: number;
+}
+
 /**
- * Whether this row PAINTS its modification time, as against only speaking it.
+ * How one row spends what {@link filesRowActionsBudget} left it (Story 56.9,
+ * FR-343): which of its two yielding cells are PAINTED, and what the verb
+ * cluster has left afterwards.
  *
- * The date is the row's lowest-priority cell, and the order it comes last in is
- * {@link FILES_ROW_MTIME_PX}'s: the name's floor, then every verb the row could
- * promote, then this. So the question is asked of what the row has left over
- * rather than of the column's width, and it is asked against the FULL verb
- * count and not against how many this particular row happens to have — a date
- * that appears on a folder and vanishes on the file beside it is a column that
- * moves as the eye goes down it.
+ * One function rather than three, because the three answers are one decision:
+ * every pixel the release cell takes is a pixel the verbs do not have, and every
+ * pixel the verbs take is one the date does not. Asked separately they were
+ * asked against the same budget twice and could not stay consistent.
  *
- * A row that cannot afford it renders the cell `sr-only` and keeps its id in
- * `aria-describedby`, so a narrow row still describes itself with the date it
- * has no room to draw. Nothing is lost; a fact is unpainted.
+ * The stated order — the same shape {@link FILES_ROW_MTIME_PX} has always
+ * described, extended by one cell — is:
+ *
+ * 1. **The name's floor**, already subtracted inside `filesRowActionsBudget` and
+ *    untouched here. Nothing below can reach it.
+ * 2. **The release cell.**
+ * 3. **The verbs**, whatever is left after that.
+ * 4. **The date**, and only out of slack no verb wants.
+ *
+ * **Why the release cell is charged before the verbs, unlike the date.**
+ * `filesRowShowsModified`'s rule — a cell is drawn only where the row can still
+ * promote every verb it has — cannot be applied to this one. At 360px, the
+ * column's shipped default, the budget is 122px and a materialized row's five
+ * verbs cost 180px on their own, so that rule would make the countdown
+ * unpaintable at the width most people have: the story's headline fact would
+ * never once appear on screen. A verb this cell displaces is still one click
+ * away in the row's menu at EVERY width — which is what the whole budget is
+ * licensed by — while a countdown nobody can see is the feature unbuilt. The
+ * cell is refused outright when the budget cannot cover it, so the name's floor
+ * is never touched by it either.
+ *
+ * **Why the date now asks THIS row's verb count.** The old rule asked against a
+ * global maximum, and its doc argued for exactly that: "a date that appears on a
+ * folder and vanishes on the file beside it is a column that moves as the eye
+ * goes down it." That argument cannot be kept, because the premise it rested on
+ * is gone — the verb count now depends on the row's sync state, so the maximum is
+ * five, and five verbs' worth of reserve unpaints the date at every shipped
+ * width, including the 480px row Story 56.7 pinned, on rows that gained no verb
+ * at all. The raggedness is now paid for by the row that gained a cell rather
+ * than charged to every row in the tree, and every figure either cell declines to
+ * draw is still SPOKEN — same element, same id, same place in the row's
+ * `aria-describedby`.
  */
-export function filesRowShowsModified(input: FilesRowBudgetInput): boolean {
-  return (
-    filesRowActionsBudget(input) >=
-    FILES_ROW_MTIME_PX + FILES_ROW_MAX_ACTIONS * (FILES_ROW_ACTION_PX + FILES_ROW_GAP_PX)
-  );
+export function filesRowCellPlan(input: FilesRowCellInput): FilesRowCellPlan {
+  const budget = filesRowActionsBudget(input);
+  const release = input.release && budget >= FILES_ROW_RELEASE_PX;
+  const afterRelease = budget - (release ? FILES_ROW_RELEASE_PX : 0);
+  const modified =
+    input.modified &&
+    afterRelease >= FILES_ROW_MTIME_PX + input.actions * (FILES_ROW_ACTION_PX + FILES_ROW_GAP_PX);
+  return {
+    release,
+    modified,
+    actions: Math.max(0, afterRelease - (modified ? FILES_ROW_MTIME_PX : 0)),
+  };
 }
 
 /** One of a row's verbs, as the row's own cluster and its menu both need it. */
@@ -824,11 +918,18 @@ export function FilesPane() {
   // what its own doc says it is for — a hook per row would be one timer per row
   // in a virtualised list.
   const longPress = useLongPress();
-  // One reading of the clock for every row's modification time (Story 56.7),
-  // the way `session-tree.tsx:212` takes it. Per-row `Date.now()` would let two
-  // rows in one paint be relative to different instants; an interval would be a
-  // tick this pane deliberately does not own — Story 56.9 adds the one there is.
-  const nowMs = Date.now();
+  // ONE reading of the clock for the whole pane (Story 56.7, Story 56.9), and
+  // one clock for both of the facts that need it: a row's modification time and
+  // its release countdown. Per-row `Date.now()` would let two cells in one paint
+  // be relative to different instants, which is the defect a shared read exists
+  // to prevent — and now that the pane ticks, it would also let two rows drift
+  // apart between ticks.
+  //
+  // State rather than a bare read, because Story 56.9 gave this pane the one
+  // interval it deliberately did not have before. The initializer is lazy so the
+  // FIRST paint already has a real clock and needs no tick to look right; the
+  // interval that advances it is armed below, once `nodes` is known.
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   /**
    * The selection model the rest of the pane reads (Story 45.3, FR-175).
@@ -1059,6 +1160,46 @@ export function FilesPane() {
       .catch(() => undefined);
   }, []);
 
+  /**
+   * Run one of the row's three STATE verbs — Materialize, Release, Pin (Story
+   * 56.9, FR-343) — and then say what happened.
+   *
+   * Two departures from the three verbs beside them in the same array, and both
+   * are about the same distinction. Open, Reveal and Copy path swallow with
+   * `.catch(() => undefined)` because they change nothing: the file is where it
+   * was whether or not the platform opened it, and the path is on screen either
+   * way. These three CHANGE what is on this computer.
+   *
+   * So, first: **the folder is re-read on success.** The row's own sync mark and
+   * its release cell ARE the feedback — a Materialize turns the mark to
+   * `materializing`, a Pin replaces a countdown with the word `Pinned` — and
+   * nothing else on this surface would ever notice. It is the parent folder and
+   * not the whole tree, the same narrowing `requestDelete` makes for the same
+   * reason; a row directly under a profile root has no `parentKey`, which is
+   * that root.
+   *
+   * And second: **a refusal is shown.** It is Rust's answer to something the
+   * person just did, so it goes to this pane's single `writeError` sink and its
+   * one `role="alert"` Alert, verbatim — Story 56.4 wrote five refusal sentences
+   * that each name the path and the next step, and a generic "failed" in their
+   * place would throw away the whole of that work. No toast, no per-row error
+   * slot, no second channel: one sink, cleared before the attempt so a stale
+   * sentence is never read as this attempt's answer.
+   */
+  const runRowVerb = useCallback(
+    (node: TreeNodeRow, work: () => Promise<void>) => {
+      setWriteError(null);
+      void work()
+        .then(() =>
+          load(node.profileId, nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, ""))),
+        )
+        .catch((error: unknown) => {
+          setWriteError(isIpcError(error) ? error.message : String(error));
+        });
+    },
+    [load],
+  );
+
   // Only enabled profiles are browsable. A paused folder is one keeper is not
   // watching, and listing it would imply otherwise.
   const enabled = useMemo(() => (profiles ?? []).filter((p) => p.enabled), [profiles]);
@@ -1196,6 +1337,54 @@ export function FilesPane() {
     () => rows.filter((row): row is TreeNodeRow => row.kind === "node"),
     [rows],
   );
+
+  /**
+   * Whether any row in the tree still has a deadline in the future (Story 56.9,
+   * FR-343).
+   *
+   * A BOOLEAN, and that is the load-bearing part: `nodes` is rebuilt whenever a
+   * listing, an expansion or the selection changes, so an effect depending on
+   * the array would tear down and re-arm the interval on every one of those.
+   * Depending on one boolean means the timer is armed once, when the first
+   * countdown appears, and cleared once, when the last one goes.
+   */
+  const counting = useMemo(
+    () =>
+      nodes.some((node) => {
+        const at = node.entry?.release?.releasesAfterMs ?? null;
+        return at !== null && at > nowMs;
+      }),
+    [nodes, nowMs],
+  );
+
+  /**
+   * The pane's one tick (Story 56.9, FR-343). `undo-send-pill.tsx`'s shape,
+   * copied deliberately: a lazy `useState` clock, ONE container-owned interval,
+   * a scalar dependency, and an early return when there is nothing to count.
+   *
+   * **One interval for the whole tree, never one per row.** The rows are
+   * windowed (see {@link useWindowedRows} below), so a timer owned by a row
+   * would be armed and disarmed on every scroll — hundreds of `setInterval`
+   * calls for a gesture that changed no fact — and N counting rows would be N
+   * timers waking the machine N times a second to compute the same subtraction.
+   *
+   * **A pane with nothing counting arms no timer at all**, which is what the
+   * early `return` buys: the ordinary Files tree holds no materialized content,
+   * and it must not tick once a second for the rest of the session to keep
+   * saying so. The same `return` clears the interval when the last deadline
+   * passes, because `counting` asks for a deadline in the FUTURE.
+   *
+   * Nothing here re-browses. The tick advances this pane's clock and nothing
+   * else: the Files tree's listings are on demand, and a countdown reaching zero
+   * means the content is *eligible* for release, not that it is gone.
+   */
+  useEffect(() => {
+    if (!counting) {
+      return;
+    }
+    const timer = setInterval(() => setNowMs(Date.now()), FILES_TICK_MS);
+    return () => clearInterval(timer);
+  }, [counting]);
 
   /**
    * Replace, extend or toggle the selection from one row (Story 45.3).
@@ -1754,6 +1943,7 @@ export function FilesPane() {
     const countId = `files-count-${encodeURIComponent(node.key)}`;
     const sizeId = `files-size-${encodeURIComponent(node.key)}`;
     const mtimeId = `files-mtime-${encodeURIComponent(node.key)}`;
+    const releaseId = `files-release-${encodeURIComponent(node.key)}`;
     const roleId = `files-role-${encodeURIComponent(node.key)}`;
     // When this file was last written (Story 56.7, FR-340), relative under a day
     // and an absolute date beyond it — `formatDraftAge`'s split, taken whole so
@@ -1780,6 +1970,43 @@ export function FilesPane() {
       entry?.mtimeMs == null || entry.mtimeMs > nowMs + FILES_MTIME_FUTURE_GRACE_MS
         ? ""
         : formatDraftAge(entry.mtimeMs, nowMs);
+    // How long the content behind this row will still be here, or Rust's word for
+    // why it is on no clock at all (Story 56.9, FR-343).
+    //
+    // **THE FORMATTED STRING IS THE GUARD, NOT THE FIELD** — the rule `modified`
+    // states four lines above, applied to a second cell for the same reason.
+    // `formatReleaseIn` answers `""` for any instant it cannot render honestly:
+    // non-finite, at or before the epoch, or past `MAX_DATE_MS`. A deadline this
+    // pane cannot render honestly renders as NOTHING at all, and because the same
+    // `releaseShort !== ""` test decides the cell, its id's membership in
+    // `aria-describedby` and whether the row is charged for it in the width plan,
+    // those three cannot come to disagree about whether this row has a release
+    // standing.
+    //
+    // `hold` and `releasesAfterMs` are complementary on the wire — exactly one is
+    // present, proven over every `ReleaseSchedule` variant in `keeper-sync` — so
+    // the word is preferred where there is one and the countdown is computed
+    // where there is not. `?? Number.NaN` rather than a second null test: a
+    // malformed pair (both absent) then reaches the one guard that already
+    // refuses everything unrenderable, instead of a branch that could only ever
+    // be reached by the invariant breaking.
+    //
+    // The eye and the ear get different strings. `"23 hr"` is right in a column
+    // of figures and says nothing at all read aloud in a list of one row's
+    // facts, so the spoken form is a phrase that stands on its own; where there
+    // is a word instead of a clock, the spoken form is Rust's whole sentence,
+    // because "Pinned" alone does not say what being pinned did.
+    const release = entry?.release ?? null;
+    const releaseShort =
+      release === null
+        ? ""
+        : (release.hold ?? formatReleaseIn(release.releasesAfterMs ?? Number.NaN, nowMs));
+    const releaseSpoken =
+      release === null
+        ? ""
+        : release.hold === null
+          ? formatReleaseSpoken(release.releasesAfterMs ?? Number.NaN, nowMs)
+          : release.detail;
     // Everything that DESCRIBES the row, in the order a person would say it.
     // Each of these is visible-but-unspeakable on its own: `aria-label` on the
     // row replaces its subtree's contribution to the name, so a size or a
@@ -1791,6 +2018,7 @@ export function FilesPane() {
         node.count === null ? null : countId,
         entry?.size == null ? null : sizeId,
         modified === "" ? null : mtimeId,
+        releaseShort === "" ? null : releaseId,
         role === null ? null : roleId,
       ]
         .filter((id) => id !== null)
@@ -1852,12 +2080,81 @@ export function FilesPane() {
               icon: copied === entry.absolutePath ? Check : Copy,
               onSelect: () => copyPath(entry.absolutePath),
             },
+            // The three STATE verbs (Story 56.9, FR-343), and they are APPENDED
+            // rather than inserted: the cluster shows a PREFIX of this list, so a
+            // verb added above `copy` would reorder every existing row's promoted
+            // controls at every width. Nothing before this point moved.
+            //
+            // Each glyph is chosen so no verb repeats the sync mark drawn on the
+            // same row — `sync-status-mark` spends Check, Clock, Ban, Cloud,
+            // ArrowDownToLine, HardDrive, CircleDashed and CircleAlert — which is
+            // the duplication the `reveal` comment above warns about: two
+            // identical marks in one row read as one mark drawn twice. So
+            // Materialize is `Download` and not `ArrowDownToLine`, the mark a
+            // materializing row already carries.
+            //
+            // A `materializing` row offers none of them, because the work it
+            // would ask for is already in flight: the only honest verb there
+            // would be a cancel, and Story 56.9 was not asked for one.
+            ...(entry.sync.status === "virtual"
+              ? [
+                  {
+                    id: "materialize",
+                    label: FILES_MATERIALIZE_LABEL,
+                    icon: Download,
+                    onSelect: () =>
+                      runRowVerb(node, () =>
+                        syncMaterializeEntry(node.profileId, entry.relativePath),
+                      ),
+                  },
+                ]
+              : []),
+            // Release before Pin, because releasing is what a person came to this
+            // row to do and pinning is how they say "not this one".
+            //
+            // **Pin only ever sends `true`, and that is not an oversight.**
+            // Nothing on the wire says whether a path is pinned — the row learns
+            // it as Rust's own word in `release.hold` — so a toggle could not tell
+            // the person which way it was about to go, and a control whose effect
+            // depends on a fact it cannot show is worse than no control. Pin is
+            // idempotent in Rust, so pressing it twice is pressing it once, and
+            // `keeper-syncd unpin` is the door back out.
+            ...(entry.sync.status === "materialized"
+              ? [
+                  {
+                    id: "release",
+                    label: FILES_RELEASE_LABEL,
+                    icon: Eraser,
+                    onSelect: () =>
+                      runRowVerb(node, () => syncReleaseEntry(node.profileId, entry.relativePath)),
+                  },
+                  {
+                    id: "pin",
+                    label: FILES_PIN_LABEL,
+                    icon: Pin,
+                    onSelect: () =>
+                      runRowVerb(node, () =>
+                        syncPinEntry(node.profileId, entry.relativePath, true),
+                      ),
+                  },
+                ]
+              : []),
           ];
-    // Whether the date is drawn, and it is decided BEFORE the verbs are planned
-    // because the pixels it takes are pixels they may not have. `modified` first,
-    // so a row with no date to show is never charged for one.
-    const showsModified =
-      modified !== "" && filesRowShowsModified({ column: treeWidth, level: node.level });
+    // How this row spends what it has left: which of its two yielding cells are
+    // painted, and what the verb cluster gets afterwards. One call, declared
+    // AFTER `actions` because the date's gate asks how many verbs this row has —
+    // see {@link filesRowCellPlan} for the stated order and for why the release
+    // cell is charged ahead of the verbs and the date behind them.
+    //
+    // The two `!== ""` tests are the same ones the cells themselves make, so a
+    // row is never charged for a cell it does not render.
+    const plan = filesRowCellPlan({
+      column: treeWidth,
+      level: node.level,
+      actions: actions.length,
+      release: releaseShort !== "",
+      modified: modified !== "",
+    });
     // How many of them are on the row, as against only in its menu. The note
     // header's own policy, applied to a narrower row: a PREFIX of the list, so a
     // verb is out here only if everything above it is, and the cluster never
@@ -1867,15 +2164,14 @@ export function FilesPane() {
     // one by 4px — the group is the row's final child, so there is nothing to its
     // right. Four pixels in the name's favour is the safe direction.
     //
-    // The date's own pixels come off the top when it is drawn, and off nothing
-    // when it is not: `filesRowActionsBudget` reserves the cells every row has,
-    // and this is the one cell a row can decline. Charging it in the reserve
-    // instead would take it from the only flexible child there is — the name —
-    // which is the floor {@link FILES_NAME_FLOOR_PX} exists to hold.
+    // The yielding cells' pixels have already come off `plan.actions`, and off
+    // nothing at all when neither is drawn: `filesRowActionsBudget` reserves the
+    // cells every row has, and these two are the ones a row can decline.
+    // Charging them in the reserve instead would take them from the only
+    // flexible child there is — the name — which is the floor
+    // {@link FILES_NAME_FLOOR_PX} exists to hold.
     const promoted = planPriorityActions({
-      available:
-        filesRowActionsBudget({ column: treeWidth, level: node.level }) -
-        (showsModified ? FILES_ROW_MTIME_PX : 0),
+      available: plan.actions,
       reserved: 0,
       widths: actions.map(() => FILES_ROW_ACTION_PX),
       gap: FILES_ROW_GAP_PX,
@@ -2027,7 +2323,7 @@ export function FilesPane() {
 
             `modified !== ""` is the test that DECIDES that there is a date at
             all, and it is the same one `describedBy` above made, so the cell and
-            its id can never disagree. `showsModified` decides only whether it is
+            its id can never disagree. `plan.modified` decides only whether it is
             PAINTED: the narrow row keeps the same element with the same id and
             the same slot and hides it from the eye alone, because the row that
             has no room for a date is still a row that can say what it is. */}
@@ -2036,12 +2332,60 @@ export function FilesPane() {
             id={mtimeId}
             data-slot={FILES_MTIME_SLOT}
             className={
-              showsModified
+              plan.modified
                 ? "figures w-16 shrink-0 text-right text-muted-foreground text-xs"
                 : "sr-only"
             }
           >
             {modified}
+          </span>
+        )}
+        {/* How long this content will still be here, or Rust's word for why it is
+            on no clock at all (Story 56.9, FR-343).
+
+            `figures` — tabular numerals — because this figure TICKS: a
+            proportional `1` and `7` would make the cell change width once a
+            second and shove the sync mark beside it about. `undo-send-pill`'s
+            countdown sets its numerals the same way for the same reason.
+
+            The eye gets the short form and a reader gets a phrase that stands on
+            its own, which is why the figure is `aria-hidden` and the words are
+            `sr-only`: "23 hr", read out in a list of one row's facts, says
+            nothing at all. Rust's whole sentence is the `title` — the size cell's
+            own idiom on this row — because it is the only place the caveat fits
+            that a deadline reaching zero means ELIGIBLE and not gone.
+
+            **There is deliberately no `aria-live` region here.** The rule that a
+            per-second tick must never announce itself is met by having nothing to
+            announce from: the Files tree is a windowed list of hundreds of rows,
+            so a live region per counting row would announce on every scroll,
+            which is worse than the per-second announcement the rule exists to
+            prevent. The fact is spoken ON DEMAND through the row's
+            `aria-describedby`, exactly as its size, its count and its date
+            already are.
+
+            **And there is deliberately no animation.** No `animate-` class, no
+            `transition-`, no ring and no spinner — so `motion-reduce` needs no
+            branch here and the countdown reads as plain text under any motion
+            preference. A test asserts the absence, which is the mechanical form
+            of that rule.
+
+            `releaseShort !== ""` DECIDES that there is a standing to show at all,
+            and it is the same test `describedBy` and the width plan both made.
+            `plan.release` decides only whether it is PAINTED. */}
+        {release !== null && releaseShort !== "" && (
+          <span
+            id={releaseId}
+            data-slot={FILES_RELEASE_SLOT}
+            title={release.detail}
+            className={
+              plan.release
+                ? "figures w-16 shrink-0 text-right text-muted-foreground text-xs"
+                : "sr-only"
+            }
+          >
+            <span aria-hidden="true">{releaseShort}</span>
+            <span className="sr-only">{releaseSpoken}</span>
           </span>
         )}
         {/* Between the name and the actions: what this file's sync state is.
