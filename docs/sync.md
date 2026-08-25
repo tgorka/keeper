@@ -835,6 +835,7 @@ keeper-syncd pause <id> | resume <id>
 keeper-syncd verify [id]          # re-verify stored content
 keeper-syncd ls-files [id]        # LFS paths: virtual, materialized or absent
 keeper-syncd materialize <id> <path>  # fetch one virtual path's content
+keeper-syncd dehydrate <id> <path>    # release one path's content again
 keeper-syncd doctor               # diagnose the environment
 keeper-syncd logs
 ```
@@ -870,6 +871,40 @@ one), a folder with LFS turned off, a path outside the folder's `subpaths`, and
 a subpath that leaves the folder — including through a symlink. Exit code `1`
 with the reason on stderr; exit `1` too when the folder is busy syncing, so a
 script can tell "you have the file" from "ask again".
+
+`dehydrate` is `materialize` pointing the other way: it removes one path's
+content and leaves the pointer the folder committed, byte for byte. The line
+says `released` with the size you got back. It is the one verb here that can
+destroy data, so it refuses before it writes anything — the folder **keeps
+every object it holds**, which is what a folder does unless you set it to keep
+pointers only, and a release there would be undone on the next pass; the file
+is **not the content this folder committed** (decided by hashing it, not by
+comparing timestamps, so a same-length edit cannot slip through); something has
+it **open**, or this machine **cannot tell** whether anything has; nothing has
+confirmed the **server can serve the object**, which is asked per object at the
+moment of the deletion and where every failure to ask — unreachable, refused,
+invisible repository — is also a refusal; the path is **pinned**; or it was
+**already a pointer**, which is not a failure and exits `0` (`--json` says
+`alreadyPointer`, with no `oid` and no `sizeBytes`). Every other refusal exits
+`1` and changes nothing on disk. The release is a rename, so a program already
+reading the file finishes reading it.
+
+Once the content is gone the release **succeeded**, even if keeper could not
+finish writing down that it happened: a locked database or a busy `.git` is
+logged and the release still reports `released` and exits `0`. Calling a
+completed deletion a failure would be the one thing this contract cannot
+afford. Nothing is lost for good either — the note is rewritten the next time
+that path's content lands, and an index entry left stale is repaired by asking
+to release the path again.
+
+**Today it refuses on every real host**, and that is deliberate rather than
+broken: keeper has no way to ask this operating system whether a file is open
+without racing, and guessing is the one guess that deletes somebody's only
+copy — so the answer is "cannot tell" and the release declines. A platform that
+can answer race-free will make the verb live; until then it is exercised only
+in tests. Automatic release on a time-to-live, rather than one path at a time by
+name, is a later story and no age, pattern or stored timestamp authorizes a
+deletion here.
 
 Paths follow XDG: `$XDG_CONFIG_HOME/keeper-sync/config.toml`,
 `$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`.

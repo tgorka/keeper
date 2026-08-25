@@ -607,6 +607,71 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
     Ok(out)
 }
 
+/// Has the owner asked for this one path's content to stay on this machine?
+///
+/// One column, one path, one statement. Beside [`materialized_rows`] rather
+/// than expressed through it for the reason [`materialized_paths`] is beside
+/// it: the caller here is deciding about a single path and reading the whole
+/// ledger to answer would be a table scan to fetch one bit.
+///
+/// **An absent row and a `NULL` are both `false`**, which is
+/// [`MaterializedRow::pinned`]'s documented rule, not a convenience: an
+/// unpinned path is the default, so a row that has never said otherwise —
+/// including every row written before the column existed — means the same
+/// thing as no row at all. There is no third answer for a caller to act on.
+///
+/// This function knows exactly one fact, and [`remember_materialized`]'s doc
+/// records what a statement that knew more than it needed to cost last time.
+pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool> {
+    let pinned = conn
+        .query_row(
+            "SELECT pinned FROM materialized WHERE profile_id = ?1 AND path = ?2",
+            (profile_id, path),
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    Ok(pinned.flatten().unwrap_or(0) != 0)
+}
+
+/// Forget that this machine holds content for one path.
+///
+/// The counterpart to [`remember_materialized`], called once the content has
+/// actually gone. The row's whole meaning is "content for this path exists
+/// here", and it does not: a retained row is a false statement about this
+/// machine, and the consumer it would mislead is [`materialized_paths`], which
+/// feeds `Engine::pending_files`' `replacing` flag — a queued download would be
+/// announced as replacing content that is no longer there.
+///
+/// It is **not** what makes `lfs::listing` call a path virtual. That comes from
+/// the worktree (`listing::collect` reads `worktree_pointer(..).is_some()`);
+/// the ledger only supplies the timestamps and the pin.
+///
+/// Deletes exactly `(profile_id, path)` and nothing else. Removing an absent
+/// row succeeds — the same contract [`crate::platform::SyncPlatform::secret_delete`]
+/// states, and for the same reason: the caller wants the fact gone, and it
+/// already being gone is that.
+///
+/// # Why the statement will not touch a pinned row
+///
+/// A pinned path never reaches here: the refusal is upstream, in
+/// [`crate::engine::Engine::dehydrate_entry`], which reads [`is_pinned`] twice
+/// and declines. `AND COALESCE(pinned, 0) = 0` is the belt to that braces, and
+/// it is here for the loss class [`remember_materialized`]'s own doc records:
+/// `pinned` is the hard floor a release sweep may not cross, so losing it is
+/// "invisible until content the owner asked to keep was gone". A statement that
+/// is structurally incapable of discarding a pin cannot participate in that,
+/// whatever a future caller does. `COALESCE` because a `NULL` **is** unpinned —
+/// [`MaterializedRow::pinned`]'s documented rule, and every row written before
+/// the column existed reads back that way.
+pub fn forget_materialized(conn: &Connection, profile_id: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM materialized
+          WHERE profile_id = ?1 AND path = ?2 AND COALESCE(pinned, 0) = 0",
+        (profile_id, path),
+    )?;
+    Ok(())
+}
+
 /// Queued transfers that have no name yet, as oid → the units wanting it.
 ///
 /// Every row queued before the `label` column existed is in here, which on an
@@ -2634,6 +2699,86 @@ mod tests {
             }],
             "only the timestamp moved: an upsert that named more than `at_ms`, \
              or a REPLACE that named less, fails here"
+        );
+    }
+
+    /// The pin is the one thing a release may not cross, so every way of not
+    /// being pinned has to answer the same `false` (Story 56.4).
+    #[test]
+    fn is_pinned_reads_one_path_and_treats_absence_and_null_alike() {
+        let c = conn();
+        assert!(
+            !is_pinned(&c, "p", "40-media/clip.mp4").expect("no row"),
+            "a path this machine has never materialized is not pinned"
+        );
+
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "p", "40-media/other.mp4", 1_700).expect("landing");
+        assert!(
+            !is_pinned(&c, "p", "40-media/clip.mp4").expect("null column"),
+            "the one writer sets `at_ms` and nothing else, so `pinned` reads \
+             back NULL — which means the default, not a third answer"
+        );
+
+        c.execute(
+            "UPDATE materialized SET pinned = 1
+              WHERE profile_id = 'p' AND path = '40-media/clip.mp4'",
+            [],
+        )
+        .expect("pin it the way 56.5's writer will");
+        assert!(is_pinned(&c, "p", "40-media/clip.mp4").expect("pinned"));
+        assert!(
+            !is_pinned(&c, "p", "40-media/other.mp4").expect("sibling"),
+            "one path's pin is not its neighbour's"
+        );
+        assert!(
+            !is_pinned(&c, "q", "40-media/clip.mp4").expect("other profile"),
+            "and not another folder's, even at the same path"
+        );
+    }
+
+    /// Forgetting one path leaves every other fact in the ledger alone — and
+    /// the owner's pin is one of those facts.
+    #[test]
+    fn forget_materialized_removes_exactly_one_row() {
+        let c = conn();
+        remember_materialized(&c, "p", "a.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "p", "b.mp4", 1_800).expect("landing");
+        remember_materialized(&c, "q", "a.mp4", 1_900).expect("landing");
+
+        forget_materialized(&c, "p", "a.mp4").expect("forget");
+        assert_eq!(
+            materialized_rows(&c, "p")
+                .expect("read")
+                .into_iter()
+                .map(|row| row.path)
+                .collect::<Vec<_>>(),
+            vec!["b.mp4".to_owned()],
+            "the sibling in the same folder survives"
+        );
+        assert_eq!(
+            materialized_rows(&c, "q").expect("read").len(),
+            1,
+            "and so does the same path in another folder"
+        );
+
+        forget_materialized(&c, "p", "a.mp4")
+            .expect("forgetting an absent row must succeed, as deleting an absent secret does");
+        forget_materialized(&c, "p", "never-here.mp4").expect("nor is a path it never knew");
+
+        // And a pinned row is not one it can take, whatever a caller asks. The
+        // refusal that keeps a pinned path away from here lives in the engine;
+        // this is the statement being incapable of the loss on its own.
+        remember_materialized(&c, "p", "kept.mp4", 2_000).expect("landing");
+        c.execute(
+            "UPDATE materialized SET pinned = 1 WHERE profile_id = 'p' AND path = 'kept.mp4'",
+            [],
+        )
+        .expect("pin it the way 56.5's writer will");
+        forget_materialized(&c, "p", "kept.mp4").expect("the statement succeeds");
+        assert!(
+            is_pinned(&c, "p", "kept.mp4").expect("still pinned"),
+            "the row — and with it the owner's pin — survived the delete"
         );
     }
 

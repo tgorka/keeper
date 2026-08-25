@@ -1,5 +1,5 @@
-//! Asking for one path's content, and the refusal that protects the bytes
-//! already there (Story 56.3, FR-338).
+//! Asking for one path's content, releasing it again, and the refusals that
+//! protect the bytes already there (Stories 56.3 and 56.4, FR-338, FR-332).
 //!
 //! # Hydration is a verb, not a side effect
 //!
@@ -16,8 +16,13 @@
 //! [`ContentRefusal`] says *keeper will not change the bytes at this path*.
 //! That is the same sentence on both sides of the epic — materializing must not
 //! overwrite a local modification, and releasing must not delete one — which is
-//! why 56.4's five release refusals extend this enum rather than forking a
-//! `ReleaseRefusal` beside it. It is a standalone enum with a hand-written
+//! why 56.4's release refusals ([`ContentRefusal::Modified`],
+//! [`ContentRefusal::Open`] with its [`ContentRefusal::OpenUnknown`] arm,
+//! [`ContentRefusal::UnprovenOnRemote`], [`ContentRefusal::Pinned`],
+//! [`ContentRefusal::AlreadyPointer`] and
+//! [`ContentRefusal::AlwaysMaterializes`]) extended this enum rather than
+//! forking a `ReleaseRefusal` beside it. It is a standalone enum with a
+//! hand-written
 //! `Display`, the idiom [`crate::browse::BrowseRefusal`],
 //! [`crate::files_write::WriteRefusal`], [`crate::export::ExportRefusal`] and
 //! [`crate::file_serve::ServeRefusal`] already establish, and it is carried
@@ -57,9 +62,12 @@ use crate::lfs::stage::{self, PendingSmudge};
 /// for something that must not happen, and the sentence it renders is the one
 /// the person who asked reads.
 ///
-/// 56.4 adds `Open`, `UnprovenOnRemote`, `Pinned` and `AlreadyPointer` here
-/// rather than to [`crate::error::SyncError`], for the reason this module's doc
-/// gives.
+/// 56.4's release refusals — `Modified`, `Open` (with its `OpenUnknown` arm),
+/// `UnprovenOnRemote`, `Pinned`, `AlreadyPointer` and `AlwaysMaterializes` —
+/// live here rather than
+/// in [`crate::error::SyncError`], for the reason this module's doc gives: one
+/// vocabulary, carried by one `SyncError` variant, so growing it costs nothing
+/// in the two exhaustive classifiers that have to sort it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentRefusal {
     /// The subpath is not a plain descendant of the profile root. Carries
@@ -130,6 +138,100 @@ pub enum ContentRefusal {
         /// The subpath as asked for, verbatim.
         path: String,
     },
+    /// The worktree file is not the content this folder committed, so keeper
+    /// will not **delete** it.
+    ///
+    /// [`Self::LocallyModified`]'s pair, pointing the other way: that one says
+    /// keeper will not *overwrite* what is there, this one says keeper will not
+    /// *destroy* it. Both are the same sentence about the same bytes, which is
+    /// why they are two variants of one enum and not two enums.
+    ///
+    /// Decided by content identity — length, then SHA-256 against the committed
+    /// `oid` — and not by a stat comparison. A same-length edit written back
+    /// with the original mtime passes every stat test there is, and this is the
+    /// verb that would then delete it.
+    Modified {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// Something on this machine has the file open, so its content stays.
+    ///
+    /// A release renames a ~130-byte pointer over the content. Descriptors
+    /// already open keep reading the old inode, but anything that opens the
+    /// path *after* the rename reads pointer text where it expected the file.
+    Open {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// This machine cannot say whether the file is open, so it is left alone.
+    ///
+    /// [`crate::platform::SyncPlatform::open_file_state`]'s default, and the
+    /// answer every real host gives today: there is no race-free primitive
+    /// available to this crate, and an `lsof`-shaped snapshot is refused by
+    /// name (AD-125). Its own variant rather than folded into [`Self::Open`]
+    /// because the two say different things to the person reading the sentence
+    /// — "close it and ask again" versus "keeper cannot tell yet" — and only
+    /// one of them is something they can act on.
+    OpenUnknown {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// Nothing established that the object is safely on the remote, so the
+    /// copy that is here is the copy that stays.
+    ///
+    /// Affirmative proof, taken per object at the moment of the deletion. Every
+    /// failure to *ask* lands here too — an unreachable server, a rejected
+    /// credential, a batch the repository is invisible to — because the only
+    /// sentence that matters is the same one: keeper could not establish that
+    /// these bytes exist anywhere else, so it will not remove them. Never a
+    /// transient fault, which a scheduler would be entitled to re-drive against
+    /// a deletion.
+    UnprovenOnRemote {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// The owner has asked for this path's content to stay on this machine.
+    ///
+    /// The hard floor: a pin is the one instruction a release may not weigh
+    /// against anything else, so it is checked before the two expensive proofs
+    /// rather than after them.
+    Pinned {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// The worktree already holds the committed pointer, so there is no content
+    /// here to release.
+    ///
+    /// A refusal, and the door reports it as **success**. It has to be a typed
+    /// error a caller can branch on — that is what makes every refusal one
+    /// uniform contract, where an `Ok` outcome for this case would have made
+    /// "keeper released something" and "keeper found nothing to release"
+    /// indistinguishable in the return type — and it also has to be something
+    /// nobody must handle as a failure. `keeper-syncd`'s `nothing_to_release`
+    /// is where those two facts meet.
+    AlreadyPointer {
+        /// The subpath as asked for, verbatim.
+        path: String,
+    },
+    /// This folder keeps every object it holds, so releasing one path's
+    /// content would be undone.
+    ///
+    /// A folder in the default mode re-materializes any path whose worktree
+    /// holds a pointer as soon as the next pass reaches it, copying the
+    /// content back from this machine's object store or queueing a download of
+    /// it. Removing one path's content there does not reclaim anything: it
+    /// costs the folder a fetch and gets the bytes back. So the release only
+    /// means something in a folder that is *meant* to hold pointers, and the
+    /// answer for a folder that keeps everything is to say so rather than to
+    /// do the work twice.
+    ///
+    /// Carries the profile's **name**, like [`Self::Paused`] and
+    /// [`Self::LfsDisabled`]: this is a fact about the folder, not about the
+    /// path that was asked for.
+    AlwaysMaterializes {
+        /// The profile's name — the folder's setting is the thing to change.
+        profile: String,
+    },
 }
 
 impl std::fmt::Display for ContentRefusal {
@@ -172,6 +274,42 @@ impl std::fmt::Display for ContentRefusal {
                 f,
                 "\"{path}\" does not hold the pointer this folder committed, so keeper will not \
                  overwrite what is there"
+            ),
+            Self::Modified { path } => write!(
+                f,
+                "\"{path}\" does not hold the content this folder committed, so keeper will not \
+                 delete what is there"
+            ),
+            Self::Open { path } => write!(
+                f,
+                "\"{path}\" is open in another program, so keeper is leaving its content where \
+                 it is; close it and ask again"
+            ),
+            Self::OpenUnknown { path } => write!(
+                f,
+                "keeper cannot tell whether \"{path}\" is in use on this machine, and it will \
+                 not remove content something may be reading"
+            ),
+            Self::UnprovenOnRemote { path } => write!(
+                f,
+                "nothing has confirmed that the content of \"{path}\" is safely on the server, \
+                 so keeper is keeping the copy that is here"
+            ),
+            Self::Pinned { path } => write!(
+                f,
+                "\"{path}\" is kept on this machine on purpose, so keeper will not remove its \
+                 content"
+            ),
+            Self::AlreadyPointer { path } => write!(
+                f,
+                "\"{path}\" is not holding any content to remove; the folder has nothing but \
+                 its pointer here already"
+            ),
+            Self::AlwaysMaterializes { profile } => write!(
+                f,
+                "\"{profile}\" keeps its content on this machine, so letting one file go here \
+                 would be undone the next time keeper looks at the folder; set the folder to \
+                 keep pointers only if that is what you want"
             ),
         }
     }
@@ -255,6 +393,34 @@ pub struct Materialization {
     /// row queued the first time: `db::enqueue_unique` deduplicates on the
     /// payload, so asking twice returns one id and queues one download.
     pub unit_id: Option<i64>,
+}
+
+/// What one release actually released (Story 56.4, FR-332).
+///
+/// Produced only when content was removed and the committed pointer published
+/// in its place: every other ending is a [`ContentRefusal`], so there is no
+/// outcome enum here and nothing to branch on to find out whether anything
+/// happened.
+///
+/// The size and the oid are the **pointer's** — [`Materialization`]'s rule,
+/// for [`Materialization`]'s reason, and here it is the number that was
+/// reclaimed rather than the number that was fetched.
+///
+/// Deliberately not `Serialize`, again for [`Materialization`]'s reason:
+/// `keeper-syncd`'s two release documents have different key sets, and the one
+/// that reports "nothing to release" promises `oid` and `sizeBytes` are
+/// **absent** rather than null. A derived serialization cannot express that, so
+/// each document is built by a renderer whose key set a test can assert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// Repository-relative and `/`-joined, the frame every other path in this
+    /// crate is already in.
+    pub path: String,
+    /// The pointer's object id, bare hex — the object the remote proved it can
+    /// serve, which is what made the release permissible.
+    pub oid: String,
+    /// The pointer's size: the bytes this machine no longer holds.
+    pub size_bytes: u64,
 }
 
 /// What may be done with one path, once every refusal has been ruled out.
@@ -474,6 +640,12 @@ mod tests {
     /// The messages reach a user verbatim — `keeper-syncd`'s stderr and the IPC
     /// envelope's `message` both take `to_string()` — so a refusal that did not
     /// say *which* file is a refusal nobody can act on.
+    ///
+    /// **Hand-written, so it is extended deliberately.** A new variant does not
+    /// break the compilation of this list the way it breaks the `Display`
+    /// match, so 56.4's seven arrived here by decision rather than by
+    /// pressure — and every one of them is a sentence a person reads after
+    /// being told their file is staying where it is.
     #[test]
     fn every_refusal_names_what_it_is_about() {
         let named: Vec<ContentRefusal> = vec![
@@ -489,6 +661,24 @@ mod tests {
             ContentRefusal::LocallyModified {
                 path: "40-media/clip.mp4".to_owned(),
             },
+            ContentRefusal::Modified {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::Open {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::OpenUnknown {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::UnprovenOnRemote {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::Pinned {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            },
         ];
         for refusal in named {
             assert!(
@@ -496,11 +686,18 @@ mod tests {
                 "got: {refusal}"
             );
         }
-        assert!(ContentRefusal::LfsDisabled {
-            profile: "Field".to_owned()
+        // The two folder-level refusals name the FOLDER, because the folder's
+        // setting is the thing a person changes to get a different answer.
+        for refusal in [
+            ContentRefusal::LfsDisabled {
+                profile: "Field".to_owned(),
+            },
+            ContentRefusal::AlwaysMaterializes {
+                profile: "Field".to_owned(),
+            },
+        ] {
+            assert!(refusal.to_string().contains("Field"), "got: {refusal}");
         }
-        .to_string()
-        .contains("Field"));
 
         // The containment refusal is browse's own sentence, unchanged.
         let escape = BrowseRefusal::Escapes {

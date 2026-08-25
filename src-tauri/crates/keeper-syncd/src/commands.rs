@@ -31,7 +31,7 @@ use serde::Serialize;
 
 use keeper_sync::engine::Engine;
 use keeper_sync::lfs::audit::RemoteAudit;
-use keeper_sync::lfs::hydrate::Materialization;
+use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Release};
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
@@ -300,6 +300,29 @@ pub enum Command {
     /// not overwrite a local modification.
     Materialize {
         /// Profile id or name. Required: materializing is a write, and "all
+        /// folders" is not a thing anybody means by it.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
+    /// Release one path's content, leaving the pointer this folder committed
+    /// (FR-332, FR-333).
+    ///
+    /// `materialize`'s inverse, and the verb where a mistake destroys the only
+    /// copy — so it refuses before it writes anything: the folder keeps every
+    /// object it holds (so a release there would be undone), the file is not
+    /// the content this folder committed, something has it open (or this
+    /// machine cannot tell), nothing has confirmed the server can serve the
+    /// object, the path is pinned, or there was no content here to begin with.
+    /// The last of those is a no-op and exits 0; every other refusal exits 1
+    /// and changes nothing on disk.
+    ///
+    /// A release whose **bookkeeping** failed afterwards still exits 0 and
+    /// still reports the release: by then the content is gone, and calling a
+    /// completed deletion a failure would be the one lie this contract cannot
+    /// afford. `Engine::dehydrate_entry` logs what it could not record.
+    Dehydrate {
+        /// Profile id or name. Required: releasing is a deletion, and "all
         /// folders" is not a thing anybody means by it.
         profile: String,
         /// The path inside the folder, as `ls-files` spells it.
@@ -590,6 +613,10 @@ pub async fn run(
         Command::Materialize { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
             cmd_materialize(&printer, &engine, &profile, &subpath)
+        }
+        Command::Dehydrate { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_dehydrate(&printer, &engine, &profile, &subpath).await
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -1476,6 +1503,149 @@ fn cmd_materialize(
 }
 
 // ---------------------------------------------------------------------------
+// dehydrate
+// ---------------------------------------------------------------------------
+
+/// One release as a human reads it.
+///
+/// Pure, taking the profile's *name*, for [`materialize_lines`]'s reason. One
+/// line, because this verb settles exactly one path and it either released it
+/// or refused.
+///
+/// The size is the **pointer's**: the bytes this machine no longer holds, which
+/// is the number a person asking for space back was asking about. The word is
+/// prose — `released` — and it is not the `--json` document's `outcome` token
+/// by coincidence rather than by sharing a function; see
+/// [`already_pointer_line`], where the two genuinely differ.
+fn dehydrate_line(profile_name: &str, done: &Release) -> String {
+    format!(
+        "{profile_name}: released  {size}  {path}",
+        size = format_bytes(done.size_bytes),
+        path = done.path,
+    )
+}
+
+/// One release as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `oid`,
+/// `sizeBytes`, `outcome`. Built by naming the keys rather than by serializing
+/// [`Release`], for the reason [`materialize_json`] states and because the
+/// sibling document below has a deliberately *narrower* key set that no single
+/// derived serialization could produce.
+fn dehydrate_json(profile: &SyncProfile, done: &Release) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "oid": done.oid,
+        "sizeBytes": done.size_bytes,
+        "outcome": "released",
+    })
+}
+
+/// The no-op line: there was no content here to release.
+///
+/// Prose, not the wire word. `alreadyPointer` in a sentence a person reads is a
+/// token that escaped from a JSON document — [`MaterializeOutcome`]'s own
+/// `Display` doc makes the same distinction for the same reason.
+fn already_pointer_line(profile_name: &str, path: &str) -> String {
+    format!("{profile_name}: already a pointer  {path}")
+}
+
+/// The no-op document: `profileId`, `profile`, `path`, `outcome` — and
+/// **no** `oid`, **no** `sizeBytes`.
+///
+/// Absent rather than null, and this is the sharper case of the rule
+/// [`materialize_json`] follows: nothing was released, so there is no size to
+/// report, and `sizeBytes: 0` would read as "released, nothing in it" while
+/// `sizeBytes: null` would read as "released something and lost the number". A
+/// consumer totalling reclaimed bytes must be able to skip this document
+/// without arithmetic.
+fn already_pointer_json(profile: &SyncProfile, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": path,
+        "outcome": "alreadyPointer",
+    })
+}
+
+/// The one refusal that is not a failure, and the path it is about.
+///
+/// [`Engine::dehydrate_entry`] returns `Ok` only when it actually released
+/// something, so "there was nothing here to release" arrives as
+/// [`ContentRefusal::AlreadyPointer`] — a typed error a caller can branch on,
+/// which is what makes every refusal one uniform contract. Both halves of
+/// that are literal: it has to be distinguishable *by type*, and it must not be
+/// something a caller has to handle as a failure.
+///
+/// This is where the two meet, and it is a pure function with its own test
+/// precisely because "the refusals really are distinguishable" is the claim
+/// being made. Matching on the message would have been the other reading, and
+/// it is the one that stops working the first time a sentence is reworded.
+fn nothing_to_release(err: &SyncError) -> Option<&str> {
+    match err {
+        SyncError::Refused(ContentRefusal::AlreadyPointer { path }) => Some(path),
+        _ => None,
+    }
+}
+
+/// Let one path's content go in one folder.
+///
+/// [`Engine::dehydrate_entry`] holds every decision — containment, the mode,
+/// the index, the cone, whether these are the committed bytes, whether the path
+/// is pinned, whether the server can serve the object, and whether anything has
+/// the file open. This function selects the profile, branches on the one
+/// refusal that is a no-op, and prints.
+///
+/// A required profile resolved through [`select`], and a two-folder name match
+/// refused by asking for the id — [`cmd_materialize`]'s rule, and it matters
+/// more here: there is no defensible arbitrary choice about which folder to
+/// delete from.
+async fn cmd_dehydrate(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = match engine.dehydrate_entry(&profile.id, subpath).await {
+        Ok(done) => done,
+        Err(err) => {
+            // Nothing to do is not a failed run: the caller asked for this path
+            // to hold nothing but its pointer, and it does.
+            if let Some(path) = nothing_to_release(&err) {
+                printer.line(already_pointer_line(&profile.name, path));
+                printer.json(&already_pointer_json(profile, path));
+                return Ok(());
+            }
+            // Every other refusal exits 1 through `sync_exit_code`. `Busy` is
+            // `EXIT_OK` for `sync --once`, where losing a race did no wrong;
+            // this verb promises the content is gone, so a run that did not do
+            // it has to be visible in `$?` — `cmd_materialize`'s reasoning.
+            return Err(match err {
+                SyncError::Busy(name) => CliError::Operational(format!(
+                    "{name} is busy syncing right now; ask again in a moment"
+                )),
+                other => other.into(),
+            });
+        }
+    };
+    printer.line(dehydrate_line(&profile.name, &done));
+    printer.json(&dehydrate_json(profile, &done));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // logs
 // ---------------------------------------------------------------------------
 
@@ -2133,6 +2303,7 @@ mod tests {
             &["keeper-syncd", "sync", "docs", "--once"],
             &["keeper-syncd", "watch"],
             &["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "dehydrate", "docs", "40-media/clip.mp4"],
             &["keeper-syncd", "pause", "docs"],
             &["keeper-syncd", "resume", "docs"],
             &["keeper-syncd", "verify"],
@@ -2173,13 +2344,15 @@ mod tests {
                 .expect_err("a profile is required to pause or resume one");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
         }
-        // `materialize` needs two: a folder and a path inside it. One argument
-        // is the shape a person trying `materialize clip.mp4` produces, and it
-        // must be told what is missing rather than have `clip.mp4` read as a
-        // profile name.
+        // `materialize` and `dehydrate` each need two: a folder and a path
+        // inside it. One argument is the shape a person trying
+        // `materialize clip.mp4` produces, and it must be told what is missing
+        // rather than have `clip.mp4` read as a profile name.
         for args in [
             vec!["keeper-syncd", "materialize"],
             vec!["keeper-syncd", "materialize", "docs"],
+            vec!["keeper-syncd", "dehydrate"],
+            vec!["keeper-syncd", "dehydrate", "docs"],
         ] {
             let err = parse(&args).expect_err("a profile AND a subpath are required");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
@@ -2876,5 +3049,176 @@ mod tests {
         };
         assert_eq!(profile, "docs");
         assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    // --- dehydrate: the two documents and the exit-0 branch (Story 56.4) ----
+
+    fn release() -> Release {
+        Release {
+            path: "40-media/clip.mp4".to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes: 4 * 1024 * 1024,
+        }
+    }
+
+    /// Two positionals, in that order, and neither optional.
+    #[test]
+    fn dehydrate_takes_a_folder_and_a_path_inside_it() {
+        let cli =
+            parse(&["keeper-syncd", "dehydrate", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Dehydrate { profile, subpath } = cli.command else {
+            panic!("expected dehydrate");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    /// The released line carries the honest size and the path, in prose.
+    ///
+    /// The size assertion is the load-bearing one and it is pinned by moving
+    /// the field: 4 MiB and 130 B can only both hold if `size_bytes` is what is
+    /// rendered — and after a release the file on disk is the ~130 bytes, so a
+    /// renderer reading the worktree would have printed the wrong number.
+    #[test]
+    fn the_released_line_carries_the_honest_size_and_the_path() {
+        let line = dehydrate_line("Field", &release());
+        assert!(line.contains("released"), "{line}");
+        assert!(
+            line.contains("4.0 MB"),
+            "the bytes given back are the pointer's number: {line}"
+        );
+        assert!(line.contains("40-media/clip.mp4"), "{line}");
+
+        let mut small = release();
+        small.size_bytes = 130;
+        assert!(
+            dehydrate_line("Field", &small).contains("130 B"),
+            "the line renders `size_bytes`, whatever it says"
+        );
+    }
+
+    /// The no-op line says so in prose, never in the wire word.
+    ///
+    /// `alreadyPointer` in a sentence a person reads is a token that escaped
+    /// from a JSON document — `MaterializeOutcome`'s `Display` doc makes the
+    /// same distinction for the same reason.
+    #[test]
+    fn the_already_pointer_line_is_prose_and_not_the_wire_word() {
+        let line = already_pointer_line("Field", "40-media/clip.mp4");
+        assert!(line.contains("already a pointer"), "{line}");
+        assert!(line.contains("40-media/clip.mp4"), "{line}");
+        assert!(
+            !line.contains("alreadyPointer"),
+            "the camelCase spelling belongs to the document, not the sentence: {line}"
+        );
+    }
+
+    /// The released document's key set is exactly the contract.
+    #[test]
+    fn the_dehydrate_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = dehydrate_json(&profile, &release());
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "oid",
+                "outcome",
+                "path",
+                "profile",
+                "profileId",
+                "sizeBytes"
+            ]
+        );
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["outcome"], serde_json::json!("released"));
+        assert_eq!(
+            object["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes now on disk"
+        );
+    }
+
+    /// The no-op document says `alreadyPointer` and carries **no** `oid` and
+    /// **no** `sizeBytes`.
+    ///
+    /// Absent, not null and not zero: nothing was released, so a consumer
+    /// totalling reclaimed bytes has to be able to skip this document without
+    /// arithmetic. Asserted on the key set, because a renamed or added field is
+    /// exactly the breakage a `contains` check would miss.
+    #[test]
+    fn the_already_pointer_json_carries_no_oid_and_no_size() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = already_pointer_json(&profile, "40-media/clip.mp4");
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["outcome", "path", "profile", "profileId"]);
+        assert_eq!(object["outcome"], serde_json::json!("alreadyPointer"));
+        assert_eq!(object["path"], serde_json::json!("40-media/clip.mp4"));
+    }
+
+    /// Exactly one refusal is a no-op; every other one is a failed run.
+    ///
+    /// The branch that gives `dehydrate` its exit-0 case, asserted over the
+    /// whole vocabulary rather than over the one variant it matches — because
+    /// the claim is that the refusals are distinguishable *by type*, and a
+    /// second variant leaking through here would silently turn a refused
+    /// deletion into a reported success.
+    #[test]
+    fn only_already_pointer_is_nothing_to_release() {
+        assert_eq!(
+            nothing_to_release(&SyncError::Refused(ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            })),
+            Some("40-media/clip.mp4"),
+            "and it hands back the path, so the no-op line can name it"
+        );
+
+        let path = "40-media/clip.mp4".to_owned();
+        let others = [
+            ContentRefusal::Modified { path: path.clone() },
+            ContentRefusal::Open { path: path.clone() },
+            ContentRefusal::OpenUnknown { path: path.clone() },
+            ContentRefusal::UnprovenOnRemote { path: path.clone() },
+            ContentRefusal::Pinned { path: path.clone() },
+            ContentRefusal::Missing { path: path.clone() },
+            ContentRefusal::NotTracked { path: path.clone() },
+            ContentRefusal::OutsideSubpaths { path: path.clone() },
+            ContentRefusal::LocallyModified { path },
+            ContentRefusal::Paused {
+                profile: "docs".to_owned(),
+            },
+            ContentRefusal::LfsDisabled {
+                profile: "docs".to_owned(),
+            },
+            ContentRefusal::AlwaysMaterializes {
+                profile: "docs".to_owned(),
+            },
+        ];
+        for refusal in others {
+            let err = SyncError::Refused(refusal.clone());
+            assert_eq!(
+                nothing_to_release(&err),
+                None,
+                "{refusal:?} is a refused release, so the command must fail"
+            );
+            assert_eq!(
+                sync_exit_code(&err),
+                EXIT_FAILURE,
+                "...and exit 1: {refusal:?}"
+            );
+        }
+
+        // Nor is anything that is not a refusal at all.
+        assert_eq!(nothing_to_release(&SyncError::MediaAbsent), None);
+        assert_eq!(
+            nothing_to_release(&SyncError::Busy("docs".to_owned())),
+            None
+        );
     }
 }

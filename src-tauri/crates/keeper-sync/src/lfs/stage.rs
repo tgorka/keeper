@@ -40,7 +40,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::error::{Result, SyncError};
 use crate::lfs::pointer::{self, Pointer};
-use crate::lfs::store::LfsStore;
+use crate::lfs::store::{LfsStore, HASH_CHUNK_BYTES};
 use crate::profile::{LfsMode, SyncProfile};
 
 /// Attribute line keeper maintains for an LFS-tracked pattern.
@@ -774,21 +774,31 @@ pub fn clean(store: &LfsStore, absolute: &Path) -> Result<Pointer> {
 ///
 /// git spells every path with forward slashes, so a Windows `a\b` finds
 /// nothing until it is asked for as `a/b`.
-fn index_key(rela: &Path) -> String {
+///
+/// `pub(crate)` because git's spelling is not only the index's key: it is also
+/// the spelling the `materialized` ledger's rows are written with, and
+/// [`crate::engine::Engine::dehydrate_entry`] has to key its two ledger calls
+/// and its reported path the same way it keyed the index lookup — otherwise on
+/// Windows a `\`-joined path would miss a pin and delete nothing from the
+/// ledger while reporting a `/`-joined path it never used.
+pub(crate) fn index_key(rela: &Path) -> String {
     rela.to_string_lossy().replace('\\', "/")
 }
 
-/// The pointer `blob` holds, if it is one.
+/// Could `blob` be an LFS pointer at all, judged from the object header?
 ///
-/// The **blob's own** length decides it, read from the object header so
-/// nothing larger is ever loaded. Consulting the index entry's `stat.size`
-/// instead is the mistake this was born with: for an LFS entry that stat is
-/// the WORKTREE file's, deliberately — see `git::commit::stage_and_commit` —
-/// so it measures the gigabytes the pointer stands in for and never the ~130
-/// bytes actually staged. It therefore rejected precisely the entries this
-/// exists to recognise, and every real LFS file answered `None`.
+/// The **blob's own** length decides it, read from the header so nothing
+/// larger is ever loaded. Consulting the index entry's `stat.size` instead is
+/// the mistake this was born with: for an LFS entry that stat is the WORKTREE
+/// file's, deliberately — see `git::commit::stage_and_commit` — so it measures
+/// the gigabytes the pointer stands in for and never the ~130 bytes actually
+/// staged. It therefore rejected precisely the entries this exists to
+/// recognise, and every real LFS file answered `None`.
 ///
-/// # Why an EMPTY blob answers `None`, and why the refusal lives here
+/// Both readers below share this rather than restating it, so the two cannot
+/// disagree about *whether* a blob is a candidate.
+///
+/// # Why an EMPTY blob answers `false`, and why the refusal lives here
 ///
 /// [`Pointer::parse`] answers `Some(empty pointer)` for zero bytes, and that
 /// is right where it is: the LFS spec carves empty files out of the format, so
@@ -798,7 +808,7 @@ fn index_key(rela: &Path) -> String {
 /// nothing. Inheriting the carve-out **here** is what was wrong (Story 34.13
 /// review). The question this function asks is "is this git blob an LFS
 /// pointer", and every empty tracked file in the repository shares the one
-/// empty blob; answering `Some` made [`indexed_pointer`] call all of them LFS
+/// empty blob; answering `true` made [`indexed_pointer`] call all of them LFS
 /// entries and handed [`is_false_modification`] a dismissible entry for each —
 /// one value away from the I/O-matrix row this story exists to establish
 /// ("Ordinary small file | blob = 5 bytes, not a pointer | `None`"), which has
@@ -808,12 +818,57 @@ fn index_key(rela: &Path) -> String {
 /// through LFS, so there is no pointer design for a racily-clean re-read to
 /// have rediscovered, and the guard below simply declines to dismiss it. It
 /// also saves loading the object at all, since the header already said zero.
+fn blob_could_be_a_pointer(repo: &gix::Repository, blob: gix::hash::ObjectId) -> bool {
+    let Ok(header) = repo.find_header(blob) else {
+        return false;
+    };
+    let size = header.size();
+    size != 0 && size <= pointer::MAX_POINTER_BYTES as u64
+}
+
+/// The pointer `blob` holds, if it is one.
+///
+/// Parses the object's buffer **in place**, with no copy: this runs once per
+/// index entry from [`indexed_pointers`], and the folders keeper is for are
+/// vaults of small files — every one of which is inside the window
+/// [`blob_could_be_a_pointer`] admits, so an allocation here would be an
+/// allocation per file listed.
 fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Pointer> {
-    let size = repo.find_header(blob).ok()?.size();
-    if size == 0 || size > pointer::MAX_POINTER_BYTES as u64 {
+    if !blob_could_be_a_pointer(repo, blob) {
         return None;
     }
     Pointer::parse(&repo.find_object(blob).ok()?.data)
+}
+
+/// [`pointer_blob`]'s answer, **with the blob's own bytes**.
+///
+/// The bytes are what [`dehydrate`] writes into the worktree, and they cannot
+/// be reconstructed from the [`Pointer`]: [`Pointer::render`] reproduces its
+/// input byte for byte only when [`Pointer::is_canonical`], whose own doc says
+/// "`false` means **do not re-encode**: write the bytes you read". A pointer
+/// committed by another git-lfs client with a legacy version URL, unsorted
+/// keys or a non-minimal `size` renders to *different* bytes — a different
+/// blob hash, and therefore a path that reads modified forever.
+///
+/// So this is the same bounded read [`pointer_blob`] already paid, keeping what
+/// that one throws away. The clone is here and **not** in `pointer_blob`, which
+/// is the listing hot path: a release asks about one path a person is waiting
+/// on. Both size carve-outs are [`blob_could_be_a_pointer`]'s, so the two
+/// readers cannot disagree.
+fn pointer_blob_bytes(
+    repo: &gix::Repository,
+    blob: gix::hash::ObjectId,
+) -> Option<(Pointer, Vec<u8>)> {
+    if !blob_could_be_a_pointer(repo, blob) {
+        return None;
+    }
+    // Cloned rather than moved: `gix::Object` implements `Drop` (it returns its
+    // buffer to the repository's pool), so the field cannot be taken out of it.
+    // At most `MAX_POINTER_BYTES`, which the header check above has already
+    // guaranteed.
+    let bytes = repo.find_object(blob).ok()?.data.clone();
+    let pointer = Pointer::parse(&bytes)?;
+    Some((pointer, bytes))
 }
 
 /// Read the pointer recorded in the index for `rela`, if the blob is one.
@@ -824,12 +879,29 @@ fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Poi
 ///
 /// An **empty** tracked file counts as ordinary here and answers `None`, even
 /// though `Pointer::parse` reads zero bytes as the empty pointer — see
-/// `pointer_blob` for why that carve-out stops at the blob layer.
+/// `blob_could_be_a_pointer` for why that carve-out stops at the blob layer.
 pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
     let index = repo.index_or_empty().ok()?;
     let key = index_key(rela);
     let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
     pointer_blob(repo, entry.id)
+}
+
+/// [`indexed_pointer`]'s answer, **with the committed blob's own bytes**.
+///
+/// The accessor a release needs, for the reason [`pointer_blob_bytes`] gives:
+/// the bytes written back over the content must be the ones git has, not a
+/// re-rendering of them.
+///
+/// Mirrors [`indexed_pointer`] exactly — same index read, same key spelling,
+/// same `None` for a path git does not track, a plain tracked file, or an
+/// empty blob — so a caller cannot get a different answer about *whether* a
+/// path is an LFS entry by asking for the bytes as well.
+pub fn indexed_pointer_blob(repo: &gix::Repository, rela: &Path) -> Option<(Pointer, Vec<u8>)> {
+    let index = repo.index_or_empty().ok()?;
+    let key = index_key(rela);
+    let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
+    pointer_blob_bytes(repo, entry.id)
 }
 
 /// The pointer the worktree file at `absolute` **is**, if its bytes are
@@ -874,7 +946,8 @@ pub fn indexed_pointer(repo: &gix::Repository, rela: &Path) -> Option<Pointer> {
 /// documented one; a truncated read of a grown file cannot parse anyway, since
 /// [`Pointer::parse`] refuses input at or above the ceiling.
 ///
-/// A **zero-length** file is refused, for the reason [`pointer_blob`] refuses
+/// A **zero-length** file is refused, for the reason
+/// [`blob_could_be_a_pointer`] refuses
 /// the empty blob: [`Pointer::parse`] reads zero bytes as the empty pointer,
 /// but an empty worktree file is a real size of its own and stands in for
 /// nothing, and calling every empty tracked file virtual is the failure that
@@ -1463,6 +1536,194 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
     Ok(())
 }
 
+/// SHA-256 and length of the file at `absolute`, read in bounded chunks.
+///
+/// The proof of content identity a release needs before it deletes the bytes.
+/// [`is_false_modification`]'s condition (a) is a *stat* comparison, which is
+/// the right cost for a status walk and the wrong proof for a deletion: a
+/// same-length edit written back with the original mtime passes it, and the
+/// release would then destroy the edit with a green suite. Length plus digest
+/// against the committed `oid` is one predicate that cannot be fooled, and it
+/// also removes any need to reason about git's racily-clean rule.
+///
+/// [`crate::copy`]'s `hash_written` shape — same chunk size, same
+/// `hex::encode` of the finalized digest — minus the cancel flag, which has no
+/// caller here: this is asked about exactly one path a person is waiting on.
+/// Chunked rather than [`std::fs::read`] because the file may be gigabytes and
+/// NFR-23 forbids sizing a buffer from an object.
+///
+/// The length comes back from the read rather than from a `stat` on purpose:
+/// it is the number of bytes the digest actually covers, so a caller comparing
+/// it against the pointer's size is comparing two facts about the same read.
+pub fn content_oid(absolute: &Path) -> Result<(String, u64)> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(absolute)
+        .map_err(|err| SyncError::io("open to prove content identity", absolute, err))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+    let mut bytes: u64 = 0;
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|err| SyncError::io("read to prove content identity", absolute, err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), bytes))
+}
+
+/// A worktree path holding real content that is about to become a pointer
+/// again (Story 56.4, FR-332).
+///
+/// [`PendingSmudge`]'s inverse, and it carries two fields that one does not:
+/// the **committed blob's own bytes** — a release writes those, never
+/// [`Pointer::render`]'s output, see [`indexed_pointer_blob`] — and the
+/// **sample the caller's content proof was taken against**, which is what
+/// [`dehydrate`] compares the target to before it publishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRelease {
+    /// Repository-relative, as the index spells it.
+    pub path: PathBuf,
+    /// The pointer the index records — the committed truth, and the source of
+    /// the `oid` and `size` every guard compares against.
+    pub pointer: Pointer,
+    /// The index entry's blob, byte for byte. What lands in the worktree.
+    pub blob: Vec<u8>,
+    /// The file as it was when the caller stat'ed it to begin proving its
+    /// content — the identity [`dehydrate`] requires to still hold.
+    ///
+    /// A [`crate::stability::FileSample`] rather than a bare length, because a
+    /// length is not change detection: the caller already bound a
+    /// [`std::fs::Metadata`] carrying the mtime and the inode too, and this is
+    /// the tuple the rest of the crate compares across a read
+    /// (`copy::stream_source`, `stability`'s tier 2).
+    pub guard: crate::stability::FileSample,
+}
+
+/// Replace a path's content with the pointer the index committed for it.
+///
+/// [`materialize`]'s exact inverse and it publishes the same way, because the
+/// hazard is the same one pointing the other direction: a sibling
+/// `.keeper.{name}.tmp` — which tier 0 already excludes (`exclude.rs`), so the
+/// watcher cannot mistake it for user content — then one `rename`.
+///
+/// # Publish, never truncate
+///
+/// `rename(2)` leaves descriptors already open on the old inode reading the
+/// old bytes, so a process part-way through the file finishes reading the file
+/// it opened. `set_len` or `OpenOptions::truncate(true)` on the target would
+/// not: a reader would see the content vanish under it, and truncating a file
+/// another process has `mmap`ed delivers SIGBUS. Neither appears here, and
+/// that is the acceptance criterion rather than an implementation note.
+///
+/// # The staging file is CREATED, never written to
+///
+/// `create_new(true)` rather than [`std::fs::write`], because a pre-existing
+/// **symlink** at the staging name would otherwise turn this publish into an
+/// arbitrary-file overwrite: `write` and `set_permissions` both follow a
+/// symlink, so the pointer text would land on — and chmod — whatever the link
+/// points at, and then `rename` would move the *link* over the released path,
+/// unlinking the content without publishing anything. The explicit
+/// `remove_file` first unlinks such a link rather than following it, and fails
+/// harmlessly on a directory, which `create_new` then refuses. The mode is
+/// applied through the returned handle for the same reason: a path lookup is
+/// one more thing that can be redirected.
+///
+/// # The re-stat, and what it actually detects
+///
+/// The caller has just hashed the whole file to prove it holds the committed
+/// content, and between that read and this rename the file could have been
+/// rewritten. So this compares the target against the very sample the caller's
+/// proof was taken against — size, mtime and, on unix, inode
+/// ([`PendingRelease::guard`]) — and anything that moved is
+/// [`SyncError::Integrity`] with nothing published.
+///
+/// That is change detection, not a compare-and-swap: an in-place rewrite of
+/// the **same length** advances the mtime, and a replacement by rename changes
+/// the inode, so both are caught where comparing lengths alone waved them
+/// through. What remains unclosed is a rewrite that reproduces the whole tuple
+/// — which on unix means restoring the mtime *and* keeping the inode, and
+/// there is no directory-entry compare-and-swap that would close it. On a
+/// non-unix host the tuple degrades to size and mtime, which
+/// [`crate::stability::FileSample`] documents at the one place it is built.
+///
+/// # Nothing is left behind
+///
+/// Every failure after the staging file exists removes it. It is excluded from
+/// sync — tier 0 skips `.keeper.*.tmp` — which is exactly why leaving one
+/// behind matters: nothing will ever notice it again, so it is litter only a
+/// human could find (`files_write::write_unmanaged`'s precedent).
+pub fn dehydrate(root: &Path, release: &PendingRelease) -> Result<()> {
+    use std::io::Write as _;
+
+    let target = root.join(&release.path);
+    let metadata = std::fs::symlink_metadata(&target)
+        .map_err(|err| SyncError::io("re-stat before releasing content", target.clone(), err))?;
+    if !metadata.is_file() || metadata.len() != release.pointer.size {
+        return Err(SyncError::Integrity {
+            subject: target.to_string_lossy().into_owned(),
+            expected: format!("a regular file of {} bytes", release.pointer.size),
+            actual: if metadata.is_file() {
+                format!("{} bytes", metadata.len())
+            } else {
+                "not a regular file".to_owned()
+            },
+        });
+    }
+    let now = crate::stability::FileSample::from_metadata(&metadata);
+    if now != release.guard {
+        return Err(SyncError::Integrity {
+            subject: target.to_string_lossy().into_owned(),
+            expected: format!(
+                "the file the release was proved against (mtime_ns {}, inode {})",
+                release.guard.mtime_ns, release.guard.inode
+            ),
+            actual: format!("mtime_ns {}, inode {}", now.mtime_ns, now.inode),
+        });
+    }
+    // The same `lstat` that just proved the target: after the rename there is
+    // nothing left to ask, and asking twice would be a second answer.
+    let mode = metadata.permissions();
+
+    let parent = target.parent().unwrap_or(root);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "object".to_owned());
+    let staging = parent.join(format!(".keeper.{name}.tmp"));
+
+    // Unlinks a symlink rather than following it; an absent path and a
+    // directory both fall through to `create_new`, which refuses either way.
+    let _ = std::fs::remove_file(&staging);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|err| SyncError::io("stage the committed pointer", staging.clone(), err))?;
+    let staged = file
+        .write_all(&release.blob)
+        .map_err(|err| SyncError::io("stage the committed pointer", staging.clone(), err))
+        .and_then(|()| {
+            file.set_permissions(mode).map_err(|err| {
+                SyncError::io("carry the released file's mode over", staging.clone(), err)
+            })
+        });
+    drop(file);
+    let published = staged.and_then(|()| {
+        std::fs::rename(&staging, &target)
+            .map_err(|err| SyncError::io("publish the committed pointer", target.clone(), err))
+    });
+    if published.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    published
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1788,404 @@ mod tests {
         );
     }
 
+    /// Content of `size` bytes and its digest, so no test writes an oid
+    /// literal that could drift away from the bytes it names.
+    fn content(size: usize) -> (Vec<u8>, String) {
+        use sha2::{Digest as _, Sha256};
+        let bytes = vec![7u8; size];
+        let oid = hex::encode(Sha256::digest(&bytes));
+        (bytes, oid)
+    }
+
+    /// A committed pointer blob spelling `size` **non-minimally**, which is one
+    /// of the deviations [`Pointer::parse`] understands and flags.
+    ///
+    /// Hand-planted because it is what another git-lfs client can legitimately
+    /// have committed, and it is the only fixture that can tell "wrote the
+    /// blob" apart from "re-rendered the pointer".
+    fn non_canonical_blob(oid: &str, size: u64) -> Vec<u8> {
+        format!(
+            "version {}\noid sha256:{oid}\nsize 0{size}\n",
+            pointer::SPEC_V1
+        )
+        .into_bytes()
+    }
+
+    /// The file as [`dehydrate`]'s caller would have sampled it.
+    ///
+    /// The engine binds this `lstat` before it hashes the file; a test binds it
+    /// at the moment it means "this is the file I proved", which is the same
+    /// fact and is what lets a test move the file afterwards on purpose.
+    fn guard_of(path: &Path) -> crate::stability::FileSample {
+        crate::stability::FileSample::of(path)
+            .expect("stat")
+            .expect("the fixture file is there")
+    }
+
+    /// The bytes a release publishes are the committed blob's, **not**
+    /// `Pointer::render()`'s.
+    ///
+    /// This is the claim that cannot be made any other way. `render` reproduces
+    /// its input byte for byte only when `is_canonical()`, so a pointer
+    /// committed with a non-minimal `size` — a legal blob another client wrote
+    /// — renders to different bytes, a different blob hash, and a path that
+    /// reads modified forever. The fixture is therefore deliberately
+    /// non-canonical, and the assertion is on both sides: equal to the blob,
+    /// and *different* from the re-rendering.
+    #[test]
+    fn releasing_writes_the_committed_blob_and_never_a_re_rendering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let blob = non_canonical_blob(&oid, 4_096);
+        let pointer = Pointer::parse(&blob).expect("the fixture blob is a pointer");
+        assert!(
+            !pointer.is_canonical(),
+            "the fixture must be non-canonical or this test cannot fail"
+        );
+
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+
+        dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: pointer.clone(),
+                blob: blob.clone(),
+                guard: guard_of(&target),
+            },
+        )
+        .expect("release");
+
+        let published = std::fs::read(&target).expect("read");
+        assert_eq!(
+            published, blob,
+            "byte for byte the blob git has, so the entry stays clean"
+        );
+        assert_ne!(
+            published,
+            pointer.render().into_bytes(),
+            "and demonstrably not the re-rendering, which is a different blob \
+             hash and a phantom modification forever"
+        );
+        assert!(
+            !root.join(".keeper.clip.mp4.tmp").exists(),
+            "the staging file was renamed, not left behind"
+        );
+    }
+
+    /// A release is a `rename`, so the path gets a new inode and a reader
+    /// holding the old one reads on undisturbed.
+    ///
+    /// The inode is what distinguishes a rename from a truncation, and the open
+    /// descriptor is what the acceptance criterion is actually about: `set_len`
+    /// or `truncate(true)` on the target would make this reader see the content
+    /// vanish under it, and on an `mmap`ed file it would deliver SIGBUS.
+    #[test]
+    #[cfg(unix)]
+    fn releasing_renames_so_a_reader_holding_it_open_keeps_the_content() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let pointer = Pointer::new(oid, 4_096);
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+
+        let before = std::fs::symlink_metadata(&target).expect("stat").ino();
+        let mut reader = std::fs::File::open(&target).expect("a reader opens it first");
+
+        dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: pointer.clone(),
+                blob: pointer.render().into_bytes(),
+                guard: guard_of(&target),
+            },
+        )
+        .expect("release");
+
+        let mut still_there = Vec::new();
+        reader
+            .read_to_end(&mut still_there)
+            .expect("the old inode is still readable");
+        assert_eq!(
+            still_there, bytes,
+            "the descriptor opened before the release still reads the content"
+        );
+        assert_ne!(
+            std::fs::symlink_metadata(&target).expect("stat").ino(),
+            before,
+            "the inode changed, which is what a rename does and a truncation \
+             does not"
+        );
+    }
+
+    /// A target whose length moved between the caller's hash and the publish is
+    /// refused, and nothing is written anywhere.
+    #[test]
+    fn a_target_whose_length_moved_is_refused_and_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (_, oid) = content(4_096);
+        // The pointer says 4 KiB; the file on disk grew. That is exactly the
+        // race the re-stat exists to catch.
+        let grown = vec![7u8; 5_000];
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &grown).expect("write");
+
+        let err = dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: Pointer::new(oid, 4_096),
+                blob: b"version x\n".to_vec(),
+                guard: guard_of(&target),
+            },
+        )
+        .expect_err("the length moved, so nothing may be published");
+        assert!(
+            matches!(err, SyncError::Integrity { .. }),
+            "got: {err} — a moved length is an integrity failure, not a refusal"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            grown,
+            "the file is exactly as it was"
+        );
+        assert!(
+            !root.join(".keeper.clip.mp4.tmp").exists(),
+            "and no staging file was left in the owner's folder"
+        );
+    }
+
+    /// A released file keeps the mode the content had, for
+    /// [`materialize`]'s measured reason pointing the other way.
+    #[test]
+    #[cfg(unix)]
+    fn releasing_carries_the_replaced_files_mode_over() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let pointer = Pointer::new(oid, 4_096);
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: pointer.clone(),
+                blob: pointer.render().into_bytes(),
+                guard: guard_of(&target),
+            },
+        )
+        .expect("release");
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "a mode change would make the entry permanently dirty, whichever \
+             direction the publish went"
+        );
+    }
+
+    /// A same-length in-place rewrite between the caller's proof and the
+    /// publish is refused, and nothing is published.
+    ///
+    /// This is what fits inside the window: an mp4 tag edit, `dd
+    /// conv=notrunc`, a fixed-record write. The length does not move, so a
+    /// length comparison waved it through and renamed the owner's edit away.
+    ///
+    /// The mtime is stamped forward explicitly rather than left to the
+    /// filesystem's clock granularity — which is what any editor's write does
+    /// anyway — so the assertion decides on the guard rather than on how
+    /// precise this filesystem's timestamps happen to be.
+    #[test]
+    fn a_same_length_rewrite_between_the_proof_and_the_publish_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+        let guard = guard_of(&target);
+
+        let edited = vec![1u8; 4_096];
+        std::fs::write(&target, &edited).expect("edit in place, same length");
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            })
+            .expect("advance the mtime, as a write does");
+
+        let err = dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: Pointer::new(oid, 4_096),
+                blob: b"version x\n".to_vec(),
+                guard,
+            },
+        )
+        .expect_err("the file moved under the proof, so nothing may be published");
+        assert!(
+            matches!(err, SyncError::Integrity { .. }),
+            "got: {err} — the length still matches, so only the guard can refuse this"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            edited,
+            "byte for byte what the owner left there"
+        );
+        assert!(
+            !root.join(".keeper.clip.mp4.tmp").exists(),
+            "and nothing was staged in their folder"
+        );
+    }
+
+    /// A replacement by rename inside the same window is refused too: same
+    /// length, same mtime, a different file.
+    ///
+    /// The limb a size-and-mtime pair cannot see, and the reason the guard is
+    /// the tuple `stability` already compares rather than two of its fields —
+    /// an atomic-save editor and a restored backup both land here.
+    #[test]
+    #[cfg(unix)]
+    fn a_same_length_replacement_by_rename_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+        let when = std::fs::symlink_metadata(&target)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        let guard = guard_of(&target);
+
+        let replacement = root.join("replacement.bin");
+        std::fs::write(&replacement, vec![1u8; 4_096]).expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .and_then(|file| file.set_modified(when))
+            .expect("carry the original's mtime over, so only the inode differs");
+        std::fs::rename(&replacement, &target).expect("replace it atomically");
+
+        let err = dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: Pointer::new(oid, 4_096),
+                blob: b"version x\n".to_vec(),
+                guard,
+            },
+        )
+        .expect_err("this is not the file that was proved");
+        assert!(matches!(err, SyncError::Integrity { .. }), "got: {err}");
+        assert_eq!(
+            std::fs::read(&target).expect("read").len(),
+            4_096,
+            "and the replacement is still the replacement"
+        );
+    }
+
+    /// A symlink planted at the staging name never becomes the published path,
+    /// and the file it points at is untouched.
+    ///
+    /// `fs::write` and a path-based `set_permissions` both follow a symlink and
+    /// `rename` moves the link itself, so the shape this replaced wrote pointer
+    /// text onto an unrelated file, chmod'ed that file, and renamed the link
+    /// over the released path — content unlinked, nothing published, and a type
+    /// change in `git status`. Creating the staging file cannot do any of that.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_at_the_staging_name_never_becomes_the_published_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let pointer = Pointer::new(oid, 4_096);
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &bytes).expect("materialized content");
+
+        let victim = root.join("important.txt");
+        std::fs::write(&victim, b"somebody else's file\n").expect("write");
+        let staging = root.join(".keeper.clip.mp4.tmp");
+        std::os::unix::fs::symlink(&victim, &staging).expect("plant the symlink");
+
+        dehydrate(
+            root,
+            &PendingRelease {
+                path: PathBuf::from("clip.mp4"),
+                pointer: pointer.clone(),
+                blob: pointer.render().into_bytes(),
+                guard: guard_of(&target),
+            },
+        )
+        .expect("release");
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read"),
+            b"somebody else's file\n",
+            "the file the link pointed at was never written to"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            pointer.render().into_bytes(),
+            "and the pointer really was published at the path asked about"
+        );
+        assert!(
+            std::fs::symlink_metadata(&staging).is_err(),
+            "the staging name holds nothing afterwards, link or file"
+        );
+    }
+
+    /// `content_oid` reports the length the **read** covered.
+    ///
+    /// Two fixtures, each pinning one half of that. A zero-length file, whose
+    /// digest is SHA-256 of nothing — which is exactly why a `size 0` pointer
+    /// is degenerate and why `Engine::dehydrate_entry` carves one out before it
+    /// ever gets here. And a file of exactly [`HASH_CHUNK_BYTES`], the loop's
+    /// boundary, where an off-by-one drops the last chunk or reports a length a
+    /// `stat` supplied rather than the read.
+    #[test]
+    fn content_oid_reports_the_length_the_read_covered() {
+        use sha2::{Digest as _, Sha256};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let empty = root.join("empty.bin");
+        std::fs::write(&empty, b"").expect("write");
+        assert_eq!(
+            content_oid(&empty).expect("hash an empty file"),
+            (pointer::EMPTY_OID.to_owned(), 0),
+            "the empty object's own oid, and a length of zero"
+        );
+
+        let exact = root.join("exact.bin");
+        let bytes = vec![3u8; HASH_CHUNK_BYTES];
+        std::fs::write(&exact, &bytes).expect("write");
+        assert_eq!(
+            content_oid(&exact).expect("hash one whole chunk"),
+            (hex::encode(Sha256::digest(&bytes)), HASH_CHUNK_BYTES as u64),
+            "a file of exactly one chunk is read whole and counted whole"
+        );
+    }
+
     /// A repository whose index holds `rela` as a pointer of `size` bytes,
     /// paired with whatever the worktree file currently is.
     fn repo_with_indexed_pointer(root: &Path, rela: &str, size: u64) -> gix::Repository {
@@ -1582,6 +2241,49 @@ mod tests {
         file.write(gix::index::write::Options::default())
             .expect("write index");
         crate::git::repo::open(root, false).expect("reopen")
+    }
+
+    /// `indexed_pointer_blob` answers `None` for both size carve-outs its doc
+    /// calls unchanged, and answers them the same way [`indexed_pointer`] does.
+    ///
+    /// The empty blob is the carve-out Story 34.13's review put in, and it is
+    /// load-bearing here for a different reason: a release that accepted it
+    /// would be deleting content on the authority of a pointer that stands for
+    /// nothing. The over-ceiling blob is deliberately pointer-*shaped*, so what
+    /// refuses it is the object header rather than a parse failure.
+    #[test]
+    fn indexed_pointer_blob_keeps_both_size_carve_outs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = repo_with_indexed_content(root, "empty.bin", b"");
+        assert_eq!(
+            indexed_pointer_blob(&repo, Path::new("empty.bin")),
+            None,
+            "every empty tracked file shares the one empty blob, and none of \
+             them is an LFS entry"
+        );
+        assert_eq!(
+            indexed_pointer(&repo, Path::new("empty.bin")),
+            None,
+            "and the two accessors cannot disagree about that"
+        );
+
+        let over = tempfile::tempdir().expect("tempdir");
+        let root = over.path();
+        let padded = format!(
+            "version {}\noid sha256:{}\nsize 4096\next-0-pad {}\n",
+            pointer::SPEC_V1,
+            "a".repeat(64),
+            "x".repeat(pointer::MAX_POINTER_BYTES)
+        );
+        let repo = repo_with_indexed_content(root, "big.bin", padded.as_bytes());
+        assert_eq!(
+            indexed_pointer_blob(&repo, Path::new("big.bin")),
+            None,
+            "the header said it is over the ceiling, so the object was never \
+             loaded to find out"
+        );
+        assert_eq!(indexed_pointer(&repo, Path::new("big.bin")), None);
     }
 
     /// The guard that would have stopped 122 emptied recordings from being
