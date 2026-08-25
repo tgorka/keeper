@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-08-25'
 status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: '3810bc0'
+final_revision: 'b2e42d3'
 review_loop_iteration: 0
 followup_review_recommended: true
 context: []
