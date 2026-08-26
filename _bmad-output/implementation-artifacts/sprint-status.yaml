@@ -839,16 +839,56 @@ development_status:
   # success-edge citation engine.rs:3052-3066 was adopt_volume; the edge is
   # mark_synced, engine.rs:3185-3197. Both corrected in the epic.
   # 56.9 is new and runs after 56.7; 56.8 (docs) stays last.
-  epic-56: backlog
-  56-1-a-policy-that-says-which-files-may-stay-away: backlog
-  56-2-a-listing-that-knows-what-it-does-not-hold: backlog
-  56-3-a-file-you-can-ask-for: backlog
-  56-4-a-release-that-refuses-five-times-before-it-deletes: backlog
-  56-5-it-lets-go-a-day-after-it-landed: backlog
-  56-6-the-checks-stop-calling-the-normal-state-a-fault: backlog
-  56-7-the-row-says-what-it-is-and-what-a-delete-will-do: backlog
-  56-9-the-button-and-the-time-you-have-left: backlog
-  56-8-a-virtual-files-chapter: backlog
+  #
+  # IMPLEMENTED 2026-08-25 as one gh-stack of nine PRs on main, bottom to top:
+  #   #268 56.1 feat/56-1-a-policy-that-says-which-files-may-stay-away
+  #   #269 56.2 feat/56-2-a-listing-that-knows-what-it-does-not-hold
+  #   #270 56.3 feat/56-3-a-file-you-can-ask-for
+  #   #271 56.4 feat/56-4-a-release-that-refuses-five-times-before-it-deletes
+  #   #272 56.5 feat/56-5-it-lets-go-a-day-after-it-landed
+  #   #273 56.6 feat/56-6-the-checks-stop-calling-the-normal-state-a-fault
+  #   #274 56.7 feat/56-7-the-row-says-what-it-is-and-what-a-delete-will-do
+  #   #275 56.9 feat/56-9-the-button-and-the-time-you-have-left
+  #   #276 56.8 docs/56-8-a-virtual-files-chapter
+  # #268 unblocks the rest: it holds VirtualPolicy AND the sync_ipc.rs
+  # EXPRESSED/PRESERVED classification for the two profile fields it adds.
+  # Every branch above it fails `a_save_cannot_move_a_field_no_request_can_express`
+  # without it, and that test cannot run on the Linux dev box.
+  #
+  # Each story ran one bmad-dev-auto iteration (spec -> implement -> Blind
+  # Hunter + Edge Case Hunter -> triage). Zero intent_gaps and zero bad_spec
+  # loopbacks across all nine; 0 review_loop_iterations. Totals: 3488 Rust tests
+  # (from 3199 on main), 4916 frontend tests (from 4869), clippy clean.
+  #
+  # THE THREE FACTS A LATER STORY WILL WANT, and none of them is in the epic:
+  #   1. A release is gated on lfsMode BEFORE any per-path refusal:
+  #      release_mode_gate returns Ok only for PointerOnly, so on a DEFAULT
+  #      (Materialize) folder nothing ever releases - it refuses
+  #      AlwaysMaterializes. Found by writing 56.8's docs, not by testing.
+  #   2. A higher-tier virtualPatterns list holding ONLY `!` protections still
+  #      triggers the wholesale override (says_something is
+  #      !patterns.is_empty() || !never.is_empty()), installing an empty
+  #      positive list and silently un-authorizing the committed zone.
+  #      Deferred, not fixed - a docs branch may not edit the engine.
+  #   3. The macOS gate is not optional for this epic. It caught the profile
+  #      -field classification twice, and the shell crate holds the workspace's
+  #      only exhaustive match over EntrySyncStatus (sync_mark) plus the
+  #      browse/status_of/browse_root arity that 56.7 changed in three files.
+  #
+  # Verified on hesperia over the whole stack: fmt, clippy incl. the shell
+  # crate, cargo test --workspace (keeper: 432 passed), and no binding drift
+  # (256 generated files). Two load-sensitive flakes are logged in
+  # deferred-work.md rather than silenced.
+  epic-56: in-progress
+  56-1-a-policy-that-says-which-files-may-stay-away: review
+  56-2-a-listing-that-knows-what-it-does-not-hold: review
+  56-3-a-file-you-can-ask-for: review
+  56-4-a-release-that-refuses-five-times-before-it-deletes: review
+  56-5-it-lets-go-a-day-after-it-landed: review
+  56-6-the-checks-stop-calling-the-normal-state-a-fault: review
+  56-7-the-row-says-what-it-is-and-what-a-delete-will-do: review
+  56-9-the-button-and-the-time-you-have-left: review
+  56-8-a-virtual-files-chapter: review
   epic-56-retrospective: optional
 
   # -- EPIC 57, 2026-08-22: scheduled tasks ----------------------------------
