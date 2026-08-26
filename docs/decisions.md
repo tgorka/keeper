@@ -95,7 +95,7 @@ is safe.
   repository produce concurrent index locks — the rule the notes cadence already follows. (AD-62)
 - **Why `update` is excluded:** the daemon holds a durable journal and can be mid-push at any
   moment; swapping its binary unattended is how a routine release becomes a corrupted transfer.
-  That refusal predates this decision and survives it. (`docs/sync.md` §12; AD-136)
+  That refusal predates this decision and survives it. (`docs/sync.md` §13; AD-136)
 - **The platform asymmetry, stated so it is not discovered:** on Linux the systemd user service is
   a real background host and a timer unit ships beside it. On **macOS there is no keeper daemon at
   all** — the desktop app is the only host, so a task runs only while keeper is running, and the UI

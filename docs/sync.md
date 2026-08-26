@@ -74,10 +74,12 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `excludes` | Extra exclusion globs on top of the built-in set |
 | `removable` | The folder lives on removable media (see §6) |
 | `volumeId` | Which volume it is bound to. Written by keeper, not by you (§6) |
-| `lfsMode` | `materialize`, `pointerOnly`, or `disabled` |
+| `lfsMode` | `materialize` (**default**), `pointerOnly`, or `disabled`; releasing content needs `pointerOnly` (§9) |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
 | `lfsPruneLocal` | Release local LFS objects once the remote holds them (default **true**) |
+| `virtualPatterns` | Paths whose absent content `verify` will not call a fault (default none; see §9) |
+| `virtualOverBytes` | Size floor for that policy; `0` means no floor (default `0`) |
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
@@ -105,7 +107,7 @@ left mid-flight is returned to the queue at the next start.
 4. Scan the working tree, discard anything excluded, and hold anything that is
    not demonstrably complete (§4).
 5. Stage what settled, route oversized files through LFS (§8), and commit with
-   provenance trailers (§9).
+   provenance trailers (§10).
 6. Transfer any LFS objects the commit queued.
 7. Push — but **only** once step 6 has nothing outstanding. A commit *this* pass
    made, whose pointers name objects the remote does not have yet, is held back
@@ -355,12 +357,14 @@ serve this". A non-empty result exits non-zero so a cron wrapper sees it.
 
 ### The second local copy, and `lfsPruneLocal`
 
-On the machine where content originates every LFS file exists **twice**: once in
-the worktree, and once in `<git-dir>/lfs/objects` as the byte-identical object
-the clean path streamed there to compute the pointer. That copy is unavoidable
-at stage time — the bytes have to be read and hashed — but it is not needed
-forever. Measured on a 211 GB archive: 215 GB of worktree content plus 215 GB of
-store objects on one 920 GB drive.
+On the machine where content originates, every LFS file whose worktree holds the
+real content exists **twice**: once in the worktree, and once in
+`<git-dir>/lfs/objects` as the byte-identical object the clean path streamed
+there to compute the pointer. A path whose worktree bytes are the pointer is the
+inverse case — there the store object is the *only* local copy of the content
+(§9). That copy is unavoidable at stage time — the bytes have to be read and
+hashed — but it is not needed forever. Measured on a 211 GB archive: 215 GB of
+worktree content plus 215 GB of store objects on one 920 GB drive.
 
 keeper releases it at the end of a successful sync — `lfsPruneLocal` is **on by
 default**. An object is released only when **all** of these hold:
@@ -374,14 +378,19 @@ default**. An object is released only when **all** of these hold:
    pointer text. This is what makes the release cheap to undo — the object is not
    the only local copy, the *file* is — and it is the condition `git lfs prune`
    cannot express, which is why its known failure mode (deleting objects for
-   staged files, git-lfs#5636) cannot occur here.
+   staged files, git-lfs#5636) cannot occur here. It is also the clause that
+   keeps this and virtual files (§9) off each other's ground: a path holding
+   pointer text fails it, so a virtual path is **never** a prune candidate and
+   the two features can never contend for the same byte.
 3. **Nothing else is running.** It happens after the upload queue has drained to
    quiescence and after the push, never between them.
 
-The honest trade: the drive stops being self-sufficient. Every file is still
-there, but restoring one the worktree later loses now needs the network. Set
-`lfsPruneLocal = false` on a machine that has to recover without one — the
-object store then stays a complete local copy, at roughly twice the disk.
+The honest trade: the drive stops being self-sufficient. Every file the worktree
+still holds is intact, but restoring one it later loses now needs the network —
+and so does a path whose content has been released, which holds pointer text and
+nothing else (§9). Set `lfsPruneLocal = false` on a machine that has to recover
+without one — the object store then stays a complete local copy, at roughly
+twice the disk.
 
 It was off by default until 0.8.12, and the reason for the change is what the
 three conditions above already prove: the copy is redundant, and rebuilding it
@@ -564,9 +573,13 @@ keeper registers itself as the repository's `lfs` clean/smudge filter
 (`filter.lfs.clean` / `filter.lfs.smudge` in `.git/config`) — whichever keeper
 executable is running, the app or the daemon, since both answer
 `lfs clean|smudge` on the same code. That is what lets you use ordinary `git`
-inside a synced folder: `git status` stays clean, `git checkout` restores real
-content rather than pointer text, and a commit you make by hand stores a pointer
-and files the object into keeper's store, exactly as keeper's own commits do.
+inside a synced folder: `git status` stays clean — the property the whole design
+rests on — a `git checkout` restores real content rather than pointer text
+**wherever this machine holds the object**, and a commit you make by hand stores
+a pointer and files the object into keeper's store, exactly as keeper's own
+commits do. Where the object is not here the checkout leaves the pointer text in
+the worktree instead: keeper hydrates nothing on read, and materializing is an
+explicit verb (§9).
 
 Two bounds on that, both worth knowing before you rely on it.
 
@@ -620,7 +633,445 @@ the file would read as modified forever.
 
 ---
 
-## 9. Provenance
+## 9. Virtual files
+
+A clone can hold an LFS-tracked path as metadata only: the worktree carries the
+committed pointer, the content stays on the server, and keeper fetches it back
+when somebody asks for it. That state is called **virtual**. This chapter is the
+operator's view of it — what the states mean, what decides them, what a release
+refuses to do, and what this deliberately does not attempt.
+
+None of it is a filesystem trick. A virtual file *is* the pointer git already
+committed, which is both the reason the design works and the cost it accepts;
+the last two sections say so plainly.
+
+### The four states a row can be in
+
+`EntrySyncStatus` (`browse.rs`) is the engine's answer for one path and
+`FilesSyncStatusVm` is its wire spelling. Three of its eight variants are this
+feature's, beside the ordinary `synced`; the remaining four — `waiting`,
+`excluded`, `notInRepository` and `unknown` — are other chapters' business:
+
+| state | glyph | what keeper says about it |
+| --- | --- | --- |
+| `synced` | a check mark (`Check`) | nothing — a synced file has no story |
+| `virtual` | a cloud (`Cloud`) | "This file's content is not stored on this computer — only a placeholder is, so it takes up almost no space. The size shown is the content's." |
+| `materializing` | an arrow into a line (`ArrowDownToLine`) | "keeper has this file's content queued to download to this computer." |
+| `materialized` | a drive (`HardDrive`) | "This file's content is on this computer. keeper may release it again later to free the space, and can fetch it back." |
+
+Those sentences are composed in Rust, in one function, and the app renders them
+rather than writing its own. Each is also its state's accessible name.
+
+**Shape carries the distinction and colour never does.** Two states that differ
+only in hue are two states somebody eventually reads as the same thing, on a bad
+monitor or with the common form of colour blindness. So each of the eight states
+carries its own glyph and its own label — both maps are injective across all
+eight — while the tone map deliberately **collides**: four states share
+`text-faint`. Tone is emphasis, never information, and a reader who cannot tell
+two tones apart loses nothing, because the difference was never carrying any.
+
+`materializing` is **indeterminate, and says so**: the mark is a
+`role="progressbar"` carrying no `aria-valuenow` at all, and that absence is the
+state. keeper does not know how far a queued download has got and will not
+invent a percentage.
+
+A `virtual`, `materializing` or `materialized` path **travels**. Deleting one is
+not a local space decision, and the confirmation says so in the same words it
+uses for any other file that syncs: *"This file syncs, so deleting it here
+removes it from every machine that syncs {profile_name}."* — the profile's own
+name, which is not necessarily the folder's. Only an excluded path, and one in no
+repository at all, are local-only.
+
+Two edges follow from where those states are decided. **Only files reach
+`virtual`, `materializing` and `materialized`** — the probe answers nothing for a
+path that is not a file, and the classifier requires a non-directory before it
+will say `virtual` — so a **folder** holding nothing but virtual content reads
+`synced`. And **exclusion is decided first**, a profile's own pattern beating
+everything else, so an excluded path reads `excluded` whatever its bytes are: a
+virtual path inside an exclusion draws the local-only delete confirmation, not
+the one above.
+
+### How a path becomes virtual
+
+The policy lives in **`.keepervirtual`** at the repository root, committed like
+any other file and read from the **worktree**, never from `HEAD` — what applies
+is the policy standing in the folder, not the one the last commit happened to
+carry. An absent file is silence, not a fault — but only a genuinely absent one.
+Any other failure to read it — a permission bit, a directory standing at that
+name, bytes that are not UTF-8 — faults that folder's verify with `could not read
+<path>: …`, which is not the quoted-pattern message below and so is easy not to
+recognise.
+
+It is not called `.keeperignore` because "ignore" is the wrong verb: these paths
+are tracked, committed and wanted, and only their bytes may stay away. It plays
+`.lfsconfig`'s role — the repository's intent, which a machine's own
+configuration may override.
+
+Same dialect as gitignore:
+
+- a pattern with no `/` matches its basename at any depth;
+- a leading `/` anchors at the repository root;
+- a trailing `/` covers the subtree below it;
+- a `!` line is a **protection** — this content stays here — and gets an
+  implicit subtree expansion that positive lines deliberately do not;
+- `\!` and `\#` escape a real filename beginning with either, and `#` is a
+  comment in the file only, never inside a TOML array.
+
+One departure, and it is the one worth remembering: **a protection wins
+unconditionally**, rather than by being the last match. Protections are also the
+**union** of every source, while a positive list from a higher tier replaces the
+file's list **wholesale** — so what is in force may be neither committed nor in
+that file at all. The boundary is worth stating exactly: a `virtualPatterns` list
+that parses to **at least one line**, positive or protective, counts as that tier
+having stated the policy and replaces the file's positive list entirely. A tier
+carrying nothing but `!` protections therefore installs an empty positive list
+and silently un-authorizes the whole committed zone, which `verify` then reports
+as missing objects — so a protection written up there has to sit beside the
+positive patterns you still want. `.keepervirtual` itself, `.lfsconfig`, `.git/`,
+`.keeper/` and git's own control files — `.gitattributes`, `.gitignore` and
+`.gitmodules` — can never be virtual whatever any pattern says; a virtualized
+`.gitattributes` would break LFS routing for its whole subtree.
+
+`virtualOverBytes` is a size floor under the whole policy: below it a path is
+materialized whatever matched it. It defaults to `0` — no floor — and the
+boundary is **inclusive**, so a file exactly at the floor is eligible. It comes
+only from the profile tiers, because gitignore dialect has no spelling for a
+size.
+
+Precedence, ascending:
+
+```
+.keepervirtual  <  stored profile row  <  <folder>/.keeper/keeper.toml  <  <folder>/.keeper/keeper.<host>.toml
+```
+
+The folder files outrank the row keeper stored because they are resolved on
+**every** read of that profile and are never written back: the row is what the
+app last saved, the files are what the folder says now, and a value the folder
+keeps stating keeps winning. Both files sync, the per-host one deliberately.
+Note where it lives — `<folder>/.keeper/keeper.<host>.toml`, inside `.keeper`
+rather than beside it.
+
+**A malformed pattern is refused with the pattern quoted**, as typed, before any
+anchoring rule has touched it:
+
+```
+invalid .keepervirtual pattern "media/[": …
+```
+
+and the message names the source carrying it: `.keepervirtual` for a line in the
+file, `virtualPatterns` for one in the profile or a folder TOML layer. A typo in
+a file every clone shares and a typo in one machine's own configuration are
+different problems and deserve different words. The refusal happens where the
+policy is compiled, which is inside `verify` — the daemon contains it to that
+one folder's verify line and carries on with the rest. There is no process-wide
+startup abort, and one folder's bad pattern stops nothing else.
+
+A line that is only punctuation — a bare `!`, `/` or `!/` — is not refused but
+dropped like a blank line, reported nowhere and not counted as that source having
+stated a policy at all, which costs most on a protection the operator believes
+they wrote.
+
+**Editing the policy never deletes a byte.** Nothing in it deletes, prunes,
+dehydrates, truncates or rewrites any worktree content, and nothing in it ever
+will: a policy edit is allowed to change an *answer*, never a file. That is not
+a style preference. It is git-lfs#3092, where a pattern change dropped content
+that existed nowhere else. Only per-object proof ever authorizes deleting a
+byte, and it is taken at the moment of the deletion.
+
+**The policy authorizes; it does not instruct.** The only thing that consults it
+today is `verify`, where its job is to stop a folder full of pointers being
+reported as a fault (§8) — those paths are counted as virtual instead. Its answer
+is one of the four facts that excuse an absent object, every one of which has to
+be free (§8), and a folder whose tier is unset or whose `lfsMode` is `disabled`
+excuses nothing whatever the policy says. It is not a download filter. What keeps
+content off this machine on arrival is `lfsMode = pointerOnly`, the whole-profile
+lever, or a path outside the profile's `subpaths`, the per-path one — or an
+explicit release of content that was already here. A path the policy calls
+virtual, whose object is in this machine's store, is materialized by the next
+pull like any other.
+
+### What a release refuses to do
+
+Removing a path's content is the one operation in this chapter that can destroy
+data, so it proves its case before it writes anything, and the proof is the same
+whether you asked for it or the sweep did.
+
+Before anything about the path is asked, a release is gated on the folder's
+**mode**: only `lfsMode = pointerOnly` may let content go. A folder in the
+default `materialize` mode refuses with `AlwaysMaterializes` — it would
+re-materialize the path on the next pass, so the release would be undone — and a
+folder with large-file support off refuses `LfsDisabled`. Both answer on the
+request door and in the sweep alike, before the hash, before the question to the
+server, and before the open-file question.
+
+Behind that gate, six per-path refusals — seven release refusals in all, one
+enum: `ContentRefusal`, carried by `SyncError::Refused`. Each is a
+distinguishable value a caller branches on rather than a line in a log:
+
+| refusal | the condition |
+| --- | --- |
+| `Modified` | the file does not hold the content this folder committed, or what stands there is not a regular file |
+| `Pinned` | somebody asked keeper to keep this one |
+| `UnprovenOnRemote` | nothing has confirmed the server can serve the object |
+| `Open` | another program has the file open |
+| `OpenUnknown` | this machine cannot tell whether anything has |
+| `AlreadyPointer` | there was no content here to remove — the one refusal that repairs rather than declines |
+
+`Modified` is decided by **hashing** the bytes — length first, then SHA-256 —
+never by comparing timestamps, so a same-length edit cannot slip through; it is
+also the answer when what stands at the path is not a regular file at all — a
+directory, a fifo, a socket, a device node or a symlink — settled by one `lstat`
+before any hashing starts. `Pinned` is checked **twice**: once before the two
+expensive proofs, the hash and the round trip, and again with nothing at all
+between that check and the deletion. `AlreadyPointer` is not a failure and exits
+`0`; every other refusal exits `1`. It is also the one refusal that is not inert,
+and its two callers differ: through `dehydrate` it refreshes that path's index
+stat, which is the documented repair for a release interrupted between the rename
+and the re-stat, while the sweep reaching it retracts the stale ledger row
+instead — best-effort, and never for a pinned row. Every other refusal changes
+nothing on disk.
+
+The remote proof is asked per object at the moment of the deletion: one LFS
+batch call using the `download` operation, because a per-object 404 there is the
+server saying it cannot serve this. The answer has to carry a `download` action
+with an href and an exactly matching size. Everything else — a transport
+failure, a refused batch, a repository the credential cannot see — collapses to
+*not proven*, which is a refusal and never a retriable fault.
+
+**There is no trust-the-local-store escape, and its absence is deliberate.** The
+store copy cannot be a precondition: `lfsPruneLocal` deletes the store object
+precisely when the worktree holds the content (§8), so a rule that leaned on the
+store would be leaning on the thing the other feature removes. The one local
+shortcut is a **filesystem remote's own** object store, proved per object, and
+only where no `.lfsconfig` names a server to ask instead.
+
+**Where the operating system cannot answer "is this file open" without racing,
+keeper refuses rather than guesses.** `open_file_state` returns
+`OpenFileState::Unknown` by default, and that default is the honest answer: no
+shipping platform overrides it — not the Linux daemon's, not the desktop shell's
+on macOS or Windows. On Linux the only answer available to a crate that carries
+no `libc` and denies `unsafe` is a `/proc/*/fd` scan, which is a snapshot and so
+TOCTOU by construction, and which cannot read the descriptor table of a process
+owned by another uid — so it would answer *closed* for exactly the reader most
+likely to be there. macOS has no equivalent at all. The consequence is stated in
+§13 and repeated here so this chapter cannot be read as a promise: **a
+`pointerOnly` folder gets as far as the open-file question, and on every real
+host today both `dehydrate` and the release sweep answer it *cannot tell* and
+refuse.** An ordinary folder never reaches that question — its mode refuses
+first. The release path is exercised in tests, and a platform that can answer
+race-free will make it live for the folders whose mode allows it.
+
+When a release does go through it publishes with a `rename(2)` and never a
+truncation. The pointer is written to a sibling temporary file, given the
+target's own mode, and renamed over the path — `rename(2)` leaves descriptors
+already open on the old inode reading the old bytes, so a program part-way
+through the file finishes reading the file it opened. `set_len` or a truncating
+open would not: a reader would see the content vanish under it, and truncating a
+file another process has `mmap`ed delivers SIGBUS. Immediately before the rename
+the file is re-`lstat`ed against the size, the mtime and, on unix, the inode
+recorded earlier in the pass, so any movement becomes an integrity error with
+nothing published. After the rename the index entry's stat is refreshed; without
+that the index still carries the content's stat while the file is ~130 bytes, and
+`git status` reports the path ` M` forever. A crash between the two is repaired
+by asking to release the path again.
+
+### Two release clocks, and which one applies
+
+Which clock measures a path is decided by where its content came from, and it is
+recorded rather than guessed. keeper's ledger — the `materialized` table, keyed
+by profile and path — carries `at_ms` (when the content landed), `last_used_ms`
+(when keeper last served it), `synced_at_ms` (when the remote was observed
+holding that path's object) and `local_origin`.
+
+* Content that **arrived from the remote** and was never modified here is
+  measured from `last_used_ms`, falling back to `at_ms` where keeper has never
+  served it. keeper's own timestamp, never the filesystem's `atime`.
+* Content **this clone authored** is measured from `synced_at_ms`, the instant
+  the remote was observed holding it — and a `synced_at_ms` that is `NULL` means
+  the path is **not eligible at any age**. Not zero, not the epoch, not
+  absent-from-the-remote: never observed.
+
+The second is stricter because those bytes may exist nowhere else. A file you
+wrote that has not reached the server is on one machine in the world, and no
+window makes deleting it acceptable. Editing a confirmed file puts it straight
+back into that state: the write sets `local_origin` and clears `synced_at_ms`,
+because the new bytes are not the ones the server agreed to.
+
+`synced_at_ms` is written from exactly two places and both are per-path facts —
+an upload unit's completion, which re-checks that the path still commits that
+object id before writing anything down, and the per-object answer of the audit
+that asks the server, written only once the server has actually been asked. It
+is deliberately **never** written at a profile's success edge: "this folder
+synced" says nothing about any one path inside it.
+
+### `releaseTtlMs`, the per-pass budget, and when the sweep runs
+
+`releaseTtlMs` is the window — how long content may stay after its clock last
+moved. It defaults to **24 hours** and is settable on the profile row and in
+either folder-TOML layer. **`0` disables releasing entirely**, and it does so
+before any window is armed, so switching it back on later starts a fresh window
+rather than firing on the next sync. A non-zero value under a minute, or one
+over ten years, is **refused rather than clamped**, with the value named and `0`
+offered as the way to turn releasing off: this knob never existed before, so
+every out-of-range number is one somebody typed. A window between a minute and an
+hour is accepted and then honoured no more often than hourly, because the look
+gate below re-arms an hour ahead on every pass that runs — so a short window is
+not a way to see the feature work sooner.
+
+A pass is bounded by two ceilings rather than one — `RELEASE_BUDGET_OBJECTS`
+(32) and `RELEASE_BUDGET_BYTES` (1 GiB). The count bounds **attempts** and is
+checked before one, because the sweep runs inside the reservation the sync tick
+already holds, and a pass walking forty thousand eligible paths would hold it
+for minutes and starve the folder's watcher. The byte ceiling is checked
+**after** an attempt, deliberately: the proof reads every byte of every
+candidate before anything is deleted, so a count alone permits thirty-two
+four-gigabyte files — 128 GB of hashing in a pass that is meant to be
+housekeeping. Reaching it **stops** the pass rather than skipping the object,
+because skipping would make anything larger than the whole budget permanently
+unreleasable. A rotating per-profile cursor makes "the next pass takes the
+remainder" true even when the first thirty-two always refuse. One residual, and
+the code states it rather than leaving it silent: the accumulator adds
+`row.size_bytes.unwrap_or(0)`, so a ledger row written before this feature
+existed contributes nothing to the gigabyte, and a pass made of them is bounded
+by the thirty-two-object count alone.
+
+**The sweep rides the first successful sync after the window expires, and never
+a timer.** There is no thread, no interval and no `.timer` unit — two schedulers
+over one git repository produce concurrent index locks — and that edge is also
+the moment keeper has just proved it can reach the remote it would have to fetch
+the content back from. So **a folder that never syncs never releases anything**,
+and neither does a paused one. Two further gates: the sweep is asked at most
+once an hour, and on its first sight of a profile **in this run** it arms that
+window and returns nothing. First sight is per run, not once in the folder's
+life — the map that remembers it is in memory on the engine — so a freshly added
+folder, a resumed one, and one whose daemon or app has only just started each arm
+a fresh hour and release nothing on that pass. And it declines entirely for a
+folder whose own configuration is **faulted**: either layer, `keeper.toml` or
+`keeper.<host>.toml`, unreadable, failing to parse, carrying one unknown or
+refused key, or failing validation. It does not fall back to the deleting
+24-hour default — one bad key elsewhere in that file must not be discovered as
+deletions.
+
+A sweep failure never fails a sync. The whole pass's result collapses into one
+warning; inside it every candidate's error is logged and skipped, and a refusal,
+which is the expected answer for most candidates, is not even that.
+
+A materialized row carries the **deadline**, not a countdown: the wire field is
+an absolute epoch-ms instant, because a countdown is the one string Rust cannot
+own — it is stale the instant it is serialized, while an instant stays true
+without anyone re-asking. Where nothing is counting, the row carries a word for
+why instead — it is pinned, its authorship is unconfirmed, the window is
+indefinite, the folder's mode keeps everything, or the folder's large-file
+support is off while the ledger rows it had survive — and exactly one of the two
+is ever present. The last three all draw the same word, `Kept`, and it is the
+sentence beside it that tells them apart: keeper keeps the reasons separate
+because telling the owner of a `disabled` folder that it "is set to keep
+large-file content" is false of the folder and points at a setting that reads the
+other way. The pane ticks once a second, and only while some row is actually
+counting.
+
+Automatic release on that success edge is the only release mechanism built here,
+and it runs only in a `pointerOnly` folder: nothing in a folder left in the
+default `materialize` mode is ever released automatically, and the decline is a
+debug line, so no surface will tell you why nothing happened. Releasing on a
+**schedule** you choose — off, manual or scheduled — is **Epic 57's `tasks`
+verb**, so the nightly script has a home rather than being something keeper
+declines to do; releasing by hand is here today, as `dehydrate` and as the
+**Release** action on a materialized row.
+
+### The verbs
+
+| verb | what it does |
+| --- | --- |
+| `ls-files [profile] [--remote]` | what this clone actually holds, per LFS path; `--remote` adds the per-object question to the server |
+| `materialize <profile> <subpath>` | fetch one path's content, or queue the transfer that will |
+| `dehydrate <profile> <subpath>` | release one path's content, leaving the committed pointer |
+| `pin <profile> <subpath>` | keep one path's content whatever the sweep says |
+| `unpin <profile> <subpath>` | withdraw that instruction |
+
+Two behaviours worth knowing before you script either of the first two.
+`ls-files --remote` propagates the audit error, so a server that cannot be asked
+fails the whole read-only command — and because the JSON document is printed once
+after the loop, `--json --remote` then emits no document at all; missing objects,
+by contrast, are reported and leave the exit code alone. And `materialize`'s
+queued transfer is delivered by a running `keeper-syncd watch` or by the app,
+never by the command itself, so on a host with no daemon running nothing arrives.
+
+`--json` is a **global** flag and works on either side of the subcommand. §13
+carries the wording contract — the lines each verb prints and the JSON field
+names — and is the authority for that. Its refusal list is wider than this
+section's, which covers only what a release refuses.
+
+In the app the same operations are row actions, and a row's state decides which
+it offers: **Materialize** on a `virtual` row, **Release** and **Pin** on a
+`materialized` one, and nothing at all while a row is `materializing` — the
+answer to "it is already coming" is to wait. Two vocabulary notes, worth having
+before you go looking for something that is not there: the app says **Release**
+where the CLI verb is `dehydrate`, and the app has no Unpin, because nothing on
+the wire carries a **boolean** a toggle could read: the row learns that it is
+pinned only as Rust's own word in `release.hold`, which cannot tell a control
+which way it is about to go. `keeper-syncd unpin` is the door back out.
+
+### What `ls`, `du` and other programs see
+
+~130 bytes of pointer text. That is a real cost, it is accepted, and it was
+chosen rather than discovered: **it is the only representation `git status`
+tolerates**, because the pointer *is* the committed blob. Any other worktree
+content is a modification forever, and every alternative fails on exactly that —
+a sparse file, or a zero-filled file of the true length, is different bytes; an
+extra key inside the pointer changes the blob's object id, a content change
+wearing an annotation's clothes; and an xattr-identified stub does not survive
+`cp`, `rsync` or `tar` without opt-in flags, so it becomes an anonymous file
+after one copy.
+
+keeper's own surfaces do not repeat that lie about a path whose content is away:
+both report the size and object id the **pointer** names rather than the length
+on disk. `ls-files` reads the pointer out of the **index**. The Files view parses
+it out of the **worktree** file, and only for a row it has already marked
+`virtual` or `materializing` — an excluded, untracked or waiting row that happens
+to hold pointer text keeps its own ~130 bytes and carries no object id, and a
+materialized row never reaches the substitution at all, because its bytes are not
+a pointer. A virtual row shows the content's size because that is the fact worth
+having; it is `ls` that is telling you about a placeholder.
+
+### Finder and `ls` integration is closed, not pending
+
+keeper will not make virtual content appear at its true size in `ls` or in
+Finder. That is a **closed** question on macOS and a deferred one on Linux, and
+the reasons are recorded as **D-2** in `docs/decisions.md` so they are not
+re-asked every time somebody sees Dropbox do it:
+
+- **macOS File Provider** has the right semantics and the wrong storage. An
+  `NSFileProviderReplicatedExtension` keeps its domain under
+  `~/Library/CloudStorage/<Provider>`, and there is no API to virtualize a path
+  the *user* chose — which is the only kind of path a synced folder has. Nor can
+  keeper mark its own files: `SF_DATALESS` *"may not be set or unset from user
+  space"*. Kexts are policy-dead.
+- **FUSE on macOS fails the licence firewall.** macFUSE forbids redistributing
+  binaries bundled with commercial software and its kext is closed; fuse-t is
+  free for personal use only. keeper's dependency policy is permissive-only and
+  both fail it.
+- **`fanotify` HSM on Linux is immature.** It needs kernel ≥ 6.14 and
+  `CAP_SYS_ADMIN`, `mmap` materializes whole files because the page-fault hook
+  was merged and backed out, directory events risk a filesystem-freeze deadlock,
+  and every read re-fires the event because the planned BPF suppression is
+  unimplemented. Revisiting it needs the page-fault hook and BPF event
+  suppression both to land.
+- **No on-read hydration, on any platform.** A `grep -r`, Spotlight, a backup
+  agent or a `du` walking the tree would hydrate everything in it. keeper
+  already took this side once, for iCloud placeholders (§4).
+
+Linux is deferred with its shape recorded: a read-only FUSE **mirror** mount,
+never a virtualization of the worktree itself.
+
+The same rule holds inside git. A `git checkout` of a path whose object this
+machine does not have yields the pointer text and leaves it there, which is
+recoverable; nothing hydrates behind your back. Materializing is an explicit
+verb, and that is the whole of it.
+
+---
+
+## 10. Provenance
 
 Every commit keeper makes carries trailers, so *"where did this come from"* is
 answerable from a clone alone, offline, with no keeper installed:
@@ -647,7 +1098,7 @@ cannot drift the first time someone uses plain `git`.
 
 ---
 
-## 10. Offline behaviour
+## 11. Offline behaviour
 
 Offline is a normal state, not an error.
 
@@ -702,7 +1153,7 @@ built.
 
 ---
 
-## 11. Progress and warnings
+## 12. Progress and warnings
 
 - **Tray glyph.** Monochrome template icons distinguished by shape, never
   colour — the system recolours them for light and dark menu bars, so colour
@@ -806,7 +1257,7 @@ moment startup returns it to `pending` there are two identical rows.
 ### Sync marks never hold up a listing
 
 The Files view decorates each row with how far that path got toward the remote,
-which comes from the same `pending` answer §11 describes — a whole-worktree
+which comes from the same `pending` answer §12 describes — a whole-worktree
 `git status` plus an untracked expansion that `lstat`s every candidate. The
 listing used to **wait** for it before naming a single entry, and the pane's
 refresh asked for it once per open directory: ten expanded folders, ten walks of
@@ -847,7 +1298,7 @@ deliberate answer, not a gap.
 
 ---
 
-## 12. `keeper-syncd` — the standalone daemon
+## 13. `keeper-syncd` — the standalone daemon
 
 The same engine with no application installed. Linux-first, depends on neither
 Tauri nor matrix-sdk.
@@ -1070,7 +1521,7 @@ published today.
 
 ---
 
-## 13. Making a folder visible to agents
+## 14. Making a folder visible to agents
 
 The reason to run `keeper-syncd` on a dev box or a container rather than the
 desktop app: an autonomous agent working in that environment sees a plain
@@ -1102,8 +1553,8 @@ A secret file that is group- or world-readable is **refused**, not warned about.
 Agents then read and write `~/agent-data` as an ordinary directory. Everything
 in this document still applies to it: only complete files are committed (§4),
 divergence produces conflict copies rather than prompts (§5), large files go
-through LFS (§8), every change carries provenance naming the host (§9), and an
-offline period queues work rather than losing it (§10).
+through LFS (§8), every change carries provenance naming the host (§10), and an
+offline period queues work rather than losing it (§11).
 
 Two things worth setting deliberately for an agent workspace:
 
@@ -1113,7 +1564,7 @@ Two things worth setting deliberately for an agent workspace:
 - **`excludes`**. Agent tooling leaves scratch files around. The built-in tier-0
   set covers editor and download conventions but not your build outputs.
 
-## 14. Security posture
+## 15. Security posture
 
 - Credentials live in the OS keychain (or, headless, a `0600` file). Everything
   gitoxide drives — fetch and the first clone — takes them through a
@@ -1153,7 +1604,7 @@ Two things worth setting deliberately for an agent workspace:
 
 ---
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 **`doctor` first.** It reports git's presence and version, each profile's path
 and writability, removable-volume presence, inotify limits, journal depth and
@@ -1168,7 +1619,7 @@ free space, and exits non-zero when something is genuinely wrong.
 | Profile says *drive not connected* | The volume marker is absent. Re-attach the drive; nothing was deleted. |
 | A new removable profile stays *drive not connected* | Its folder is missing, or it is on this computer's own disk. Keeper will not mark either (§6): create the folder on the drive, or clear `removable`. |
 | *A different volume is mounted at this path* | Another drive is where this profile's own drive should be. Nothing is synced either way until the right one is attached. |
-| Authentication rejected, but `git` works in that folder by hand | Keeper uses the credential stored against the profile and nothing else — plain `git` is reading your OS credential store, which keeper deliberately ignores (§14). Add the token to the profile. |
+| Authentication rejected, but `git` works in that folder by hand | Keeper uses the credential stored against the profile and nothing else — plain `git` is reading your OS credential store, which keeper deliberately ignores (§15). Add the token to the profile. |
 | Watch mode misses changes on a network mount | inotify/FSEvents do not work on many network and FUSE mounts. Enable polling for that profile. |
 | `Too many open files` / watches exhausted | Raise `fs.inotify.max_user_watches`. One watcher is used per profile, not per folder. |
 | LFS upload restarts from zero | Expected. The `basic` adapter has no resumable upload. |
@@ -1186,19 +1637,32 @@ Linux).
 
 ---
 
-## 16. Current implementation status
+## 17. Current implementation status
 
-This document describes the designed behaviour. As of 2026-07-25 the engine and
-the `keeper-syncd` daemon implement and verify §§1–10 and §12 against real git
-remotes, including a full LFS round trip (upload, peer clone, download,
-materialize) against a local LFS server and the review-lane airlock. One part is
-not yet reachable at runtime:
+This document describes the designed behaviour. As of 2026-08-25 the engine and
+the `keeper-syncd` daemon implement and verify §§1–8, §10, §11 and §13 against
+real git remotes, including a full LFS round trip (upload, peer clone, download,
+materialize) against a local LFS server and the review-lane airlock. Virtual
+files (§9) are real and exercised end to end: the excuse the policy gives
+`verify`, the `ls-files` inventory, `materialize` on demand, the four row states
+with the sentences and glyphs that carry them, `pin`/`unpin`, and — in a
+`pointerOnly` folder — the release deadline a materialized row counts down. A
+folder in the default `materialize` mode answers with a word and no instant, so
+no row counts there: a counting row needs `lfsMode = pointerOnly`, a non-zero
+`releaseTtlMs`, an unpinned row and, for content this clone authored, a
+`synced_at_ms` that is not NULL. Two parts are not reachable at runtime:
 
-- **§11 progress and warnings.** These are engine-side and correct — the tray
+- **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.
+- **Releasing content (§9).** `dehydrate` and the release sweep are implemented
+  and covered by tests, but a folder only reaches the open-file question when its
+  `lfsMode` is `pointerOnly` — the default `materialize` mode refuses before it —
+  and no shipping platform can answer whether a file is open without racing, so
+  both refuse on every real host today. Nothing releases content on a production
+  machine until a platform can answer that question race-free.
 
-## 17. Measured envelopes
+## 18. Measured envelopes
 
 Measured on a release build, Linux, AMD Ryzen AI 9 HX PRO 370, local disk, with
 a `file://` remote so the numbers reflect the engine rather than a network.
@@ -1217,7 +1681,7 @@ mandatory rather than optional.
 Steady-state cost is dominated by one `lstat` per file, so a folder that is not
 changing is cheap to keep watched.
 
-## 18. Deliberate limitations
+## 19. Deliberate limitations
 
 - **The daemon's update is checksum-verified, not signature-verified.** It
   proves the bytes arrived intact from the URL it asked; it does not prove who
@@ -1229,7 +1693,7 @@ changing is cheap to keep watched.
   targets build from source. `update` names the asset it looked for rather than
   failing vaguely.
 - **`update` never runs on a timer, and never restarts the daemon.** Both are
-  deliberate; see §12.
+  deliberate; see §13.
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.
@@ -1242,3 +1706,7 @@ changing is cheap to keep watched.
    available but shrinking history is a destructive operation keeper will not
    perform on its own. `lfsPruneLocal` is not this: it releases *local object
    copies* the remote already holds and never touches history.
+7. **A virtual file looks like ~130 bytes to everything else.** `ls -l`, `du`
+   and third-party applications see the pointer text rather than the content's
+   size, and there is no filesystem virtualization on any platform — a closed
+   question on macOS and a deferred one on Linux (§9; `docs/decisions.md` D-2).
