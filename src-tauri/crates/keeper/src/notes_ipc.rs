@@ -1374,7 +1374,17 @@ pub async fn notes_gallery(
             // `Unavailable` and never an empty `Known`: a gallery asks the
             // engine nothing, and an empty known list would mark every photo
             // `Synced` — a claim nobody here is entitled to make.
-            browse::browse_root(&root, &folder, &excludes, &browse::PendingView::Unavailable)
+            //
+            // The gallery already passes `Unavailable`, so every row answers
+            // `Unknown` well before the ledger rung is reached (Story 56.7):
+            // this view can only ever go unread.
+            browse::browse_root(
+                &root,
+                &folder,
+                &excludes,
+                &browse::PendingView::Unavailable,
+                &browse::MaterializedView::none(),
+            )
         })
         .await
         .map_err(|error| {

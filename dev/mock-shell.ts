@@ -38,8 +38,10 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   FileSizeVm,
+  FilesEntrySyncVm,
   FilesEntryVm,
   FilesListingVm,
+  FilesReleaseVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
@@ -198,12 +200,67 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     sync: { status: "synced", detail: null },
     size: isDir ? null : size,
     folderRole: name === "10-notes" ? "notesVault" : null,
+    // Story 56.2's two additions. `lfsOid` is null because none of these rows
+    // is a virtual path, which is the statement that `size` came off a `stat`;
+    // `mtimeMs` is a fixed instant so the harness renders identically on every
+    // run.
+    lfsOid: null,
+    mtimeMs: 1_700_000_000_000,
+    // Story 56.9: no release standing, because release is a fact about content
+    // keeper itself put here and none of these rows is that. The two rows that
+    // are get one below.
+    release: null,
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
   };
 }
+
+/**
+ * A row whose bytes are not where its size says they are (Story 56.7).
+ *
+ * A sibling rather than two more parameters on {@link browseEntry}, so the rows
+ * above it are untouched. The sentence is typed out here because in the real
+ * product `sync_ipc::sync_mark` composes it and this file is what stands in for
+ * that — a paraphrase would put words on the harness's marks that keeper never
+ * says, and reviewing the wrong words is worse than reviewing none.
+ *
+ * `lfsOid` makes {@link browseEntry}'s statement in reverse: a non-null oid says
+ * `size` is the POINTER's number rather than a `stat`'s, which is exactly the
+ * claim a virtual row makes and a materialized one does not.
+ */
+function lfsEntry(
+  name: string,
+  size: FileSizeVm,
+  sync: FilesEntrySyncVm,
+  lfsOid: string | null,
+  release: FilesReleaseVm | null = null,
+): FilesEntryVm {
+  return { ...browseEntry(name, false, size), sync, lfsOid, release };
+}
+
+/** Verbatim from `sync_ipc::sync_mark`, for the reason {@link lfsEntry} gives. */
+const VIRTUAL_SENTENCE =
+  "This file's content is not stored on this computer — only a placeholder is, so it takes up almost no space. The size shown is the content's.";
+/** The state a `queued_downloads` row puts a pointer in: queued, running or
+ *  deferred, which is why the words are about the QUEUE and not about an
+ *  activity — a deferred download whose removable remote is absent waits
+ *  indefinitely, and "is downloading" would be false about it. */
+const MATERIALIZING_SENTENCE =
+  "keeper has this file's content queued to download to this computer.";
+const MATERIALIZED_SENTENCE =
+  "This file's content is on this computer. keeper may release it again later to free the space, and can fetch it back.";
+
+/** Verbatim from `keeper_sync::engine::ReleaseSchedule::sentence`, for the
+ *  reason {@link lfsEntry} gives. The deadline beside it is `Date.now()`-relative
+ *  and not a fixed instant, unlike every other timestamp in this file: a
+ *  countdown frozen at a stored epoch would render `due` for ever, which is the
+ *  one thing the cell it is here to show cannot demonstrate. */
+const RELEASE_DUE_SENTENCE =
+  "keeper lets this content go on the first sync after the time runs out; the copy stays here until then";
+const RELEASE_PINNED_SENTENCE =
+  "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
 
 /** A folder tree with the depth and the awkward names a real drive has. */
 const ENTRIES: FilesEntryVm[] = [
@@ -218,13 +275,63 @@ const ENTRIES: FilesEntryVm[] = [
   browseEntry("README.md", false, { bytes: 3_380, label: "3.4 kB" }),
   browseEntry("deck-v10-complete.pdf", false, { bytes: 8_400_000, label: "8.4 MB" }),
   browseEntry("screen-0000.mov", false, { bytes: 412_000_000, label: "412 MB" }),
+  // The states Story 56.7 made visible, side by side and all large, so the
+  // harness shows what the pane's whole point is: rows claiming the same four
+  // gigabytes, two of which are 130 bytes of placeholder on this disk. The
+  // middle one is here because it is the only state that takes the mark's
+  // `role="progressbar"` branch, its own arrow glyph and a non-recessive tone —
+  // a state nothing can show is a state nobody reviews.
+  lfsEntry(
+    "master-2026-04.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "virtual", detail: VIRTUAL_SENTENCE },
+    "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea",
+  ),
+  lfsEntry(
+    "master-2026-05.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materializing", detail: MATERIALIZING_SENTENCE },
+    // Still a pointer on disk, which is what `browse::classify` requires before
+    // it will call a queued download this content arriving — so `size` is the
+    // pointer's number here exactly as it is for the virtual row above.
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  ),
+  lfsEntry(
+    "master-2026-06.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+  ),
+  // The two shapes Story 56.9's release cell takes, so both can be looked at:
+  // one row counting down to a real instant, and one row whose words say there
+  // is no clock at all. `hold` and `releasesAfterMs` are never both set —
+  // `ReleaseSchedule` guarantees it and this harness must not be the one place
+  // that reads otherwise.
+  lfsEntry(
+    "master-2026-07.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    {
+      releasesAfterMs: Date.now() + 23 * 3_600_000 + 30 * 60_000,
+      hold: null,
+      detail: RELEASE_DUE_SENTENCE,
+    },
+  ),
+  lfsEntry(
+    "master-2026-08.wav",
+    { bytes: 4_294_967_296, label: "4.3 GB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    { releasesAfterMs: null, hold: "Pinned", detail: RELEASE_PINNED_SENTENCE },
+  ),
 ];
 
 /**
  * What one folder inside the root holds.
  *
  * One and not six: an expansion has to show something other than the root's own
- * eleven rows again, and beyond that this is a viewing aid rather than a disk.
+ * rows again, and beyond that this is a viewing aid rather than a disk.
  * Every other folder answers `listed` with nothing in it, which is a state the
  * pane draws a sentence for and is worth seeing too.
  */
@@ -1658,7 +1765,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return { rev: "rev-mock", text: `# ${title}\n${rest}` };
   },
   // The tree asks this once per folder it opens, so a table would answer the
-  // root's eleven rows for every expansion and the tree would repeat itself
+  // root's own rows for every expansion and the tree would repeat itself
   // down the pane. `state`, `detail` and `write` are the listing's own fields
   // and not the entries' — the folder that cannot be written into is a
   // different fact from the file that cannot be.

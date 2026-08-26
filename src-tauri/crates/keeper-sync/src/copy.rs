@@ -48,6 +48,20 @@
 //! macOS dataless iCloud placeholders (opening one silently materializes a
 //! file that may be gigabytes).
 //!
+//! # Large files whose content is not here
+//!
+//! Since Epic 56 a tracked path may hold nothing but its ~130-byte LFS
+//! pointer, and copying that text would produce a *verified* copy of nothing:
+//! hashed twice, reported [`CopyOutcome::Copied`] with a matching digest, onto
+//! the pendrive that was supposed to be the second copy. So a pointer path is
+//! refused by name unless the caller supplies a [`ContentSource`].
+//!
+//! Refusing by default is AD-128's rule kept where it belongs. A copy is a read
+//! of a whole subtree, and `grep -r`, Spotlight, a backup agent or a `du` are
+//! all reads of a whole subtree; this module — which any of them could reach —
+//! must not be able to hydrate on its own. The capability arrives as a value,
+//! from a caller that knows a human asked.
+//!
 //! # Blocking
 //!
 //! [`copy_verified`] is **synchronous and long-running** — it is the whole
@@ -66,6 +80,33 @@ use sha2::{Digest, Sha256};
 use crate::error::{Result, SyncError};
 use crate::lfs::basic::{ProgressCoalescer, DEFAULT_PROGRESS_INTERVAL};
 use crate::stability::{is_dataless, FileSample};
+
+/// Where a copy can get the real bytes for a path that holds only its pointer.
+///
+/// One object-safe method, so the capability can be threaded as
+/// `Option<&dyn ContentSource>` without this module learning what a profile,
+/// an index or an object store is — the premise stated at the top of the file.
+/// `keeper_sync::engine::Engine` is the implementation; there is deliberately
+/// no default one.
+///
+/// Blocking, like everything else here: the implementor may read gigabytes.
+/// `Ok(())` means the worktree file at `absolute` now holds its content, so a
+/// caller MUST re-stat before believing any length it read earlier.
+pub trait ContentSource {
+    /// Put this path's content in the worktree, or say why not.
+    ///
+    /// **Every `Err` reaches the report.** Only
+    /// [`crate::lfs::hydrate::ContentRefusal::ContentNotHere`] is re-rendered,
+    /// and only so the path it names is the one the row is keyed by
+    /// ([`entry_reason`]); every other `SyncError` becomes that entry's reason
+    /// through its own `Display`, verbatim. So an implementor is answerable for
+    /// each sentence it can produce — a `SyncError::Io` about a temp file the
+    /// implementor could not create is what the person who asked to copy their
+    /// pictures will be shown. [`crate::error::SyncError::Refused`] carrying a
+    /// [`crate::lfs::hydrate::ContentRefusal`] is what a sentence written for
+    /// them looks like.
+    fn materialize(&self, absolute: &Path) -> Result<()>;
+}
 
 /// Read granularity for every hashing and copying loop in this module.
 ///
@@ -186,14 +227,27 @@ pub type CopySink = Box<dyn Fn(CopyProgress) -> bool + Send + Sync>;
 /// a destination directory that cannot be created — comes back as `Err`. A
 /// single unreadable or unwritable file is one [`CopyOutcome::Failed`] entry,
 /// never the end of a ten-thousand-file copy (AD-C6).
+///
+/// `content` is the hydration capability described in this module's doc.
+/// `None` — the answer for every caller that is not a user-initiated copy
+/// verb — refuses each path that holds only its LFS pointer, by name.
 pub fn copy_verified(
     source: &Path,
     destination: &Path,
     options: &CopyOptions,
     progress: Option<&CopySink>,
     cancel: &AtomicBool,
+    content: Option<&dyn ContentSource>,
 ) -> Result<CopyReport> {
-    copy_verified_hooked(source, destination, options, progress, cancel, &mut |_| {})
+    copy_verified_hooked(
+        source,
+        destination,
+        options,
+        progress,
+        cancel,
+        content,
+        &mut |_| {},
+    )
 }
 
 /// Fired once per source file, right after its first chunk has been consumed.
@@ -213,9 +267,10 @@ fn copy_verified_hooked(
     options: &CopyOptions,
     progress: Option<&CopySink>,
     cancel: &AtomicBool,
+    content: Option<&dyn ContentSource>,
     hook: ChunkHook<'_>,
 ) -> Result<CopyReport> {
-    let plan = plan_copy(source)?;
+    let plan = plan_copy(source, content)?;
     std::fs::create_dir_all(destination)
         .map_err(|err| SyncError::io("create copy destination", destination, err))?;
 
@@ -257,12 +312,13 @@ fn copy_verified_hooked(
                 reporter.begin(display(rel));
                 let src = plan.root.join(rel);
                 let dst = destination.join(rel);
-                let step = match copy_one(&src, &dst, options, cancel, &mut reporter, hook) {
+                let step = match copy_one(&src, &dst, options, cancel, &mut reporter, content, hook)
+                {
                     Ok(step) => step,
                     // One file's I/O problem is one line in the report.
                     Err(err) => Step::Done(
                         CopyOutcome::Failed {
-                            reason: err.to_string(),
+                            reason: entry_reason(&err, rel),
                         },
                         None,
                     ),
@@ -303,6 +359,25 @@ enum Step {
     Cancelled,
 }
 
+/// One file's failure as that entry's reason, in the copy's own frame.
+///
+/// Every error but one is somebody else's sentence and is passed through
+/// verbatim. [`crate::lfs::hydrate::ContentRefusal::ContentNotHere`] is the
+/// exception because a [`ContentSource`] names paths in **its** frame — the
+/// engine's implementation names them relative to the profile — while this
+/// report keys the row by the path relative to the copy source. Left alone, a
+/// row keyed `clip.mp4` carries a sentence about `40-media/clip.mp4`, which is
+/// two paths for one file in one line a person is reading. The copy owns the
+/// naming, so the copy re-renders it.
+fn entry_reason(err: &SyncError, rel: &Path) -> String {
+    match err {
+        SyncError::Refused(crate::lfs::hydrate::ContentRefusal::ContentNotHere { .. }) => {
+            crate::lfs::hydrate::ContentRefusal::ContentNotHere { path: display(rel) }.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Copy one regular file, deciding against whatever is already at `dst`.
 fn copy_one(
     src: &Path,
@@ -310,6 +385,7 @@ fn copy_one(
     options: &CopyOptions,
     cancel: &AtomicBool,
     reporter: &mut Reporter<'_>,
+    content: Option<&dyn ContentSource>,
     hook: ChunkHook<'_>,
 ) -> Result<Step> {
     // Re-stat rather than trusting the pre-walk: between the plan and here the
@@ -325,7 +401,7 @@ fn copy_one(
     };
 
     let Some(existing) = existing else {
-        return stage(src, dst, Publish::Fresh, cancel, reporter, hook);
+        return hydrate_then_stage(src, dst, Publish::Fresh, cancel, reporter, content, hook);
     };
 
     if !existing.is_file() {
@@ -349,7 +425,15 @@ fn copy_one(
         if !options.replace_existing {
             return Ok(Step::Done(CopyOutcome::Collision, None));
         }
-        return stage(src, dst, Publish::Replacing, cancel, reporter, hook);
+        return hydrate_then_stage(
+            src,
+            dst,
+            Publish::Replacing,
+            cancel,
+            reporter,
+            content,
+            hook,
+        );
     }
 
     // Same length: only digests can tell the two apart. The destination is
@@ -374,8 +458,86 @@ fn copy_one(
         // the identical case — a re-run over a whole tree — from having to
         // stage a full temp copy of every file just to discover it changed
         // nothing.
-        Streamed::Read { .. } => stage(src, dst, Publish::Replacing, cancel, reporter, hook),
+        Streamed::Read { .. } => hydrate_then_stage(
+            src,
+            dst,
+            Publish::Replacing,
+            cancel,
+            reporter,
+            content,
+            hook,
+        ),
     }
+}
+
+/// Put this path's real bytes in the worktree if it holds only its LFS
+/// pointer, then [`stage`] them (Story 56.6).
+///
+/// # Why hydration is here and not in [`classify`]
+///
+/// Everything a hydration needs to be answerable for lives at execute time and
+/// none of it exists during the pre-walk. `cancel` is read here and cannot be
+/// read there. The opening progress frame has been emitted, so a job that
+/// spends four minutes fetching an object is not a UI stuck at `0/0`.
+/// `create_dir_all(destination)` has run, so a destination that was never
+/// writable fails the job before a byte is fetched rather than after the whole
+/// zone was. And it sits **after** the collision decision above, so a re-run
+/// with the default `replace_existing: false` reports `Collision` for what is
+/// already there instead of hydrating a whole folder to say so.
+///
+/// # Why the question is asked again at all
+///
+/// The plan is a snapshot, and the window between it and here is real: keeper's
+/// own release sweep (Story 56.5) can re-dehydrate a planned path while this
+/// job runs. Without this the copy would stream, hash, verify and publish ~130
+/// bytes of pointer text, then report `Copied` with the plan's byte count — a
+/// verified copy of nothing, which is the failure the whole seam exists to
+/// stop.
+///
+/// A path that is not pointer text goes straight to [`stage`], which is every
+/// ordinary file.
+fn hydrate_then_stage(
+    src: &Path,
+    dst: &Path,
+    publish: Publish,
+    cancel: &AtomicBool,
+    reporter: &mut Reporter<'_>,
+    content: Option<&dyn ContentSource>,
+    hook: ChunkHook<'_>,
+) -> Result<Step> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(Step::Cancelled);
+    }
+    let meta = std::fs::symlink_metadata(src)
+        .map_err(|err| SyncError::io("stat copy source", src, err))?;
+    if crate::lfs::stage::worktree_pointer(src, &meta).is_none() {
+        return stage(src, dst, publish, cancel, reporter, hook);
+    }
+    // Reachable even though [`classify`] refuses a pointer path when there is
+    // no source: an ordinary file can BECOME pointer text between the plan and
+    // here, and copying the stub is the one answer that must never happen.
+    let Some(source) = content else {
+        return Err(SyncError::Refused(
+            crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                path: src.to_string_lossy().into_owned(),
+            },
+        ));
+    };
+    source.materialize(src)?;
+    // Re-stat, so the mode and mtime [`stage`] carries to the destination are
+    // the content's and not the pointer's.
+    let after = std::fs::symlink_metadata(src)
+        .map_err(|err| SyncError::io("stat copy source", src, err))?;
+    if crate::lfs::stage::worktree_pointer(src, &after).is_some() {
+        // The source answered `Ok` and the file is still its pointer. Nothing
+        // here knows why, and there is exactly one safe answer.
+        return Err(SyncError::Refused(
+            crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                path: src.to_string_lossy().into_owned(),
+            },
+        ));
+    }
+    stage(src, dst, publish, cancel, reporter, hook)
 }
 
 /// Whether publishing this file will destroy something.
@@ -711,7 +873,7 @@ enum PlanItem {
 /// The pre-walk exists so `files_total` and `bytes_total` are facts rather than
 /// guesses (AC 5): a surface must never claim a total it does not have. It is
 /// also what makes the job's order deterministic — see [`children_of`].
-fn plan_copy(source: &Path) -> Result<Plan> {
+fn plan_copy(source: &Path, content: Option<&dyn ContentSource>) -> Result<Plan> {
     let root_meta = std::fs::symlink_metadata(source)
         .map_err(|err| SyncError::io("stat copy source", source, err))?;
 
@@ -726,7 +888,7 @@ fn plan_copy(source: &Path) -> Result<Plan> {
             )));
         };
         let rel = PathBuf::from(name);
-        let item = classify(source, rel)?;
+        let item = classify(source, rel, content)?;
         let bytes_total = match &item {
             PlanItem::File { bytes, .. } => *bytes,
             _ => 0,
@@ -778,7 +940,7 @@ fn plan_copy(source: &Path) -> Result<Plan> {
             }
             continue;
         }
-        items.push(classify(&absolute, rel)?);
+        items.push(classify(&absolute, rel, content)?);
     }
 
     let files_total = items
@@ -802,7 +964,11 @@ fn plan_copy(source: &Path) -> Result<Plan> {
 }
 
 /// Decide what one non-directory path is, and whether it can be copied.
-fn classify(absolute: &Path, rel: PathBuf) -> Result<PlanItem> {
+fn classify(
+    absolute: &Path,
+    rel: PathBuf,
+    content: Option<&dyn ContentSource>,
+) -> Result<PlanItem> {
     let meta = std::fs::symlink_metadata(absolute)
         .map_err(|err| SyncError::io("stat copy source", absolute, err))?;
 
@@ -827,6 +993,41 @@ fn classify(absolute: &Path, rel: PathBuf) -> Result<PlanItem> {
             reason: "a dataless iCloud placeholder; copying it would materialize \
                      the file from the network"
                 .into(),
+        });
+    }
+    // The sibling of the refusal above, and the same shape: a path that holds
+    // only its LFS pointer stands in for content that is somewhere else, and
+    // copying the ~130 bytes would report a verified copy of nothing.
+    //
+    // It is not free, and the cost is worth stating rather than waving away:
+    // `worktree_pointer` opens and reads every file of one to
+    // `MAX_POINTER_BYTES` bytes before its memcmp can reject it, and its own
+    // doc draws the opposite conclusion for `browse::classify` — a probe per
+    // dirent is one open per note. It is accepted here because a copy already
+    // opens and reads every one of those files twice, in full, moments later;
+    // one bounded read at plan time is noise beside the job it is planning,
+    // where a listing has nothing to hide it behind. The `Metadata` is the one
+    // already in hand, so no second `stat` is paid either way.
+    if let Some(pointer) = crate::lfs::stage::worktree_pointer(absolute, &meta) {
+        if content.is_none() {
+            return Ok(PlanItem::Refused {
+                reason: crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                    path: display(&rel),
+                }
+                .to_string(),
+                rel,
+            });
+        }
+        // Planned as an ordinary file, and the size is the one the pointer
+        // DECLARES. Hydration itself belongs to execute time — see
+        // [`hydrate_then_stage`] — so the plan must state the total without
+        // moving a byte, and the content's declared size is the honest number
+        // every other keeper surface already prints for a virtual path
+        // (FR-336). Stating the ~130 bytes instead would make the bar's
+        // denominator a lie for the whole job.
+        return Ok(PlanItem::File {
+            rel,
+            bytes: pointer.size,
         });
     }
     Ok(PlanItem::File {
@@ -1136,8 +1337,15 @@ mod tests {
         let destination = dir.path().join("dst");
         source_tree(&source);
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("copy");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         assert_eq!(
             outcomes(&report),
@@ -1173,7 +1381,15 @@ mod tests {
         let destination = dir.path().join("dst");
         source_tree(&source);
 
-        copy_verified(&source, &destination, &CopyOptions::default(), None, &off()).expect("first");
+        copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("first");
 
         // The full identity tuple, not just the mtime: a rewrite that preserved
         // the mtime would still move the ctime and the inode, and this has to
@@ -1187,8 +1403,15 @@ mod tests {
             })
             .collect();
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("second");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("second");
 
         assert!(
             report
@@ -1226,8 +1449,15 @@ mod tests {
         let same_length = b"GAMMA";
         write_file(&destination.join("nested/deeper/gamma.txt"), same_length);
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("copy");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         assert_eq!(entry(&report, "alpha.txt").outcome, CopyOutcome::Collision);
         assert_eq!(
@@ -1267,7 +1497,8 @@ mod tests {
         let options = CopyOptions {
             replace_existing: true,
         };
-        let report = copy_verified(&source, &destination, &options, None, &off()).expect("copy");
+        let report =
+            copy_verified(&source, &destination, &options, None, &off(), None).expect("copy");
 
         assert_eq!(entry(&report, "alpha.txt").outcome, CopyOutcome::Copied);
         assert_eq!(read_file(&destination.join("alpha.txt")), b"alpha");
@@ -1304,8 +1535,16 @@ mod tests {
         let options = CopyOptions {
             replace_existing: true,
         };
-        let report = copy_verified_hooked(&source, &destination, &options, None, &off(), &mut torn)
-            .expect("copy");
+        let report = copy_verified_hooked(
+            &source,
+            &destination,
+            &options,
+            None,
+            &off(),
+            None,
+            &mut torn,
+        )
+        .expect("copy");
 
         let CopyOutcome::Failed { reason } = &entry(&report, "alpha.txt").outcome else {
             panic!("expected a failure, got {:?}", outcomes(&report));
@@ -1346,6 +1585,7 @@ mod tests {
             &CopyOptions::default(),
             None,
             &off(),
+            None,
             &mut torn,
         )
         .expect("copy");
@@ -1402,6 +1642,7 @@ mod tests {
             &CopyOptions::default(),
             None,
             &cancel,
+            None,
             &mut mid_file,
         )
         .expect("copy");
@@ -1440,6 +1681,7 @@ mod tests {
             &CopyOptions::default(),
             None,
             &AtomicBool::new(true),
+            None,
         )
         .expect("copy");
 
@@ -1473,6 +1715,7 @@ mod tests {
                 &CopyOptions::default(),
                 Some(&sink),
                 &off(),
+                None,
             )
             .expect("copy")
         };
@@ -1512,8 +1755,15 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("outside.txt"), source.join("escape.txt"))
             .expect("symlink");
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("copy");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         let CopyOutcome::Failed { reason } = &entry(&report, "escape.txt").outcome else {
             panic!("expected a refusal, got {:?}", outcomes(&report));
@@ -1545,7 +1795,15 @@ mod tests {
         )
         .expect("chmod");
 
-        copy_verified(&source, &destination, &CopyOptions::default(), None, &off()).expect("copy");
+        copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         let script = std::fs::metadata(destination.join("run.sh")).expect("stat script");
         let notes = std::fs::metadata(destination.join("notes.txt")).expect("stat notes");
@@ -1571,8 +1829,15 @@ mod tests {
         let destination = dir.path().join("dst");
         write_file(&source, b"just the one");
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("copy");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         assert_eq!(outcomes(&report), vec![("one.txt", &CopyOutcome::Copied)]);
         assert_eq!(read_file(&destination.join("one.txt")), b"just the one");
@@ -1587,6 +1852,7 @@ mod tests {
             &CopyOptions::default(),
             None,
             &off(),
+            None,
         )
         .expect_err("a source that is not there is not a per-file problem");
         assert_eq!(err.code(), "io");
@@ -1600,8 +1866,15 @@ mod tests {
         source_tree(&source);
         std::fs::create_dir_all(destination.join("alpha.txt")).expect("occupy with a directory");
 
-        let report = copy_verified(&source, &destination, &CopyOptions::default(), None, &off())
-            .expect("copy");
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("copy");
 
         let CopyOutcome::Failed { reason } = &entry(&report, "alpha.txt").outcome else {
             panic!("expected a failure, got {:?}", outcomes(&report));
@@ -1633,6 +1906,7 @@ mod tests {
                 &CopyOptions::default(),
                 Some(&sink),
                 &off(),
+                None,
             )
             .expect("copy")
         };
@@ -1755,5 +2029,280 @@ mod tests {
         );
         assert!(copy_log_filename("20260730-120000").starts_with("keeper-copy-"));
         assert!(copy_log_filename("20260730-120000").ends_with(".log"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The hydration seam (Story 56.6)
+    //
+    // Engine-free on purpose: this module's whole premise is that it knows
+    // nothing about profiles, indexes or object stores, so the capability it
+    // asks for has to be exercisable by something that has none of them. The
+    // end-to-end proof through a real `Engine`, a real index and a real object
+    // store lives in `tests/virtual_state_is_not_a_fault.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Pointer text for `content`, exactly as a checkout of a virtual LFS path
+    /// leaves it on disk. Test-only: production mints these through
+    /// `lfs::stage::clean`, which would need an object store.
+    fn pointer_text(content: &[u8]) -> Vec<u8> {
+        let oid = hex::encode(Sha256::digest(content));
+        crate::lfs::pointer::Pointer::new(oid, content.len() as u64)
+            .render()
+            .into_bytes()
+    }
+
+    /// A source that publishes the real bytes over the pointer, which is what
+    /// `Engine::materialize_entry` does with an object it already holds.
+    struct FakeContent {
+        bytes: Vec<u8>,
+        asked: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl ContentSource for FakeContent {
+        fn materialize(&self, absolute: &Path) -> Result<()> {
+            self.asked
+                .lock()
+                .expect("asked lock")
+                .push(absolute.to_path_buf());
+            std::fs::write(absolute, &self.bytes)
+                .map_err(|err| SyncError::io("publish fixture content", absolute, err))?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_pointer_path_is_hydrated_before_it_is_copied_when_a_source_is_supplied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("src");
+        let destination = dir.path().join("dst");
+        let content = wide(7);
+        write_file(&source.join("alpha.txt"), b"alpha");
+        write_file(&source.join("clip.mp4"), &pointer_text(&content));
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let hydrator = FakeContent {
+            bytes: content.clone(),
+            asked: Arc::clone(&asked),
+        };
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            Some(&hydrator),
+        )
+        .expect("copy");
+
+        assert_eq!(
+            asked.lock().expect("asked lock").as_slice(),
+            &[source.join("clip.mp4")],
+            "only the pointer path is asked for, and by its absolute path"
+        );
+        assert_eq!(entry(&report, "clip.mp4").outcome, CopyOutcome::Copied);
+        assert_eq!(
+            read_file(&destination.join("clip.mp4")),
+            content,
+            "the destination must hold the content, byte for byte — not its pointer"
+        );
+        // The digest reported is the content's, computed on the way out and
+        // proven by the independent re-read (AD-C2).
+        assert_eq!(
+            entry(&report, "clip.mp4").sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&content)).as_str())
+        );
+        assert_eq!(entry(&report, "clip.mp4").bytes, content.len() as u64);
+        assert_eq!(entry(&report, "alpha.txt").outcome, CopyOutcome::Copied);
+    }
+
+    #[test]
+    fn a_pointer_path_with_no_source_is_refused_by_name_and_nothing_reaches_the_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("src");
+        let destination = dir.path().join("dst");
+        let stub = pointer_text(&wide(3));
+        write_file(&source.join("alpha.txt"), b"alpha");
+        write_file(&source.join("clip.mp4"), &stub);
+
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+        )
+        .expect("a refusal is one entry, never the end of the job");
+
+        let CopyOutcome::Failed { reason } = &entry(&report, "clip.mp4").outcome else {
+            panic!("expected a refusal, got {:?}", outcomes(&report));
+        };
+        assert_eq!(
+            reason,
+            &crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                path: "clip.mp4".to_owned(),
+            }
+            .to_string(),
+            "the sentence the person who asked for the copy reads"
+        );
+        assert_eq!(entry(&report, "clip.mp4").bytes, 0);
+        // The failure this whole seam exists to prevent: ~130 bytes of pointer
+        // text sitting at the destination, hashed twice and called a verified
+        // copy of a file that is somewhere else entirely.
+        assert!(
+            !destination.join("clip.mp4").exists(),
+            "a stub reached the destination: {:?}",
+            tree_paths(&destination)
+        );
+        assert_eq!(
+            entry(&report, "alpha.txt").outcome,
+            CopyOutcome::Copied,
+            "one refusal must not stop the files beside it"
+        );
+        assert_eq!(read_file(&destination.join("alpha.txt")), b"alpha");
+    }
+
+    #[test]
+    fn the_plan_totals_after_a_hydration_are_the_contents_and_not_the_pointers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("src");
+        let destination = dir.path().join("dst");
+        let content = wide(11);
+        write_file(&source.join("clip.mp4"), &pointer_text(&content));
+
+        let seen: Arc<Mutex<Vec<CopyProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let hydrator = FakeContent {
+            bytes: content.clone(),
+            asked: Arc::new(Mutex::new(Vec::new())),
+        };
+        let report = {
+            let recorded = Arc::clone(&seen);
+            let sink: CopySink = Box::new(move |event| {
+                recorded.lock().expect("sink lock").push(event);
+                true
+            });
+            copy_verified(
+                &source,
+                &destination,
+                &CopyOptions::default(),
+                Some(&sink),
+                &off(),
+                Some(&hydrator),
+            )
+            .expect("copy")
+        };
+
+        let events = seen.lock().expect("sink lock").clone();
+        let first = events.first().expect("an opening event with the totals");
+        let last = events.last().expect("a closing event");
+        // Without planning the pointer's DECLARED size the pre-walk total is
+        // the ~130 bytes of pointer text while the report accounts for the
+        // content, and the bar's denominator is a lie the whole way through.
+        assert_eq!(first.bytes_total, content.len() as u64);
+        assert_eq!(first.bytes_total, last.bytes_total);
+        let accounted: u64 = report.entries.iter().map(|entry| entry.bytes).sum();
+        assert_eq!(last.bytes_total, accounted);
+        assert_eq!(last.bytes_done, last.bytes_total);
+        assert_eq!(report.bytes_copied, content.len() as u64);
+    }
+
+    #[test]
+    fn a_file_that_becomes_pointer_text_between_the_plan_and_the_copy_is_failed_not_copied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("src");
+        let destination = dir.path().join("dst");
+        let stub = pointer_text(&wide(5));
+        write_file(&source.join("alpha.txt"), b"alpha");
+        write_file(&source.join("clip.mp4"), &wide(5));
+
+        // The plan sees `clip.mp4` as an ordinary file; keeper's own release
+        // sweep re-dehydrates it while the job runs. The hook fires on the
+        // FIRST file of the sorted walk, so the write lands after the plan and
+        // before `clip.mp4` is reached.
+        let stubbed = stub.clone();
+        let victim = source.join("clip.mp4");
+        let mut released = |current: &Path| {
+            if current.ends_with("alpha.txt") {
+                std::fs::write(&victim, &stubbed).expect("re-dehydrate under the job");
+            }
+        };
+        let report = copy_verified_hooked(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            None,
+            &mut released,
+        )
+        .expect("a refusal is one entry, never the end of the job");
+
+        let CopyOutcome::Failed { reason } = &entry(&report, "clip.mp4").outcome else {
+            panic!("expected a refusal, got {:?}", outcomes(&report));
+        };
+        assert_eq!(
+            reason,
+            &crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                path: "clip.mp4".to_owned(),
+            }
+            .to_string(),
+            "named in the copy's own frame, which is how the row is keyed"
+        );
+        // The whole point: without the execute-time question this streams,
+        // hashes, verifies and publishes ~130 bytes, then reports `Copied`
+        // with the plan's byte count.
+        assert!(
+            !destination.join("clip.mp4").exists(),
+            "a stub reached the destination: {:?}",
+            tree_paths(&destination)
+        );
+        assert_eq!(entry(&report, "alpha.txt").outcome, CopyOutcome::Copied);
+    }
+
+    /// A source that answers `Ok` and leaves the pointer standing is a failure,
+    /// not a copy.
+    ///
+    /// Nothing here can know why — a hydration that raced a release, an
+    /// implementor with a bug — and there is exactly one safe answer to a
+    /// worktree that is still ~130 bytes of text standing in for the file
+    /// somebody asked to copy.
+    #[test]
+    fn a_source_that_claims_success_and_leaves_the_pointer_fails_that_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("src");
+        let destination = dir.path().join("dst");
+        let stub = pointer_text(&wide(13));
+        write_file(&source.join("clip.mp4"), &stub);
+
+        // Writes the pointer text back over itself and reports success.
+        let liar = FakeContent {
+            bytes: stub.clone(),
+            asked: Arc::new(Mutex::new(Vec::new())),
+        };
+        let report = copy_verified(
+            &source,
+            &destination,
+            &CopyOptions::default(),
+            None,
+            &off(),
+            Some(&liar),
+        )
+        .expect("a refusal is one entry, never the end of the job");
+
+        let CopyOutcome::Failed { reason } = &entry(&report, "clip.mp4").outcome else {
+            panic!("expected a refusal, got {:?}", outcomes(&report));
+        };
+        assert_eq!(
+            reason,
+            &crate::lfs::hydrate::ContentRefusal::ContentNotHere {
+                path: "clip.mp4".to_owned(),
+            }
+            .to_string()
+        );
+        assert!(
+            !destination.join("clip.mp4").exists(),
+            "a stub reached the destination: {:?}",
+            tree_paths(&destination)
+        );
     }
 }

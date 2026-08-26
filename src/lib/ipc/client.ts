@@ -82,6 +82,7 @@ export type { FilesEntryVm } from "./gen/FilesEntryVm";
 export type { FilesFolderRoleVm } from "./gen/FilesFolderRoleVm";
 export type { FilesListingState } from "./gen/FilesListingState";
 export type { FilesListingVm } from "./gen/FilesListingVm";
+export type { FilesReleaseVm } from "./gen/FilesReleaseVm";
 export type { FilesSyncStatusVm } from "./gen/FilesSyncStatusVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
@@ -3254,6 +3255,82 @@ export async function syncOpenEntry(id: string, subpath: string): Promise<void> 
  */
 export async function syncReadText(id: string, subpath: string): Promise<TextFileVm> {
   return await invoke<TextFileVm>("sync_read_text", { id, subpath });
+}
+
+/**
+ * Ask for one virtual path's content (FR-338, Story 56.3).
+ *
+ * Takes the profile id and the profile-relative `subpath` this surface was
+ * handed by {@link syncBrowse}, never a path and never one composed here
+ * (AD-65) — Rust re-resolves it through the same containment rule the listing
+ * uses. It is NOT given `FilesEntryVm.absolutePath`.
+ *
+ * **Two things can happen and both resolve.** If this machine already holds
+ * the object, the file on disk becomes the real bytes before this resolves. If
+ * it does not, a transfer is queued and this resolves as soon as it is queued —
+ * the sync daemon delivers it, so watch `sync_subscribe_progress` for
+ * `downloadingLfs` with the path in `current`, and re-read the listing to see
+ * the row turn from virtual to materialized. Nothing is returned, because every
+ * fact a row needs already has a surface.
+ *
+ * **A file the user has edited is refused, never overwritten.** So is a path
+ * that is not a tracked large file, one outside the folder's subpaths, one that
+ * has been deleted, and any path in a folder with large-file support turned
+ * off. Each rejection's message is Rust's own sentence, written to be shown
+ * verbatim.
+ *
+ * Rejects with: `syncUnavailable` (the folder is already syncing — the run in
+ * progress will finish first), `unsupported`, `internal`.
+ */
+export async function syncMaterializeEntry(id: string, subpath: string): Promise<void> {
+  await invoke<void>("sync_materialize_entry", { id, subpath });
+}
+
+/**
+ * Let one materialized path go back to being its pointer (FR-343, FR-332,
+ * Story 56.9).
+ *
+ * Addressed exactly like {@link syncMaterializeEntry}: the profile id and the
+ * profile-relative `subpath` the listing handed over, never a path composed
+ * here (AD-65).
+ *
+ * **This deletes content from this machine, and refuses five times before it
+ * does.** A path whose bytes are not what the folder committed, a path some
+ * process may be reading, a path nothing has confirmed the server holds, a
+ * pinned path — each is refused by name, and each rejection's message is Rust's
+ * own sentence, written to be shown verbatim. On a host that cannot answer "is
+ * this file open" without racing, the refusal is that it cannot tell, which is
+ * the safe answer rather than a bug.
+ *
+ * **A path that is already a pointer RESOLVES.** There was nothing to release,
+ * which is not a failure; re-read the listing either way.
+ *
+ * Rejects with: `syncUnavailable` (the folder is already syncing — the run in
+ * progress will finish first), `unsupported`, `internal`.
+ */
+export async function syncReleaseEntry(id: string, subpath: string): Promise<void> {
+  await invoke<void>("sync_release_entry", { id, subpath });
+}
+
+/**
+ * Hold one path's content against release, or stop holding it (FR-334, Story
+ * 56.9).
+ *
+ * A standing instruction about a path, not an operation on bytes: it writes
+ * nothing into the folder, it is idempotent, and the path does not have to hold
+ * content yet. What it changes is that the release sweep and
+ * {@link syncReleaseEntry} will both refuse this path until the pin is lifted —
+ * so a pinned row shows no countdown at all.
+ *
+ * `pinned` is an argument rather than a toggle, so two presses in a row cannot
+ * leave the folder in a state neither side expected.
+ *
+ * Rejects with: `unsupported`, `internal` (no such folder, a drive that is out,
+ * a subpath that escapes the folder, a path that is not a tracked large file,
+ * a path outside the folder's subpaths).
+ */
+export async function syncPinEntry(id: string, subpath: string, pinned: boolean): Promise<void> {
+  await invoke<void>("sync_pin_entry", { id, subpath, pinned });
 }
 
 /**

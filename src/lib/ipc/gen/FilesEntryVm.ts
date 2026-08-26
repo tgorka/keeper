@@ -2,6 +2,7 @@
 import type { FileSizeVm } from "./FileSizeVm";
 import type { FilesEntrySyncVm } from "./FilesEntrySyncVm";
 import type { FilesFolderRoleVm } from "./FilesFolderRoleVm";
+import type { FilesReleaseVm } from "./FilesReleaseVm";
 import type { FilesWriteVm } from "./FilesWriteVm";
 import type { RecordingNoteTargetKind } from "./RecordingNoteTargetKind";
 
@@ -67,6 +68,56 @@ sync: FilesEntrySyncVm,
  * guessing.
  */
 size: FileSizeVm | null, 
+/**
+ * The object id of the LFS pointer this entry's bytes are, if they are one
+ * (Story 56.2, FR-336).
+ *
+ * **`Some` is what makes [`Self::size`] legible.** A virtual path is about
+ * 130 bytes on disk and its `size` is the gigabytes the pointer names, so
+ * without this field a surface has a number it cannot account for and no
+ * way to tell it apart from an ordinary file's. With it, the row can say
+ * where the bytes are.
+ *
+ * Also the handle the later verbs of this epic need — the store path, the
+ * batch request and the release ledger are all keyed by oid — carried on
+ * the entry rather than re-derived, because re-deriving it means reading
+ * the file again.
+ *
+ * `None` for a directory, for an ordinary file, and for an entry whose
+ * metadata could not be read.
+ */
+lfsOid: string | null, 
+/**
+ * When this entry was last written, ms since the Unix epoch (Story 56.2,
+ * FR-340).
+ *
+ * **`Option`, not the `0` sentinel** `SessionEntryVm::mtime_ms` uses. Both
+ * spellings exist in this crate and this is the chain in which
+ * [`Self::size`] is already an absence-when-unknown for exactly this
+ * reason: a struct carrying `size: null` beside `mtimeMs: 0` would be
+ * answering the same question two ways, and 1970 is a plausible-looking
+ * date rather than an admission.
+ *
+ * Carried for a **directory** too, unlike the size. A folder's mtime is a
+ * real fact about the folder; a folder's `len()` is a fact about its own
+ * bookkeeping and about nothing anybody asked.
+ *
+ * `#[ts(type = "number | null")]` because ts-rs maps a 64-bit integer to
+ * `bigint` otherwise, which no `JSON.parse` produces and no comparison
+ * against a `number` accepts.
+ */
+mtimeMs: number | null, 
+/**
+ * When keeper may let this entry's content go again, or why it will not
+ * (Story 56.9, FR-343).
+ *
+ * `None` means release is not a concept for this row: an ordinary file
+ * whose bytes are the user's own, a folder, a pointer with nothing here
+ * to release, or a download still in flight. Only a materialized file can
+ * carry one, and [`Self::new`] enforces that rather than trusting its
+ * caller.
+ */
+release: FilesReleaseVm | null, 
 /**
  * Whether keeper itself put something here (Story 45.5, FR-178).
  *

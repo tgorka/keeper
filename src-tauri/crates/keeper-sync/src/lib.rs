@@ -63,7 +63,8 @@ pub mod volume;
 pub mod watch;
 
 pub use copy::{
-    copy_verified, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport, CopySink,
+    copy_verified, ContentSource, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport,
+    CopySink,
 };
 pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};

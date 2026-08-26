@@ -149,6 +149,34 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 15_000;
 /// tree on every 1 Hz supervisor tick, on a pendrive or over a network mount.
 pub const MIN_POLL_INTERVAL_MS: u64 = 2_000;
 
+/// How long content may stay on this machine after its clock last moved,
+/// before the release sweep may let it go (Story 56.5, FR-341).
+///
+/// 24 h is the owner's own ask, and it is a day rather than an hour because
+/// the cost of releasing too eagerly is a re-download of content somebody was
+/// still working with, while the cost of holding a day too long is a day of
+/// disk.
+pub const DEFAULT_RELEASE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Smallest non-zero release TTL a profile may carry.
+///
+/// Below a minute the sweep is not housekeeping, it is a race against the
+/// download that just materialized the content. Refused rather than floored —
+/// the divergence from [`MIN_POLL_INTERVAL_MS`] is deliberate: this field
+/// never existed before Story 56.5, so no stored profile can carry a legacy
+/// zero-by-omission, which means every out-of-range value here is one a person
+/// typed and deserves to be told about. `0` is the documented way to disable
+/// the sweep and is accepted.
+pub const MIN_RELEASE_TTL_MS: u64 = 60_000;
+/// Largest release TTL a profile may carry: ten years.
+///
+/// **Load-bearing, not decorative.** The sweep compares
+/// `since.saturating_add(ttl_ms as i64)` against a millisecond clock, and the
+/// `as i64` cast of a `u64` above `i64::MAX` wraps *negative* — which would
+/// make every row instantly eligible and turn "keep this essentially forever"
+/// into "release everything on the next sync". Ten years is far past any
+/// honest retention window and comfortably inside the cast.
+pub const RELEASE_TTL_CEILING_MS: u64 = 3650 * 24 * 60 * 60 * 1000;
+
 /// Where a vault lives inside a notes-flagged folder, by default (AD-54).
 pub const DEFAULT_NOTES_SUBFOLDER: &str = "notes";
 /// Where a journal entry for a given day is written, by default (FR-99).
@@ -827,6 +855,72 @@ pub struct SyncProfile {
     /// of.
     #[serde(default)]
     pub lfs_never: Vec<String>,
+    /// Repository-relative globs whose **content** may stay unmaterialized
+    /// after a pull (AD-122, FR-328).
+    ///
+    /// Gitignore dialect, the same one every other pattern field in this record
+    /// uses: a pattern with no `/` matches that basename at any depth,
+    /// otherwise it is anchored at the repository root; `!` negates, and a
+    /// negated line wins unconditionally over a matching one, because erring
+    /// toward keeping bytes is the only safe direction. A path listed here is
+    /// still tracked, still committed and still wanted — only its bytes are
+    /// allowed to be absent, and the pointer is what answers for it.
+    ///
+    /// This is **not** `lfs_never` directly above, which is very nearly the
+    /// opposite: `lfs_never` says "never route this through LFS at all", so a
+    /// file matched there has no pointer to stay away behind. A file matched
+    /// here is one keeper deliberately routed through LFS and may now leave in
+    /// the store.
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for `notes`
+    /// below and for the same reason: a row written by a keeper that had never
+    /// heard of virtualization simply has no key, so it loads as an empty list
+    /// and says nothing. No SQL change, no schema bump, nothing to run on
+    /// upgrade, and a row written by this keeper still loads on the older one.
+    #[serde(default)]
+    pub virtual_patterns: Vec<String>,
+    /// Smallest size, in bytes, a matched path may stay unmaterialized at
+    /// (inclusive). `0` means no floor.
+    ///
+    /// Every term of the policy has to be answerable from the LFS pointer and
+    /// never from the bytes (AD-122) — reading the bytes to decide whether the
+    /// bytes may be absent is circular — and a size is, because the pointer
+    /// carries it. That is also why the floor lives here and has no spelling in
+    /// the committed pattern file: a size is not expressible in gitignore
+    /// dialect.
+    ///
+    /// No named `default_*` fn, unlike `lfs_threshold_bytes` above: there the
+    /// correct default is a real number a constant has to hold, whereas here it
+    /// really is zero, so `Default` is already the right answer and a named fn
+    /// would only be a second place for it to disagree from.
+    #[serde(default)]
+    pub virtual_over_bytes: u64,
+    /// How long this repository's content may stay on this machine after its
+    /// release clock last moved (Story 56.5, FR-341, AD-126).
+    ///
+    /// Which clock is a fact about the path, not about this field: content
+    /// that arrived from the remote measures from its last use, content this
+    /// clone authored measures from the instant the remote confirmed it and is
+    /// not eligible at any age until then.
+    ///
+    /// **`0` disables the sweep entirely**, and it disables it before the due
+    /// clock is read, so a folder with the sweep turned off never arms a window
+    /// that would fire the moment somebody turns it back on. That is the
+    /// `lfs.pruneoffsetdays` convention and a deliberate divergence from
+    /// `poll_interval_ms` directly below, whose zero is silently floored.
+    ///
+    /// `#[serde(default = "default_release_ttl_ms")]` **is** the migration,
+    /// exactly as it is for `virtual_patterns` above: a profile row written by
+    /// a keeper that had never heard of the release sweep simply has no key, so
+    /// it loads with the 24 h default. No SQL change, nothing to run on
+    /// upgrade, and a row written by this keeper still loads on the older one.
+    ///
+    /// [`SyncProfile::validate`] refuses a non-zero value below
+    /// [`MIN_RELEASE_TTL_MS`] or anything above [`RELEASE_TTL_CEILING_MS`]
+    /// rather than clamping either, because this field never existed before
+    /// this release: every out-of-range value is one a person typed.
+    #[serde(default = "default_release_ttl_ms")]
+    pub release_ttl_ms: u64,
     #[serde(default = "default_settle_ms")]
     pub settle_ms: u64,
     #[serde(default = "default_poll_interval_ms")]
@@ -895,6 +989,9 @@ fn default_settle_ms() -> u64 {
 fn default_poll_interval_ms() -> u64 {
     DEFAULT_POLL_INTERVAL_MS
 }
+fn default_release_ttl_ms() -> u64 {
+    DEFAULT_RELEASE_TTL_MS
+}
 fn default_true() -> bool {
     true
 }
@@ -935,6 +1032,9 @@ impl SyncProfile {
             lfs_mode: LfsMode::Materialize,
             lfs_threshold_bytes: DEFAULT_LFS_THRESHOLD_BYTES,
             lfs_never: Vec::new(),
+            virtual_patterns: Vec::new(),
+            virtual_over_bytes: 0,
+            release_ttl_ms: DEFAULT_RELEASE_TTL_MS,
             lfs_prune_local: true,
             settle_ms: DEFAULT_SETTLE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
@@ -971,6 +1071,23 @@ impl SyncProfile {
     /// (AD-34-8).
     pub fn effective_poll_interval_ms(&self) -> u64 {
         self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
+    }
+
+    /// The release TTL in force, or `None` when the sweep is switched off
+    /// (Story 56.5).
+    ///
+    /// Beside [`Self::effective_poll_interval_ms`] because it answers the same
+    /// shape of question, and deliberately *unlike* it in the answer: there a
+    /// zero is floored to a cadence, because a scheduler that never ticks is
+    /// not a thing an operator can want. Here a zero is the documented way to
+    /// say "never release anything from this folder", so it is carried out to
+    /// the caller as `None` rather than turned into a very short TTL.
+    ///
+    /// `Option` rather than a sentinel so the disabled case cannot be read as
+    /// a duration by accident: the sweep matches on it and returns before it
+    /// reads a clock.
+    pub fn effective_release_ttl_ms(&self) -> Option<u64> {
+        (self.release_ttl_ms > 0).then_some(self.release_ttl_ms)
     }
 
     /// The vault root — `local_path` joined with the notes subfolder — or
@@ -1058,6 +1175,29 @@ impl SyncProfile {
         if self.settle_ms > SETTLE_CEILING_MS {
             return Err(SyncError::Config(format!(
                 "settle window must not exceed {SETTLE_CEILING_MS} ms"
+            )));
+        }
+        // Refused rather than floored, unlike `poll_interval_ms`: this field
+        // never existed before Story 56.5, so no stored profile can be
+        // carrying a legacy zero-by-omission and every out-of-range value is
+        // one somebody typed. `0` is excluded from the floor check because it
+        // is the documented way to switch the sweep off.
+        if self.release_ttl_ms > 0 && self.release_ttl_ms < MIN_RELEASE_TTL_MS {
+            return Err(SyncError::Config(format!(
+                "release TTL must be at least {MIN_RELEASE_TTL_MS} ms, got {}; use 0 to disable \
+                 releasing entirely",
+                self.release_ttl_ms
+            )));
+        }
+        // The ceiling is a correctness guard, not a taste one: the sweep casts
+        // this to `i64` to add it to a millisecond clock, and a `u64` above
+        // `i64::MAX` wraps negative there — every row would become instantly
+        // eligible, so "keep it essentially forever" would mean "release
+        // everything on the next sync".
+        if self.release_ttl_ms > RELEASE_TTL_CEILING_MS {
+            return Err(SyncError::Config(format!(
+                "release TTL must not exceed {RELEASE_TTL_CEILING_MS} ms, got {}",
+                self.release_ttl_ms
             )));
         }
         // Refused here, where the user can still see the field, rather than
@@ -1271,6 +1411,120 @@ mod tests {
         assert_eq!(p.effective_poll_interval_ms(), 45_000);
     }
 
+    /// The release TTL diverges from the scan cadence directly above, and the
+    /// divergence is the point (Story 56.5).
+    ///
+    /// `poll_interval_ms` floors a zero because a scheduler that never ticks is
+    /// not a thing an operator can want. A release sweep that never runs is
+    /// exactly a thing an operator can want, so zero is carried out as `None`
+    /// and the sweep switches off — the `lfs.pruneoffsetdays` convention. A
+    /// silent floor here would turn "never release anything from this folder"
+    /// into "release it after a minute", which is data loss spelled as a
+    /// default.
+    #[test]
+    fn a_zero_release_ttl_disables_the_sweep_where_a_zero_poll_interval_is_floored() {
+        let mut p = profile();
+        assert_eq!(
+            p.effective_release_ttl_ms(),
+            Some(DEFAULT_RELEASE_TTL_MS),
+            "a fresh profile releases a day after the clock last moved"
+        );
+
+        p.release_ttl_ms = 0;
+        assert_eq!(
+            p.effective_release_ttl_ms(),
+            None,
+            "zero is off, not a very short window"
+        );
+        assert!(
+            p.validate().is_ok(),
+            "and it is the documented way to disable, so it is accepted rather \
+             than refused for being below the floor"
+        );
+
+        p.poll_interval_ms = 0;
+        assert_eq!(
+            p.effective_poll_interval_ms(),
+            MIN_POLL_INTERVAL_MS,
+            "the neighbouring knob still floors its zero: the two answers differ \
+             on purpose and this is the assertion that says so"
+        );
+
+        p.release_ttl_ms = 3_600_000;
+        assert_eq!(p.effective_release_ttl_ms(), Some(3_600_000));
+    }
+
+    /// A release TTL out of range is refused at load, with the value and the
+    /// reason named (Story 56.5).
+    ///
+    /// Refused rather than clamped because the field never existed before this
+    /// release: no stored profile can be carrying a legacy value, so every
+    /// out-of-range number is one somebody typed.
+    #[test]
+    fn a_release_ttl_below_the_floor_or_above_the_ceiling_is_refused() {
+        let mut p = profile();
+
+        p.release_ttl_ms = 500;
+        let err = p.validate().expect_err("half a second is not housekeeping");
+        let message = err.to_string();
+        assert!(
+            message.contains(&MIN_RELEASE_TTL_MS.to_string()),
+            "the message must name the floor: {message}"
+        );
+        assert!(
+            message.contains('0'),
+            "and how to disable, which is the thing the person typing 500 may \
+             actually have wanted: {message}"
+        );
+
+        p.release_ttl_ms = MIN_RELEASE_TTL_MS;
+        assert!(p.validate().is_ok(), "the floor itself is accepted");
+
+        // The ceiling is a correctness guard: the sweep casts this to `i64`,
+        // and a `u64` above `i64::MAX` wraps NEGATIVE there — every row would
+        // be instantly eligible, so "keep it forever" would mean "release
+        // everything on the next sync".
+        p.release_ttl_ms = u64::MAX;
+        let err = p.validate().expect_err("an unbounded TTL is refused");
+        assert!(
+            err.to_string()
+                .contains(&RELEASE_TTL_CEILING_MS.to_string()),
+            "the message must name the ceiling: {err}"
+        );
+        assert!(
+            (RELEASE_TTL_CEILING_MS as i64) > 0,
+            "and the ceiling has to be a value the cast survives, or the guard \
+             is guarding nothing"
+        );
+
+        p.release_ttl_ms = RELEASE_TTL_CEILING_MS;
+        assert!(p.validate().is_ok(), "the ceiling itself is accepted");
+    }
+
+    /// A profile row written before the release sweep existed loads with the
+    /// default rather than with a zero that would silently disable it (Story
+    /// 56.5).
+    ///
+    /// `#[serde(default = "default_release_ttl_ms")]` IS the migration, and the
+    /// direction matters: `#[serde(default)]` would give `0`, which is "never
+    /// release", so every folder that upgraded would keep every byte forever
+    /// and the feature would ship inert.
+    #[test]
+    fn a_profile_stored_before_this_field_existed_loads_with_the_default_ttl() {
+        let mut json = serde_json::to_value(profile()).expect("serialize");
+        json.as_object_mut()
+            .expect("a profile is an object")
+            .remove("releaseTtlMs")
+            .expect("the key is there to remove");
+
+        let loaded: SyncProfile = serde_json::from_value(json).expect("an older row still loads");
+        assert_eq!(loaded.release_ttl_ms, DEFAULT_RELEASE_TTL_MS);
+        assert_eq!(
+            loaded.effective_release_ttl_ms(),
+            Some(DEFAULT_RELEASE_TTL_MS)
+        );
+    }
+
     #[test]
     fn a_commit_subject_template_is_optional_and_its_placeholders_are_checked() {
         let mut p = profile();
@@ -1402,6 +1656,50 @@ mod tests {
         // folder round-trips to the same thing, so rolling back a release
         // cannot turn `notes: null` into a parse failure.
         let round = serde_json::to_string(&parsed).expect("encode");
+        let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+        assert_eq!(parsed, back);
+    }
+
+    /// `#[serde(default)]` is the whole migration for the two virtualization
+    /// keys (AD-122): a row written before this story has neither, and must
+    /// load as "nothing may stay away, and no floor" rather than fail to parse
+    /// — there is no SQL change and nothing to run on upgrade.
+    #[test]
+    fn a_profile_row_written_before_virtualization_existed_still_loads() {
+        let older = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": ["*.csv"],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(older).expect("an older row still loads");
+        assert!(
+            parsed.virtual_patterns.is_empty(),
+            "an absent key means: nothing's content may stay away"
+        );
+        assert_eq!(
+            parsed.virtual_over_bytes, 0,
+            "and no floor, which is the only default that cannot surprise anyone"
+        );
+        assert_eq!(
+            parsed.lfs_never,
+            vec!["*.csv".to_owned()],
+            "the neighbouring field it must never be confused with is untouched"
+        );
+        assert!(parsed.validate().is_ok(), "and it is still a valid profile");
+
+        // The other direction too: the row this keeper writes carries both new
+        // keys and round-trips, so rolling a release back cannot turn them into
+        // a parse failure.
+        let round = serde_json::to_string(&parsed).expect("encode");
+        assert!(
+            round.contains("\"virtualPatterns\"") && round.contains("\"virtualOverBytes\""),
+            "both keys must be present once written: {round}"
+        );
         let back: SyncProfile = serde_json::from_str(&round).expect("decode");
         assert_eq!(parsed, back);
     }

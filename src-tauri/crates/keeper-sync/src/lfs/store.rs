@@ -32,7 +32,13 @@ use crate::error::{Result, SyncError};
 ///
 /// Bounded on purpose: an LFS object is routinely larger than RAM, so nothing
 /// in this module may size a buffer from the object (NFR-23).
-const HASH_CHUNK_BYTES: usize = 128 * 1024;
+///
+/// `pub(crate)` because a second LFS hashing loop arrived that is not in this
+/// module and must read at the same granularity:
+/// [`crate::lfs::stage::content_oid`], which hashes a materialized worktree
+/// file to prove it still holds the object this store would have handed out. A
+/// third copy of the literal would be a third thing to keep in step.
+pub(crate) const HASH_CHUNK_BYTES: usize = 128 * 1024;
 
 /// A repository's local LFS object store.
 #[derive(Debug, Clone)]

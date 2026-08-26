@@ -102,6 +102,17 @@ pub fn handle<R: Runtime>(
                     return note_protocol::not_found();
                 }
             };
+            // A use keeper can observe, so the release clock for this path
+            // moves (Story 56.5, AD-126) — but only for the head of a stream.
+            // A video scrub issues a Range request per seek, and treating each
+            // as a distinct use would write dozens of rows a second through the
+            // engine's single db mutex to tell a TTL measured in days something
+            // it cannot distinguish. This is the only judgement this story puts
+            // in a crate that does not build on Linux, and `serve` below stays
+            // pure.
+            if starts_a_playback(range.as_deref()) {
+                engine.note_use(&profile_id, &rel);
+            }
             serve(&profiles, &profile_id, &rel, range)
         })
         .await
@@ -111,6 +122,33 @@ pub fn handle<R: Runtime>(
         });
         responder.respond(response);
     });
+}
+
+/// Is this request the START of a read, rather than a seek within one?
+///
+/// The gate on the one `Engine::note_use` stamp this handler makes (Story
+/// 56.5). No `Range` at all is a plain fetch; `bytes=0-...` is a media element
+/// opening a file. Anything else — a forward seek, a suffix range — is a
+/// continuation of a use already recorded, and a scrub through an hour of video
+/// must not write a row per drag.
+///
+/// Deliberately conservative: a header this cannot read is not counted. The
+/// cost of missing a use is a TTL measured from a slightly earlier instant; the
+/// cost of counting every seek is a write storm against the sync loop's mutex.
+/// Pure, so it is unit-tested below rather than only on a running app.
+fn starts_a_playback(range: Option<&str>) -> bool {
+    let Some(raw) = range else {
+        return true;
+    };
+    let Some(spec) = raw.trim().strip_prefix("bytes=") else {
+        return false;
+    };
+    // A single range only. A multi-range request is not something a media
+    // element opening a file emits.
+    let Some((start, _)) = spec.trim().split_once('-') else {
+        return false;
+    };
+    start.trim() == "0"
 }
 
 /// Resolve one request and answer it. Blocking: a canonicalize and the file
@@ -186,6 +224,45 @@ mod tests {
 
     fn body_len(response: &Response<Vec<u8>>) -> usize {
         response.body().len()
+    }
+
+    /// A scrub through a video is one use, however many Range requests it
+    /// emits (Story 56.5).
+    ///
+    /// The gate is the whole of the judgement this crate holds for the release
+    /// clock, and getting it wrong the permissive way is a row written per
+    /// drag through the engine's single db mutex.
+    #[test]
+    fn only_the_head_of_a_stream_counts_as_a_new_use() {
+        assert!(
+            starts_a_playback(None),
+            "a plain fetch with no Range is a read from the beginning"
+        );
+        assert!(
+            starts_a_playback(Some("bytes=0-")),
+            "a media element opening a file asks for everything from zero"
+        );
+        assert!(
+            starts_a_playback(Some("bytes=0-1023")),
+            "and so does one that asks for the first slice only"
+        );
+        assert!(
+            !starts_a_playback(Some("bytes=1024-")),
+            "a forward seek continues the use already recorded"
+        );
+        assert!(
+            !starts_a_playback(Some("bytes=-500")),
+            "a suffix range is a seek to the end, not a beginning"
+        );
+        assert!(
+            !starts_a_playback(Some("items=0-10")),
+            "a unit this handler does not serve is not a beginning either"
+        );
+        assert!(
+            !starts_a_playback(Some("nonsense")),
+            "and a header that cannot be read is not counted: missing a use \
+             costs a slightly early TTL, counting every seek costs a write storm"
+        );
     }
 
     #[test]

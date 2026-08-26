@@ -177,6 +177,59 @@ pub fn report(
     }
 }
 
+/// Did the server affirmatively say it can serve **this** object?
+///
+/// The proof a deletion needs, and it is the exact inverse of [`report`]'s
+/// default. `report` treats a bare object — neither `actions` nor `error` — as
+/// present, because claiming a hole that is not there would send somebody
+/// hunting for bytes that are fine. That is the right polarity for a *report*:
+/// its worst outcome is wasted time.
+///
+/// A *deletion* cannot borrow that default. Here the worst outcome is content
+/// that existed nowhere else, so this reads the same wire shape the way
+/// [`crate::lfs::batch::ObjectSpec::disposition`] reads it for a download —
+/// which is the crate's one reading of it, and the strict one:
+///
+/// * **A row for the oid must exist.** Silence is not proof: a server that
+///   answered about some other object, or answered with an empty list, has
+///   said nothing about this one.
+/// * **No row for the oid may carry an `error`.** `disposition` says an error
+///   wins over any action, "and if a server sends both, refusing to transfer
+///   is the safe reading" — so a healthy row cannot outvote an errored one for
+///   the same object.
+/// * **Every row must offer a `download` action.** A bare object is precisely
+///   what `disposition` calls "a server that owes us an href and did not
+///   supply one", and a server that cannot say where the bytes are has not
+///   established that it has them.
+/// * **Every row's `size` must be the size asked about.** The filesystem
+///   branch beside this one proves presence through
+///   [`crate::lfs::store::LfsStore::contains`], which verifies the length
+///   exactly; an answer about the same digest at a different length is an
+///   answer about something else.
+///
+/// Takes the specs rather than making the round trip so the predicate is a pure
+/// function with its own tests, while the caller
+/// ([`crate::engine::Engine::remote_serves`]) owns the one thing that varies:
+/// how the question got asked. It takes the [`ObjectId`] it asked about rather
+/// than a bare oid so the size is part of the question, not a fact the caller
+/// is trusted to re-check.
+pub fn serves(specs: &[crate::lfs::batch::ObjectSpec], object: &ObjectId) -> bool {
+    let mut rows = specs
+        .iter()
+        .filter(|spec| spec.oid == object.oid)
+        .peekable();
+    if rows.peek().is_none() {
+        return false;
+    }
+    rows.all(|spec| {
+        spec.error.is_none()
+            && spec.size == object.size
+            && spec
+                .action(crate::lfs::batch::Operation::Download)
+                .is_some()
+    })
+}
+
 /// A repository-relative path as the rest of the engine spells one.
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -247,5 +300,77 @@ mod tests {
         let audit = report(&[spec("aa", 400, None)], &paths, 1, 400);
         assert!(audit.is_intact());
         assert_eq!(audit.missing_bytes(), 0);
+    }
+
+    /// A row the server offered a download for, which is the only shape that
+    /// authorizes a deletion.
+    fn served(oid: &str, size: u64) -> ObjectSpec {
+        ObjectSpec {
+            actions: Some(crate::lfs::batch::Actions {
+                download: Some(crate::lfs::batch::Action {
+                    href: "https://example.invalid/o".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..spec(oid, size, None)
+        }
+    }
+
+    /// Proof is affirmative, complete, and about the object asked for.
+    ///
+    /// Every false case here is a way a deletion could have been authorized by
+    /// something that is not evidence, and each one is a real wire shape:
+    /// silence, an answer about another object, an errored row, an errored row
+    /// standing beside a healthy one, a **bare** row with neither an error nor
+    /// an href, and a row about the same digest at a different length.
+    /// `report`'s own default says "present" for the bare row and for silence,
+    /// which is why this is a separate predicate rather than a reuse.
+    #[test]
+    fn only_an_affirmative_row_for_that_oid_proves_the_server_serves_it() {
+        let asked = ObjectId::new("aa", 400);
+
+        assert!(
+            serves(&[served("aa", 400)], &asked),
+            "no error, the size asked about, and an href to fetch it from — the \
+             server has said it can hand this over"
+        );
+        assert!(
+            serves(&[served("bb", 1), served("aa", 400)], &asked),
+            "and the row is found wherever in the answer it sits"
+        );
+
+        assert!(
+            !serves(&[], &asked),
+            "silence is not proof — this is exactly where `report`'s default \
+             would have said `present`"
+        );
+        assert!(
+            !serves(&[served("bb", 400)], &asked),
+            "an answer about another object says nothing about this one"
+        );
+        assert!(
+            !serves(&[spec("aa", 400, Some((404, "Not Found")))], &asked),
+            "an errored row is the server saying it cannot"
+        );
+        assert!(
+            !serves(
+                &[served("aa", 400), spec("aa", 400, Some((404, "Not Found")))],
+                &asked
+            ),
+            "one affirmative row does not outvote an errored one for the SAME \
+             object: `disposition` says an error wins"
+        );
+        assert!(
+            !serves(&[spec("aa", 400, None)], &asked),
+            "a BARE row — no error, no href — is what `disposition` calls a \
+             server that owes us a download action and did not supply one"
+        );
+        assert!(
+            !serves(&[served("aa", 399)], &asked),
+            "the same digest at a different length is an answer about \
+             something else; `LfsStore::contains` verifies the length exactly \
+             and so does this"
+        );
     }
 }

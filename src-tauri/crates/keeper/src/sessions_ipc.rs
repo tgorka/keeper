@@ -155,7 +155,9 @@ const SESSION_TREE_DIR_UNDELETABLE: &str =
 /// **The sync mark is the Files tab's, not a second opinion.** `pending` is
 /// asked once for the whole tree and every entry is classified through
 /// [`keeper_sync::browse::status_of`] — the same function the listing and the
-/// delete confirmation go through — then worded by the same five sentences.
+/// delete confirmation go through — then worded by the Files pane's own
+/// wording function, `sync_ipc::sessions_sync_mark`, rather than by a count of
+/// sentences that goes stale the moment a state is added.
 /// A session file that the Files pane calls excluded is called excluded here,
 /// in those words, because it is one fact asked from two places.
 ///
@@ -214,6 +216,25 @@ pub async fn sessions_tree(
         Err(error) => (browse::PendingView::Unavailable, Some(error)),
     };
 
+    // Per tree, not per row: `HashSet::new()` allocates nothing, but building
+    // this inside the map would claim it is per-entry state, beside a `pending`
+    // and an `excludes` that are per tree and hoisted for that reason.
+    //
+    // This surface reads no ledger (Story 56.7), and the asymmetry that leaves
+    // is worth naming: `materializing` IS reachable here, because it is decided
+    // from `PendingReason::Incoming` plus pointer text and `sessions_pending`
+    // supplies the first half — while `materialized` is not, so a hydrated
+    // recording the Files pane words as content on this computer reads `Synced`
+    // in this tree. That divergence is between a more specific truth and a less
+    // specific one, never between a truth and a lie, which is the polarity
+    // `MaterializedView` documents: unlike an empty `PendingView::Known`, which
+    // would call every entry synced and be wrong, an empty `MaterializedView`
+    // cannot be. A later story that wants this tree to say it too replaces this
+    // binding with a read of `Engine::materialized_paths` through a
+    // `sessions_materialized` accessor beside [`crate::sync_ipc::sessions_pending`],
+    // mapped by `MaterializedView::from_paths`.
+    let materialized = browse::MaterializedView::none();
+
     let entries = raw
         .into_iter()
         .map(|entry| {
@@ -242,6 +263,9 @@ pub async fn sessions_tree(
                 entry.is_dir,
                 &excludes,
                 &pending,
+                // Hoisted above this map, where the sentence explaining what
+                // an empty view means for this surface lives with it.
+                &materialized,
             );
             SessionEntryVm {
                 name: entry.name,

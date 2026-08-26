@@ -101,9 +101,15 @@ export const SYNC_VERIFY_LABEL = "Check files";
  * pass reads every file (failing only if it changes under the read) and
  * confirms each large-file object is present at its recorded size. Claiming
  * "matched its recorded digest" described a comparison that never happens.
+ *
+ * It also stops short of promising that *every* large file's stored copy is
+ * present: since Epic 56 a folder may deliberately keep only the pointer for
+ * files its own policy authorizes to stay away, and the check counts those as
+ * expected rather than as damage. Promising more than the pass checks is the
+ * failure DW-1272 exists to prevent.
  */
 export const SYNC_VERIFY_CLEAN_SENTENCE =
-  "Every file read cleanly, and every large file's stored copy is present.";
+  "Every file read cleanly, and every large file kept on this machine has its stored copy.";
 
 /** Used only if Rust flagged attention without naming a reason. */
 export const SYNC_ATTENTION_FALLBACK_SENTENCE =
