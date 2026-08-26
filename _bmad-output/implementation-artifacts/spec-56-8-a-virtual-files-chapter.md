@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-08-25'
 status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: 'ea967ad'
+final_revision: 'c777281'
 review_loop_iteration: 0
 followup_review_recommended: true # 28 patches (2 high, 12 medium) across the whole chapter; the patched prose has not itself been reviewed
 context: ['{project-root}/docs/sync.md', '{project-root}/docs/decisions.md']
