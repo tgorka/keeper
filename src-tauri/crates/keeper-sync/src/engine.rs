@@ -367,6 +367,16 @@ const REPAIR_BATCH: usize = 500;
 /// index over successive passes.
 const REPAIR_WINDOW: usize = 5_000;
 
+/// The most repair-backlog paths one Pending poll names.
+///
+/// A cap on the LIST, not on the work: [`REPAIR_WINDOW`] already bounds what
+/// the probe examines. This bounds what crosses the IPC boundary and lands in
+/// a virtualized list — the folder this was written for has tens of thousands
+/// of them, and a poll that serialized 37 500 rows every five seconds would be
+/// its own kind of permanent load. Larger than the list the pane renders, so
+/// scrolling never runs out of rows before the sweep converts them.
+const PENDING_REPAIR_CAP: usize = 500;
+
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
@@ -8004,7 +8014,78 @@ impl Engine {
         // A folder that is not a repository yet has nothing git can classify,
         // and materializing one is a clone — far too much for a poll. The
         // first sync adopts it and the next call is complete.
-        if profile.local_path.join(".git").exists() {
+        let is_repository = profile.local_path.join(".git").exists();
+
+        // Before the walk, not after it, and for exactly the reason
+        // [`Self::repair_recorded_pointers`] gives on the commit leg: a path
+        // whose recorded blob contradicts its own attributes is pending BY
+        // DEFINITION — the index says so, for free — and the walk is the most
+        // expensive possible way to rediscover it. The walk cleans the file,
+        // gets a pointer, compares it to a raw blob and calls it modified: one
+        // full read and one filter round trip per path, on every poll.
+        //
+        // The commit leg learned this and this one did not, which is what made
+        // an open Sync pane a permanent full-tree scan. Measured on the folder
+        // it was written for: ~37 500 such paths, 48 to 72 minutes per walk,
+        // restarted the moment it finished because the pane polls every five
+        // seconds and the poll before it had only just returned.
+        //
+        // Answering from the index instead is not a thinner list, it is the
+        // first list that arrives at all: the walk it replaces never finished,
+        // so Pending read "Loading…" for days. Bounded by the same window the
+        // repair sweep uses and started from the same cursor — READ, never
+        // advanced, because moving it here would make the sweep skip the work
+        // it is the only leg that can do.
+        let repair = if is_repository {
+            let repo_path = profile.local_path.clone();
+            let removable = profile.removable;
+            let filtered = profile.lfs_mode != LfsMode::Disabled;
+            let from = Self::lock(&self.repair_cursor)
+                .get(&profile.id)
+                .copied()
+                .unwrap_or(0);
+            tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                if !filtered {
+                    return Vec::new();
+                }
+                let Ok(repo) = git::repo::open(&repo_path, removable) else {
+                    return Vec::new();
+                };
+                let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                    return Vec::new();
+                };
+                lfs::stage::mismatched_filtered_paths(
+                    &repo,
+                    &tracked,
+                    from,
+                    REPAIR_WINDOW,
+                    PENDING_REPAIR_CAP,
+                )
+                .0
+            })
+            .await
+            .map_err(|err| SyncError::Journal(format!("pending repair probe failed: {err}")))?
+        } else {
+            Vec::new()
+        };
+        for rela in &repair {
+            if excludes.is_excluded(rela) {
+                continue;
+            }
+            let relative = rela.to_string_lossy().into_owned();
+            if named.insert(relative.clone()) {
+                out.push(PendingFile {
+                    path: relative,
+                    reason: PendingReason::Modified,
+                    size_bytes: std::fs::metadata(profile.local_path.join(rela))
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len()),
+                });
+            }
+        }
+
+        if is_repository && repair.is_empty() {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
@@ -10134,6 +10215,125 @@ mod tests {
                 .0
                 .is_empty(),
             "a repaired path must not be repaired again"
+        );
+    }
+
+    /// And the POLL must not walk either, for the same reason.
+    ///
+    /// The commit leg learned this (above); the Pending poll did not, and that
+    /// asymmetry is what made an open Sync pane a permanent full-tree scan. The
+    /// pane polls every five seconds, the walk it triggered took 48 to 72
+    /// minutes on the folder this was written for, and the next poll started it
+    /// again — so the list the user was waiting for never arrived while the
+    /// machine stayed pinned. Answering from the index is not a thinner answer,
+    /// it is the first one that arrives.
+    #[tokio::test]
+    async fn a_pending_poll_names_the_repair_backlog_without_walking_the_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        // Reporting every item makes a walk impossible to miss: if this poll
+        // walked, `Scanning` would appear in the stream below.
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1_000_000;
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The same fixture as the sweep's test: a per-extension rule filters
+        // every `.gif`, and the blob is the file's own raw bytes.
+        std::fs::write(
+            p.local_path.join(".gitattributes"),
+            "*.gif filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .expect("rule");
+        std::fs::write(p.local_path.join("small.gif"), vec![3u8; 512]).expect("write");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=cat",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".gitattributes",
+            "small.gif",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "raw",
+        ]);
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert!(
+            pending.iter().any(|row| row.path == "small.gif"
+                && matches!(row.reason, PendingReason::Modified)),
+            "the backlog is what the folder is waiting on, and the index names \
+             it for free: {pending:?}"
+        );
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "the poll must not walk the folder to rediscover what the index \
+             already recorded: {phases:?}"
+        );
+    }
+
+    /// With no backlog, the poll walks exactly as it always did.
+    ///
+    /// The other half of the same rule, and the one that keeps the shortcut
+    /// honest: skipping the walk is only defensible while there is a cheaper
+    /// answer, so a clean folder must still get the full one — untracked files
+    /// included, which the index cannot know about.
+    #[tokio::test]
+    async fn a_pending_poll_with_no_backlog_still_walks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // Nothing the index could name: a file git has never heard of.
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
+            "an untracked path is only discoverable by walking: {pending:?}"
         );
     }
 
