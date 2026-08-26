@@ -76,6 +76,9 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
     drop_foreign_lfs_driver(&mut repo)?;
+    // Strictly after the drop: it decides WHICH `filter "lfs"` sections remain,
+    // and this one takes a key out of whichever ones did.
+    use_single_shot_lfs_filter(&mut repo)?;
     Ok(repo)
 }
 
@@ -188,6 +191,92 @@ fn has_foreign_lfs_driver(repo: &gix::Repository) -> bool {
 /// still has no business naming the `lfs` driver for a folder keeper manages.
 fn is_repository_scope(meta: &gix::config::file::Metadata) -> bool {
     meta.source.kind() == gix::config::source::Kind::Repository
+}
+
+/// Take the long-running `process` driver out of THIS handle's `lfs` filter,
+/// leaving the one on disk for everybody else.
+///
+/// # The processes this stops leaking
+///
+/// `filter.lfs.process` names a long-running helper, and gitoxide starts one per
+/// pipeline. It never stops one. `gix_filter::driver::State::shutdown` is the
+/// only function in gitoxide that `wait`s a filter child, and it has no caller
+/// anywhere in the workspace outside gix-filter's own test; `State` has no
+/// `Drop`, and `shutdown` takes `self` by value so it could not have one. The
+/// pipeline `gix::status` uses is built inside `index_worktree_status`, moved
+/// into `gix_status`, and dropped — the helper's pipes close, it exits, and
+/// nobody reaps it.
+///
+/// Field measurement, one machine, 10 h 29 m of uptime: **274 zombie children**
+/// owned by keeper plus 32 live helpers for a single folder, against a
+/// `kern.maxprocperuid` of 2 666. Roughly 26 an hour is a four-day fuse to the
+/// point where nothing on the machine can `fork` — which is what a browser
+/// failing to open a tab looks like from the outside.
+///
+/// It cannot be fixed where it happens: `Repository::status` accepts no pipeline
+/// and hands none back, in gix 0.86 or 0.87.1. What is in keeper's gift is which
+/// driver gitoxide *picks*. With `process` gone, `extract_driver` falls back to
+/// the `clean`/`smudge` pair [`enforce_local_config_with_filter`] writes beside
+/// it — single-file drivers, which gitoxide **does** wait on
+/// (`gix_filter::driver::apply` calls `child.wait()` on the success and the
+/// failure path alike). No zombies, no pool.
+///
+/// # Why the key stays on disk
+///
+/// Because there it is load-bearing, for a different git (DW-140). A human
+/// running `git add` in a synced folder has to reach keeper's filter, and git
+/// prefers a `process` driver over a `clean`/`smudge` pair *whatever scope each
+/// was defined in* — so deleting the local `process` key from the FILE would
+/// hand the folder straight back to the `filter.lfs.process` that
+/// `git lfs install` leaves in `~/.gitconfig`. This surgery is on the merged
+/// snapshot this `Repository` handle holds, exactly like
+/// [`drop_foreign_lfs_driver`]'s, and nothing on disk is touched.
+///
+/// # What it costs
+///
+/// One `fork`+`exec` per filtered file instead of one per pass. Measured against
+/// the shipped bundle on a real folder: process startup is 5-10 ms warm, beside
+/// the 60-250 ms of hashing and storing that both forms pay anyway. A pass that
+/// filters 38 000 files spends a few minutes more on spawns — against a walk
+/// that was taking 72 minutes and wedging itself on its own helper pool.
+pub fn use_single_shot_lfs_filter(repo: &mut gix::Repository) -> Result<()> {
+    // Read first, for `drop_foreign_lfs_driver`'s reason: committing a snapshot
+    // re-reads every value and clears the repository's caches, and a folder
+    // whose filter was registered without `serves_process` has no key here.
+    if repo
+        .config_snapshot()
+        .string("filter.lfs.process")
+        .is_none()
+    {
+        return Ok(());
+    }
+    let mut snapshot = repo.config_snapshot_mut();
+    // Collected first so the immutable borrow ends before the section is taken
+    // mutably. Several `[filter "lfs"]` sections in one file are legal.
+    let ids: Vec<_> = snapshot
+        .sections_and_ids()
+        .filter(|(section, _)| {
+            section.header().name() == "filter"
+                && section
+                    .header()
+                    .subsection_name()
+                    .is_some_and(|name| name == "lfs")
+        })
+        .map(|(_, id)| id)
+        .collect();
+    for id in ids {
+        if let Some(mut section) = snapshot.section_mut_by_id(id) {
+            // A loop rather than one call: `remove` takes the last match and a
+            // section may legally carry the key more than once.
+            while section.remove("process").is_some() {}
+        }
+    }
+    snapshot.commit().map_err(|err| {
+        SyncError::Git(format!(
+            "could not switch the lfs filter to its single-shot form: {err}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Remove an `index.lock` left behind by a process that was killed.
@@ -2987,6 +3076,12 @@ mod tests {
     /// used to register alone. Writing a local `process` key is the only way to
     /// win that comparison, and it is the whole reason this registration
     /// exists.
+    ///
+    /// Read off the FILE, not through [`open`]: the reader is a `git` keeper
+    /// does not run, and keeper's own handles deliberately no longer see this
+    /// key (see [`use_single_shot_lfs_filter`]). Parsed rather than grepped, so
+    /// the assertion is about the registration and not about how the encoder
+    /// escapes the quotes around a program path.
     #[test]
     fn the_filter_registration_claims_the_key_that_actually_takes_effect() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2999,13 +3094,10 @@ mod tests {
         )
         .expect("enforce");
 
-        // Read back through gix rather than off the raw file: the on-disk form
-        // escapes the quotes around the program path, and asserting on that
-        // spelling would test the encoder instead of the registration.
-        let reopened = open(dir.path(), true).expect("reopen");
-        let snapshot = reopened.config_snapshot();
-        let process = snapshot
-            .string("filter.lfs.process")
+        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
+            .expect("read the file a plain git would read");
+        let process = on_disk
+            .raw_value("filter.lfs.process")
             .expect("the long-running form must be registered, not only clean/smudge")
             .to_string();
         assert_eq!(
@@ -3017,14 +3109,120 @@ mod tests {
         // No `%f`: the protocol names each path in-band, and a stray
         // placeholder would arrive as an argument the filter never asked for.
         assert!(!process.contains("%f"), "{process}");
-        // The single-shot pair stays: it costs one line and is what a git old
-        // enough to lack process filters would use.
+        // The single-shot pair stays: it costs one line, it is what a git old
+        // enough to lack process filters would use — and since
+        // `use_single_shot_lfs_filter` it is also the only driver keeper's own
+        // handles have left.
+        let snapshot = open(dir.path(), true).expect("reopen");
+        let snapshot = snapshot.config_snapshot();
         assert!(snapshot
             .string("filter.lfs.clean")
             .is_some_and(|value| value.to_string().contains("lfs clean")));
         assert!(snapshot
             .string("filter.lfs.smudge")
             .is_some_and(|value| value.to_string().contains("lfs smudge")));
+    }
+
+    /// keeper's own handle must not carry the key that spawns a helper it can
+    /// never reap — and the file must keep it anyway.
+    ///
+    /// Both halves are the test. Leaving it in the handle is the process leak
+    /// (274 zombies in ten hours on one machine); taking it out of the file
+    /// hands the folder back to `git lfs install`'s global driver the next time
+    /// a human types `git add` there. Nothing else in the codebase asserts that
+    /// a handle and its own `.git/config` deliberately disagree.
+    #[test]
+    fn the_process_driver_is_dropped_from_the_handle_and_kept_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(
+            &repo,
+            Some(Path::new("/Applications/keeper.app/keeper")),
+            true,
+        )
+        .expect("enforce");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        assert!(
+            reopened
+                .config_snapshot()
+                .string("filter.lfs.process")
+                .is_none(),
+            "gitoxide starts one long-running helper per pipeline and waits on \
+             none of them; the only way not to leak is not to name one"
+        );
+
+        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
+            .expect("read config");
+        assert!(
+            on_disk.raw_value("filter.lfs.process").is_ok(),
+            "the key is load-bearing for the git a human runs by hand (DW-140)"
+        );
+    }
+
+    /// Dropping `process` must not leave the handle with NO driver.
+    ///
+    /// That failure mode is silent and much worse than the leak: with no driver
+    /// at all gitoxide compares a worktree file against its own pointer blob,
+    /// every LFS-tracked path reads as modified, and the folder commits its
+    /// content raw. The fallback pair is the whole reason this is safe.
+    #[test]
+    fn dropping_the_process_driver_leaves_the_single_shot_pair_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(
+            &repo,
+            Some(Path::new("/Applications/keeper.app/keeper")),
+            true,
+        )
+        .expect("enforce");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        let drivers = gix::filter::Pipeline::options(&reopened)
+            .expect("filter options")
+            .drivers;
+        let lfs = drivers
+            .iter()
+            .find(|driver| driver.name == "lfs")
+            .expect("the driver gitoxide will actually use");
+        assert!(
+            lfs.process.is_none(),
+            "this is the handle gitoxide filters through: {:?}",
+            lfs.process
+        );
+        assert!(
+            lfs.clean.is_some(),
+            "clean is the fallback that must survive"
+        );
+        assert!(
+            lfs.smudge.is_some(),
+            "smudge is the fallback that must survive"
+        );
+    }
+
+    /// A folder registered without the process form is untouched, and pays
+    /// nothing: no snapshot commit, no cache clear, on every open.
+    #[test]
+    fn a_folder_with_no_process_driver_is_left_exactly_as_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(
+            &repo,
+            Some(Path::new("/Applications/keeper.app/keeper")),
+            false,
+        )
+        .expect("enforce");
+        let before = std::fs::read_to_string(dir.path().join(".git/config")).expect("read");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        let snapshot = reopened.config_snapshot();
+        assert!(snapshot.string("filter.lfs.process").is_none());
+        assert!(snapshot.string("filter.lfs.clean").is_some());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/config")).expect("read"),
+            before,
+            "an in-memory surgery that rewrote the file would be a different bug"
+        );
     }
 
     #[test]
@@ -3072,10 +3270,14 @@ mod tests {
         enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
             .expect("enforce");
 
-        let reopened = open(dir.path(), true).expect("reopen");
-        let config = reopened.config_snapshot();
-        let process = config
-            .string("filter.lfs.process")
+        // Off the file, not through `open`: keeper's own handles deliberately
+        // no longer carry this key (see `use_single_shot_lfs_filter`), and the
+        // reader this registration exists for is the `git` binary, which reads
+        // the file.
+        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
+            .expect("read config");
+        let process = on_disk
+            .raw_value("filter.lfs.process")
             .expect("keeper's own driver must occupy the slot")
             .to_string();
         assert!(
@@ -3090,6 +3292,11 @@ mod tests {
         // beside a survivor in another section.
         let text = std::fs::read_to_string(dir.path().join(".git/config")).expect("read config");
         assert_eq!(text.matches("process = ").count(), 1, "{text}");
+        // These two ARE read through keeper's own handle: they are what it
+        // filters with once `use_single_shot_lfs_filter` has taken `process`
+        // out of the way.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let config = reopened.config_snapshot();
         assert!(
             config
                 .string("filter.lfs.clean")
@@ -3168,7 +3375,15 @@ mod tests {
         let repo = gix::init(dir.path()).expect("init");
         enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
             .expect("enforce");
-        let mut repo = open(dir.path(), true).expect("reopen");
+        // Opened WITHOUT keeper's own surgeries. The subject here is
+        // `drop_foreign_lfs_driver` filtering on SCOPE, and `open` would also
+        // run `use_single_shot_lfs_filter`, which removes the key under test
+        // for an entirely different reason.
+        let mut repo = gix::open_opts(
+            dir.path(),
+            gix::open::Options::default().with(gix::sec::Trust::Full),
+        )
+        .expect("open");
 
         let foreign = gix::config::File::from_bytes_owned(
             &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
