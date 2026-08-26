@@ -380,6 +380,13 @@ const PENDING_REPAIR_CAP: usize = 500;
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
 
+/// How long a repair-backlog probe stays good enough to answer a poll with.
+///
+/// Longer than the pane's five-second poll by enough that a probe costing
+/// seconds is amortized rather than repeated, and far shorter than the hours a
+/// backlog of tens of thousands takes to drain. See [`Engine::repair_memo`].
+const REPAIR_MEMO_TTL: Duration = Duration::from_secs(30);
+
 /// How often a folder's transfer scratch is swept.
 ///
 /// Scratch is what an interrupted transfer leaves behind, and nothing else ever
@@ -808,6 +815,20 @@ pub struct Engine {
     /// the inconsistencies deeper in the tree. Wraps at the end; see
     /// [`REPAIR_WINDOW`].
     repair_cursor: Mutex<HashMap<String, usize>>,
+    /// The last repair-backlog probe per profile, and when it was taken.
+    ///
+    /// The probe is cheap next to the walk it replaces and expensive next to
+    /// nothing: it opens the repository and materializes every tracked path
+    /// before examining a window of them. Measured on a 155 662-entry folder,
+    /// 3 to 21 seconds. The Pending pane polls every five seconds, so running
+    /// it per poll meant the answer was never ready when the next question
+    /// arrived — the pane sat on "Loading folders…" and the allocator churned
+    /// a six-figure path list on a loop.
+    ///
+    /// A backlog of tens of thousands does not change meaningfully inside
+    /// [`REPAIR_MEMO_TTL`], and the sweep that drains it publishes its own
+    /// progress, so a slightly old answer here is honest.
+    repair_memo: Mutex<HashMap<String, (Instant, Vec<PathBuf>)>>,
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -922,6 +943,7 @@ impl Engine {
             counters: Mutex::new(HashMap::new()),
             walk_report_interval: WALK_REPORT_INTERVAL,
             repair_cursor: Mutex::new(HashMap::new()),
+            repair_memo: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -4145,6 +4167,26 @@ impl Engine {
         converged.copies.sort();
         converged.stale.sort();
         Ok(converged)
+    }
+
+    /// The last repair-backlog probe for this profile, if it is still fresh.
+    ///
+    /// `None` means "ask again", not "there is no backlog" — the two are
+    /// different answers and conflating them would make a poll during the TTL
+    /// claim a folder is clean.
+    fn remembered_repair(&self, profile_id: &str) -> Option<Vec<PathBuf>> {
+        Self::lock(&self.repair_memo)
+            .get(profile_id)
+            .filter(|(taken, _)| taken.elapsed() < REPAIR_MEMO_TTL)
+            .map(|(_, found)| found.clone())
+    }
+
+    /// Remember a probe, including an empty one: "this folder has no backlog"
+    /// is exactly as expensive to establish as the opposite and exactly as
+    /// worth not re-establishing five seconds later.
+    fn remember_repair(&self, profile_id: &str, found: &[PathBuf]) {
+        Self::lock(&self.repair_memo)
+            .insert(profile_id.to_owned(), (Instant::now(), found.to_vec()));
     }
 
     /// A bounded batch of paths whose committed blob contradicts their
@@ -8037,34 +8079,43 @@ impl Engine {
         // advanced, because moving it here would make the sweep skip the work
         // it is the only leg that can do.
         let repair = if is_repository {
-            let repo_path = profile.local_path.clone();
-            let removable = profile.removable;
-            let filtered = profile.lfs_mode != LfsMode::Disabled;
-            let from = Self::lock(&self.repair_cursor)
-                .get(&profile.id)
-                .copied()
-                .unwrap_or(0);
-            tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
-                if !filtered {
-                    return Vec::new();
+            match self.remembered_repair(&profile.id) {
+                Some(remembered) => remembered,
+                None => {
+                    let repo_path = profile.local_path.clone();
+                    let removable = profile.removable;
+                    let filtered = profile.lfs_mode != LfsMode::Disabled;
+                    let from = Self::lock(&self.repair_cursor)
+                        .get(&profile.id)
+                        .copied()
+                        .unwrap_or(0);
+                    let found = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                        if !filtered {
+                            return Vec::new();
+                        }
+                        let Ok(repo) = git::repo::open(&repo_path, removable) else {
+                            return Vec::new();
+                        };
+                        let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                            return Vec::new();
+                        };
+                        lfs::stage::mismatched_filtered_paths(
+                            &repo,
+                            &tracked,
+                            from,
+                            REPAIR_WINDOW,
+                            PENDING_REPAIR_CAP,
+                        )
+                        .0
+                    })
+                    .await
+                    .map_err(|err| {
+                        SyncError::Journal(format!("pending repair probe failed: {err}"))
+                    })?;
+                    self.remember_repair(&profile.id, &found);
+                    found
                 }
-                let Ok(repo) = git::repo::open(&repo_path, removable) else {
-                    return Vec::new();
-                };
-                let Ok(tracked) = git::repo::tracked_paths(&repo) else {
-                    return Vec::new();
-                };
-                lfs::stage::mismatched_filtered_paths(
-                    &repo,
-                    &tracked,
-                    from,
-                    REPAIR_WINDOW,
-                    PENDING_REPAIR_CAP,
-                )
-                .0
-            })
-            .await
-            .map_err(|err| SyncError::Journal(format!("pending repair probe failed: {err}")))?
+            }
         } else {
             Vec::new()
         };
@@ -10335,6 +10386,50 @@ mod tests {
                 .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
             "an untracked path is only discoverable by walking: {pending:?}"
         );
+    }
+
+    /// The probe answers a poll; it must not BE the poll.
+    ///
+    /// It opens the repository and materializes every tracked path before it
+    /// examines a window of them — 3 to 21 seconds on the 155 662-entry folder
+    /// this was written for. The pane asks every five seconds, so running it
+    /// per poll put the answer permanently behind the next question: the pane
+    /// sat on "Loading folders…" and the allocator churned a six-figure path
+    /// list on a loop, which is a regression the first version of this shortcut
+    /// shipped with.
+    ///
+    /// Asserted on the memo's own timestamp rather than on timing, because a
+    /// wall-clock assertion under load is a flake and this is a question about
+    /// whether work happened at all.
+    #[tokio::test]
+    async fn a_second_pending_poll_reuses_the_probe_instead_of_repeating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let first = engine.pending(&p.id).await.expect("pending");
+        let taken = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("the first poll has to leave an answer behind");
+
+        let second = engine.pending(&p.id).await.expect("pending");
+        let taken_again = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("still memoized");
+
+        assert_eq!(
+            taken, taken_again,
+            "the second poll re-ran a probe it already had the answer to"
+        );
+        assert_eq!(first, second, "and it must be the same answer");
     }
 
     /// The maintenance guarantee: an operation that takes time SAYS SO.
