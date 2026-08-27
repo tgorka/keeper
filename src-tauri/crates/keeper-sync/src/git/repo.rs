@@ -3582,8 +3582,12 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_excluding(&repo, &[], Some(&report), Duration::from_millis(1))
-            .expect("status");
+        // ZERO, not a millisecond cadence: whether a 3 000-entry walk outlasts
+        // a tick is a property of the machine, and this test is about WHAT is
+        // counted, not about whether the clock got a turn. At ZERO the closing
+        // report is owed unconditionally, so the assertions below run on every
+        // machine — and an emissions-based numerator still fails them.
+        status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
@@ -3631,14 +3635,19 @@ mod tests {
     /// macOS gate saw exactly that — `[198, 382, 296, 392]` against a
     /// denominator of 400.
     ///
-    /// The fixture is sized so the gap is not a coincidence: 8 000 entries at a
-    /// 100 ms cadence leaves thousands of entries between the last tick and the
-    /// end of the walk, so a run without the closing report cannot land on the
-    /// denominator by luck.
+    /// **The claim is conditional on purpose.** How many ticks an 8 000-entry
+    /// walk outlasts is a property of the machine, not of this code: the same
+    /// fixture produced four reports on Linux and fewer than two on the macOS
+    /// gate, where the walk finished inside a single 5 ms slice. Demanding a
+    /// tick count is how the previous revision of this test failed CI while
+    /// the behaviour it guards was correct. What must hold on every machine is
+    /// that the LAST word is the denominator whenever there was a word at all;
+    /// `the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero`
+    /// carries the rule itself, with the clock taken out.
     #[test]
     fn a_walk_that_reported_says_where_it_stopped() {
         const ENTRIES: usize = 8_000;
-        const CADENCE: Duration = Duration::from_millis(5);
+        const CADENCE: Duration = Duration::from_millis(1);
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = gix::init(dir.path()).expect("init");
         let mut added = Vec::with_capacity(ENTRIES);
@@ -3669,14 +3678,16 @@ mod tests {
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
-            seen.len() >= 2,
-            "the fixture has to outlast at least one tick or this proves nothing: {seen:?}"
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {seen:?}"
         );
-        assert_eq!(
-            seen.last().copied(),
-            Some((ENTRIES as u64, ENTRIES as u64)),
-            "the walk compared every entry and its last word said otherwise: {seen:?}"
-        );
+        if let Some(last) = seen.last().copied() {
+            assert_eq!(
+                last,
+                (ENTRIES as u64, ENTRIES as u64),
+                "the walk compared every entry and its last word said otherwise: {seen:?}"
+            );
+        }
     }
 
     #[test]
