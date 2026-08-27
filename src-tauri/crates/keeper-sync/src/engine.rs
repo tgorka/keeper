@@ -12392,10 +12392,15 @@ mod tests {
             "the Pending poll walked and said nothing: {:?}",
             Engine::lock(&published).clone()
         );
+        // Non-decreasing, not strictly increasing: progress is published off a
+        // clock now, so a tick that lands between two comparisons honestly
+        // repeats the figure rather than inventing movement. The macOS gate
+        // caught this with `[120, 140, 193, 292, 346, 375, 400, 400]` — a walk
+        // that had reached the end of the index and said so twice.
         assert!(
             counts
                 .windows(2)
-                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= 1),
             "a count moved backwards without restarting: {counts:?}"
         );
     }
