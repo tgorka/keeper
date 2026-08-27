@@ -1502,6 +1502,29 @@ fn push_item(out: &mut RepoStatus, item: gix::status::Item) {
     }
 }
 
+/// Whether a finished walk still owes one closing progress report.
+///
+/// Two rules meet here, and they pull in opposite directions.
+///
+/// A walk that never reached its first tick must stay silent: publishing the
+/// scanning phase on every poll of an idle folder is what made the menu-bar
+/// glyph flip once a second, and the report exists for the ten-minute walk, not
+/// the ten-millisecond one. That is the `spoke` half — a ticker that did speak
+/// must not leave the last figure it happened to catch as the final word, or
+/// the bar stops short of its own end (the macOS gate saw `[198, 382, 296,
+/// 392]` against a denominator of 400).
+///
+/// A ZERO interval is the opposite case and always owes the report. It means
+/// "report every item", which the ticker cannot deliver: it sleeps a clamped
+/// millisecond before its first look, and a small walk has already set `done`
+/// by then. Without this arm every caller of `Engine::report_every_walk_item`
+/// is racing its own fixture — `a_pending_poll_publishes_the_progress_of_its_own_walk`
+/// failed on the macOS gate for exactly this reason while passing on Linux,
+/// with an empty event stream and a walk that had genuinely run.
+fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
+    spoke || interval.is_zero()
+}
+
 /// The walk, with the pace its caller reports at.
 ///
 /// `skip` is held out of the walk entirely. The exclusions are spelled
@@ -1590,13 +1613,9 @@ fn status_paths_excluding(
     // the scope's join never adds a report interval to the end of a fast walk:
     // `neuradrive` finishes in 150 ms and runs every few seconds.
     let done = std::sync::Arc::new(AtomicBool::new(false));
-    // Whether the ticker ever spoke. It decides whether the walk owes a closing
-    // report: a walk that stayed under one interval must stay silent (see
-    // `a_walk_that_finishes_immediately_reports_no_progress`), and a walk that
-    // did speak must not leave the last figure it happened to catch as the
-    // final word. Without this the bar stops short of its own end — the macOS
-    // gate saw `[198, 382, 296, 392]` against a denominator of 400 — and "did
-    // it finish?" becomes unanswerable from the number.
+    // Whether the ticker ever spoke, which is one half of
+    // [`owes_closing_report`] - the rule that decides whether this walk still
+    // owes a final figure when it returns.
     let spoke = std::sync::Arc::new(AtomicBool::new(false));
     let mut out = RepoStatus::default();
     let walked = std::thread::scope(|scope| -> Result<RepoStatus> {
@@ -1652,7 +1671,7 @@ fn status_paths_excluding(
         // The closing figure, from this thread now the ticker has been told to
         // stop, so there is exactly one last report and no race for it.
         if let Some(report) = report {
-            if spoke.load(Ordering::Relaxed) {
+            if owes_closing_report(spoke.load(Ordering::Relaxed), interval) {
                 report(scanned.load(Ordering::Relaxed) as u64, entries);
             }
         }
@@ -3463,6 +3482,59 @@ mod tests {
             "a fast walk must stay silent, got {:?}",
             seen.lock().expect("lock")
         );
+    }
+
+    /// And a ZERO interval reports even when the walk beats the ticker to it.
+    ///
+    /// Same fixture as the silence guard above, so the two differ in exactly
+    /// one input: the interval. `Duration::ZERO` is what
+    /// `Engine::report_every_walk_item` asks for, and the ticker cannot serve
+    /// it — it sleeps a clamped millisecond before its first look, by which
+    /// time a two-file walk has finished and set `done`. Every engine-level
+    /// test that subscribes to `Scanning` progress rests on this closing
+    /// report; without it those tests assert that the machine is slow.
+    #[test]
+    fn a_zero_interval_walk_reports_its_closing_figure() {
+        let (dir, repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_reported(&repo, Some(&report), Duration::ZERO).expect("status");
+        let seen = seen.lock().expect("lock").clone();
+        let last = seen.last().copied().expect("a zero interval reports");
+        assert!(
+            last.0 > 0 && last.1 > 0,
+            "the closing report is the pair the UI renders: {seen:?}"
+        );
+        assert_eq!(
+            last.1, 2,
+            "the denominator is the index entry count: {seen:?}"
+        );
+    }
+
+    /// The rule itself, which is where the mutation is detectable.
+    ///
+    /// The walk above cannot carry this claim on its own: whether a two-entry
+    /// walk beats the ticker's first millisecond is a property of the machine,
+    /// so on a slow enough box it passes with the closing report deleted. This
+    /// is the same rule with the timing removed.
+    #[test]
+    fn the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero() {
+        assert!(
+            owes_closing_report(true, Duration::from_secs(1)),
+            "a ticker that spoke must not leave a mid-walk figure as the final word"
+        );
+        assert!(
+            !owes_closing_report(false, Duration::from_secs(1)),
+            "a paced walk that stayed under one interval must stay silent"
+        );
+        assert!(
+            owes_closing_report(false, Duration::ZERO),
+            "report-every-item cannot depend on the ticker winning a race"
+        );
+        assert!(owes_closing_report(true, Duration::ZERO));
     }
 
     /// And a walk that does take time reports the pair the UI renders.
