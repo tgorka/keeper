@@ -408,11 +408,49 @@ the helper itself is re-parented away. A check that looked only for the recorded
 helper pid among its own children passed against the leak — worth knowing for
 anyone reproducing this.
 
+### And under real sync, A/B, on the machine that reported it
+
+The unit guard is one `status_paths` call. This is the whole engine:
+`keeper-syncd`, built twice from the same tree with only the `gix` source
+changed, driving six sync rounds over a fixture in the shape tgdrive is in, with
+the pass's children sampled every 20 ms (`/Users/tgorka/reap-ab.sh` on
+hesperia).
+
+| binary | `shutdown_mut` in it | walks | zombie sightings |
+| --- | --- | --- | --- |
+| crates.io `gix 0.86` | 0 | 120 | **1245** (192-225 per round) |
+| fork pin | 2 | 150 | **0** |
+
+**The fixture is the hard part, and two obvious ones do not work.** Committing
+LFS files and then `touch`ing them proves nothing: keeper's own
+`refresh_index_stat` answers the stat drift before any content comparison, and
+`stage_and_commit` writes pointer bytes keeper computed itself (AD-46), so gix's
+filter is never asked — measured, 83 walks and 58 commits with zero driver
+launches. Changing the file bodies does not help either, for the same reason.
+What does work is stripping the stat data from the index entry
+(`git update-index --cacheinfo 100644,<pointer-oid>,<path>`) before each pass:
+the walk then cannot take the shortcut and must clean-filter the worktree file
+to find out whether it matches.
+
+**On macOS a reaped-but-unwaited child shows no command**, only `<defunct>`, so
+attribute by parent pid and state rather than by matching `lfs filter-process`
+in the command column — which is why the per-round helper counts above read 0 on
+both sides while the zombie counts differ by 1245.
+
 ### And in the shipped app
 
 `shutdown_mut` is present in the installed binary (2 occurrences) and absent
 from the previous bundle (0), with `lfs filter-process` at 1 in both as the
 control that the search method works.
+
+The app-level before/after is the helper *age*: without the fix its helpers were
+as old as the process (26:54 against an app age of 27:43); with the fix the only
+helpers alive are the four belonging to the tgdrive walk currently in flight,
+with zero zombies over 1h37m. A tgdrive pass takes 66-72 minutes
+(`elapsed_ms=3992162`, `4330534`), so the release of those four is observable
+only when it ends; `/tmp/keeper-reap-watch.log` and `/tmp/tgdrive-pass.log` on
+hesperia record that transition. The A/B above is what settles the mechanism
+without waiting for it.
 
 Retire the pin when the fix is released upstream: restore a version requirement
 in `src-tauri/Cargo.toml`, drop the `allow-git` line in `deny.toml`, and re-run
