@@ -1590,11 +1590,20 @@ fn status_paths_excluding(
     // the scope's join never adds a report interval to the end of a fast walk:
     // `neuradrive` finishes in 150 ms and runs every few seconds.
     let done = std::sync::Arc::new(AtomicBool::new(false));
+    // Whether the ticker ever spoke. It decides whether the walk owes a closing
+    // report: a walk that stayed under one interval must stay silent (see
+    // `a_walk_that_finishes_immediately_reports_no_progress`), and a walk that
+    // did speak must not leave the last figure it happened to catch as the
+    // final word. Without this the bar stops short of its own end — the macOS
+    // gate saw `[198, 382, 296, 392]` against a denominator of 400 — and "did
+    // it finish?" becomes unanswerable from the number.
+    let spoke = std::sync::Arc::new(AtomicBool::new(false));
     let mut out = RepoStatus::default();
     let walked = std::thread::scope(|scope| -> Result<RepoStatus> {
         if let Some(report) = report {
             let ticking = std::sync::Arc::clone(&scanned);
             let ticking_done = std::sync::Arc::clone(&done);
+            let ticking_spoke = std::sync::Arc::clone(&spoke);
             scope.spawn(move || {
                 // The wake is short so the scope's join never adds a report
                 // interval to the end of a fast walk, and it never exceeds the
@@ -1610,6 +1619,7 @@ fn status_paths_excluding(
                     waited += slice;
                     if waited >= interval {
                         waited = Duration::ZERO;
+                        ticking_spoke.store(true, Ordering::Relaxed);
                         report(ticking.load(Ordering::Relaxed) as u64, entries);
                     }
                 }
@@ -1639,6 +1649,13 @@ fn status_paths_excluding(
             Ok(())
         })();
         done.store(true, Ordering::Relaxed);
+        // The closing figure, from this thread now the ticker has been told to
+        // stop, so there is exactly one last report and no race for it.
+        if let Some(report) = report {
+            if spoke.load(Ordering::Relaxed) {
+                report(scanned.load(Ordering::Relaxed) as u64, entries);
+            }
+        }
         walked.map(|()| std::mem::take(&mut out))
     })?;
     let mut out = walked;
@@ -3530,6 +3547,63 @@ mod tests {
             "the count never got past the single emitted item ({reached}), which \
              is exactly the freeze this reports off a clock to avoid: {:?}",
             &seen[..seen.len().min(8)]
+        );
+    }
+
+    /// A walk that reported at all reports where it stopped.
+    ///
+    /// The ticker fires on its own cadence, so the walk almost never ends on
+    /// one: whatever figure the last tick happened to catch would otherwise be
+    /// the final word, and the pane would sit a few thousand entries short of
+    /// the end with no way to tell "finished" from "stalled near the end". The
+    /// macOS gate saw exactly that — `[198, 382, 296, 392]` against a
+    /// denominator of 400.
+    ///
+    /// The fixture is sized so the gap is not a coincidence: 8 000 entries at a
+    /// 100 ms cadence leaves thousands of entries between the last tick and the
+    /// end of the walk, so a run without the closing report cannot land on the
+    /// denominator by luck.
+    #[test]
+    fn a_walk_that_reported_says_where_it_stopped() {
+        const ENTRIES: usize = 8_000;
+        const CADENCE: Duration = Duration::from_millis(5);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(ENTRIES);
+        for i in 0..ENTRIES {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+        status_paths_excluding(&repo, &[], Some(&report), CADENCE).expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.len() >= 2,
+            "the fixture has to outlast at least one tick or this proves nothing: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().copied(),
+            Some((ENTRIES as u64, ENTRIES as u64)),
+            "the walk compared every entry and its last word said otherwise: {seen:?}"
         );
     }
 
