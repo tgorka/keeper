@@ -367,15 +367,24 @@ const REPAIR_BATCH: usize = 500;
 /// index over successive passes.
 const REPAIR_WINDOW: usize = 5_000;
 
-/// The most repair-backlog paths one Pending poll names.
+/// The most rows one Pending poll puts in its list, per source.
 ///
-/// A cap on the LIST, not on the work: [`REPAIR_WINDOW`] already bounds what
-/// the probe examines. This bounds what crosses the IPC boundary and lands in
-/// a virtualized list — the folder this was written for has tens of thousands
-/// of them, and a poll that serialized 37 500 rows every five seconds would be
-/// its own kind of permanent load. Larger than the list the pane renders, so
-/// scrolling never runs out of rows before the sweep converts them.
-const PENDING_REPAIR_CAP: usize = 500;
+/// A cap on the LIST, not on the truth. The headline count — "N waiting to
+/// sync, M waiting for writes to stop" — is computed separately from indexed
+/// `COUNT(*)`s (see [`crate::progress::status_line`]), so bounding the list
+/// hides no work from the user.
+///
+/// It bounds two things that were both unbounded, and both measured on the
+/// same folder:
+///
+/// * the repair backlog, ~37 500 paths, where [`REPAIR_WINDOW`] already bounds
+///   the probe and this bounds what crosses the IPC boundary;
+/// * the settling rows, **128 483** of them, where the poll used to `stat`
+///   every single one — 128 483 blocking syscalls on a USB volume, per poll.
+///
+/// Larger than the list the pane renders, so scrolling never runs out of rows
+/// before the engine converts or releases them.
+const PENDING_LIST_CAP: usize = 500;
 
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
@@ -8023,35 +8032,60 @@ impl Engine {
 
         // Settling paths are absolute in `file_state` (that is what the gate
         // samples), and everything the user sees must be repository-relative.
+        //
+        // **Bounded, and off the runtime.** This loop used to `stat` every row
+        // the gate held, inline in an async fn. On the folder this was written
+        // for the gate holds 128 483 of them, so one Pending poll made 128 483
+        // blocking syscalls on a USB volume from a tokio worker — which is why
+        // the Pending list never arrived AND why Activity, a single indexed
+        // query, appeared to hang beside it: they share the runtime, and the
+        // frontend renders the three legs together.
+        //
+        // Capping the LIST does not cost the count. "N waiting for writes to
+        // stop" comes from `status.settling`, a `COUNT(*)`; see
+        // [`crate::progress::status_line`]. What is bounded here is how many
+        // rows cross the IPC boundary and get a size measured.
         let settling = self.with_db(|conn| db::load_file_state(conn, profile_id))?;
-        let mut out: Vec<PendingFile> = Vec::with_capacity(settling.len());
-        let mut named: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(settling.len());
-        for (path, entry) in settling {
-            let relative = path.strip_prefix(&profile.local_path).unwrap_or(&path);
-            // A row written before a pattern was added to the profile: the gate
-            // will drop it on the next walk, and until then it must not be
-            // shown.
-            if excludes.is_excluded(relative) {
-                continue;
-            }
-            let relative = relative.to_string_lossy().into_owned();
-            if named.insert(relative.clone()) {
-                // `path` here is absolute — the gate stores it that way, which
-                // is the whole reason `relative` is derived above.
-                let size_bytes = std::fs::metadata(&path)
-                    .ok()
-                    .filter(|m| m.is_file())
-                    .map(|m| m.len());
-                out.push(PendingFile {
-                    path: relative,
-                    reason: PendingReason::Settling {
-                        since_ms: entry.pending_since_ms,
-                    },
-                    size_bytes,
-                });
-            }
-        }
+        let local_path = profile.local_path.clone();
+        let filter = excludes.clone();
+        let (mut out, mut named) = tokio::task::spawn_blocking(
+            move || -> (Vec<PendingFile>, std::collections::HashSet<String>) {
+                let mut out: Vec<PendingFile> = Vec::new();
+                let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (path, entry) in settling {
+                    if out.len() >= PENDING_LIST_CAP {
+                        break;
+                    }
+                    let relative = path.strip_prefix(&local_path).unwrap_or(&path);
+                    // A row written before a pattern was added to the profile:
+                    // the gate will drop it on the next walk, and until then it
+                    // must not be shown.
+                    if filter.is_excluded(relative) {
+                        continue;
+                    }
+                    let relative = relative.to_string_lossy().into_owned();
+                    if named.insert(relative.clone()) {
+                        // `path` here is absolute — the gate stores it that
+                        // way, which is the whole reason `relative` is derived
+                        // above.
+                        let size_bytes = std::fs::metadata(&path)
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| m.len());
+                        out.push(PendingFile {
+                            path: relative,
+                            reason: PendingReason::Settling {
+                                since_ms: entry.pending_since_ms,
+                            },
+                            size_bytes,
+                        });
+                    }
+                }
+                (out, named)
+            },
+        )
+        .await
+        .map_err(|err| SyncError::Journal(format!("pending settling scan failed: {err}")))?;
 
         // A folder that is not a repository yet has nothing git can classify,
         // and materializing one is a clone — far too much for a poll. The
@@ -8104,7 +8138,7 @@ impl Engine {
                             &tracked,
                             from,
                             REPAIR_WINDOW,
-                            PENDING_REPAIR_CAP,
+                            PENDING_LIST_CAP,
                         )
                         .0
                     })
@@ -10430,6 +10464,79 @@ mod tests {
             "the second poll re-ran a probe it already had the answer to"
         );
         assert_eq!(first, second, "and it must be the same answer");
+    }
+
+    /// The Pending list is bounded, and the count it sits under is not.
+    ///
+    /// The gate on the folder this was written for held **128 483** rows, and
+    /// this poll used to `stat` every one of them, inline in an async fn. That
+    /// is 128 483 blocking syscalls on a USB volume per poll, from a tokio
+    /// worker — so the Pending list never arrived, and Activity, a single
+    /// indexed query, appeared to hang beside it because the frontend renders
+    /// the three legs together.
+    ///
+    /// Both halves are asserted: the list stops at [`PENDING_LIST_CAP`], and
+    /// the count behind "N waiting for writes to stop" still reports every row,
+    /// because it comes from a `COUNT(*)` and not from this list.
+    #[tokio::test]
+    async fn a_pending_poll_bounds_its_settling_list_without_understating_the_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // More rows than the cap, each a real file so the stat that used to be
+        // unbounded has something to measure.
+        let held = PENDING_LIST_CAP + 25;
+        let mut rows = Vec::with_capacity(held);
+        for i in 0..held {
+            let name = format!("held-{i:05}.bin");
+            let absolute = p.local_path.join(&name);
+            std::fs::write(&absolute, b"still writing").expect("write");
+            rows.push((
+                absolute,
+                crate::stability::PersistedEntry {
+                    sample: crate::stability::FileSample {
+                        size: 13,
+                        mtime_ns: 1,
+                        ctime_ns: 1,
+                        inode: i as u64 + 1,
+                    },
+                    unchanged_since_ms: 1,
+                    pending_since_ms: 1,
+                    close_write: false,
+                },
+            ));
+        }
+        engine
+            .with_db(|conn| db::save_file_state(conn, &p.id, &rows))
+            .expect("seed the gate");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let settling = pending
+            .iter()
+            .filter(|row| matches!(row.reason, PendingReason::Settling { .. }))
+            .count();
+        assert_eq!(
+            settling, PENDING_LIST_CAP,
+            "the list is what is bounded, and it has to be bounded exactly"
+        );
+
+        assert_eq!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("gate rows")
+                .len(),
+            held,
+            "the gate still holds every row — the cap bounds what the poll \
+             RENDERS, and the count behind \"N waiting for writes to stop\" is \
+             taken from this state, not from the list (see \
+             `crate::progress::status_line`). A cap that also shrank the state \
+             would be a lie about how much work is waiting"
+        );
     }
 
     /// The maintenance guarantee: an operation that takes time SAYS SO.
