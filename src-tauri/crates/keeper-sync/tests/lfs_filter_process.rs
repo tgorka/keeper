@@ -54,10 +54,14 @@ fn the_probe_tells_a_real_filter_from_a_binary_that_is_not_one() {
     ));
 }
 
-#[test]
-fn gitoxide_drives_keepers_filter_process_without_failing_status() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
+/// A repository whose one tracked path is an LFS pointer whose worktree stat no
+/// longer matches, with keeper's filter registered in all three forms.
+///
+/// The stat mismatch is the load-bearing part: it is what sends gix down the
+/// *content* comparison and therefore through the filter, rather than letting
+/// the stat shortcut answer. Without it both tests below would pass with no
+/// filter configured at all.
+fn pointer_fixture(root: &std::path::Path) -> gix::Repository {
     std::process::Command::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(root)
@@ -147,14 +151,18 @@ fn gitoxide_drives_keepers_filter_process_without_failing_status() {
             .expect("git");
     }
 
-    // Touch the file so its stat no longer matches the entry. That is what sends
-    // gix down the *content* comparison — and therefore through the filter —
-    // rather than letting the stat shortcut answer. It is the exact trigger
-    // DW-206 identifies, and without it this test would pass with no filter
-    // configured at all.
+    // Touch the file so its stat no longer matches the entry.
     std::fs::write(&big, &payload).expect("re-write to move the stat");
 
-    let repo = git::repo::open(root, false).expect("reopen");
+    git::repo::open(root, false).expect("reopen")
+}
+
+#[test]
+fn gitoxide_drives_keepers_filter_process_without_failing_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let repo = pointer_fixture(root);
+
     let status = git::repo::status_paths(&repo)
         .expect("status must not fail: a filter gix cannot drive is DW-206 all over again");
     println!("status with keeper's process filter registered -> {status:?}");
@@ -179,4 +187,124 @@ fn gitoxide_drives_keepers_filter_process_without_failing_status() {
         "git's own view: [{}]",
         String::from_utf8_lossy(&out.stdout).trim()
     );
+}
+
+/// Every child gitoxide launched for the walk is gone when the walk returns.
+///
+/// This is the guard for the fork pin in `src-tauri/Cargo.toml`. Upstream
+/// `gix_filter::driver::State` has no `Drop` and its `shutdown` — the only code
+/// in the gitoxide workspace that waits a filter child — has no production
+/// caller, so each pipeline terminated its helper by closing the pipes and left
+/// the corpse in the process table. `index_as_worktree` clones the state per
+/// thread, so a single `status()` leaked on the order of `thread_limit + 2`.
+/// Field measurement on the shipped bundle: 274 zombies plus 32 live helpers
+/// after 10h29m, against a `kern.maxprocperuid` of 2666.
+///
+/// Nothing about that is observable from keeper's own code — `Repository::
+/// status` takes no pipeline and hands none back — which is why this test looks
+/// at the process table instead. It is not a sampling loop: the harness records
+/// its own pid on launch, so the driver's presence is a fact on disk rather
+/// than something to catch in the act.
+///
+/// **The corpse is the shell, not the harness.** gitoxide runs a filter command
+/// through `sh -c`, so the direct child is a shell and the harness is a
+/// grandchild. An unreaped filter therefore shows up as `[sh] <defunct>`
+/// parented to this process, while the harness itself is re-parented away —
+/// measured against the crates.io release, which leaves exactly that and passes
+/// a check that only looks for the recorded pid among our own children.
+///
+/// So both arms are asserted: no zombie child of ours, and no recorded pid
+/// still in the table. With the pin reverted the first arm fails.
+#[cfg(unix)]
+#[test]
+fn a_finished_status_walk_reaps_the_filter_children_it_launched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let repo = pointer_fixture(root);
+
+    let status = git::repo::status_paths(&repo).expect("status");
+    assert!(
+        status.modified.is_empty(),
+        "the fixture must go through the filter, or there is no child to reap: {status:?}"
+    );
+
+    // An empty record would mean gitoxide answered from the single-shot pair
+    // (or from no filter at all) and this test proved nothing.
+    let launched = launched_filter_pids(root);
+    assert!(
+        !launched.is_empty(),
+        "no `process` filter was launched, so the reaping claim is vacuous"
+    );
+
+    let ours = std::process::id();
+    let table = process_table();
+    let zombies: Vec<String> = table
+        .iter()
+        .filter(|row| row.ppid == ours && row.state.starts_with('Z'))
+        .map(|row| format!("{} [{}] {}", row.pid, row.state, row.command))
+        .collect();
+    assert!(
+        zombies.is_empty(),
+        "the walk returned and left {} unreaped child(ren) of its own: {zombies:?}",
+        zombies.len()
+    );
+
+    let survivors: Vec<String> = table
+        .iter()
+        .filter(|row| launched.contains(&row.pid) && row.command.contains("lfs filter-process"))
+        .map(|row| format!("{} [{}] {}", row.pid, row.state, row.command))
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "{} of the {} launched filters are still in the table: {survivors:?}",
+        survivors.len(),
+        launched.len()
+    );
+}
+
+/// The pids the harness recorded for itself, one per `process` launch.
+#[cfg(unix)]
+fn launched_filter_pids(root: &std::path::Path) -> Vec<u32> {
+    std::fs::read_to_string(root.join(".git").join("filter-process-pids"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+#[cfg(unix)]
+struct ProcessRow {
+    pid: u32,
+    ppid: u32,
+    state: String,
+    command: String,
+}
+
+/// Every process on the machine, with its parent, state and command.
+///
+/// `ps` rather than `libc`: a zombie is exactly what is being looked for, and
+/// `kill(pid, 0)` succeeds for one — it is reachable, it just cannot run.
+/// `/proc` would be Linux-only, and the machine this defect was measured on is
+/// the Mac.
+#[cfg(unix)]
+fn process_table() -> Vec<ProcessRow> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,state=,command="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let state = fields.next()?.to_owned();
+            Some(ProcessRow {
+                pid,
+                ppid,
+                state,
+                command: fields.collect::<Vec<_>>().join(" "),
+            })
+        })
+        .collect()
 }
