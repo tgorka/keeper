@@ -357,3 +357,63 @@ Assisted-by: <agent>
 - The leak is established by ownership analysis plus the absence of any
   `shutdown` caller, and corroborated by the field measurement; it was not
   reproduced against a build of gitoxide itself.
+
+---
+
+## Resolution, as shipped in keeper (2026-08-27)
+
+The fix is written, filed and **in use**: keeper's `gix` is pinned to
+`tgorka/gitoxide`, branch `keeper/gix-filter-0.33-reap` — the two commits filed
+as tgorka/gitoxide#1 (lifecycle tests, `process::Client::id()`) and #2
+(`State::shutdown_mut` plus `impl Drop for State`), cherry-picked onto the
+`gix-filter-v0.33.0` release tag. That tag is also where `gix` 0.86.0 and
+`gix-quote` 0.7.2 were published, so the tree is the code crates.io serves plus
+the `Drop`. See the long note on `gix` in `src-tauri/Cargo.toml` for why it is a
+git source rather than a `[patch.crates-io]` entry on `gix-filter` alone.
+
+### What the leak looked like, measured
+
+The last build without the fix, on hesperia, 27 minutes after launch:
+
+```
+keeper pid 3300, app_age 27:43
+  3424 ppid=3300 age=26:54   keeper lfs filter-process --repo /Volumes/merope/tgdrive
+  3425 ppid=3300 age=26:54
+  3426 ppid=3300 age=26:54
+  3431 ppid=3300 age=26:53
+```
+
+Four helpers, each as old as the process that started them: launched in the
+first seconds of the first walk and never let go. `STATUS_THREAD_LIMIT` is 4,
+which is the `thread_limit` term in §1's arithmetic, visible directly.
+
+### The same machine with the fix
+
+`a_finished_status_walk_reaps_the_filter_children_it_launched`
+(`crates/keeper-sync/tests/lfs_filter_process.rs`) is the mechanical guard. Run
+on hesperia with one input changed between the two runs — the `gix` source:
+
+```
+### macOS, crates.io gix 0.86 (unpinned)
+  the walk returned and left 1 unreaped child(ren) of its own: ["18555 [Z] <defunct>"]
+  FAIL a_finished_status_walk_reaps_the_filter_children_it_launched
+
+### macOS, fork pin restored
+  PASS a_finished_status_walk_reaps_the_filter_children_it_launched
+```
+
+**The corpse is the shell, not the helper.** gitoxide runs a filter command
+through `sh -c`, so the unreaped child of the walking process is the shell and
+the helper itself is re-parented away. A check that looked only for the recorded
+helper pid among its own children passed against the leak — worth knowing for
+anyone reproducing this.
+
+### And in the shipped app
+
+`shutdown_mut` is present in the installed binary (2 occurrences) and absent
+from the previous bundle (0), with `lfs filter-process` at 1 in both as the
+control that the search method works.
+
+Retire the pin when the fix is released upstream: restore a version requirement
+in `src-tauri/Cargo.toml`, drop the `allow-git` line in `deny.toml`, and re-run
+the guard.
