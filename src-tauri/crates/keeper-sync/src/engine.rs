@@ -396,6 +396,27 @@ const TICK_MS: u64 = 1_000;
 /// backlog of tens of thousands takes to drain. See [`Engine::repair_memo`].
 const REPAIR_MEMO_TTL: Duration = Duration::from_secs(30);
 
+/// How often a Pending poll pays for a directory walk to look for untracked
+/// files.
+///
+/// The poll runs every five seconds and the directory walk is the expensive
+/// half of a status: it `lstat`s the whole tree whatever changed. On the folder
+/// this was written for that is 996 s of `lstat` per pass, measured, for rows
+/// the stability gate is already holding — a new file is announced by the
+/// watcher, recorded by the gate, and shown as `Settling` without any walk
+/// finding it.
+///
+/// So the poll asks the index-only question, and pays for the directory walk on
+/// this cadence instead: often enough that a file the watcher missed — a create
+/// during a restart, an event the backend dropped — surfaces within the quarter
+/// hour, rarely enough that it is no longer the reason the pane says
+/// "Scanning". The first poll after a start always sweeps, because a process
+/// that has just come up knows nothing about what happened while it was down.
+///
+/// A profile with no live watcher sweeps on every poll: there is nothing to
+/// trust in that case, and correctness outranks the cost.
+const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
+
 /// How often a folder's transfer scratch is swept.
 ///
 /// Scratch is what an interrupted transfer leaves behind, and nothing else ever
@@ -856,6 +877,15 @@ pub struct Engine {
     /// The claim is `try`-only on both legs: nobody waits for a walk, because a
     /// caller that waits 72 minutes for a UI poll is the bug in a new place.
     walking: Mutex<std::collections::HashSet<String>>,
+
+    /// When each profile's Pending poll last paid for a directory walk.
+    ///
+    /// Absent means "never in this run", and a run that has just started must
+    /// sweep: whatever happened while the process was down was announced to
+    /// nobody. In memory on purpose — the guarantee this offers is per run, and
+    /// a persisted timestamp would let a restart skip the one sweep it most
+    /// needs. See [`UNTRACKED_SWEEP_INTERVAL`].
+    untracked_sweep: Mutex<HashMap<String, Instant>>,
 }
 
 /// A profile's in-flight full-tree walk, released when this is dropped.
@@ -991,6 +1021,7 @@ impl Engine {
             repair_cursor: Mutex::new(HashMap::new()),
             repair_memo: Mutex::new(HashMap::new()),
             walking: Mutex::new(std::collections::HashSet::new()),
+            untracked_sweep: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -1013,6 +1044,38 @@ impl Engine {
                 walking: &self.walking,
                 profile_id: profile_id.to_owned(),
             })
+    }
+
+    /// What a Pending poll asks of the walk it is about to run.
+    ///
+    /// The index-only question is answered from `lstat` per entry; the
+    /// directory walk that finds untracked files costs the whole tree, every
+    /// time, and on the folder this was written for that is 996 s. The poll
+    /// therefore skips it and sweeps on [`UNTRACKED_SWEEP_INTERVAL`] — except
+    /// where skipping would mean not knowing:
+    ///
+    /// * the first poll of a run, because nothing was watching while the
+    ///   process was down;
+    /// * a profile whose watcher is not live, because then there is no second
+    ///   source for a new file at all.
+    ///
+    /// Records the sweep as taken, so this is called exactly once per poll.
+    fn poll_walk_policy(&self, profile_id: &str) -> git::repo::WalkPolicy {
+        let watched = matches!(
+            Self::lock(&self.watchers).get(profile_id),
+            Some(ProfileWatch::Live { .. })
+        );
+        let now = Instant::now();
+        let mut swept = Self::lock(&self.untracked_sweep);
+        let due = match swept.get(profile_id) {
+            None => true,
+            Some(last) => now.saturating_duration_since(*last) >= UNTRACKED_SWEEP_INTERVAL,
+        };
+        if !watched || due {
+            swept.insert(profile_id.to_owned(), now);
+            return git::repo::WalkPolicy::full();
+        }
+        git::repo::WalkPolicy::tracked_only()
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -4738,7 +4801,16 @@ impl Engine {
                 event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             };
-            git::repo::status_paths_reported(&repo, Some(&report), self.walk_report_interval)?
+            // `full`: this leg holds the walk claim, and finding untracked
+            // files is what it exists to do. It is also the leg that must save
+            // the stats — a folder whose index carries none pays 25.4 GB of
+            // re-reads per pass until somebody writes them down.
+            git::repo::status_paths_reported(
+                &repo,
+                Some(&report),
+                self.walk_report_interval,
+                git::repo::WalkPolicy::full(),
+            )?
         };
         // The pass only got this far because those paths were stepped over, and
         // a folder that syncs while quietly omitting a file is the one outcome
@@ -8257,6 +8329,14 @@ impl Engine {
             let removable = profile.removable;
             let filter = excludes.clone();
             let interval = self.walk_report_interval;
+            // The expensive half of a walk is the directory scan, and a
+            // five-second poll does not need it: a new file reaches this list
+            // through the watcher and the stability gate long before a walk
+            // would find it. Measured on tgdrive, `find . -type f` over 157 490
+            // files takes 996 s on that volume — every poll, for rows the gate
+            // already holds. So the poll asks about the index and sweeps for
+            // untracked paths on a cadence; see `untracked_sweep_due`.
+            let policy = self.poll_walk_policy(profile_id);
             // The walk runs on a blocking thread and cannot touch `&self`, so
             // its progress comes back over a channel and is published from
             // here. Without this the Pending list is the one surface that
@@ -8279,7 +8359,8 @@ impl Engine {
                         // still has a list to finish, so the send is dropped.
                         let _ = tx.send((seen, entries));
                     };
-                    let status = git::repo::status_paths_reported(&repo, Some(&report), interval)?;
+                    let status =
+                        git::repo::status_paths_reported(&repo, Some(&report), interval, policy)?;
                     // Asked here, where the repository is already open and on a
                     // blocking thread: a deleted path cannot be stat'd, and the
                     // index is the only thing that still knows how big it was.
@@ -15464,6 +15545,90 @@ mod tests {
             Some(now + i64::try_from(crate::profile::CLOSE_WRITE_SETTLE_MS).expect("fits")),
             "one second, not the full settle window"
         );
+    }
+
+    /// A watched folder pays for the directory walk once, then leaves new files
+    /// to the watcher until the sweep falls due.
+    ///
+    /// The directory walk is the expensive half of a status and it is not
+    /// proportional to what changed: measured on the field folder,
+    /// `find . -type f` over 157 490 files takes 996 s, and the Pending poll
+    /// was paying that every five seconds for rows the stability gate already
+    /// held.
+    #[test]
+    fn a_watched_folder_sweeps_for_untracked_once_and_then_stops_walking_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let (_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            _tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        // The first poll of a run always sweeps: nothing was watching while the
+        // process was down.
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::full(),
+            "the first poll after a start has to look for itself"
+        );
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::tracked_only(),
+            "and the next one must not walk the tree again five seconds later"
+        );
+
+        // Age the record past the interval: the sweep comes back, so a file the
+        // watcher never announced is still found within the quarter hour.
+        Engine::lock(&engine.untracked_sweep).insert(
+            p.id.clone(),
+            Instant::now()
+                .checked_sub(UNTRACKED_SWEEP_INTERVAL + Duration::from_secs(1))
+                .expect("the test clock is not at the epoch"),
+        );
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::full(),
+            "a due sweep is what catches an event the backend dropped"
+        );
+    }
+
+    /// With no live watcher there is no second source for a new file, so every
+    /// poll pays.
+    ///
+    /// This is the branch that keeps the cheap path honest: the saving is
+    /// available precisely because something else is watching, and a folder on
+    /// a filesystem that cannot notify (`ProfileWatch::Failed`, or a watcher
+    /// that has not armed yet) gets the old behaviour rather than a quiet gap.
+    #[test]
+    fn an_unwatched_folder_keeps_sweeping_on_every_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        for pass in 1..=3 {
+            assert_eq!(
+                engine.poll_walk_policy(&p.id),
+                git::repo::WalkPolicy::full(),
+                "pass {pass}: an unwatched folder has nothing else to trust"
+            );
+        }
     }
 
     /// The tap is an observer: it sees what the drain saw, and its absence —

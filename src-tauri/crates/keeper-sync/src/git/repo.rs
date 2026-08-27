@@ -1011,8 +1011,9 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// file return to synchronization the moment its permissions are restored,
 /// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
-    // No reporter, so the interval cannot matter: the walk asks nothing.
-    status_paths_reported(repo, None, Duration::MAX)
+    // No reporter, so the interval cannot matter: the walk asks nothing. And no
+    // claim, so it changes nothing either — see [`WalkPolicy::read_only`].
+    status_paths_reported(repo, None, Duration::MAX, WalkPolicy::read_only())
 }
 
 /// [`status_paths`], plus a way for a slow walk to say how far it has got.
@@ -1027,6 +1028,7 @@ pub fn status_paths_reported(
     repo: &gix::Repository,
     report: Option<WalkReport<'_>>,
     interval: Duration,
+    policy: WalkPolicy,
 ) -> Result<RepoStatus> {
     let known = still_unreadable(repo, remembered_unreadable(repo));
     let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
@@ -1034,7 +1036,7 @@ pub fn status_paths_reported(
     // `WalkReport` is a shared reference and therefore `Copy`, which is the
     // point: the retry arm below needs the same reporter, and a `&mut dyn
     // FnMut` could not be handed to both walks.
-    let status = match status_paths_excluding(repo, &skip, report, interval) {
+    let status = match status_paths_excluding(repo, &skip, report, interval, policy) {
         Ok(mut status) => {
             status.unreadable = known;
             status
@@ -1056,7 +1058,7 @@ pub fn status_paths_reported(
                 return Err(first);
             }
             let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
-            let mut status = status_paths_excluding(repo, &skip, report, interval)?;
+            let mut status = status_paths_excluding(repo, &skip, report, interval, policy)?;
             for item in &found {
                 tracing::warn!(path = %item.path.display(), reason = %item.reason,
                     "this file could not be read; the rest of the folder was synchronized without it");
@@ -1525,6 +1527,73 @@ fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
     spoke || interval.is_zero()
 }
 
+/// What a walk does besides answering the question it was asked.
+///
+/// Two decisions, both of which cost or save whole minutes on a large folder,
+/// and neither of which the walk can make for itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkPolicy {
+    /// Write the stat data the walk observed back into the index.
+    ///
+    /// gitoxide hands these over and expects the caller to save them:
+    /// `EntryStatus::NeedsUpdate(stat)` is collected into
+    /// `gix::status::Outcome`, whose own documentation says that without the
+    /// write-back "subsequent `status` operations will take longer to
+    /// complete". Dropping them is what made tgdrive's pane a permanent
+    /// "Scanning": measured on that folder, 60 280 of 155 662 index entries
+    /// carried no stat at all, so every pass re-read 25.4 GB — 24.2 GB of it
+    /// back through the LFS clean filter — to learn what the previous pass had
+    /// already learned and thrown away.
+    ///
+    /// Only for a caller that holds the folder's walk claim. The write is the
+    /// walk's own index with stat fields replaced, so a leg that staged
+    /// something after the walk started would have that work overwritten.
+    pub persist_stats: bool,
+    /// Walk the directories looking for files git does not track.
+    ///
+    /// This is the expensive half of a walk and it is not proportional to what
+    /// changed: it `lstat`s the whole tree every time. Measured on tgdrive,
+    /// `find . -type f` over 157 490 files takes 996 s on that USB volume, and
+    /// that is the floor for a pass that asks the question at all.
+    ///
+    /// The commit leg must ask it — an untracked file is exactly what it exists
+    /// to publish. A five-second UI poll does not: a new file reaches the
+    /// Pending list through the watcher and the stability gate long before any
+    /// walk would find it, so the poll asks only about entries the index
+    /// already names, and sweeps for untracked ones on the cadence in
+    /// `Engine::UNTRACKED_SWEEP_INTERVAL`.
+    pub find_untracked: bool,
+}
+
+impl WalkPolicy {
+    /// Everything: find untracked files, and save what was learned.
+    pub const fn full() -> Self {
+        Self {
+            persist_stats: true,
+            find_untracked: true,
+        }
+    }
+
+    /// Only what the index already names — no directory walk — but still save
+    /// the stats, because that is what makes the next pass cheaper.
+    pub const fn tracked_only() -> Self {
+        Self {
+            persist_stats: true,
+            find_untracked: false,
+        }
+    }
+
+    /// Answer the question and change nothing. For callers that do not hold the
+    /// walk claim, and for every test that asserts on a walk's output rather
+    /// than on its effect.
+    pub const fn read_only() -> Self {
+        Self {
+            persist_stats: false,
+            find_untracked: true,
+        }
+    }
+}
+
 /// The walk, with the pace its caller reports at.
 ///
 /// `skip` is held out of the walk entirely. The exclusions are spelled
@@ -1535,11 +1604,16 @@ fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
 ///
 /// `interval` is the publisher's policy, not git's: see the engine's
 /// `WALK_REPORT_INTERVAL`. `Duration::MAX` with no reporter is the silent case.
+///
+/// `policy` decides the two things that dominate the cost on a large folder:
+/// whether the directories are walked at all, and whether what was learned is
+/// written down. See [`WalkPolicy`].
 fn status_paths_excluding(
     repo: &gix::Repository,
     skip: &[PathBuf],
     report: Option<WalkReport<'_>>,
     interval: Duration,
+    policy: WalkPolicy,
 ) -> Result<RepoStatus> {
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
     // file reports "IO error while writing blob or reading file metadata or
@@ -1569,8 +1643,16 @@ fn status_paths_excluding(
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?
         .should_interrupt_owned(std::sync::Arc::clone(&interrupt))
         .index_worktree_options_mut(|options| {
-            if let Some(dirwalk) = options.dirwalk_options.as_mut() {
-                dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
+            if policy.find_untracked {
+                if let Some(dirwalk) = options.dirwalk_options.as_mut() {
+                    dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
+                }
+            } else {
+                // `None` is how gix is told not to walk the directories at all.
+                // Clearing it rather than filtering the emissions is the whole
+                // point: the cost is the `lstat` of every entry in the tree,
+                // not the reporting of the few that are untracked.
+                options.dirwalk_options = None;
             }
             // See `STATUS_THREAD_LIMIT`: unbounded parallelism here is what
             // produced 55 simultaneous LFS conversions against a smaller pool
@@ -1585,7 +1667,7 @@ fn status_paths_excluding(
             pattern
         })
         .collect();
-    let iter = platform
+    let mut iter = platform
         .into_iter(patterns)
         .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
 
@@ -1647,7 +1729,7 @@ fn status_paths_excluding(
         // `done` is set on every exit from the walk, including the error one:
         // a ticker left running would hold the scope open forever.
         let walked = (|| -> Result<()> {
-            for item in iter {
+            for item in iter.by_ref() {
                 // Before the item is inspected: a walk that is producing
                 // anything at all is alive, whatever the item turns out to be.
                 // The heartbeat is the count, so there is no second counter to
@@ -1678,6 +1760,15 @@ fn status_paths_excluding(
         walked.map(|()| std::mem::take(&mut out))
     })?;
     let mut out = walked;
+
+    // The step gitoxide leaves to the caller, and the one keeper used to skip.
+    //
+    // Before `finish_walk`, because an interrupted walk still learned something
+    // true about every entry it did reach — and after the scope, because the
+    // iterator has to be finished for its outcome to exist at all.
+    if policy.persist_stats {
+        persist_observed_stats(repo, iter);
+    }
 
     for bucket in [
         &mut out.added,
@@ -1722,6 +1813,49 @@ fn status_paths_excluding(
         "status walk finished"
     );
     Ok(out)
+}
+
+/// Save the stat data a finished walk observed, so the next one can answer from
+/// `lstat` instead of reading the file again.
+///
+/// gitoxide collects these while it walks — `EntryStatus::NeedsUpdate(stat)`,
+/// gathered into `gix::status::Outcome` — and then leaves the write to the
+/// caller, saying so in its own documentation: without it, "subsequent `status`
+/// operations will take longer to complete".
+///
+/// Best-effort, and quiet about the ordinary cases. `into_outcome` returns
+/// `None` for a walk that ended early, which is not a failure: the pass was
+/// interrupted and there is nothing to save. A failed write is worth a line,
+/// because the folder will keep paying for it, but it is not worth failing a
+/// pass that has already produced a correct answer.
+fn persist_observed_stats(repo: &gix::Repository, iter: gix::status::Iter) {
+    let Some(mut outcome) = iter.into_outcome() else {
+        return;
+    };
+    if !outcome.has_changes() {
+        return;
+    }
+    let observed = outcome
+        .index_worktree
+        .tracked_file_modification
+        .entries_to_update;
+    match outcome.write_changes() {
+        Some(Ok(())) => tracing::info!(
+            folder = repo
+                .workdir()
+                .and_then(|dir| dir.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            entries = observed,
+            "wrote the stat data this walk observed into the index"
+        ),
+        Some(Err(err)) => tracing::warn!(
+            error = %err,
+            entries = observed,
+            "could not write the walk's stat data back; the next pass will re-read those files"
+        ),
+        None => {}
+    }
 }
 
 /// Tracked paths that cannot be read right now, and what the filesystem said.
@@ -3058,6 +3192,126 @@ mod tests {
         (dir, repo)
     }
 
+    /// Zero the stat data of one index entry, the way a plumbing write leaves
+    /// it (`git update-index --cacheinfo`, and whatever produced 60 280 such
+    /// entries in the field folder).
+    fn strip_stat(repo: &gix::Repository, rela: &str) {
+        let mut index = gix::index::File::at(
+            repo.index_path(),
+            repo.object_hash(),
+            false,
+            Default::default(),
+        )
+        .expect("read the index from disk");
+        let position = index
+            .entry_index_by_path(rela.into())
+            .expect("the fixture path is in the index");
+        index.entries_mut()[position].stat = gix::index::entry::Stat::default();
+        index
+            .write(gix::index::write::Options::default())
+            .expect("write the stat-less index");
+    }
+
+    /// The stat data of one index entry, read fresh from disk.
+    fn stat_of(root: &std::path::Path, rela: &str) -> gix::index::entry::Stat {
+        let repo = open(root, true).expect("reopen");
+        let index = repo.index().expect("index");
+        let position = index
+            .entry_index_by_path(rela.into())
+            .expect("the fixture path is in the index");
+        index.entries()[position].stat
+    }
+
+    /// A walk that is allowed to save what it learned, saves it.
+    ///
+    /// This is the whole of DW's "Scanning 151578/155662 forever". An entry
+    /// with no stat cannot be answered by `lstat`, so every pass reads the file
+    /// and — for an LFS path — runs it back through the clean filter. gitoxide
+    /// hands the observed stat over and leaves the write to the caller; keeper
+    /// dropped it, so the next pass re-learned the same thing. Measured on the
+    /// field folder: 60 280 of 155 662 entries, 25.4 GB re-read per walk.
+    #[test]
+    fn a_persisting_walk_writes_the_stat_it_observed() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+        assert_eq!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            0,
+            "the fixture must start stat-less, or this test proves nothing"
+        );
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let status =
+            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        assert!(
+            status.modified.is_empty(),
+            "the file matches its blob; a stat-less entry is not a modified one: {status:?}"
+        );
+
+        assert_ne!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            0,
+            "the walk read the file and must have written down what it found"
+        );
+    }
+
+    /// And a walk that was not asked to save anything changes nothing.
+    ///
+    /// The read-only policy is what every caller without the folder's walk
+    /// claim gets, because the write is the walk's own index with stat fields
+    /// replaced: a leg that staged something after the walk started would have
+    /// that work overwritten.
+    #[test]
+    fn a_read_only_walk_leaves_the_index_exactly_as_it_found_it() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+        let before = std::fs::read(dir.path().join(".git/index")).expect("read index");
+
+        let repo = open(dir.path(), true).expect("reopen");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::read_only()).expect("status");
+
+        assert_eq!(
+            std::fs::read(dir.path().join(".git/index")).expect("read index"),
+            before,
+            "a read-only walk must not rewrite the index at all"
+        );
+    }
+
+    /// The poll's cheap walk: index entries yes, directory scan no.
+    ///
+    /// The directory scan is the half that costs the whole tree whatever
+    /// changed — 996 s of `lstat` on the field folder, per pass. What it buys
+    /// is untracked paths, which a five-second poll does not need: the watcher
+    /// and the stability gate name a new file long before a walk finds it.
+    #[test]
+    fn a_tracked_only_walk_skips_the_untracked_search_and_still_reports_changes() {
+        let (dir, _repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        std::fs::write(dir.path().join("new.txt"), "untracked").expect("write");
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let full =
+            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        assert_eq!(
+            full.untracked,
+            [PathBuf::from("new.txt")],
+            "the full policy is what finds an untracked file: {full:?}"
+        );
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let tracked = status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::tracked_only())
+            .expect("status");
+        assert!(
+            tracked.untracked.is_empty(),
+            "the poll's walk must not have walked the directories: {tracked:?}"
+        );
+        assert_eq!(
+            tracked.modified,
+            [PathBuf::from("a.txt")],
+            "and it must still answer the question the index can answer: {tracked:?}"
+        );
+    }
+
     #[test]
     fn enforce_local_config_writes_the_key_that_keeps_status_working() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3476,7 +3730,13 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_reported(&repo, Some(&report), Duration::from_secs(1)).expect("status");
+        status_paths_reported(
+            &repo,
+            Some(&report),
+            Duration::from_secs(1),
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
         assert!(
             seen.lock().expect("lock").is_empty(),
             "a fast walk must stay silent, got {:?}",
@@ -3501,7 +3761,13 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_reported(&repo, Some(&report), Duration::ZERO).expect("status");
+        status_paths_reported(
+            &repo,
+            Some(&report),
+            Duration::ZERO,
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
         let seen = seen.lock().expect("lock").clone();
         let last = seen.last().copied().expect("a zero interval reports");
         assert!(
@@ -3587,7 +3853,14 @@ mod tests {
         // counted, not about whether the clock got a turn. At ZERO the closing
         // report is owed unconditionally, so the assertions below run on every
         // machine — and an emissions-based numerator still fails them.
-        status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
+        status_paths_excluding(
+            &repo,
+            &[],
+            Some(&report),
+            Duration::ZERO,
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
@@ -3674,7 +3947,8 @@ mod tests {
 
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
-        status_paths_excluding(&repo, &[], Some(&report), CADENCE).expect("status");
+        status_paths_excluding(&repo, &[], Some(&report), CADENCE, WalkPolicy::read_only())
+            .expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
