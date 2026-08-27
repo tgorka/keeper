@@ -3255,6 +3255,48 @@ mod tests {
         );
     }
 
+    /// And the commit that follows the walk does not revert it.
+    ///
+    /// The trap this pins: `stage_and_commit` used to clone the handle's
+    /// *cached* index snapshot, and a pass loads that cache early — the walk
+    /// reads the index for its own denominator. So the stats the walk had just
+    /// written were reverted by the very same pass, on every folder that
+    /// actually committed something, and the saving would have shown up only on
+    /// idle passes.
+    #[test]
+    fn a_commit_after_a_persisting_walk_keeps_the_stats_the_walk_wrote() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+
+        // One handle for the whole pass, exactly as `commit_local` uses it.
+        let repo = open(dir.path(), true).expect("reopen");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        let after_walk = stat_of(dir.path(), "a.txt").mtime.secs;
+        assert_ne!(after_walk, 0, "the walk must have written the stat first");
+
+        std::fs::write(dir.path().join("c.txt"), "gamma").expect("write");
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added: vec![PathBuf::from("c.txt")],
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+
+        assert_eq!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            after_walk,
+            "staging wrote a stale index and threw the walk's work away"
+        );
+    }
+
     /// And a walk that was not asked to save anything changes nothing.
     ///
     /// The read-only policy is what every caller without the folder's walk
