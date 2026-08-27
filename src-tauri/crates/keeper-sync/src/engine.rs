@@ -838,6 +838,43 @@ pub struct Engine {
     /// [`REPAIR_MEMO_TTL`], and the sweep that drains it publishes its own
     /// progress, so a slightly old answer here is honest.
     repair_memo: Mutex<HashMap<String, (Instant, Vec<PathBuf>)>>,
+
+    /// Profiles with a full-tree status walk in flight.
+    ///
+    /// Measured on hesperia's `tgdrive`: **two** concurrent walks of the same
+    /// 155 662-entry USB folder, in 26 of 26 one-second samples over seven
+    /// minutes — two `keeper-status-watchdog` threads, two
+    /// `gix::status::index_worktree::producer`s, two `index_as_worktree`
+    /// scopes. Nothing bounded it: the commit leg and every Pending poll each
+    /// called `status_paths_reported` directly, and a walk of that folder takes
+    /// 72 minutes, so a five-second poll only had to reach the walk branch once
+    /// to leave a second full-tree pass running for over an hour beside the
+    /// first.
+    ///
+    /// Two walks of one tree are not twice the work — they are twice the work
+    /// plus the seek contention of interleaving them on one external volume.
+    /// The claim is `try`-only on both legs: nobody waits for a walk, because a
+    /// caller that waits 72 minutes for a UI poll is the bug in a new place.
+    walking: Mutex<std::collections::HashSet<String>>,
+}
+
+/// A profile's in-flight full-tree walk, released when this is dropped.
+///
+/// A `Drop` guard rather than a matching pair of calls, because the walk it
+/// covers can end four ways — completion, the watchdog's abandonment, an
+/// unreadable-tree error, or a panic on a worker — and three of those do not
+/// come back to the line that made the claim. A leaked claim is a folder that
+/// never walks again, which is a far worse failure than the duplicate walk this
+/// removes.
+struct WalkClaim<'a> {
+    walking: &'a Mutex<std::collections::HashSet<String>>,
+    profile_id: String,
+}
+
+impl Drop for WalkClaim<'_> {
+    fn drop(&mut self) {
+        Engine::lock(self.walking).remove(&self.profile_id);
+    }
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -953,9 +990,29 @@ impl Engine {
             walk_report_interval: WALK_REPORT_INTERVAL,
             repair_cursor: Mutex::new(HashMap::new()),
             repair_memo: Mutex::new(HashMap::new()),
+            walking: Mutex::new(std::collections::HashSet::new()),
         };
         engine.seed_status()?;
         Ok(engine)
+    }
+
+    /// Claim the one full-tree walk this profile is allowed to have running.
+    ///
+    /// `None` means somebody else is already walking this folder. There is no
+    /// waiting variant on purpose: the two callers are a commit pass and a UI
+    /// poll, and on a folder whose walk takes over an hour, a caller that
+    /// queued behind one would be indistinguishable from the freeze this
+    /// exists to remove. Both legs have a correct answer for "not now" — the
+    /// commit pass defers to the supervisor's next tick, and the poll answers
+    /// from the index and the gate, which is what it does anyway whenever a
+    /// repair backlog exists.
+    fn claim_walk(&self, profile_id: &str) -> Option<WalkClaim<'_>> {
+        Self::lock(&self.walking)
+            .insert(profile_id.to_owned())
+            .then(|| WalkClaim {
+                walking: &self.walking,
+                profile_id: profile_id.to_owned(),
+            })
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -4651,6 +4708,18 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
+        // One walk per folder. If a Pending poll is already inside one, this
+        // pass has nothing to add by starting a second: it would read the same
+        // tree, reach the same verdicts, and halve the throughput of the walk
+        // already running. Staging nothing is an outcome this caller already
+        // handles on every quiet pass, and the supervisor's next tick retries.
+        let Some(_claim) = self.claim_walk(&profile.id) else {
+            tracing::info!(
+                profile = %profile.name,
+                "a status walk is already in flight; deferring this pass to the next tick"
+            );
+            return Ok(git::commit::StagedChange::default());
+        };
         // A walk that takes longer than a second says so, on the surface the
         // owner is looking at. Before this, the one step that can run for ten
         // minutes on a 155 000-file folder published nothing at all, so the pane
@@ -4658,13 +4727,15 @@ impl Engine {
         // way to tell work from a wedge. Fast folders still report nothing: the
         // pacing lives in `git::repo`, and DW-116's flipping glyph stays fixed.
         let status = {
-            let report = |seen: u64, entries: u64| {
+            let report = |scanned: u64, entries: u64| {
                 let mut event = self.progress(profile, SyncPhase::Scanning);
-                event.files_done = seen;
-                // `seen` counts untracked paths the index never had, so it can
-                // pass `entries`; a denominator below the numerator would render
-                // a bar past its end. Say the count alone in that case.
-                event.files_total = (entries >= seen).then_some(entries);
+                event.files_done = scanned;
+                // Both counts are index entries now (see [`git::repo::WalkReport`]),
+                // so the numerator can no longer overrun the denominator and
+                // the bar cannot render past its end. A zero denominator is
+                // still not a denominator: an index the walk could not read
+                // bounds nothing, and the count alone is the honest answer.
+                event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             };
             git::repo::status_paths_reported(&repo, Some(&report), self.walk_report_interval)?
@@ -8170,7 +8241,18 @@ impl Engine {
             }
         }
 
-        if is_repository && repair.is_empty() {
+        // The same one-walk-per-folder claim the commit leg takes, and the
+        // reason the claim exists: this branch is reached from a five-second UI
+        // poll, so without it a folder whose walk runs for over an hour ends up
+        // with a second full-tree pass beside the first — measured, two at once
+        // for as long as anyone watched. Losing the claim costs the poll only
+        // the untracked rows; the settling rows and the repair backlog above
+        // are already assembled, and the walk that does hold the claim is
+        // computing the same verdicts for the commit path anyway.
+        let walk_claim = (is_repository && repair.is_empty())
+            .then(|| self.claim_walk(profile_id))
+            .flatten();
+        if walk_claim.is_some() {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
@@ -8237,10 +8319,11 @@ impl Engine {
             // branch at RANDOM, so a walk that finished before the first drain
             // could take the handle's branch and discard every queued report.
             // On Linux the timing hid it; the same test failed on the Mac.
-            while let Some((seen, entries)) = rx.recv().await {
+            while let Some((scanned, entries)) = rx.recv().await {
                 let mut event = self.progress(&profile, SyncPhase::Scanning);
-                event.files_done = seen;
-                event.files_total = (entries >= seen).then_some(entries);
+                event.files_done = scanned;
+                // Index entries on both sides; see [`git::repo::WalkReport`].
+                event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             }
             let (status, untracked, deleted_sizes) = task
@@ -10539,6 +10622,75 @@ mod tests {
         );
     }
 
+    /// One full-tree walk per folder, and the loser keeps working.
+    ///
+    /// Measured on hesperia: two concurrent walks of the same 155 662-entry USB
+    /// folder in 26 of 26 samples over seven minutes — the commit leg and a
+    /// five-second Pending poll, each calling the walk directly, on a tree
+    /// whose walk takes 72 minutes. Two walks of one tree are twice the work
+    /// plus the seek contention of interleaving them.
+    ///
+    /// Both halves matter. Losing the race must not raise an error and must not
+    /// stall: `collect_stable_changes` stages nothing and lets the supervisor
+    /// retry, which is the same outcome as any quiet pass.
+    #[test]
+    fn only_one_status_walk_runs_against_a_folder_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("work.txt"), b"x").expect("write");
+        // Open the settle episode and age it out, so the folder really does
+        // hold something a walk would stage. Without this the assertion below
+        // passes for the wrong reason - a freshly written file is held by the
+        // stability gate whether the walk ran or not - and deleting the claim
+        // leaves the test green.
+        engine
+            .collect_stable_changes(&p)
+            .expect("the first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+
+        let held = engine.claim_walk(&p.id).expect("the first claim is free");
+        assert!(
+            engine.claim_walk(&p.id).is_none(),
+            "a second walk was allowed against a folder already being walked"
+        );
+        // A different folder is a different tree; the claim is per profile, not
+        // a global lock on walking.
+        assert!(
+            engine.claim_walk("another-profile").is_some(),
+            "the claim locked out an unrelated folder"
+        );
+
+        // The commit leg's answer to losing: nothing staged, no error.
+        let deferred = engine
+            .collect_stable_changes(&p)
+            .expect("a deferred pass is not a failure");
+        assert!(
+            deferred.added.is_empty()
+                && deferred.modified.is_empty()
+                && deferred.deleted.is_empty(),
+            "a pass that could not walk reported changes it never looked for: {deferred:?}"
+        );
+
+        // The claim is released, so the next pass is not locked out for the
+        // life of the process - and that pass finds the work the deferred one
+        // stayed silent about, which is what makes the silence above a
+        // consequence of the claim and not of an empty folder.
+        drop(held);
+        let ran = engine
+            .collect_stable_changes(&p)
+            .expect("the released folder walks");
+        assert_eq!(
+            ran.added,
+            vec![PathBuf::from("work.txt")],
+            "the folder had stageable work all along: {ran:?}"
+        );
+    }
+
     /// The maintenance guarantee: an operation that takes time SAYS SO.
     ///
     /// The field report this exists for: "pending took very long; if keeper has
@@ -10549,11 +10701,12 @@ mod tests {
     /// sync` - a fact about the queue, while the work itself was invisible and
     /// indistinguishable from a wedge.
     ///
-    /// Simulating "slow" is done by reporting on every item rather than by
-    /// making a disk slow: what has to stay true is that the *counts reach the
-    /// surface the owner reads*, and a test that waited out real seconds to
-    /// prove it would be a test nobody runs. The silent-when-fast half is
-    /// `git::repo`'s `a_walk_that_finishes_immediately_reports_no_progress`.
+    /// Simulating "slow" is done with a folder big enough to outlast a report
+    /// tick rather than by making a disk slow: what has to stay true is that
+    /// the *counts reach the surface the owner reads*, and a test that waited
+    /// out real seconds to prove it would be a test nobody runs. The
+    /// silent-when-fast half is `git::repo`'s
+    /// `a_walk_that_finishes_immediately_reports_no_progress`.
     #[test]
     fn a_long_running_walk_reports_its_progress_where_the_owner_can_see_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10564,9 +10717,22 @@ mod tests {
         engine.report_every_walk_item();
         let p = adoptable(dir.path());
         std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        // A committed body the walk has to compare its way through. Progress is
+        // published off a clock now (see `git::repo::WalkReport`), so a folder
+        // that finishes inside one tick proves nothing about a folder that runs
+        // for an hour, which is the case this exists for.
+        const COMMITTED: usize = 400;
+        for i in 0..COMMITTED {
+            std::fs::write(p.local_path.join(format!("base-{i:05}.txt")), b"x").expect("write");
+        }
         engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            COMMITTED as u64
+        );
 
-        // Enough files that a report carries a count worth reading.
+        // And work on top, so the second scan below has something to hand the
+        // commit and the walk is a real one rather than a no-op.
         for i in 0..8 {
             std::fs::write(p.local_path.join(format!("file-{i}.txt")), b"content").expect("write");
         }
@@ -10595,20 +10761,26 @@ mod tests {
         );
         let counts: Vec<u64> = walking.iter().map(|event| event.files_done).collect();
         // It counts up, so a watcher can tell movement from a freeze - within a
-        // walk. Each walk is its own operation and starts again at one, which is
-        // what a restart back to 1 in this stream is.
+        // walk. Each walk is its own operation and starts again, which is what a
+        // drop back to a smaller number in this stream is.
         assert!(
             counts
                 .windows(2)
-                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= COMMITTED as u64),
             "a count moved backwards without restarting: {counts:?}"
         );
-        // And it reaches every item the walk produced: eight untracked files,
-        // so a report that stopped at two would mean the pane freezes part way.
+        // And it reaches the index it is drawn against: a report that stopped
+        // part way is a pane that freezes part way.
         assert_eq!(
             counts.iter().copied().max(),
-            Some(8),
+            Some(COMMITTED as u64),
             "the report has to follow the walk to its end: {counts:?}"
+        );
+        assert!(
+            walking
+                .iter()
+                .all(|event| event.files_total == Some(COMMITTED as u64)),
+            "the denominator is the index entry count: {walking:?}"
         );
         // And the line the owner actually reads names the step and the numbers,
         // rather than only what is queued behind it.
@@ -12183,12 +12355,19 @@ mod tests {
         let p = adoptable(dir.path());
         // The seed ignores itself, so the first commit needs a file of its own.
         std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
-        std::fs::write(p.local_path.join("committed.txt"), b"already here").expect("write");
+        // Four hundred of them, because progress is published off a clock
+        // now: a seven-file walk finishes inside the first tick and a test
+        // built on one would be asserting that the clock is fast, not that the
+        // poll reports. See `git::repo::WalkReport`.
+        for i in 0..400 {
+            std::fs::write(p.local_path.join(format!("committed-{i:05}.txt")), b"x")
+                .expect("write");
+        }
         engine.upsert_profile(&p).expect("upsert");
         // `pending` only walks a folder that is already a repository - the
         // first sync is what adopts it - so the fixture commits once before
         // there is anything for a poll to find.
-        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 400);
         for i in 0..6 {
             std::fs::write(p.local_path.join(format!("waiting-{i}.txt")), b"x").expect("write");
         }

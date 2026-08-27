@@ -1421,14 +1421,86 @@ const STATUS_THREAD_LIMIT: usize = 4;
 /// core" is what deadlocked 55 conversions against a smaller filter pool.
 const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
 
-/// What a walk in progress can say about itself: items produced, and the number
-/// of index entries that bounds them.
+/// What a walk in progress can say about itself: index entries compared, and
+/// the number of index entries there are.
 ///
-/// The count is not a percentage and the denominator is not exact — a walk also
-/// emits untracked paths the index has never heard of, so `seen` can pass
-/// `entries`. It is the honest pair the walk actually holds, and it is what
-/// turns ten silent minutes into "checked 41 000 of 155 000 files".
-pub type WalkReport<'a> = &'a dyn Fn(u64, u64);
+/// **Both numbers count the same thing**, which is the whole point and was not
+/// true before. The numerator used to be items *emitted* — a walk's changed
+/// paths — against a denominator of index entries. On a folder mid-LFS
+/// migration that reads as `9113/155662` and creeps, because it is measuring
+/// how many differences have been found, not how far the walk has got; and it
+/// stops dead for the whole of any stretch where the walk finds nothing, which
+/// on a mostly clean tree is most of the pass.
+///
+/// `scanned` is what gix itself counts through the index (see `ScannedEntries`),
+/// so the pair is monotonic, bounded by its own denominator, and moves at the
+/// rate the walk is actually working. It is what turns ten silent minutes into
+/// "checked 41 000 of 155 000 files" and means it.
+///
+/// `Sync`, because the ticker that publishes it runs beside the walk rather
+/// than inside it — see `status_paths_excluding`.
+pub type WalkReport<'a> = &'a (dyn Fn(u64, u64) + Sync);
+
+/// File one walked item into the bucket that describes what has to happen.
+///
+/// Lifted out of the loop so the loop can live inside a `thread::scope` without
+/// eighty lines of match arms moving one indent to the right; the classification
+/// is unchanged.
+fn push_item(out: &mut RepoStatus, item: gix::status::Item) {
+    use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
+
+    match item {
+        Item::TreeIndex(change) => match change {
+            gix::diff::index::Change::Addition { location, .. } => {
+                out.added.push(to_path(location.as_ref()));
+            }
+            gix::diff::index::Change::Deletion { location, .. } => {
+                out.deleted.push(to_path(location.as_ref()));
+            }
+            gix::diff::index::Change::Modification { location, .. } => {
+                out.modified.push(to_path(location.as_ref()));
+            }
+            // A rename is a deletion at the source fused with an addition at
+            // the destination; keeping both keeps the two vectors a faithful
+            // description of what the tree has to become.
+            gix::diff::index::Change::Rewrite {
+                source_location,
+                location,
+                ..
+            } => {
+                out.deleted.push(to_path(source_location.as_ref()));
+                out.added.push(to_path(location.as_ref()));
+            }
+        },
+        Item::IndexWorktree(WorktreeItem::Modification {
+            rela_path, status, ..
+        }) => match status {
+            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                out.deleted.push(to_path(rela_path.as_ref()));
+            }
+            index_as_worktree::EntryStatus::Change(_) => {
+                out.modified.push(to_path(rela_path.as_ref()));
+            }
+            // A conflicted entry is a divergence the merge machinery never
+            // produces here (AD-43 makes conflict copies instead), and
+            // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
+            _ => {}
+        },
+        Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
+            if entry.status == gix::dir::entry::Status::Untracked {
+                out.untracked.push(to_path(entry.rela_path.as_ref()));
+            }
+        }
+        Item::IndexWorktree(WorktreeItem::Rewrite {
+            source,
+            dirwalk_entry,
+            ..
+        }) => {
+            out.deleted.push(to_path(source.rela_path()));
+            out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
+        }
+    }
+}
 
 /// The walk, with the pace its caller reports at.
 ///
@@ -1446,8 +1518,6 @@ fn status_paths_excluding(
     report: Option<WalkReport<'_>>,
     interval: Duration,
 ) -> Result<RepoStatus> {
-    use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
-
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
     // file reports "IO error while writing blob or reading file metadata or
     // changing filetype" in its top frame, and the errno that says *why* —
@@ -1504,84 +1574,74 @@ fn status_paths_excluding(
         .map(|index| index.entries().len() as u64)
         .unwrap_or(0);
 
-    let mut last_report = Instant::now();
-
+    // Progress comes off a clock, not off the items.
+    //
+    // It used to be published from inside this loop, which meant it could only
+    // move when the walk *emitted* something. A pass whose dirty entries run
+    // out part-way then compares tens of thousands of clean files in complete
+    // silence — the same stretch that used to get healthy walks killed — and
+    // the pane froze on whatever number the last emission left behind. This is
+    // also why the number the owner saw was items emitted rather than entries
+    // compared: inside the loop, the emission count was the only one that was
+    // guaranteed to have moved.
+    //
+    // Scoped, so the ticker can borrow the caller's reporter rather than
+    // forcing every call site through an `Arc`. It wakes on a short slice so
+    // the scope's join never adds a report interval to the end of a fast walk:
+    // `neuradrive` finishes in 150 ms and runs every few seconds.
+    let done = std::sync::Arc::new(AtomicBool::new(false));
     let mut out = RepoStatus::default();
-    for item in iter {
-        // Before the item is inspected: a walk that is producing anything at
-        // all is alive, whatever the item turns out to be. The heartbeat is the
-        // count, so there is no second counter to keep in step with it.
-        let seen = watchdog.beat();
+    let walked = std::thread::scope(|scope| -> Result<RepoStatus> {
         if let Some(report) = report {
-            // Paced, not per item: see `WALK_REPORT_INTERVAL`. Checked after the
-            // beat so the count reported is one the walk has really reached.
-            if last_report.elapsed() >= interval {
-                last_report = Instant::now();
-                report(seen, entries);
-            }
+            let ticking = std::sync::Arc::clone(&scanned);
+            let ticking_done = std::sync::Arc::clone(&done);
+            scope.spawn(move || {
+                // The wake is short so the scope's join never adds a report
+                // interval to the end of a fast walk, and it never exceeds the
+                // interval itself so a test can ask for a millisecond cadence
+                // and get one.
+                let slice = interval.clamp(Duration::from_millis(1), Duration::from_millis(20));
+                let mut waited = Duration::ZERO;
+                loop {
+                    std::thread::sleep(slice);
+                    if ticking_done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    waited += slice;
+                    if waited >= interval {
+                        waited = Duration::ZERO;
+                        report(ticking.load(Ordering::Relaxed) as u64, entries);
+                    }
+                }
+            });
         }
-        let item = item.map_err(|err| {
-            // An interrupt usually ends the iterator rather than surfacing
-            // here, which is why the real guard is after the loop — but if it
-            // ever does surface, the reason the walk stopped is the useful
-            // sentence, not gix's inner error.
-            if interrupt.load(Ordering::Relaxed) {
-                return watchdog.silence_error(seen);
+        // `done` is set on every exit from the walk, including the error one:
+        // a ticker left running would hold the scope open forever.
+        let walked = (|| -> Result<()> {
+            for item in iter {
+                // Before the item is inspected: a walk that is producing
+                // anything at all is alive, whatever the item turns out to be.
+                // The heartbeat is the count, so there is no second counter to
+                // keep in step with it.
+                let seen = watchdog.beat();
+                let item = item.map_err(|err| {
+                    // An interrupt usually ends the iterator rather than
+                    // surfacing here, which is why the real guard is after the
+                    // loop — but if it ever does surface, the reason the walk
+                    // stopped is the useful sentence, not gix's inner error.
+                    if interrupt.load(Ordering::Relaxed) {
+                        return watchdog.silence_error(seen);
+                    }
+                    SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
+                })?;
+                push_item(&mut out, item);
             }
-            SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
-        })?;
-        match item {
-            Item::TreeIndex(change) => match change {
-                gix::diff::index::Change::Addition { location, .. } => {
-                    out.added.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Deletion { location, .. } => {
-                    out.deleted.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Modification { location, .. } => {
-                    out.modified.push(to_path(location.as_ref()));
-                }
-                // A rename is a deletion at the source fused with an addition
-                // at the destination; keeping both keeps the two vectors a
-                // faithful description of what the tree has to become.
-                gix::diff::index::Change::Rewrite {
-                    source_location,
-                    location,
-                    ..
-                } => {
-                    out.deleted.push(to_path(source_location.as_ref()));
-                    out.added.push(to_path(location.as_ref()));
-                }
-            },
-            Item::IndexWorktree(WorktreeItem::Modification {
-                rela_path, status, ..
-            }) => match status {
-                index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                    out.deleted.push(to_path(rela_path.as_ref()));
-                }
-                index_as_worktree::EntryStatus::Change(_) => {
-                    out.modified.push(to_path(rela_path.as_ref()));
-                }
-                // A conflicted entry is a divergence the merge machinery never
-                // produces here (AD-43 makes conflict copies instead), and
-                // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
-                _ => {}
-            },
-            Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
-                if entry.status == gix::dir::entry::Status::Untracked {
-                    out.untracked.push(to_path(entry.rela_path.as_ref()));
-                }
-            }
-            Item::IndexWorktree(WorktreeItem::Rewrite {
-                source,
-                dirwalk_entry,
-                ..
-            }) => {
-                out.deleted.push(to_path(source.rela_path()));
-                out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
-            }
-        }
-    }
+            Ok(())
+        })();
+        done.store(true, Ordering::Relaxed);
+        walked.map(|()| std::mem::take(&mut out))
+    })?;
+    let mut out = walked;
 
     for bucket in [
         &mut out.added,
@@ -3390,34 +3450,86 @@ mod tests {
 
     /// And a walk that does take time reports the pair the UI renders.
     ///
-    /// The interval is forced to zero rather than waited out - the behaviour
-    /// under test is what the numbers *are*, and a test that slept a second per
-    /// item to prove it would be a test nobody runs.
+    /// The fixture is the failure, not a convenience: 3 000 committed files
+    /// that are all **clean**, plus one untracked path. The walk therefore
+    /// emits exactly one item and compares 3 000 index entries.
+    ///
+    /// Against that, the two candidate designs give opposite answers:
+    ///
+    /// * published from inside the item loop, counting emissions — **one**
+    ///   report, reading `1`, for the whole pass. That is what the owner was
+    ///   looking at when a 155 662-entry folder sat on `9113/155662`.
+    /// * published off a clock, counting entries — a report per interval,
+    ///   climbing to 3 000, which is what the walk is actually doing.
     #[test]
-    fn a_slow_walk_reports_items_against_the_index_size() {
-        let (dir, repo) = repo_with_two_files();
-        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+    fn a_slow_walk_reports_index_entries_compared_not_items_emitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(3_000);
+        for i in 0..3_000 {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+        // The one emission. Everything else the walk touches is clean, so a
+        // reporter tied to emissions has nothing further to say.
+        std::fs::write(dir.path().join("untracked.txt"), "u").expect("write");
+
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
-        status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
+        status_paths_excluding(&repo, &[], Some(&report), Duration::from_millis(1))
+            .expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
             !seen.is_empty(),
-            "an item was produced and nothing was said"
+            "3 000 entries were compared and the walk said nothing"
         );
-        // The count is the walk's own, and it counts up.
-        assert_eq!(seen.first().map(|pair| pair.0), Some(1));
+        // The denominator is the index, which holds the committed files and not
+        // the untracked one.
         assert!(
-            seen.windows(2).all(|pair| pair[1].0 > pair[0].0),
-            "the count never walks backwards: {seen:?}"
+            seen.iter().all(|pair| pair.1 == 3_000),
+            "the denominator is the index entry count: {:?}",
+            &seen[..seen.len().min(8)]
         );
-        // The denominator is the index, which holds the two committed files -
-        // and not the untracked third, which is exactly why `seen` may pass it.
+        // Drawn against that denominator, so it can never pass it. An emission
+        // count could: the untracked path is emitted and is not an index entry.
         assert!(
-            seen.iter().all(|pair| pair.1 == 2),
-            "the denominator is the index entry count: {seen:?}"
+            seen.iter().all(|pair| pair.0 <= pair.1),
+            "the numerator overran its own denominator: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // Counts up. Not *strictly*: a tick that lands between two comparisons
+        // honestly repeats the figure rather than inventing movement.
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // The regression, stated as a number: one emission happened, so a
+        // loop-driven reporter could not have got past it.
+        let reached = seen.iter().map(|pair| pair.0).max().unwrap_or(0);
+        assert!(
+            reached > 1,
+            "the count never got past the single emitted item ({reached}), which \
+             is exactly the freeze this reports off a clock to avoid: {:?}",
+            &seen[..seen.len().min(8)]
         );
     }
 
