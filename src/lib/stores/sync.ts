@@ -25,6 +25,7 @@ import {
   type SyncProfileReq,
   type SyncProfileVm,
   type SyncStatusVm,
+  type SyncVerifyVm,
   syncFolderNow,
   syncProfileRemove,
   syncProfileSave,
@@ -76,6 +77,23 @@ export const SYNC_REMOVABLE_SETTLE_MS = 10_000;
 export const SYNC_DEFAULT_POLL_INTERVAL_MS = 15_000;
 /** Mirrors `MIN_POLL_INTERVAL_MS`: below this a scan runs on every 1 Hz tick. */
 export const SYNC_MIN_POLL_INTERVAL_MS = 2_000;
+
+/**
+ * The retention window keeper applies when a folder says nothing about it, and
+ * the floor below which it refuses (Story 56.12, Story 56.5).
+ *
+ * Mirrored for the same reason as the four above — the form has to name the
+ * number that will be in force while the box is still empty — but with one
+ * difference worth knowing before touching it: `0` is not "nothing pinned"
+ * here, it is keeper's documented instruction to never release. Rust REFUSES a
+ * non-zero window below {@link SYNC_MIN_RELEASE_TTL_MS} rather than flooring
+ * it, so the form must not silently round one up into a save.
+ */
+export const SYNC_DEFAULT_RELEASE_TTL_MS = 24 * 60 * 60 * 1000;
+/** Mirrors `MIN_RELEASE_TTL_MS`. A non-zero window under a minute is refused. */
+export const SYNC_MIN_RELEASE_TTL_MS = 60_000;
+/** Mirrors `RELEASE_TTL_CEILING_MS` — ten years. Refused above, never clamped. */
+export const SYNC_RELEASE_TTL_CEILING_MS = 3650 * 24 * 60 * 60 * 1000;
 
 /** Fast poll cadence, used while any profile is doing work. */
 export const SYNC_ACTIVE_POLL_MS = 2_000;
@@ -395,6 +413,7 @@ export async function setSyncProfileRecordingsSubfolder(
   if (stored === undefined) {
     throw new Error(SYNC_PROFILE_GONE);
   }
+  const folderOwned = new Set(stored.folderOwned);
   return await saveSyncProfile({
     id: stored.id,
     name: stored.name,
@@ -407,26 +426,40 @@ export async function setSyncProfileRecordingsSubfolder(
     excludes: stored.excludes,
     removable: stored.removable,
     lfsMode: stored.lfsMode,
-    // The VM reports what is PINNED (`null` = "keeper chooses"), which is the
-    // same `null` the request reads as "not expressed" — so an unpinned window
-    // or cadence stays unpinned instead of being frozen at today's default.
-    lfsThresholdBytes: stored.lfsThresholdBytes,
+    // Every key with an `Option` slot that a folder config file can own is sent
+    // as the omission when it is owned, on the folder form's rule — the two
+    // writers must not disagree about what "express" means. Sending an owned
+    // value back is not harmless: `profile::as_stored` compares it against the
+    // TABLE row, which for an owned key differs by definition, so it would log a
+    // shadowed-change warning for a field this call never touched.
+    lfsThresholdBytes: folderOwned.has("lfsThresholdBytes") ? null : stored.lfsThresholdBytes,
+    // The three virtualization knobs (Story 56.12), which this call is not
+    // about and must therefore carry faithfully. The VM reports them as they
+    // are IN FORCE — `db::list_profiles` layers the folder's own config on
+    // before the view model is built — so the omission is what an owned key
+    // gets here too.
+    virtualPatterns: folderOwned.has("virtualPatterns") ? null : stored.virtualPatterns,
+    virtualOverBytes: folderOwned.has("virtualOverBytes") ? null : stored.virtualOverBytes,
+    releaseTtlMs: folderOwned.has("releaseTtlMs") ? null : stored.releaseTtlMs,
     settleMs: stored.settleMs,
     pollIntervalMs: stored.pollIntervalMs,
     tags: stored.tags,
     authorOverride: stored.authorOverride,
-    commitSubjectTemplate: stored.commitSubjectTemplate,
-    // The flags ride along unchanged. `notesSubfolder` is `null` for a folder
-    // that is not a vault, which is again the omission rather than a clear.
-    notes: stored.notes,
-    notesSubfolder: stored.notesSubfolder,
-    recordings: stored.recordings,
+    commitSubjectTemplate: folderOwned.has("commitSubjectTemplate")
+      ? null
+      : stored.commitSubjectTemplate,
+    // The flags ride along unchanged, on the same ownership rule.
+    // `notesSubfolder` is `null` for a folder that is not a vault, which is
+    // again the omission rather than a clear.
+    notes: folderOwned.has("notes") ? null : stored.notes,
+    notesSubfolder: folderOwned.has("notes") ? null : stored.notesSubfolder,
+    recordings: folderOwned.has("recordings") ? null : stored.recordings,
     // The one field this call is about. Sent verbatim: Rust trims whitespace and
     // otherwise refuses rather than corrects, and correcting it here would make
     // a save succeed against a folder nobody named.
     recordingsSubfolder: subfolder,
-    sessions: stored.sessions,
-    sessionsSubfolder: stored.sessionsSubfolder,
+    sessions: folderOwned.has("sessions") ? null : stored.sessions,
+    sessionsSubfolder: folderOwned.has("sessions") ? null : stored.sessionsSubfolder,
   });
 }
 
@@ -471,13 +504,16 @@ export async function syncProfileNow(id: string): Promise<SyncOutcomeVm> {
 }
 
 /**
- * Re-verify a profile against its recorded digests, then re-read the statuses.
- * Resolves the problems found — an empty array means everything checked out.
+ * Re-read a profile's tracked files, then re-read the statuses.
+ *
+ * Resolves the whole report, not just the faults: `checked` and `virtualPaths`
+ * are what let the caller say how much of the folder was looked at and how much
+ * of it is away on purpose. An empty `problems` means everything checked out.
  */
-export async function verifySyncProfile(id: string): Promise<string[]> {
-  const problems = await syncVerify(id);
+export async function verifySyncProfile(id: string): Promise<SyncVerifyVm> {
+  const report = await syncVerify(id);
   await refreshSyncStatuses();
-  return problems;
+  return report;
 }
 
 /**

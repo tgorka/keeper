@@ -38,7 +38,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+import type {
+  SyncDeviceVm,
+  SyncOutcomeVm,
+  SyncProfileVm,
+  SyncStatusVm,
+  SyncVerifyVm,
+} from "@/lib/ipc/client";
 // Read and written straight through rather than through the mirror store: the
 // device name is one app-global string nothing else changes, so mirroring it
 // would be a second source of truth for a value read once per open. Opening a
@@ -110,6 +116,29 @@ export const SYNC_VERIFY_LABEL = "Check files";
  */
 export const SYNC_VERIFY_CLEAN_SENTENCE =
   "Every file read cleanly, and every large file kept on this machine has its stored copy.";
+
+/**
+ * What the pass looked at, said before what it found (Story 56.12).
+ *
+ * The all-clear sentence below stops short of promising that every large file's
+ * copy is present, because since Epic 56 a folder may deliberately keep only
+ * the pointer for files its own policy authorizes to stay away. That is honest
+ * and it is also silent: "nothing was wrong" is what a folder with nothing in
+ * it reports too. These two numbers are what make the difference visible —
+ * `Engine::verify` has counted them since Story 56.6 and the IPC boundary threw
+ * them away until now.
+ *
+ * The excused count is left out entirely when it is zero rather than rendered
+ * as "0 kept away on purpose", following the folder footprint's rule: a
+ * quantity nobody has is not a fact worth a clause.
+ */
+export function syncVerifyCountSentence(checked: number, virtualPaths: number): string {
+  const read = `Read ${checked} file${checked === 1 ? "" : "s"}.`;
+  if (virtualPaths === 0) {
+    return read;
+  }
+  return `${read} ${virtualPaths} kept away on purpose.`;
+}
 
 /** Used only if Rust flagged attention without naming a reason. */
 export const SYNC_ATTENTION_FALLBACK_SENTENCE =
@@ -461,7 +490,12 @@ function SyncProfileRow({
    * leaves the status exactly as it was.
    */
   const [outcome, setOutcome] = useState<SyncOutcomeVm | null>(null);
-  const [problems, setProblems] = useState<string[] | null>(null);
+  /**
+   * The last check's whole report, or `null` before one has run. The faults
+   * alone were never enough to tell a clean pass from a pass that did not
+   * happen; the two counts beside them are (Story 56.12).
+   */
+  const [verified, setVerified] = useState<SyncVerifyVm | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   /**
    * Whether this row's configuration is open for editing. Per row, because the
@@ -588,7 +622,7 @@ function SyncProfileRow({
               disabled={busy}
               onClick={() => {
                 void run(async () => {
-                  setProblems(await verifySyncProfile(profile.id));
+                  setVerified(await verifySyncProfile(profile.id));
                 });
               }}
             >
@@ -597,18 +631,29 @@ function SyncProfileRow({
           </AlertAction>
         </Alert>
       )}
-      {problems !== null &&
-        (problems.length === 0 ? (
-          <p className="text-muted-foreground text-xs">{SYNC_VERIFY_CLEAN_SENTENCE}</p>
-        ) : (
-          <ul className="flex flex-col gap-0.5">
-            {problems.map((problem) => (
-              <li key={problem} className="text-destructive text-xs">
-                {problem}
-              </li>
-            ))}
-          </ul>
-        ))}
+      {verified !== null && (
+        <>
+          {/* What the pass looked at, before what it found. Story 56.6 taught
+              verify to excuse a path whose content is away on purpose, and
+              until now that excuse was invisible: the folder simply reported
+              nothing wrong, which is also what a check over an empty folder
+              reports. */}
+          <p className="text-muted-foreground text-xs">
+            {syncVerifyCountSentence(verified.checked, verified.virtualPaths)}
+          </p>
+          {verified.problems.length === 0 ? (
+            <p className="text-muted-foreground text-xs">{SYNC_VERIFY_CLEAN_SENTENCE}</p>
+          ) : (
+            <ul className="flex flex-col gap-0.5">
+              {verified.problems.map((problem) => (
+                <li key={problem} className="text-destructive text-xs">
+                  {problem}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
       {outcome !== null && (
         // Inline, in the row that was acted on, exactly where Check files
         // already reports what it found — nothing on the sync surfaces is

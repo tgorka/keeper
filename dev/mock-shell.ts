@@ -45,6 +45,10 @@ import type {
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
+  SyncFootprintVm,
+  SyncProfileReq,
+  SyncProfileVm,
+  SyncVerifyVm,
 } from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
@@ -1053,28 +1057,121 @@ const ANSWERS: Record<string, unknown> = {
     })),
     notices: [],
   },
-  // Deliberately NOT annotated `satisfies SyncProfileVm[]`: that type carries
-  // twenty fields and this row answers six. It is under-specified rather than
-  // wrong-shaped, which is the harmless failure — every consumer reads the six
-  // and the rest come back `undefined` — and filling in fourteen invented
-  // values to buy a type annotation would be a fixture that lies. The rule the
-  // Files listing above follows is the one worth keeping: annotate the shapes
-  // a consumer DEREFERENCES, because those are the ones that blank a window.
+  // Annotated `satisfies SyncProfileVm[]` since Story 56.12, which is a change
+  // of policy for this row and worth the sentence. It used to answer six of the
+  // twenty-odd fields on purpose, on the argument that under-specified is the
+  // harmless failure. That stopped being true the moment the folder settings
+  // form became reachable under the mock shell: it calls `profile.excludes
+  // .join`, and `undefined.join` blanks the whole window. The rule the Files
+  // listing follows — annotate the shapes a consumer DEREFERENCES — now applies
+  // here, and `satisfies` is what stops the next field added in Rust from
+  // quietly reintroducing the same white page.
   sync_profiles: [
     {
       id: "p1",
       name: "tgdrive",
       localPath: "/Volumes/merope/tgdrive",
       remoteUrl: "git@electra:tgdrive.git",
+      branch: "main",
+      direction: "bidirectional",
+      lane: "main",
+      subpaths: [],
+      excludes: ["*.tmp", ".DS_Store"],
+      removable: true,
+      lfsMode: "materialize",
+      lfsThresholdBytes: 4 * 1024 * 1024,
+      virtualPatterns: ["scans/**"],
+      virtualOverBytes: 8 * 1024 * 1024,
+      releaseTtlMs: 24 * 60 * 60 * 1000,
+      settleMs: null,
+      effectiveSettleMs: 10_000,
+      pollIntervalMs: null,
+      effectivePollIntervalMs: 15_000,
+      tags: [],
+      commitSubjectTemplate: "",
+      authorOverride: null,
       enabled: true,
+      notes: true,
+      notesSubfolder: "notes",
+      recordings: true,
       recordingsSubfolder: "recordings",
+      sessions: true,
+      sessionsSubfolder: "60-sessions",
+      folderOwned: [],
     },
+    {
+      // The second folder exists to make the owned-elsewhere marker reachable
+      // by hand: its `.keeper/keeper.toml` decides the virtualization policy,
+      // so opening its settings shows those controls disabled with the reason
+      // beside them, and a save from that form omits the keys.
+      id: "p2",
+      name: "neuradrive",
+      localPath: "/Volumes/merope/neuradrive",
+      remoteUrl: "git@electra:neuradrive.git",
+      branch: "main",
+      direction: "bidirectional",
+      lane: "main",
+      subpaths: [],
+      excludes: [],
+      removable: false,
+      lfsMode: "pointerOnly",
+      lfsThresholdBytes: 4 * 1024 * 1024,
+      virtualPatterns: ["raw/**", "!raw/keep-these/**"],
+      virtualOverBytes: 32 * 1024 * 1024,
+      releaseTtlMs: 0,
+      settleMs: null,
+      effectiveSettleMs: 5_000,
+      pollIntervalMs: null,
+      effectivePollIntervalMs: 15_000,
+      tags: [],
+      commitSubjectTemplate: "",
+      authorOverride: null,
+      enabled: true,
+      notes: false,
+      notesSubfolder: null,
+      recordings: false,
+      recordingsSubfolder: "recordings",
+      sessions: false,
+      sessionsSubfolder: "60-sessions",
+      folderOwned: ["releaseTtlMs", "virtualOverBytes", "virtualPatterns"],
+    },
+  ] satisfies SyncProfileVm[],
+  sync_statuses: [
+    { profileId: "p1", state: "idle", pending: 0, lastSyncMs: ago(3) },
+    { profileId: "p2", state: "idle", pending: 0, lastSyncMs: ago(41) },
   ],
-  sync_statuses: [{ profileId: "p1", state: "idle", pending: 0, lastSyncMs: ago(3) }],
   sync_problems: { profiles: [] },
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
   sync_device: { id: "01DEVICE", label: "hesperia" },
+  // No token stored for either folder. Without this the edit form's keychain
+  // read falls through to `fallback`, which answers `null` — the same answer,
+  // by accident rather than on purpose. Spelled out so the form's opening read
+  // is a fixture rather than a coincidence.
+  sync_get_credential: null,
   config_layers: { overrides: [], faults: [], mainFolder: null },
+  // The folder card's footprint sentence and the Check-files report, both of
+  // which used to fall through to `fallback` and render nothing at all under
+  // the mock shell — so the two surfaces Story 56.12 added counts to could not
+  // be looked at on Linux without a Tauri build.
+  sync_footprint: {
+    onDisk: 218_000_000_000n,
+    lfsCache: 91_000_000_000n,
+    reclaimable: 74_000_000_000n,
+    scratch: 1_400_000_000n,
+    content: 410_000_000_000n,
+    virtualPaths: 118,
+    materializedPaths: 3,
+    onDiskLabel: "218 GB",
+    lfsCacheLabel: "91 GB",
+    reclaimableLabel: "74 GB",
+    scratchLabel: "1.4 GB",
+    contentLabel: "410 GB",
+  } satisfies SyncFootprintVm,
+  sync_verify: {
+    checked: 1_284,
+    virtualPaths: 118,
+    problems: [],
+  } satisfies SyncVerifyVm,
   recording_settings_get: {
     codec: "hevc",
     fps: 60,
@@ -1344,6 +1441,73 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       ? FOLDER_MIGRATION
       : { needed: false, creates: [], rewrites: [], trashes: [] },
   sessions_migrate: () => null,
+  // The folder settings form's one write. Stateful, for the reason the two
+  // space writes below are: the flow being looked at is press Save, watch the
+  // form re-seed, and a shell that accepted the save and re-answered the old
+  // profile would make that flow look broken in exactly the way it is being
+  // looked at for.
+  //
+  // It merges the way `parse_req` does — every `Option` left `null` means "the
+  // caller did not express this", so the stored value stands — which is what
+  // makes the DW-116 property visible here rather than only in a Rust test. It
+  // also strips the keys the fixture's folder file owns, exactly as
+  // `profile::as_stored` does, so the second folder's controls demonstrate the
+  // revert they exist to prevent.
+  sync_profile_save: (payload) => {
+    const req = payload.req as SyncProfileReq;
+    const profiles = ANSWERS.sync_profiles as SyncProfileVm[];
+    // An add sends `id: null` and must APPEND. Falling back to `profiles[0]`
+    // for the shape while keeping a fresh id is what stops "Add folder" from
+    // renaming the first fixture folder, which is half the flow this handler
+    // exists to make inspectable.
+    const existing = profiles.find((candidate) => candidate.id === req.id);
+    const prior = existing ?? { ...profiles[0], id: `p${profiles.length + 1}`, folderOwned: [] };
+    const owned = new Set(prior.folderOwned);
+    const merged: SyncProfileVm = {
+      ...prior,
+      name: req.name,
+      localPath: req.localPath,
+      remoteUrl: req.remoteUrl,
+      branch: req.branch,
+      direction: req.direction,
+      lane: req.lane,
+      subpaths: req.subpaths,
+      excludes: req.excludes,
+      removable: req.removable,
+      lfsMode: req.lfsMode,
+      lfsThresholdBytes: req.lfsThresholdBytes ?? prior.lfsThresholdBytes,
+      virtualPatterns: req.virtualPatterns ?? prior.virtualPatterns,
+      virtualOverBytes: req.virtualOverBytes ?? prior.virtualOverBytes,
+      releaseTtlMs: req.releaseTtlMs ?? prior.releaseTtlMs,
+      settleMs: req.settleMs ?? prior.settleMs,
+      pollIntervalMs: req.pollIntervalMs ?? prior.pollIntervalMs,
+      tags: req.tags,
+      commitSubjectTemplate: req.commitSubjectTemplate ?? prior.commitSubjectTemplate,
+      authorOverride: req.authorOverride ?? prior.authorOverride,
+      notes: req.notes ?? prior.notes,
+      notesSubfolder: req.notesSubfolder ?? prior.notesSubfolder,
+      recordings: req.recordings ?? prior.recordings,
+      recordingsSubfolder: req.recordingsSubfolder ?? prior.recordingsSubfolder,
+      sessions: req.sessions ?? prior.sessions,
+      sessionsSubfolder: req.sessionsSubfolder ?? prior.sessionsSubfolder,
+    };
+    const stored: SyncProfileVm = {
+      ...merged,
+      virtualPatterns: owned.has("virtualPatterns")
+        ? prior.virtualPatterns
+        : merged.virtualPatterns,
+      virtualOverBytes: owned.has("virtualOverBytes")
+        ? prior.virtualOverBytes
+        : merged.virtualOverBytes,
+      releaseTtlMs: owned.has("releaseTtlMs") ? prior.releaseTtlMs : merged.releaseTtlMs,
+      excludes: owned.has("excludes") ? prior.excludes : merged.excludes,
+    };
+    ANSWERS.sync_profiles =
+      existing === undefined
+        ? [...profiles, stored]
+        : profiles.map((candidate) => (candidate.id === stored.id ? stored : candidate));
+    return stored;
+  },
   // The two space writes MUTATE the fixture rather than answering and forgetting.
   // A shell that accepted a save and then re-answered the old five would make
   // the editor look broken in exactly the way it is being looked at for — the

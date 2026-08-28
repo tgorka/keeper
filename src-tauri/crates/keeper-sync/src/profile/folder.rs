@@ -607,6 +607,50 @@ pub fn folder_config_is_faulted(local_path: &Path) -> bool {
     candidates.iter().any(|path| faults.contains_key(path))
 }
 
+/// The canonical profile keys this folder's own files currently set.
+///
+/// The **read**-side counterpart of [`as_stored`]'s strip: the same
+/// [`FolderOutcome::owned`] set, asked *before* a write rather than during one.
+/// [`as_stored`] can only put the prior value back and say so in a log line no
+/// user reads (AD-98 leaves it no other option — the table must never learn
+/// what the file said), so a surface with no way to ask this question offers an
+/// editable control, accepts the edit, reports success and silently reverts.
+/// With the question answerable, the surface can say *a file decides this*
+/// instead, disable the control, and never send the key at all — at which point
+/// the `tracing::warn!` never has to fire for a change somebody could see.
+///
+/// The keys are canonical camelCase [`SyncProfile`] field names — whatever
+/// [`super::canonical_key`] folds a file's spelling to — so they compare
+/// directly against the JSON a request carries. Only [`Allowed`] keys can ever
+/// appear: a layer that names an [`Identity`] or [`MachineLocal`] field is
+/// refused and dropped whole by [`FolderTier::apply`], so nothing it refused
+/// reaches this set.
+///
+/// This re-reads the folder's TOML layers, which [`in_force`] has already read
+/// on this profile's way out of [`crate::db::list_profiles`]. Cheap — two
+/// `read_to_string`s of a file the OS has cached — and deliberately not cached
+/// here, because the file can be edited under a running app: the two answers
+/// are "you may edit this" and "a file decides this", and a stale *permission*
+/// is the wrong direction to be wrong in.
+///
+/// Faults are not this function's business — [`folder_config_is_faulted`]
+/// answers that one. A layer that failed to parse sets nothing, so its keys are
+/// correctly absent here: the value in force came from the table, and the table
+/// is exactly what the surface may still edit.
+///
+/// The empty set when the tier is not armed, which is [`in_force`]'s own answer
+/// in that case: nothing is layered, so nothing is owned.
+///
+/// [`Allowed`]: FolderFieldRule::Allowed
+/// [`Identity`]: FolderFieldRule::Identity
+/// [`MachineLocal`]: FolderFieldRule::MachineLocal
+pub fn owned_fields(profile: &SyncProfile) -> BTreeSet<String> {
+    let Some(tier) = installed_folder_tier() else {
+        return BTreeSet::new();
+    };
+    tier.apply(profile).owned
+}
+
 /// One profile as it is **in force**: the stored row with its folder files
 /// layered on top.
 ///
@@ -1301,8 +1345,117 @@ subfolder = "60-sessions"
         assert!(!folder_config_is_faulted(&root));
     }
 
-    /// The tier is process-wide, so the five tests that arm it take a lock and
-    /// leave it disarmed behind them.
+    /// The read side of AD-98: a surface may ask which keys a file decides
+    /// *before* offering a control over them, rather than discovering it from a
+    /// log line after [`as_stored`] has quietly put the old value back.
+    #[test]
+    fn owned_fields_names_exactly_the_keys_a_folder_file_sets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(FOLDER_CONFIG_DIR)).expect("create .keeper");
+        std::fs::write(
+            root.join(FOLDER_CONFIG_DIR).join(SHARED_FILE),
+            "[folder]\nvirtualPatterns = [\"40-media/**\"]\nreleaseTtlMs = 3600000\n",
+        )
+        .expect("write");
+        let _tier = TierGuard::armed(tier());
+
+        let stored = profile(&root);
+        let expected: BTreeSet<String> = ["releaseTtlMs", "virtualPatterns"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            owned_fields(&stored),
+            expected,
+            "exactly the two the file set, and nothing the file was silent about"
+        );
+        assert_eq!(
+            in_force(stored).release_ttl_ms,
+            3_600_000,
+            "and the value the disabled control shows is the file's, because \
+             every read is already overlaid"
+        );
+    }
+
+    /// Two ways to own nothing, and they must not be confused: a folder with no
+    /// file, and a process where nothing is layered at all.
+    ///
+    /// The second is [`in_force`]'s own answer with the tier unarmed, and the
+    /// one `keeper-syncd` and every pre-tier caller sees.
+    #[test]
+    fn owned_fields_is_empty_with_no_file_and_with_no_tier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let stored = profile(&root);
+
+        let armed = TierGuard::armed(tier());
+        assert!(
+            owned_fields(&stored).is_empty(),
+            "a folder with no `.keeper/` file has nothing owned"
+        );
+        drop(armed);
+
+        let _disarmed = TierGuard::disarmed();
+        std::fs::create_dir_all(root.join(FOLDER_CONFIG_DIR)).expect("create .keeper");
+        std::fs::write(
+            root.join(FOLDER_CONFIG_DIR).join(SHARED_FILE),
+            "[folder]\nvirtualPatterns = [\"40-media/**\"]\n",
+        )
+        .expect("write");
+        assert!(
+            owned_fields(&stored).is_empty(),
+            "and with nothing layered nothing can be owned, however much the \
+             file says — the table is still the whole truth"
+        );
+    }
+
+    /// A key the overlay refused is not owned, and neither is the legal key
+    /// beside it: a layer is dropped **whole**, so nothing it named is in force
+    /// and everything it named is still the table's to edit.
+    ///
+    /// Two layers, because the refusal is per-file and the answer must say so —
+    /// a version that gave up on the first refusal would drop the machine
+    /// layer's honest `virtualPatterns` too, and disable a control the file has
+    /// no say over.
+    #[test]
+    fn owned_fields_never_names_a_key_the_overlay_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let config = root.join(FOLDER_CONFIG_DIR);
+        std::fs::create_dir_all(&config).expect("create .keeper");
+        std::fs::write(
+            config.join(SHARED_FILE),
+            "[folder]\nsettleMs = 9000\nvirtualOverBytes = 1048576\n",
+        )
+        .expect("write shared");
+        std::fs::write(
+            config.join("keeper.hesperia.toml"),
+            "[folder]\nvirtualPatterns = [\"40-media/**\"]\n",
+        )
+        .expect("write host");
+        let _tier = TierGuard::armed(tier());
+
+        let owned = owned_fields(&profile(&root));
+        assert!(
+            !owned.contains("settleMs"),
+            "a folder file may not set a machine-local key, so it cannot own \
+             one: {owned:?}"
+        );
+        assert!(
+            !owned.contains("virtualOverBytes"),
+            "nor the allowed key that shared its refused layer: {owned:?}"
+        );
+        let expected: BTreeSet<String> =
+            ["virtualPatterns"].into_iter().map(str::to_owned).collect();
+        assert_eq!(
+            owned, expected,
+            "and one refused file says nothing about the other"
+        );
+    }
+
+    /// The tier is process-wide, so every test that arms or disarms it takes a
+    /// lock and leaves it disarmed behind them.
     ///
     /// A guard rather than a call at the end of each test, for the reason every
     /// shared-global test suite eventually learns: a failing assertion unwinds

@@ -47,6 +47,28 @@ scratch: bigint,
  */
 content: bigint, 
 /**
+ * How many tracked paths are here as pointers rather than content, and how
+ * many of the large ones actually hold their bytes.
+ *
+ * The other half of `content`'s sentence directly above. That number is
+ * everything tracked at full size, fetched or not; these two say how much
+ * of it is on this machine and how much is deliberately not — which is the
+ * whole difference between a folder that looks mysteriously small and one
+ * that is visibly working the way it was configured to.
+ *
+ * Counts, not sizes, and that shows up twice. Neither gets a `*_label`:
+ * the rule that every size string is formatted in Rust exists because two
+ * formatters disagree about the same bytes, and a count has only one
+ * rendering. And both are annotated `number` where the five byte fields
+ * above are left bare — those are bare because the argument stated on
+ * `on_disk` is about SIZES, and because they were already crossing as
+ * `bigint` before that reading was written down. A count of paths in one
+ * folder is bounded by the number of files a person keeps in it, so
+ * `number` is the honest type for it, and it keeps this wire's two count
+ * pairs — these and [`SyncVerifyVm`]'s — spelled the same way.
+ */
+virtualPaths: number, materializedPaths: number, 
+/**
  * The same five numbers as people read them.
  *
  * Formatted here, by the one formatter, because a second one in TypeScript

@@ -58,6 +58,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
+    virtualPatterns: [],
+    virtualOverBytes: 0,
+    releaseTtlMs: 24 * 60 * 60 * 1000,
+    folderOwned: [],
     settleMs: null,
     effectiveSettleMs: 5_000,
     pollIntervalMs: null,
@@ -204,6 +208,9 @@ describe("actions", () => {
       removable: false,
       lfsMode: "materialize",
       lfsThresholdBytes: null,
+      virtualPatterns: null,
+      virtualOverBytes: null,
+      releaseTtlMs: null,
       settleMs: null,
       pollIntervalMs: null,
       tags: [],
@@ -239,6 +246,9 @@ describe("actions", () => {
         removable: false,
         lfsMode: "materialize",
         lfsThresholdBytes: null,
+        virtualPatterns: null,
+        virtualOverBytes: null,
+        releaseTtlMs: null,
         settleMs: null,
         pollIntervalMs: null,
         tags: [],
@@ -293,11 +303,18 @@ describe("actions", () => {
     expect(syncStore.getState().statuses.p1.line).toBe("tgdrive — up to date just now");
   });
 
-  it("verify resolves the problems found and refreshes the statuses", async () => {
+  it("verify resolves the whole report and refreshes the statuses", async () => {
     await ensureSyncHydrated();
-    mockVerify.mockResolvedValue(["notes/a.md: digest mismatch"]);
+    // The counts ride along with the faults (Story 56.12): a caller that only
+    // got the faults could not tell a clean pass from a pass over nothing.
+    const report = {
+      checked: 42,
+      virtualPaths: 7,
+      problems: ["notes/a.md: digest mismatch"],
+    };
+    mockVerify.mockResolvedValue(report);
 
-    await expect(verifySyncProfile("p1")).resolves.toEqual(["notes/a.md: digest mismatch"]);
+    await expect(verifySyncProfile("p1")).resolves.toEqual(report);
     expect(mockVerify).toHaveBeenCalledWith("p1");
     expect(mockStatuses).toHaveBeenCalledTimes(2);
   });

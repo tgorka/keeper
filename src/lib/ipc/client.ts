@@ -257,6 +257,7 @@ export type { SyncProfileVm } from "./gen/SyncProfileVm";
 export type { SyncProgressVm } from "./gen/SyncProgressVm";
 export type { SyncStatusVm } from "./gen/SyncStatusVm";
 export type { SyncUnspellableVm } from "./gen/SyncUnspellableVm";
+export type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
 export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 export type { TccPermission } from "./gen/TccPermission";
@@ -400,6 +401,7 @@ import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
 import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
+import type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
@@ -3107,15 +3109,23 @@ export async function syncFolderNow(id: string): Promise<SyncOutcomeVm> {
 }
 
 /**
- * Re-verify a profile's stored content against its recorded digests.
+ * Re-read a profile's tracked files and report what the pass found.
  *
- * Resolves the list of problems found, each as `"<path>: <reason>"`. An empty
- * array means everything checked out.
+ * NOT a digest comparison — keeper records no per-file hash. Each file is read
+ * and fails only if it changed under the read, and each large file's object
+ * must be present at its recorded size **except** where the folder's own
+ * virtual-file policy authorizes that content to stay away, which the pass
+ * counts rather than reports (Story 56.6).
+ *
+ * Resolves `checked` (how many files the pass read), `virtualPaths` (how many
+ * were excused on purpose) and `problems`, each still `"<path>: <reason>"`. An
+ * empty `problems` means everything checked out; the two counts are what stop a
+ * clean pass and a pass that never ran from rendering identically.
  *
  * Rejects with: `unsupported`, `internal`.
  */
-export async function syncVerify(id: string): Promise<string[]> {
-  return await invoke<string[]>("sync_verify", { id });
+export async function syncVerify(id: string): Promise<SyncVerifyVm> {
+  return await invoke<SyncVerifyVm>("sync_verify", { id });
 }
 
 /**

@@ -34,7 +34,7 @@ pub mod folder;
 
 pub use folder::{
     as_stored, folder_faults, folder_field_rule, in_force, install_folder_tier,
-    installed_folder_tier, FolderFault, FolderFieldRule, FolderOutcome, FolderTier,
+    installed_folder_tier, owned_fields, FolderFault, FolderFieldRule, FolderOutcome, FolderTier,
     FOLDER_CONFIG_DIR,
 };
 

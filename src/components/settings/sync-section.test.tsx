@@ -51,9 +51,11 @@ import {
   SYNC_REMOVE_CONFIRM_SENTENCE,
   SYNC_REMOVE_LABEL,
   SYNC_RESUME_LABEL,
+  SYNC_VERIFY_CLEAN_SENTENCE,
   SYNC_VERIFY_LABEL,
   SyncSection,
   syncRemoteHost,
+  syncVerifyCountSentence,
 } from "@/components/settings/sync-section";
 import {
   SYNC_ADD_SUBMIT_LABEL,
@@ -126,6 +128,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
+    virtualPatterns: [],
+    virtualOverBytes: 0,
+    releaseTtlMs: 24 * 60 * 60 * 1000,
+    folderOwned: [],
     settleMs: null,
     effectiveSettleMs: 5_000,
     pollIntervalMs: null,
@@ -406,12 +412,37 @@ describe("SyncSection needs-attention notice", () => {
     mockStatuses.mockResolvedValue([
       statusVm({ needsAttention: true, error: "content does not match" }),
     ]);
-    mockVerify.mockResolvedValue(["notes/a.md: digest mismatch"]);
+    mockVerify.mockResolvedValue({
+      checked: 1_284,
+      virtualPaths: 118,
+      problems: ["notes/a.md: digest mismatch"],
+    });
     render(<SyncSection open />);
     fireEvent.click(await screen.findByRole("button", { name: SYNC_VERIFY_LABEL }));
 
     expect(await screen.findByText("notes/a.md: digest mismatch")).toBeInTheDocument();
+    // What the pass looked at, beside what it found (Story 56.12).
+    expect(screen.getByText(syncVerifyCountSentence(1_284, 118))).toBeInTheDocument();
     expect(mockVerify).toHaveBeenCalledWith("p1");
+  });
+
+  it("says how many paths a clean check excused on purpose", async () => {
+    mockStatuses.mockResolvedValue([statusVm({ needsAttention: true, error: "have a look" })]);
+    mockVerify.mockResolvedValue({ checked: 12, virtualPaths: 5, problems: [] });
+    render(<SyncSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_VERIFY_LABEL }));
+
+    expect(await screen.findByText(SYNC_VERIFY_CLEAN_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByText("Read 12 files. 5 kept away on purpose.")).toBeInTheDocument();
+  });
+
+  it("leaves the excused clause out when the folder keeps nothing away", async () => {
+    mockStatuses.mockResolvedValue([statusVm({ needsAttention: true, error: "have a look" })]);
+    mockVerify.mockResolvedValue({ checked: 1, virtualPaths: 0, problems: [] });
+    render(<SyncSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: SYNC_VERIFY_LABEL }));
+
+    expect(await screen.findByText("Read 1 file.")).toBeInTheDocument();
   });
 
   it("does not render an alert for a healthy profile", async () => {
@@ -569,6 +600,12 @@ describe("SyncSection add-profile form", () => {
         removable: false,
         lfsMode: "materialize",
         lfsThresholdBytes: 4 * 1024 * 1024,
+        // Expressed as keeper's own answers for the same reason (Story 56.12):
+        // an empty patterns box is `[]`, which the policy reads as silence, and
+        // the two numbers are the documented no-floor and 24 h window.
+        virtualPatterns: [],
+        virtualOverBytes: 0,
+        releaseTtlMs: 24 * 60 * 60 * 1000,
         // An empty box means "keeper picks", and keeper's own number is how that
         // is spelled on the wire: `null` would be the omission Rust reads as
         // "leave whatever is stored" (AD-34-9), a different instruction.

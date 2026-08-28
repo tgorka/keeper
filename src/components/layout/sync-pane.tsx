@@ -335,6 +335,21 @@ function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactE
       : null,
     footprint.reclaimable > 0 ? `${footprint.reclaimableLabel} the server already has` : null,
     footprint.scratch > 0 ? `${footprint.scratchLabel} scratch` : null,
+    // The other half of `content`'s claim, and the only place a person can see
+    // the virtual-file policy doing anything (Story 56.12). `content` says what
+    // the folder weighs whether or not the bytes are here; these two say how
+    // much of that is here and how much is deliberately not. Both are counts of
+    // LFS paths — a file git stores directly has no state to report — and both
+    // are zero-suppressed on the rule directly above, so an ordinary folder's
+    // sentence is exactly as long as it was. The noun is carried by the FIRST
+    // clause so the pair reads as one fact — "118 large files kept away on
+    // purpose, 3 held here" — rather than as two counts of unstated things.
+    footprint.virtualPaths > 0
+      ? `${footprint.virtualPaths} large file${
+          footprint.virtualPaths === 1 ? "" : "s"
+        } kept away on purpose`
+      : null,
+    footprint.materializedPaths > 0 ? `${footprint.materializedPaths} held here` : null,
   ].filter((part): part is string => part !== null);
 
   return (
