@@ -4,6 +4,7 @@ type: 'bugfix'
 created: '2026-08-28'
 status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: 'f541f14'
+final_revision: 'f793551'
 review_loop_iteration: 0
 followup_review_recommended: true
 context: []
