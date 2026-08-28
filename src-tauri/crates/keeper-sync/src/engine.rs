@@ -1078,6 +1078,26 @@ impl Engine {
         git::repo::WalkPolicy::tracked_only()
     }
 
+    /// What the commit leg asks of its walk.
+    ///
+    /// Same arithmetic as [`Self::poll_walk_policy`] plus the one input that
+    /// matters here: this leg publishes untracked files, so it must not miss
+    /// one. The watcher is what makes skipping safe — a file that appears sets
+    /// the profile's wake, and a pass with no wake pending has nothing new for
+    /// a directory scan to find.
+    ///
+    /// Measured on the field folder: a pass that spent the scan reported
+    /// `elapsed_ms=9299355` — two and a half hours against a busy USB volume —
+    /// to find twelve modified files, which the index-only question answers in
+    /// under two seconds.
+    fn commit_walk_policy(&self, profile: &SyncProfile) -> git::repo::WalkPolicy {
+        if self.watch_wake_pending(&profile.id) {
+            Self::lock(&self.untracked_sweep).insert(profile.id.clone(), Instant::now());
+            return git::repo::WalkPolicy::full();
+        }
+        self.poll_walk_policy(&profile.id)
+    }
+
     /// Report a walk's progress on every item, for tests.
     ///
     /// The pacing is what keeps an idle folder from publishing a phase once a
@@ -4801,15 +4821,17 @@ impl Engine {
                 event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             };
-            // `full`: this leg holds the walk claim, and finding untracked
-            // files is what it exists to do. It is also the leg that must save
-            // the stats — a folder whose index carries none pays 25.4 GB of
-            // re-reads per pass until somebody writes them down.
+            // The directory scan is this leg's biggest single cost and it is not
+            // proportional to what changed: `find . -type f` over this folder's
+            // 157 490 files is 996 s, and a pass that spent it reported
+            // `elapsed_ms=9299355` — two and a half hours — for twelve modified
+            // files. `commit_walk_policy` spends it on the watcher's word, with
+            // no watcher to trust, or on the sweep cadence.
             git::repo::status_paths_reported(
                 &repo,
                 Some(&report),
                 self.walk_report_interval,
-                git::repo::WalkPolicy::full(),
+                self.commit_walk_policy(profile),
             )?
         };
         // The pass only got this far because those paths were stepped over, and
@@ -15629,6 +15651,53 @@ mod tests {
                 "pass {pass}: an unwatched folder has nothing else to trust"
             );
         }
+    }
+
+    /// The commit leg spends its directory scan on the watcher's word.
+    ///
+    /// It is the leg that publishes untracked files, so it may not miss one —
+    /// and the watcher is what makes skipping safe. The scan is what a pass
+    /// costs: `elapsed_ms=9299355` on the field folder, two and a half hours,
+    /// to report twelve modified files.
+    #[test]
+    fn the_commit_leg_scans_when_the_watcher_says_something_happened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx,
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::full(),
+            "the first pass after a start has to look for itself"
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "nothing has happened since, so the scan buys nothing"
+        );
+
+        engine.note_watch_wake(&p.id);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::full(),
+            "a wake means a file may have appeared, and only a scan finds it"
+        );
     }
 
     /// The tap is an observer: it sees what the drain saw, and its absence —
