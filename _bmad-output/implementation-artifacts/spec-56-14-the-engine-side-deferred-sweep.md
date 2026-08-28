@@ -2,9 +2,11 @@
 title: 'The engine-side deferred sweep'
 type: 'bugfix'
 created: '2026-08-28'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
-followup_review_recommended: false
+baseline_revision: '1016bef'
+final_revision: 'PENDING'
+followup_review_recommended: true
 context: []
 warnings: ['multiple-goals']
 ---
@@ -194,3 +196,38 @@ Nothing new. The two entries whose fix would have to land in `src-tauri/crates/k
 ## Spec Change Log
 
 ## Review Triage Log
+
+### 2026-08-28 — Review pass
+
+- intent_gap: 0
+- bad_spec: 0
+- patch: 11: (high 4, medium 4, low 3)
+- defer: 1: (low 1)
+- reject: 0
+- addressed_findings:
+  - `[high]` `[patch]` `note_local_authorship` was the one row-creating writer not taught to clear `released_at_ms`, and it is the ONLY writer that can reach a released row — content the owner puts back at a released path is not pointer text, so `pending_smudges` skips it and neither `remember_materialized` nor `observe_materialized` runs. The row stayed retired forever: bytes just authored were never a release candidate at any age, carried no schedule in a listing, and read to `materialized_paths` as content this machine does not have. Both reviewers found it independently, with a reproduction. `released_at_ms = NULL` added to its `DO UPDATE SET`, with the reasoning in its doc.
+  - `[high]` `[patch]` `observe_materialized` wrote no `oid` or `size_bytes` although the already-held arm is holding the committed pointer. `release_path_gate` reads `row.size_bytes.unwrap_or(u64::MAX)` against a `size < over_bytes` floor, so a NULL-size row cleared **any** `virtualOverBytes` floor — releasing exactly the small file a person had just named — contributed nothing to `RELEASE_BUDGET_BYTES`, and made `release_schedules` compute a countdown against a size nobody measured. The identity is now written on both arms.
+  - `[high]` `[patch]` `lfs::stage::materialize` raised on a raced target, which escaped `materialize_pending`'s loop, was captured by `sync_once` as `arrival_fault`, **failed the whole pass** and skipped `mark_synced` — so one file being saved during a sync abandoned every remaining publish, reported a failed sync, and left the release window unarmed. Replaced with `Published::{Content, TargetMoved}`: the two sweeps `continue` past it, as their own two sibling `continue`s already do for the same discovery, and the request door answers `ContentRefusal::LocallyModified`, which is what `hydrate::plan` would have said an instant later. Found by self-review before the reviewers reported; both confirmed the mechanism.
+  - `[high]` `[patch]` `clean`'s new pre-open `symlink_metadata` refused a symlink to a REGULAR file, which `File::open` has always followed — so `republish_missing_objects` reported an object unrecoverable, "those bytes exist on some other machine or nowhere", for a file sitting behind a link on another volume. The stat now asks twice: what is at the path, and, when that is a link, what it leads to. A link to a FIFO is still refused, by the second answer.
+  - `[medium]` `[patch]` `materialize`'s new staging cleanup did not cover the `fs::copy` failure — the one that leaves the LARGEST partial file — because an early `?` returned before the cleanup block. An `ENOSPC` part-way through a multi-gigabyte object left a junk `.keeper.*.tmp` in the owner's folder on the very failure where they can least afford the space, and `exclude.rs` keeps it out of every commit so nothing ever collected it. The copy is now inside the same fallible block.
+  - `[medium]` `[patch]` `browse::classify`'s new disjunction let `replacing: true` short-circuit past the worktree probe, so a `None` probe — a directory, or a path with no file at all — reached `Materializing`. The ledger row outliving the file is the ordinary case, so a deleted-but-ledgered path with a queued download would have read "this content is arriving" forever, over a file `materialize` now declines to publish on every pass. The rung requires the probe to have answered.
+  - `[medium]` `[patch]` `remote_serves`' filesystem fallback fired on ANY `lfs_access` error, including `Auth` and `Network` — so a release could proceed on a removable drive's word about a named server that was merely down, and AD-48 treats an absent drive as never a failure, leaving the content on neither. Narrowed to `SyncError::Config`, the class `endpoint::derive` raises when no endpoint can exist for that remote at all.
+  - `[medium]` `[patch]` The reclaimed-bytes figure read `nlink` from an `lstat` taken before a whole-file hash, a network round trip and the `/proc` walk. Re-stated from a fresh stat beside the second pin read, falling back to the earlier answer rather than refusing a release every guard has already permitted.
+  - `[low]` `[patch]` `clean`'s doc claimed the post-open `fstat` "closes the window" in which a regular file is replaced by a FIFO. It cannot: the `fstat` is on the already-opened handle, so it cannot run until the blocking `open` returns. Corrected to say the window is narrowed from "always" to "a few microseconds", and to record that closing it needs `O_NONBLOCK`, which needs `libc`, which this crate does not carry and its `deny(unsafe_code)` posture argues against.
+  - `[low]` `[patch]` `clean`'s doc named `republish_missing_objects` as its sole caller; `stage::prepare` also calls it. Both are named now, with which one the refusal is load-bearing for — that omission is what let the symlink case go unconsidered.
+  - `[low]` `[patch]` `forget_materialized`'s doc claimed the retained rows are "bounded by the folder, not by time". False: nothing prunes a released row, so a path deleted or renamed upstream leaves its row forever and the bound is paths-ever-hydrated. The doc now states the real bound and says a prune is a decision rather than an edit.
+  - `[low]` `[defer]` A prune for released `materialized` rows. Recorded in `deferred-work.md` against this spec.
+
+Two findings were considered and NOT changed, with the argument recorded rather than
+the code:
+
+- `Release::size_bytes` now carrying "bytes reclaimed" means a hard-linked release emits
+  `{"outcome": "released", "sizeBytes": 0}`, and `keeper-syncd`'s `already_pointer_json`
+  doc reserves a zero size for "nothing was released". The two documents remain
+  distinguishable by `outcome`, which is the field a consumer must branch on either way,
+  and a consumer totalling RECLAIMED bytes wants the zero. The field's own doc has always
+  said "the bytes this machine no longer holds"; what changed is that it is now true. The
+  surface half of story 56.14 documents the `0 B` line in `docs/sync.md` §13 explicitly.
+- The residual blocking-in-async in `release_resolved` — the index open and parse, the
+  `lstat`, and the `/proc` walk — is unchanged and is recorded as such in the ledger. Only
+  the whole-file hash was moved, because only it is bounded by the size of the user's file.

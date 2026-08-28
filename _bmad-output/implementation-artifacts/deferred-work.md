@@ -4802,3 +4802,23 @@ status: open
 
     It becomes worth doing at the next deliberate `--json` version bump, where every field
     can be renamed at once behind one documented break.
+
+- source_spec: `spec-56-14-the-engine-side-deferred-sweep.md`
+  summary: Nothing prunes a released `materialized` row, so the ledger grows with every path a profile has ever hydrated rather than with the paths its cone holds.
+  evidence: Story 56.14 made `db::forget_materialized` retain the row and stamp `released_at_ms` instead of deleting it, so the recency history the release clocks reason with survives a release. There is no `DELETE FROM materialized` anywhere in the crate (grep), so a path deleted or renamed upstream leaves its released row behind forever: the bound is paths-ever-hydrated, which for a folder with renames, dated exports or a rolling archive grows with time and not with the folder. Both filtered readers (`materialized_paths`, `materialized_rows`) stay correct and index-ranged, and `is_pinned` is a single-row lookup, so the cost is disk rather than time. Found by story 56.14's own review pass, which caught the `keep`'s original claim that the growth was "bounded by the folder, not by time" — that sentence has been corrected to state the real bound.
+  status: open
+  keep: |
+    Not fixed here because the rule is a decision rather than an edit: a released row is
+    worth keeping precisely so that a re-materialization inherits its clocks, so a prune has
+    to name an age past which that no longer matters — some multiple of the folder's
+    `releaseTtlMs`, which is itself per-folder and can be switched off — and it has to know
+    the path is gone upstream, which is an index read the ledger layer deliberately cannot
+    do.
+
+    It becomes worth doing when a real profile's `materialized` table is measured large
+    enough to matter, or when `sync.db` size is reported as a complaint. The shape at that
+    point is a `db::prune_released(conn, profile_id, before_ms)` called from the same sweep
+    that already holds the profile's reservation and already has the index open, so the
+    "is it still tracked" question costs nothing extra there and cannot be asked cheaply
+    anywhere else.
+

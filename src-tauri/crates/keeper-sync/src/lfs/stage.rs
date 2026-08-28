@@ -751,31 +751,56 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
 /// straight into the store's staging area. Nothing is ever fully buffered,
 /// which is the whole point.
 ///
-/// # It refuses anything that is not a regular file, before it opens it
+/// # It refuses anything that does not lead to a regular file, before it opens it
 ///
 /// Story 56.14. `File::open` on a FIFO with no writer **blocks forever**, with
 /// no timeout std can offer — `copy::describe_kind` records the same hazard
 /// beside `copy::classify`'s `!meta.is_file()` refusal, which is the precedent
-/// this mirrors. The sole production caller,
-/// `Engine::republish_missing_objects`, reaches here for any path whose
-/// worktree file is not the pointer for the object it is repairing, and a FIFO,
-/// a socket or a device node standing at that path is one of those. Hanging is
-/// the worst possible answer: the repair pass holds nothing back for it and the
-/// process never returns.
+/// this mirrors. Two callers reach here. [`prepare`] filters
+/// `!metadata.is_file()` itself before it ever calls this, so the refusal is
+/// dead code there; `Engine::republish_missing_objects` does not, and reaches
+/// here for any path whose worktree file is not the pointer for the object it
+/// is repairing — a FIFO, a socket or a device node standing at that path is
+/// one of those. Hanging is the worst possible answer: the repair pass holds
+/// the profile's reservation and the process never returns.
 ///
-/// `symlink_metadata`, so the refusal is about what is AT the path and not
-/// about what a link points at, and then `file.metadata()` — an `fstat` on the
-/// handle that was actually opened — closes the window in which the regular
-/// file that was there is replaced by something else between the two calls.
-/// That second check is free: the length was already being read from it.
+/// **A symlink is FOLLOWED, deliberately.** `File::open` has always followed
+/// one, so a path whose content lives on another volume behind a link is
+/// content `republish_missing_objects` has always been able to rebuild an
+/// object from, and refusing it on the strength of the `lstat` alone would
+/// report that object unrecoverable — "those bytes exist on some other machine
+/// or nowhere" — about a file sitting right there. So the question is asked
+/// twice: what is at the path, and, when that is a link, what it leads to. A
+/// link to a FIFO is refused by the second answer.
+///
+/// **The window is narrowed, not closed.** A regular file replaced by a FIFO
+/// between the `stat` and the `open` still blocks: `file.metadata()` is an
+/// `fstat` on the already-opened handle, so it cannot run until the `open`
+/// returns. Closing it needs `O_NONBLOCK`, which needs the constant, which
+/// needs `libc` — a dependency this crate does not carry and which its
+/// `deny(unsafe_code)` posture argues against. What the pre-open stat buys is
+/// the difference between "a FIFO standing at the path hangs the repair pass,
+/// always" and "a FIFO substituted inside a few microseconds does", and the
+/// second check catches every substitution that loses that race.
 pub fn clean(store: &LfsStore, absolute: &Path) -> Result<Pointer> {
-    let kind = std::fs::symlink_metadata(absolute)
+    let at_path = std::fs::symlink_metadata(absolute)
         .map_err(|err| SyncError::io("stat for LFS staging", absolute, err))?;
-    if !kind.is_file() {
+    // The second question, and only for a link: `metadata` follows, which is
+    // what `File::open` below is about to do anyway.
+    let followed = if at_path.is_symlink() {
+        Some(
+            std::fs::metadata(absolute)
+                .map_err(|err| SyncError::io("stat what a link leads to", absolute, err))?,
+        )
+    } else {
+        None
+    };
+    let leads_to = followed.as_ref().unwrap_or(&at_path);
+    if !leads_to.is_file() {
         return Err(SyncError::Integrity {
             subject: absolute.to_string_lossy().into_owned(),
             expected: "a regular file".to_owned(),
-            actual: crate::copy::describe_kind(&kind).to_owned(),
+            actual: crate::copy::describe_kind(leads_to).to_owned(),
         });
     }
     let file = std::fs::File::open(absolute)
@@ -1598,7 +1623,7 @@ pub fn pending_smudges(root: &Path, tracked: &[PathBuf]) -> Result<Vec<PendingSm
 /// and starves the journal drain — a folder that reads "Idle · 95 waiting to
 /// sync" while nothing whatsoever can run. Carrying the mode over keeps the
 /// entry clean, and the walk stat-clean with it.
-pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<()> {
+pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<Published> {
     let oid = &smudge.pointer.oid;
     if !store.contains(oid, smudge.pointer.size) {
         return Err(SyncError::Integrity {
@@ -1614,16 +1639,24 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
     let mode = std::fs::symlink_metadata(&target)
         .map(|metadata| metadata.permissions())
         .ok();
-    std::fs::copy(store.object_path(oid), &staging)
-        .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))?;
-    // Applied to the staging file, so the published path never exists with the
-    // wrong mode — the same reason the copy is staged at all.
-    let staged = if let Some(mode) = mode {
-        std::fs::set_permissions(&staging, mode)
-            .map_err(|err| SyncError::io("carry the pointer's mode over", staging.clone(), err))
-    } else {
-        Ok(())
-    };
+    // Inside the fallible block, not ahead of it: an `ENOSPC` or an `EIO`
+    // part-way through a multi-gigabyte copy is the failure that leaves the
+    // LARGEST partial file, and an early `?` here would have skipped the
+    // cleanup below and left it in the owner's folder — where nothing collects
+    // it, because `exclude.rs` keeps `.keeper.*.tmp` out of every commit and
+    // out of the watcher.
+    let staged = std::fs::copy(store.object_path(oid), &staging)
+        .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))
+        .and_then(|_| {
+            // Applied to the staging file, so the published path never exists
+            // with the wrong mode — the same reason the copy is staged at all.
+            match mode {
+                Some(mode) => std::fs::set_permissions(&staging, mode).map_err(|err| {
+                    SyncError::io("carry the pointer's mode over", staging.clone(), err)
+                }),
+                None => Ok(()),
+            }
+        });
     // The decision is re-stated here, against the file as it is one instant
     // before the rename (Story 56.14).
     //
@@ -1645,29 +1678,76 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
     // stronger than an mtime/inode sample — a same-length pointer-text
     // rewrite with a preserved mtime fails it.
     let published = staged.and_then(|()| {
-        let now = std::fs::symlink_metadata(&target).map_err(|err| {
-            SyncError::io("re-stat before publishing content", target.clone(), err)
-        })?;
+        let now = match std::fs::symlink_metadata(&target) {
+            Ok(now) => now,
+            // The file is not there at all any more. A deletion, which is one
+            // of the two shapes of [`Published::TargetMoved`] — see its doc for
+            // why neither is an error. An I/O failure on the `lstat` IS one.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Published::TargetMoved);
+            }
+            Err(err) => {
+                return Err(SyncError::io(
+                    "re-stat before publishing content",
+                    target.clone(),
+                    err,
+                ));
+            }
+        };
         let holds_it = read_worktree_pointer(&target, &now)
             .map_err(|err| SyncError::io("re-read before publishing content", target.clone(), err))?
             .is_some_and(|found| found.oid == *oid);
         if !holds_it {
-            return Err(SyncError::Integrity {
-                subject: target.to_string_lossy().into_owned(),
-                expected: format!("the committed pointer for {oid}"),
-                actual: "something else, written since keeper decided to publish here".to_owned(),
-            });
+            return Ok(Published::TargetMoved);
         }
         std::fs::rename(&staging, &target)
-            .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))
+            .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))?;
+        Ok(Published::Content)
     });
-    // A refusal must not leave a `.keeper.*.tmp` beside the user's file for a
-    // human to find: `files_write::write_unmanaged`'s precedent, and the one
-    // `dehydrate` already follows.
-    if published.is_err() {
+    // Neither a refusal nor an error may leave a `.keeper.*.tmp` beside the
+    // user's file for a human to find: `files_write::write_unmanaged`'s
+    // precedent, and the one `dehydrate` already follows.
+    if !matches!(published, Ok(Published::Content)) {
         let _ = std::fs::remove_file(&staging);
     }
     published
+}
+
+/// What [`materialize`] did, when it did not fail.
+///
+/// # Why the raced target is an outcome and not an error (Story 56.14)
+///
+/// Because two of `materialize`'s three callers are SWEEPS, and for a sweep
+/// "this path is not the committed pointer any more" is not a failure — it is
+/// the ordinary discovery the loop is built to make, arriving a few
+/// milliseconds later than usual. `Engine::materialize_pending`'s loop already
+/// `continue`s past exactly this fact twice, in its own words: *"Not a pointer
+/// any more: another arm materialized it, or the file has been replaced since
+/// the row was queued"* and *"the pointer in the worktree names a different
+/// object than the one that landed"*. A third spelling of the same discovery
+/// must land on the same rung.
+///
+/// Raising instead was measured and rejected: `materialize_pending`'s error
+/// escapes the loop, `Engine::sync_once` captures it as `arrival_fault` and
+/// **fails the whole pass**, which skips `mark_synced` — so one file being
+/// saved during a sync would abandon every remaining publish, report a failed
+/// sync, and leave the release window unarmed and `last_sync_ms` unmoved.
+/// Telling somebody their folder failed to sync because they pressed save is
+/// the class of lie this story exists to remove, not one to add.
+///
+/// The request door does the opposite and must: `Engine::materialize_held`
+/// turns this into `ContentRefusal::LocallyModified`, which is exactly what
+/// [`super::hydrate::plan`] would have answered had it looked an instant later,
+/// and exactly what a person who asked for one file needs to hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// The object's bytes are at the path now.
+    Content,
+    /// Nothing was written, and nothing is wrong. Between the caller's decision
+    /// and the `rename(2)` the target stopped holding the committed pointer —
+    /// it was edited, replaced, or deleted — so publishing over it would have
+    /// destroyed whatever is there.
+    TargetMoved,
 }
 
 /// The sibling path content is staged at before a `rename(2)` publishes it.
@@ -1992,7 +2072,7 @@ mod tests {
             .collect()
     }
 
-    /// `materialize` refuses a target that no longer holds the committed
+    /// `materialize` declines a target that no longer holds the committed
     /// pointer, and leaves the bytes standing there alone.
     ///
     /// Every production caller — `hydrate::plan`'s `Publish` arm and
@@ -2005,6 +2085,10 @@ mod tests {
     /// The planted content is the pointer text's own length, so no length
     /// comparison can refuse it. Without the fix `materialize` renames the
     /// object over those bytes and the user's file is gone.
+    ///
+    /// `Published::TargetMoved` rather than an `Err`, because two of the three
+    /// callers are sweeps for which this is the ordinary discovery and not a
+    /// failure — see that variant's own doc for what raising here cost.
     #[test]
     fn a_target_that_no_longer_holds_the_committed_pointer_is_never_published_over() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2025,12 +2109,10 @@ mod tests {
         let target = root.join("clip.mp4");
         std::fs::write(&target, &saved).expect("the save that landed in the window");
 
-        let err = materialize(&store, root, &smudge)
-            .expect_err("the target does not hold the pointer any more");
-        assert!(
-            matches!(err, SyncError::Integrity { .. }),
-            "got: {err} — publishing over an unrelated file is an integrity \
-             failure, not a retryable io fault"
+        assert_eq!(
+            materialize(&store, root, &smudge).expect("declining is not a failure"),
+            Published::TargetMoved,
+            "the target does not hold the pointer any more, so nothing was written"
         );
         assert_eq!(
             std::fs::read(&target).expect("read"),
@@ -2044,7 +2126,7 @@ mod tests {
         );
     }
 
-    /// `materialize` refuses a target deleted since the decision, and creates
+    /// `materialize` declines a target deleted since the decision, and creates
     /// nothing.
     ///
     /// The other half of the same window. Without the fix the `rename(2)`
@@ -2066,17 +2148,10 @@ mod tests {
         };
         let target = root.join("clip.mp4");
 
-        let err = materialize(&store, root, &smudge)
-            .expect_err("there is nothing at the target to publish over");
-        assert!(
-            matches!(
-                err,
-                SyncError::Io {
-                    operation: "re-stat before publishing content",
-                    ..
-                }
-            ),
-            "got: {err} — the refusal must name the re-stat that caught it"
+        assert_eq!(
+            materialize(&store, root, &smudge).expect("declining is not a failure"),
+            Published::TargetMoved,
+            "there is nothing at the target to publish over"
         );
         assert!(
             !target.exists(),

@@ -1208,15 +1208,29 @@ fn classify(
         // Either fact confirms the row names this path, which is the whole job
         // of the conjunction — and `replacing` is free, so it is asked first
         // and can spare the probe its `open`.
+        // `replacing` widens the rung from "the worktree holds pointer text" to
+        // "the worktree holds pointer text OR the ledger says this machine holds
+        // content for this path". It does NOT remove the rung's precondition
+        // that there be a readable regular file to have an opinion about: a
+        // `None` probe means the path is a directory, or is not there at all —
+        // and the ledger row outliving the file is the ordinary case, so a
+        // deleted-but-ledgered path with a queued download would otherwise read
+        // "this content is arriving" forever, over a file `materialize` will
+        // decline to publish on every pass (`Published::TargetMoved`).
+        let bytes = if matches!(reason, Some(PendingReason::Incoming { .. })) {
+            worktree_bytes()
+        } else {
+            None
+        };
         if in_repository
-            && matches!(reason, Some(PendingReason::Incoming { .. }))
+            && bytes.is_some()
             && (matches!(
                 reason,
                 Some(PendingReason::Incoming {
                     replacing: true,
                     ..
                 })
-            ) || worktree_bytes() == Some(true))
+            ) || bytes == Some(true))
         {
             return EntrySyncStatus::Materializing;
         }

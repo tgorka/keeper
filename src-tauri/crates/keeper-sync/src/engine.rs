@@ -6128,7 +6128,16 @@ impl Engine {
                 // it now needs.
                 continue;
             }
-            lfs::stage::materialize(store, &profile.local_path, &smudge)?;
+            // Nothing was written because the target stopped holding the
+            // committed pointer while the copy ran — the same discovery the
+            // `store.contains` arm above makes, arriving a moment later, and
+            // the same answer: the sweep owns it and the next pass reconsiders
+            // the path. No ledger row either, because no content landed.
+            if lfs::stage::materialize(store, &profile.local_path, &smudge)?
+                == lfs::stage::Published::TargetMoved
+            {
+                continue;
+            }
             // The one moment this is knowable: content for this path now exists
             // here, so the next object for it is a replacement rather than an
             // arrival.
@@ -6306,7 +6315,17 @@ impl Engine {
                 if profile.lfs_mode == LfsMode::PointerOnly {
                     continue;
                 }
-                lfs::stage::materialize(store, &profile.local_path, smudge)?;
+                // Nothing was written because the target stopped holding the
+                // committed pointer while the copy ran. The loop's own two
+                // earlier `continue`s make the same discovery from the scan; a
+                // third spelling of it belongs on the same rung, and raising
+                // here would fail the whole pass — see
+                // `lfs::stage::Published::TargetMoved` for the measurement.
+                if lfs::stage::materialize(store, &profile.local_path, smudge)?
+                    == lfs::stage::Published::TargetMoved
+                {
+                    continue;
+                }
                 // The one moment this is knowable: content for this path now
                 // exists here, so the next object for it is a replacement
                 // rather than an arrival.
@@ -7309,32 +7328,44 @@ impl Engine {
             // objects are in that directory and asking it is the honest answer
             // (Story 56.14).
             //
-            // Reachable exactly when a filesystem remote also carries a
-            // committed `.lfsconfig` that does not name a usable `lfs.url` —
-            // the file wins over the shape of the remote URL by design, which
-            // sent this profile past the branch above, and then
-            // `endpoint::derive` refuses a local path outright. The
-            // consequence was a folder that could never release anything at
-            // all: every candidate refused `UnprovenOnRemote` forever, on every
-            // pass, having already paid a whole-file hash to get here.
+            // Reachable when a filesystem remote also carries a committed
+            // `.lfsconfig` that does not name a usable `lfs.url` — the file
+            // wins over the shape of the remote URL by design, which sent this
+            // profile past the branch above, and then `endpoint::derive`
+            // refuses a local path outright. The consequence was a folder that
+            // could never release anything at all: every candidate refused
+            // `UnprovenOnRemote` forever, on every pass, having already paid a
+            // whole-file hash to get here.
             //
             // The precedence is unchanged — the named server is still asked
             // first and its answer still decides. This is the fallback for
             // there being no server to ask, and it is fail-closed the same way:
             // a store that does not hold the object at this size keeps the
             // local copy.
+            //
+            // `SyncError::Config` and nothing else, because that is the class
+            // `endpoint::derive` raises for a remote from which no endpoint can
+            // be DERIVED — the dead end this exists for. An `Auth`, a
+            // `Forbidden` or a `Network` means a real server was named and
+            // could not be asked, and answering those from a directory would
+            // let a release proceed on a removable drive's word about a server
+            // that is merely down; AD-48 treats an absent drive as never a
+            // failure, so the content could end up on neither.
             Err(err) => {
-                if let Some(store) = lfs::local::remote_store(&profile.remote_url) {
-                    let held = store.contains(oid, size);
-                    tracing::warn!(
-                        profile = profile.name,
-                        oid,
-                        error = %err,
-                        held,
-                        "this folder's `.lfsconfig` names no LFS server keeper can address, so \
-                         the filesystem remote's own object store was asked instead"
-                    );
-                    return held;
+                let no_endpoint_can_exist = matches!(err, SyncError::Config(_));
+                if no_endpoint_can_exist {
+                    if let Some(store) = lfs::local::remote_store(&profile.remote_url) {
+                        let held = store.contains(oid, size);
+                        tracing::warn!(
+                            profile = profile.name,
+                            oid,
+                            error = %err,
+                            held,
+                            "this folder's `.lfsconfig` names no LFS server keeper can address, \
+                             so the filesystem remote's own object store was asked instead"
+                        );
+                        return held;
+                    }
                 }
                 tracing::warn!(
                     profile = profile.name,
@@ -7688,9 +7719,16 @@ impl Engine {
                 // that has already succeeded because a memo failed would be the
                 // worse answer.
                 let now = self.platform.now_ms();
-                if let Err(err) =
-                    self.with_db(|conn| db::observe_materialized(conn, &profile.id, &path, now))
-                {
+                if let Err(err) = self.with_db(|conn| {
+                    db::observe_materialized(
+                        conn,
+                        &profile.id,
+                        &path,
+                        now,
+                        &indexed.oid,
+                        indexed.size,
+                    )
+                }) {
                     tracing::warn!(
                         profile = profile.name,
                         path = path,
@@ -7782,7 +7820,16 @@ impl Engine {
         event.current = Some(path.clone());
         self.publish(event);
 
-        lfs::stage::materialize(&store, &profile.local_path, &smudge)?;
+        // The request door's answer is the opposite of the sweeps' (see
+        // `lfs::stage::Published::TargetMoved`): a person asked for ONE file,
+        // and the honest reply is the one `lfs::hydrate::plan` would have given
+        // had it looked an instant later — the path does not hold the pointer
+        // this folder committed, so keeper will not overwrite what is there.
+        if lfs::stage::materialize(&store, &profile.local_path, &smudge)?
+            == lfs::stage::Published::TargetMoved
+        {
+            return Err(SyncError::Refused(ContentRefusal::LocallyModified { path }));
+        }
         // The one moment this is knowable: content for this path now exists
         // here, so the next object for it is a replacement rather than an
         // arrival.
@@ -8393,10 +8440,19 @@ impl Engine {
         // Not a guard: refusing a hard-linked path would be a new refusal for a
         // request that succeeds, and nothing in the guard chain has ever read
         // the link count. Only the figure changes, to the one that is true.
+        // Re-stated here rather than read off the `lstat` above, which was
+        // taken before a whole-file hash, a network round trip and the `/proc`
+        // walk: a link created or removed in those seconds would make the figure
+        // wrong in either direction. Beside the second pin read, for its reason
+        // — nothing between this and the deletion. A failure to re-stat falls
+        // back to the earlier answer rather than refusing a release that every
+        // guard has already permitted.
         #[cfg(unix)]
         let reclaimed = {
             use std::os::unix::fs::MetadataExt as _;
-            if metadata.nlink() > 1 {
+            let fresh = std::fs::symlink_metadata(&absolute);
+            let links = fresh.as_ref().unwrap_or(&metadata).nlink();
+            if links > 1 {
                 tracing::info!(
                     profile = profile.name,
                     path = path,

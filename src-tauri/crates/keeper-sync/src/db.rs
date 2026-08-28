@@ -629,6 +629,25 @@ pub fn remember_materialized(
 /// It clears `released_at_ms` for [`remember_materialized`]'s reason — the
 /// content is here, and that column says it is not.
 ///
+/// # It writes the identity, because the caller is holding the pointer
+///
+/// `oid` and `size_bytes` on both arms, from the committed pointer the
+/// already-held arm looked up to get here — the same fact [`note_arrival`] and
+/// [`note_local_authorship`] record for the same reason, and this is the third
+/// moment the pointer is in hand.
+///
+/// Not optional bookkeeping. `Engine::release_expired` hands
+/// `row.size_bytes.unwrap_or(u64::MAX)` to `release_path_gate`, whose floor is
+/// `size < over_bytes`, so a row with a `NULL` size clears **any**
+/// `virtualOverBytes` floor — a folder that keeps small files materialized on
+/// purpose would release the 2 MB file a person had just explicitly asked for.
+/// A `NULL` size also contributes nothing to `RELEASE_BUDGET_BYTES`, so one
+/// pass could release `RELEASE_BUDGET_OBJECTS` files of any size while holding
+/// the profile's reservation, which is exactly the residual
+/// [`note_arrival`]'s doc says these columns exist to bound. And
+/// `Engine::release_schedules` resolves the same row, so a Files-pane countdown
+/// would be computed against a size nobody measured.
+///
 /// It does not touch `local_origin`, so an inserted row reads `NULL` — *arrived
 /// from the remote*. That is the honest default and the safe one: it selects
 /// the `last_used_ms` clock, which this call has just set to now, and nothing
@@ -641,13 +660,24 @@ pub fn observe_materialized(
     profile_id: &str,
     path: &str,
     now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO materialized (profile_id, path, at_ms, last_used_ms)
-         VALUES (?1, ?2, ?3, ?3)
+        "INSERT INTO materialized
+             (profile_id, path, at_ms, last_used_ms, oid, size_bytes)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5)
          ON CONFLICT(profile_id, path)
-         DO UPDATE SET last_used_ms = excluded.last_used_ms, released_at_ms = NULL",
-        (profile_id, path, now_ms),
+         DO UPDATE SET last_used_ms = excluded.last_used_ms,
+                       oid = excluded.oid, size_bytes = excluded.size_bytes,
+                       released_at_ms = NULL",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
     )?;
     Ok(())
 }
@@ -764,6 +794,19 @@ pub fn note_arrival(
 /// written a row. `at_ms` is honest on insert: content for this path does exist
 /// on this machine, that is precisely why there is something to upload. It
 /// never touches `pinned` or `last_used_ms`.
+///
+/// # It clears `released_at_ms`, and that is the one arm that must (Story 56.14)
+///
+/// For [`remember_materialized`]'s reason — the column is the negation of "this
+/// clone holds content for this path", which is exactly what a local authorship
+/// asserts — and because this is the ONLY writer that can reach a released row.
+/// Content the owner puts back at a released path is not pointer text, so
+/// `pending_smudges` skips it and neither `remember_materialized` nor
+/// [`observe_materialized`] is ever called for it; the sweep cannot reach it
+/// either, because its candidates come from [`materialized_rows`]. Without the
+/// clear, the row stays retired forever: bytes the owner just authored would be
+/// invisible to the release sweep at any age, carry no schedule in a listing,
+/// and read to [`materialized_paths`] as content this machine does not have.
 pub fn note_local_authorship(
     conn: &Connection,
     profile_id: &str,
@@ -778,7 +821,8 @@ pub fn note_local_authorship(
          VALUES (?1, ?2, ?3, 1, NULL, ?4, ?5)
          ON CONFLICT(profile_id, path)
            DO UPDATE SET local_origin = 1, synced_at_ms = NULL,
-                         oid = excluded.oid, size_bytes = excluded.size_bytes",
+                         oid = excluded.oid, size_bytes = excluded.size_bytes,
+                         released_at_ms = NULL",
         (
             profile_id,
             path,
@@ -1071,10 +1115,19 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
 /// which is honest — somebody opened it — and is the fact a later
 /// re-materialization wants.
 ///
+/// # What it costs
+///
 /// The table now grows with the number of distinct paths this profile has ever
-/// hydrated rather than with the number it currently holds. That is bounded by
-/// the folder, not by time: a release is per path, so the row count cannot
-/// exceed the tracked paths in the cone however many release cycles run.
+/// hydrated rather than with the number it currently holds, and **nothing
+/// prunes a released row**: there is no `DELETE FROM materialized` anywhere in
+/// this crate. So the bound is paths-ever-hydrated, which for a folder with
+/// renames, dated exports or a rolling archive grows with time and not with the
+/// cone. Both filtered readers stay correct and index-ranged either way; the
+/// cost is disk, and it is small per row. Bounding it needs a rule about which
+/// released rows are worth keeping — an age relative to the folder's TTL, plus
+/// an index read to know the path is gone upstream — which is a decision rather
+/// than an edit, and it is recorded as deferred work rather than guessed at
+/// here.
 ///
 /// # Why the statement will not touch a pinned row
 ///
@@ -3634,7 +3687,7 @@ mod tests {
     fn observing_content_records_the_use_and_never_moves_the_landing_clock() {
         let c = conn();
 
-        observe_materialized(&c, "p", "found.mp4", 4_000).expect("first sighting");
+        observe_materialized(&c, "p", "found.mp4", 4_000, "aaa111", 4_096).expect("first sighting");
         let row = materialized_rows(&c, "p").expect("read").remove(0);
         assert_eq!(
             (row.at_ms, row.last_used_ms, row.local_origin, row.pinned),
@@ -3644,7 +3697,8 @@ mod tests {
         );
 
         remember_materialized(&c, "p", "landed.mp4", 1_000).expect("landing");
-        observe_materialized(&c, "p", "landed.mp4", 7_000).expect("second sighting");
+        observe_materialized(&c, "p", "landed.mp4", 7_000, "bbb222", 8_192)
+            .expect("second sighting");
         let row = materialized_rows(&c, "p")
             .expect("read")
             .into_iter()
@@ -3659,7 +3713,8 @@ mod tests {
         // A sighting of a released path brings it back into the present tense,
         // because looking at it is how we found out the content is here.
         forget_materialized(&c, "p", "landed.mp4", 8_000).expect("release");
-        observe_materialized(&c, "p", "landed.mp4", 9_000).expect("third sighting");
+        observe_materialized(&c, "p", "landed.mp4", 9_000, "bbb222", 8_192)
+            .expect("third sighting");
         assert!(
             materialized_paths(&c, "p")
                 .expect("read")
